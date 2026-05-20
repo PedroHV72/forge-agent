@@ -32,7 +32,7 @@ From `$ARGUMENTS`:
 ## Step 1 — Minimal context read (this command, main context)
 
 Read ONLY these small files:
-- `.gsd/STATE.md` → determine next milestone ID (M001 if none, else M00N+1)
+- `.gsd/STATE.md` → current project state (the milestone ID is timestamp-based — see below — not derived from STATE)
 - `.gsd/PROJECT.md` → project description and stack
 - `.gsd/REQUIREMENTS.md` → constraints (or skip if missing)
 - Last 10 rows of `.gsd/DECISIONS.md` → locked decisions
@@ -41,7 +41,11 @@ If `SESSION_ID` is set: Read `.gsd/sessions/{SESSION_ID}.md` → store as `SESSI
 
 Do NOT read anything else. Do NOT read source code.
 
-Set `MILESTONE_ID` = next available M### (e.g. M002 if M001 exists).
+Set `MILESTONE_ID` to a **timestamp-based** ID — generate it with `date`:
+```bash
+echo "M-$(date +%Y%m%d-%H%M%S)"
+```
+This yields e.g. `M-20260519-144328` (local time, second precision). Use that value as `{MILESTONE_ID}` for the rest of this skill. NEVER use a sequential counter (`M001`, `M002`, …) — sequential IDs collide between team members committing to the same repo. Legacy IDs `M001`–`M011` already in history stay valid.
 Create the milestone directory:
 ```bash
 mkdir -p .gsd/milestones/{MILESTONE_ID}/slices

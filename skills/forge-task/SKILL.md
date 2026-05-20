@@ -62,12 +62,11 @@ Initialize: `session_units = 0`, `COMPACT_AFTER = PREFS.compact_after || 10`
 
 ```bash
 mkdir -p .gsd/tasks
-ls .gsd/tasks/ 2>/dev/null | grep -oE 'TASK-[0-9]+' | sort -t- -k2 -n | tail -1
+echo "TASK-$(date +%Y%m%d-%H%M%S)"
 ```
 
 - Resume mode: `TASK_ID` already set — skip to Dispatch loop
-- No tasks exist: `TASK_ID = TASK-001`
-- Otherwise: increment last number → `TASK_ID = TASK-NNN` (zero-padded to 3 digits)
+- Otherwise: set `TASK_ID` to the **timestamp-based** ID from the command above — `TASK-$(date +%Y%m%d-%H%M%S)`, e.g. `TASK-20260519-144328` (local time, second precision). NEVER use a sequential counter (`TASK-001`, `TASK-002`, …) — sequential IDs collide between team members committing to the same repo. Legacy IDs `TASK-NNN` already in history stay valid.
 
 ---
 
