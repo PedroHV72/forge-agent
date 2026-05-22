@@ -55,8 +55,10 @@ process.stdin.on('end', () => {
       //   1. M004 dashboard: "- **M###** — milestone ..." inside Active runs section
       //   2. Pre-M004 ## Active Milestone heading form
       //   3. Pre-M004 legacy **Active Milestone:** bold form
+      // Shared milestone-ID fragment: matches legacy M### and timestamp M-<14digits>(-<slug>)?
+      const M_ID = 'M(?:-\\d{14}(?:-[a-z0-9-]+)?|\\d+)';
       let milestoneText = '';
-      const dashMatch = state.match(/^-\s+\*\*(M\d+)\*\*\s+—\s+milestone\b/m);
+      const dashMatch = state.match(new RegExp('^-\\s+\\*\\*(' + M_ID + ')\\*\\*\\s+—\\s+milestone\\b', 'm'));
       if (dashMatch) milestoneText = dashMatch[1];
       else {
         const headMatch = state.match(/^## Active Milestone\s*\n([^\n]+)/mi);
@@ -68,7 +70,7 @@ process.stdin.on('end', () => {
       }
 
       const mId = milestoneText && !/^—|^\(none\)/i.test(milestoneText)
-        ? (milestoneText.match(/^(M\d+)/i)?.[1] || '')
+        ? (milestoneText.match(new RegExp('^(' + M_ID + ')'))?.[1] || '')
         : '';
 
       if (mId) {
