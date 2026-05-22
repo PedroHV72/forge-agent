@@ -7,20 +7,21 @@
 // Library exports:
 //   resolveRunFromArgs(cwd, args, opts) → { run_id, kind, status, message }
 //   listActiveSummary(cwd) → string (multi-line, formatted for user)
-//   newTaskId(description) → string (task-{slug}-{shortuuid4})
+//   newTaskId(description) → string (T-<ts>-<slug>, delegates to forge-ids.js)
 //   refuseMessage(activeRuns, command) → string
 //   activateRun(cwd, opts) → registered RunRecord
 //
 // CLI:
 //   node forge-cli-helpers.js --resolve-args --args "M065" [--cwd <path>]
+//   node forge-cli-helpers.js --resolve-args --args "M-20260522143012-oauth" [--cwd <path>]
 //   node forge-cli-helpers.js --list-active-summary [--cwd <path>]
 //   node forge-cli-helpers.js --new-task-id --description "fix typo"
 
 'use strict';
 
 const path  = require('path');
-const crypto = require('crypto');
 const runs  = require('./forge-runs.js');
+const ids   = require('./forge-ids.js');
 
 // ── Prefs read (multi_run.refused_when_active_count) ────────────────────────
 function readPref(cwd, dottedKey, fallback) {
@@ -49,23 +50,16 @@ function readPref(cwd, dottedKey, fallback) {
 }
 
 // ── ID generation ───────────────────────────────────────────────────────────
-function slugify(s) {
-  return String(s).toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 30);
-}
-
+// newTaskId delegates to forge-ids.js — no local slugify or crypto needed.
 function newTaskId(description) {
-  const slug = slugify(description || 'task');
-  const suffix = crypto.randomBytes(2).toString('hex');
-  return `task-${slug}-${suffix}`;
+  return ids.makeTaskId(description || 'task');
 }
 
 // ── Arg resolution ──────────────────────────────────────────────────────────
-// Input: raw argument string (e.g. "M065", "task-fix-foo-a3f2", "", "resume", "ignored-text")
+// Input: raw argument string (e.g. "M065", "M-20260522143012-oauth",
+//        "T-20260522143012-fix-typo", "task-fix-foo-a3f2", "", "resume")
 // Output:
-//   { run_id: "M###" | "task-...", kind: "milestone"|"task", status: "ok"|"refuse"|"activate-new"|"resume-only", message }
+//   { run_id, kind: "milestone"|"task"|null, status: "ok"|"refuse"|"activate-new"|"resume"|"error"|"legacy", message }
 function resolveRunFromArgs(cwd, argsRaw, opts) {
   opts = opts || {};
   const arg = String(argsRaw || '').trim();
@@ -74,25 +68,40 @@ function resolveRunFromArgs(cwd, argsRaw, opts) {
 
   // Direct ID arg
   if (arg) {
-    // Milestone-style ID (M### where ### is digits)
-    if (/^M\d+$/i.test(arg)) {
-      const id = arg.toUpperCase();
-      const existing = runs.get(cwd, id);
-      if (existing && existing.active) {
-        return { run_id: id, kind: 'milestone', status: 'resume', message: `Retomando run ativa: ${id}` };
-      }
-      return { run_id: id, kind: 'milestone', status: 'activate-new', message: `Iniciando run: ${id}` };
+    // Validate the ID using forge-ids.js — handles both legacy and timestamp formats
+    if (!ids.isValid(arg)) {
+      return {
+        run_id: null,
+        kind: null,
+        status: 'error',
+        message: `Argumento "${arg}" não reconhecido. Use M###, M-<ts>..., TASK-### ou T-<ts>...`,
+      };
     }
-    // Task-style ID
-    if (/^task-/.test(arg)) {
+
+    const kind = ids.entityKind(arg);
+
+    if (kind === 'milestone') {
+      // Normalize lookup key: legacy IDs upper-case (existing behavior preserved);
+      // timestamp IDs used verbatim — slug is lowercase, must NOT be upper-cased.
+      const lookupId = ids.classify(arg) === 'legacy' ? arg.toUpperCase() : arg;
+      const existing = runs.get(cwd, lookupId);
+      if (existing && existing.active) {
+        return { run_id: lookupId, kind: 'milestone', status: 'resume', message: `Retomando run ativa: ${lookupId}` };
+      }
+      return { run_id: lookupId, kind: 'milestone', status: 'activate-new', message: `Iniciando run: ${lookupId}` };
+    }
+
+    if (kind === 'task') {
+      // Task lookup is format-agnostic — registry key is the ID string as-is
       const existing = runs.get(cwd, arg);
       if (existing && existing.active) {
         return { run_id: arg, kind: 'task', status: 'resume', message: `Retomando task run: ${arg}` };
       }
       return { run_id: null, kind: null, status: 'error', message: `Task ID "${arg}" não encontrado no registry.` };
     }
-    // Unknown arg
-    return { run_id: null, kind: null, status: 'error', message: `Argumento "${arg}" não reconhecido. Use M### ou task-...` };
+
+    // kind === 'unknown' — isValid passed but entityKind returned unknown (should not happen with current patterns)
+    return { run_id: null, kind: null, status: 'error', message: `Argumento "${arg}" não reconhecido. Use M###, M-<ts>..., TASK-### ou T-<ts>...` };
   }
 
   // No arg — decide based on active count
@@ -185,9 +194,10 @@ function cliMain() {
 Flags:
   --resolve-args --args "<arg>" [--command forge-auto]
                                 resolve user input to a {run_id,kind,status,message}
+                                e.g. "M065", "M-20260522143012-oauth", "T-20260522143012-fix-typo"
   --list-active-summary         human-readable summary of active runs
   --new-task-id --description "<text>"
-                                generate task-{slug}-{shortuuid} ID
+                                generate T-<ts>-<slug> ID
   --refuse-msg --command <name> (assumes >=2 active) print refuse message
   --cwd <path>                  override working directory
 `);
