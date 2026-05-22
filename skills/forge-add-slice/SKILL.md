@@ -32,14 +32,18 @@ ls .gsd/STATE.md 2>/dev/null && echo "ok" || echo "missing"
 $ARGUMENTS
 
 ## Parse the input
-- First token that matches `M\d+` → milestone ID (use active milestone from STATE.md if not specified)
+- First token that is a valid milestone ID — `M###` legacy (e.g. `M003`) or `M-<ts>-<slug>` timestamp
+  (e.g. `M-20260522143012-auth`) → milestone ID (use active milestone from STATE.md if not specified).
+  If unsure whether a token is a valid milestone ID, shell out:
+  `node "$FORGE_SCRIPTS_DIR/forge-ids.js" --classify <token>`
+  (`legacy` or `timestamp` output both count; any non-zero exit means not a milestone ID).
 - Remaining text → slice description / goal
 
 ## Your job
 
 1. **Read milestone context:**
-   - `M###-ROADMAP.md` — existing slices, boundary map, next slice ID (S0N+1)
-   - `M###-CONTEXT.md` — architecture decisions that constrain this slice
+   - `<milestone-id>-ROADMAP.md` — existing slices, boundary map, next slice ID (S0N+1)
+   - `<milestone-id>-CONTEXT.md` — architecture decisions that constrain this slice
    - `.gsd/DECISIONS.md` — locked decisions
    - Summaries of completed slices that this new slice might depend on
 
@@ -54,7 +58,7 @@ $ARGUMENTS
    - Each T##-PLAN.md needs: Goal, Must-Haves (Truths + Artifacts + Key Links), Steps (3-10), Context
 
 4. **Update the milestone:**
-   - Add the new slice entry to `M###-ROADMAP.md` with `- [ ]`, risk tag, depends tag, demo sentence
+   - Add the new slice entry to `<milestone-id>-ROADMAP.md` with `- [ ]`, risk tag, depends tag, demo sentence
    - Update the Boundary Map section with what this slice produces/consumes
 
 5. **Update STATE.md** if this is the next slice to execute — Read it first before writing

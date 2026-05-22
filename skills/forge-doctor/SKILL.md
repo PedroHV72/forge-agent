@@ -36,6 +36,7 @@ Extract from STATE: M=ActiveMilestone, S=ActiveSlice, T=ActiveTask, P=Phase.
 
 **C1a** — If M≠none and `.gsd/milestones/M/` missing:
 ```bash
+# M* matches both M### (legacy) and M-<ts>-<slug> (timestamp); sort -V orders timestamp IDs — format-agnostic
 ls -d .gsd/milestones/M*/ 2>/dev/null | sort -V | tail -1
 ```
 Fix: set M to last existing (or `none`), S/T=none, P=idle. Edit STATE.
@@ -171,7 +172,7 @@ If repo_path unknown → `[SKIP] execute bash install.sh`.
 | `.gsd/DECISIONS.md` | exists + has `\| # \| When \| Scope...` header | create or fix header (preserve data rows) |
 | `.gsd/AUTO-MEMORY.md` | first line starts with `<!-- gsd-auto-memory \|` | create or prepend header |
 | `.gsd/CODING-STANDARDS.md` | exists | create via forge-init auto-detection (never overwrite) |
-| `M-ROADMAP.md` | contains `## Boundary Map` | append stub `## Boundary Map\n<!-- forge-planner preencherá -->` |
+| `<milestone-id>-ROADMAP.md` | contains `## Boundary Map` | append stub `## Boundary Map\n<!-- forge-planner preencherá -->` |
 | `.gsd/forge/events.jsonl` | each non-empty line starts with `{` and ends with `}` | rewrite keeping only valid lines |
 
 AUTO-MEMORY header:
