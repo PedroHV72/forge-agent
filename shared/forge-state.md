@@ -45,7 +45,7 @@ isolation_mode: shared
 
 | Field | Type | Notes |
 |---|---|---|
-| `milestone` | string `M###` | Must match parent directory name |
+| `milestone` | string — legacy `M###` or timestamp `M-<ts>-<slug>` | Must match parent directory name |
 | `kind` | `"milestone"` | Always `milestone` for this file type |
 | `created` | ISO-8601 UTC | When the file was first written |
 | `last_updated` | ISO-8601 UTC | Bumped on every write |
@@ -87,7 +87,7 @@ isolation_mode: shared
 ```ts
 type RunRecord = {
   kind: "milestone" | "task";
-  id: string;                       // "M065" for milestones, "task-{slug}-{shortuuid4}" for tasks
+  id: string;                       // "M065" or "M-<ts>-<slug>" for milestones, "T-<ts>-<slug>" for tasks
   session_id: string;               // Claude Code session_id from hook payload
   active: boolean;                  // true while loop is alive
   started_at: number;               // Unix ms
@@ -102,7 +102,7 @@ type RunRecord = {
   task_description?: string;        // The original user prompt for /forge-task
   pending_decisions?: Array<{       // Buffered for merge at complete-task
     ts: string;                     // ISO-8601
-    id: string;                     // "D-task-{slug}-{n}"
+    id: string;                     // "D-<task-id>-{n}" where <task-id> is the T-<ts>-<slug> id
     decision: string;
     rationale?: string;
   }>;
@@ -139,7 +139,7 @@ type RunRecord = {
 ```json
 {
   "kind": "task",
-  "id": "task-fix-typo-readme-a3f2",
+  "id": "T-20260522143012-fix-typo-readme",
   "session_id": "def-456",
   "active": true,
   "started_at": 1779203140063,
@@ -246,6 +246,8 @@ Workspaces with pre-M004 STATE.md (single-run with `**Active Milestone:**` field
   4. Old STATE.md is overwritten (no backup — git tracks it)
 
 Detection rule: STATE.md without `<!-- AUTO-GENERATED -->` first line = legacy. Once dashboard regenerates, the marker is present.
+
+**Task ID retrocompat:** Legacy task run files with IDs of the form `task-{slug}-{hex}` remain readable by `scripts/forge-runs.js`. New task runs use `T-<ts>-<slug>` (emitted by `makeTaskId()` in `scripts/forge-ids.js`). The slug portion is optional — when the description reduces to an empty slug, the ID is `T-<ts>` with no trailing segment.
 
 ---
 
