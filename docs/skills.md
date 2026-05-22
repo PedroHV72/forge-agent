@@ -26,8 +26,8 @@ Skills são módulos de conhecimento especializado que o agente carrega sob dema
 ```bash
 /forge-new-milestone autenticação OAuth         # brainstorm + scope + discuss + plan
 /forge-new-milestone -fast autenticação OAuth   # só discuss + plan
-/forge-discuss M003                              # com brainstorm (se disponível)
-/forge-discuss -fast M003                        # discuss direto
+/forge-discuss M-20260522143012-oauth             # com brainstorm (se disponível)
+/forge-discuss -fast M-20260522143012-oauth      # discuss direto
 ```
 
 ## Instalar skills de outros repositórios

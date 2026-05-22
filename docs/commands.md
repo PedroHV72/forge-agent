@@ -19,8 +19,8 @@
 | Comando | Exemplo | O que faz |
 |---------|---------|-----------|
 | `/forge-new-milestone` | `/forge-new-milestone sistema de pagamentos com Stripe` | Cria milestone completo: discuss → plan → ROADMAP com slices e boundary map. |
-| `/forge-discuss` | `/forge-discuss M002` ou `/forge-discuss S03` | Fase de discuss para milestone ou slice específico. Pergunta sobre gray areas e registra decisões. |
-| `/forge-add-slice` | `/forge-add-slice M002 webhook de pagamentos` | Adiciona slice ao milestone com tasks planejadas e T##-PLAN.md. |
+| `/forge-discuss` | `/forge-discuss M-20260522143012-oauth` ou `/forge-discuss S03` | Fase de discuss para milestone ou slice específico. Pergunta sobre gray areas e registra decisões. |
+| `/forge-add-slice` | `/forge-add-slice M-20260522143012-oauth webhook de pagamentos` | Adiciona slice ao milestone com tasks planejadas e T##-PLAN.md. |
 | `/forge-add-task` | `/forge-add-task S03 validar assinatura do webhook` | Planeja task específica com steps e must-haves. |
 
 ## Visibilidade
@@ -29,7 +29,7 @@
 |---------|---------|-----------|
 | `/forge-status` | `/forge-status` | Dashboard: milestone ativo, progresso de slices/tasks, próxima ação. |
 | `/forge-codebase` | `/forge-codebase` | Qualidade do codebase — estrutura, nomenclatura e responsabilidade. Use `--paths a,b` para escopo e `--fix` para correções seguras. |
-| `/forge-explain` | `/forge-explain M002` · `/forge-explain S03` · `/forge-explain decisions` | Explica qualquer artefato sem modificar nada. Aceita: `M###`, `S##`, `T##`, `decisions`, `state`, `all`. |
+| `/forge-explain` | `/forge-explain M-20260522143012-oauth` · `/forge-explain S03` · `/forge-explain decisions` | Explica qualquer artefato sem modificar nada. Aceita: `M-<ts>-<slug>` (formato atual) ou `M###` (legado, ainda resolvido), `S##`, `T##`, `decisions`, `state`, `all`. |
 | `/forge-memories` | `/forge-memories` · `/forge-memories stats` | Gerencia memórias auto-aprendidas. Sub-comandos: `show`, `stats`, `clean`, `export`, `inject`. |
 | `/forge-help` | `/forge-help` | Ajuda completa com todos os comandos, agentes e arquivos. |
 
@@ -42,3 +42,5 @@
 | `/forge-prefs` | `/forge-prefs` | Mostra configuração atual de modelos, skip rules e git. |
 | `/forge-prefs set` | `/forge-prefs set research haiku` | Muda o modelo de uma fase. |
 | `/forge-prefs reset` | `/forge-prefs reset` | Restaura todos os padrões. |
+
+> **Retrocompat de leitura:** IDs legados (`M###`, `TASK-###`) continuam válidos para resolução, leitura e `--resume`. Apenas a *geração* de novos milestones e tasks soltas passou a usar o formato timestamp (`M-<ts>-<slug>` / `T-<ts>-<slug>`).

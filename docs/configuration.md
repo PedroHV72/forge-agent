@@ -40,7 +40,7 @@ main_branch: main
 O Forge instala uma status line customizada para o Claude Code que substitui a nativa. Ela não é ativada automaticamente — você escolhe quando habilitar.
 
 ```
-Forge │ Claude Sonnet 4.6 │ meu-projeto │ M001/S02 │ █████░░░░░ 47% │ $0.0042 │ ↑12k ↓3k 💾8k
+Forge │ Claude Sonnet 4.6 │ meu-projeto │ M-20260522…/S02 │ █████░░░░░ 47% │ $0.0042 │ ↑12k ↓3k 💾8k
 ✓ forge-executor: implement auth middleware  2m ago (3 units)
 ```
 
@@ -48,7 +48,7 @@ Forge │ Claude Sonnet 4.6 │ meu-projeto │ M001/S02 │ █████░�
 |-------|-------------|
 | `Claude Sonnet 4.6` | Modelo ativo na sessão |
 | `meu-projeto` | Pasta atual |
-| `M001/S02` | Milestone e slice ativos (lido de `.gsd/STATE.md`) |
+| `M-20260522…/S02` | Milestone e slice ativos (lido de `.gsd/STATE.md`) |
 | `█████░░░░░ 47%` | Uso da context window |
 | `$0.0042` | Custo acumulado da sessão |
 | `↑12k ↓3k 💾8k` | Tokens enviados / recebidos / cache |
@@ -73,11 +73,11 @@ CLAUDE.md                       ← carregado automaticamente pelo Claude Code e
   AUTO-MEMORY.md                ← memórias auto-aprendidas (cresce com o uso)
   claude-agent-prefs.md         ← overrides de modelo e git para este projeto
   milestones/
-    M001/
-      M001-ROADMAP.md           ← slices com checkboxes + boundary map
-      M001-CONTEXT.md           ← decisões capturadas no discuss
-      M001-RESEARCH.md          ← pesquisa de codebase
-      M001-SUMMARY.md           ← resumo acumulado do milestone
+    M-20260522143012-oauth/     ← ID timestamp (M### legado lido normalmente)
+      M-20260522143012-oauth-ROADMAP.md    ← slices com checkboxes + boundary map
+      M-20260522143012-oauth-CONTEXT.md   ← decisões capturadas no discuss
+      M-20260522143012-oauth-RESEARCH.md  ← pesquisa de codebase
+      M-20260522143012-oauth-SUMMARY.md   ← resumo acumulado do milestone
       slices/
         S01/
           S01-PLAN.md           ← tasks com checkboxes

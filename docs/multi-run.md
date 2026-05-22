@@ -1,18 +1,18 @@
 # Multi-Run Workspace (M004+)
 
-A partir do milestone M004, o Forge Agent suporta **N orquestradores simultâneos** no mesmo workspace. Você pode rodar `/forge-auto M065` em um terminal e `/forge-auto M066` em outro, ambos contra o mesmo `.gsd/`, sem corrupção de estado.
+A partir do milestone M004, o Forge Agent suporta **N orquestradores simultâneos** no mesmo workspace. Você pode rodar `/forge-auto M-20260522101500-pagamentos` em um terminal e `/forge-auto M-20260522142000-notificacoes` em outro, ambos contra o mesmo `.gsd/`, sem corrupção de estado.
 
 ## TL;DR
 
 ```bash
 # Terminal A
-$ /forge-auto M065
+$ /forge-auto M-20260522101500-pagamentos
 
 # Terminal B (mesmo workspace, mesmo .gsd/)
-$ /forge-auto M066
+$ /forge-auto M-20260522142000-notificacoes
 
 # Ambos rodam até completar. Statusline mostra:
-# ● AUTO ×2 │ M065 ⚡T03 +12s │ M066 🔥S04 +1m
+# ● AUTO ×2 │ M-20260522101500-pagamentos ⚡T03 +12s │ M-20260522142000-notificacoes 🔥S04 +1m
 ```
 
 Sem mudança de fluxo pra workspaces single-run — comportamento legado preservado quando há 0 ou 1 run ativa.
@@ -24,7 +24,7 @@ Sem mudança de fluxo pra workspaces single-run — comportamento legado preserv
 | Antes (single-run) | Depois (multi-run) |
 |---|---|
 | `.gsd/STATE.md` source-of-truth | `.gsd/STATE.md` = **dashboard read-only** auto-gerado |
-| — | `.gsd/milestones/M###/M###-STATE.md` = source-of-truth da run |
+| — | `.gsd/milestones/M###/M###-STATE.md` = source-of-truth da run (`M###` é placeholder format-agnostic — casa IDs legados e timestamp) |
 | `.gsd/forge/auto-mode.json` único | `.gsd/forge/runs/{id}.json` por run (auto-mode.json vira alias do oldest) |
 
 ### Globais agora per-run + merge no fim
@@ -48,7 +48,7 @@ Zero contention entre runs — cada um toca apenas seu próprio diretório. Lock
 ```json
 {
   "kind": "milestone",
-  "id": "M065",
+  "id": "M-20260522101500-pagamentos",
   "session_id": "claude-session-abc",
   "active": true,
   "started_at": 1779203140063,
@@ -56,7 +56,7 @@ Zero contention entre runs — cada um toca apenas seu próprio diretório. Lock
   "worker": "execute-task/T03",
   "worker_started": 1779203180000,
   "isolation_mode": "shared",
-  "milestone_dir": ".gsd/milestones/M065/",
+  "milestone_dir": ".gsd/milestones/M-20260522101500-pagamentos/",
   "cwd": "C:/DEV/projeto"
 }
 ```
@@ -75,7 +75,7 @@ Schema completo em [`shared/forge-state.md`](../shared/forge-state.md) §2.
 ### Sem argumento
 
 - **0 runs ativas** → lê `.gsd/STATE.md` legado (single-run compat)
-- **1 run ativa** → assume retomar, msg `↺ Retomando única run ativa: M065`
+- **1 run ativa** → assume retomar, msg `↺ Retomando única run ativa: M-20260522101500-pagamentos`
 - **2+ runs ativas** → refuse + lista IDs + exemplos
 
 ### Com argumento `M###`
@@ -85,7 +85,7 @@ Schema completo em [`shared/forge-state.md`](../shared/forge-state.md) §2.
 
 ### Tasks
 
-`/forge-task <descrição>` registra `kind:"task"` em `runs/{id}.json` com ID `task-{slug}-{shortuuid}`. Diretório `.gsd/tasks/{TASK_ID}/` continua sendo o artifact home (compat).
+`/forge-task <descrição>` registra `kind:"task"` em `runs/{id}.json` com ID `T-<ts>-<slug>` (formato timestamp, gerado por `scripts/forge-ids.js makeTaskId`). Diretório `.gsd/tasks/{TASK_ID}/` continua sendo o artifact home (compat).
 
 ## Isolation modes
 
@@ -149,8 +149,8 @@ Funciona out-of-the-box em workspaces tipo monorepo (Lookchina omnichannel = 10 
 ## Statusline
 
 - 0-1 runs: visual legado (rico, mostra last_outcome, retry, burn rate)
-- 2-3 runs: compacto — `● AUTO ×2 │ M065 ⚡T03 +12s │ M066 🔥S04 +1m`
-- 4+ runs: trunca — `● AUTO ×4 │ M065 │ M066 │ M067 · +1 mais`
+- 2-3 runs: compacto — `● AUTO ×2 │ M-20260522101500-pagamentos ⚡T03 +12s │ M-20260522142000-notificacoes 🔥S04 +1m`
+- 4+ runs: trunca — `● AUTO ×4 │ M-20260522101500-pagamentos │ M-20260522142000-notificacoes │ M-20260522160000-relatorios · +1 mais`
 
 **Smart stale (M005+):** isMultiRunMode considera mais de uma fonte de heartbeat. Run com `runs/{id}.json.last_heartbeat` velho mas com `M###-events.jsonl` ou `M###-STATE.md` modificado recentemente é considerada viva. Cobre cenários onde a sessão atual está com session_id mismatch no registry mas workers estão escrevendo normalmente.
 
@@ -159,7 +159,7 @@ Funciona out-of-the-box em workspaces tipo monorepo (Lookchina omnichannel = 10 
 `.gsd/STATE.md` (auto-gerado) mostra phase real lendo `M###-STATE.md` de cada run:
 
 ```
-- **M067** — milestone · phase: execute-task · slice: S07 · task: T01 · worker: T01 · heartbeat: 2s ago · ...
+- **M-20260522160000-relatorios** — milestone · phase: execute-task · slice: S07 · task: T01 · worker: T01 · heartbeat: 2s ago · ...
 ```
 
 Antes do M005 mostrava `phase: —` porque o schema `runs/{id}.json` não tinha esse campo. Agora cross-references o per-milestone STATE pra trazer phase + active_slice + active_task.
@@ -167,7 +167,7 @@ Antes do M005 mostrava `phase: —` porque o schema `runs/{id}.json` não tinha 
 ## Pause + compact recovery
 
 - `/forge-pause` (sem arg, 1 run) → toggla aquela
-- `/forge-pause M065` → toggla scoped `.gsd/forge/pause-M065`
+- `/forge-pause M-20260522101500-pagamentos` → toggla scoped `.gsd/forge/pause-M-20260522101500-pagamentos`
 - `/forge-pause` (2+ runs, sem arg) → refuse + lista
 - Compact recovery escopado: `compact-signal-{sessionId}.json` (per-tab)
 
@@ -181,17 +181,19 @@ Antes do M005 mostrava `phase: —` porque o schema `runs/{id}.json` não tinha 
 
 Nada é apagado — apenas reformatado.
 
+> **Retrocompat de IDs:** IDs legados (`M###`, `TASK-###`) continuam válidos para resolução, `--resume` e leitura de artefatos. Apenas a *geração* de novos milestones e tasks soltas passou a usar o formato timestamp (`M-<ts>-<slug>` / `T-<ts>-<slug>`). IDs legados em `--run`, `--remove` e outros argumentos de CLI continuam funcionando.
+
 ## Troubleshooting
 
 ### `Múltiplas runs ativas` ao rodar /forge-auto sem ID
 
-Esperado. Especifique o ID: `/forge-auto M065`. Lista IDs no error message.
+Esperado. Especifique o ID: `/forge-auto M-20260522101500-pagamentos`. Lista IDs no error message.
 
 ### Run mostrou ⚠ STALE no dashboard
 
 Run sem heartbeat há >5min. Provavelmente Ctrl+C ou kill no terminal. Próximo `/forge-*` boot a remove (>30min) ou você pode forçar:
 ```bash
-node ~/.claude/scripts/forge-runs.js --remove M065
+node ~/.claude/scripts/forge-runs.js --remove M-20260522101500-pagamentos
 ```
 
 ### Arquivo em uso por outra run
@@ -202,7 +204,7 @@ Hook bloqueia Write/Edit cross-run. Orquestrador retenta com backoff. Se travar:
 node ~/.claude/scripts/forge-filelock.js --check src/conflict.ts
 
 # Liberar (caso seguro)
-node ~/.claude/scripts/forge-filelock.js --release src/conflict.ts --run M065
+node ~/.claude/scripts/forge-filelock.js --release src/conflict.ts --run M-20260522101500-pagamentos
 ```
 
 ### Quero ver o que cada run está fazendo
