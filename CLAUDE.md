@@ -16,7 +16,7 @@ Forge Agent é um sistema de **context engineering** que:
 
 ### Hierarquia de trabalho
 ```
-Milestone (M###) → Slice (S##) → Task (T##)
+Milestone (M-<ts>-<slug>) → Slice (S##) → Task (T##)
 ```
 Regra de ferro: cada Task cabe em um context window. Slices agrupam tasks relacionadas. Milestones são entregas de valor.
 
@@ -75,7 +75,7 @@ Fluxo de composição:
 - `/forge-discuss` → `Skill(brainstorm)` se BRAINSTORM.md não existe → discuss inline
 - `/forge-auto` / `/forge-next` → `Skill(risk-radar)` automático antes de `plan-slice` com `risk:high`
 
-**Regra:** Skills são auto-suficientes (lêem seus próprios arquivos de disco). Não injetar contexto via args — passar apenas IDs (M###, S##).
+**Regra:** Skills são auto-suficientes (lêem seus próprios arquivos de disco). Não injetar contexto via args — passar apenas IDs (`M-<ts>-<slug>` para milestones, `S##` para slices).
 
 ## Estrutura de arquivos do projeto
 
@@ -150,15 +150,15 @@ forge-agent/
 │   ├── auto-mode-started.txt    # Timestamp de início persistido (sobrevive entre tool calls)
 │   └── pause                    # Arquivo-sinal: se existe, forge-auto pausa no próximo intervalo
 ├── archive/                     # Milestones arquivados (milestone_cleanup: archive)
-│   └── M###/                    # Cópia movida do diretório de milestone completo
+│   └── M-<ts>-<slug>/           # Cópia movida do diretório de milestone completo
 └── milestones/
-    └── M###/
-        ├── M###-ROADMAP.md      # Slices, dependências, boundary map
-        ├── M###-CONTEXT.md      # Decisões de arquitetura (discuss)
-        ├── M###-RESEARCH.md     # Pesquisa de codebase
-        ├── M###-BRAINSTORM.md   # Brainstorm estruturado
-        ├── M###-SCOPE.md        # Contrato de escopo
-        ├── M###-SUMMARY.md      # Summary acumulativo
+    └── M-<ts>-<slug>/           # M-<ts>-<slug> = ID timestamp (M### legado lido normalmente)
+        ├── M-<ts>-<slug>-ROADMAP.md      # Slices, dependências, boundary map
+        ├── M-<ts>-<slug>-CONTEXT.md      # Decisões de arquitetura (discuss)
+        ├── M-<ts>-<slug>-RESEARCH.md     # Pesquisa de codebase
+        ├── M-<ts>-<slug>-BRAINSTORM.md   # Brainstorm estruturado
+        ├── M-<ts>-<slug>-SCOPE.md        # Contrato de escopo
+        ├── M-<ts>-<slug>-SUMMARY.md      # Summary acumulativo
         └── slices/
             └── S##/
                 ├── S##-PLAN.md      # Tasks, dependências, acceptance criteria
@@ -338,6 +338,9 @@ Modelo agora resolvido por tier (`light`/`standard`/`heavy`) via `PREFS.tier_mod
 
 ### Installer re-merge de hooks em upgrades
 Instaladores (`install.sh`, `install.ps1`) copiavam `merge-settings.js` atualizado para `~/.claude/forge-settings.js` mas nunca o re-executavam. Usuários que ativaram a statusline antes da v0.7.0 ficavam com `settings.json` sem os hooks `SubagentStart/Stop` e `PreCompact/PostCompact` — o `last_heartbeat` em `auto-mode.json` só era bumpado pelo Bash do orquestrador (antes/depois do dispatch), então workers longos tripavam o stale check da statusline (15 min) e o indicador `AUTO` sumia durante a execução. Fix: após copiar `forge-settings.js`, ambos instaladores detectam via `node` se `statusLine.command` do `~/.claude/settings.json` contém `forge-statusline.js`; se sim, re-executam o `forge-settings.js` no próprio `settings.json`. `merge-settings.js` já é idempotente — só adiciona hooks faltando, preserva todas as outras chaves. Garante que `/forge-update` sempre sincronize hooks mesmo quando o usuário nunca toggla a statusline.
+
+### IDs timestamp para milestones e tasks soltas (M001)
+Milestones e tasks soltas (`/forge-task`) usam IDs no formato `M-<YYYYMMDDHHMMSS>-<slug>` e `T-<YYYYMMDDHHMMSS>-<slug>` respectivamente (ex.: `M-20260522101500-pagamentos`). O timestamp UTC de 14 dígitos é a chave primária — única, ordenável por criação, sem colisão entre branches paralelos. O slug é cosmético (lowercase, hífens, ≤24 chars) e ignorado nas comparações. Slices `S##` e tasks internas `T##` permanecem sequenciais — são entidades de dono único dentro de um milestone, sem risco de colisão. Toda lógica de ID está centralizada em `scripts/forge-ids.js` (8 exports: `nowTimestamp`, `slugify`, `makeMilestoneId`, `makeTaskId`, `classify`, `isValid`, `prefixGlob`, `entityKind`) — zero regex de ID espalhado no codebase. A CLI do módulo aceita `--new-milestone`, `--new-task`, `--classify`, `--slugify`. Geração é timestamp-only; leitura aceita ambos os formatos, detectados por prefixo. **Retrocompat:** IDs legados `M###` e `TASK-###` continuam válidos para leitura, `--resume` e `/forge-explain`. Motivação: eliminar a colisão de `M006`/`M006` entre devs em branches paralelos — problema que o esquema sequencial não pode resolver sem coordenação central.
 
 ## Convenções de código
 

@@ -76,7 +76,7 @@ A partir da v1.0, o Forge Agent usa **3 comandos slash** e **skills** para tudo 
 | `forge-next` | Executa exatamente uma unidade e para (step mode) |
 | `forge-task <descrição>` | Task autônoma sem milestone — brainstorm → discuss → plan → execute |
 | `forge-new-milestone <descrição>` | Cria milestone completo — brainstorm → scope → discuss → ROADMAP |
-| `forge-discuss <M###\|S##>` | Abre fase de discuss para milestone ou slice |
+| `forge-discuss <milestone\|S##>` | Abre fase de discuss para milestone ou slice |
 | `forge-add-slice`, `forge-add-task` | Adiciona slice ou task a um milestone existente |
 
 ### Skills de visibilidade e manutenção
@@ -103,6 +103,8 @@ A partir da v1.0, o Forge Agent usa **3 comandos slash** e **skills** para tudo 
 | `forge-security` | Checklist de segurança por task (auto-invocada por keywords) |
 | `forge-responsive` | Audit responsivo — Core Web Vitals, WCAG 2.2 |
 | `forge-ui-review` | Review UI — acessibilidade, performance, React 19 |
+
+> **Compatibilidade retroativa:** IDs legados no formato `M###` (ex.: `M006`) e `TASK-###` continuam sendo lidos e resolvidos normalmente — `--resume`, `/forge-explain` e `/forge-discuss` aceitam ambos os formatos. Novos milestones e tasks soltas criados pelo forge geram IDs no formato timestamp `M-<ts>-<slug>` / `T-<ts>-<slug>` (ex.: `M-20260522101500-pagamentos`).
 
 ---
 
