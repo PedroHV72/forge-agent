@@ -7,7 +7,7 @@ allowed-tools: Read, Write, Edit, Bash, Agent, Skill, AskUserQuestion, TaskCreat
 ## Parse arguments
 
 From `$ARGUMENTS`:
-- If contains `--resume TASK-###` → **RESUME MODE**: set `TASK_ID` to that ID, skip init
+- If contains `--resume <id>` (aceita `T-<ts>-<slug>` ou o legado `TASK-###`) → **RESUME MODE**: set `TASK_ID` to that ID, skip init
 - `--skip-brainstorm` or `-skip-brainstorm` → `SKIP_BRAINSTORM = true`
 - `--skip-research` or `-skip-research` → `SKIP_RESEARCH = true`
 - Remaining text after all flags → `TASK_DESCRIPTION`
@@ -87,12 +87,11 @@ fi
 **Determine TASK_ID:**
 ```bash
 mkdir -p .gsd/tasks
-ls .gsd/tasks/ 2>/dev/null | grep -oE 'TASK-[0-9]+' | sort -t- -k2 -n | tail -1
+TASK_ID=$(node "$FORGE_SCRIPTS_DIR/forge-ids.js" --new-task "$TASK_DESCRIPTION")
 ```
 
 - Resume mode: `TASK_ID` already set — skip to Dispatch loop
-- No tasks exist: `TASK_ID = TASK-001`
-- Otherwise: increment last number → `TASK_ID = TASK-NNN` (zero-padded to 3 digits)
+- `TASK_ID` agora tem o formato `T-<YYYYMMDDHHMMSS>-<slug>` (slug omitido se a descrição for vaga)
 
 **Register in multi-run registry** (M004+) — only when initializing fresh (not on resume):
 ```bash
@@ -578,7 +577,7 @@ If `session_units >= COMPACT_AFTER` and `{TASK_ID}-SUMMARY.md` does not yet exis
 ---GSD-COMPACT---
 task: {TASK_ID}
 session_units: {N}
-resume: /forge-task --resume {TASK_ID}
+resume: /forge-task --resume {TASK_ID}  # e.g. T-20240115103045-fix-login-bug
 ---
 
 Batch de {N} unidades completo para {TASK_ID}.
