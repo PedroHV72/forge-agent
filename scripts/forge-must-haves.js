@@ -117,24 +117,65 @@ function parseObjectArray(block) {
   const lines = block.split('\n');
   const items = [];
   let current = null;
+  // pending block-sequence state: tracks a field whose value is an indented block array
+  let pending = null; // { fieldName: string, fieldIndent: number } | null
 
   for (const line of lines) {
-    if (!line.trim()) continue;
+    if (!line.trim()) continue; // skip blank lines — do NOT close pending state
+
+    // Skip comment lines — do NOT close pending state (Pitfall 4)
+    if (line.trimStart().startsWith('#')) continue;
 
     // New item: "  - key: value" (2+ spaces + dash)
     const itemMatch = line.match(/^(\s+)-\s+(\w[\w_-]*):\s*(.*)/);
     if (itemMatch) {
+      // Close any pending block-sequence state
+      pending = null;
       if (current) items.push(current);
       current = {};
       current[itemMatch[2]] = parseFieldValue(itemMatch[3].trim());
       continue;
     }
 
+    // If pending block-sequence is active, check for sequence items BEFORE field-continuation
+    // (Pitfall 3: sequence items may contain ":", must not be mis-parsed as fields)
+    if (pending) {
+      const seqMatch = line.match(/^(\s+)-\s+([\s\S]*)/);
+      if (seqMatch) {
+        const itemIndent = seqMatch[1].length;
+        if (itemIndent > pending.fieldIndent) {
+          // Collect this item into the pending array field
+          const raw = seqMatch[2].trim().replace(/^["']|["']$/g, '');
+          if (!Array.isArray(current[pending.fieldName])) {
+            current[pending.fieldName] = [];
+          }
+          current[pending.fieldName].push(raw);
+          continue;
+        }
+      }
+    }
+
     // Continuation field: "    key: value" (4+ spaces, no dash)
     const fieldMatch = line.match(/^(\s{4,})(\w[\w_-]*):\s*(.*)/);
     if (fieldMatch && current) {
-      current[fieldMatch[2]] = parseFieldValue(fieldMatch[3].trim());
+      const fieldIndent = fieldMatch[1].length;
+      const fieldValue = fieldMatch[3].trim();
+
+      if (fieldValue === '') {
+        // Empty value — enter pending block-sequence state
+        pending = { fieldName: fieldMatch[2], fieldIndent };
+        // Initialize to empty array (will be populated by subsequent sequence lines)
+        current[fieldMatch[2]] = [];
+      } else {
+        // Non-empty value — close pending state and assign normally
+        pending = null;
+        current[fieldMatch[2]] = parseFieldValue(fieldValue);
+      }
+      continue;
     }
+
+    // Any other line that doesn't match closes pending state
+    if (pending) pending = null;
   }
 
   if (current) items.push(current);
@@ -167,6 +208,14 @@ function parseFieldValue(val) {
  * @returns {string[]|object[]|undefined}
  */
 function parseArrayKey(yaml, key) {
+  // Patch #1: probe for inline array BEFORE falling through to extractSubBlock.
+  // extractTopLevelValue returns [] or [a,b] for inline arrays, null for empty-value (block form),
+  // undefined for absent key, or a scalar string for non-array inline values.
+  // Short-circuit only when the probe returns an actual Array — covers `key: []` and `key: [a, b]`
+  // at any nesting depth (Pitfall 6: must come before extractSubBlock, not after).
+  const inlineProbe = extractTopLevelValue(yaml, key);
+  if (Array.isArray(inlineProbe)) return inlineProbe;
+
   const block = extractSubBlock(yaml, key);
   if (!block) return undefined;
 
