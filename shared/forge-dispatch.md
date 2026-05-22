@@ -23,6 +23,17 @@ The templates below already apply this convention around `{TOP_MEMORIES}`, `{CS_
 
 ---
 
+## Placeholder Conventions
+
+`{M###}`, `{S##}`, and `{T##}` are **substitution placeholders** filled by the orchestrator at dispatch time — they are never parsed as regexes.
+
+- `{M###}` is replaced with the resolved milestone ID, which may be a legacy sequential ID (e.g. `M001`) **or** a timestamp-based ID (e.g. `M-20240501120000-my-feature`). The token name `{M###}` is kept for historical continuity and does not constrain the ID format. Authoritative ID format rules live in `scripts/forge-ids.js`.
+- `{S##}` and `{T##}` remain sequential (e.g. `S01`, `T03`).
+
+Illustrative examples in this file (e.g. `M001`, `M002`, `M042`) are prose examples only — they do not imply the sequential format is required.
+
+---
+
 ### execute-task
 
 ```

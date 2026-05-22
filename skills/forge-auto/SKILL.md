@@ -147,7 +147,7 @@ Branch on `$STATUS`:
   ```
   Without this, `forge-hook.resolveBySessionId` won't match — heartbeats fall back to legacy `auto-mode.json` and `runs/{id}.json` becomes stale.
 
-For all non-legacy paths, the `MILESTONE_DIR` for downstream substitution is `.gsd/milestones/$RUN_ID/` (if kind=milestone) or null (if kind=task). Where bash blocks below reference `{M###}`, substitute `$RUN_ID`. Workers receive `{M###}` resolved in their prompt header via the dispatch templates.
+For all non-legacy paths, the `MILESTONE_DIR` for downstream substitution is `.gsd/milestones/$RUN_ID/` (if kind=milestone) or null (if kind=task). Where bash blocks below reference `{M###}`, substitute `$RUN_ID` (`$RUN_ID` may be a legacy `M###` or a timestamp `M-<ts>-<slug>` ID — the substitution is format-agnostic). Workers receive `{M###}` resolved in their prompt header via the dispatch templates.
 
 **Regenerate dashboard** after registry change:
 ```bash
