@@ -22,6 +22,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const ids  = require('./forge-ids.js');
 
 const STALE_THRESHOLD_MS = 30 * 60 * 1000;   // 30min: garbage-collect
 const ALIAS_FILE         = 'auto-mode.json'; // legacy alias
@@ -185,11 +186,11 @@ function migrateLegacyState(cwd) {
   if (!m) return { migrated: false, reason: 'no Active Milestone field' };
 
   const milestoneText = m[1].trim();
-  const milestoneId = (milestoneText.match(/^(M\d+)/i) || [])[1];
-  if (!milestoneId) {
-    // Legacy STATE.md exists but no active milestone — just write empty dashboard
+  const token = milestoneText.split(/\s/)[0];
+  if (!token || !ids.isValid(token) || ids.entityKind(token) !== 'milestone') {
     return { migrated: false, reason: 'no active milestone in legacy STATE' };
   }
+  const milestoneId = token;
 
   const milestoneDir = path.join(cwd, '.gsd', 'milestones', milestoneId);
   if (!fs.existsSync(milestoneDir)) {
