@@ -566,6 +566,101 @@ expected_output: []`);
 });
 
 // ─────────────────────────────────────────────────────────────
+// Axis 5: Reviewer regression — pending-guard ordering (HIGH) + indent (MEDIUM)
+// ─────────────────────────────────────────────────────────────
+console.log('\nAxis 5: Reviewer regression — pending-guard ordering + indent\n');
+
+// Cell 27 (HIGH): stub_patterns item with colon — must NOT be parsed as new artifact
+// Before fix: "- TODO: fix this" inside stub_patterns was consumed by itemMatch first,
+// creating a spurious second artifact and silently corrupting the parsed schema.
+test('Cell 27 (HIGH): stub_patterns block item "TODO: fix this" (colon in value) → 1 artifact, not 2', () => {
+  const plan = mkPlan(`must_haves:
+  truths:
+    - "it works"
+  artifacts:
+    - path: "scripts/foo.js"
+      provides: "does stuff"
+      min_lines: 10
+      stub_patterns:
+        - "TODO: fix this"
+        - "FIXME: later"
+  key_links: []
+expected_output: []`);
+  const r = parseMustHaves(plan);
+  assert(r.artifacts.length === 1, `expected 1 artifact, got ${r.artifacts.length}`);
+  assertEq(r.artifacts[0].stub_patterns, ['TODO: fix this', 'FIXME: later']);
+  assertEq(r.artifacts[0].path, 'scripts/foo.js');
+});
+
+// Cell 28 (HIGH): colon item is the ONLY stub_patterns entry
+test('Cell 28 (HIGH): single colon-containing stub_patterns item → 1 artifact', () => {
+  const plan = mkPlan(`must_haves:
+  truths:
+    - "works"
+  artifacts:
+    - path: "src/auth.js"
+      provides: "auth"
+      min_lines: 20
+      stub_patterns:
+        - "throw new Error('not implemented: login')"
+  key_links: []
+expected_output: []`);
+  const r = parseMustHaves(plan);
+  assert(r.artifacts.length === 1, `expected 1 artifact, got ${r.artifacts.length}`);
+  assertEq(r.artifacts[0].stub_patterns, ["throw new Error('not implemented: login')"]);
+});
+
+// Cell 29 (MEDIUM): seq-dash line at same/lesser indent than pending field closes pending
+// deterministically and the line is re-evaluated as a new artifact.
+// Setup: first artifact has stub_patterns (pending), then a new artifact starts at equal indent.
+test('Cell 29 (MEDIUM): stub_patterns followed by next artifact at equal indent closes pending cleanly', () => {
+  const plan = mkPlan(`must_haves:
+  truths:
+    - "works"
+  artifacts:
+    - path: "src/a.js"
+      provides: "a"
+      min_lines: 5
+      stub_patterns:
+        - "TODO"
+    - path: "src/b.js"
+      provides: "b"
+      min_lines: 5
+  key_links: []
+expected_output: []`);
+  const r = parseMustHaves(plan);
+  assert(r.artifacts.length === 2, `expected 2 artifacts, got ${r.artifacts.length}`);
+  assertEq(r.artifacts[0].stub_patterns, ['TODO']);
+  assertEq(r.artifacts[1].path, 'src/b.js');
+  assert(r.artifacts[1].stub_patterns === undefined, 'second artifact should have no stub_patterns');
+});
+
+// Cell 30 (MEDIUM): seq-dash line at lesser indent followed by more items — those items
+// must NOT be collected into the already-closed pending field.
+test('Cell 30 (MEDIUM): items after pending-close not incorrectly collected into prior field', () => {
+  const plan = mkPlan(`must_haves:
+  truths:
+    - "works"
+  artifacts:
+    - path: "src/a.js"
+      provides: "a"
+      min_lines: 5
+      stub_patterns:
+        - "TODO"
+    - path: "src/b.js"
+      provides: "b"
+      min_lines: 8
+      stub_patterns:
+        - "FIXME"
+  key_links: []
+expected_output: []`);
+  const r = parseMustHaves(plan);
+  assert(r.artifacts.length === 2, `expected 2 artifacts, got ${r.artifacts.length}`);
+  assertEq(r.artifacts[0].stub_patterns, ['TODO']);
+  assertEq(r.artifacts[1].stub_patterns, ['FIXME']);
+});
+
+// ─────────────────────────────────────────────────────────────
 // CLI --check spot checks (Agent's Discretion)
 // ─────────────────────────────────────────────────────────────
 console.log('\nCLI --check spot checks\n');

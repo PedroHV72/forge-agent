@@ -126,21 +126,11 @@ function parseObjectArray(block) {
     // Skip comment lines — do NOT close pending state (Pitfall 4)
     if (line.trimStart().startsWith('#')) continue;
 
-    // New item: "  - key: value" (2+ spaces + dash)
-    const itemMatch = line.match(/^(\s+)-\s+(\w[\w_-]*):\s*(.*)/);
-    if (itemMatch) {
-      // Close any pending block-sequence state
-      pending = null;
-      if (current) items.push(current);
-      current = {};
-      current[itemMatch[2]] = parseFieldValue(itemMatch[3].trim());
-      continue;
-    }
-
-    // If pending block-sequence is active, check for sequence items BEFORE field-continuation
-    // (Pitfall 3: sequence items may contain ":", must not be mis-parsed as fields)
+    // If pending block-sequence is active, check for sequence items BEFORE the new-item check.
+    // (HIGH fix: itemMatch ran first, so "- TODO: fix" inside stub_patterns was mis-parsed as a
+    // new artifact. The pending field must claim any deeper-indented seq-dash line first.)
     if (pending) {
-      const seqMatch = line.match(/^(\s+)-\s+([\s\S]*)/);
+      const seqMatch = line.match(/^(\s+)-\s+(.*)/);
       if (seqMatch) {
         const itemIndent = seqMatch[1].length;
         if (itemIndent > pending.fieldIndent) {
@@ -152,7 +142,22 @@ function parseObjectArray(block) {
           current[pending.fieldName].push(raw);
           continue;
         }
+        // MEDIUM fix: seq-dash found but not deeper than pending field — close pending
+        // deterministically and fall through to re-evaluate as a new item/field below.
+        pending = null;
+        // (no continue — let the line fall through to itemMatch/fieldMatch below)
       }
+    }
+
+    // New item: "  - key: value" (2+ spaces + dash)
+    const itemMatch = line.match(/^(\s+)-\s+(\w[\w_-]*):\s*(.*)/);
+    if (itemMatch) {
+      // Close any pending block-sequence state
+      pending = null;
+      if (current) items.push(current);
+      current = {};
+      current[itemMatch[2]] = parseFieldValue(itemMatch[3].trim());
+      continue;
     }
 
     // Continuation field: "    key: value" (4+ spaces, no dash)
