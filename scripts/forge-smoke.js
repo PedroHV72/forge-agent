@@ -4,12 +4,12 @@
 // Runs all the script-level invariants the milestone established:
 //   - runs.js CRUD + refresh-legacy-alias
 //   - lock.js acquire/release/steal
-//   - state.js read/write/migrate-legacy
+//   - state.js read/write/migrate-legacy (legacy M### AND timestamp M-<ts> IDs)
 //   - dashboard.js regen
 //   - merger.js promote per-milestone → globals
 //   - filelock.js cross-run conflict + steal
 //   - repos.js + isolation.js prefs parsing
-//   - cli-helpers.js refuse logic
+//   - cli-helpers.js refuse logic + timestamp/legacy ID resolution (paired)
 //
 // Designed to be cheap (~5s) and self-cleaning. Use as pre-release sanity check.
 //
@@ -154,6 +154,28 @@ Continue T01.
   const s = JSON.parse(r.stdout);
   assert(s.active_slice === 'S03' && s.active_task === 'T01' && s.phase === 'execute-task', 'fields preserved through migration');
 
+  // ── Paired: timestamp M-<ts> migration ──────────────────────────────────
+  const dir2 = mkTmp('state-ts');
+  const tsId = 'M-20260522143012-oauth';
+  fs.writeFileSync(path.join(dir2, '.gsd/STATE.md'), `# GSD State
+
+**Active Milestone:** ${tsId} — Timestamp migration test
+**Active Slice:** S01
+**Active Task:** T02
+**Phase:** execute-task
+**Auto-mode:** on
+
+## Next Action
+Continue T02.
+`);
+  fs.mkdirSync(path.join(dir2, `.gsd/milestones/${tsId}`), { recursive: true });
+
+  r = runScript('forge-runs.js', ['--migrate-legacy', '--cwd', dir2]);
+  assert(r.status === 0, 'migrate-legacy executes (timestamp id)');
+  const mig2 = JSON.parse(r.stdout);
+  assert(mig2.migrated === true && mig2.milestoneId === tsId, `migration created ${tsId}-STATE.md`);
+
+  cleanup(dir2);
   cleanup(dir);
 }
 
@@ -317,9 +339,27 @@ function smokeCliHelpers() {
   res = JSON.parse(r.stdout);
   assert(res.status === 'resume' && res.run_id === 'M001', '1 active + no arg → resume that one');
 
-  // newTaskId
+  // ── Timestamp milestone ID → activate-new (paired with M001 legacy above) ──
+  const dir2 = mkTmp('cli-ts');
+  const tsMs = 'M-20260522143012-oauth';
+  r = runScript('forge-cli-helpers.js', ['--resolve-args', '--args', tsMs, '--command', 'forge-auto', '--cwd', dir2]);
+  res = JSON.parse(r.stdout);
+  assert(res.status === 'activate-new' && res.run_id === tsMs, `${tsMs} → activate-new`);
+  assert(res.kind === 'milestone', `${tsMs} recognized as kind:milestone`);
+
+  // Timestamp task ID — register then resolve → kind:task, status:resume
+  const tsTask = 'T-20260522143012-fix-typo';
+  runScript('forge-runs.js', ['--add', '--id', tsTask, '--kind', 'task', '--session', 'sess-ts', '--cwd', dir2]);
+  r = runScript('forge-cli-helpers.js', ['--resolve-args', '--args', tsTask, '--command', 'forge-auto', '--cwd', dir2]);
+  res = JSON.parse(r.stdout);
+  assert(res.kind === 'task', `${tsTask} recognized as kind:task`);
+  assert(res.status === 'resume', `${tsTask} returns resume when registered`);
+
+  cleanup(dir2);
+
+  // newTaskId — format changed in T01: now T-<ts>-<slug> (replaces stale legacy regex)
   r = runScript('forge-cli-helpers.js', ['--new-task-id', '--description', 'fix typo in readme']);
-  assert(/^task-fix-typo-in-readme-[a-f0-9]{4}$/.test(r.stdout.trim()), 'newTaskId format');
+  assert(/^T-\d{14}(-[a-z0-9-]+)?$/.test(r.stdout.trim()), 'newTaskId format is T-<14digits>-<slug>');
 
   cleanup(dir);
 }
