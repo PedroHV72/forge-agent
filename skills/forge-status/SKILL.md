@@ -45,7 +45,7 @@ Read these files in order and produce a status dashboard:
 1. `.gsd/STATE.md` — current position
 2. Active `M###-ROADMAP.md` — slice completion status
 3. Active `S##-PLAN.md` — task completion status (if a slice is active)
-4. Glob `.gsd/tasks/*/TASK-*-BRIEF.md` — list all forge-tasks
+4. Glob `.gsd/tasks/*/` directory entries and within each read `*-BRIEF.md` — lists both legacy `TASK-###` and timestamp `T-<ts>-<slug>` forge-tasks
 
 Report in this format:
 ```
@@ -72,10 +72,11 @@ Report in this format:
 <list or "Nenhum">
 
 ### Tasks autônomas
-{If .gsd/tasks/ exists and has entries, list each TASK-### with its status:}
+{If .gsd/tasks/ exists and has entries, list each task (legacy TASK-### or timestamp T-<ts>-<slug>) with its status:}
 - ✓ TASK-001: <description> (done — SUMMARY.md exists)
-- ▶ TASK-002: <description> (em andamento — last phase with existing file)
-- · TASK-003: <description> (pendente — só BRIEF.md)
+- ✓ T-20240315120000-add-auth: <description> (done — SUMMARY.md exists)
+- ▶ T-20240316093000-fix-login: <description> (em andamento — last phase with existing file)
+- · T-20240317080000-update-docs: <description> (pendente — só BRIEF.md)
 {If no tasks: omit this section entirely}
 ```
 
@@ -88,7 +89,7 @@ Report in this format:
 Run the following to aggregate token telemetry for the active milestone and render the `### Token usage` block:
 
 ```bash
-ACTIVE_M=$(grep -oE 'M[0-9]{3}' .gsd/STATE.md | head -1)
+ACTIVE_M=$(grep -oE 'M(-[0-9]{14}(-[a-z0-9-]+)?|[0-9]+)' .gsd/STATE.md | head -1)
 if [ -z "$ACTIVE_M" ]; then
   # No active milestone — omit Token usage block entirely
   :
