@@ -133,30 +133,30 @@ for f in "${REPO_DIR}/agents"/forge*.md; do
 done
 
 # ── Opus model availability probe ─────────────────────────────────────────────
-# Agents default to claude-opus-4-7[1m]. If the user's account doesn't have access
-# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-6.
+# Agents default to claude-opus-4-8[1m]. If the user's account doesn't have access
+# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-7.
 # Runs a minimal API probe (~1 token). Skip with --no-model-probe.
 _sed_inplace_probe() { sed -i '' "$@" 2>/dev/null || sed -i "$@"; }
 
-OPUS_TARGET="claude-opus-4-7[1m]"  # default; flipped to claude-opus-4-6 on probe downgrade
+OPUS_TARGET="claude-opus-4-8[1m]"  # default; flipped to claude-opus-4-7 on probe downgrade
 SYNC_PREFS=true                     # default; false when probe is inconclusive (keep prefs unchanged)
 
-downgrade_opus_to_46() {
+downgrade_opus_to_47() {
   for agent in forge-planner.md forge-discusser.md forge-researcher.md; do
     local f="${AGENTS_DIR}/${agent}"
     [ -f "$f" ] || continue
     if $DRY_RUN; then
-      dry "downgrade model in agents/${agent}: claude-opus-4-7[1m] → claude-opus-4-6"
+      dry "downgrade model in agents/${agent}: claude-opus-4-8[1m] → claude-opus-4-7"
     else
-      _sed_inplace_probe 's|^model: "claude-opus-4-7\[1m\]"$|model: claude-opus-4-6|' "$f"
+      _sed_inplace_probe 's|^model: "claude-opus-4-8\[1m\]"$|model: claude-opus-4-7|' "$f"
     fi
   done
 }
 
 # Sync opus model references in prefs file with the current agent frontmatter model.
-# Replaces both `claude-opus-4-6` and `claude-opus-4-7[1m]` with $1 (target).
+# Replaces both `claude-opus-4-7` and `claude-opus-4-8[1m]` with $1 (target).
 # Touches only opus model strings — sonnet/haiku refs and user-customized rows for other
-# models are preserved. If user explicitly pinned a phase to claude-opus-4-6, they must
+# models are preserved. If user explicitly pinned a phase to claude-opus-4-7, they must
 # reapply manually after install (edge case; documented in installer output).
 sync_prefs_opus_model() {
   local target="$1"
@@ -168,34 +168,34 @@ sync_prefs_opus_model() {
   fi
   # Placeholder approach: collapse both IDs to a temp token, then expand to target.
   # [1m] contains regex-special brackets — escape in the pattern only.
-  _sed_inplace_probe "s|claude-opus-4-7\[1m\]|@@FORGE_OPUS_TMP@@|g; s|claude-opus-4-6|@@FORGE_OPUS_TMP@@|g; s|@@FORGE_OPUS_TMP@@|${target}|g" "$prefs"
+  _sed_inplace_probe "s|claude-opus-4-8\[1m\]|@@FORGE_OPUS_TMP@@|g; s|claude-opus-4-7|@@FORGE_OPUS_TMP@@|g; s|@@FORGE_OPUS_TMP@@|${target}|g" "$prefs"
 }
 
 if $DRY_RUN; then
   :  # skip probe in dry-run
 elif $NO_MODEL_PROBE; then
   info ""
-  info "  (--no-model-probe: mantendo claude-opus-4-7[1m] como padrão)"
+  info "  (--no-model-probe: mantendo claude-opus-4-8[1m] como padrão)"
 elif ! command -v claude >/dev/null 2>&1; then
   info ""
-  info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-4-7[1m])"
+  info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-4-8[1m])"
   SYNC_PREFS=false  # can't verify — leave prefs untouched
 else
   echo ""
-  info "Verificando disponibilidade de claude-opus-4-7[1m]..."
+  info "Verificando disponibilidade de claude-opus-4-8[1m]..."
   set +e
-  probe_out=$(claude -p "ok" --model 'claude-opus-4-7[1m]' --max-turns 1 2>&1)
+  probe_out=$(claude -p "ok" --model 'claude-opus-4-8[1m]' --max-turns 1 2>&1)
   probe_exit=$?
   set -e
   if [ $probe_exit -eq 0 ]; then
-    success "  claude-opus-4-7[1m] disponível — usando como modelo Opus padrão"
+    success "  claude-opus-4-8[1m] disponível — usando como modelo Opus padrão"
   elif echo "$probe_out" | grep -qiE "model.*not.*(found|available|supported|allowed)|invalid.*model|404|not_found|does not have access|issue with.*model|may not exist|may not have access"; then
-    warn "  claude-opus-4-7[1m] indisponível nesta conta — fallback para claude-opus-4-6"
-    downgrade_opus_to_46
+    warn "  claude-opus-4-8[1m] indisponível nesta conta — fallback para claude-opus-4-7"
+    downgrade_opus_to_47
     info "  Agents atualizados: forge-planner, forge-discusser, forge-researcher"
-    OPUS_TARGET="claude-opus-4-6"
+    OPUS_TARGET="claude-opus-4-7"
   else
-    info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-4-7[1m]"
+    info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-4-8[1m]"
     info "  Se houver problemas em runtime, rode: bash install.sh --update (com conectividade)"
     SYNC_PREFS=false  # can't verify — leave prefs untouched
   fi
@@ -306,7 +306,7 @@ if $SYNC_PREFS && [ -f "$PREFS_DST" ]; then
   else
     sync_prefs_opus_model "$OPUS_TARGET"
     info "  prefs opus model sincronizado: ${OPUS_TARGET}"
-    info "  (se você fixou uma fase em claude-opus-4-6 manualmente, reaplique via /forge-prefs)"
+    info "  (se você fixou uma fase em claude-opus-4-7 manualmente, reaplique via /forge-prefs)"
   fi
 fi
 

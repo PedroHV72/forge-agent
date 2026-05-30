@@ -34,7 +34,7 @@ The three tiers map to three model aliases. Operators can override the model for
 |---|---|---|---|---|
 | `light` | `claude-haiku-4-5-20251001` | `haiku` | Memory extraction, aggregation, fast summaries | `tier_models.light` |
 | `standard` | `claude-sonnet-4-6` | `sonnet` | Code execution, research, discussion, scoped planning | `tier_models.standard` |
-| `heavy` | `claude-opus-4-7[1m]` | `opus` | Deep architectural planning, full milestone decomposition | `tier_models.heavy` |
+| `heavy` | `claude-opus-4-8[1m]` | `opus` | Deep architectural planning, full milestone decomposition | `tier_models.heavy` |
 
 ---
 

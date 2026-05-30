@@ -118,27 +118,27 @@ foreach ($f in Get-ChildItem "$RepoDir\agents\forge*.md") {
 }
 
 # ── Opus model availability probe ─────────────────────────────────────────────
-# Agents default to claude-opus-4-7[1m]. If the user's account doesn't have access
-# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-6.
+# Agents default to claude-opus-4-8[1m]. If the user's account doesn't have access
+# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-7.
 # Runs a minimal API probe (~1 token). Skip with -NoModelProbe.
-function Downgrade-OpusTo46 {
+function Downgrade-OpusTo47 {
     foreach ($agent in @("forge-planner.md", "forge-discusser.md", "forge-researcher.md")) {
         $file = "$AgentsDir\$agent"
         if (!(Test-Path $file)) { continue }
         if ($DryRun) {
-            Dry "downgrade model in agents\${agent}: claude-opus-4-7[1m] → claude-opus-4-6"
+            Dry "downgrade model in agents\${agent}: claude-opus-4-8[1m] → claude-opus-4-7"
         } else {
             $content = Get-Content $file -Raw
-            $content = $content -replace '(?m)^model: "claude-opus-4-7\[1m\]"$', 'model: claude-opus-4-6'
+            $content = $content -replace '(?m)^model: "claude-opus-4-8\[1m\]"$', 'model: claude-opus-4-7'
             Set-Content $file $content -NoNewline
         }
     }
 }
 
 # Sync opus model references in prefs file with the current agent frontmatter model.
-# Replaces both `claude-opus-4-6` and `claude-opus-4-7[1m]` with $Target.
+# Replaces both `claude-opus-4-7` and `claude-opus-4-8[1m]` with $Target.
 # Touches only opus model strings — sonnet/haiku and user customizations for other
-# models are preserved. If user explicitly pinned a phase to claude-opus-4-6, they
+# models are preserved. If user explicitly pinned a phase to claude-opus-4-7, they
 # must reapply manually (edge case; documented in installer output).
 function Sync-PrefsOpusModel {
     param([string]$Target, [string]$PrefsFile)
@@ -150,13 +150,13 @@ function Sync-PrefsOpusModel {
     $content = Get-Content $PrefsFile -Raw
     # Placeholder approach: collapse both IDs to a temp token, then expand to Target.
     # Escape regex-special brackets in the source patterns only.
-    $content = $content -replace 'claude-opus-4-7\[1m\]', '@@FORGE_OPUS_TMP@@'
-    $content = $content -replace 'claude-opus-4-6', '@@FORGE_OPUS_TMP@@'
+    $content = $content -replace 'claude-opus-4-8\[1m\]', '@@FORGE_OPUS_TMP@@'
+    $content = $content -replace 'claude-opus-4-7', '@@FORGE_OPUS_TMP@@'
     $content = $content -replace '@@FORGE_OPUS_TMP@@', $Target
     Set-Content $PrefsFile $content -NoNewline
 }
 
-$script:OpusTarget = "claude-opus-4-7[1m]"  # default; flipped to claude-opus-4-6 on downgrade
+$script:OpusTarget = "claude-opus-4-8[1m]"  # default; flipped to claude-opus-4-7 on downgrade
 $script:SyncPrefs  = $true                   # false when probe inconclusive
 
 $ClaudeForProbe = Get-Command claude -ErrorAction SilentlyContinue
@@ -165,32 +165,32 @@ if ($DryRun) {
     # skip probe in dry-run
 } elseif ($NoModelProbe) {
     Info ""
-    Info "  (-NoModelProbe: mantendo claude-opus-4-7[1m] como padrão)"
+    Info "  (-NoModelProbe: mantendo claude-opus-4-8[1m] como padrão)"
 } elseif (-not $ClaudeForProbe) {
     Info ""
-    Info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-4-7[1m])"
+    Info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-4-8[1m])"
     $script:SyncPrefs = $false  # can't verify — leave prefs untouched
 } else {
     Write-Host ""
-    Info "Verificando disponibilidade de claude-opus-4-7[1m]..."
+    Info "Verificando disponibilidade de claude-opus-4-8[1m]..."
     $probeOut = ""
     $probeExit = 1
     try {
-        $probeOut = & claude -p "ok" --model 'claude-opus-4-7[1m]' --max-turns 1 2>&1 | Out-String
+        $probeOut = & claude -p "ok" --model 'claude-opus-4-8[1m]' --max-turns 1 2>&1 | Out-String
         $probeExit = $LASTEXITCODE
     } catch {
         $probeOut = $_.Exception.Message
         $probeExit = 1
     }
     if ($probeExit -eq 0) {
-        Success "  claude-opus-4-7[1m] disponível — usando como modelo Opus padrão"
+        Success "  claude-opus-4-8[1m] disponível — usando como modelo Opus padrão"
     } elseif ($probeOut -imatch "model.*not.*(found|available|supported|allowed)|invalid.*model|404|not_found|does not have access|issue with.*model|may not exist|may not have access") {
-        Warn "  claude-opus-4-7[1m] indisponível nesta conta — fallback para claude-opus-4-6"
-        Downgrade-OpusTo46
+        Warn "  claude-opus-4-8[1m] indisponível nesta conta — fallback para claude-opus-4-7"
+        Downgrade-OpusTo47
         Info "  Agents atualizados: forge-planner, forge-discusser, forge-researcher"
-        $script:OpusTarget = "claude-opus-4-6"
+        $script:OpusTarget = "claude-opus-4-7"
     } else {
-        Info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-4-7[1m]"
+        Info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-4-8[1m]"
         Info "  Se houver problemas em runtime, rode: .\install.ps1 -Update (com conectividade)"
         $script:SyncPrefs = $false  # can't verify — leave prefs untouched
     }
@@ -276,7 +276,7 @@ if ($script:SyncPrefs -and (Test-Path $prefsFile)) {
     } else {
         Sync-PrefsOpusModel -Target $script:OpusTarget -PrefsFile $prefsFile
         Info "  prefs opus model sincronizado: $($script:OpusTarget)"
-        Info "  (se você fixou uma fase em claude-opus-4-6 manualmente, reaplique via /forge-prefs)"
+        Info "  (se você fixou uma fase em claude-opus-4-7 manualmente, reaplique via /forge-prefs)"
     }
 }
 

@@ -146,7 +146,7 @@ Also: if active task has `status: DONE` and continue.md exists in that slice →
 
 ## C5: Prefs
 
-Valid IDs: `claude-opus-4-7[1m]`, `claude-opus-4-6` (fallback), `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
+Valid IDs: `claude-opus-4-8[1m]`, `claude-opus-4-7` (fallback), `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
 Aliases: opus→opus-4-7 (fallback opus-4-6), sonnet→sonnet-4-6, haiku→haiku-4-5-20251001 (expand to full ID on fix)
 
 Defaults: discuss/research/plan phases → opus-4-7 (fallback opus-4-6) | execute/complete → sonnet-4-6 | memory → haiku-4-5-20251001

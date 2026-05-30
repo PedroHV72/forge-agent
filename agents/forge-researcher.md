@@ -1,7 +1,7 @@
 ---
 name: forge-researcher
 description: GSD research phase agent. Scouts codebases, reads docs, identifies patterns and pitfalls before planning. Used for research-milestone and research-slice units. Runs on a more capable model for deep analysis.
-model: "claude-opus-4-7[1m]"
+model: "claude-opus-4-8[1m]"
 thinking: adaptive
 effort: medium
 tools: Read, Bash, Glob, Grep, Write, AskUserQuestion, Skill, WebSearch, WebFetch

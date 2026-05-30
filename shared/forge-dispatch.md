@@ -511,7 +511,7 @@ Classifier output: `{"kind":"server","retry":true,"backoffMs":30000}`
 Exponential override for attempt 2: `2000 * 2^1 = 4000 ms`. Use `Math.min(30000, 4000) = 4000 ms`.
 Event log entry:
 ```json
-{"ts":"2026-04-16T10:01:12Z","event":"retry","unit":"plan-slice/S02","class":"server","attempt":2,"backoff_ms":4000,"model":"claude-opus-4-7"}
+{"ts":"2026-04-16T10:01:12Z","event":"retry","unit":"plan-slice/S02","class":"server","attempt":2,"backoff_ms":4000,"model":"claude-opus-4-8"}
 ```
 
 **Example 3 — ECONNRESET network error (attempt 3 of 3, exhausted)**
@@ -522,7 +522,7 @@ Attempt counter is now `3 > max_transient_retries (3)`? No, `3 === 3` — this I
 If the re-dispatch also throws: `attempt` becomes `4 > 3` → bail with CRITICAL message `"retries exhausted after 4 attempts (kind: network)"`.
 Event log entry for attempt 3:
 ```json
-{"ts":"2026-04-16T10:02:44Z","event":"retry","unit":"research-slice/S01","class":"network","attempt":3,"backoff_ms":3000,"model":"claude-opus-4-7"}
+{"ts":"2026-04-16T10:02:44Z","event":"retry","unit":"research-slice/S01","class":"network","attempt":3,"backoff_ms":3000,"model":"claude-opus-4-8"}
 ```
 
 #### Wiring into a dispatch template
@@ -735,7 +735,7 @@ Before every `Agent()` dispatch, after Retry Handler setup but before Token Tele
    ```bash
    model=$(node -e "
      const prefs=require('./.gsd/prefs-resolved.json')||{};
-     const defaults={'light':'claude-haiku-4-5-20251001','standard':'claude-sonnet-4-6','heavy':'claude-opus-4-7'};
+     const defaults={'light':'claude-haiku-4-5-20251001','standard':'claude-sonnet-4-6','heavy':'claude-opus-4-8'};
      const m=(prefs.tier_models||{})['$tier']||defaults['$tier'];
      process.stdout.write(m);
    ")
@@ -753,7 +753,7 @@ Before every `Agent()` dispatch, after Retry Handler setup but before Token Tele
 |-----|------|-----------------------|-------------|
 | `tier_models.light` | string (model ID) | `claude-haiku-4-5-20251001` | Model used when tier resolves to `light` |
 | `tier_models.standard` | string (model ID) | `claude-sonnet-4-6` | Model used when tier resolves to `standard` |
-| `tier_models.heavy` | string (model ID) | `claude-opus-4-7` | Model used when tier resolves to `heavy` |
+| `tier_models.heavy` | string (model ID) | `claude-opus-4-8` | Model used when tier resolves to `heavy` |
 
 The `tier_models` block ships in T05. Until then, the resolver falls back to the defaults above silently.
 
@@ -810,13 +810,13 @@ PLAN_TIER  : heavy   ← explicit; wins over tag
 PLAN_TAG   : docs
 
 → tier   = heavy   (manual tier: overrides tag: docs downgrade)
-→ model  = claude-opus-4-7
+→ model  = claude-opus-4-8
 → reason = "frontmatter-override:heavy"
 ```
 
 Dispatch event:
 ```json
-{"ts":"2026-04-16T10:06:00Z","event":"dispatch","unit":"execute-task/T07","model":"claude-opus-4-7","input_tokens":3200,"output_tokens":540,"tier":"heavy","reason":"frontmatter-override:heavy"}
+{"ts":"2026-04-16T10:06:00Z","event":"dispatch","unit":"execute-task/T07","model":"claude-opus-4-8","input_tokens":3200,"output_tokens":540,"tier":"heavy","reason":"frontmatter-override:heavy"}
 ```
 
 **Example C — `execute-task` with ONLY `tag: docs` in frontmatter (downgrade applied)**
@@ -866,8 +866,8 @@ if [ "$UNIT_TYPE" = "execute-task" ]; then
 fi
 
 # Step 4: resolve model
-declare -A TIER_MODELS=([light]="claude-haiku-4-5-20251001" [standard]="claude-sonnet-4-6" [heavy]="claude-opus-4-7")
-MODEL_ID=$(node -e "const p=JSON.parse(require('fs').readFileSync('.gsd/prefs-resolved.json','utf8')||'{}');const d={'light':'claude-haiku-4-5-20251001','standard':'claude-sonnet-4-6','heavy':'claude-opus-4-7'};process.stdout.write((p.tier_models||{})['$TIER']||d['$TIER'])")
+declare -A TIER_MODELS=([light]="claude-haiku-4-5-20251001" [standard]="claude-sonnet-4-6" [heavy]="claude-opus-4-8")
+MODEL_ID=$(node -e "const p=JSON.parse(require('fs').readFileSync('.gsd/prefs-resolved.json','utf8')||'{}');const d={'light':'claude-haiku-4-5-20251001','standard':'claude-sonnet-4-6','heavy':'claude-opus-4-8'};process.stdout.write((p.tier_models||{})['$TIER']||d['$TIER'])")
 
 # Step 5: extend dispatch event (append after Token Telemetry builds dispatchEvent)
 # Add:  ,"tier":"$TIER","reason":"$REASON"
