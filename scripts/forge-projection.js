@@ -16,7 +16,7 @@
 // CLI:
 //   node forge-projection.js --render ledger|decisions|memory|checker [--cwd <dir>]
 //   node forge-projection.js --stale [--cwd <dir>]
-//   node forge-projection.js --write-all [--cwd <dir>]
+//   node forge-projection.js --write-all [--cwd <dir>] [--force]
 //   node forge-projection.js --help
 //
 // Exit codes:
@@ -33,6 +33,7 @@ const ledgerMod    = require('./forge-ledger');
 const decisionsMod = require('./forge-decisions');
 const memoryMod    = require('./forge-memory');
 const checkerMod   = require('./forge-checker-memory');
+const storeStateMod = require('./forge-store-state');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -527,18 +528,40 @@ function isStale(cwd) {
 // ── writeAll ──────────────────────────────────────────────────────────────────
 // Renders all three projections and writes to .gsd/{LEDGER,DECISIONS,AUTO-MEMORY}.md.
 // Byte-compares before writing — no-op when content is identical (idempotent).
-// Returns { written:[string], skipped:[string] }
-function writeAll(cwd) {
+//
+// Data-loss guard: when a store is 'unmigrated' (fragment store empty but the
+// monolith still has real entries), rendering produces an empty skeleton that
+// would overwrite the real content. Such targets are BLOCKED — never written —
+// unless opts.force is set. This prevents the silent history loss seen on
+// non-migrated working copies (e.g. SVN trunks where the monolith is the source
+// of truth and was never decomposed into fragments).
+//
+// Returns { written:[string], skipped:[string], blocked:[{file, reason}] }
+function writeAll(cwd, opts) {
+  const { force = false } = opts || {};
   const written = [];
   const skipped = [];
+  const blocked = [];
+
+  const state = storeStateMod.storeState(cwd);
 
   const targets = [
-    { file: LEDGER_FILE,    render: () => renderLedger(cwd) },
-    { file: DECISIONS_FILE, render: () => renderDecisions(cwd) },
-    { file: MEMORY_FILE,    render: () => renderMemory(cwd) },
+    { file: LEDGER_FILE,    store: 'ledger',    render: () => renderLedger(cwd) },
+    { file: DECISIONS_FILE, store: 'decisions', render: () => renderDecisions(cwd) },
+    { file: MEMORY_FILE,    store: 'memory',    render: () => renderMemory(cwd) },
   ];
 
-  for (const { file, render } of targets) {
+  for (const { file, store, render } of targets) {
+    // Guard: refuse to overwrite a populated monolith from an empty store.
+    const st = state[store];
+    if (!force && st && st.state === 'unmigrated') {
+      blocked.push({
+        file,
+        reason: `fragment store empty but ${file} has ${st.monolithEntries} entr${st.monolithEntries === 1 ? 'y' : 'ies'} — run forge-migrate.js first, or use --force to overwrite`,
+      });
+      continue;
+    }
+
     const fpath = path.join(cwd, file);
     const content = render();
 
@@ -561,7 +584,7 @@ function writeAll(cwd) {
     written.push(file);
   }
 
-  return { written, skipped };
+  return { written, skipped, blocked };
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
@@ -583,8 +606,10 @@ Commands:
                           Print reconstructed monolith content to stdout
   --stale [--cwd <dir>]   Print JSON {ledger:bool, decisions:bool, memory:bool}
                           and exit 0 (true = stale)
-  --write-all [--cwd <dir>]
-                          Render all three projections to .gsd/*.md (idempotent)
+  --write-all [--cwd <dir>] [--force]
+                          Render all three projections to .gsd/*.md (idempotent).
+                          Refuses to overwrite a populated monolith from an empty
+                          fragment store unless --force is given (exit 1 if blocked).
   --help, -h              Show this help
 
 Options:
@@ -649,14 +674,21 @@ function cliMain(argv) {
   }
 
   if (cmd === '--write-all') {
+    const force = argv.includes('--force');
     let result;
     try {
-      result = writeAll(cwd);
+      result = writeAll(cwd, { force });
     } catch (e) {
       process.stderr.write(`${e.message}\n`);
       process.exit(1);
     }
     console.log(JSON.stringify(result));
+    if (result.blocked && result.blocked.length > 0) {
+      for (const b of result.blocked) {
+        process.stderr.write(`[forge-projection] BLOCKED ${b.file}: ${b.reason}\n`);
+      }
+      process.exit(1);
+    }
     process.exit(0);
   }
 

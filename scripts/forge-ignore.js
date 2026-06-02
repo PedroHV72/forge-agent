@@ -22,7 +22,16 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFileSync } = require('child_process');
+const childProcess = require('child_process');
+
+// Indirection layer so tests can stub SVN calls without a real working copy.
+// Defaults to the real execFileSync; __setExecFileSync swaps it (and restores).
+let _execFileSync = childProcess.execFileSync;
+function __setExecFileSync(fn) {
+  const prev = _execFileSync;
+  _execFileSync = fn || childProcess.execFileSync;
+  return prev;
+}
 
 // ── LOCAL_IGNORE_PATHS ────────────────────────────────────────────────────────
 // Canonical Layer-1 local-state paths that must be ignored by VCS.
@@ -87,11 +96,24 @@ function groupByParentDir(paths) {
   return groups;
 }
 
+// Returns true if `dir` is under SVN version control. A non-versioned node
+// (e.g. a directory the parent ignores wholesale) makes `svn info` exit non-zero
+// — we treat any failure as "not versioned". Used to skip per-child ignore
+// rules inside directories already covered by an ancestor's wholesale ignore.
+function svnIsVersioned(dir) {
+  try {
+    _execFileSync('svn', ['info', dir], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Run svn propget svn:ignore on a directory; returns array of existing patterns (trimmed).
 // Returns [] on any error (property not set, SVN not found, etc.)
 function svnPropget(dir) {
   try {
-    const out = execFileSync('svn', ['propget', 'svn:ignore', dir], { encoding: 'utf8' });
+    const out = _execFileSync('svn', ['propget', 'svn:ignore', dir], { encoding: 'utf8' });
     return out.split('\n').map(l => l.trim()).filter(Boolean);
   } catch (e) {
     // Property not set on dir → empty; treat as []
@@ -107,7 +129,7 @@ function svnPropset(dir, patterns) {
   const tmp = path.join(os.tmpdir(), `forge-ignore-${Date.now()}.tmp`);
   try {
     fs.writeFileSync(tmp, patterns.join('\n') + '\n', 'utf8');
-    execFileSync('svn', ['propset', 'svn:ignore', '-F', tmp, dir], { encoding: 'utf8' });
+    _execFileSync('svn', ['propset', 'svn:ignore', '-F', tmp, dir], { encoding: 'utf8' });
   } catch (e) {
     const msg = (e.stderr || e.message || String(e)).trim();
     throw new Error(`svn propset failed on "${dir}": ${msg}`);
@@ -156,6 +178,7 @@ function applyIgnore(cwd) {
     const groups = groupByParentDir(allIgnorePaths());
     const added = [];
     const skipped = [];
+    const notes = [];
 
     for (const [parentDir, basenames] of groups) {
       const absDir = path.join(dir, parentDir);
@@ -164,6 +187,17 @@ function applyIgnore(cwd) {
       if (!fs.existsSync(absDir)) {
         // Cannot set svn:ignore on non-existent dir; mark all as skipped with a warning
         for (const b of basenames) skipped.push(path.posix.join(parentDir, b));
+        continue;
+      }
+
+      // Wholesale-ignore guard: if the directory exists on disk but is NOT under
+      // version control, an ancestor already ignores it wholesale (e.g. the
+      // `.gsd` svn:ignore lists `forge`). svn propset would throw E155010 on a
+      // non-versioned node and abort the entire --apply, leaving partial state.
+      // The per-child rules are redundant here — skip the whole group.
+      if (!svnIsVersioned(absDir)) {
+        for (const b of basenames) skipped.push(path.posix.join(parentDir, b));
+        notes.push(`${parentDir}: not versioned (covered by an ancestor's wholesale svn:ignore) — skipped`);
         continue;
       }
 
@@ -187,7 +221,7 @@ function applyIgnore(cwd) {
       }
     }
 
-    return { vcs: 'svn', added, skipped };
+    return { vcs: 'svn', added, skipped, notes };
   }
 
   // vcs === 'none'
@@ -210,9 +244,19 @@ function validateIgnore(cwd) {
   if (vcs === 'svn') {
     const groups = groupByParentDir(allIgnorePaths());
     const missing = [];
+    const covered = [];
 
     for (const [parentDir, basenames] of groups) {
       const absDir = path.join(dir, parentDir);
+
+      // A directory present on disk but not under version control is covered by
+      // an ancestor's wholesale svn:ignore — its children are effectively
+      // ignored and must NOT be reported as missing (that was a false positive).
+      if (fs.existsSync(absDir) && !svnIsVersioned(absDir)) {
+        for (const b of basenames) covered.push(path.posix.join(parentDir, b));
+        continue;
+      }
+
       let existing = [];
       if (fs.existsSync(absDir)) {
         existing = svnPropget(absDir);
@@ -223,7 +267,7 @@ function validateIgnore(cwd) {
       }
     }
 
-    return { vcs: 'svn', missing, ok: missing.length === 0 };
+    return { vcs: 'svn', missing, covered, ok: missing.length === 0 };
   }
 
   // vcs === 'none' — no VCS, treat as ok (informational; forge-doctor handles no-VCS projects)
@@ -237,6 +281,8 @@ module.exports = {
   detectVcs,
   applyIgnore,
   validateIgnore,
+  svnIsVersioned,
+  __setExecFileSync,
 };
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
@@ -294,14 +340,20 @@ Exit codes:
       if (result.added.length > 0) {
         process.stdout.write(`vcs: ${result.vcs}\nadded:\n${result.added.map(p => `  ${p}`).join('\n')}\n`);
         if (result.skipped.length > 0) {
-          process.stdout.write(`skipped (already present):\n${result.skipped.map(p => `  ${p}`).join('\n')}\n`);
+          process.stdout.write(`skipped (already present or covered):\n${result.skipped.map(p => `  ${p}`).join('\n')}\n`);
         }
       } else {
         process.stdout.write(`vcs: ${result.vcs}\nall paths already present (no changes made)\n`);
       }
+      if (result.notes && result.notes.length > 0) {
+        process.stdout.write(`notes:\n${result.notes.map(n => `  ${n}`).join('\n')}\n`);
+      }
 
     } else if ('validate' in args) {
       const result = validateIgnore(cwdArg);
+      if (result.covered && result.covered.length > 0) {
+        process.stdout.write(`covered by wholesale ignore:\n${result.covered.map(p => `  ${p}`).join('\n')}\n`);
+      }
       if (result.ok) {
         process.stdout.write(`vcs: ${result.vcs}\nok: all canonical paths are ignored\n`);
         process.exit(0);

@@ -40,7 +40,9 @@ node scripts/forge-doctor.js --regen-projection
 Monoliths regenerated. (.gsd/{AUTO-MEMORY,DECISIONS,LEDGER,CHECKER-MEMORY}.md refreshed from fragments.)
 ```
 
-Exit code `0` = sucesso, `1` = falha (ver stderr).
+Exit code `0` = sucesso, `1` = falha **ou regeneração recusada**.
+
+> **Guarda contra perda de dado:** se o fragment store estiver vazio mas o monolito ainda tiver conteúdo (working copy **não-migrado**), o regen é **recusado** (exit 1) em vez de sobrescrever o monolito com um esqueleto vazio. Nesse caso, rode a migração primeiro (`node scripts/forge-migrate.js`) ou, se realmente quiser descartar o monolito, force com `node scripts/forge-doctor.js --regen-projection --force`.
 
 Exiba ao usuário:
 ```
@@ -52,9 +54,11 @@ Forge Doctor — Regen Projection
     (workers já consomem fragmentos diretamente — este monolito é para leitura humana)
 ```
 
-Se exit code `1`, exiba:
+Se exit code `1`, exiba o stderr capturado (que já distingue "falha" de "regeneração recusada por store não-migrado") e, no segundo caso, a sugestão:
 ```
-  ✗ Falha ao regenerar monolitos. Verifique o stderr acima.
+  ✗ Regeneração recusada — store não-migrado sobrescreveria o monolito.
+    Rode a migração primeiro:  node scripts/forge-migrate.js
+    Ou force (perda de dado):  node scripts/forge-doctor.js --regen-projection --force
 ```
 
 Interrompa aqui — não continue para Step 2.
@@ -145,6 +149,8 @@ Execute este passo **somente se** `FIX_MODE=true` **e** `LAYER2_STATUS=fail`.
 ```bash
 node scripts/forge-doctor.js --fix
 ```
+
+> **Gate de migração:** se o store estiver **não-migrado** (fragmentos vazios mas monolitos com conteúdo), `--fix` **recusa carimbar** o `SCHEMA-VERSION` (exit 1) — carimbar nesse estado tornaria o `--regen-projection` destrutivo. A saída instrui rodar `node scripts/forge-migrate.js`. Para migrar e carimbar em um passo só, use `node scripts/forge-doctor.js --fix --migrate` (decompõe os monolitos em fragmentos, verifica e então carimba). Em projeto novo (sem monolito) o carimbo acontece normalmente.
 
 Re-execute o check de schema e atualize `LAYER2_STATUS` conforme o resultado.
 

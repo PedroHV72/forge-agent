@@ -208,8 +208,12 @@ function cliMain() {
 
 Flags:
   --check <name> [--cwd <dir>]   run check: schema | projection-versioned | all
-  --fix [--cwd <dir>]            write SCHEMA-VERSION if missing; suggest ignore fixes
-  --regen-projection [--cwd <dir>]  regenerate monolith projections from fragment store
+  --fix [--cwd <dir>] [--migrate]  write SCHEMA-VERSION if missing; suggest ignore
+                                 fixes. Refuses to stamp an unmigrated store unless
+                                 --migrate is given (then runs forge-migrate first).
+  --regen-projection [--cwd <dir>] [--force]  regenerate monolith projections from
+                                 fragment store (refuses to overwrite a populated
+                                 monolith from an empty store unless --force)
   --cwd <dir>                    working directory (default: process.cwd())
   --help                         show this help
 
@@ -231,6 +235,60 @@ Exit codes:
     // Ensure .gsd/ exists
     if (!fs.existsSync(gsdDir)) {
       fs.mkdirSync(gsdDir, { recursive: true });
+    }
+
+    // Migration gate: never stamp SCHEMA-VERSION on an unmigrated working copy.
+    // A stamped-but-empty store makes --regen-projection destructive (it would
+    // overwrite populated monoliths with empty skeletons). Require an explicit
+    // --migrate to decompose the monoliths into fragments before stamping.
+    const { isUnmigrated, storeState } = require('./forge-store-state');
+    if (isUnmigrated(cwdArg)) {
+      const st = storeState(cwdArg);
+      const unmig = Object.entries(st)
+        .filter(([, s]) => s.state === 'unmigrated')
+        .map(([name, s]) => `${name} (${s.monolithPath}: ${s.monolithEntries} entries, 0 fragments)`);
+
+      if (!args.migrate) {
+        process.stdout.write('forge-doctor --fix:\n');
+        process.stdout.write('  Refusing to stamp SCHEMA-VERSION — fragment store is not migrated.\n');
+        process.stdout.write('  The following monoliths still hold the source of truth:\n');
+        for (const u of unmig) process.stdout.write(`    - ${u}\n`);
+        process.stdout.write('\n  Run the migration first (decomposes monoliths → fragments, then stamps):\n');
+        process.stdout.write('    node scripts/forge-migrate.js\n');
+        process.stdout.write('  Or let --fix run it for you:\n');
+        process.stdout.write('    node scripts/forge-doctor.js --fix --migrate\n');
+        process.exit(1);
+        return;
+      }
+
+      // --migrate: delegate to the umbrella migrator. migrateAll() backs up each
+      // monolith to .bak, decomposes into fragments, verifies, and stamps
+      // SCHEMA-VERSION itself. Lazy-required to avoid the forge-migrate ↔
+      // forge-doctor require cycle.
+      const { migrateAll } = require('./forge-migrate');
+      let results;
+      try {
+        results = migrateAll(cwdArg, {});
+      } catch (e) {
+        process.stderr.write(`forge-doctor --fix --migrate: migration failed: ${e.message}\n`);
+        process.exit(1);
+        return;
+      }
+      const migErr = ['ledger', 'decisions', 'memory'].find(n => results[n] && results[n].error);
+      if (migErr) {
+        process.stderr.write(`forge-doctor --fix --migrate: ${migErr} migration errored: ${results[migErr].error}\n`);
+        process.stderr.write('  Partial state preserved; .bak files kept. See above.\n');
+        process.exit(1);
+        return;
+      }
+      process.stdout.write('forge-doctor --fix --migrate:\n');
+      for (const n of ['ledger', 'decisions', 'memory']) {
+        const r = results[n];
+        if (r) process.stdout.write(`  ${n}: ${r.written} fragment(s) written, verification: ${r.verification}\n`);
+      }
+      process.stdout.write(`  SCHEMA-VERSION stamped: ${results.schema_version_written}\n`);
+      process.exit(0);
+      return;
     }
 
     if (!fs.existsSync(schemaPath)) {
@@ -266,12 +324,19 @@ Exit codes:
     const projectionScript = path.resolve(__dirname, 'forge-projection.js');
     const projArgs = ['--write-all'];
     if (cwdArg !== process.cwd()) projArgs.push('--cwd', cwdArg);
+    if (args.force) projArgs.push('--force');
     try {
       execFileSync(process.execPath, [projectionScript].concat(projArgs), { stdio: 'inherit' });
       process.stdout.write('Monoliths regenerated. (.gsd/{AUTO-MEMORY,DECISIONS,LEDGER,CHECKER-MEMORY}.md refreshed from fragments.)\n');
       process.exit(0);
     } catch (err) {
-      process.stderr.write('forge-doctor --regen-projection: forge-projection.js failed (see above).\n');
+      // forge-projection exits 1 when a target was blocked (empty store would
+      // overwrite a populated monolith). The block reasons were printed to
+      // stderr via stdio:inherit — add the operator-facing next step.
+      process.stderr.write('forge-doctor --regen-projection: regeneration incomplete.\n');
+      process.stderr.write('  An unmigrated store would overwrite a populated monolith.\n');
+      process.stderr.write('  Run the migration first:  node scripts/forge-migrate.js\n');
+      process.stderr.write('  Or force-overwrite (data loss):  node scripts/forge-doctor.js --regen-projection --force\n');
       process.exit(1);
     }
     return;
