@@ -474,6 +474,44 @@ plan_check:
 - Artefato gerado: `.gsd/milestones/{M###}/slices/{S##}/{S##}-PLAN-CHECK.md`.
 - Documentado em `CLAUDE.md § Anti-Hallucination Layer`.
 
+## Review Settings
+
+Controla o **review gate dialético** que roda no orquestrador antes de `complete-slice` (no diff do slice ainda não-mergeado). Dois agentes se confrontam sobre o código — `forge-reviewer` (challenger, acha bugs/brechas) × `forge-advocate` (defender, o autor) — e o humano só arbitra as objeções em que os dois discordam. Advisory: **nunca bloqueia** o `complete-slice`.
+
+```
+review:
+  mode: enabled       # enabled | disabled
+  style: dialectic    # dialectic | flags
+  rounds: 1           # 0–3 rodadas de réplica do reviewer sobre a defesa
+  ask_in_auto: defer  # defer | pause
+```
+
+### Semântica
+
+- `mode: enabled` (padrão): o gate roda. `disabled`: pula inteiramente — nenhum `S##-REVIEW.md` é gerado.
+- `style: dialectic` (padrão): loop completo challenge → defense → rebuttal → resolução. Objeções `aberta`s sobem ao humano (via `AskUserQuestion` em modo interativo). `style: flags`: single-pass legado — só o reviewer, grava `## ⚠ Review Flags` em `S##-REVIEW.md`, sem defesa nem perguntas. Opt-out do debate.
+- `rounds` (padrão `1`): quantas vezes o reviewer replica à defesa do advocate. `0` = sem réplica (toda objeção contestada vira `aberta`). Cap em `3`.
+- `ask_in_auto` (padrão `defer`): em `forge-auto`, `defer` **não pausa** — registra `aberta`s/`concedida`s no `S##-REVIEW.md` e segue (honra a AUTONOMY RULE). `pause` faz o `forge-auto` perguntar ao humano mesmo no modo autônomo (opt-in).
+
+### Resolução das objeções
+
+| advocate | réplica do reviewer | resolução |
+|----------|---------------------|-----------|
+| conceded | (qualquer) | **CONCEDIDA** — ambos veem um problema real → item de ação |
+| refuted  | withdrawn | **RESOLVIDA** — o advocate convenceu o reviewer → sem ação |
+| refuted  | maintained | **ABERTA** — discordância genuína → humano decide |
+| open     | withdrawn | **RESOLVIDA** — reviewer retirou → sem ação |
+| open     | maintained | **ABERTA** — tradeoff real → humano decide |
+
+### Cross-references
+
+- Spec autoritativa: `shared/forge-review.md` (procedimento completo do gate).
+- Challenger: `agents/forge-reviewer.md` (challenge mode + rebuttal mode).
+- Defender: `agents/forge-advocate.md`.
+- Dispatch guard: `skills/forge-auto/SKILL.md` + `skills/forge-next/SKILL.md` (antes de `complete-slice`; idempotente — se `S##-REVIEW.md` já existe, pula).
+- Artefato gerado: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (durável com a milestone; limpo por `milestone_cleanup`).
+- Boundary: per-slice. Tasks soltas (`/forge-task`) mantêm o review flags-style do step 5.5.
+
 ## Token Budget Settings
 
 O bloco `token_budget` limita o tamanho das seções **opcionais** injetadas nos prompts dos workers, mantendo o consumo de contexto previsível. O orquestrador multiplica cada valor por 4 para obter o limite em caracteres antes de chamar `truncateAtSectionBoundary` (de `scripts/forge-tokens.js`), que usa a heurística `Math.ceil(chars / 4)` para estimar tokens — sem dependências externas, com precisão de ±5–15% para inglês/markdown.

@@ -367,6 +367,20 @@ Skill({ skill: "forge-security", args: "{M###} {S##} {T##}" })
 ```
 The produced `T##-SECURITY.md` will be injected into that task's worker prompt as `## Security Checklist`. Skills run in the orchestrator context — loop them serially (fast enough; each is short) before dispatching the batch in parallel.
 
+**Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the slice branch `gsd/{M###}/{S##}` is still unmerged here, so the diff is intact). This is the challenger × defender confrontation:
+
+1. Idempotency: if `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already exists → skip the gate, proceed to `complete-slice`.
+2. Read `review.{mode,style,rounds,ask_in_auto}` via the cascade in `shared/forge-review.md § Step 0`. If `mode == disabled` → skip.
+3. Execute the procedure in **`shared/forge-review.md`** with `MODE = auto`:
+   - Challenge → `Agent({ subagent_type: 'forge-reviewer', … })`
+   - Defense → `Agent({ subagent_type: 'forge-advocate', … })`
+   - Rebuttal × `rounds` → `forge-reviewer` in rebuttal mode (DEFENSE injected)
+   - Resolve (Step 5 truth table), write `{S##}-REVIEW.md` (Step 6), handle OPEN/CONCEDED per `ask_in_auto` (Step 7 — `defer` does NOT pause; `pause` asks).
+   - Append the `review` event to `events.jsonl` (Step 8).
+4. The gate **never blocks** — any `Agent()` throw is recorded and the loop proceeds to `complete-slice` regardless.
+
+> Fires ONLY when the derived unit is `complete-slice`. Boundary is per-slice; standalone `/forge-task` keeps its own step-5.5 review. After the gate, dispatch `forge-completer` normally.
+
 **Plan-check gate (between plan-slice and first execute-task):**
 
 After a successful `plan-slice` unit, before dispatching the first `execute-task` for the same slice, run the plan-check gate:

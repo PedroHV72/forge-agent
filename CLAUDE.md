@@ -31,6 +31,9 @@ Regra de ferro: cada Task cabe em um context window. Slices agrupam tasks relaci
 | `forge-executor` | Sonnet | execute-task | Implementa código, verifica must-haves, commita, escreve SUMMARY |
 | `forge-completer` | Sonnet | complete-slice, complete-milestone | Escreve summaries, UAT scripts, squash-merge, fecha artefatos |
 | `forge-memory` | Haiku | pós-unidade | Extrai conhecimento durável do trabalho completado (quality gate: project-specific + non-obvious + durable) |
+| `forge-reviewer` | Sonnet | review gate (challenger) | Reviewer adversarial — acha bugs/brechas no diff do slice; em rebuttal mode reage à defesa do advocate. Read-only, advisory |
+| `forge-advocate` | Sonnet | review gate (defender) | Autor que defende o código contra as objeções do reviewer — refuta, concede ou marca `open`. Read-only, advisory |
+| `forge-plan-checker` | Sonnet | gate plan-slice→execute | Pontua 10 dimensões estruturais do plano (advisory) |
 | `forge-worker` | Vários | (template legado) | Template genérico — não usado diretamente |
 
 ### Dispatch loop (forge-auto / forge-next)
@@ -88,6 +91,9 @@ forge-agent/
 │   ├── forge-executor.md        # Sonnet — implementação de código
 │   ├── forge-completer.md       # Sonnet — fechamento e merge
 │   ├── forge-memory.md          # Haiku — extração de memórias
+│   ├── forge-reviewer.md        # Sonnet — challenger do review dialético (+ rebuttal mode)
+│   ├── forge-advocate.md        # Sonnet — defender (autor) do review dialético
+│   ├── forge-plan-checker.md    # Sonnet — plan-checker advisory (10 dimensões)
 │   └── forge-worker.md          # Template genérico (legado)
 ├── commands/                    # Slash commands para CLI (/forge-*)
 │   ├── forge-auto.md            # Modo autônomo — milestone inteiro
@@ -165,6 +171,7 @@ forge-agent/
                 ├── S##-CONTEXT.md   # Decisões do slice
                 ├── S##-RESEARCH.md  # Pesquisa do slice
                 ├── S##-RISK.md      # Avaliação de riscos
+                ├── S##-REVIEW.md    # Diálogo do review dialético (challenger × advocate)
                 ├── S##-SUMMARY.md   # Summary do slice
                 ├── S##-UAT.md       # Script de teste manual
                 ├── continue.md      # Checkpoint para retomada
@@ -341,6 +348,15 @@ Instaladores (`install.sh`, `install.ps1`) copiavam `merge-settings.js` atualiza
 
 ### IDs timestamp para milestones e tasks soltas (M001)
 Milestones e tasks soltas (`/forge-task`) usam IDs no formato `M-<YYYYMMDDHHMMSS>-<slug>` e `T-<YYYYMMDDHHMMSS>-<slug>` respectivamente (ex.: `M-20260522101500-pagamentos`). O timestamp UTC de 14 dígitos é a chave primária — única, ordenável por criação, sem colisão entre branches paralelos. O slug é cosmético (lowercase, hífens, ≤24 chars) e ignorado nas comparações. Slices `S##` e tasks internas `T##` permanecem sequenciais — são entidades de dono único dentro de um milestone, sem risco de colisão. Toda lógica de ID está centralizada em `scripts/forge-ids.js` (8 exports: `nowTimestamp`, `slugify`, `makeMilestoneId`, `makeTaskId`, `classify`, `isValid`, `prefixGlob`, `entityKind`) — zero regex de ID espalhado no codebase. A CLI do módulo aceita `--new-milestone`, `--new-task`, `--classify`, `--slugify`. Geração é timestamp-only; leitura aceita ambos os formatos, detectados por prefixo. **Retrocompat:** IDs legados `M###` e `TASK-###` continuam válidos para leitura, `--resume` e `/forge-explain`. Motivação: eliminar a colisão de `M006`/`M006` entre devs em branches paralelos — problema que o esquema sequencial não pode resolver sem coordenação central.
+
+### Review dialético — dois agentes se confrontam, humano arbitra
+Inspirado no copilot-review do GitHub, mas reformulado como **debate**: em vez de um agente despejando flags num SUMMARY que ninguém lê, dois agentes independentes se confrontam sobre o código e o humano só decide onde eles genuinamente discordam. **Challenger** = `forge-reviewer` (acha bugs/brechas, formula cada achado como objeção + pergunta). **Defender** = `forge-advocate` (assume ser o autor; refuta, concede ou marca `open` cada objeção). Uma rodada de réplica bounded (`review.rounds`, default 1) deixa o reviewer manter ou retirar cada objeção vendo a defesa. Resolução: `conceded`→ação, `refuted+withdrawn`/`open+withdrawn`→sem ação, `*+maintained`/`refuted+maintained`→**aberta** (sobe ao humano).
+
+**Boundary: per-slice.** O gate roda no orquestrador (skills `forge-auto`/`forge-next`) **antes de despachar `complete-slice`**, com o branch `gsd/{M###}/{S##}` ainda não-mergeado (diff intacto). **Por que no orquestrador e não no `forge-completer`:** o completer tem `tools: Read, Write, Edit, Bash` — sem `Agent` nem `AskUserQuestion`. Não consegue despachar reviewer/advocate nem perguntar ao humano. (O `Agent("forge-reviewer")` que existia no step 4b do completer era código morto — removido; o completer agora só faz o pattern-scan determinístico e linka o `S##-REVIEW.md`.)
+
+**Postura Ask + autonomia:** em `/forge-next` (interativo) cada objeção `aberta` vira `AskUserQuestion` ao vivo (`manter` / `refatorar` / `follow-up`). Em `/forge-auto` respeita `review.ask_in_auto`: `defer` (default) **não pausa** — registra abertas/concedidas no `S##-REVIEW.md` e segue, honrando a AUTONOMY RULE; `pause` (opt-in) pergunta mesmo no modo autônomo. O gate **nunca bloqueia** o `complete-slice`; qualquer throw de `Agent()` é registrado e o loop prossegue.
+
+Prefs em `review:` (`mode|style|rounds|ask_in_auto`). `style: flags` reproduz o comportamento advisory legado (só challenger, sem debate). Spec autoritativa: `shared/forge-review.md`. Artefato: `S##-REVIEW.md` (o diálogo inteiro — objeção → defesa → réplica → resolução — auditável; durável com a milestone, limpo por `milestone_cleanup`). Tasks soltas (`/forge-task`) mantêm o review flags-style do step 5.5 — boundary é per-slice.
 
 ## Convenções de código
 

@@ -285,6 +285,10 @@ Write-Host ""
 Info "Instalando referências compartilhadas..."
 CopyFile "$RepoDir\shared\forge-dispatch.md" "$ClaudeDir\forge-dispatch.md"
 Info "  forge-dispatch.md"
+if (Test-Path "$RepoDir\shared\forge-review.md") {
+    CopyFile "$RepoDir\shared\forge-review.md" "$ClaudeDir\forge-review.md"
+    Info "  forge-review.md"
+}
 if (Test-Path "$RepoDir\shared\forge-mcps.md") {
     CopyFile "$RepoDir\shared\forge-mcps.md" "$ClaudeDir\forge-mcps.md"
     Info "  forge-mcps.md"

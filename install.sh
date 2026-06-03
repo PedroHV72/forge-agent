@@ -315,6 +315,10 @@ echo ""
 info "Installing shared references..."
 copy "${REPO_DIR}/shared/forge-dispatch.md" "${CLAUDE_DIR}/forge-dispatch.md"
 info "  forge-dispatch.md"
+if [ -f "${REPO_DIR}/shared/forge-review.md" ]; then
+  copy "${REPO_DIR}/shared/forge-review.md" "${CLAUDE_DIR}/forge-review.md"
+  info "  forge-review.md"
+fi
 if [ -f "${REPO_DIR}/shared/forge-mcps.md" ]; then
   copy "${REPO_DIR}/shared/forge-mcps.md" "${CLAUDE_DIR}/forge-mcps.md"
   info "  forge-mcps.md"

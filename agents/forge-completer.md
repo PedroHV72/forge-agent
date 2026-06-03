@@ -341,32 +341,28 @@ Given all `T##-SUMMARY.md` files from the slice:
    ```
    If the result is `disabled` → SKIP this entire step. Continue to step 5.
 
+   > **Note — the adversarial/dialectic review does NOT run here.** It runs in the orchestrator (`shared/forge-review.md`, gated before `complete-slice` is dispatched) because this agent has no `Agent` tool and cannot dispatch `forge-reviewer`/`forge-advocate`. By the time you run, the dialogue already lives in `{S##}-REVIEW.md`. This step only does the deterministic pattern-scan and links to it.
+
    4a. **Pattern scan.** Grep files changed in this slice for risky patterns:
       `eval(`, `exec(`, `innerHTML`, `dangerouslySetInnerHTML`, string-concatenated SQL queries (`.query("` + variable), `console.log` adjacent to token/password/secret, hardcoded credentials, `shell=True`, `os.system(`.
       Collect hits as `{file, line, pattern, snippet}` → `PATTERN_HITS`. Empty list is fine.
 
-   4b. **Adversarial review.** Dispatch `forge-reviewer` on the slice diff:
-      ```
-      Agent("forge-reviewer", "WORKING_DIR: {WORKING_DIR}\nUNIT: complete-slice/{S##}\nDIFF_CMD: git diff $(git merge-base HEAD master 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD~10)...HEAD")
-      ```
-      Parse the result. If the worker returned `NO_FLAGS` → `LLM_FINDINGS = ""`. Otherwise capture the markdown block (everything before `---GSD-WORKER-RESULT---`).
-      If the `Agent()` call throws → record `LLM_FINDINGS = ""` and a one-line note; continue. Review failures never abort complete-slice.
+   4b. **Link the dialectic review.** Check whether `{S##}-REVIEW.md` exists in the slice dir. If it does, read its `**Outcome:**` line to capture the `{X resolved · Y conceded · Z open}` summary → `REVIEW_OUTCOME`. If it does not exist (review disabled, or empty diff), `REVIEW_OUTCOME = ""`.
 
    4c. **Merge & write.** Build the `## ⚠ Review Flags` section:
       ```markdown
       ## ⚠ Review Flags
 
-      _Advisory — pattern scan + adversarial reviewer on slice diff. No action taken; recorded for auditing._
+      _Advisory — deterministic pattern scan on slice diff. No action taken; recorded for auditing._
 
-      {LLM_FINDINGS if non-empty}
+      {if REVIEW_OUTCOME non-empty:} **Dialectic review:** {REVIEW_OUTCOME} — see [`{S##}-REVIEW.md`](./{S##}-REVIEW.md).
 
       ### Pattern Hits
       - `{file}:{line}` — pattern `{pattern}` — {one-line context from snippet}
       ```
       Write rules:
-      - Both empty → omit the section entirely.
-      - `PATTERN_HITS` empty → omit `### Pattern Hits` sub-heading.
-      - `LLM_FINDINGS` empty → include only `### Pattern Hits`.
+      - `PATTERN_HITS` empty AND `REVIEW_OUTCOME` empty → omit the section entirely.
+      - `PATTERN_HITS` empty → omit the `### Pattern Hits` sub-heading (keep the dialectic-review line if present).
 
       Append to `S##-SUMMARY.md`. This is documentation only — never a blocker.
 
