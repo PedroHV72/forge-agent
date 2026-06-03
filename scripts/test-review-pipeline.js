@@ -345,15 +345,17 @@ function runRound(roundNum) {
     assert.ok(!c.includes('## ⚠ Security Flags'), 'stale heading still present');
   });
 
-  test('T6.3 forge-task SKILL has Step 5.5 Review', () => {
+  test('T6.3 forge-task SKILL has Step 5.5 dialectic review', () => {
     const s = fs.readFileSync(path.join(REPO_ROOT, 'skills', 'forge-task', 'SKILL.md'), 'utf8');
-    assert.ok(s.includes('### Step 5.5 — Review'));
+    assert.ok(s.includes('### Step 5.5 — Dialectic review'));
     assert.ok(s.includes('.start-sha'));
+    assert.ok(s.includes('{TASK_ID}-REVIEW.md'), 'writes the per-task review artifact');
   });
 
-  test('T6.4 forge-task SKILL dispatches forge-reviewer', () => {
+  test('T6.4 forge-task SKILL runs the challenger × advocate confrontation', () => {
     const s = fs.readFileSync(path.join(REPO_ROOT, 'skills', 'forge-task', 'SKILL.md'), 'utf8');
-    assert.ok(s.includes('forge-reviewer'));
+    assert.ok(s.includes('forge-reviewer'), 'dispatches the challenger');
+    assert.ok(s.includes('forge-advocate'), 'dispatches the defender');
   });
 
   // T7 — installer glob coverage
@@ -361,6 +363,30 @@ function runRound(roundNum) {
     const files = fs.readdirSync(path.join(REPO_ROOT, 'agents'))
       .filter(f => f.startsWith('forge') && f.endsWith('.md'));
     assert.ok(files.includes('forge-reviewer.md'));
+  });
+
+  test('T7.2 forge-advocate.md exists, matches glob, valid frontmatter', () => {
+    const dir = path.join(REPO_ROOT, 'agents');
+    const files = fs.readdirSync(dir).filter(f => f.startsWith('forge') && f.endsWith('.md'));
+    assert.ok(files.includes('forge-advocate.md'), 'defender agent present');
+    const fm = (fs.readFileSync(path.join(dir, 'forge-advocate.md'), 'utf8').match(/^---\n([\s\S]*?)\n---/) || [])[1] || '';
+    assert.ok(/^name:\s*forge-advocate\s*$/m.test(fm), 'name frontmatter');
+    assert.ok(/^model:\s*claude-sonnet/m.test(fm), 'sonnet model');
+    assert.ok(!/\bAgent\b/.test(fm), 'advocate has no Agent tool (read-only worker)');
+  });
+
+  test('T7.3 forge-reviewer.md has rebuttal mode with conceded carry-through', () => {
+    const c = fs.readFileSync(path.join(REPO_ROOT, 'agents', 'forge-reviewer.md'), 'utf8');
+    assert.ok(c.includes('## Rebuttal mode'), 'rebuttal mode section');
+    assert.ok(/conceded/i.test(c), 'carries conceded objections through');
+  });
+
+  test('T7.4 shared/forge-review.md spec exists and is installed by both installers', () => {
+    assert.ok(fs.existsSync(path.join(REPO_ROOT, 'shared', 'forge-review.md')), 'spec present');
+    const sh = fs.readFileSync(path.join(REPO_ROOT, 'install.sh'), 'utf8');
+    const ps1 = fs.readFileSync(path.join(REPO_ROOT, 'install.ps1'), 'utf8');
+    assert.ok(sh.includes('forge-review.md'), 'install.sh copies the spec');
+    assert.ok(ps1.includes('forge-review.md'), 'install.ps1 copies the spec');
   });
 
   roundStats.push({ round: roundNum, pass, fail, failures });

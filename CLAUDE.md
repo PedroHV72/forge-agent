@@ -356,7 +356,9 @@ Inspirado no copilot-review do GitHub, mas reformulado como **debate**: em vez d
 
 **Postura Ask + autonomia:** em `/forge-next` (interativo) cada objeção `aberta` vira `AskUserQuestion` ao vivo (`manter` / `refatorar` / `follow-up`). Em `/forge-auto` respeita `review.ask_in_auto`: `defer` (default) **não pausa** — registra abertas/concedidas no `S##-REVIEW.md` e segue, honrando a AUTONOMY RULE; `pause` (opt-in) pergunta mesmo no modo autônomo. O gate **nunca bloqueia** o `complete-slice`; qualquer throw de `Agent()` é registrado e o loop prossegue.
 
-Prefs em `review:` (`mode|style|rounds|ask_in_auto`). `style: flags` reproduz o comportamento advisory legado (só challenger, sem debate). Spec autoritativa: `shared/forge-review.md`. Artefato: `S##-REVIEW.md` (o diálogo inteiro — objeção → defesa → réplica → resolução — auditável; durável com a milestone, limpo por `milestone_cleanup`). Tasks soltas (`/forge-task`) mantêm o review flags-style do step 5.5 — boundary é per-slice.
+Prefs em `review:` (`mode|style|rounds|ask_in_auto`). `style: flags` reproduz o comportamento advisory legado (só challenger, sem debate). Spec autoritativa: `shared/forge-review.md` (boundary-agnostic — dois consumidores). Artefato: `S##-REVIEW.md` (o diálogo inteiro — objeção → defesa → réplica → resolução — auditável; durável com a milestone, limpo por `milestone_cleanup`).
+
+**Dois boundaries:** (1) per-slice — gate antes de `complete-slice` no branch não-mergeado, em `forge-auto`/`forge-next`. (2) **task solta** — `/forge-task` step 5.5 roda o mesmo confronto no diff da task (`git diff {START_SHA}..HEAD`), artefato `{TASK_ID}-REVIEW.md`, sempre `MODE = interactive` (o forge-task já é interativo). Ambos respeitam `review.style`; `flags` = single-pass legado em qualquer um dos dois.
 
 ## Convenções de código
 

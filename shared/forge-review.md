@@ -1,6 +1,13 @@
-# Forge Review — Dialectic Confrontation (per-slice)
+# Forge Review — Dialectic Confrontation
 
-Authoritative spec for the **review gate** that runs in the orchestrator context (skills `forge-auto` / `forge-next`) right before `complete-slice` is dispatched — while the slice branch `gsd/{M###}/{S##}` is still **unmerged**, so the diff is intact.
+Authoritative spec for the **review gate**: a two-agent confrontation on a completed diff, run from the orchestrator context. Two consumers bind it at their own boundary:
+
+| Consumer | Boundary | DIFF_CMD | Artifact | MODE |
+|----------|----------|----------|----------|------|
+| `forge-auto` / `forge-next` (before `complete-slice`) | per-slice — branch `gsd/{M###}/{S##}` still **unmerged** | `git diff {merge-base}...HEAD` (Step 1) | `{S##}-REVIEW.md` | `auto` / `interactive` |
+| `forge-task` (Step 5.5) | standalone task | `git diff {START_SHA}..HEAD` (worktree fallback) | `{TASK_ID}-REVIEW.md` | `interactive` |
+
+Steps 2–8 below are boundary-agnostic — only the four bindings above differ. The rest of this doc is written in slice terms (`{S##}-REVIEW.md`); substitute the task bindings when invoked from `forge-task`.
 
 The gate stages two independent agents against the slice diff:
 

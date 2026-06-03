@@ -455,27 +455,17 @@ Do NOT modify STATE.md. Return ---GSD-WORKER-RESULT---.
 
 ---
 
-### Step 5.5 — Review (advisory)
+### Step 5.5 — Dialectic review (advisory)
+
+Runs the **challenger × advocate** confrontation on the task diff — the same per-slice gate from `shared/forge-review.md`, bound to the standalone-task boundary. `/forge-task` is a skill (main context) with `Agent` + `AskUserQuestion`, and it is interactive (it already runs a discuss phase), so OPEN objections are put to the user live (`MODE = interactive`).
 
 **Skip if:**
 - `review.mode: disabled` in merged prefs, OR
-- `{TASK_ID}-SUMMARY.md` already contains `## ⚠ Review Flags` section (idempotent resume)
+- `.gsd/tasks/{TASK_ID}/{TASK_ID}-REVIEW.md` already exists (idempotent resume).
 
-**Read `review.mode` pref** (same cascade as forge-completer):
-```bash
-node -e "
-const fs=require('fs'),path=require('path'),os=require('os');
-const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-             path.join('{WORKING_DIR}','.gsd','claude-agent-prefs.md'),
-             path.join('{WORKING_DIR}','.gsd','prefs.local.md')];
-let mode='enabled';
-for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^review:[ \t]*\n[ \t]+mode:[ \t]*(\w+)/m);if(m)mode=m[1].toLowerCase();}catch{}}
-process.stdout.write(mode);
-"
-```
-If `disabled` → skip Step 5.5 entirely.
+**Read review prefs** (`mode`, `style`, `rounds` — 3-file cascade, exactly as `shared/forge-review.md § Step 0`). If `mode == disabled` → skip Step 5.5 entirely.
 
-**Compute DIFF_CMD:**
+**Compute DIFF_CMD** (task boundary — START_SHA marker, with worktree fallback):
 ```bash
 START_SHA=$(cat .gsd/tasks/{TASK_ID}/.start-sha 2>/dev/null || echo "")
 if [ -n "$START_SHA" ] && git rev-parse "$START_SHA" >/dev/null 2>&1 && [ "$START_SHA" != "$(git rev-parse HEAD 2>/dev/null)" ]; then
@@ -484,30 +474,39 @@ else
   DIFF_CMD="git diff HEAD"
 fi
 ```
-`git diff HEAD` is the fallback for `auto_commit: false` (working-tree changes) or when no commit happened.
+`git diff HEAD` is the fallback for `auto_commit: false` (working-tree changes) or when no commit happened. If `$DIFF_CMD` is empty → write a minimal `{TASK_ID}-REVIEW.md` ("no diff to review") and skip the dispatches.
 
-**Pattern scan.** Grep changed files (from `$DIFF_CMD --name-only`) for the same patterns as forge-completer step 4a. Collect `PATTERN_HITS`.
+**Pattern scan.** Grep changed files (`$DIFF_CMD --name-only`) for the same risky patterns as forge-completer step 4a → `PATTERN_HITS`.
 
-**Create timeline task:**
+**Create timeline tasks:**
 ```
 TaskCreate({ subject: "[{TASK_ID}] review", activeForm: "review · forge-reviewer (sonnet)" })
-TaskUpdate({ taskId: <id>, status: "in_progress" })
 ```
 
-**Dispatch forge-reviewer:**
-```
-Agent("forge-reviewer", "WORKING_DIR: {WORKING_DIR}\nUNIT: task/{TASK_ID}\nDIFF_CMD: {DIFF_CMD}")
-```
-If the `Agent()` call throws → `LLM_FINDINGS = ""` + one-line note in event log; continue. Review failures never abort the task.
+**Run the dialectic loop** — follow `shared/forge-review.md` Steps 2–7 with these bindings:
+- `UNIT = task/{TASK_ID}`, `DIFF_CMD` as above, `MODE = interactive`, artifact = `.gsd/tasks/{TASK_ID}/{TASK_ID}-REVIEW.md`.
+- **Challenge** → `Agent({ subagent_type: 'forge-reviewer', prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: task/{TASK_ID}\nDIFF_CMD: {DIFF_CMD}" })`. `NO_FLAGS` → clean REVIEW, done.
+- **Defense** → `Agent({ subagent_type: 'forge-advocate', prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: task/{TASK_ID}\nDIFF_CMD: {DIFF_CMD}\nOBJECTIONS:\n{OBJECTIONS}" })`.
+- **Rebuttal** × `rounds` (default 1) → `forge-reviewer` with `DEFENSE` injected (rebuttal mode).
+- **Resolve** via the Step 5 truth table; write the dialogue to `{TASK_ID}-REVIEW.md` (Step 6 template, `## Pattern hits` from `PATTERN_HITS`). For each **OPEN** objection, `AskUserQuestion` live (`Manter` / `Refatorar agora` / `Criar follow-up`) and record the decision. **CONCEDED** items: list and ask once whether to address now.
+- Any `Agent()` throw is recorded; the review **never aborts the task**.
+- `style: flags` → single-pass: run the challenge only, write `## ⚠ Review Flags` (+ pattern hits) into `{TASK_ID}-REVIEW.md`. No defense/rebuttal/Ask.
 
-**Merge & append.** Build `## ⚠ Review Flags` section (same rules as forge-completer 4c) and append to `{TASK_ID}-SUMMARY.md`. If both `PATTERN_HITS` and `LLM_FINDINGS` are empty → skip append entirely.
+**Append a pointer** to `{TASK_ID}-SUMMARY.md`:
+```markdown
+## Review
+Dialectic review: {X resolved · Y conceded · Z open} — see [`{TASK_ID}-REVIEW.md`](./{TASK_ID}-REVIEW.md).
+```
+Skip the pointer if no `{TASK_ID}-REVIEW.md` was written.
 
-**Follow-up commit** (only if `auto_commit: true` AND the section was written):
+**Event log** — append the `review` line to `.gsd/forge/events.jsonl` (`shared/forge-review.md § Step 8`, with `"unit":"task/{TASK_ID}"`).
+
+**Follow-up commit** (only if `auto_commit: true` AND a `{TASK_ID}-REVIEW.md` was written):
 ```bash
-git add .gsd/tasks/{TASK_ID}/{TASK_ID}-SUMMARY.md
-git commit -m "chore({TASK_ID}): append review flags"
+git add .gsd/tasks/{TASK_ID}/{TASK_ID}-REVIEW.md .gsd/tasks/{TASK_ID}/{TASK_ID}-SUMMARY.md
+git commit -m "chore({TASK_ID}): dialectic review"
 ```
-Do NOT amend the `feat({TASK_ID})` commit — create a distinct follow-up. If no section was written, skip the commit.
+Do NOT amend the `feat({TASK_ID})` commit — create a distinct follow-up.
 
 After: `TaskUpdate({ status: "completed" })`, `session_units += 1`.
 

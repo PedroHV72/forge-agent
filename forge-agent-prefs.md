@@ -509,8 +509,8 @@ review:
 - Challenger: `agents/forge-reviewer.md` (challenge mode + rebuttal mode).
 - Defender: `agents/forge-advocate.md`.
 - Dispatch guard: `skills/forge-auto/SKILL.md` + `skills/forge-next/SKILL.md` (antes de `complete-slice`; idempotente — se `S##-REVIEW.md` já existe, pula).
-- Artefato gerado: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (durável com a milestone; limpo por `milestone_cleanup`).
-- Boundary: per-slice. Tasks soltas (`/forge-task`) mantêm o review flags-style do step 5.5.
+- Artefato gerado: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (per-slice) ou `.gsd/tasks/{TASK_ID}/{TASK_ID}-REVIEW.md` (task solta) — durável com a unidade; limpo por `milestone_cleanup`.
+- Dois boundaries: per-slice (gate antes de `complete-slice` em `forge-auto`/`forge-next`) e task solta (`/forge-task` step 5.5, sempre interativo). Ambos honram `mode`/`style`/`rounds`; `ask_in_auto` só se aplica ao `forge-auto`.
 
 ## Token Budget Settings
 
