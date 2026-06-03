@@ -93,11 +93,27 @@ TASK_ID=$(node "$FORGE_SCRIPTS_DIR/forge-ids.js" --new-task "$TASK_DESCRIPTION")
 - Resume mode: `TASK_ID` already set — skip to Dispatch loop
 - `TASK_ID` agora tem o formato `T-<YYYYMMDDHHMMSS>-<slug>` (slug omitido se a descrição for vaga)
 
+**Isolation setup (branch/worktree)** — apply `forge_isolation` from prefs BEFORE registering the run. Idempotent — safe on resume (`already-on-branch` / `already-exists`):
+```bash
+ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$TASK_ID" --cwd "$(pwd)")
+ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
+WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
+ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
+echo "ISOLATION_MODE=$ISOLATION_MODE  WORKTREE_DIR=${WORKTREE_DIR:-—}  ISO_ERRORS=${ISO_ERRORS:-none}"
+```
+
+Isolation rules (CRITICAL — the operator configured this; honor it):
+- `shared` → `CODE_DIR = $(pwd)`. Nothing else to do.
+- `branch` → `CODE_DIR = $(pwd)`. The executor commits on the `forge/{TASK_ID}` branch the setup just checked out.
+- `worktree` → `CODE_DIR = $WORKTREE_DIR`. ALL code reads/writes/commits happen inside the worktree; `.gsd/**` artifacts ALWAYS stay under the original workspace.
+- `ISO_ERRORS` non-empty AND no repo succeeded → STOP and surface the errors. Running un-isolated when the operator configured isolation is NOT an acceptable fallback.
+- When mode != shared, emit one line: `⛓ Isolation: {mode} → {branch name or worktree path}`.
+
 **Register in multi-run registry** (M004+) — only when initializing fresh (not on resume):
 ```bash
 if [ -z "$RESUME_MODE" ]; then
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
   # Regenerate dashboard
   node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
 fi
@@ -387,9 +403,9 @@ After result: `TaskUpdate({ status: "completed" })`, `session_units += 1`.
 
 **Skip if:** `.gsd/tasks/{TASK_ID}/{TASK_ID}-SUMMARY.md` already exists (task done).
 
-**Record pre-execute HEAD SHA** (persisted to file so Step 5.5 can diff after executor commits):
+**Record pre-execute HEAD SHA** (persisted to file so Step 5.5 can diff after executor commits). In `worktree` mode the commits land in `CODE_DIR` — read HEAD from there:
 ```bash
-git rev-parse HEAD 2>/dev/null > .gsd/tasks/{TASK_ID}/.start-sha || echo "" > .gsd/tasks/{TASK_ID}/.start-sha
+git -C "${CODE_DIR:-.}" rev-parse HEAD 2>/dev/null > .gsd/tasks/{TASK_ID}/.start-sha || echo "" > .gsd/tasks/{TASK_ID}/.start-sha
 ```
 
 **Create timeline task:**
@@ -398,10 +414,14 @@ TaskCreate({ subject: "[{TASK_ID}] execute", activeForm: "execute · forge-execu
 TaskUpdate({ taskId: <id>, status: "in_progress" })
 ```
 
-Dispatch `forge-executor` (sonnet) with this prompt:
+Dispatch `forge-executor` (sonnet) with this prompt. When `ISOLATION_MODE != shared`, include the isolation header lines (omit them entirely in `shared` mode):
 ```
 Execute forge-task {TASK_ID}: {TASK_DESCRIPTION}
 WORKING_DIR: {WORKING_DIR}
+ISOLATION: {ISOLATION_MODE}                # only when != shared
+BRANCH: {resolved forge/{TASK_ID} branch}  # only when != shared
+CODE_DIR: {CODE_DIR}                       # only when != shared
+Isolation rule: all source-code reads, writes, builds and git commits happen inside CODE_DIR on branch BRANCH. All .gsd/** artifact paths stay under WORKING_DIR. Never commit from WORKING_DIR when CODE_DIR differs.
 auto_commit: {PREFS.auto_commit — true or false}
 effort: {EFFORT_EXEC}
 thinking: disabled
@@ -465,13 +485,14 @@ Runs the **challenger × advocate** confrontation on the task diff — the same 
 
 **Read review prefs** (`mode`, `style`, `rounds` — 3-file cascade, exactly as `shared/forge-review.md § Step 0`). If `mode == disabled` → skip Step 5.5 entirely.
 
-**Compute DIFF_CMD** (task boundary — START_SHA marker, with worktree fallback):
+**Compute DIFF_CMD** (task boundary — START_SHA marker). In `worktree` mode the commits live in `CODE_DIR`, so every git call targets it via `git -C`:
 ```bash
+GIT_DIR_FLAG="-C ${CODE_DIR:-.}"
 START_SHA=$(cat .gsd/tasks/{TASK_ID}/.start-sha 2>/dev/null || echo "")
-if [ -n "$START_SHA" ] && git rev-parse "$START_SHA" >/dev/null 2>&1 && [ "$START_SHA" != "$(git rev-parse HEAD 2>/dev/null)" ]; then
-  DIFF_CMD="git diff ${START_SHA}..HEAD"
+if [ -n "$START_SHA" ] && git $GIT_DIR_FLAG rev-parse "$START_SHA" >/dev/null 2>&1 && [ "$START_SHA" != "$(git $GIT_DIR_FLAG rev-parse HEAD 2>/dev/null)" ]; then
+  DIFF_CMD="git $GIT_DIR_FLAG diff ${START_SHA}..HEAD"
 else
-  DIFF_CMD="git diff HEAD"
+  DIFF_CMD="git $GIT_DIR_FLAG diff HEAD"
 fi
 ```
 `git diff HEAD` is the fallback for `auto_commit: false` (working-tree changes) or when no commit happened. If `$DIFF_CMD` is empty → write a minimal `{TASK_ID}-REVIEW.md` ("no diff to review") and skip the dispatches.
@@ -561,6 +582,11 @@ Keep each entry under 10 lines. This is the only task artifact that persists reg
   rm -rf .gsd/tasks/{TASK_ID}
   ```
 In all cases the ledger fragment (`.gsd/ledger/{TASK_ID}.md`), `AUTO-MEMORY.md`, `DECISIONS.md`, and `CODING-STANDARDS.md` are never touched.
+
+**Isolation cleanup** — runs ONLY here (task completed), never on pause/blocked/partial exits (the branch/worktree must survive for `--resume`). No-op when `ISOLATION_MODE == shared`; `branch` mode checks the repo back out to the default branch (the `forge/{TASK_ID}` branch is kept for PR/merge by the operator); `worktree` mode removes the worktree only if `worktree_cleanup_on_complete: true` in prefs:
+```bash
+node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --cleanup --run "$TASK_ID" --cwd "$(pwd)" || true
+```
 
 **Final report:**
 ```

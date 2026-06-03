@@ -39,7 +39,10 @@ function readIsolationPrefs(cwd) {
   for (const f of files) {
     try {
       const raw = fs.readFileSync(f, 'utf8');
-      const block = raw.match(/^forge_isolation:[ \t]*\n([\s\S]*?)(?=^\w|\Z)/m);
+      // Capture only the indented body of the block (plus blank lines). The previous
+      // pattern used `\Z`, which JS treats as a literal "Z" — blocks at end-of-file
+      // were silently ignored, so prefs like `mode: worktree` never took effect.
+      const block = raw.match(/^forge_isolation:[ \t]*\n((?:[ \t]+[^\n]*(?:\n|$)|[ \t]*\n)*)/m);
       if (!block) continue;
       const modeM = block[1].match(/mode:[ \t]*(\w+)/);                                if (modeM) mode = modeM[1].toLowerCase();
       const patM  = block[1].match(/branch_pattern:[ \t]*["']?([^"'\n]+)["']?/);       if (patM)  branchPattern = patM[1].trim();

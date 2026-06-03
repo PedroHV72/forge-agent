@@ -34,6 +34,27 @@ Illustrative examples in this file (e.g. `M001`, `M002`, `M042`) are prose examp
 
 ---
 
+## Isolation Header Convention
+
+When the run's `forge_isolation.mode` (resolved by the orchestrator at activation via `scripts/forge-isolation.js --setup`) is **not** `shared`, the orchestrator appends an isolation header to EVERY worker prompt, immediately after the `WORKING_DIR:` line:
+
+```
+ISOLATION: branch | worktree
+BRANCH: forge/{run-id}                  # resolved from forge_isolation.branch_pattern
+CODE_DIR: {worktree path, or WORKING_DIR in branch mode}
+Isolation rule: all source-code reads, writes, builds and git commits happen inside CODE_DIR on branch BRANCH. All .gsd/** artifact paths stay under WORKING_DIR. Never commit from WORKING_DIR when CODE_DIR differs.
+```
+
+Semantics for workers:
+- **`branch`** — `CODE_DIR == WORKING_DIR`. The orchestrator already checked out `BRANCH`; commit on it and never switch back to the default branch mid-unit.
+- **`worktree`** — `CODE_DIR` is a physical worktree (e.g. `.forge-worktrees/{run-id}/{repo}/`). Use `CODE_DIR` for every source file path and run git with `git -C "{CODE_DIR}" …`. `.gsd/**` reads/writes (plans, summaries, events) keep using `WORKING_DIR` paths — the GSD state never moves into the worktree.
+- Header absent → `shared` mode; nothing changes.
+- When the header is present with `ISOLATION: worktree`, commands in the templates that take `--cwd "{WORKING_DIR}"` for **code verification/build** (e.g. `forge-verify.js`) run with `--cwd "{CODE_DIR}"` instead; `--plan`/artifact paths under `.gsd/**` keep `{WORKING_DIR}`.
+
+The templates below do NOT repeat this header — the orchestrator injects it at dispatch time (see `skills/forge-auto/SKILL.md` and `skills/forge-next/SKILL.md` § Build worker prompt).
+
+---
+
 ### execute-task
 
 ```

@@ -128,6 +128,27 @@ RUN_KIND=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).kind || '')
 MSG=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).message || '')" "$RESOLVE")
 ```
 
+**Isolation setup (branch/worktree)** — when `$STATUS` resolves to `activate-new`, `resume`, or `legacy`, apply `forge_isolation` from prefs BEFORE the per-status registry actions below. For `refuse`/`error`, skip entirely — never touch git on a refused invocation. The script is idempotent (re-running on resume is a no-op: `already-on-branch` / `already-exists`). In legacy mode (`RUN_ID` empty), substitute `$ISO_RUN` with the active milestone ID from STATE.md.
+
+```bash
+ISO_RUN="${RUN_ID:-<active milestone ID from STATE.md>}"
+ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$ISO_RUN" --cwd "$WORKING_DIR")
+ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
+WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
+ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
+echo "ISOLATION_MODE=$ISOLATION_MODE"
+echo "WORKTREE_DIR=${WORKTREE_DIR:-—}"
+echo "ISO_ERRORS=${ISO_ERRORS:-none}"
+```
+
+Isolation rules (CRITICAL — the operator configured this; honor it):
+- `ISOLATION_MODE == shared` → `WORKER_CWD = $WORKING_DIR`. Nothing else to do.
+- `ISOLATION_MODE == branch` → `WORKER_CWD = $WORKING_DIR`. Workers commit on the `forge/{run}` branch the setup just checked out.
+- `ISOLATION_MODE == worktree` → `WORKER_CWD = $WORKTREE_DIR`. ALL code reads/writes/commits happen inside the worktree; `.gsd/**` artifacts ALWAYS stay under `$WORKING_DIR` (the original workspace — registry, statusline and other tabs depend on it).
+- If `ISO_ERRORS` is non-empty AND every repo failed (`WORKTREE_DIR` empty in worktree mode, or no repo succeeded in branch mode) → STOP. Surface the errors to the user. Running un-isolated when the operator explicitly configured isolation is NOT an acceptable fallback.
+- If only some repos failed → emit a warning line listing them and continue.
+- When `ISOLATION_MODE != shared`, emit one line so the operator sees isolation took effect: `⛓ Isolation: {mode} → {branch name or worktree path}`.
+
 Branch on `$STATUS`:
 
 - **`refuse`** — emit `$MSG` (lists active runs + example commands) and stop. Do NOT continue.
@@ -136,14 +157,14 @@ Branch on `$STATUS`:
 - **`activate-new`** — register the new run:
   ```bash
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$RUN_ID" --kind "$RUN_KIND" --session "$SESSION_ID" --cwd "$WORKING_DIR" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$RUN_ID" --kind "$RUN_KIND" --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --cwd "$WORKING_DIR" > /dev/null
   echo "$MSG"
   ```
   Then continue to legacy activation (which writes auto-mode-started.txt + alias).
-- **`resume`** — emit `$MSG`, set `RUN_ID` (already set). Update the existing registry entry with the new session_id (the previous orchestrator process exited; this is a fresh session that needs to own heartbeat updates):
+- **`resume`** — emit `$MSG`, set `RUN_ID` (already set). Update the existing registry entry with the new session_id (the previous orchestrator process exited; this is a fresh session that needs to own heartbeat updates) and the freshly-resolved isolation mode:
   ```bash
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"session_id\":\"$SESSION_ID\",\"active\":true}" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"session_id\":\"$SESSION_ID\",\"active\":true,\"isolation_mode\":\"$ISOLATION_MODE\"}" > /dev/null
   ```
   Without this, `forge-hook.resolveBySessionId` won't match — heartbeats fall back to legacy `auto-mode.json` and `runs/{id}.json` becomes stale.
 
@@ -599,7 +620,7 @@ Read PREFS for `skip_discuss` and `skip_research`. If the current unit type is s
 
 Use the template from `~/.claude/forge-dispatch.md` for the current `unit_type`.
 Substitute placeholders:
-- `{WORKING_DIR}` <- current working directory
+- `{WORKING_DIR}` <- current working directory (orchestrator workspace — all `.gsd/**` paths)
 - `{M###}`, `{S##}`, `{T##}` <- from STATE
 - `{unit_effort}`, `{THINKING_OPUS}` <- resolved effort/thinking for this unit
 - `{TOP_MEMORIES}` <- RELEVANT_MEMORIES (already filtered in Step 4)
@@ -609,6 +630,15 @@ Substitute placeholders:
 - `{auto_commit}` <- PREFS.auto_commit
 - `{milestone_cleanup}` <- PREFS.milestone_cleanup
 - `{CODING_STANDARDS}` <- full CODING_STANDARDS content (for research templates)
+
+**Isolation header** — when `ISOLATION_MODE != shared` (resolved at activation), append these lines to the worker prompt header, immediately after the `WORKING_DIR:` line (see `shared/forge-dispatch.md § Isolation Header Convention`):
+```
+ISOLATION: {ISOLATION_MODE}
+BRANCH: {resolved branch name, e.g. forge/M-20260601...}
+CODE_DIR: {WORKER_CWD}
+Isolation rule: all source-code reads, writes, builds and git commits happen inside CODE_DIR on branch BRANCH. All .gsd/** artifact paths stay under WORKING_DIR. Never commit from WORKING_DIR when CODE_DIR differs.
+```
+(In `branch` mode `CODE_DIR == WORKING_DIR` — include the header anyway so the worker commits on the right branch and never switches back to the default branch.)
 
 Do NOT read artifact files here — templates now pass paths; workers read their own context.
 
@@ -1005,6 +1035,14 @@ fi
 ---
 
 ## Final Report (milestone complete)
+
+**Isolation cleanup** — runs ONLY here (milestone complete), never on pause/blocked/partial exits (the branch/worktree must survive for resume). No-op when `ISOLATION_MODE == shared`. In `branch` mode it checks the repo back out to the default branch (the `forge/{run}` branch is kept for PR/merge by the operator). In `worktree` mode it removes the worktree only if `worktree_cleanup_on_complete: true` in prefs:
+
+```bash
+node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --cleanup --run "${RUN_ID:-<active milestone ID>}" --cwd "$WORKING_DIR" || true
+```
+
+If the cleanup output contains `status: "error"` entries, surface them in the final report (advisory — do not fail the milestone).
 
 ```
 ✓ Milestone {M###} completo

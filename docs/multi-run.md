@@ -89,6 +89,8 @@ Schema completo em [`shared/forge-state.md`](../shared/forge-state.md) §2.
 
 ## Isolation modes
 
+O setup é aplicado automaticamente na ativação de `/forge-auto`, `/forge-next` e `/forge-task` (`scripts/forge-isolation.js --setup`, idempotente). Workers recebem um header de isolamento no prompt (`ISOLATION` / `BRANCH` / `CODE_DIR` — ver `shared/forge-dispatch.md § Isolation Header Convention`). O cleanup roda só no complete da milestone/task — pause/blocked preservam branch/worktree para resume.
+
 Configurável em `forge-agent-prefs.md`:
 
 ```yaml

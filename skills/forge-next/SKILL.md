@@ -70,6 +70,28 @@ If CODING-STANDARDS.md is missing, all section variables are `"(none)"`.
 
 ---
 
+## Isolation setup (branch/worktree)
+
+Apply `forge_isolation` from prefs before dispatching the unit. Idempotent — re-running on every `/forge-next` invocation is safe (`already-on-branch` / `already-exists`). `$ISO_RUN` is the active milestone ID from STATE.md:
+
+```bash
+ISO_RUN="<active milestone ID from STATE.md>"
+ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$ISO_RUN" --cwd "$WORKING_DIR")
+ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
+WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
+ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
+echo "ISOLATION_MODE=$ISOLATION_MODE  WORKTREE_DIR=${WORKTREE_DIR:-—}  ISO_ERRORS=${ISO_ERRORS:-none}"
+```
+
+Isolation rules (CRITICAL — the operator configured this; honor it):
+- `shared` → `WORKER_CWD = $WORKING_DIR`. Nothing else to do.
+- `branch` → `WORKER_CWD = $WORKING_DIR`. Workers commit on the `forge/{run}` branch the setup just checked out.
+- `worktree` → `WORKER_CWD = $WORKTREE_DIR`. ALL code reads/writes/commits happen inside the worktree; `.gsd/**` artifacts ALWAYS stay under `$WORKING_DIR`.
+- `ISO_ERRORS` non-empty AND no repo succeeded → STOP and surface the errors. Running un-isolated when the operator configured isolation is NOT an acceptable fallback.
+- When mode != shared, emit one line: `⛓ Isolation: {mode} → {branch name or worktree path}`.
+
+---
+
 ## Orchestrate — STEP MODE
 
 You are the orchestrator. Execute the dispatch loop **exactly once**, then stop.
@@ -393,7 +415,7 @@ Store as `RELEVANT_MEMORIES` and use in the worker prompt `## Project Memory` se
 
 Use the template from `~/.claude/forge-dispatch.md` for the current `unit_type`.
 Substitute placeholders:
-- `{WORKING_DIR}` <- current working directory
+- `{WORKING_DIR}` <- current working directory (orchestrator workspace — all `.gsd/**` paths)
 - `{M###}`, `{S##}`, `{T##}` <- from STATE
 - `{unit_effort}`, `{THINKING_OPUS}` <- resolved effort/thinking for this unit
 - `{TOP_MEMORIES}` <- RELEVANT_MEMORIES (filtered above)
@@ -403,6 +425,15 @@ Substitute placeholders:
 - `{auto_commit}` <- PREFS.auto_commit
 - `{milestone_cleanup}` <- PREFS.milestone_cleanup
 - `{CODING_STANDARDS}` <- full CODING_STANDARDS content (for research templates)
+
+**Isolation header** — when `ISOLATION_MODE != shared` (resolved in `## Isolation setup`), append these lines to the worker prompt header, immediately after the `WORKING_DIR:` line (see `shared/forge-dispatch.md § Isolation Header Convention`):
+```
+ISOLATION: {ISOLATION_MODE}
+BRANCH: {resolved branch name, e.g. forge/M-20260601...}
+CODE_DIR: {WORKER_CWD}
+Isolation rule: all source-code reads, writes, builds and git commits happen inside CODE_DIR on branch BRANCH. All .gsd/** artifact paths stay under WORKING_DIR. Never commit from WORKING_DIR when CODE_DIR differs.
+```
+(In `branch` mode `CODE_DIR == WORKING_DIR` — include the header anyway so the worker commits on the right branch and never switches back to the default branch.)
 
 Do NOT read artifact files here — templates now pass paths; workers read their own context.
 
@@ -530,7 +561,12 @@ KEY_DECISIONS:
 {key_decisions field from result, or "(none)"}
 ```
 
-**d) Emit progress + next action:**
+**e) Isolation cleanup (complete-milestone only)** — if the unit just processed was `complete-milestone` with `status: done`, release the isolation. No-op when `ISOLATION_MODE == shared`; `branch` mode checks the repo back out to the default branch (the `forge/{run}` branch is kept for PR/merge); `worktree` mode removes the worktree only if `worktree_cleanup_on_complete: true` in prefs. Never run this on partial/blocked — the branch/worktree must survive for resume:
+```bash
+node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --cleanup --run "$ISO_RUN" --cwd "$WORKING_DIR" || true
+```
+
+**f) Emit progress + next action:**
 ```
 ✓ [M001/S02/T03] execute-task — JWT auth with refresh rotation  · forge-executor (claude-sonnet-4-6)
 → Next: /forge-next para {next unit_type} {unit_id}

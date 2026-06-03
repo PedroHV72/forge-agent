@@ -65,7 +65,7 @@ function cleanup(dir) {
 
 // ── Section 1: forge-runs CRUD ─────────────────────────────────────────────
 function smokeRuns() {
-  process.stdout.write('\n[1/8] forge-runs\n');
+  process.stdout.write('\n[1/9] forge-runs\n');
   const dir = mkTmp('runs');
 
   // list empty
@@ -104,7 +104,7 @@ function smokeRuns() {
 
 // ── Section 2: forge-lock acquire/release/steal ─────────────────────────────
 function smokeLock() {
-  process.stdout.write('\n[2/8] forge-lock\n');
+  process.stdout.write('\n[2/9] forge-lock\n');
   const dir = mkTmp('lock');
 
   let r = runScript('forge-lock.js', ['--acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
@@ -125,7 +125,7 @@ function smokeLock() {
 
 // ── Section 3: forge-state read/write/migrate-legacy ────────────────────────
 function smokeState() {
-  process.stdout.write('\n[3/8] forge-state + migrate-legacy\n');
+  process.stdout.write('\n[3/9] forge-state + migrate-legacy\n');
   const dir = mkTmp('state');
 
   // Setup legacy STATE.md
@@ -181,7 +181,7 @@ Continue T02.
 
 // ── Section 4: forge-dashboard regen ────────────────────────────────────────
 function smokeDashboard() {
-  process.stdout.write('\n[4/8] forge-dashboard + cross-reference\n');
+  process.stdout.write('\n[4/9] forge-dashboard + cross-reference\n');
   const dir = mkTmp('dash');
 
   // Setup: 1 run + per-milestone STATE
@@ -215,7 +215,7 @@ function smokeDashboard() {
 
 // ── Section 5: forge-merger E2E ─────────────────────────────────────────────
 function smokeMerger() {
-  process.stdout.write('\n[5/8] forge-merger\n');
+  process.stdout.write('\n[5/9] forge-merger\n');
   const dir = mkTmp('merger');
 
   fs.mkdirSync(path.join(dir, '.gsd/milestones/M060'), { recursive: true });
@@ -262,7 +262,7 @@ function smokeMerger() {
 
 // ── Section 6: forge-filelock cross-run ─────────────────────────────────────
 function smokeFilelock() {
-  process.stdout.write('\n[6/8] forge-filelock\n');
+  process.stdout.write('\n[6/9] forge-filelock\n');
   const dir = mkTmp('filelock');
 
   runScript('forge-runs.js', ['--add', '--id', 'M070', '--kind', 'milestone', '--session', 'sess-x', '--cwd', dir]);
@@ -293,7 +293,7 @@ function smokeFilelock() {
 
 // ── Section 7: forge-repos auto-detect ─────────────────────────────────────
 function smokeRepos() {
-  process.stdout.write('\n[7/8] forge-repos\n');
+  process.stdout.write('\n[7/9] forge-repos\n');
   const dir = mkTmp('repos');
 
   fs.mkdirSync(path.join(dir, 'repo-a/.git'), { recursive: true });
@@ -313,7 +313,7 @@ function smokeRepos() {
 
 // ── Section 8: forge-cli-helpers refuse logic ───────────────────────────────
 function smokeCliHelpers() {
-  process.stdout.write('\n[8/8] forge-cli-helpers\n');
+  process.stdout.write('\n[8/9] forge-cli-helpers\n');
   const dir = mkTmp('cli');
 
   // 0 active + no arg → legacy
@@ -367,6 +367,68 @@ function smokeCliHelpers() {
   cleanup(dir);
 }
 
+// ── Section 9: forge-isolation prefs + setup/cleanup ────────────────────────
+function smokeIsolation() {
+  process.stdout.write('\n[9/9] forge-isolation\n');
+  const dir = mkTmp('iso');
+  // Isolate HOME so the operator's real ~/.claude/forge-agent-prefs.md never leaks in
+  const env = { ...process.env, HOME: dir, USERPROFILE: dir };
+
+  function git(args, cwd) {
+    return spawnSync('git', args, { cwd, encoding: 'utf8', env });
+  }
+
+  // Sandbox git repo
+  const repo = path.join(dir, 'repo');
+  fs.mkdirSync(path.join(repo, '.gsd'), { recursive: true });
+  git(['init', '-q', '-b', 'main'], repo);
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'hi\n');
+  git(['add', 'a.txt'], repo);
+  git(['-c', 'user.email=smoke@forge', '-c', 'user.name=smoke', 'commit', '-qm', 'init'], repo);
+
+  // Prefs block at END OF FILE on purpose — regression guard for the `\Z` regex bug
+  // (JS has no \Z; blocks at EOF were silently ignored and mode stayed "shared")
+  fs.writeFileSync(path.join(repo, '.gsd', 'prefs.local.md'),
+    'forge_isolation:\n  mode: branch\n  auto_pull_main: false\n');
+
+  let r = runScript('forge-isolation.js', ['--prefs', '--cwd', repo], { env });
+  let res = JSON.parse(r.stdout);
+  assert(res.mode === 'branch', 'prefs block at EOF is parsed (regex \\Z regression)', r.stdout);
+
+  // branch mode: setup creates + checks out forge/{run}
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-SMOKE', '--cwd', repo], { env });
+  res = JSON.parse(r.stdout);
+  assert(res.mode === 'branch' && res.repos[0] && res.repos[0].status === 'created', 'branch setup creates forge/M-SMOKE', r.stdout);
+  let cur = git(['branch', '--show-current'], repo).stdout.trim();
+  assert(cur === 'forge/M-SMOKE', 'repo is on forge/M-SMOKE after setup', cur);
+
+  // idempotent re-run
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-SMOKE', '--cwd', repo], { env });
+  res = JSON.parse(r.stdout);
+  assert(res.repos[0].status === 'already-on-branch', 'branch setup is idempotent', r.stdout);
+
+  // cleanup: back to default, branch preserved
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-SMOKE', '--cwd', repo], { env });
+  cur = git(['branch', '--show-current'], repo).stdout.trim();
+  assert(cur === 'main', 'branch cleanup checks out default', cur);
+  const branches = git(['branch', '--list'], repo).stdout;
+  assert(/forge\/M-SMOKE/.test(branches), 'forge branch preserved after cleanup (PR-able)', branches);
+
+  // worktree mode: setup creates physical worktree; cleanup respects pref
+  fs.writeFileSync(path.join(repo, '.gsd', 'prefs.local.md'),
+    'forge_isolation:\n  mode: worktree\n  auto_pull_main: false\n  worktree_cleanup_on_complete: true\n');
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-SMOKE-WT', '--cwd', repo], { env });
+  res = JSON.parse(r.stdout);
+  const wt = res.repos[0] && res.repos[0].worktree;
+  assert(res.mode === 'worktree' && wt && fs.existsSync(wt), 'worktree setup creates physical worktree', r.stdout);
+
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-SMOKE-WT', '--cwd', repo], { env });
+  res = JSON.parse(r.stdout);
+  assert(res.repos[0].status === 'removed' && !fs.existsSync(wt), 'worktree cleanup removes when pref true', r.stdout);
+
+  cleanup(dir);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
@@ -382,6 +444,7 @@ function main() {
     smokeFilelock();
     smokeRepos();
     smokeCliHelpers();
+    smokeIsolation();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

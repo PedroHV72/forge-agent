@@ -136,13 +136,23 @@ forge_isolation:
 - **worktree**: isolamento físico total. Cada milestone roda numa worktree separada — zero risco
   de overlap. Custo: disco × N milestones simultâneas, IDE complexity.
 
+### Quando é aplicado
+
+O setup roda automaticamente na ativação de `/forge-auto`, `/forge-next` e `/forge-task`
+(via `scripts/forge-isolation.js --setup`, idempotente). O cleanup roda apenas quando a
+milestone/task **completa** (`--cleanup`): `branch` volta para a branch default (a branch
+`forge/{id}` é preservada para PR); `worktree` só remove a worktree se
+`worktree_cleanup_on_complete: true`. Pause/blocked nunca disparam cleanup — o isolamento
+sobrevive para o resume.
+
 ### Override por run
 
-`forge_isolation.mode` pode ser sobrescrito por run individual via CLI flag (futuro: `/forge-auto M065 --isolation=worktree`). Por enquanto, edite prefs antes de iniciar.
+`forge_isolation.mode` pode ser sobrescrito por run individual via CLI flag (futuro: `/forge-auto M065 --isolation=worktree`). Por enquanto, edite prefs antes de iniciar — a mudança é lida na próxima ativação.
 
 ### Cross-references
 
 - `shared/forge-state.md` §2 — campo `isolation_mode` no `runs/{id}.json`
+- `shared/forge-dispatch.md § Isolation Header Convention` — header injetado nos worker prompts
 - `scripts/forge-repos.js` (S08) — implementação do auto-detect
 - `scripts/forge-isolation.js` (S08) — setup/cleanup de branch + worktree
 
