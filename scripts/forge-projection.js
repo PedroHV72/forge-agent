@@ -49,7 +49,12 @@ const MEMORY_CAP = 50;
 
 // ── renderLedger ──────────────────────────────────────────────────────────────
 // Reconstructs LEDGER.md from .gsd/ledger/*.md fragments.
-// Fragments are sorted by milestone ID (timestamp-ascending) then body appended.
+// Fragments are sorted by completed_at ascending (id as tiebreaker) so the last
+// block is always the most recently completed milestone. Lexicographic id order
+// breaks with mixed legacy/timestamp ids: '-' (0x2D) < '0' (0x30) puts every
+// legacy `M###` after every `M-<ts>-<slug>`, so readers that take the file tail
+// as "most recent" (forge-dashboard readLedgerTail) surface a stale milestone.
+// Fragments without completed_at sort first (treated as oldest).
 // Mirrors the legacy LEDGER.md block shape produced by forge-completer.
 function renderLedger(cwd) {
   const fragments = ledgerMod.listFragments(cwd);
@@ -62,16 +67,26 @@ function renderLedger(cwd) {
     return lines.join('\n') + '\n';
   }
 
+  // Parse everything up-front — ordering needs completed_at from the frontmatter
+  const parsed = [];
   for (const { id, path: fpath } of fragments) {
-    let frag;
     try {
       const text = fs.readFileSync(fpath, 'utf8');
-      frag = ledgerMod.parseFragment(text);
+      parsed.push({ id, frag: ledgerMod.parseFragment(text) });
     } catch (e) {
       process.stderr.write(`[forge-projection] warn: skipping ledger fragment ${id}: ${e.message}\n`);
-      continue;
     }
+  }
 
+  parsed.sort((a, b) => {
+    const ca = String(a.frag.completed_at || '');
+    const cb = String(b.frag.completed_at || '');
+    if (ca < cb) return -1;
+    if (ca > cb) return 1;
+    return a.id.localeCompare(b.id);
+  });
+
+  for (const { id, frag } of parsed) {
     // Emit block header
     lines.push(`## ${frag.id || id}`);
     if (frag.title) lines.push(`**${frag.title}**`);
