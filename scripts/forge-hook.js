@@ -363,6 +363,92 @@ process.stdin.on('end', () => {
       return;
     }
 
+    // ── Stop: block Claude from stopping when a fresh Forge run is active ────
+    // Guards run in order; any allow path returns immediately.
+    // Resolution is READ-ONLY (resolveBySessionId only) — never resolveRunForSession (has heal).
+    // Counter lives in os.tmpdir() — max 3 consecutive blocks, then allow + reset.
+    if (phase === 'stop') {
+      try {
+        const REASON  = 'Active Forge run with fresh heartbeat — the dispatch loop must not stop mid-run.';
+        const CONTINUE = 'A Forge run is still active in this workspace. Re-read .gsd/STATE.md, derive the next unit from the dispatch table, and continue the dispatch loop. To stop intentionally: create .gsd/forge/pause or deactivate the run via scripts/forge-runs.js --update <id> --json \'{"active":false}\'.';
+
+        const stopCounterFile = path.join(os.tmpdir(), `forge-stop-blocks-${sessionId}.json`);
+
+        const readCount = () => {
+          try {
+            const parsed = JSON.parse(fs.readFileSync(stopCounterFile, 'utf8'));
+            return (typeof parsed.count === 'number') ? parsed.count : 0;
+          } catch { return 0; }
+        };
+        const writeCount = (n) => {
+          try { fs.writeFileSync(stopCounterFile, JSON.stringify({ count: n, updated_at: Date.now() }), 'utf8'); } catch {}
+        };
+        const resetCount = () => writeCount(0);
+
+        // Guard 1: stop_hook_active flag — allow when explicitly set (counter untouched)
+        if (data.stop_hook_active === true) return;
+
+        // Guard 2: no .gsd/forge/ — not a forge workspace, no-op (~1 stat)
+        if (!fs.existsSync(path.join(cwd, '.gsd', 'forge'))) return;
+
+        // Guard 3: pause file present — allow + reset counter
+        if (fs.existsSync(path.join(cwd, '.gsd', 'forge', 'pause'))) {
+          resetCount();
+          return;
+        }
+
+        // Guard 4: resolve run READ-ONLY (never resolveRunForSession)
+        let run = null;
+        if (runs) {
+          run = runs.resolveBySessionId(cwd, sessionId);
+        }
+        // Legacy fallback: check auto-mode.json (read-only, no update)
+        if (!run) {
+          try {
+            const autoFile = path.join(cwd, '.gsd', 'forge', 'auto-mode.json');
+            const auto = JSON.parse(fs.readFileSync(autoFile, 'utf8'));
+            if (auto && auto.active === true && auto.session_id === sessionId) {
+              run = auto;
+            }
+          } catch {}
+        }
+        if (!run) {
+          resetCount();
+          return; // no matching run for this session
+        }
+
+        // Guard 5: stale heartbeat — allow + reset counter
+        // last_heartbeat is a numeric epoch in production (forge-runs.js writes
+        // Date.now()); ISO strings are tolerated for hand-edited/legacy records.
+        const hb = run.last_heartbeat;
+        const threshold = (runs && runs.ACTIVE_THRESHOLD_MS) ? runs.ACTIVE_THRESHOLD_MS : 15 * 60 * 1000;
+        const hbMs = (typeof hb === 'number') ? hb : (hb ? Date.parse(hb) : NaN);
+        if (!hb || isNaN(hbMs) || (Date.now() - hbMs) >= threshold) {
+          resetCount();
+          return;
+        }
+
+        // Guard 6: counter exhausted (>= 3) — allow + reset (5th will block again)
+        const count = readCount();
+        if (count >= 3) {
+          writeCount(0);
+          return;
+        }
+
+        // Guard 7: block — increment counter, emit block output
+        writeCount(count + 1);
+        process.stdout.write(JSON.stringify({
+          decision: 'block',
+          reason: REASON,
+          hookSpecificOutput: {
+            hookEventName: 'Stop',
+            additionalContext: CONTINUE,
+          },
+        }));
+      } catch { /* silent-fail — hook must never crash (MEM008) */ }
+      return;
+    }
+
     // ── PreToolUse / PostToolUse: track Agent dispatches ────────────────────
     const toolName  = data.tool_name  || '';
     const toolInput = data.tool_input || {};

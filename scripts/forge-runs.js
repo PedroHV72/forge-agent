@@ -24,7 +24,8 @@ const fs   = require('fs');
 const path = require('path');
 const ids  = require('./forge-ids.js');
 
-const STALE_THRESHOLD_MS = 30 * 60 * 1000;   // 30min: garbage-collect
+const STALE_THRESHOLD_MS  = 30 * 60 * 1000;   // 30min: garbage-collect
+const ACTIVE_THRESHOLD_MS = 15 * 60 * 1000;   // 15min: run "fresco" — Stop hook + statusline
 const ALIAS_FILE         = 'auto-mode.json'; // legacy alias
 
 function runsDir(cwd) {
@@ -333,4 +334,5 @@ module.exports = {
   refreshLegacyAlias, migrateLegacyState,
   runsDir, runFile,
   STALE_THRESHOLD_MS,
+  ACTIVE_THRESHOLD_MS,
 };

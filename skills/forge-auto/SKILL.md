@@ -54,13 +54,27 @@ Store as: `STATE`, `PREFS`, `ALL_MEMORIES`, `CODING_STANDARDS`.
 - `CS_RULES` — content of `## Code Rules` section only
 If CODING-STANDARDS.md is missing, all section variables are `"(none)"`.
 
+**Extract notifications pref from PREFS:**
+- `NOTIFICATIONS_ON` ← match `^notifications:[ \t]*(\S+)` (single-line, no `\s`, no `\Z`) in the merged prefs text; if absent or not `on`/`off`, default `on`. Store as `NOTIFICATIONS_ON`.
+
 Initialize:
 ```
 session_units    = 0
 COMPACT_AFTER    = PREFS.compact_after if set and not "unlimited", else "unlimited"
                    (0 or "unlimited" disables context checkpoints entirely — this is the default)
 completed_units  = []
+PUSH_AVAILABLE   = null   # sentinel: not yet probed this session
 ```
+
+**Probe PushNotification (1x per session, cached):**
+Run `ToolSearch("select:PushNotification")` exactly once. If the result contains an entry for `PushNotification`, set `PUSH_AVAILABLE = true`; otherwise `PUSH_AVAILABLE = false`. Never re-probe — use the cached value for all subsequent call-sites. PushNotification is a deferred tool; `ToolSearch` is the correct detection method (not tool-list introspection).
+
+**Push helper (define-once, use-thrice):**
+To fire a notification at any of the 3 call-sites: if `NOTIFICATIONS_ON != "on"` OR `PUSH_AVAILABLE != true` → silent-skip (no error, no log). Otherwise call:
+```
+PushNotification({ title: "Forge — {RUN_ID}", message: <mensagem pt-BR> })
+```
+Use this helper at every call-site below. Never duplicate the guard logic.
 
 **Cleanup orphaned tasks** — call `TaskList`. If any tasks have `status: in_progress` (leftover from a previous crashed session), mark them completed to keep the UI clean:
 ```
@@ -252,6 +266,7 @@ If the file exists:
    - `.gsd/CODING-STANDARDS.md` → re-extract `CS_LINT`, `CS_STRUCTURE`, `CS_RULES`
 2. Re-derive `EFFORT_MAP` and `THINKING_OPUS` from merged PREFS
 3. Reset `session_units = 0`
+3a. Reset `PUSH_AVAILABLE = null` and re-execute `ToolSearch("select:PushNotification")` at the next opportunity (same "not yet probed" semantics as activation — the probe runs once per context window, not once per process)
 4. Delete the signal: `rm -f .gsd/forge/compact-signal.json`
 5. Emit: `↺ Recovery pós-compactação — retomando de: {next_action from STATE.md}`
 6. Continue the loop normally (proceed to derive next unit below)
@@ -404,9 +419,10 @@ The produced `T##-SECURITY.md` will be injected into that task's worker prompt a
 **Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the slice branch `gsd/{M###}/{S##}` is still unmerged here, so the diff is intact). This is the challenger × defender confrontation:
 
 1. Idempotency: if `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already exists → skip the gate, proceed to `complete-slice`.
-2. Read `review.{mode,style,rounds,ask_in_auto}` via the cascade in `shared/forge-review.md § Step 0`. If `mode == disabled` → skip.
+2. Read `review.{mode,style,rounds,ask_in_auto,engine}` via the cascade in `shared/forge-review.md § Step 0`. If `mode == disabled` → skip.
 3. Execute the procedure in **`shared/forge-review.md`** with `MODE = auto`:
    > Antes de despachar cada agente (Challenge e Defense abaixo), exiba o **Spawn Liveness Banner** referenciado em `shared/forge-dispatch.md § Spawn Liveness Banner` com duração estimada para `review-challenger` / `review-advocate`.
+   - **Engine** (`shared/forge-review.md § Engine workflow`): se `engine: workflow` e a tool `Workflow` estiver no seu tool list (introspecção — NÃO ToolSearch), os três dispatches abaixo (Challenge/Defense/Rebuttal) são substituídos por UMA invocação Workflow; em tool ausente ou erro → fallback agents com warning + evento `review-engine-fallback`. O render do Step 6 e os Steps 7a/7b/8 não mudam.
    - Challenge → `Agent({ subagent_type: 'forge-reviewer', … })`
    - Defense → `Agent({ subagent_type: 'forge-advocate', … })`
    - Rebuttal × `rounds` → `forge-reviewer` in rebuttal mode (DEFENSE injected)
@@ -422,7 +438,7 @@ The produced `T##-SECURITY.md` will be injected into that task's worker prompt a
 
 1. Scan all `{S##}-REVIEW.md` under `.gsd/milestones/{M###}/slices/*/` for pending items: `Decisão: deferido → triagem no fim da milestone`, `Correção: falhou — deferida para triagem final`, or legacy `Decisão: deferido (auto-mode)`.
 2. Zero pending → skip silently and dispatch `complete-milestone` normally.
-3. Otherwise print the digest table (slice · R# · path:line · objeção · status) and triage each item via `AskUserQuestion` (batched up to 4, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
+3. Otherwise **fire push (call-site 2):** use Push helper with message `"Forge {RUN_ID} — {N} item(ns) de review aguardam sua triagem antes de fechar a milestone."` (N = count of pending items). Then print the digest table (slice · R# · path:line · objeção · status) and triage each item via `AskUserQuestion` (batched up to 4, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
 4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (slices already merged — fixes are normal commits). Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items also append to `.gsd/KNOWLEDGE.md § Review follow-ups` (survives `milestone_cleanup`).
 5. Append the `review-triage` event to `events.jsonl`. The triage **never blocks** the milestone close-out.
 
@@ -924,11 +940,10 @@ Agent({ subagent_type: "forge-executor", description: "⚡ T03 · <one-liner>", 
 1. Do NOT wait for background completion notifications — they may arrive later but the dispatch loop is not resumable from a half-state like this.
 2. Deactivate run (M005+ pattern — records reason in registry for post-hoc audit):
    ```bash
-   _deact=$(node -e "process.stdout.write(String(Date.now()))")
    if [ -n "$RUN_ID" ]; then
-     node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"active\":false,\"deactivated_at\":$_deact,\"deactivated_reason\":\"parallel_dispatch_backgrounded\"}" > /dev/null
+     node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}' > /dev/null
    else
-     echo "{\"active\":false,\"deactivated_at\":$_deact,\"reason\":\"parallel_dispatch_backgrounded\"}" > .gsd/forge/auto-mode.json
+     echo '{"active":false}' > .gsd/forge/auto-mode.json
    fi
    ```
 3. Append one `blocked` event per affected task to `events.jsonl` with `reason: "parallel_dispatch_backgrounded"` and `batch_size: N`.
@@ -984,8 +999,8 @@ fi
 
 Parse the `---GSD-WORKER-RESULT---` block:
 - `status: done` → proceed to post-unit housekeeping, then **immediately continue loop** (do NOT pause or ask user)
-- `status: partial` → write `continue.md`, update STATE, emit compact signal, **stop loop**
-- `status: blocked` → apply failure taxonomy before stopping:
+- `status: partial` → write `continue.md`, update STATE, emit compact signal, **fire push (call-site 1):** use Push helper with message `"Forge {RUN_ID} travou — partial: {resumo do blocker}. Run pausado, requer ação manual."`, then **deactivate run NOW** (`node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}'` — see `## Deactivate auto-mode indicator`), **stop loop**
+- `status: blocked` → apply failure taxonomy before stopping; if no auto-recovery or recovery exhausted: **fire push (call-site 1):** use Push helper with message `"Forge {RUN_ID} travou — {classe do blocker}: {resumo}. Run pausado, requer ação manual."`, then **deactivate run NOW** (`node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}'` — see `## Deactivate auto-mode indicator`), **stop loop**:
 
 **Failure Taxonomy** (check `blocker` field in result, first match wins):
 
@@ -1234,6 +1249,8 @@ Próximo milestone: /forge-new-milestone <descrição>
 ```
 
 The review digest is built from the `review` / `review-triage` events in `events.jsonl` (fallback: scan the `**Outcome:**` lines of each `{S##}-REVIEW.md`). Omit the section entirely when the milestone had zero objections.
+
+**Fire push (call-site 3):** After printing the Final Report above, use Push helper with message `"Forge {RUN_ID} — milestone completa. {N} slices entregues."` (N = count of slices in the report table).
 
 ---
 

@@ -145,6 +145,8 @@ see [docs/fragment-store.md](docs/fragment-store.md).
 | [Skills](docs/skills.md) | Skills incluídas, como instalar e contribuir |
 | [Configuração](docs/configuration.md) | Preferências, status line, arquivos do projeto |
 
+> **Nota — `review.engine: workflow` e approval prompt:** quando `review.engine: workflow` está configurado, cada debate de review usa a tool `Workflow` do Claude Code (requer ≥ v2.1.154). Em `permissions.defaultMode` padrão, **cada invocação Workflow pede aprovação do operador** — o que pausa o `forge-auto` silenciosamente. Para uso autônomo, configure `permissions.defaultMode: bypassPermissions` (usuários com a statusline ativa já têm — ativado pelo `merge-settings.js`). Se a tool `Workflow` não estiver disponível ou a invocação falhar, o gate faz **fallback automático para `engine: agents`** com um warning e regista o evento `review-engine-fallback` — nunca bloqueia.
+
 ---
 
 ## Atualizar

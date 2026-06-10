@@ -471,8 +471,24 @@ Do NOT modify STATE.md. Return ---GSD-WORKER-RESULT---.
 
 **Process result:**
 - `status: done` → `TaskUpdate({ status: "completed" })`, proceed to post-task
-- `status: partial` → `TaskUpdate` left in_progress, emit compact signal, stop
-- `status: blocked` → surface blocker to user, stop
+- `status: partial` → `TaskUpdate` left in_progress, emit compact signal, deactivate run, stop:
+  ```bash
+  if [ -n "$RUN_ID" ]; then
+    node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}' > /dev/null
+    node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
+  else
+    echo '{"active":false}' > .gsd/forge/auto-mode.json
+  fi
+  ```
+- `status: blocked` → deactivate run, surface blocker to user, stop:
+  ```bash
+  if [ -n "$RUN_ID" ]; then
+    node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}' > /dev/null
+    node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
+  else
+    echo '{"active":false}' > .gsd/forge/auto-mode.json
+  fi
+  ```
 
 `session_units += 1`
 

@@ -6,6 +6,18 @@ const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 
+// Dual-path require for ACTIVE_THRESHOLD_MS — follows forge-hook.js:27-33 pattern.
+// Never throws: statusline is installed flat in ~/.claude/ (without scripts/ sibling).
+let ACTIVE_THRESHOLD_MS;
+try {
+  ({ ACTIVE_THRESHOLD_MS } = require(path.join(__dirname, 'scripts', 'forge-runs.js')));
+} catch {
+  try {
+    ({ ACTIVE_THRESHOLD_MS } = require(path.join(__dirname, 'forge-runs.js')));
+  } catch { /* both paths failed — installed flat without forge-runs.js nearby */ }
+}
+if (typeof ACTIVE_THRESHOLD_MS !== 'number') ACTIVE_THRESHOLD_MS = 15 * 60 * 1000;
+
 process.stdin.setEncoding('utf8');
 let raw = '';
 process.stdin.on('data', chunk => (raw += chunk));
@@ -116,7 +128,7 @@ process.stdin.on('end', () => {
         // 5min was too aggressive — opus planner thinking phases produce no
         // mtime updates for 5-10min, causing the run to flap in/out of
         // multiRunActive (statusline flicker between "AUTO ×2" and "AUTO").
-        const STALE_MS = 15 * 60 * 1000;
+        const STALE_MS = ACTIVE_THRESHOLD_MS;
         const now = Date.now();
         const files = fs.readdirSync(runsDir).filter(f => f.endsWith('.json'));
         const forgeDir = path.join(cwd, '.gsd', 'forge');
@@ -189,7 +201,7 @@ process.stdin.on('end', () => {
         // Using mtime as fallback resolves the case where hooks aren't registered
         // (old session predating hook fix) AND the orchestrator is in long
         // extended-thinking phases between Bash heartbeat writes.
-        const STALE_THRESHOLD_SECS = 15 * 60;
+        const STALE_THRESHOLD_SECS = ACTIVE_THRESHOLD_MS / 1000;
         let eventsMtimeMs = 0;
         try {
           eventsMtimeMs = fs.statSync(path.join(cwd, '.gsd', 'forge', 'events.jsonl')).mtimeMs;

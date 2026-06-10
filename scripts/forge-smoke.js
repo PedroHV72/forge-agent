@@ -65,7 +65,7 @@ function cleanup(dir) {
 
 // ── Section 1: forge-runs CRUD ─────────────────────────────────────────────
 function smokeRuns() {
-  process.stdout.write('\n[1/13] forge-runs\n');
+  process.stdout.write('\n[1/16] forge-runs\n');
   const dir = mkTmp('runs');
 
   // list empty
@@ -104,7 +104,7 @@ function smokeRuns() {
 
 // ── Section 2: forge-lock acquire/release/steal ─────────────────────────────
 function smokeLock() {
-  process.stdout.write('\n[2/13] forge-lock\n');
+  process.stdout.write('\n[2/16] forge-lock\n');
   const dir = mkTmp('lock');
 
   let r = runScript('forge-lock.js', ['--acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
@@ -125,7 +125,7 @@ function smokeLock() {
 
 // ── Section 3: forge-state read/write/migrate-legacy ────────────────────────
 function smokeState() {
-  process.stdout.write('\n[3/13] forge-state + migrate-legacy\n');
+  process.stdout.write('\n[3/16] forge-state + migrate-legacy\n');
   const dir = mkTmp('state');
 
   // Setup legacy STATE.md
@@ -181,7 +181,7 @@ Continue T02.
 
 // ── Section 4: forge-dashboard regen ────────────────────────────────────────
 function smokeDashboard() {
-  process.stdout.write('\n[4/13] forge-dashboard + cross-reference\n');
+  process.stdout.write('\n[4/16] forge-dashboard + cross-reference\n');
   const dir = mkTmp('dash');
 
   // Setup: 1 run + per-milestone STATE
@@ -215,7 +215,7 @@ function smokeDashboard() {
 
 // ── Section 5: forge-merger E2E ─────────────────────────────────────────────
 function smokeMerger() {
-  process.stdout.write('\n[5/13] forge-merger\n');
+  process.stdout.write('\n[5/16] forge-merger\n');
   const dir = mkTmp('merger');
 
   fs.mkdirSync(path.join(dir, '.gsd/milestones/M060'), { recursive: true });
@@ -262,7 +262,7 @@ function smokeMerger() {
 
 // ── Section 6: forge-filelock cross-run ─────────────────────────────────────
 function smokeFilelock() {
-  process.stdout.write('\n[6/13] forge-filelock\n');
+  process.stdout.write('\n[6/16] forge-filelock\n');
   const dir = mkTmp('filelock');
 
   runScript('forge-runs.js', ['--add', '--id', 'M070', '--kind', 'milestone', '--session', 'sess-x', '--cwd', dir]);
@@ -293,7 +293,7 @@ function smokeFilelock() {
 
 // ── Section 7: forge-repos auto-detect ─────────────────────────────────────
 function smokeRepos() {
-  process.stdout.write('\n[7/13] forge-repos\n');
+  process.stdout.write('\n[7/16] forge-repos\n');
   const dir = mkTmp('repos');
 
   fs.mkdirSync(path.join(dir, 'repo-a/.git'), { recursive: true });
@@ -313,7 +313,7 @@ function smokeRepos() {
 
 // ── Section 8: forge-cli-helpers refuse logic ───────────────────────────────
 function smokeCliHelpers() {
-  process.stdout.write('\n[8/13] forge-cli-helpers\n');
+  process.stdout.write('\n[8/16] forge-cli-helpers\n');
   const dir = mkTmp('cli');
 
   // 0 active + no arg → legacy
@@ -371,7 +371,7 @@ function smokeCliHelpers() {
 
 // ── Section 9: forge-isolation prefs + setup/cleanup ────────────────────────
 function smokeIsolation() {
-  process.stdout.write('\n[9/13] forge-isolation\n');
+  process.stdout.write('\n[9/16] forge-isolation\n');
   const dir = mkTmp('iso');
   // Isolate HOME so the operator's real ~/.claude/forge-agent-prefs.md never leaks in
   const env = { ...process.env, HOME: dir, USERPROFILE: dir };
@@ -428,6 +428,24 @@ function smokeIsolation() {
   res = JSON.parse(r.stdout);
   assert(res.repos[0].status === 'removed' && !fs.existsSync(wt), 'worktree cleanup removes when pref true', r.stdout);
 
+  // dirty worktree: cleanup must SKIP and preserve uncommitted work even with pref true
+  // (regression guard — 2026-06-10 incident: --force removal discarded an uncommitted milestone)
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-SMOKE-WT2', '--cwd', repo], { env });
+  res = JSON.parse(r.stdout);
+  const wt2 = res.repos[0] && res.repos[0].worktree;
+  assert(wt2 && fs.existsSync(wt2), 'worktree setup creates second worktree', r.stdout);
+  fs.writeFileSync(path.join(wt2, 'uncommitted.txt'), 'work in progress\n');
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-SMOKE-WT2', '--cwd', repo], { env });
+  res = JSON.parse(r.stdout);
+  assert(/^skipped \(dirty\)/.test(res.repos[0].status) && fs.existsSync(wt2),
+    'dirty worktree cleanup skips removal and preserves uncommitted work', r.stdout);
+  // after committing, the same cleanup removes the now-clean worktree
+  git(['add', 'uncommitted.txt'], wt2);
+  git(['-c', 'user.email=smoke@forge', '-c', 'user.name=smoke', 'commit', '-qm', 'wip'], wt2);
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-SMOKE-WT2', '--cwd', repo], { env });
+  res = JSON.parse(r.stdout);
+  assert(res.repos[0].status === 'removed' && !fs.existsSync(wt2), 'clean worktree cleanup removes after commit', r.stdout);
+
   cleanup(dir);
 }
 
@@ -435,7 +453,7 @@ function smokeIsolation() {
 const { auditTestQuality } = require('./forge-verifier');
 
 function smokeSymbolAndTestQuality() {
-  process.stdout.write('\n[11/13] symbol-check + test-quality\n');
+  process.stdout.write('\n[11/16] symbol-check + test-quality\n');
   const dir = mkTmp('s02');
 
   // Create a small code file with a known function
@@ -540,7 +558,7 @@ Implement \`newThing\` in code/newThing.js.
 
 // ── Section 10: Spawn Liveness Banner presence ──────────────────────────────
 function smokeLivenessBanner() {
-  process.stdout.write('\n[10/13] liveness-banner\n');
+  process.stdout.write('\n[10/16] liveness-banner\n');
   const root = path.join(SCRIPTS, '..');
 
   // Assert canonical phrase + section in shared/forge-dispatch.md
@@ -574,7 +592,7 @@ function smokeLivenessBanner() {
 const cm = require('./forge-context-monitor');
 
 function smokeContextMonitor() {
-  process.stdout.write('\n[12/13] context-monitor\n');
+  process.stdout.write('\n[12/16] context-monitor\n');
 
   // severity from bridge fixtures
   assert(cm.severityFor(0.20) === 'critical', 'ctx #1: 0.20 remaining → critical', `got ${cm.severityFor(0.20)}`);
@@ -612,7 +630,7 @@ function smokeContextMonitor() {
 // ── Section 13: node-repair invariants ────────────────────────────────────────
 
 function smokeNodeRepair() {
-  process.stdout.write('\n[13/13] node-repair\n');
+  process.stdout.write('\n[13/16] node-repair\n');
 
   const dispatchPath = path.join(path.dirname(SCRIPTS), 'shared', 'forge-dispatch.md');
   const parallelismPath = path.join(SCRIPTS, 'forge-parallelism.js');
@@ -799,6 +817,378 @@ function smokeNodeRepair() {
   }
 }
 
+// ── Section 14: stop-hook registration + exit anchors + stop branch regression ─
+function smokeStopHook() {
+  process.stdout.write('\n[14/16] stop-hook\n');
+
+  const ROOT = path.dirname(SCRIPTS);
+  const mergeSettingsPath = path.join(SCRIPTS, 'merge-settings.js');
+  const autoSkillPath     = path.join(ROOT, 'skills', 'forge-auto', 'SKILL.md');
+  const taskSkillPath     = path.join(ROOT, 'skills', 'forge-task', 'SKILL.md');
+
+  // ── (a) Behavioural: merge-settings registers Stop in LIFECYCLE_HOOKS ──────
+  const dir = mkTmp('stop-hook');
+  try {
+    const settingsFile = path.join(dir, 'settings.json');
+    fs.writeFileSync(settingsFile, '{}', 'utf8');
+
+    // Run merge the same way smokeMerger runs forge-merger: via runScript / spawnSync
+    const mergeResult = spawnSync(
+      'node', [mergeSettingsPath, settingsFile],
+      { encoding: 'utf8' }
+    );
+    assert(
+      mergeResult.status === 0,
+      'merge-settings exits 0 on empty settings',
+      mergeResult.stderr
+    );
+
+    let merged;
+    try { merged = JSON.parse(fs.readFileSync(settingsFile, 'utf8')); } catch (e) {
+      fail('merge-settings produces valid JSON', String(e));
+      return;
+    }
+
+    const stopHooks = (merged.hooks && merged.hooks.Stop) || [];
+    const stopEntry = stopHooks.find(
+      e => e.hooks && e.hooks.some(
+        h => h.command && h.command.includes('forge-hook.js') && /\bstop$/.test(h.command.trim())
+      )
+    );
+    assert(
+      !!stopEntry,
+      'LIFECYCLE_HOOKS missing Stop entry (merge-settings.js line ~35)',
+      `hooks.Stop = ${JSON.stringify(stopHooks)}`
+    );
+  } finally {
+    cleanup(dir);
+  }
+
+  // ── (b) Exit anchor heuristic — Anchor Contract from S01-PLAN ─────────────
+  // Regex: /forge-runs\.js[^\n]*--update[\s\S]{0,300}?["']active["']\s*:\s*false/
+  // Heuristic over markdown — if this fails after a legit rephrase, update the
+  // anchor list here. Failure message names the file + exit (not opaque).
+  const ANCHOR_RE = /forge-runs\.js[^\n]*--update[\s\S]{0,300}?["']active["']\s*:\s*false/;
+
+  // Window: find an anchor text in the file; extract the next ~1000 chars (~30 lines);
+  // assert ANCHOR_RE. Heuristic over markdown — if this fails after a legit rephrase,
+  // update the anchor list here.
+  function assertExitAnchor(filePath, fileName, exitLabel, anchorText, windowSize) {
+    windowSize = windowSize || 1000;
+    let content;
+    try {
+      content = fs.readFileSync(filePath, 'utf8');
+    } catch (e) {
+      fail(`${fileName} readable`, `file not found or unreadable: ${filePath} — ${e.message}`);
+      return;
+    }
+    const idx = content.indexOf(anchorText);
+    if (idx === -1) {
+      fail(
+        `${fileName} exit '${exitLabel}' anchor text found`,
+        `anchor text not found: "${anchorText.slice(0, 80)}"`
+      );
+      return;
+    }
+    const window = content.slice(idx, idx + windowSize);
+    assert(
+      ANCHOR_RE.test(window),
+      `${fileName} exit '${exitLabel}' has run-deactivation anchor`,
+      `${fileName} exit '${exitLabel}' lost run-deactivation anchor — check region around: "${anchorText.slice(0, 60)}"`
+    );
+  }
+
+  // forge-auto exits to audit (per T04-PLAN § Step 2b)
+  // Anchors chosen to be within ~30 lines before the forge-runs.js --update call
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'plan-check non-decreasing',
+    'reason: `non-decreasing`');
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'plan-check exhausted',
+    'terminated-exhausted');
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'Agent() dispatch failure',
+    'CRITICAL — Agent() dispatch failure');
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'parallel_dispatch_backgrounded',
+    'Fail-fast check (execute BEFORE processing any result)');
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'pause',
+    'Deactivate THIS run only');
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'status: partial',
+    'emit compact signal');
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'status: blocked',
+    'deactivate run NOW');
+  assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', '## Deactivate auto-mode indicator',
+    '## Deactivate auto-mode indicator');
+
+  // forge-task exits to audit
+  assertExitAnchor(taskSkillPath, 'forge-task/SKILL.md', 'status: done',
+    '`status: done`');
+  assertExitAnchor(taskSkillPath, 'forge-task/SKILL.md', 'status: partial',
+    '`status: partial`');
+  assertExitAnchor(taskSkillPath, 'forge-task/SKILL.md', 'status: blocked',
+    '`status: blocked`');
+
+  // ── (c) Branch stop regression: forge-hook-stop.test.js passes ─────────────
+  const stopTest = runScript('forge-hook-stop.test.js', []);
+  assert(
+    stopTest.status === 0,
+    'forge-hook-stop.test.js failed — stop branch regression',
+    stopTest.stderr || stopTest.stdout
+  );
+}
+
+// ── Section 15: notifications pref + PushNotification probe + call-sites ─────
+function smokeNotifications() {
+  process.stdout.write('\n[15/16] notifications\n');
+
+  const ROOT = path.dirname(SCRIPTS);
+  const prefsPath    = path.join(ROOT, 'forge-agent-prefs.md');
+  const autoSkillPath = path.join(ROOT, 'skills', 'forge-auto', 'SKILL.md');
+
+  // ── (a) Pref scaffold: forge-agent-prefs.md has ## Notification Settings ───
+  // Heuristic over markdown — if this fails after a legit rephrase, update the
+  // anchor strings here. Failure message names the file + block (not opaque).
+  let prefsContent;
+  try {
+    prefsContent = fs.readFileSync(prefsPath, 'utf8');
+  } catch (e) {
+    fail('forge-agent-prefs.md readable', `file not found or unreadable: ${prefsPath} — ${e.message}`);
+    return;
+  }
+
+  assert(
+    prefsContent.includes('## Notification Settings'),
+    'forge-agent-prefs.md has ## Notification Settings block',
+    'forge-agent-prefs.md is missing "## Notification Settings" — T01 pref scaffold may have been removed'
+  );
+  assert(
+    prefsContent.includes('notifications:'),
+    'forge-agent-prefs.md has notifications: key',
+    'forge-agent-prefs.md is missing "notifications:" key in Notification Settings block'
+  );
+  assert(
+    /notifications:\s+on/.test(prefsContent),
+    'forge-agent-prefs.md has notifications: on as default',
+    'forge-agent-prefs.md "notifications:" default is not "on" — check ## Notification Settings block'
+  );
+
+  // ── (b) Probe + pref read in SKILL.md ────────────────────────────────────
+  // Heuristic over markdown — if this fails after a legit rephrase, update the
+  // anchor strings here. Failure message names the file + what is missing.
+  let skillContent;
+  try {
+    skillContent = fs.readFileSync(autoSkillPath, 'utf8');
+  } catch (e) {
+    fail('skills/forge-auto/SKILL.md readable', `file not found or unreadable: ${autoSkillPath} — ${e.message}`);
+    return;
+  }
+
+  assert(
+    skillContent.includes('ToolSearch') && skillContent.includes('PushNotification'),
+    'forge-auto/SKILL.md has PushNotification ToolSearch probe',
+    'forge-auto/SKILL.md is missing ToolSearch or PushNotification — probe may have been removed'
+  );
+  assert(
+    skillContent.includes('select:PushNotification'),
+    'forge-auto/SKILL.md has select:PushNotification anchor',
+    'forge-auto/SKILL.md is missing "select:PushNotification" — ToolSearch probe anchor may have been removed'
+  );
+  assert(
+    /NOTIFICATIONS_ON/.test(skillContent),
+    'forge-auto/SKILL.md reads notifications pref (NOTIFICATIONS_ON)',
+    'forge-auto/SKILL.md is missing NOTIFICATIONS_ON pref read — T01 pref-read scaffold may have been removed'
+  );
+
+  // ── (c) 3 call-sites: count "fire push" invocations in SKILL.md ──────────
+  // Heuristic: call-sites are written as "fire push (call-site N)" using the Push helper.
+  // The Push helper definition has PushNotification({...}); the call-sites reference
+  // "fire push" or "Push helper". Count "fire push (call-site" occurrences — should be ≥3.
+  // If a legit rephrase reduces count, update this threshold and the anchor list below.
+  const firePushRe = /fire push \(call-site/g;
+  const firePushMatches = skillContent.match(firePushRe) || [];
+  assert(
+    firePushMatches.length >= 3,
+    `forge-auto/SKILL.md has ≥3 push call-sites (found ${firePushMatches.length})`,
+    `forge-auto/SKILL.md has only ${firePushMatches.length} "fire push (call-site" entries — expected ≥3 (blocker, review triage, Final Report)`
+  );
+
+  // Verify each of the 3 anchor regions contains a push invocation reference.
+  // Heuristic over markdown: find each anchor text, extract surrounding window,
+  // assert "fire push" or "Push helper" appears nearby. Failure names the call-site.
+  const PUSH_INVOKE_RE = /fire push|Push helper/;
+
+  function assertPushCallSite(anchorText, callSiteLabel, windowSize) {
+    windowSize = windowSize || 2000;
+    const idx = skillContent.indexOf(anchorText);
+    if (idx === -1) {
+      fail(
+        `forge-auto/SKILL.md call-site '${callSiteLabel}' anchor found`,
+        `anchor text not found: "${anchorText.slice(0, 80)}" — call-site may have moved or anchor needs update`
+      );
+      return;
+    }
+    const window = skillContent.slice(Math.max(0, idx - 100), idx + windowSize);
+    assert(
+      PUSH_INVOKE_RE.test(window),
+      `forge-auto/SKILL.md call-site '${callSiteLabel}' has push invoke`,
+      `forge-auto/SKILL.md call-site '${callSiteLabel}' lost push invoke — check region around: "${anchorText.slice(0, 60)}"`
+    );
+  }
+
+  // Call-site 1: blocker/partial (deactivate run NOW)
+  assertPushCallSite('deactivate run NOW', 'blocker/partial');
+  // Call-site 2: review triage gate (before complete-milestone)
+  assertPushCallSite('Review triage gate', 'review triage gate');
+  // Call-site 3: Final Report (milestone complete)
+  assertPushCallSite('## Final Report', 'Final Report');
+}
+
+function smokeReviewEngine() {
+  process.stdout.write('\n[16/16] review-engine\n');
+
+  const ROOT = path.dirname(SCRIPTS);
+  const prefsPath  = path.join(ROOT, 'forge-agent-prefs.md');
+  const specPath   = path.join(ROOT, 'shared', 'forge-review.md');
+
+  // ── (a) forge-agent-prefs.md: Review Settings block with engine: agents ────
+  // Heuristic over markdown — if this fails after a legit rephrase of the pref
+  // block, update the anchor and regex here. Failure message names file + what.
+  let prefsContent;
+  try {
+    prefsContent = fs.readFileSync(prefsPath, 'utf8');
+  } catch (e) {
+    fail('review-engine: forge-agent-prefs.md readable', `file not found or unreadable: ${prefsPath} — ${e.message}`);
+    return;
+  }
+
+  // Extract fenced block under ## Review Settings and check for engine: agents line
+  const reviewSettingsIdx = prefsContent.indexOf('## Review Settings');
+  assert(
+    reviewSettingsIdx !== -1,
+    'review-engine: pref ## Review Settings block',
+    `forge-agent-prefs.md is missing "## Review Settings" — T01 pref scaffold may have been removed`
+  );
+
+  // Look for the fenced block (```) after ## Review Settings (within 2000 chars)
+  const reviewSettingsWindow = prefsContent.slice(reviewSettingsIdx, reviewSettingsIdx + 2000);
+  const fenceStart = reviewSettingsWindow.indexOf('```');
+  const fenceEnd   = fenceStart !== -1 ? reviewSettingsWindow.indexOf('```', fenceStart + 3) : -1;
+  const fencedBlock = (fenceStart !== -1 && fenceEnd !== -1)
+    ? reviewSettingsWindow.slice(fenceStart, fenceEnd + 3)
+    : '';
+
+  assert(
+    /^\s*engine:\s*agents/m.test(fencedBlock),
+    'review-engine: pref engine key',
+    `forge-agent-prefs.md review: fenced block missing "engine: agents" line — T01 engine key may have been removed`
+  );
+
+  // Semântica section should mention review-engine-fallback (doc of fallback present)
+  assert(
+    prefsContent.includes('review-engine-fallback'),
+    'review-engine: pref review-engine-fallback doc',
+    `forge-agent-prefs.md is missing "review-engine-fallback" — T01 fallback documentation may have been removed`
+  );
+
+  // ── (b) shared/forge-review.md: presence asserts ────────────────────────────
+  // Heuristic over markdown — update anchor strings if legitimate refactor changes them.
+  let specContent;
+  try {
+    specContent = fs.readFileSync(specPath, 'utf8');
+  } catch (e) {
+    fail('review-engine: shared/forge-review.md readable', `file not found or unreadable: ${specPath} — ${e.message}`);
+    return;
+  }
+
+  const workflowPresent = specContent.includes('## Engine workflow');
+  assert(
+    workflowPresent,
+    'review-engine: spec workflow section',
+    `shared/forge-review.md is missing "## Engine workflow" heading — T02 engine workflow section may have been removed`
+  );
+  if (!workflowPresent) {
+    // Absence asserts below depend on extracting the ## Engine workflow section.
+    // Skipping them to avoid vacuous passes when the section does not exist.
+    return;
+  }
+
+  assert(
+    specContent.includes('export const meta'),
+    'review-engine: spec export const meta literal',
+    `shared/forge-review.md is missing "export const meta" — T02 meta literal in Engine workflow may have been removed`
+  );
+
+  assert(
+    specContent.includes("agentType: 'forge-reviewer'"),
+    'review-engine: spec agentType forge-reviewer',
+    `shared/forge-review.md is missing "agentType: 'forge-reviewer'" — T02 reviewer agentType may have been removed`
+  );
+
+  assert(
+    specContent.includes("agentType: 'forge-advocate'"),
+    'review-engine: spec agentType forge-advocate',
+    `shared/forge-review.md is missing "agentType: 'forge-advocate'" — T02 advocate agentType may have been removed`
+  );
+
+  assert(
+    specContent.includes('review-engine-fallback'),
+    'review-engine: spec review-engine-fallback event',
+    `shared/forge-review.md is missing "review-engine-fallback" — T02 fallback event may have been removed`
+  );
+
+  // Step 0 parse: engine array ['agents','workflow'] — tolerant to quotes/spacing
+  assert(
+    /\[\s*'agents'\s*,\s*'workflow'\s*\]/.test(specContent),
+    "review-engine: spec Step 0 engine parse ['agents','workflow']",
+    `shared/forge-review.md is missing "['agents','workflow']" array in Step 0 — T02 engine detection snippet may have been removed`
+  );
+
+  // ── (c) shared/forge-review.md: absence asserts (S03-RISK Blocker 2 guard) ──
+  // The Engine workflow script MUST NOT contain clock/random primitives — the
+  // Workflow runtime throws on these and they also break deterministic resume.
+  // Scoped to the ## Engine workflow section only: the PROHIBITED doc line in that
+  // section lists these patterns in backtick-quoted text (e.g. `Date.now()`), so
+  // we scan only the JS code block(s) inside the section, not the prose. We extract
+  // from the section heading to the next ## heading (or EOF) and strip markdown
+  // code fences to check only fenced code content.
+  const engineWorkflowIdx = specContent.indexOf('## Engine workflow');
+  const nextSectionIdx = specContent.indexOf('\n## ', engineWorkflowIdx + 1);
+  const engineSection = engineWorkflowIdx !== -1
+    ? specContent.slice(engineWorkflowIdx, nextSectionIdx !== -1 ? nextSectionIdx : undefined)
+    : '';
+
+  // Extract only fenced code blocks (``` ... ```) from the section
+  const fencedCodeRe = /```(?:\w*\n)?([\s\S]*?)```/g;
+  let engineCode = '';
+  let fm;
+  while ((fm = fencedCodeRe.exec(engineSection)) !== null) {
+    engineCode += fm[1] + '\n';
+  }
+
+  assert(
+    !/Date\.now\s*\(/.test(engineCode),
+    'review-engine: spec no Date.now() (Blocker 2)',
+    `shared/forge-review.md Engine workflow code block contains "Date.now(" — prohibited; breaks Workflow runtime resume`
+  );
+
+  assert(
+    !/new Date\s*\(/.test(engineCode),
+    'review-engine: spec no new Date() (Blocker 2)',
+    `shared/forge-review.md Engine workflow code block contains "new Date(" — prohibited; breaks Workflow runtime resume`
+  );
+
+  assert(
+    !/Math\.random\s*\(/.test(engineCode),
+    'review-engine: spec no Math.random() (Blocker 2)',
+    `shared/forge-review.md Engine workflow code block contains "Math.random(" — prohibited; breaks Workflow runtime resume`
+  );
+
+  // 2026-06-10 dogfood: a wrapped body never parses — runtime only accepts the
+  // meta export; everything else must be top-level statements in async context.
+  assert(
+    !/export\s+default/.test(engineCode),
+    'review-engine: script body at top level (no export default wrapper)',
+    `shared/forge-review.md Engine workflow code block contains "export default" — the Workflow runtime throws SyntaxError on any export besides meta`
+  );
+}
+
 function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -818,6 +1208,9 @@ function main() {
     smokeSymbolAndTestQuality();
     smokeContextMonitor();
     smokeNodeRepair();
+    smokeStopHook();
+    smokeNotifications();
+    smokeReviewEngine();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

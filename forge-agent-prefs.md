@@ -130,6 +130,39 @@ ganha) > default `timestamp`. Valor inválido cai silenciosamente em `timestamp`
 - Consumidores: `skills/forge-new-milestone/SKILL.md`, `skills/forge-task/SKILL.md`,
   `scripts/forge-cli-helpers.js` (`newTaskId`)
 
+## Notification Settings
+
+Controla se o `forge-auto` dispara notificações push (via tool `PushNotification`) nos
+pontos de espera humana do loop: blocker não-recuperável, triagem final de review antes
+de `complete-milestone`, e Final Report.
+
+```
+notifications: on        # on | off
+```
+
+### Semântica
+
+- `on` (default) — dispara `PushNotification` do harness nos 3 pontos de espera:
+  blocker não-recuperável, triagem final de review (antes de fechar a milestone),
+  e Final Report (milestone completa). Em qualquer modo, ausência da tool
+  `PushNotification` no harness = **silent-skip** (zero erro no loop).
+- `off` — desativa todos os pushes; o loop se comporta de forma idêntica, sem notificação.
+- Valor inválido (qualquer coisa diferente de `on`/`off`) cai silenciosamente em `on`.
+- A tool `PushNotification` é *deferred* — carregada via `ToolSearch("select:PushNotification")`
+  **uma única vez** por janela de contexto, resultado cacheado em `PUSH_AVAILABLE`. Não re-probar
+  em cada iteração. Se o contexto for compactado, `PUSH_AVAILABLE` é redefinido para `null` no
+  recovery pós-compactação e o probe é reexecutado (1x por janela de contexto, não 1x por processo).
+
+### Cross-references
+
+- Consumidor principal: `skills/forge-auto/SKILL.md` (leitura na ativação em `## Load context`
+  + probe único cacheado `PUSH_AVAILABLE` + 3 invokes condicionais nos call-sites de espera)
+- Tool: `PushNotification` (deferred — detectada via `ToolSearch`, não via introspecção direta)
+
+### Resolução
+
+Cascata user → repo → local, último ganha. Valor inválido cai em `on`.
+
 ## Forge Isolation (multi-run)
 
 Controla como múltiplos `/forge-auto`/`/forge-task` simultâneos isolam suas mudanças.
@@ -150,6 +183,9 @@ forge_isolation:
   worktree_root: ".forge-worktrees"  # diretório raiz onde worktrees são criadas
                                      # path relativo ao workspace; absoluto também aceito
   worktree_cleanup_on_complete: false # remove worktree ao completar milestone
+                                     # mesmo com true, NUNCA remove worktree suja (mudanças não
+                                     # commitadas) — cleanup vira skipped (dirty); commit na branch
+                                     # forge/{id} primeiro (obrigatório com auto_commit: false)
 
   file_locks: true                   # ativa PreToolUse file-lock check (default true em shared/branch)
                                      # ignorado em mode=worktree (FS já isolado)
@@ -178,8 +214,10 @@ O setup roda automaticamente na ativação de `/forge-auto`, `/forge-next` e `/f
 (via `scripts/forge-isolation.js --setup`, idempotente). O cleanup roda apenas quando a
 milestone/task **completa** (`--cleanup`): `branch` volta para a branch default (a branch
 `forge/{id}` é preservada para PR); `worktree` só remove a worktree se
-`worktree_cleanup_on_complete: true`. Pause/blocked nunca disparam cleanup — o isolamento
-sobrevive para o resume.
+`worktree_cleanup_on_complete: true` **e o working tree estiver limpo** — mudanças não
+commitadas nunca são descartadas (status `skipped (dirty)`; com `auto_commit: false`,
+commite na branch `forge/{id}` antes do cleanup). Pause/blocked nunca disparam cleanup —
+o isolamento sobrevive para o resume.
 
 ### Override por run
 
@@ -534,6 +572,7 @@ Controla o **review gate dialético** que roda no orquestrador antes de `complet
 ```
 review:
   mode: enabled       # enabled | disabled
+  engine: agents      # agents | workflow — quem roda o debate (Steps 2–5)
   style: dialectic    # dialectic | flags
   rounds: 1           # 0–3 rodadas de réplica do reviewer sobre a defesa
   ask_in_auto: defer  # defer | pause
@@ -543,6 +582,11 @@ review:
 ### Semântica
 
 - `mode: enabled` (padrão): o gate roda. `disabled`: pula inteiramente — nenhum `S##-REVIEW.md` é gerado.
+- `engine: agents` (padrão): o orquestrador despacha `forge-reviewer`/`forge-advocate` via `Agent()` — comportamento atual, byte-a-byte; nenhum pré-requisito de versão ou permissão adicional.
+- `engine: workflow`: os Steps 2–5 (challenge → defense → rebuttal × rounds) rodam numa ÚNICA invocação da tool `Workflow` do harness (Claude Code ≥ v2.1.154) com `agentType: forge-reviewer/forge-advocate` — o diálogo inteiro sai do contexto do orquestrador, que recebe só o JSON de resolução e renderiza o `S##-REVIEW.md`. Detecção no Step 0 do gate por introspecção do tool list do orquestrador; **tool ausente → fallback automático para `agents`** com warning de uma linha + evento `review-engine-fallback` em `events.jsonl` — nunca falha, nunca bloqueia o gate.
+  - **Pré-requisito de approval:** em `permissions.defaultMode` padrão, **cada run de Workflow pede aprovação do operador** — num `forge-auto` isso pausa o loop de forma invisível. Modo recomendado para `engine: workflow`: `permissions.defaultMode: bypassPermissions` (usuários com a statusline ativa já têm — `merge-settings.js` configura isso automaticamente). Sem bypass, o gate never-blocks cobre: run não retorna → fallback agents com evento `review-engine-fallback`.
+  - **Interação com `style`:** `style: flags` ignora `engine` — o single-pass legado roda sempre via agents (um debate de 3 fases não tem forma "flags").
+  - **Fallback em dois pontos:** (a) tool ausente no Step 0, `reason: "tool-absent"`; (b) invocação lança throw ou retorna `{outcome:'error'}` (challenge null), `reason: "workflow-error:<stage>"` — em ambos, o gate rerun via caminho agents (Steps 2–5).
 - `style: dialectic` (padrão): loop completo challenge → defense → rebuttal → resolução. Objeções `aberta`s sobem ao humano (via `AskUserQuestion` em modo interativo). `style: flags`: single-pass legado — só o reviewer, grava `## ⚠ Review Flags` em `S##-REVIEW.md`, sem defesa nem perguntas. Opt-out do debate.
 - `rounds` (padrão `1`): quantas vezes o reviewer replica à defesa do advocate. `0` = sem réplica (toda objeção contestada vira `aberta`). Cap em `3`.
 - `ask_in_auto` (padrão `defer`): em `forge-auto`, `defer` **não pausa no meio do loop** — marca as `aberta`s como `deferido → triagem no fim da milestone` e segue (honra a AUTONOMY RULE). **Defer não engole:** todo item deferido é apresentado ao operador na triagem final, antes do `complete-milestone` rodar de fato. `pause` faz o `forge-auto` perguntar ao humano por slice, mesmo no modo autônomo (opt-in).
@@ -561,11 +605,12 @@ review:
 ### Cross-references
 
 - Spec autoritativa: `shared/forge-review.md` (procedimento completo do gate).
+- Engine workflow: `shared/forge-review.md § Engine workflow` (script inline, schemas full-text, tratamento de null/throw por etapa).
 - Challenger: `agents/forge-reviewer.md` (challenge mode + rebuttal mode).
 - Defender: `agents/forge-advocate.md`.
 - Dispatch guard: `skills/forge-auto/SKILL.md` + `skills/forge-next/SKILL.md` (antes de `complete-slice`; idempotente — se `S##-REVIEW.md` já existe, pula). Triagem final: mesmos skills, antes de `complete-milestone` (`shared/forge-review.md § Step 9`).
 - Artefato gerado: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (per-slice) ou `.gsd/tasks/{TASK_ID}/{TASK_ID}-REVIEW.md` (task solta) — durável com a unidade; limpo por `milestone_cleanup`. Follow-ups da triagem final vão para `.gsd/KNOWLEDGE.md § Review follow-ups` (sobrevive cleanup).
-- Dois boundaries: per-slice (gate antes de `complete-slice` em `forge-auto`/`forge-next`) e task solta (`/forge-task` step 5.5, sempre interativo). Ambos honram `mode`/`style`/`rounds`/`fix_conceded`; `ask_in_auto` só se aplica ao `forge-auto`.
+- Dois boundaries: per-slice (gate antes de `complete-slice` em `forge-auto`/`forge-next`) e task solta (`/forge-task` step 5.5, sempre interativo). Ambos honram `mode`/`style`/`rounds`/`fix_conceded`/`engine`; `ask_in_auto` só se aplica ao `forge-auto`.
 
 ## Token Budget Settings
 
@@ -766,6 +811,8 @@ repo_path:    # preenchido pelo install.sh — caminho do repositório gsd-agent
 
 ## Notes
 
+- Para detalhes de `engine: workflow` (script inline, schemas, tratamento de null/throw por etapa), consultar `shared/forge-review.md § Engine workflow`.
+- `review.engine` é ignorado quando `review.mode: disabled`.
 - Para mudar o modelo de uma fase, edite o bloco `tier_models:` na seção `## Tier Settings` acima.
   A tabela Phase → Agent Routing é informacional; o bloco `tier_models:` é a fonte de verdade.
 - Modelos disponíveis: fable (claude-fable-5 — tier max, 2x custo do opus), opus (claude-opus-4-8[1m], fallback claude-opus-4-7), sonnet (claude-sonnet-4-6), haiku (claude-haiku-4-5-20251001)

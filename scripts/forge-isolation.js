@@ -177,6 +177,15 @@ function cleanupWorktreeOne(repoPath, worktreePath) {
       result.status = 'not-found';
       return result;
     }
+    // Uncommitted work (modified or untracked) is unrecoverable after removal —
+    // commits on the forge/{id} branch survive, the working tree does not.
+    // worktree_cleanup_on_complete only authorizes removal of a CLEAN worktree.
+    const dirty = execSync('git status --porcelain', { cwd: worktreePath, encoding: 'utf8', shell: true, stdio: 'pipe' }).trim();
+    if (dirty) {
+      result.status = 'skipped (dirty)';
+      result.reason = 'uncommitted changes in worktree — commit on the forge branch (or discard) before cleanup; nothing was removed';
+      return result;
+    }
     execSync(`git worktree remove "${worktreePath}" --force`, { cwd: repoPath, encoding: 'utf8', shell: true, stdio: 'pipe' });
     result.status = 'removed';
   } catch (e) {

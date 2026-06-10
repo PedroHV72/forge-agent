@@ -34,7 +34,7 @@ const wd=process.env.WORKING_DIR||process.cwd();
 const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
              path.join(wd,'.gsd','claude-agent-prefs.md'),
              path.join(wd,'.gsd','prefs.local.md')];
-let mode='enabled',style='dialectic',rounds=1,askAuto='defer',fixConceded=true;
+let mode='enabled',style='dialectic',rounds=1,askAuto='defer',fixConceded=true,engine='agents';
 for(const f of files){try{
   const r=fs.readFileSync(f,'utf8');
   const blk=(r.match(/^review:[ \t]*\n((?:[ \t]+.*\n?)*)/m)||[])[1]||'';
@@ -44,18 +44,41 @@ for(const f of files){try{
   if(m=blk.match(/^[ \t]+rounds:[ \t]*(\d+)/m))rounds=parseInt(m[1],10);
   if(m=blk.match(/^[ \t]+ask_in_auto:[ \t]*(\w+)/m))askAuto=m[1].toLowerCase();
   if(m=blk.match(/^[ \t]+fix_conceded:[ \t]*(\w+)/m))fixConceded=m[1].toLowerCase()!=='false';
+  if(m=blk.match(/^[ \t]+engine:[ \t]*(\w+)/m))engine=m[1].toLowerCase();
 }catch(e){}}
 if(!['enabled','disabled'].includes(mode))mode='enabled';
 if(!['dialectic','flags'].includes(style))style='dialectic';
 if(!Number.isInteger(rounds)||rounds<0||rounds>3)rounds=1;
 if(!['defer','pause'].includes(askAuto))askAuto='defer';
-process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded}));
+if(!['agents','workflow'].includes(engine))engine='agents';
+process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engine}));
 " WORKING_DIR=\"$WORKING_DIR\")
 ```
 
 - `mode == disabled` → **skip the entire gate.** Proceed straight to `complete-slice`.
 - `style == flags` → run the **legacy single-pass** (challenge only; write a `## ⚠ Review Flags`-style section into `{S##}-REVIEW.md`; no defense, no rebuttal, no Ask). Back-compat for users who don't want the debate.
-- `style == dialectic` (default) → run Steps 1–7 below.
+- `style == dialectic` (default) → run Steps 1–7 below. Engine routing applies within this path:
+  - `engine == agents` (default) → Steps 1–9 as-is (zero change).
+  - `engine == workflow` AND `style == dialectic` → **detect by introspection:** check whether the tool `Workflow` is present in **your own tool list** (when available, `Workflow` is a top-level tool — **do NOT use ToolSearch**, which only finds deferred tools and would return empty even when `Workflow` is available). Tool present → run Step 1 then execute **`## Engine workflow`** in place of Steps 2–5; Steps 6, 7a, 7b, 8, 9 are unchanged. Tool absent → **fallback agents** (see sub-section below).
+  - `engine == workflow` AND `style == flags` → engine is ignored; run the legacy single-pass via agents (a 3-phase debate has no "flags" form).
+
+### Fallback agents (engine: workflow)
+
+Two triggers, same treatment:
+
+**(a) Tool absent (Step 0):** echo `⚠ review.engine: workflow mas a tool Workflow não está disponível neste harness — usando engine agents`, then append to `{WORKING_DIR}/.gsd/forge/events.jsonl`:
+```json
+{"ts":"<ISO>","event":"review-engine-fallback","milestone":"{M###}","slice":"{S##}","reason":"tool-absent"}
+```
+Proceed via Steps 2–5 (agents).
+
+**(b) Workflow invocation throws OR returns `{outcome:'error'}` (challenge stage):** echo `⚠ review.engine: workflow — invocação Workflow falhou (<stage>) — usando engine agents`, then append:
+```json
+{"ts":"<ISO>","event":"review-engine-fallback","milestone":"{M###}","slice":"{S##}","reason":"workflow-error:<stage>"}
+```
+Proceed via Steps 2–5 (agents). Defense/rebuttal `null` **never** reach this point — they are absorbed inside the script (`open`/`maintained` fallback).
+
+> The `<ISO>` timestamp for both events comes from bash (`date -u +%Y-%m-%dT%H:%M:%SZ`) in the orchestrator — never from inside the script.
 
 ## Step 0a — Idempotency
 
@@ -123,6 +146,170 @@ Truth table (advocate verdict × reviewer rebuttal):
 
 With `rounds == 0` (no rebuttal), treat every objection's rebuttal as `maintained`.
 
+## Engine workflow
+
+Replaces Steps 2–5 when `engine: workflow` and the `Workflow` tool is present in the orchestrator's tool list. The entire challenge → defense → rebuttal × rounds dialogue runs outside the orchestrator's context; only the structured JSON result is returned. The opt-in requirement is satisfied in two layers: this spec (read by the skill) instructs calling `Workflow`, and the operator's explicit `review.engine: workflow` pref.
+
+**Invocation** (`DIFF_CMD` comes from Step 1; the date is NOT passed in args — it is stamped by the orchestrator at render time):
+
+```
+Workflow({ script: <contents of the fenced block below>,
+           args: { wd: "{WORKING_DIR}", unit: "complete-slice/{S##}", diffCmd: "{DIFF_CMD}", rounds: {rounds} } })
+```
+
+**Script constraints:**
+- Plain JS (no TypeScript annotations — TS breaks the runtime parser).
+- **Body at top level** — após o `export const meta`, o corpo roda direto em contexto async. NUNCA embrulhar em `export default function`: o runtime lança `SyntaxError: Unexpected keyword export` (verificado empiricamente em 2026-06-10).
+- `export const meta` must be a **literal** at the top (no variables, no interpolation).
+- **PROHIBITED:** `Date.now()`, `new Date()`, `Math.random()` — the runtime throws on these; they also break resume.
+- `rounds` always comes from `args` (never hardcoded).
+- Truth table is deterministic code **inside the script** (not prose).
+- Only the last rebuttal round's verdicts count.
+
+**The script:**
+
+```js
+export const meta = {
+name: 'forge-review-dialectic',
+description: 'Review dialetico: challenge (forge-reviewer) -> defense (forge-advocate) -> rebuttal x rounds -> resolucao deterministica',
+phases: [{ title: 'Challenge' }, { title: 'Defense' }, { title: 'Rebuttal' }]
+}
+
+const { wd, unit, diffCmd, rounds } = args
+
+const challengeSchema = {
+  type: 'object', required: ['objections'],
+  properties: { objections: { type: 'array', items: {
+    type: 'object',
+    required: ['id', 'path_line', 'claim', 'suggested_fix', 'challenge', 'severity'],
+    properties: {
+      id: { type: 'string', description: 'Stable id R1, R2, ... severity-then-order' },
+      path_line: { type: 'string' },
+      claim: { type: 'string', description: 'Full text of the issue' },
+      suggested_fix: { type: 'string' },
+      challenge: { type: 'string', description: 'The one question that decides whether this is real' },
+      severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] }
+    } } } }
+}
+
+let challenge = null
+try {
+  challenge = await agent(
+    'WORKING_DIR: ' + wd + '\nUNIT: ' + unit + '\nDIFF_CMD: ' + diffCmd +
+    '\nExecute DIFF_CMD from INSIDE WORKING_DIR (cd to it first) — the diff target lives there, not in your default cwd.\nReturn ALL findings as structured objections; empty array if NO_FLAGS.',
+    { label: 'Challenge', phase: 'Challenge', agentType: 'forge-reviewer', schema: challengeSchema })
+} catch (e) { challenge = null }
+if (!challenge || !Array.isArray(challenge.objections)) {
+  return { outcome: 'error', stage: 'challenge', items: [] }
+}
+if (challenge.objections.length === 0) return { outcome: 'ok', no_flags: true, items: [] }
+
+const objText = challenge.objections.map(function (o) {
+  return o.id + ' `' + o.path_line + '` [' + o.severity + '] — ' + o.claim +
+    ' — suggested fix: ' + o.suggested_fix + ' — challenge: ' + o.challenge
+}).join('\n')
+
+const verdictSchema = function (allowed) {
+  return {
+    type: 'object', required: ['verdicts'],
+    properties: { verdicts: { type: 'array', items: {
+      type: 'object', required: ['id', 'verdict', 'rationale'],
+      properties: {
+        id: { type: 'string' },
+        verdict: { type: 'string', enum: allowed },
+        rationale: { type: 'string' }
+      } } } }
+  }
+}
+
+let defense = null
+try {
+  defense = await agent(
+    'WORKING_DIR: ' + wd + '\nUNIT: ' + unit + '\nDIFF_CMD: ' + diffCmd + '\nExecute DIFF_CMD from INSIDE WORKING_DIR (cd to it first) — the diff target lives there, not in your default cwd.\nOBJECTIONS:\n' + objText,
+    { label: 'Defense', phase: 'Defense', agentType: 'forge-advocate',
+      schema: verdictSchema(['refuted', 'conceded', 'open']) })
+} catch (e) { defense = null }
+
+const defById = {}
+const defWarnings = []
+if (defense && Array.isArray(defense.verdicts)) {
+  for (const v of defense.verdicts) {
+    if (defById[v.id]) { defWarnings.push('duplicate advocate verdict for ' + v.id + ' — first occurrence kept') }
+    else { defById[v.id] = v }
+  }
+}
+for (const o of challenge.objections) {
+  if (!defById[o.id]) defById[o.id] = { id: o.id, verdict: 'open',
+    rationale: 'defesa indisponivel (agent null/throw) — tratada como open' }
+}
+
+const rebById = {}
+for (const o of challenge.objections) {
+  rebById[o.id] = { id: o.id, verdict: 'maintained',
+    rationale: 'sem replica (rounds=0 ou agent null/throw) — mantida (conservador)' }
+}
+const n = Number.isInteger(rounds) ? Math.min(Math.max(rounds, 0), 3) : 1
+for (let i = 0; i < n; i++) {
+  const defText = challenge.objections.map(function (o) {
+    const d = defById[o.id]
+    const r = rebById[o.id]
+    const rebLine = (i > 0)
+      ? ' | rebuttal round ' + i + ': ' + r.verdict + ' — ' + r.rationale
+      : ''
+    return o.id + ': advocate: ' + d.verdict + ' — ' + d.rationale + rebLine
+  }).join('\n')
+  let reb = null
+  try {
+    reb = await agent(
+      'WORKING_DIR: ' + wd + '\nUNIT: ' + unit + '\nDIFF_CMD: ' + diffCmd +
+      '\nExecute DIFF_CMD from INSIDE WORKING_DIR (cd to it first) — the diff target lives there, not in your default cwd.\nOBJECTIONS:\n' + objText + '\nDEFENSE:\n' + defText,
+      { label: 'Rebuttal ' + (i + 1), phase: 'Rebuttal', agentType: 'forge-reviewer',
+        schema: verdictSchema(['maintained', 'withdrawn', 'conceded']) })
+  } catch (e) { reb = null }
+  if (reb && Array.isArray(reb.verdicts)) {
+    for (const v of reb.verdicts) { if (rebById[v.id]) rebById[v.id] = v }  // last round wins
+  }
+}
+
+// Step 5 truth table — deterministic, in-script
+const items = challenge.objections.map(function (o) {
+  const d = defById[o.id], r = rebById[o.id]
+  let resolution
+  if (d.verdict === 'conceded') resolution = 'conceded'
+  else if (r.verdict === 'withdrawn') resolution = 'resolved'
+  else resolution = 'open'   // OPEN: rebuttal maintained (advocate refuted/open) — ver truth table Step 5
+  return { id: o.id, path_line: o.path_line, severity: o.severity, claim: o.claim,
+    suggested_fix: o.suggested_fix, challenge: o.challenge,
+    defense: { verdict: d.verdict, rationale: d.rationale },
+    rebuttal: { verdict: r.verdict, rationale: r.rationale }, resolution }
+})
+return { outcome: 'ok', no_flags: false, items, warnings: defWarnings.length ? defWarnings : undefined }
+```
+
+**Return schema:**
+```
+{
+  outcome: 'ok' | 'error',
+  stage?: string,           // present on error: 'challenge'
+  no_flags?: boolean,       // true when objections array was empty
+  items: [{
+    id, path_line, severity, claim, suggested_fix, challenge,
+    defense:  { verdict: 'refuted'|'conceded'|'open',     rationale },
+    rebuttal: { verdict: 'maintained'|'withdrawn'|'conceded', rationale },
+    resolution: 'conceded' | 'resolved' | 'open'
+  }]
+}
+```
+
+**Render by the orchestrator** (same Step 6 template):
+- `no_flags: true` → write a clean `{S##}-REVIEW.md` ("Reviewer found nothing to challenge.").
+- Otherwise: group `items` by `resolution` into the Abertas / Concedidas / Resolvidas sections of Step 6, filling Objeção/Defesa/Réplica from the full-text fields.
+- `**Reviewed:**` stamped with `date +%Y-%m-%d` (bash in the orchestrator — **never inside the script**).
+- `Outcome` in the header calculated from item counts.
+- `conceded` items (where `resolution == 'conceded'`) feed Step 7a: **ação = `suggested_fix`** (from the objection); **contexto = `defense.rationale`** (advocate's concession); `open` items feed Step 7b — both steps unchanged.
+
+**Fallback:** if the invocation throws OR returns `{outcome:'error'}` → trigger Fallback agents (b) as described in Step 0, then proceed via Steps 2–5.
+
 ## Step 6 — Write `{S##}-REVIEW.md`
 
 The artifact is the **dialogue**, not a flag dump. Auditable, durable with the milestone.
@@ -163,7 +350,7 @@ Skip if `fixConceded == false` (pref opt-out → conceded items fall through to 
 
 ```
 Agent({ subagent_type: 'forge-executor',
-  prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: review-fix/{S##}\n{isolation header lines when ISOLATION_MODE != shared}\nFix ONLY the conceded review items listed below. Minimal diffs — no refactors, no scope creep beyond the listed items. Run the lint/format commands if configured. Commit with message: fix(review): {S##} conceded items\n\n## Conceded items\n{for each CONCEDED R#: R# — path:line — objeção: <claim> — ação: <what should happen (advocate's concession)>}\n\nReturn ---GSD-WORKER-RESULT--- with status and the commit SHA." })
+  prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: review-fix/{S##}\n{isolation header lines when ISOLATION_MODE != shared}\nFix ONLY the conceded review items listed below. Minimal diffs — no refactors, no scope creep beyond the listed items. Run the lint/format commands if configured. Commit with message: fix(review): {S##} conceded items\n\n## Conceded items\n{for each CONCEDED R#: R# — path:line — objeção: <claim> — ação: <suggested_fix (use advocate concession rationale when suggested_fix is absent, e.g. in agents engine)> — contexto: <defense.rationale>}\n\nReturn ---GSD-WORKER-RESULT--- with status and the commit SHA." })
 ```
 
 - On success → update each conceded R# in `{S##}-REVIEW.md`: `**Correção:** aplicada — commit {sha}`.
@@ -191,10 +378,10 @@ The gate **never** returns a blocker regardless of posture.
 Append one line per agent dispatch to `{WORKING_DIR}/.gsd/forge/events.jsonl` (I/O errors propagate — no silent-fail):
 
 ```json
-{"ts":"<ISO-8601>","event":"review","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","style":"dialectic","rounds":N,"counts":{"resolved":N,"conceded":N,"open":N},"conceded_fixed":N}
+{"ts":"<ISO-8601>","event":"review","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","style":"dialectic","rounds":N,"counts":{"resolved":N,"conceded":N,"open":N},"conceded_fixed":N,"engine":"agents"}
 ```
 
-`conceded_fixed` is additive (S03-style readers that ignore unknown fields stay compatible): number of conceded items whose Step 7a fix landed.
+`conceded_fixed` and `engine` are additive fields (readers that ignore unknown fields stay compatible — same convention as `tier`/`reason` from M002). `engine` is either `"agents"` or `"workflow"` and is emitted by **both** engine paths. `conceded_fixed`: number of conceded items whose Step 7a fix landed.
 
 ## Step 9 — Milestone-final triage (before `complete-milestone`)
 
@@ -222,5 +409,5 @@ When `style == flags`: run Step 2 only. Write the reviewer's findings (+ optiona
 - `agents/forge-reviewer.md` — challenger + rebuttal mode
 - `agents/forge-advocate.md` — defender
 - `skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md` — gate invocation (before `complete-slice`) + milestone-final triage (Step 9, before `complete-milestone`)
-- `forge-agent-prefs.md § Review Settings` — `review.{mode,style,rounds,ask_in_auto,fix_conceded}`
+- `forge-agent-prefs.md § Review Settings` — `review.{mode,style,rounds,ask_in_auto,fix_conceded,engine}`
 - Artifact: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (durable with the milestone; cleaned by `milestone_cleanup`)

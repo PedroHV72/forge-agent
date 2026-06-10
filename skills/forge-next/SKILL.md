@@ -227,9 +227,10 @@ The produced `T##-SECURITY.md` will be injected into the execute-task worker pro
 **Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the slice branch `gsd/{M###}/{S##}` is still unmerged here, so the diff is intact). This is the challenger × defender confrontation:
 
 1. Idempotency: if `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already exists → skip the gate, proceed to `complete-slice`.
-2. Read `review.{mode,style,rounds,ask_in_auto}` via the cascade in `shared/forge-review.md § Step 0`. If `mode == disabled` → skip.
+2. Read `review.{mode,style,rounds,ask_in_auto,engine}` via the cascade in `shared/forge-review.md § Step 0`. If `mode == disabled` → skip.
 3. Execute the procedure in **`shared/forge-review.md`** with `MODE = interactive`:
    > Antes de despachar cada agente (Challenge e Defense abaixo), exiba o **Spawn Liveness Banner** (ver `shared/forge-dispatch.md § Spawn Liveness Banner`) com duração estimada para `review-challenger` / `review-advocate`.
+   - **Engine** (`shared/forge-review.md § Engine workflow`): se `engine: workflow` e a tool `Workflow` estiver no seu tool list (introspecção — NÃO ToolSearch), os três dispatches abaixo (Challenge/Defense/Rebuttal) são substituídos por UMA invocação Workflow; em tool ausente ou erro → fallback agents com warning + evento `review-engine-fallback`. O render do Step 6 e os Steps 7a/7b/8 não mudam.
    - Challenge → `Agent({ subagent_type: 'forge-reviewer', … })`
    - Defense → `Agent({ subagent_type: 'forge-advocate', … })`
    - Rebuttal × `rounds` → `forge-reviewer` in rebuttal mode (DEFENSE injected)
