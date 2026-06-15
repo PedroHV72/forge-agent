@@ -173,6 +173,15 @@ function tokenSubcommand(name) {
   return wrapperOnPath() ? `forge-accounts token ${name}` : `node '${scriptPath()}' --token ${name}`;
 }
 
+// First candidate command resolvable on PATH, else null (cross-platform which).
+function firstOnPath(cands) {
+  const probe = process.platform === 'win32' ? 'where' : 'which';
+  for (const c of cands) {
+    try { execFileSync(probe, [c], { stdio: 'ignore' }); return c; } catch { /* next */ }
+  }
+  return null;
+}
+
 function launchCommand(name) {
   return `FORGE_ACCOUNT=${name} CLAUDE_CODE_OAUTH_TOKEN="$(${tokenSubcommand(name)})" claude`;
 }
@@ -188,35 +197,72 @@ function shq(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
 function openNewTerminal(name) {
   assertName(name);
   if (!readToken(name)) throw new Error(`sem token para '${name}' — rode 'add ${name}'`);
-  if (process.platform !== 'darwin') {
-    throw new Error('--new-window por enquanto só no macOS (usa osascript). Em outros SOs, rode o comando do --print num terminal.');
-  }
   const projectDir = process.cwd();
-  const isForge = fs.existsSync(path.join(projectDir, '.gsd'));
-  const claudeCmd = isForge ? 'claude "/forge-auto"' : 'claude';
-  const launcher = path.join(os.tmpdir(), `forge-switch-${name}-${process.pid}.sh`);
-  const body = [
-    '#!/usr/bin/env bash',
-    `cd ${shq(projectDir)} || exit 1`,
-    `export FORGE_ACCOUNT=${shq(name)}`,
-    `export CLAUDE_CODE_OAUTH_TOKEN="$(${tokenSubcommand(name)})"`,
-    `rm -f -- ${shq(launcher)}`,
-    `exec ${claudeCmd}`,
-    '',
-  ].join('\n');
+  // Run-aware: resume the active run only when there is exactly one (see
+  // forgeAutoArgsFor). Otherwise a normal session — no forced /forge-auto.
+  const autoArgs = forgeAutoArgsFor(projectDir);
+  const resume   = autoArgs.length > 0;
+  const runId    = resume ? autoArgs[0].split(' ')[1] : null;
+  const plat     = process.platform;
+  const dryrun   = !!process.env.FORGE_NEW_WINDOW_DRYRUN;
 
-  const term = process.env.TERM_PROGRAM || '';
-  const osa = term === 'iTerm.app'
-    ? [['-e', `tell application "iTerm" to create window with default profile command "bash ${launcher}"`]]
-    : [['-e', `tell application "Terminal" to do script "bash ${launcher}"`],
-       ['-e', 'tell application "Terminal" to activate']];
+  if (plat === 'darwin' || plat === 'linux') {
+    const claudeCmd = resume ? `claude ${shq(autoArgs[0])}` : 'claude';
+    const launcher  = path.join(os.tmpdir(), `forge-switch-${name}-${process.pid}.sh`);
+    const body = [
+      '#!/usr/bin/env bash',
+      `cd ${shq(projectDir)} || exit 1`,
+      `export FORGE_ACCOUNT=${shq(name)}`,
+      `export CLAUDE_CODE_OAUTH_TOKEN="$(${tokenSubcommand(name)})"`,
+      `rm -f -- ${shq(launcher)}`,
+      `exec ${claudeCmd}`,
+      '',
+    ].join('\n');
 
-  if (process.env.FORGE_NEW_WINDOW_DRYRUN) {
-    return { dryrun: true, projectDir, isForge, launcherBody: body, osascript: osa.flat() };
+    if (plat === 'darwin') {
+      const term = process.env.TERM_PROGRAM || '';
+      const osa = term === 'iTerm.app'
+        ? [['-e', `tell application "iTerm" to create window with default profile command "bash ${launcher}"`]]
+        : [['-e', `tell application "Terminal" to do script "bash ${launcher}"`],
+           ['-e', 'tell application "Terminal" to activate']];
+      if (dryrun) return { dryrun: true, projectDir, resume, runId, launcherBody: body, opener: ['osascript', ...osa.flat()] };
+      fs.writeFileSync(launcher, body, { mode: 0o700 });
+      execFileSync('osascript', osa.flat());
+      return { dryrun: false, projectDir, resume, runId };
+    }
+
+    // linux: first available terminal emulator
+    const emu = firstOnPath(['x-terminal-emulator', 'gnome-terminal', 'konsole', 'xfce4-terminal', 'xterm']);
+    if (!emu) throw new Error('nenhum terminal gráfico encontrado — use o comando do --print');
+    const opener = emu === 'gnome-terminal' ? [emu, '--', 'bash', launcher] : [emu, '-e', `bash ${launcher}`];
+    if (dryrun) return { dryrun: true, projectDir, resume, runId, launcherBody: body, opener };
+    fs.writeFileSync(launcher, body, { mode: 0o700 });
+    execFileSync(opener[0], opener.slice(1));
+    return { dryrun: false, projectDir, resume, runId };
   }
-  fs.writeFileSync(launcher, body, { mode: 0o700 });
-  execFileSync('osascript', osa.flat());
-  return { dryrun: false, projectDir, isForge };
+
+  if (plat === 'win32') {
+    const winq       = (s) => `"${String(s)}"`;
+    const claudeArgs = resume ? winq(autoArgs[0]) : '';
+    const launcher   = path.join(os.tmpdir(), `forge-switch-${name}-${process.pid}.cmd`);
+    const body = [
+      '@echo off',
+      `cd /d ${winq(projectDir)}`,
+      `for /f "usebackq delims=" %%t in (\`node ${winq(scriptPath())} --token ${name}\`) do set "CLAUDE_CODE_OAUTH_TOKEN=%%t"`,
+      `set "FORGE_ACCOUNT=${name}"`,
+      `claude ${claudeArgs}`.trim(),
+      'del "%~f0"',
+      '',
+    ].join('\r\n');
+    const wt = firstOnPath(['wt.exe', 'wt']);
+    const opener = wt ? [wt, 'new-tab', 'cmd', '/c', launcher] : ['cmd', '/c', 'start', '', 'cmd', '/c', launcher];
+    if (dryrun) return { dryrun: true, projectDir, resume, runId, launcherBody: body, opener };
+    fs.writeFileSync(launcher, body);
+    execFileSync(opener[0], opener.slice(1));
+    return { dryrun: false, projectDir, resume, runId };
+  }
+
+  throw new Error(`--new-window não suportado em ${plat} — use o comando do --print`);
 }
 
 // ── Operations ───────────────────────────────────────────────────────────────
@@ -311,6 +357,239 @@ function currentAccount() {
   };
 }
 
+// ── Shell integration ─────────────────────────────────────────────────────────
+// Emits a `claude` shell function (zsh/bash) that auto-attaches the registry-active
+// account's token at launch. Account selection only happens at process-launch time
+// (a running session can't swap its own account — see CLAUDE.md), so a plain
+// `claude` would otherwise fall back to the default Keychain login. Wired into the
+// rc by the installer:  eval "$(forge-accounts shell-init)"
+// Guards keep it inert when it shouldn't act:
+//   • CLAUDE_CODE_OAUTH_TOKEN already set → respect `forge-accounts use`/`forge-run`
+//   • FORGE_NO_AUTO_ACCOUNT=1            → escape hatch (use the default login once)
+//   • forge-accounts not on PATH         → plain `claude`, no error
+// Calls the `forge-accounts` wrapper (on PATH) — no hardcoded node paths — so it
+// stays portable across machines and survives `/forge-update`.
+function shellInit() {
+  return [
+    '# >>> forge-accounts shell-init >>>',
+    '# Auto-attaches a Claude account to `claude` (the default, or `--account <name>`',
+    '# for a one-off / parallel terminal). Managed by Forge. Opt out per launch:',
+    '#   FORGE_NO_AUTO_ACCOUNT=1 claude',
+    'claude() {',
+    '  if [ -n "${FORGE_NO_AUTO_ACCOUNT:-}" ] || ! command -v forge-accounts >/dev/null 2>&1; then',
+    '    command claude "$@"; return $?',
+    '  fi',
+    '  local _fa_acct="" _fa_a',
+    '  local _fa_args; _fa_args=()',
+    '  while [ "$#" -gt 0 ]; do',
+    '    _fa_a="$1"',
+    '    case "$_fa_a" in',
+    '      --account) _fa_acct="${2:-}"; shift 2 2>/dev/null || shift ;;',
+    '      --account=*) _fa_acct="${_fa_a#--account=}"; shift ;;',
+    '      *) _fa_args+=("$_fa_a"); shift ;;',
+    '    esac',
+    '  done',
+    '  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "$_fa_acct" ]; then',
+    '    command claude "${_fa_args[@]}"; return $?',
+    '  fi',
+    '  local _fa_prep _fa_name _fa_tok',
+    '  _fa_prep="$(forge-accounts launch-prep $_fa_acct 2>/dev/null)"',
+    '  _fa_name="${_fa_prep%% *}"',
+    '  _fa_tok="${_fa_prep#* }"',
+    '  if [ -n "$_fa_name" ] && [ -n "$_fa_tok" ] && [ "$_fa_name" != "$_fa_tok" ]; then',
+    '    FORGE_ACCOUNT="$_fa_name" CLAUDE_CODE_OAUTH_TOKEN="$_fa_tok" command claude "${_fa_args[@]}"',
+    '    return $?',
+    '  fi',
+    '  command claude "${_fa_args[@]}"',
+    '}',
+    '# <<< forge-accounts shell-init <<<',
+  ].join('\n') + '\n';
+}
+
+// PowerShell equivalent of shellInit() for the Windows $PROFILE. Same guards and
+// the same --account override; injects the token into the session env and removes
+// it in a finally block so it never persists. Wired by install.ps1 via:
+//   Invoke-Expression (& forge-accounts shell-init-pwsh | Out-String)
+function shellInitPwsh() {
+  return [
+    '# >>> forge-accounts shell-init >>>',
+    '# Auto-attaches the active Claude account to `claude`. Managed by Forge.',
+    '# Opt out per launch:  $env:FORGE_NO_AUTO_ACCOUNT=1; claude',
+    'function claude {',
+    '  $real = (Get-Command claude.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source',
+    '  if (-not $real) { $real = (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source }',
+    '  if (-not $real) { Write-Error "claude not found on PATH"; return }',
+    '  if ($env:FORGE_NO_AUTO_ACCOUNT -or -not (Get-Command forge-accounts -ErrorAction SilentlyContinue)) { & $real @args; return }',
+    '  $acct = $null; $passthru = @()',
+    '  for ($i = 0; $i -lt $args.Count; $i++) {',
+    "    if ($args[$i] -eq '--account') { $acct = $args[$i+1]; $i++ }",
+    "    elseif ($args[$i] -like '--account=*') { $acct = $args[$i].Substring(10) }",
+    '    else { $passthru += $args[$i] }',
+    '  }',
+    '  if ($env:CLAUDE_CODE_OAUTH_TOKEN -and -not $acct) { & $real @passthru; return }',
+    "  $prepArgs = @('launch-prep'); if ($acct) { $prepArgs += $acct }",
+    '  $prep = (& forge-accounts @prepArgs 2>$null)',
+    '  if ($prep) {',
+    "    $parts = $prep.Trim() -split ' ', 2",
+    '    if ($parts.Count -eq 2 -and $parts[0] -and $parts[1]) {',
+    '      $env:FORGE_ACCOUNT = $parts[0]; $env:CLAUDE_CODE_OAUTH_TOKEN = $parts[1]',
+    '      try { & $real @passthru }',
+    '      finally { Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue; Remove-Item Env:FORGE_ACCOUNT -ErrorAction SilentlyContinue }',
+    '      return',
+    '    }',
+    '  }',
+    '  & $real @passthru',
+    '}',
+    '# <<< forge-accounts shell-init <<<',
+  ].join('\n') + '\n';
+}
+
+// ── Logged-in identity (~/.claude.json) ──────────────────────────────────────
+// Claude Code stores the active subscription login here (oauthAccount). Its
+// statusline JSON does NOT include the account, so for sessions launched WITHOUT
+// FORGE_ACCOUNT (plain Keychain login) we read this file and match it to a
+// registered account for the 👤 badge. Tolerant — missing/garbage → all null.
+function readClaudeIdentity() {
+  try {
+    const j  = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'));
+    const oa = j.oauthAccount || {};
+    return { uuid: oa.accountUuid || null, email: oa.emailAddress || null, display: oa.displayName || null };
+  } catch { return { uuid: null, email: null, display: null }; }
+}
+
+// Find the registered account name whose stored identity matches uuid (preferred)
+// or email. Returns null when nothing matches.
+function matchAccount(reg, ident) {
+  if (!ident) return null;
+  const accts = Object.entries(reg.accounts || {});
+  if (ident.uuid) {
+    const m = accts.find(([, a]) => a.account_uuid && a.account_uuid === ident.uuid);
+    if (m) return m[0];
+  }
+  if (ident.email) {
+    const e = String(ident.email).toLowerCase();
+    const m = accts.find(([, a]) => a.email && String(a.email).toLowerCase() === e);
+    if (m) return m[0];
+  }
+  return null;
+}
+
+// Best-effort: stamp uuid/email onto <name>. Anti-clobber: when not forced, refuse
+// if that uuid already belongs to a DIFFERENT account — this guards the case where
+// a token-launch did NOT rewrite ~/.claude.json (so it still shows the Keychain
+// identity, which must not be recorded under the launched account). A `manual`
+// value is never overwritten by a probe.
+function recordIdentity(name, ident, opts) {
+  const force = !!(opts && opts.force);
+  if (!name || !ident || (!ident.uuid && !ident.email)) return false;
+  const reg = loadRegistry();
+  const a = reg.accounts[name];
+  if (!a) return false;
+  if (!force && ident.uuid) {
+    const owner = matchAccount(reg, { uuid: ident.uuid });
+    if (owner && owner !== name) return false;
+  }
+  if (a.email_source === 'manual' && !force) return false;
+  let changed = false;
+  if (ident.uuid  && a.account_uuid !== ident.uuid)  { a.account_uuid = ident.uuid;  changed = true; }
+  if (ident.email && a.email        !== ident.email) { a.email        = ident.email; changed = true; }
+  if (changed) { a.email_source = force ? 'manual' : 'probed'; saveRegistry(reg); }
+  return changed;
+}
+
+function setEmail(name, email, uuid) {
+  assertName(name);
+  const reg = loadRegistry();
+  if (!reg.accounts[name]) throw new Error(`account '${name}' not registered (run --add ${name} first)`);
+  const a = reg.accounts[name];
+  if (email && email !== true) a.email = String(email);
+  if (uuid  && uuid  !== true) a.account_uuid = String(uuid);
+  a.email_source = 'manual';
+  saveRegistry(reg);
+  return { name, email: a.email || null, uuid: a.account_uuid || null };
+}
+
+// Set the persistent default account WITHOUT launching anything (the `default`
+// subcommand). `use` keeps doing default+launch; `launch` does launch only.
+function setDefault(name) {
+  assertName(name);
+  const reg = loadRegistry();
+  if (!reg.accounts[name]) throw new Error(`account '${name}' not registered (run --add ${name} first)`);
+  if (!readToken(name)) throw new Error(`no token stored for '${name}' — re-run --add ${name}`);
+  reg.active = name;
+  reg.accounts[name].last_used = nowIso();
+  saveRegistry(reg);
+  return name;
+}
+
+// Resolve which account to launch on: explicit name, else the registry default.
+// Returns { name, token } or null when there is nothing usable.
+function resolveLaunch(name) {
+  const reg = loadRegistry();
+  const target = (name && name !== true) ? assertName(name) : reg.active;
+  if (!target) return null;
+  const token = readToken(target);
+  if (!token) return null;
+  return { name: target, token };
+}
+
+// Run-aware: resume the auto ONLY when exactly one run is active in this project.
+// 0 active → normal session; 2+ active → ambiguous, normal session (user picks).
+// Returns [] (bare claude) or ['/forge-auto <RUN_ID>'].
+function forgeAutoArgsFor(cwd) {
+  try {
+    const runs = require('./forge-runs.js');
+    const active = runs.listActive(cwd);
+    if (active.length === 1 && active[0] && active[0].id) return [`/forge-auto ${active[0].id}`];
+  } catch { /* no runs registry / not a forge project → bare */ }
+  return [];
+}
+
+// Switch in place: launch claude in the current terminal on <name>, resuming the
+// active run when there is exactly one. FORGE_ACCOUNT tags the session; the token
+// goes via env only (never argv). Exits the process with claude's status.
+function spawnClaudeOnAccount(name) {
+  const { spawnSync } = require('child_process');
+  const tok = readToken(name);
+  if (!tok) throw new Error(`no token stored for '${name}' — re-run --add ${name}`);
+  const args = forgeAutoArgsFor(process.cwd());
+  process.stderr.write(`\nIniciando Claude Code na conta '${name}'…\n`);
+  const r = spawnSync('claude', args, {
+    stdio: 'inherit',
+    env: { ...process.env, FORGE_ACCOUNT: name, CLAUDE_CODE_OAUTH_TOKEN: tok },
+  });
+  if (r.error) {
+    if (r.error.code === 'ENOENT') throw new Error("comando 'claude' não encontrado no PATH");
+    throw new Error(`falha ao lançar claude: ${r.error.message}`);
+  }
+  process.exit(typeof r.status === 'number' ? r.status : 0);
+}
+
+// Shared launch decision for both `use` (after setDefault) and `launch` (no default
+// change). forcePrint → emit the relaunch command; forceWindow OR non-TTY → open a
+// new terminal window (falls back to printing the command if no windowing method);
+// TTY → switch in place.
+function launchOrEmit(name, opts) {
+  const forceWindow = !!(opts && opts.forceWindow);
+  const forcePrint  = !!(opts && opts.forcePrint);
+  assertName(name);
+  if (!readToken(name)) throw new Error(`no token stored for '${name}' — re-run --add ${name}`);
+  if (forcePrint) { process.stdout.write(launchCommand(name) + '\n'); return; }
+  if (forceWindow || !process.stdout.isTTY) {
+    try {
+      const r = openNewTerminal(name);
+      if (r.dryrun) { process.stdout.write(JSON.stringify(r, null, 2) + '\n'); return; }
+      process.stdout.write(
+        `nova janela de Terminal aberta na conta '${name}'` +
+        (r.resume ? ` — retomando /forge-auto ${r.runId}.` : '.') + '\n');
+    } catch {
+      process.stdout.write(launchCommand(name) + '\n');
+    }
+    return;
+  }
+  spawnClaudeOnAccount(name);
+}
+
 // ── Supervisor support (forge-run): cooldown tracking + account selection ─────
 // A cooldown file maps account → { exhausted_at, resets_at } (epoch seconds).
 // "Headroom" can't be queried live outside a session (rate_limits only reaches
@@ -378,6 +657,34 @@ function readStdinSync() {
   try { return fs.readFileSync(0, 'utf8'); } catch { return ''; }
 }
 
+// Subcommand → flag normalizer. The bash wrapper (bin/forge-accounts) already emits
+// flag form, so on Unix argv[0] starts with '--' and this is a no-op. It exists so a
+// trivial pass-through wrapper (Windows forge-accounts.cmd → `node engine %*`) accepts
+// the same `forge-accounts <sub> <name> ...` ergonomics without batch translation.
+const SUBCOMMANDS = new Set([
+  'add', 'list', 'current', 'use', 'default', 'launch', 'launch-prep', 'launch-cmd',
+  'token', 'rename', 'remove', 'set-email', 'shell-init', 'shell-init-pwsh',
+  'next-account', 'mark-cooldown',
+]);
+const NAME_SUBS = new Set(['add', 'use', 'default', 'launch', 'launch-prep', 'launch-cmd', 'token', 'remove', 'set-email', 'mark-cooldown']);
+function normalizeSubcommandArgv(argv) {
+  if (!argv.length || argv[0].startsWith('--')) return argv; // already flag form
+  const sub = argv[0];
+  if (!SUBCOMMANDS.has(sub)) return argv;                     // unknown → let dispatch error
+  const rest = argv.slice(1);
+  const out = [`--${sub}`];
+  let i = 0;
+  if (sub === 'rename') {
+    if (rest[0]) out.push(rest[0]);
+    if (rest[1]) { out.push('--to', rest[1]); i = 2; } else i = rest[0] ? 1 : 0;
+  } else {
+    if (NAME_SUBS.has(sub) && rest[0] !== undefined && !rest[0].startsWith('--')) { out.push(rest[0]); i = 1; }
+    if (sub === 'set-email' && rest[i] !== undefined && !rest[i].startsWith('--')) { out.push('--email', rest[i]); i++; }
+  }
+  for (; i < rest.length; i++) out.push(rest[i]);
+  return out;
+}
+
 // Run `claude setup-token` interactively and capture the token automatically.
 // stdin+stderr are inherited so the browser/login flow and its prompts work and
 // stay visible; stdout is captured (setup-token emits the token there). The token
@@ -408,12 +715,26 @@ Flags:
   --add <name> --token <tok>                    register with an explicit token
   --add <name> --setup                          force the setup-token flow
   --list [--json]                               list registered accounts
-  --current [--json]                            show active account (registry + env)
-  --use <name> [--new-window] [--print]         switch to the account. TTY → launch
-                                                claude here; --new-window (or no TTY on
-                                                macOS) → open a NEW Terminal window on it
-                                                (resumes /forge-auto in a forge project);
+  --current [--json] [--name]                   show active account (registry + env);
+                                                --name prints just the active name
+  --shell-init                                  emit a claude() shell function (zsh/bash)
+                                                that auto-attaches the default account
+                                                (or "claude --account <name>") at launch.
+                                                rc: eval "$(forge-accounts shell-init)"
+  --shell-init-pwsh                             same, as a PowerShell function for $PROFILE
+  --launch-prep [name]                          print "<name> <token>" for the resolved
+                                                account (default if none) — used by shell-init
+  --default <name>                              set the persistent default WITHOUT launching
+  --use <name> [--new-window] [--print]         set default AND switch to it. TTY → launch
+                                                claude here; --new-window (or no TTY) → open
+                                                a NEW terminal window (macOS/Windows/Linux),
+                                                resuming the active run if exactly one;
                                                 --print → just emit the relaunch command
+  --launch <name> [--new-window] [--print]      launch/open on an account WITHOUT changing
+                                                the default — parallel terminals, N accounts
+  --set-email <name> [--email <addr>] [--uuid <u>]  record the account's identity (for the
+                                                statusline 👤 on plain Keychain logins);
+                                                no --email → captures THIS session's login
   --launch-cmd <name>                           print relaunch command only
   --token <name>                                print the raw token (for $( ) substitution)
   --rename <old> --to <new>                     rename an account (keeps the token)
@@ -431,7 +752,7 @@ Get a token once per account with:  claude setup-token
 `;
 
 function cliMain() {
-  const args = parseArgs(process.argv.slice(2));
+  const args = parseArgs(normalizeSubcommandArgv(process.argv.slice(2)));
   if (args.help || Object.keys(args).length === 0) { process.stdout.write(HELP); return; }
 
   try {
@@ -472,45 +793,58 @@ function cliMain() {
         process.stdout.write(`${a.name}${a.note ? ` — ${a.note}` : ''}${marks ? `  [${marks}]` : ''}\n`);
       }
 
+    } else if ('shell-init' in args) {
+      process.stdout.write(shellInit());
+
     } else if ('current' in args) {
       const data = currentAccount();
+      // --name → just the registry-active account, bare (for the shell-init function)
+      if (args.name) { if (data.registry_active) process.stdout.write(data.registry_active + '\n'); return; }
       if (args.json) { process.stdout.write(JSON.stringify(data, null, 2) + '\n'); return; }
       process.stdout.write(`registry: ${data.registry_active || '(none)'}\nsession : ${data.env_active || '(default login)'}\n`);
 
     } else if ('use' in args) {
+      // use = set the persistent default AND launch on it (run-aware via launchOrEmit)
       const name = assertName(args.use);
-      const cmd = useAccount(name); // marks active + validates token exists
-      const forceWindow = 'new-window' in args;
-      const forcePrint  = 'print' in args;
-      // Resolution:
-      //   --print                         → emit the command (scriptable)
-      //   --new-window, or non-TTY+macOS  → open a NEW terminal window on the account
-      //                                      (resumes /forge-auto in a forge project)
-      //   TTY (plain terminal)            → switch in place: launch claude here
-      //   non-TTY non-macOS               → emit the command (last resort)
-      if (forcePrint) {
-        process.stdout.write(cmd + '\n');
-      } else if (forceWindow || (!process.stdout.isTTY && process.platform === 'darwin')) {
-        const r = openNewTerminal(name);
-        if (r.dryrun) { process.stdout.write(JSON.stringify(r, null, 2) + '\n'); return; }
-        process.stdout.write(
-          `nova janela de Terminal aberta na conta '${name}'` +
-          (r.isForge ? ' — retomando /forge-auto.' : '.') + '\n');
-      } else if (process.stdout.isTTY) {
-        const { spawnSync } = require('child_process');
-        process.stderr.write(`\nTrocando para a conta '${name}' — iniciando Claude Code…\n`);
-        const r = spawnSync('claude', [], {
-          stdio: 'inherit',
-          env: { ...process.env, FORGE_ACCOUNT: name, CLAUDE_CODE_OAUTH_TOKEN: readToken(name) },
-        });
-        if (r.error) {
-          if (r.error.code === 'ENOENT') throw new Error("comando 'claude' não encontrado no PATH");
-          throw new Error(`falha ao lançar claude: ${r.error.message}`);
+      setDefault(name);
+      launchOrEmit(name, { forceWindow: 'new-window' in args, forcePrint: 'print' in args });
+
+    } else if ('default' in args) {
+      // set the persistent default only — does NOT launch anything
+      const name = setDefault(args.default);
+      process.stdout.write(`default account → '${name}'\n`);
+
+    } else if ('launch' in args) {
+      // launch/open on an account WITHOUT changing the default — enables parallel
+      // terminals on different accounts (the multi-terminal model)
+      const name = assertName(args.launch);
+      launchOrEmit(name, { forceWindow: 'new-window' in args, forcePrint: 'print' in args });
+
+    } else if ('launch-prep' in args) {
+      // single-call resolver for the shell-init function: prints "<name> <token>"
+      // (default account when no name given), or nothing when unusable.
+      const name = (typeof args['launch-prep'] === 'string') ? args['launch-prep'] : null;
+      const r = resolveLaunch(name);
+      if (r) process.stdout.write(`${r.name} ${r.token}\n`);
+
+    } else if ('set-email' in args) {
+      const name = assertName(args['set-email']);
+      let email = (typeof args.email === 'string') ? args.email : null;
+      let uuid  = (typeof args.uuid  === 'string') ? args.uuid  : null;
+      if (!email && !uuid) {
+        // No explicit value → capture the CURRENT session's logged-in identity.
+        // Safe because the user is asserting "I'm on <name> right now".
+        const ident = readClaudeIdentity();
+        email = ident.email; uuid = ident.uuid;
+        if (!email && !uuid) {
+          throw new Error('não consegui ler a identidade logada (~/.claude.json) — passe --email <addr> explicitamente');
         }
-        process.exit(typeof r.status === 'number' ? r.status : 0);
-      } else {
-        process.stdout.write(cmd + '\n');
       }
+      const r = setEmail(name, email, uuid);
+      process.stdout.write(`identity for '${r.name}': ${r.email || '(no email)'}${r.uuid ? ` [${r.uuid}]` : ''}\n`);
+
+    } else if ('shell-init-pwsh' in args) {
+      process.stdout.write(shellInitPwsh());
 
     } else if ('launch-cmd' in args) {
       assertName(args['launch-cmd']);
@@ -558,7 +892,9 @@ module.exports = {
   loadRegistry, saveRegistry,
   addAccount, removeAccount, renameAccount, useAccount, listAccounts, currentAccount,
   readToken, storeToken, deleteToken,
-  launchCommand, daysLeft, assertName,
+  launchCommand, daysLeft, assertName, shellInit, shellInitPwsh,
+  setDefault, resolveLaunch, launchOrEmit, spawnClaudeOnAccount, forgeAutoArgsFor,
+  setEmail, recordIdentity, matchAccount, readClaudeIdentity, openNewTerminal,
   nextAccount, markCooldown, readCooldowns,
   REGISTRY_FILE, TOKENS_FILE,
 };

@@ -292,6 +292,28 @@ if [ -d "${REPO_DIR}/bin" ]; then
     *":${BIN_DIR}:"*) ;;
     *) warn "  ${BIN_DIR} não está no PATH — adicione: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
   esac
+
+  # Shell integration: wire `eval "$(forge-accounts shell-init)"` into the rc so a
+  # plain `claude` auto-attaches the active account at launch. Idempotent via marker.
+  # (zsh/bash only — Windows uses the explicit `forge-accounts use` flow.)
+  RC_MARKER="forge-accounts shell-init"
+  case "$(basename "${SHELL:-}")" in
+    zsh)  RC_FILE="${HOME}/.zshrc" ;;
+    bash) RC_FILE="${HOME}/.bashrc" ;;
+    *)    RC_FILE="${HOME}/.profile" ;;
+  esac
+  if grep -qF "$RC_MARKER" "$RC_FILE" 2>/dev/null; then
+    info "  shell-init já presente em ${RC_FILE}"
+  elif $DRY_RUN; then
+    dry "append forge-accounts shell-init → ${RC_FILE}"
+  else
+    {
+      printf '\n# Forge Agent — auto-attach the active Claude account to `claude`\n'
+      printf 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac\n'
+      printf 'command -v forge-accounts >/dev/null 2>&1 && eval "$(forge-accounts shell-init)"\n'
+    } >> "$RC_FILE"
+    info "  shell-init → ${RC_FILE} (reabra o terminal ou rode: source ${RC_FILE})"
+  fi
 fi
 
 echo ""

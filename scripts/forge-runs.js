@@ -105,6 +105,7 @@ function add(cwd, record) {
     isolation_mode: record.isolation_mode || 'shared',
     milestone_dir: record.milestone_dir || (record.kind === 'milestone' ? `.gsd/milestones/${record.id}/` : null),
     cwd: record.cwd || cwd,
+    account: record.account || null,   // which Claude account is driving this run (display/audit)
   };
   if (record.kind === 'task') {
     full.task_description = record.task_description || '';
@@ -258,7 +259,7 @@ Flags:
   --list                   list all runs (active + inactive)
   --list-active            list only active runs
   --get <id>               get single run record
-  --add --id <id> --kind <milestone|task> --session <id>  create
+  --add --id <id> --kind <milestone|task> --session <id> [--account <name>]  create
   --update <id> --json <patch-json>                       update fields
   --remove <id>            delete record
   --bump <id>              bump last_heartbeat to now
@@ -287,6 +288,7 @@ Flags:
         session_id: args.session,
         isolation_mode: args['isolation-mode'] || 'shared',
         task_description: args['task-description'],
+        account: (typeof args.account === 'string') ? args.account : (process.env.FORGE_ACCOUNT || null),
         cwd,
       });
       process.stdout.write(JSON.stringify(r, null, 2) + '\n');

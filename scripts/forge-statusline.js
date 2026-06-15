@@ -18,6 +18,44 @@ try {
 }
 if (typeof ACTIVE_THRESHOLD_MS !== 'number') ACTIVE_THRESHOLD_MS = 15 * 60 * 1000;
 
+// forge-accounts — account identity matching for the 👤 badge. Dual-path like above,
+// best-effort: a flat install without the sibling just disables the matching fallback.
+let _facct = null;
+try { _facct = require(path.join(__dirname, 'scripts', 'forge-accounts.js')); }
+catch { try { _facct = require(path.join(__dirname, 'forge-accounts.js')); } catch { /* flat install */ } }
+
+// Resolve the 👤 badge. With FORGE_ACCOUNT set → that name (no disk reads). Without
+// it (plain Keychain login, which the statusline JSON can't identify) → read
+// ~/.claude.json and match its identity to a registered account (recorded via
+// `forge-accounts set-email`). Reads of the 110KB ~/.claude.json are cached by
+// (claude.json mtime, registry mtime) so a normal render does only two stat() calls.
+// NOTE: identity is never auto-captured here — a session's ~/.claude.json may not
+// reflect a token-launched account, so capture is explicit (set-email). Returns
+// { label, name }.
+function accountBadge(envAcct) {
+  if (!_facct) return { label: envAcct ? `👤 ${envAcct}` : '', name: envAcct || null };
+  try {
+    if (envAcct) return { label: `👤 ${envAcct}`, name: envAcct };
+    const cacheFile  = path.join(os.tmpdir(), 'forge-acct-match.json');
+    const claudeFile = path.join(os.homedir(), '.claude.json');
+    let key = '';
+    try {
+      const cm = fs.statSync(claudeFile).mtimeMs;
+      let rm = 0; try { rm = fs.statSync(_facct.REGISTRY_FILE).mtimeMs; } catch {}
+      key = `${cm}:${rm}`;
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (cached.key === key) return { label: cached.label || '', name: cached.name || null };
+    } catch { /* recompute */ }
+    const ident = _facct.readClaudeIdentity();
+    const name  = _facct.matchAccount(_facct.loadRegistry(), ident);
+    let label = '', resolved = null;
+    if (name) { label = `👤 ${name}`; resolved = name; }
+    else if (ident.display || ident.email) { label = `👤 ${ident.display || ident.email} ⚠`; }
+    try { fs.writeFileSync(cacheFile, JSON.stringify({ key, label, name: resolved }), 'utf8'); } catch {}
+    return { label, name: resolved };
+  } catch { return { label: envAcct ? `👤 ${envAcct}` : '', name: envAcct || null }; }
+}
+
 process.stdin.setEncoding('utf8');
 let raw = '';
 process.stdin.on('data', chunk => (raw += chunk));
@@ -645,12 +683,13 @@ process.stdin.on('end', () => {
       }
     } catch { /* no rate_limits — Pro/Max only, after first API response */ }
 
-    // --- Active account (👤) — set when launched as FORGE_ACCOUNT=<name> claude ---
-    // The relaunch command from `forge-accounts use <name>` exports this so the
-    // statusline can show which account this session runs under. Empty = default
-    // Keychain login (no indicator).
-    const acctName = (process.env.FORGE_ACCOUNT || '').trim();
-    const acctLabel = acctName ? `👤 ${acctName}` : '';
+    // --- Active account (👤) ---
+    // FORGE_ACCOUNT (set by shell-init / `use` / `launch`) wins; otherwise we match
+    // the logged-in identity from ~/.claude.json to a registered account so a plain
+    // `claude` still shows the right account. See accountBadge().
+    const acctName  = (process.env.FORGE_ACCOUNT || '').trim();
+    const _badge    = accountBadge(acctName);
+    const acctLabel = _badge.label;
 
     // --- Rate-limit bridge: persist usage for forge-auto's exhaustion handoff ---
     // forge-auto runs in the orchestrator and can't read the statusline JSON; it
@@ -668,7 +707,7 @@ process.stdin.on('end', () => {
           JSON.stringify({
             five_hour: slim(rl.five_hour),
             seven_day: slim(rl.seven_day),
-            account: acctName || null,
+            account: _badge.name || acctName || null,
             ts: Date.now(),
           }),
           'utf8'

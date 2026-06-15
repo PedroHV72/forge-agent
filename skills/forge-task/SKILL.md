@@ -113,7 +113,7 @@ Isolation rules (CRITICAL — the operator configured this; honor it):
 ```bash
 if [ -z "$RESUME_MODE" ]; then
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
   # Regenerate dashboard
   node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
 fi

@@ -1,3 +1,27 @@
+## v1.35.0 (2026-06-15) — Multi-conta redesenhado: default vs launch, display por identidade, resume run-aware, cross-platform
+
+Revisão estrutural do multi-conta. Tudo backward-compatible (single-account e fluxos `use`/`forge-run` existentes seguem iguais).
+
+### Added
+
+- **`claude` puro entra na conta default automaticamente** via `forge-accounts shell-init` (zsh/bash) e `--shell-init-pwsh` (PowerShell `$PROFILE`). Instaladores adicionam o hook ao rc/`$PROFILE` de forma idempotente (`install.sh` já; `install.ps1` agora).
+- **Modelo default vs launch:** `forge-accounts default <nome>` (seta default sem lançar), `launch <nome>` (lança sem mudar o default) e **`claude --account <nome>`** (fixa um terminal) — habilita **N terminais em N contas ao mesmo tempo**.
+- **Display por identidade real:** sem `FORGE_ACCOUNT`, a statusline lê `~/.claude.json` e casa uuid/email contra o registro → `👤 <nome>` mesmo em login manual do Keychain (cache por mtime; render normal = 2 `stat()`). Identidade gravada via `forge-accounts set-email <nome>` (sem `--email` captura a sessão atual).
+- **`forge-accounts launch-prep`** (resolve conta+token numa chamada) e **normalizador de subcomando** no engine (permite `forge-accounts <sub>` sem tradução em batch — base do wrapper Windows `bin/forge-accounts.cmd`).
+- **New-window cross-platform:** macOS (osascript), Linux (gnome-terminal/x-terminal-emulator/konsole/xterm), Windows (`.cmd` + `wt.exe`).
+
+### Changed
+
+- **Resume run-aware:** trocar de conta / abrir nova janela só retoma `/forge-auto <RUN_ID>` quando existe **exatamente um** run ativo no projeto (0 ou 2+ → sessão `claude` normal). Antes forçava `/forge-auto` sempre que havia `.gsd/`.
+- **Run record** ganha campo `account` (additivo), gravado pelo orquestrador (`--account "${FORGE_ACCOUNT:-}"`).
+
+### Notes
+
+- Captura automática de identidade por-render foi deliberadamente **removida** (uma sessão lançada por token nem sempre reescreve `~/.claude.json` → risco de gravar a conta errada). Captura é sempre explícita via `set-email`.
+- Regression guards na Section 16 do `forge-smoke.js` (164/164). Windows é best-effort (validado por revisão; sem `pwsh` no ambiente de dev).
+
+---
+
 ## v1.16.0 (2026-05-22) — forge-sweep skill
 
 New maintenance skill, promoted from a project-local draft used in production (WDMA / custody-transfer).

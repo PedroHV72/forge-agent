@@ -372,6 +372,50 @@ Get-ChildItem -Path "$RepoDir\scripts" -Filter "forge-*.js" -File | ForEach-Obje
     Info "  scripts/$name"
 }
 
+# ── Install CLI wrapper + shell integration (Windows) ─────────────────────────
+# forge-accounts.cmd on PATH + an auto-attach claude() function in $PROFILE, so a
+# plain `claude` enters the active account (and `claude --account <name>` a chosen
+# one). Join-Path everywhere — never embed a literal "\f" segment in this file.
+Write-Host ""
+Info "Instalando CLI forge-accounts + shell integration..."
+$BinDir = Join-Path $env:USERPROFILE ".local\bin"
+if (-not (Test-Path $BinDir)) { New-Item -ItemType Directory -Path $BinDir -Force | Out-Null }
+$CmdSrc = Join-Path (Join-Path $RepoDir "bin") "forge-accounts.cmd"
+$CmdDst = Join-Path $BinDir "forge-accounts.cmd"
+if (Test-Path $CmdSrc) {
+    CopyFile $CmdSrc $CmdDst
+    Info ("  bin -> " + $CmdDst)
+}
+# Ensure $BinDir on the persisted User PATH so the wrapper resolves in new shells.
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not (($UserPath -split ';') | Where-Object { $_ -eq $BinDir })) {
+    if (-not $DryRun) {
+        [Environment]::SetEnvironmentVariable("Path", "$UserPath;$BinDir", "User")
+        $env:Path = "$env:Path;$BinDir"
+    }
+    Info ("  PATH += " + $BinDir + " (reabra o terminal)")
+}
+# Wire the auto-attach claude() function into $PROFILE (idempotent via marker).
+$Marker = "forge-accounts shell-init"
+$ProfileHas = (Test-Path $PROFILE) -and (Select-String -Path $PROFILE -SimpleMatch $Marker -Quiet)
+if ($ProfileHas) {
+    Info ("  shell-init ja presente em " + $PROFILE)
+} elseif ($DryRun) {
+    Dry ("append forge-accounts shell-init -> " + $PROFILE)
+} else {
+    $ProfileDir = Split-Path -Parent $PROFILE
+    if ($ProfileDir -and -not (Test-Path $ProfileDir)) { New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null }
+    $Block = @(
+        "",
+        "# Forge Agent - auto-attach the active Claude account to claude (forge-accounts shell-init)",
+        "if (Get-Command forge-accounts -ErrorAction SilentlyContinue) {",
+        "  Invoke-Expression (& forge-accounts shell-init-pwsh | Out-String)",
+        "}"
+    ) -join "`r`n"
+    Add-Content -Path $PROFILE -Value $Block
+    Info ("  shell-init -> " + $PROFILE + " (reabra o terminal)")
+}
+
 # ── Install statusline + hooks ────────────────────────────────────────────────
 Write-Host ""
 Info "Instalando statusline & hooks..."

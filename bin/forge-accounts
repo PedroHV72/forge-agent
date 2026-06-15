@@ -24,7 +24,7 @@ sub="${1:-list}"
 [ "$#" -gt 0 ] && shift || true
 
 case "$sub" in
-  add|use|token|launch-cmd|remove)
+  add|use|token|launch-cmd|remove|default|launch|launch-prep)
     # subcommands that take a positional <name> before any flags
     name="${1:-}"
     if [ -n "$name" ] && [ "${name#-}" = "$name" ]; then
@@ -33,12 +33,22 @@ case "$sub" in
     fi
     exec node "$ENGINE" --"$sub" "$@"
     ;;
+  set-email)
+    # forms: set-email <name> <email>  |  set-email <name> --email <e> [--uuid <u>]
+    name="${1:-}"; shift 2>/dev/null || true
+    second="${1:-}"
+    if [ -n "$second" ] && [ "${second#-}" = "$second" ]; then
+      shift
+      exec node "$ENGINE" --set-email "$name" --email "$second" "$@"
+    fi
+    exec node "$ENGINE" --set-email "$name" "$@"
+    ;;
   rename)
     # two positionals: <old> <new>
     old="${1:-}"; new="${2:-}"
     exec node "$ENGINE" --rename "$old" --to "$new"
     ;;
-  list|current)
+  list|current|shell-init|shell-init-pwsh)
     exec node "$ENGINE" --"$sub" "$@"
     ;;
   help|-h|--help|"")

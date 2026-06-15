@@ -1189,6 +1189,66 @@ function smokeReviewEngine() {
   );
 }
 
+// ── Section 16: forge-accounts (shell-init, identity match, run-aware launch) ─
+function smokeAccounts() {
+  process.stdout.write('\n▸ Section 16: forge-accounts\n');
+  const ENGINE = path.join(SCRIPTS, 'forge-accounts.js');
+  const acct = require(ENGINE);
+
+  // shell-init (zsh/bash) emits valid shell + handles the --account override
+  const sh = acct.shellInit();
+  const bn = spawnSync('bash', ['-n'], { input: sh, encoding: 'utf8' });
+  assert(bn.status === 0, 'shell-init emits valid bash', bn.stderr);
+  assert(/--account\)/.test(sh) && /launch-prep/.test(sh), 'shell-init handles --account via launch-prep');
+
+  // shell-init-pwsh emits a claude() function with the managed marker
+  const ps = acct.shellInitPwsh();
+  assert(/function claude/.test(ps) && /forge-accounts shell-init/.test(ps), 'shell-init-pwsh emits claude() with marker');
+
+  // matchAccount: uuid preferred, email case-insensitive, miss → null
+  const reg = { accounts: { a: { account_uuid: 'U1', email: 'A@x.com' }, b: { email: 'b@x.com' } } };
+  assert(acct.matchAccount(reg, { uuid: 'U1' }) === 'a', 'matchAccount by uuid');
+  assert(acct.matchAccount(reg, { email: 'B@X.COM' }) === 'b', 'matchAccount by email (case-insensitive)');
+  assert(acct.matchAccount(reg, { uuid: 'ZZ', email: 'no@x.com' }) === null, 'matchAccount miss → null');
+
+  // recordIdentity anti-clobber (child process: registry path is read at module load)
+  const dir = mkTmp('accounts');
+  const regFile = path.join(dir, 'reg.json');
+  fs.writeFileSync(regFile, JSON.stringify({ version: 1, active: 'a', accounts: { a: { account_uuid: 'U9' }, b: {} } }));
+  const evalRI = `
+    process.env.FORGE_ACCOUNTS_REGISTRY=${JSON.stringify(regFile)};
+    const a=require(${JSON.stringify(ENGINE)});
+    const clobber=a.recordIdentity('b',{uuid:'U9',email:'x@y.com'});
+    const ok=a.recordIdentity('b',{uuid:'U-new',email:'b@y.com'});
+    process.stdout.write(JSON.stringify({clobber,ok}));`;
+  let r = spawnSync('node', ['-e', evalRI], { encoding: 'utf8' });
+  const ri = JSON.parse(r.stdout || '{}');
+  assert(ri.clobber === false, "recordIdentity refuses to clobber another account's uuid");
+  assert(ri.ok === true, 'recordIdentity stamps a fresh uuid');
+
+  // resolveLaunch → null when the account has no token
+  r = spawnSync('node', ['-e', `
+    process.env.FORGE_ACCOUNTS_REGISTRY=${JSON.stringify(regFile)};
+    const a=require(${JSON.stringify(ENGINE)});
+    process.stdout.write(String(a.resolveLaunch('nope')===null));`], { encoding: 'utf8' });
+  assert(r.stdout.trim() === 'true', 'resolveLaunch(no token) → null');
+
+  // run-aware: forgeAutoArgsFor resumes only with exactly one active run
+  const proj = mkTmp('accounts-runs');
+  const runsD = path.join(proj, '.gsd', 'forge', 'runs');
+  fs.mkdirSync(runsD, { recursive: true });
+  const argsFor = () => JSON.parse(spawnSync('node', ['-e',
+    `const a=require(${JSON.stringify(ENGINE)});process.stdout.write(JSON.stringify(a.forgeAutoArgsFor(${JSON.stringify(proj)})));`],
+    { encoding: 'utf8' }).stdout || 'null');
+  assert(JSON.stringify(argsFor()) === '[]', 'forgeAutoArgsFor: 0 runs → []');
+  fs.writeFileSync(path.join(runsD, 'M1.json'), JSON.stringify({ id: 'M1', kind: 'milestone', active: true }));
+  assert(argsFor()[0] === '/forge-auto M1', 'forgeAutoArgsFor: 1 run → /forge-auto M1');
+  fs.writeFileSync(path.join(runsD, 'M2.json'), JSON.stringify({ id: 'M2', kind: 'milestone', active: true }));
+  assert(JSON.stringify(argsFor()) === '[]', 'forgeAutoArgsFor: 2 runs → [] (ambiguous)');
+
+  cleanup(dir); cleanup(proj);
+}
+
 function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -1211,6 +1271,7 @@ function main() {
     smokeStopHook();
     smokeNotifications();
     smokeReviewEngine();
+    smokeAccounts();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
