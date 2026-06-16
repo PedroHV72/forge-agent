@@ -93,7 +93,11 @@ while :; do
   rm -f "$HANDOFF"
   LOG="$(mktemp -t forge-run.XXXXXX)"
 
-  FORGE_ACCOUNT="$ACCT" CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
+  # ANTHROPIC_AUTH_TOKEN (not CLAUDE_CODE_OAUTH_TOKEN): the latter loses to the
+  # macOS Keychain login on Claude Code ≥2.1.x, so the per-account token was being
+  # ignored. ANTHROPIC_AUTH_TOKEN sits above the Keychain in auth precedence and
+  # actually selects the account. See scripts/forge-accounts.js header (TOKEN_ENV).
+  FORGE_ACCOUNT="$ACCT" ANTHROPIC_AUTH_TOKEN="$TOKEN" \
     claude -p "$PROMPT" --dangerously-skip-permissions 2>&1 | tee "$LOG"
   CODE="${PIPESTATUS[0]}"
 

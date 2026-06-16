@@ -5,9 +5,24 @@
 // A running Claude Code session cannot switch its own account mid-session
 // (`/login` mid-session is broken — stuck 401). The reliable, macOS-safe way to
 // run multiple Claude accounts is `claude setup-token` (long-lived OAuth token,
-// ~1yr) selected at launch via the CLAUDE_CODE_OAUTH_TOKEN env var, which takes
-// precedence over the Keychain subscription login. This module stores one token
-// per named account and builds the exact relaunch command to switch.
+// ~1yr) selected at launch via the ANTHROPIC_AUTH_TOKEN env var (see TOKEN_ENV).
+// This module stores one token per named account and builds the exact relaunch
+// command to switch.
+//
+// WHY ANTHROPIC_AUTH_TOKEN AND NOT CLAUDE_CODE_OAUTH_TOKEN
+// Despite the docs, Claude Code ≥2.1.x gives the Keychain subscription login
+// PRECEDENCE OVER `CLAUDE_CODE_OAUTH_TOKEN` (verified empirically: an invalid
+// CLAUDE_CODE_OAUTH_TOKEN + a valid Keychain login still authenticates via the
+// Keychain). The shared macOS Keychain item ("Claude Code-credentials") is the
+// same for every account, so the per-account token was being silently ignored —
+// every session ran on whatever `/login` last wrote, and a stale Keychain login
+// surfaced as `401 → Please run /login`. `ANTHROPIC_AUTH_TOKEN` sits ABOVE the
+// Keychain in the auth-precedence order, so it actually overrides the login
+// WITHOUT requiring `/login`/logout, and launches that bypass us fall back to the
+// Keychain gracefully (still authenticated) instead of hard-failing. The setup-
+// token (`sk-ant-oat01-…`) is a Bearer token, accepted as ANTHROPIC_AUTH_TOKEN.
+// NOTE: usage still draws on the token's subscription (it is a subscription OAuth
+// token, not an API key) — validate billing in a real session if in doubt.
 //
 // STORAGE
 //   - Registry (NON-secret): ~/.claude/forge-accounts.json
@@ -46,6 +61,11 @@ const TOKENS_FILE    = path.join(CLAUDE_DIR, 'forge-accounts-tokens.json'); // n
 const IS_DARWIN      = process.platform === 'darwin';
 const KEYCHAIN_ACCT  = (() => { try { return os.userInfo().username; } catch { return 'forge'; } })();
 const TOKEN_TTL_DAYS = 365; // setup-token validity window
+// Env var used to inject a per-account token at launch. ANTHROPIC_AUTH_TOKEN
+// (auth-precedence item 2) overrides the Keychain subscription login (item 6);
+// CLAUDE_CODE_OAUTH_TOKEN (item 5) does NOT on Claude Code ≥2.1.x. See the header
+// note. Single source of truth — change here to re-route every launch path.
+const TOKEN_ENV = 'ANTHROPIC_AUTH_TOKEN';
 
 // ── Name validation ──────────────────────────────────────────────────────────
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/i;
@@ -183,7 +203,7 @@ function firstOnPath(cands) {
 }
 
 function launchCommand(name) {
-  return `FORGE_ACCOUNT=${name} CLAUDE_CODE_OAUTH_TOKEN="$(${tokenSubcommand(name)})" claude`;
+  return `FORGE_ACCOUNT=${name} ${TOKEN_ENV}="$(${tokenSubcommand(name)})" claude`;
 }
 
 // Single-quote for safe interpolation into a /bin/sh script.
@@ -213,7 +233,7 @@ function openNewTerminal(name) {
       '#!/usr/bin/env bash',
       `cd ${shq(projectDir)} || exit 1`,
       `export FORGE_ACCOUNT=${shq(name)}`,
-      `export CLAUDE_CODE_OAUTH_TOKEN="$(${tokenSubcommand(name)})"`,
+      `export ${TOKEN_ENV}="$(${tokenSubcommand(name)})"`,
       `rm -f -- ${shq(launcher)}`,
       `exec ${claudeCmd}`,
       '',
@@ -248,7 +268,7 @@ function openNewTerminal(name) {
     const body = [
       '@echo off',
       `cd /d ${winq(projectDir)}`,
-      `for /f "usebackq delims=" %%t in (\`node ${winq(scriptPath())} --token ${name}\`) do set "CLAUDE_CODE_OAUTH_TOKEN=%%t"`,
+      `for /f "usebackq delims=" %%t in (\`node ${winq(scriptPath())} --token ${name}\`) do set "${TOKEN_ENV}=%%t"`,
       `set "FORGE_ACCOUNT=${name}"`,
       `claude ${claudeArgs}`.trim(),
       'del "%~f0"',
@@ -364,7 +384,8 @@ function currentAccount() {
 // `claude` would otherwise fall back to the default Keychain login. Wired into the
 // rc by the installer:  eval "$(forge-accounts shell-init)"
 // Guards keep it inert when it shouldn't act:
-//   • CLAUDE_CODE_OAUTH_TOKEN already set → respect `forge-accounts use`/`forge-run`
+//   • ANTHROPIC_AUTH_TOKEN already set   → respect `forge-accounts use`/`forge-run`
+//                                          (or a user's own gateway token)
 //   • FORGE_NO_AUTO_ACCOUNT=1            → escape hatch (use the default login once)
 //   • forge-accounts not on PATH         → plain `claude`, no error
 // Calls the `forge-accounts` wrapper (on PATH) — no hardcoded node paths — so it
@@ -389,7 +410,7 @@ function shellInit() {
     '      *) _fa_args+=("$_fa_a"); shift ;;',
     '    esac',
     '  done',
-    '  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "$_fa_acct" ]; then',
+    `  if [ -n "\${${TOKEN_ENV}:-}" ] && [ -z "$_fa_acct" ]; then`,
     '    command claude "${_fa_args[@]}"; return $?',
     '  fi',
     '  local _fa_prep _fa_name _fa_tok',
@@ -397,7 +418,7 @@ function shellInit() {
     '  _fa_name="${_fa_prep%% *}"',
     '  _fa_tok="${_fa_prep#* }"',
     '  if [ -n "$_fa_name" ] && [ -n "$_fa_tok" ] && [ "$_fa_name" != "$_fa_tok" ]; then',
-    '    FORGE_ACCOUNT="$_fa_name" CLAUDE_CODE_OAUTH_TOKEN="$_fa_tok" command claude "${_fa_args[@]}"',
+    `    FORGE_ACCOUNT="$_fa_name" ${TOKEN_ENV}="$_fa_tok" command claude "\${_fa_args[@]}"`,
     '    return $?',
     '  fi',
     '  command claude "${_fa_args[@]}"',
@@ -426,15 +447,15 @@ function shellInitPwsh() {
     "    elseif ($args[$i] -like '--account=*') { $acct = $args[$i].Substring(10) }",
     '    else { $passthru += $args[$i] }',
     '  }',
-    '  if ($env:CLAUDE_CODE_OAUTH_TOKEN -and -not $acct) { & $real @passthru; return }',
+    `  if ($env:${TOKEN_ENV} -and -not $acct) { & $real @passthru; return }`,
     "  $prepArgs = @('launch-prep'); if ($acct) { $prepArgs += $acct }",
     '  $prep = (& forge-accounts @prepArgs 2>$null)',
     '  if ($prep) {',
     "    $parts = $prep.Trim() -split ' ', 2",
     '    if ($parts.Count -eq 2 -and $parts[0] -and $parts[1]) {',
-    '      $env:FORGE_ACCOUNT = $parts[0]; $env:CLAUDE_CODE_OAUTH_TOKEN = $parts[1]',
+    `      $env:FORGE_ACCOUNT = $parts[0]; $env:${TOKEN_ENV} = $parts[1]`,
     '      try { & $real @passthru }',
-    '      finally { Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue; Remove-Item Env:FORGE_ACCOUNT -ErrorAction SilentlyContinue }',
+    `      finally { Remove-Item Env:${TOKEN_ENV} -ErrorAction SilentlyContinue; Remove-Item Env:FORGE_ACCOUNT -ErrorAction SilentlyContinue }`,
     '      return',
     '    }',
     '  }',
@@ -556,7 +577,7 @@ function spawnClaudeOnAccount(name) {
   process.stderr.write(`\nIniciando Claude Code na conta '${name}'…\n`);
   const r = spawnSync('claude', args, {
     stdio: 'inherit',
-    env: { ...process.env, FORGE_ACCOUNT: name, CLAUDE_CODE_OAUTH_TOKEN: tok },
+    env: { ...process.env, FORGE_ACCOUNT: name, [TOKEN_ENV]: tok },
   });
   if (r.error) {
     if (r.error.code === 'ENOENT') throw new Error("comando 'claude' não encontrado no PATH");
@@ -746,7 +767,7 @@ Flags:
   --help                                        show this help
 
 Switch accounts (cannot happen mid-session — relaunch claude):
-  ${"FORGE_ACCOUNT=<name> CLAUDE_CODE_OAUTH_TOKEN=\"$(node forge-accounts.js --token <name>)\" claude"}
+  ${`FORGE_ACCOUNT=<name> ${TOKEN_ENV}="$(node forge-accounts.js --token <name>)" claude`}
 
 Get a token once per account with:  claude setup-token
 `;

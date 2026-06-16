@@ -1205,6 +1205,20 @@ function smokeAccounts() {
   const ps = acct.shellInitPwsh();
   assert(/function claude/.test(ps) && /forge-accounts shell-init/.test(ps), 'shell-init-pwsh emits claude() with marker');
 
+  // Precedence fix (Claude Code ≥2.1.x): every launch path must inject the token
+  // via ANTHROPIC_AUTH_TOKEN — CLAUDE_CODE_OAUTH_TOKEN loses to the macOS Keychain
+  // login, silently defeating the per-account switch (verified empirically; see
+  // forge-accounts.js TOKEN_ENV header). Guard against a regression to the old var.
+  const launchPaths = [
+    ['shell-init',      sh],
+    ['shell-init-pwsh', ps],
+    ['launch-cmd',      acct.launchCommand('demo')],
+  ];
+  for (const [label, p] of launchPaths) {
+    assert(/ANTHROPIC_AUTH_TOKEN/.test(p), `${label} injects ANTHROPIC_AUTH_TOKEN`);
+    assert(!/CLAUDE_CODE_OAUTH_TOKEN/.test(p), `${label} does not use CLAUDE_CODE_OAUTH_TOKEN`);
+  }
+
   // matchAccount: uuid preferred, email case-insensitive, miss → null
   const reg = { accounts: { a: { account_uuid: 'U1', email: 'A@x.com' }, b: { email: 'b@x.com' } } };
   assert(acct.matchAccount(reg, { uuid: 'U1' }) === 'a', 'matchAccount by uuid');
