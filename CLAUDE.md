@@ -509,8 +509,8 @@ Resolver o challenger e advocate de cada review pela autoria do código reflete 
 
 ## Estado atual
 
-- **Milestone ativo:** — (M001 concluído)
-- **Fase:** idle — M001 encerrado com sucesso (S01, S02, S03 completos).
+- **Milestone ativo:** — (M007 concluído e deployado, PR #50 mergeada em `75be33c`)
+- **Fase:** idle — M007 (routing model-first por domínio, multi-LLM fase 4) encerrado: S01–S05 completos, 594/594 smoke, PR #44 (Gemini/souzalemos) incorporada e fechada.
 - **Próxima ação:** Executar `/forge-new-milestone <descrição>` para iniciar o próximo milestone.
 
 ## GSD — Início de sessão obrigatório (dogfood)
