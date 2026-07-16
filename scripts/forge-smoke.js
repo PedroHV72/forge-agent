@@ -1441,9 +1441,11 @@ function smokePlanGateDegradation() {
     '(d) plan_gate.ask_in_auto defaults to defer', 'ask_in_auto: defer missing');
 }
 
-// ── Section 20: forge-xllm adapter (mock codex on PATH) ─────────────────────
+// ── Section 20: forge-xllm adapter (mock codex on PATH + mock agy via env) ──
 // Live-spawns the T01 adapter against a mock `codex` shell binary prepended to
 // PATH — structural (token-presence) asserts don't catch runtime failures.
+// The agy engine scenarios (G–M) inject a Node mock via FORGE_XLLM_AGY_BIN
+// instead, which also runs on Windows.
 function writeMockCodex(dir, opts) {
   opts = opts || {};
   const script = [
@@ -1494,6 +1496,39 @@ function mkGitRepo(dir) {
   run(['add', '-A']);
   run(['-c', 'user.email=smoke@forge', '-c', 'user.name=smoke', 'commit', '-q', '--allow-empty', '-m', 'init']);
   return dir;
+}
+
+// Mock agy as a Node script injected via FORGE_XLLM_AGY_BIN — cross-platform
+// (unlike the POSIX-sh mock codex), so the agy scenarios run on Windows too.
+// The mock prints `payload` to stdout and exits `exitCode`. With checkContract
+// it first verifies the adapter's invocation contract (--sandbox present, -p
+// carries a "Read the file at <path>" instruction, the prompt file exists and
+// holds the real payload) and exits 3 on any violation.
+function writeMockAgy(dir, opts) {
+  opts = opts || {};
+  const js = [
+    '// forge-smoke mock agy',
+    "const fs = require('fs');",
+    'const args = process.argv.slice(2);',
+    "const pIdx = args.indexOf('-p');",
+    "const inline = pIdx >= 0 ? String(args[pIdx + 1] || '') : '';",
+    `if (${opts.checkContract ? 'true' : 'false'}) {`,
+    "  if (!args.includes('--sandbox')) { process.stderr.write('mock: no --sandbox'); process.exit(3); }",
+    '  const m = inline.match(/Read the file at (.+?) and follow/);',
+    "  if (!m) { process.stderr.write('mock: no prompt-file instruction'); process.exit(3); }",
+    "  let t = ''; try { t = fs.readFileSync(m[1], 'utf8'); } catch (e) { process.stderr.write('mock: prompt file unreadable'); process.exit(3); }",
+    "  if (!t.includes('DIFF START') && !t.includes('OBJECTIONS')) { process.stderr.write('mock: prompt file misses payload'); process.exit(3); }",
+    '}',
+    opts.sleepMs
+      ? `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${opts.sleepMs});`
+      : '',
+    `process.stdout.write(${JSON.stringify(String(opts.payload == null ? '' : opts.payload))});`,
+    `process.exit(${typeof opts.exitCode === 'number' ? opts.exitCode : 0});`,
+    '',
+  ].join('\n');
+  const agyPath = path.join(dir, 'mock-agy.js');
+  fs.writeFileSync(agyPath, js, 'utf8');
+  return agyPath;
 }
 
 function runXllm(args, mockDir, cwd, extraEnv) {
@@ -1643,6 +1678,135 @@ function smokeXllm() {
 
     cleanup(dir);
   }
+
+  // ── agy engine scenarios (mock injected via FORGE_XLLM_AGY_BIN — cross-platform) ──
+
+  // Scenario G — agy happy challenge WITH contract check: --sandbox present,
+  // -p carries a "Read the file at <path>" instruction, prompt file exists and
+  // holds the diff payload. Narration prose before the JSON must be tolerated.
+  {
+    const dir = mkTmp('xllm-g');
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-g-mock-'));
+    const payload = 'I will inspect the diff...\nStep narration line 2.\n' + JSON.stringify({
+      objections: [{ id: 'R1', path_line: 'src/a.js:12', claim: 'x', suggested_fix: 'y', challenge: 'z?', severity: 'high' }],
+    });
+    const mockPath = writeMockAgy(mockDir, { payload, exitCode: 0, checkContract: true });
+    const r = runXllm(['--mode', 'challenge', '--engine', 'agy', '--diff-cmd', 'echo diff', '--cwd', dir],
+      null, dir, { FORGE_XLLM_AGY_BIN: mockPath });
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout); } catch (e) { /* leave null */ }
+    assert(r.status === 0, 'G: agy happy challenge exits 0 (contract honored)', `status=${r.status} stderr=${r.stderr}`);
+    const o = parsed && parsed.objections && parsed.objections[0];
+    assert(!!o && o.id === 'R1' && o.severity === 'high' && o.file === 'src/a.js' && o.line === 12,
+      'G: agy stdout normalizes to objections contract', `stdout=${r.stdout}`);
+    cleanup(dir);
+    cleanup(mockDir);
+  }
+
+  // Scenario H — agy missing binary: no override, PATH-hermetic → exit non-zero.
+  {
+    const dir = mkTmp('xllm-h');
+    const r = runXllm(['--mode', 'challenge', '--engine', 'agy', '--diff-cmd', 'echo diff', '--cwd', dir], null, dir);
+    assert(r.status !== 0, 'H: agy missing binary exits non-zero', `status=${r.status}`);
+    assert(r.stderr.length > 0, 'H: agy missing binary writes stderr', `stderr=${r.stderr}`);
+    cleanup(dir);
+  }
+
+  // Scenario I — agy exit 0 with EMPTY stdout (the known non-TTY dropout) → adapter non-zero.
+  {
+    const dir = mkTmp('xllm-i');
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-i-mock-'));
+    const mockPath = writeMockAgy(mockDir, { payload: '', exitCode: 0 });
+    const r = runXllm(['--mode', 'challenge', '--engine', 'agy', '--diff-cmd', 'echo diff', '--cwd', dir],
+      null, dir, { FORGE_XLLM_AGY_BIN: mockPath });
+    assert(r.status !== 0, 'I: agy empty stdout (non-TTY dropout) exits non-zero', `status=${r.status}`);
+    assert(/empty stdout/.test(r.stderr), 'I: agy empty stdout cause is on stderr', `stderr=${r.stderr}`);
+    cleanup(dir);
+    cleanup(mockDir);
+  }
+
+  // Scenario J — agy child exit ≠ 0 → adapter non-zero.
+  {
+    const dir = mkTmp('xllm-j');
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-j-mock-'));
+    const mockPath = writeMockAgy(mockDir, { payload: '', exitCode: 1 });
+    const r = runXllm(['--mode', 'challenge', '--engine', 'agy', '--diff-cmd', 'echo diff', '--cwd', dir],
+      null, dir, { FORGE_XLLM_AGY_BIN: mockPath });
+    assert(r.status !== 0, 'J: agy child exit 1 makes adapter exit non-zero', `status=${r.status}`);
+    cleanup(dir);
+    cleanup(mockDir);
+  }
+
+  // Scenario K — agy timeout: mock sleeps past --timeout 1 (+5s grace) → killed, bounded.
+  {
+    const dir = mkTmp('xllm-k');
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-k-mock-'));
+    const mockPath = writeMockAgy(mockDir, { sleepMs: 20000, exitCode: 0, payload: JSON.stringify({ objections: [] }) });
+    const t0 = Date.now();
+    const r = runXllm(['--mode', 'challenge', '--engine', 'agy', '--diff-cmd', 'echo diff', '--cwd', dir, '--timeout', '1'],
+      null, dir, { FORGE_XLLM_AGY_BIN: mockPath });
+    const elapsed = Date.now() - t0;
+    assert(r.status !== 0, 'K: agy timeout makes adapter exit non-zero', `status=${r.status}`);
+    assert(elapsed < 15000, 'K: agy timeout kill is bounded (< 15s wall time)', `elapsed=${elapsed}ms`);
+    cleanup(dir);
+    cleanup(mockDir);
+  }
+
+  // Scenario L — agy rebuttal happy path (contract check verifies OBJECTIONS payload reached the prompt file).
+  {
+    const dir = mkTmp('xllm-l');
+    const inputFile = path.join(dir, 'input.txt');
+    fs.writeFileSync(inputFile, 'R1: objection text\nDefense: still real\n', 'utf8');
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-l-mock-'));
+    const mockPath = writeMockAgy(mockDir, {
+      payload: JSON.stringify({ verdicts: [{ id: 'R1', verdict: 'maintained', rationale: 'still real' }] }),
+      exitCode: 0,
+      checkContract: true,
+    });
+    const r = runXllm(['--mode', 'rebuttal', '--engine', 'agy', '--input', inputFile, '--cwd', dir],
+      null, dir, { FORGE_XLLM_AGY_BIN: mockPath });
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout); } catch (e) { /* leave null */ }
+    assert(r.status === 0, 'L: agy rebuttal happy path exits 0', `status=${r.status} stderr=${r.stderr}`);
+    assert(!!parsed && parsed.verdicts && parsed.verdicts[0] && parsed.verdicts[0].verdict === 'maintained'
+      && typeof parsed.verdicts[0].reason === 'string',
+      'L: agy normalized verdict has verdict=maintained and reason', `stdout=${r.stdout}`);
+    cleanup(dir);
+    cleanup(mockDir);
+  }
+
+  // Scenario M — unknown --engine value is rejected up front.
+  {
+    const dir = mkTmp('xllm-m');
+    const r = runXllm(['--mode', 'challenge', '--engine', 'llama', '--diff-cmd', 'echo diff', '--cwd', dir], null, dir);
+    assert(r.status !== 0, 'M: unknown --engine exits non-zero', `status=${r.status}`);
+    assert(/unknown --engine/.test(r.stderr), 'M: unknown --engine cause is on stderr', `stderr=${r.stderr}`);
+    cleanup(dir);
+  }
+
+  // Scenario N — CVE-2024-27980 guard: on the cmd.exe /c last-resort path, any
+  // argument carrying a shell metacharacter/quote (an untrusted challenger_model
+  // is repo-committed and reaches argv as --model <value>) must be rejected
+  // before it crosses cmd.exe. Unit-test the exported guard directly (the
+  // cmd.exe path only triggers on win32, so a live subprocess can't exercise it
+  // cross-platform).
+  {
+    const xllm = require(path.join(SCRIPTS, 'forge-xllm.js'));
+    assert(typeof xllm.assertSafeForCmdShell === 'function',
+      'N: forge-xllm exports assertSafeForCmdShell', `got ${typeof xllm.assertSafeForCmdShell}`);
+    // Safe args (incl. an agy label with spaces + parens) must pass unharmed.
+    let safeOk = true;
+    try { xllm.assertSafeForCmdShell(['--model', 'Gemini 3.1 Pro (High)', '--sandbox']); }
+    catch (e) { safeOk = false; }
+    assert(safeOk, 'N: safe args (spaces/parens) pass the cmd-shell guard', 'unexpected throw');
+    // The exact breakout payload from the review objection must be rejected.
+    for (const evil of ['x" & echo PWNED & "', 'a|b', 'a&b', 'a>b', 'a<b', 'a^b', 'a%PATH%b']) {
+      let threw = false;
+      try { xllm.assertSafeForCmdShell(['--model', evil]); }
+      catch (e) { threw = /CVE-2024-27980/.test(e.message); }
+      assert(threw, `N: cmd-shell guard rejects metachar payload ${JSON.stringify(evil)}`, 'no throw / wrong message');
+    }
+  }
 }
 
 // ── Section 21: model ID→alias map (live) ────────────────────────────────
@@ -1768,10 +1932,15 @@ function smokeChallengerWiring() {
   assert(spec.includes('challenger:'), 'spec Step 0 reads challenger:', 'token "challenger:" not found');
   assert(spec.includes('challenger_model'), 'spec Step 0 reads challenger_model', 'token "challenger_model" not found');
   assert(spec.includes('review-challenger-fallback'), 'spec defines review-challenger-fallback event', 'token not found');
-  assert(spec.includes('engine-workflow-forced-agents'), 'spec has codex x workflow precedence reason', 'token "engine-workflow-forced-agents" not found');
+  assert(spec.includes('engine-workflow-forced-agents'), 'spec has external-challenger x workflow precedence reason', 'token "engine-workflow-forced-agents" not found');
   assert(spec.includes('Challenger:'), 'spec Step 6 has Challenger: header', 'token "Challenger:" not found');
   assert(spec.includes('"challenger"'), 'spec Step 8 event has challenger field', 'token \'"challenger"\' not found');
   assert(spec.includes('scripts/forge-xllm.js'), 'spec invokes the forge-xllm.js adapter', 'token not found');
+  assert(spec.includes("'claude','codex','gemini'"), 'spec Step 0 whitelist includes gemini', 'whitelist token not found');
+  assert(spec.includes('XLLM_ENGINE'), 'spec Step 0 derives XLLM_ENGINE', 'token "XLLM_ENGINE" not found');
+  assert(spec.includes('gemini-exit-nonzero'), 'spec has gemini-exit-nonzero fallback reason', 'token not found');
+  assert(spec.includes('--engine "$XLLM_ENGINE"'), 'spec Steps 2/4 pass --engine to the adapter', 'token not found');
+  assert(spec.includes('--model "$CHALLENGER_MODEL"'), 'spec Steps 2/4 quote --model (agy labels have spaces)', 'token not found');
 
   // Live scenario — reuse the Section 20 mock-codex harness in challenge mode
   // and assert the normalized {objections:[...]} contract the spec's Codex
@@ -1821,14 +1990,14 @@ for(const f of files){try{
   if(m=blk.match(/^[ \\t]+fix_conceded:[ \\t]*(\\w+)/m))fixConceded=m[1].toLowerCase()!=='false';
   if(m=blk.match(/^[ \\t]+engine:[ \\t]*(\\w+)/m))engine=m[1].toLowerCase();
   if(m=blk.match(/^[ \\t]+challenger:[ \\t]*(\\w+)/m))challenger=m[1].toLowerCase();
-  if(m=blk.match(/^[ \\t]+challenger_model:[ \\t]*(\\S+)/m))challengerModel=m[1];
+  if(m=blk.match(/^[ \\t]+challenger_model:[ \\t]*([^#\\n]+)/m)){const v=m[1].trim().replace(/^["']|["']$/g,'');if(v)challengerModel=v;}
 }catch(e){}}
 if(!['enabled','disabled'].includes(mode))mode='enabled';
 if(!['dialectic','flags'].includes(style))style='dialectic';
 if(!Number.isInteger(rounds)||rounds<0||rounds>3)rounds=1;
 if(!['defer','pause'].includes(askAuto))askAuto='defer';
 if(!['agents','workflow'].includes(engine))engine='agents';
-if(!['claude','codex'].includes(challenger))challenger='claude';
+if(!['claude','codex','gemini'].includes(challenger))challenger='claude';
 process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engine,challenger,challengerModel}));
 `;
     const dir = mkTmp('challenger-cascade');
@@ -1839,7 +2008,7 @@ process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engin
     // Case 1: challenger: codex + challenger_model: gpt-5-test
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
       'review:\n  challenger: codex\n  challenger_model: gpt-5-test\n');
-    const r1 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir }, encoding: 'utf8' });
+    const r1 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
     let p1 = null;
     try { p1 = JSON.parse(r1.stdout); } catch (e) { /* leave null */ }
     assert(!!p1 && p1.challenger === 'codex' && p1.challengerModel === 'gpt-5-test',
@@ -1848,11 +2017,29 @@ process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engin
     // Case 2: challenger: invalido -> whitelist fallback to "claude"
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
       'review:\n  challenger: invalido\n');
-    const r2 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir }, encoding: 'utf8' });
+    const r2 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
     let p2 = null;
     try { p2 = JSON.parse(r2.stdout); } catch (e) { /* leave null */ }
     assert(!!p2 && p2.challenger === 'claude',
       'Step 0 cascade: invalid challenger falls back to claude whitelist default', `stdout=${r2.stdout} stderr=${r2.stderr}`);
+
+    // Case 3: challenger: gemini + quoted spaced agy label -> quotes stripped, spaces kept
+    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
+      'review:\n  challenger: gemini\n  challenger_model: "Gemini 3.1 Pro (High)"\n');
+    const r3 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
+    let p3 = null;
+    try { p3 = JSON.parse(r3.stdout); } catch (e) { /* leave null */ }
+    assert(!!p3 && p3.challenger === 'gemini' && p3.challengerModel === 'Gemini 3.1 Pro (High)',
+      'Step 0 cascade: gemini + spaced quoted label resolve from prefs', `stdout=${r3.stdout} stderr=${r3.stderr}`);
+
+    // Case 4: challenger_model with only an inline comment -> stays null (latent "#" bug guard)
+    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
+      'review:\n  challenger: gemini\n  challenger_model:        # (unset) — comentário inline\n');
+    const r4 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
+    let p4 = null;
+    try { p4 = JSON.parse(r4.stdout); } catch (e) { /* leave null */ }
+    assert(!!p4 && p4.challenger === 'gemini' && p4.challengerModel === null,
+      'Step 0 cascade: comment-only challenger_model stays null (never "#")', `stdout=${r4.stdout} stderr=${r4.stderr}`);
 
     cleanup(dir);
   }
@@ -1910,7 +2097,7 @@ process.stdout.write(JSON.stringify({challengerModel,advocateModel}));
 
     // Case 1: no advocate_model pref -> default claude-fable-5
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), 'review:\n  mode: enabled\n');
-    const r1 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir }, encoding: 'utf8' });
+    const r1 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
     let p1 = null;
     try { p1 = JSON.parse(r1.stdout); } catch (e) { /* leave null */ }
     assert(!!p1 && p1.advocateModel === 'claude-fable-5',
@@ -1918,7 +2105,7 @@ process.stdout.write(JSON.stringify({challengerModel,advocateModel}));
 
     // Case 2: advocate_model override
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), 'review:\n  advocate_model: claude-opus-4-8\n');
-    const r2 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir }, encoding: 'utf8' });
+    const r2 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
     let p2 = null;
     try { p2 = JSON.parse(r2.stdout); } catch (e) { /* leave null */ }
     assert(!!p2 && p2.advocateModel === 'claude-opus-4-8',
@@ -2841,7 +3028,8 @@ function smokeReviewPairing() {
   assert(modelFamily('claude-fable-5') === 'claude', '(a) modelFamily(claude-fable-5)===claude', `got ${modelFamily('claude-fable-5')}`);
   assert(modelFamily('claude-opus-4-8') === 'claude', '(a) modelFamily(claude-opus-4-8)===claude', `got ${modelFamily('claude-opus-4-8')}`);
   assert(modelFamily('gpt-5-codex') === 'gpt', '(a) modelFamily(gpt-5-codex)===gpt', `got ${modelFamily('gpt-5-codex')}`);
-  assert(modelFamily('gemini-2') === null, '(a) modelFamily(gemini-2)===null', `got ${modelFamily('gemini-2')}`);
+  assert(modelFamily('gemini-2') === 'gemini', '(a) modelFamily(gemini-2)===gemini', `got ${modelFamily('gemini-2')}`);
+  assert(modelFamily('mistral-7b') === null, '(a) modelFamily(mistral-7b)===null', `got ${modelFamily('mistral-7b')}`);
   assert(modelFamily('') === null, "(a) modelFamily('')===null", `got ${modelFamily('')}`);
   assert(engineFamily('claude') === 'claude', '(a) engineFamily(claude)===claude', `got ${engineFamily('claude')}`);
   assert(engineFamily('codex') === 'gpt', '(a) engineFamily(codex)===gpt', `got ${engineFamily('codex')}`);
@@ -2852,8 +3040,8 @@ function smokeReviewPairing() {
   assert(rFamily1.status === 0 && rFamily1.stdout.trim() === 'claude',
     '(a2) CLI --family claude-fable-5 → stdout claude', `status=${rFamily1.status} stdout='${rFamily1.stdout.trim()}'`);
   const rFamily2 = runScript('forge-model-alias.js', ['--family', 'gemini-2']);
-  assert(rFamily2.status === 0 && rFamily2.stdout.trim() === '',
-    '(a2) CLI --family gemini-2 → stdout vazio', `status=${rFamily2.status} stdout='${rFamily2.stdout.trim()}'`);
+  assert(rFamily2.status === 0 && rFamily2.stdout.trim() === 'gemini',
+    '(a2) CLI --family gemini-2 → stdout gemini', `status=${rFamily2.status} stdout='${rFamily2.stdout.trim()}'`);
 
   // helper de fixture
   const writeEvents = (dir, lines) => {
@@ -3196,9 +3384,9 @@ function smokeReviewPairingWiring() {
   const taskMd = rd('skills/forge-task/SKILL.md');
   const dispatchMd = rd('shared/forge-dispatch.md');
 
-  // (e1) whitelist do reader inclui `auto`.
-  assert(reviewMd.includes("['claude','codex','auto'].includes(challenger)"),
-    '(e1) forge-review.md: whitelist do reader inclui auto para challenger', 'whitelist auto não encontrada');
+  // (e1) whitelist do reader inclui `auto` (e gemini, reconciliado R5-spec S05).
+  assert(reviewMd.includes("['claude','codex','gemini','auto'].includes(challenger)"),
+    '(e1) forge-review.md: whitelist do reader inclui auto+gemini para challenger', 'whitelist auto/gemini não encontrada');
 
   // (e2) bloco de resolução + evento review-pairing-fallback presentes.
   assert(reviewMd.includes('Resolução de pairing') && reviewMd.includes('review-pairing-fallback'),
@@ -3206,12 +3394,12 @@ function smokeReviewPairingWiring() {
 
   // (e3) ORDEM DE PRECEDÊNCIA: a chamada ao CLI (resolução) vem ANTES do check workflow-força-agents.
   const idxResolve = reviewMd.indexOf('--events "$SCOPED" --slice "{S##}" --milestone "{M###}" --cwd "$WORKING_DIR"');
-  const idxWorkflow = reviewMd.indexOf('[ "$RESOLVED_CHALLENGER" = "codex" ] && [ "$ENGINE" = "workflow" ]');
+  const idxWorkflow = reviewMd.indexOf('[ "$RESOLVED_CHALLENGER" != "claude" ] && [ "$ENGINE" = "workflow" ]');
   assert(idxResolve > -1 && idxWorkflow > -1 && idxResolve < idxWorkflow,
     '(e3) resolução de pairing precede o check engine:workflow-força-agents (ordem canônica)', `idxResolve=${idxResolve} idxWorkflow=${idxWorkflow}`);
 
-  // (e4) a regra workflow testa o RESOLVIDO (nunca `auto` cru).
-  assert(reviewMd.includes('[ "$RESOLVED_CHALLENGER" = "codex" ] && [ "$ENGINE" = "workflow" ]'),
+  // (e4) a regra workflow testa o RESOLVIDO (nunca `auto` cru); != claude cobre codex E gemini (R2/S05).
+  assert(reviewMd.includes('[ "$RESOLVED_CHALLENGER" != "claude" ] && [ "$ENGINE" = "workflow" ]'),
     '(e4) forge-review.md: regra workflow-força-agents testa $RESOLVED_CHALLENGER (não auto cru)', 'check do resolvido não encontrado');
 
   // (e5) codex-unavailable é distinto de codex-exit-nonzero (check command -v codex no Step 0).
@@ -3306,6 +3494,676 @@ function smokeReviewPairingPrefsSchema() {
     '(e) § Review Settings preserva os eixos challenger_model/advocate_model (MODELO, ortogonal a auto=FAMÍLIA)', 'eixos de modelo ausentes');
 }
 
+// ── Section 32: routing resolver (célula a célula + identidade legado) ─────
+// M007 S01 T04. Exercita forge-routing.js (readRoutingConfig/resolveRoute)
+// via require() e via CLI subprocess (runScript), incluindo o assert de
+// identidade byte-idêntica com readTierChain() quando não há bloco routing:.
+function smokeRouting() {
+  process.stdout.write('\n▸ Section 32: routing resolver (célula a célula + identidade legado)\n');
+  const { resolveRoute, readRoutingConfig } = require('./forge-routing');
+  const { modelFamily } = require('./forge-model-alias');
+  const { readTierChain } = require('./forge-tier-chain');
+
+  const qStatuses = []; // (q) exit 0 sempre — coletado em cada runScript abaixo
+
+  const writeRoutingPrefs = (dir, bodyText, filename) => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.gsd', filename || 'claude-agent-prefs.md'),
+      'routing:\n' + bodyText,
+      'utf8'
+    );
+  };
+
+  // (a) precedência: routing.<domínio>.<fase>.<tier> presente → routing-hit
+  const dirA = mkTmp('routing-a');
+  writeRoutingPrefs(dirA,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n'
+  );
+  const rA = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirA });
+  assert(rA.source === 'routing' && /routing-hit/.test(rA.reason) && rA.domain_used === 'backend',
+    '(a) precedência: célula routing.<domínio>.<fase>.<tier> → source:routing, reason:routing-hit, domain_used:<domínio>',
+    JSON.stringify(rA));
+  cleanup(dirA);
+
+  // (b) routing-default: célula do domínio ausente, routing.default presente
+  const dirB = mkTmp('routing-b');
+  writeRoutingPrefs(dirB,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      heavy: [claude-opus-4-8]\n' +
+    '  default:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n'
+  );
+  const rB = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirB });
+  assert(rB.source === 'routing' && /routing-default/.test(rB.reason) && rB.domain_used === 'default',
+    '(b) routing-default: célula ausente no domínio → cai para routing.default.<fase>.<tier>',
+    JSON.stringify(rB));
+  cleanup(dirB);
+
+  // (c) tier_models legado: domínio+default ausentes para a fase/tier pedidos
+  const dirC = mkTmp('routing-c');
+  writeRoutingPrefs(dirC,
+    '  frontend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n'
+  );
+  const rC = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirC });
+  assert(rC.source === 'tier_models', '(c) domínio+default ausentes → source:tier_models (legado)', JSON.stringify(rC));
+  cleanup(dirC);
+
+  // (d) frontmatter override: tier/worker fixados no frontmatter vencem o source
+  const dirD = mkTmp('routing-d');
+  writeRoutingPrefs(dirD,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n'
+  );
+  const rD1 = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', frontmatterTier: 'heavy', cwd: dirD });
+  assert(rD1.source === 'frontmatter' && /frontmatter-tier/.test(rD1.reason),
+    '(d) frontmatter-tier vence o rótulo de source (mesmo resolvendo via routing/legado no tier fixado)',
+    JSON.stringify(rD1));
+  const rD2 = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', frontmatterWorker: 'claude-opus-4-8', cwd: dirD });
+  assert(rD2.source === 'frontmatter' && /frontmatter-worker/.test(rD2.reason) && rD2.chain.length === 1 && rD2.chain[0].id === 'claude-opus-4-8',
+    '(d) frontmatter-worker fixa um único membro de cadeia, vence a precedência inteira',
+    JSON.stringify(rD2));
+  cleanup(dirD);
+
+  // (e) parse-error: indentação quebrada (dedent para nível desconhecido) → all-or-nothing
+  const dirE = mkTmp('routing-e');
+  writeRoutingPrefs(dirE,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n' +
+    '   fallback: claude-haiku-4-5-20251001\n'
+  );
+  const cfgE = readRoutingConfig(dirE);
+  assert(cfgE.present === true && cfgE.ok === false && cfgE.error === 'routing-parse-error',
+    '(e) indentação quebrada → present:true, ok:false, error:routing-parse-error', JSON.stringify(cfgE));
+  const rE = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirE });
+  assert(rE.source === 'tier_models' && /routing-parse-error/.test(rE.reason),
+    '(e) resolveRoute degrada para tier_models com routing-parse-error no reason', JSON.stringify(rE));
+  const eCli = runScript('forge-routing.js', ['--unit-type', 'execute-task', '--tier', 'standard', '--domain', 'backend', '--cwd', dirE]);
+  qStatuses.push(eCli.status);
+  assert(eCli.status === 0, '(e) CLI com bloco malformado ainda sai 0', `status=${eCli.status}`);
+  cleanup(dirE);
+
+  // (f) tabs vs espaços: indentação relativa (não absoluta) → mesmo resultado de parse
+  const dirF1 = mkTmp('routing-f1');
+  writeRoutingPrefs(dirF1,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n' +
+    '      fallback: claude-haiku-4-5-20251001\n'
+  );
+  const dirF2 = mkTmp('routing-f2');
+  writeRoutingPrefs(dirF2,
+    '\tbackend:\n' +
+    '\t\texecutor:\n' +
+    '\t\t\tstandard: [claude-sonnet-5]\n' +
+    '\t\t\tfallback: claude-haiku-4-5-20251001\n'
+  );
+  const cfgF1 = readRoutingConfig(dirF1);
+  const cfgF2 = readRoutingConfig(dirF2);
+  assert(cfgF1.ok === true && cfgF2.ok === true, '(f) blocos com espaços e com tabs ambos parseiam ok:true',
+    `f1.ok=${cfgF1.ok} f2.ok=${cfgF2.ok}`);
+  assert(JSON.stringify(cfgF1.routing) === JSON.stringify(cfgF2.routing),
+    '(f) tabs vs espaços → parse idêntico (indentação relativa, não absoluta)',
+    `${JSON.stringify(cfgF1.routing)} !== ${JSON.stringify(cfgF2.routing)}`);
+  cleanup(dirF1);
+  cleanup(dirF2);
+
+  // (g) domínio duplicado entre arquivos da cascata → last-wins por domínio inteiro
+  const dirG = mkTmp('routing-g');
+  writeRoutingPrefs(dirG,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n',
+    'claude-agent-prefs.md'
+  );
+  fs.writeFileSync(
+    path.join(dirG, '.gsd', 'prefs.local.md'),
+    'routing:\n  backend:\n    executor:\n      standard: [claude-opus-4-8]\n',
+    'utf8'
+  );
+  const cfgG = readRoutingConfig(dirG);
+  assert(cfgG.routing.backend.executor.standard[0] === 'claude-opus-4-8',
+    '(g) domínio redefinido em arquivo mais específico → last-wins por domínio inteiro (nunca merge de campo)',
+    JSON.stringify(cfgG.routing));
+  cleanup(dirG);
+
+  // (h) célula mista claude/gpt: chain com engine por membro
+  const dirH = mkTmp('routing-h');
+  writeRoutingPrefs(dirH,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5, gpt-5-codex]\n'
+  );
+  const rH = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirH });
+  assert(rH.chain.length === 2 && rH.chain[0].engine === 'claude' && rH.chain[1].engine === 'gpt',
+    '(h) célula mista claude/gpt → cadeia com 2 membros, engine correto por membro', JSON.stringify(rH.chain));
+  cleanup(dirH);
+
+  // (i) membro com família desconhecida (não-gemini) é pulado da cadeia
+  const dirI = mkTmp('routing-i');
+  writeRoutingPrefs(dirI,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5, mistral-7b]\n'
+  );
+  const rI = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirI });
+  assert(rI.chain.length === 1 && rI.chain[0].id === 'claude-sonnet-5',
+    '(i) membro família desconhecida → pulado, cadeia final só com claude', JSON.stringify(rI.chain));
+  assert(/skipped-unknown-family/.test(rI.reason), '(i) reason contém skipped-unknown-family', rI.reason);
+  cleanup(dirI);
+
+  // (j) cadeia de 5 membros → cap em 3, reason chain-capped
+  const dirJ = mkTmp('routing-j');
+  writeRoutingPrefs(dirJ,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5, claude-opus-4-8, claude-haiku-4-5-20251001, claude-sonnet-5, claude-opus-4-8]\n'
+  );
+  const rJ = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirJ });
+  assert(rJ.chain.length === 3, '(j) cadeia de 5 membros → truncada em 3 (CHAIN_CAP)', `got length=${rJ.chain.length}`);
+  assert(/chain-capped/.test(rJ.reason), '(j) reason contém chain-capped', rJ.reason);
+  cleanup(dirJ);
+
+  // (k) fallback configurado não-claude/não-mapeado → substituído pelo default do tier
+  const dirK = mkTmp('routing-k');
+  writeRoutingPrefs(dirK,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n' +
+    '      fallback: gpt-5-codex\n'
+  );
+  const rK = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirK });
+  assert(/fallback-invalid-substituted/.test(rK.reason), '(k) fallback gpt → reason fallback-invalid-substituted', rK.reason);
+  assert(rK.fallback.id !== 'gpt-5-codex' && modelFamily(rK.fallback.id) === 'claude',
+    '(k) fallback substituído pelo default claude/mapeado do tier', JSON.stringify(rK.fallback));
+  const kCli = runScript('forge-routing.js', ['--unit-type', 'execute-task', '--tier', 'standard', '--domain', 'backend', '--cwd', dirK]);
+  qStatuses.push(kCli.status);
+  assert(kCli.status === 0, '(k) CLI com fallback inválido ainda sai 0', `status=${kCli.status}`);
+  cleanup(dirK);
+
+  // (l) plan-milestone NUNCA é capturado pelo routing, mesmo com célula presente
+  const dirL = mkTmp('routing-l');
+  writeRoutingPrefs(dirL,
+    '  default:\n' +
+    '    plan:\n' +
+    '      standard: [claude-fable-5]\n'
+  );
+  const rL = resolveRoute({ unitType: 'plan-milestone', tier: 'standard', domain: 'backend', cwd: dirL });
+  assert(/phase-not-routable/.test(rL.reason), '(l) plan-milestone → phase-not-routable (nunca célula do routing)', rL.reason);
+  const cliL = runScript('forge-routing.js', ['--unit-type', 'plan-milestone', '--tier', 'standard', '--domain', 'backend', '--cwd', dirL]);
+  qStatuses.push(cliL.status);
+  let parsedL = null;
+  try { parsedL = JSON.parse(cliL.stdout); } catch {}
+  assert(cliL.status === 0 && parsedL !== null && /phase-not-routable/.test(parsedL.reason),
+    '(l) CLI contrato JSON confirma phase-not-routable, sai 0', `status=${cliL.status} stdout=${cliL.stdout}`);
+  cleanup(dirL);
+
+  // (m) fases claude-only (discuss-slice, memory) também são phase-not-routable
+  const dirM = mkTmp('routing-m');
+  const rM1 = resolveRoute({ unitType: 'discuss-slice', tier: 'standard', cwd: dirM });
+  assert(/phase-not-routable/.test(rM1.reason), '(m) discuss-slice → phase-not-routable', rM1.reason);
+  const rM2 = resolveRoute({ unitType: 'memory', tier: 'standard', cwd: dirM });
+  assert(/phase-not-routable/.test(rM2.reason), '(m) memory → phase-not-routable', rM2.reason);
+  cleanup(dirM);
+
+  // (n) --next-after: cadeia resolvida (2 membros) → segundo, depois fallback, depois ''
+  const dirN = mkTmp('routing-n');
+  writeRoutingPrefs(dirN,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5, claude-opus-4-8]\n' +
+    '      fallback: claude-haiku-4-5-20251001\n'
+  );
+  const baseArgsN = ['--unit-type', 'execute-task', '--tier', 'standard', '--domain', 'backend', '--cwd', dirN];
+  const n1 = runScript('forge-routing.js', [...baseArgsN, '--next-after', 'claude-sonnet-5']);
+  qStatuses.push(n1.status);
+  assert(n1.status === 0 && n1.stdout.trim() === 'claude-opus-4-8',
+    '(n) --next-after do primeiro membro → segundo membro da cadeia', `status=${n1.status} stdout='${n1.stdout.trim()}'`);
+  const n2 = runScript('forge-routing.js', [...baseArgsN, '--next-after', 'claude-opus-4-8']);
+  qStatuses.push(n2.status);
+  assert(n2.status === 0 && n2.stdout.trim() === 'claude-haiku-4-5-20251001',
+    '(n) --next-after do último membro → fallback de categoria', `status=${n2.status} stdout='${n2.stdout.trim()}'`);
+  const n3 = runScript('forge-routing.js', [...baseArgsN, '--next-after', 'claude-haiku-4-5-20251001']);
+  qStatuses.push(n3.status);
+  assert(n3.status === 0 && n3.stdout.trim() === '',
+    '(n) --next-after do fallback já usado → string vazia (cadeia esgotada)', `status=${n3.status} stdout='${n3.stdout.trim()}'`);
+  cleanup(dirN);
+
+  // (o) --explain: marcadores pt-BR de precedência/degradação presentes
+  const dirO = mkTmp('routing-o');
+  writeRoutingPrefs(dirO,
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n'
+  );
+  const o1 = runScript('forge-routing.js', ['--unit-type', 'execute-task', '--tier', 'standard', '--domain', 'backend', '--explain', '--cwd', dirO]);
+  qStatuses.push(o1.status);
+  assert(o1.status === 0, '(o) --explain sai 0', `status=${o1.status}`);
+  assert(/Explicação da rota/.test(o1.stdout) && /camada de precedência vencedora/.test(o1.stdout) && /Cadeia final/.test(o1.stdout),
+    '(o) --explain contém marcadores pt-BR da decisão (célula/precedência/degradação)', o1.stdout.slice(0, 300));
+  cleanup(dirO);
+
+  // (p) IDENTIDADE byte-idêntica: sem bloco routing:, chain/fallback == readTierChain()
+  const projChain = (arr) => arr.map((m) => ({ id: m.id, alias: m.alias, mapped: m.mapped }));
+
+  const dirP1 = mkTmp('routing-p-scalar');
+  fs.mkdirSync(path.join(dirP1, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dirP1, '.gsd', 'claude-agent-prefs.md'), 'tier_models:\n  standard: claude-sonnet-5\n', 'utf8');
+  const rP1 = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'x', cwd: dirP1 });
+  const legacyP1 = readTierChain('standard', dirP1);
+  assert(JSON.stringify(projChain(rP1.chain)) === JSON.stringify(projChain(legacyP1)),
+    '(p) IDENTIDADE: sem routing:, chain byte-idêntica ao readTierChain (escalar)',
+    `${JSON.stringify(rP1.chain)} vs ${JSON.stringify(legacyP1)}`);
+  assert(rP1.fallback.id === legacyP1[0].id && rP1.fallback.alias === legacyP1[0].alias,
+    '(p) IDENTIDADE: fallback byte-idêntico ao primeiro membro legado (escalar)', JSON.stringify(rP1.fallback));
+  cleanup(dirP1);
+
+  const dirP2 = mkTmp('routing-p-list');
+  fs.mkdirSync(path.join(dirP2, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dirP2, '.gsd', 'claude-agent-prefs.md'),
+    'tier_models:\n  standard: [claude-sonnet-5, claude-haiku-4-5-20251001]\n', 'utf8');
+  const rP2 = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'x', cwd: dirP2 });
+  const legacyP2 = readTierChain('standard', dirP2);
+  assert(JSON.stringify(projChain(rP2.chain)) === JSON.stringify(projChain(legacyP2)),
+    '(p) IDENTIDADE: sem routing:, chain byte-idêntica ao readTierChain (lista inline)',
+    `${JSON.stringify(rP2.chain)} vs ${JSON.stringify(legacyP2)}`);
+  cleanup(dirP2);
+
+  // (q) exit 0 sempre — todos os runScript('forge-routing.js', ...) acima retornaram status 0,
+  // inclusive nos caminhos de degradação (e/f/k/l).
+  assert(qStatuses.length > 0 && qStatuses.every((s) => s === 0),
+    '(q) todos os runScript(forge-routing.js, ...) desta Section retornam status 0 (inclusive degradações)',
+    JSON.stringify(qStatuses));
+}
+
+// ── Section 33: routing wiring (call-sites + eventos + contrato BLOCKER) ────
+// M007 S02 T04. Doc-presence guards (grep-over-file) que verificam o wiring
+// de T01/T02/T03 nos 3 arquivos: canônico shared/forge-dispatch.md, e os
+// dois mirrors executáveis skills/forge-auto/SKILL.md e forge-next/SKILL.md.
+// Não exercita runtime — apenas confirma que os textos/call-sites existem.
+function smokeRoutingWiring() {
+  process.stdout.write('\n▸ Section 33: routing wiring (call-sites + eventos + contrato BLOCKER)\n');
+
+  const dispatchPath = path.join(__dirname, '..', 'shared', 'forge-dispatch.md');
+  const autoPath = path.join(__dirname, '..', 'skills', 'forge-auto', 'SKILL.md');
+  const nextPath = path.join(__dirname, '..', 'skills', 'forge-next', 'SKILL.md');
+
+  const dispatchTxt = fs.readFileSync(dispatchPath, 'utf8');
+  const autoTxt = fs.readFileSync(autoPath, 'utf8');
+  const nextTxt = fs.readFileSync(nextPath, 'utf8');
+
+  const files = [
+    { name: 'shared/forge-dispatch.md', txt: dispatchTxt },
+    { name: 'skills/forge-auto/SKILL.md', txt: autoTxt },
+    { name: 'skills/forge-next/SKILL.md', txt: nextTxt },
+  ];
+
+  // (a) call-sites: forge-routing.js aparece como call de dispatch (perto de --unit-type)
+  // nos 3 arquivos.
+  for (const f of files) {
+    const hasCallSite = /forge-routing\.js["'`]?[\s\S]{0,120}--unit-type/.test(f.txt) ||
+      /--unit-type[\s\S]{0,300}forge-routing\.js/.test(f.txt);
+    assert(hasCallSite,
+      `(a) ${f.name} contém forge-routing.js como call de dispatch (perto de --unit-type)`,
+      `forge-routing.js count=${(f.txt.match(/forge-routing\.js/g) || []).length}`);
+  }
+
+  // (b) os mirrors NÃO retêm a resolução inicial de cadeia via forge-tier-chain.js --json
+  // (só pode sobrar menção descritiva "replaces the old forge-tier-chain.js --json", nunca
+  // um call-site ativo tipo `node ... forge-tier-chain.js ... --json` fora de comentário/prosa).
+  const activeTierChainJsonCall = /\$\([^)]*forge-tier-chain\.js[^)]*--json[^)]*\)/;
+  for (const f of [{ name: 'skills/forge-auto/SKILL.md', txt: autoTxt }, { name: 'skills/forge-next/SKILL.md', txt: nextTxt }]) {
+    assert(!activeTierChainJsonCall.test(f.txt),
+      `(b) ${f.name} não retém call-site ativo de forge-tier-chain.js --json (resolução inicial substituída)`,
+      'encontrado call-site ativo');
+  }
+  // e o dispatch canônico também não descreve forge-routing.js como opcional/paralelo —
+  // assert positivo: o step 4 de Tier Resolution é a chamada forge-routing.js.
+  assert(/forge-routing\.js/.test(dispatchTxt) && /SINGLE.{0,20}call/i.test(dispatchTxt),
+    '(b) shared/forge-dispatch.md descreve forge-routing.js como a chamada ÚNICA (single call)',
+    'marcador "SINGLE ... call" ausente');
+
+  // (c) eventos aditivos: os 3 arquivos documentam/emitem domain/route_source/chain_len
+  // no evento dispatch.
+  for (const f of files) {
+    assert(/route_source/.test(f.txt) && /chain_len/.test(f.txt) && /\bdomain\b/.test(f.txt),
+      `(c) ${f.name} documenta os campos aditivos domain/route_source/chain_len no evento dispatch`,
+      `route_source=${/route_source/.test(f.txt)} chain_len=${/chain_len/.test(f.txt)} domain=${/\bdomain\b/.test(f.txt)}`);
+  }
+
+  // (d) contrato BLOCKER (doc-presence): sufixo -attempt- (state fresco por tentativa),
+  // reset verificado (git status --porcelain) e cap SIDECAR_ATTEMPT presentes em
+  // forge-auto e forge-next; o canônico descreve os três.
+  for (const f of [{ name: 'skills/forge-auto/SKILL.md', txt: autoTxt }, { name: 'skills/forge-next/SKILL.md', txt: nextTxt }]) {
+    assert(/-attempt-/.test(f.txt),
+      `(d) ${f.name} contém o sufixo -attempt- (state fresco por tentativa)`, 'ausente');
+    assert(/porcelain/.test(f.txt),
+      `(d) ${f.name} contém 'porcelain' (reset verificado via git status --porcelain)`, 'ausente');
+    assert(/SIDECAR_ATTEMPT/.test(f.txt),
+      `(d) ${f.name} contém o cap SIDECAR_ATTEMPT`, 'ausente');
+  }
+  assert(/-attempt-/.test(dispatchTxt) && /porcelain/.test(dispatchTxt) && /SIDECAR_ATTEMPT/.test(dispatchTxt),
+    '(d) shared/forge-dispatch.md descreve os três invariantes do contrato BLOCKER (-attempt-, porcelain, SIDECAR_ATTEMPT)',
+    `attempt=${/-attempt-/.test(dispatchTxt)} porcelain=${/porcelain/.test(dispatchTxt)} cap=${/SIDECAR_ATTEMPT/.test(dispatchTxt)}`);
+
+  // (e) Layer 2 / MEM001: forge-routing.js aparece perto de --next-after; context_overflow
+  // re-resolve via routing (não forge-tier-chain na row); e o texto reforça "nunca 4ª camada".
+  for (const f of [{ name: 'shared/forge-dispatch.md', txt: dispatchTxt }, { name: 'skills/forge-auto/SKILL.md', txt: autoTxt }, { name: 'skills/forge-next/SKILL.md', txt: nextTxt }]) {
+    assert(/forge-routing\.js[\s\S]{0,400}--next-after/.test(f.txt) || /--next-after[\s\S]{0,400}forge-routing\.js/.test(f.txt),
+      `(e) ${f.name}: forge-routing.js aparece perto de --next-after (Layer 2 via routing)`,
+      'padrão não encontrado');
+  }
+  assert(/never a 4th layer|nunca.{0,10}4ª camada|never.{0,10}4th layer/i.test(dispatchTxt),
+    '(e) shared/forge-dispatch.md reforça "nunca 4ª camada" (MEM001)', 'marcador ausente');
+  assert(/never a 4th layer/i.test(autoTxt), '(e) skills/forge-auto/SKILL.md reforça "never a 4th layer" (MEM001)', 'marcador ausente');
+  assert(/never a 4th layer/i.test(nextTxt), '(e) skills/forge-next/SKILL.md reforça "never a 4th layer" (MEM001)', 'marcador ausente');
+
+  // (f) context_overflow re-resolve THROUGH routing (não uma linha isolada com
+  // forge-tier-chain.js na tabela de failure taxonomy).
+  for (const f of files) {
+    assert(/context_overflow/.test(f.txt),
+      `(f) ${f.name} contém 'context_overflow' na Failure Taxonomy`, 'ausente');
+  }
+  assert(/context_overflow[\s\S]{0,600}forge-routing\.js/.test(dispatchTxt) || /forge-routing\.js[\s\S]{0,600}context_overflow/.test(dispatchTxt),
+    '(f) shared/forge-dispatch.md: context_overflow re-resolve THROUGH forge-routing.js (proximidade textual)',
+    'padrão não encontrado');
+
+  // (g) compat: route_source/tier_models como caminho byte-idêntico legado (source:tier_models).
+  for (const f of files) {
+    assert(/tier_models/.test(f.txt),
+      `(g) ${f.name} menciona tier_models (caminho legado byte-idêntico)`, 'ausente');
+  }
+  assert(/tier_models[\s\S]{0,400}(byte-idêntic|byte-identical)|(byte-idêntic|byte-identical)[\s\S]{0,400}tier_models/.test(dispatchTxt),
+    '(g) shared/forge-dispatch.md descreve tier_models como caminho legado byte-idêntico',
+    'padrão não encontrado');
+
+  // (h) stub check — nenhum dos 3 arquivos ganhou placeholder no wiring de S02.
+  const stubPatterns = [/\bTODO\b/, /\bTBD\b/, /\bFIXME\b/, /\bPLACEHOLDER\b/];
+  for (const f of files) {
+    for (const re of stubPatterns) {
+      assert(!re.test(f.txt), `(h) ${f.name} não contém stub pattern ${re}`, 'stub encontrado');
+    }
+  }
+}
+
+// ── Section 34: emissão de domínio (schema aditivo + planner + plan-checker) ─
+// M007 S03 T04. Asserts behaviorais sobre o schema aditivo `domain:` de
+// forge-must-haves.js e sobre forge-routing.js --list-domains, mais drift
+// guards (grep de presença/ausência) sobre a guidance de emissão em
+// agents/forge-planner.md e a extensão da dimension 7 em
+// agents/forge-plan-checker.md.
+function smokeDomainEmission() {
+  process.stdout.write('\n▸ Section 34: emissão de domínio (schema aditivo + planner + plan-checker)\n');
+
+  const mustHavesScript = path.join(SCRIPTS, 'forge-must-haves.js');
+
+  const runCheck = (content) => {
+    const dir = mkTmp('domain-mh');
+    const file = path.join(dir, 'T01-PLAN.md');
+    fs.writeFileSync(file, content, 'utf8');
+    const r = spawnSync(process.execPath, [mustHavesScript, '--check', file], { encoding: 'utf8' });
+    cleanup(dir);
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout); } catch {}
+    return { status: r.status, parsed, raw: r.stdout, stderr: r.stderr };
+  };
+
+  const structuredWith = (domainLine) =>
+    '---\n' +
+    'id: T01\n' +
+    'slice: S01\n' +
+    'milestone: M999\n' +
+    'title: "fixture"\n' +
+    'worker: forge-executor\n' +
+    (domainLine ? domainLine + '\n' : '') +
+    'must_haves:\n' +
+    '  truths:\n' +
+    '    - "algo verdadeiro"\n' +
+    '  artifacts:\n' +
+    '    - path: "scripts/x.js"\n' +
+    '      provides: "x"\n' +
+    '      min_lines: 1\n' +
+    '  key_links: []\n' +
+    'expected_output:\n' +
+    '  - scripts/x.js\n' +
+    '---\n\n# T01: fixture\n';
+
+  const legacyPlan =
+    '---\n' +
+    'id: T01\n' +
+    'slice: S01\n' +
+    'milestone: M999\n' +
+    'title: "fixture legada"\n' +
+    'worker: forge-executor\n' +
+    '---\n\n# T01: fixture legada\n\n## Must-Haves\n- algo verdadeiro (free-text, sem bloco structured).\n';
+
+  // (a) structured COM domain: backend → valid:true, domain refletido.
+  const rA = runCheck(structuredWith('domain: backend'));
+  assert(rA.status === 0 && rA.parsed && rA.parsed.legacy === false && rA.parsed.valid === true && rA.parsed.domain === 'backend',
+    '(a) structured COM domain: backend → valid:true, domain:"backend"', JSON.stringify(rA));
+
+  // (b) structured SEM domain: → valid:true, domain null/ausente.
+  const rB = runCheck(structuredWith(null));
+  assert(rB.status === 0 && rB.parsed && rB.parsed.legacy === false && rB.parsed.valid === true &&
+    (rB.parsed.domain === null || rB.parsed.domain === undefined),
+    '(b) structured SEM domain: → valid:true, domain null/ausente (campo aditivo)', JSON.stringify(rB));
+
+  // (c) legacy (must_haves free-text) → legacy:true, valid:true.
+  const rC = runCheck(legacyPlan);
+  assert(rC.status === 0 && rC.parsed && rC.parsed.legacy === true && rC.parsed.valid === true,
+    '(c) plano legacy (free-text) → legacy:true, valid:true', JSON.stringify(rC));
+
+  // (d) domain: malformado (lista) → valid:false.
+  const rD = runCheck(structuredWith('domain: [backend, frontend]'));
+  assert(rD.status !== 0 && rD.parsed && rD.parsed.legacy === false && rD.parsed.valid === false,
+    '(d) domain: malformado (lista) → valid:false, exit != 0', JSON.stringify(rD));
+
+  // ── --list-domains behavioral ──────────────────────────────────────────
+  const writeRoutingPrefsDom = (dir, bodyText) => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.gsd', 'claude-agent-prefs.md'), 'routing:\n' + bodyText, 'utf8');
+  };
+
+  // (e) dir com bloco routing: (2 domínios) → --list-domains retorna ambos, exit 0.
+  const dirE = mkTmp('domain-list-e');
+  writeRoutingPrefsDom(dirE,
+    '  default:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n' +
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [claude-sonnet-5]\n'
+  );
+  const eR = runScript('forge-routing.js', ['--list-domains', '--cwd', dirE]);
+  let eParsed = null;
+  try { eParsed = JSON.parse(eR.stdout); } catch {}
+  assert(eR.status === 0 && Array.isArray(eParsed) && eParsed.includes('default') && eParsed.includes('backend'),
+    '(e) --list-domains com bloco routing: (2 domínios) → JSON array com ambas as chaves, exit 0',
+    `status=${eR.status} stdout=${eR.stdout}`);
+  cleanup(dirE);
+
+  // (f) dir SEM bloco routing: → --list-domains retorna [], exit 0.
+  const dirF = mkTmp('domain-list-f');
+  fs.mkdirSync(path.join(dirF, '.gsd'), { recursive: true });
+  const fR = runScript('forge-routing.js', ['--list-domains', '--cwd', dirF]);
+  let fParsed = null;
+  try { fParsed = JSON.parse(fR.stdout); } catch {}
+  assert(fR.status === 0 && Array.isArray(fParsed) && fParsed.length === 0,
+    '(f) --list-domains sem bloco routing: → [], exit 0', `status=${fR.status} stdout=${fR.stdout}`);
+  cleanup(dirF);
+
+  // ── Drift guards — markdown (grep de presença/ausência) ────────────────
+  const plannerTxt = fs.readFileSync(path.join(__dirname, '..', 'agents', 'forge-planner.md'), 'utf8');
+  const planCheckerTxt = fs.readFileSync(path.join(__dirname, '..', 'agents', 'forge-plan-checker.md'), 'utf8');
+
+  // (g) planner: guidance de domain: no frontmatter da task.
+  assert(/domain:\s*backend/.test(plannerTxt) || /`domain:`/.test(plannerTxt),
+    '(g) agents/forge-planner.md contém guidance de domain: no frontmatter da task', 'padrão não encontrado');
+
+  // (h) planner: tag domain:<name> na linha do slice do ROADMAP.
+  assert(/domain:<name>/.test(plannerTxt),
+    '(h) agents/forge-planner.md referencia a tag `domain:<name>` na linha do slice do ROADMAP', 'padrão não encontrado');
+
+  // (i) plan-checker: dimension 7 (scope_alignment) referencia domínio / --list-domains.
+  assert(/scope_alignment/.test(planCheckerTxt) && /--list-domains/.test(planCheckerTxt),
+    '(i) agents/forge-plan-checker.md: dimension 7 (scope_alignment) referencia --list-domains', 'padrão não encontrado');
+
+  // (j) plan-checker: NÃO existe uma "Dimension 11" — extensão fica na dim-7 existente.
+  assert(!/Dimension 11/.test(planCheckerTxt),
+    '(j) agents/forge-plan-checker.md NÃO contém "Dimension 11" (extensão aditiva à dim-7, sem 11ª dimensão)',
+    'ocorrência inesperada de "Dimension 11"');
+}
+
+// ── Section 35: guard de integração 3-família (gemini) + R5 whitelist ──────
+// Guarda a integração ponta-a-ponta da 3ª família gemini: modelFamily,
+// pairing (R1 preserve + explicit-respect + opposite), routing
+// (phase-unsupported-family) e a reconciliação R5 da whitelist entre
+// shared/forge-review.md (spec) e forge-review-pairing.js (CLI). Os cenários
+// G–M do adapter agy (Section 20/smokeXllm) NÃO são responsabilidade desta
+// seção — só o eixo 3-família + R5.
+function smokeGeminiFamily() {
+  process.stdout.write('\n▸ Section 35: integração 3-família (gemini) + R5 reconciliação\n');
+  const { modelFamily } = require('./forge-model-alias');
+  const { resolveRoute } = require('./forge-routing');
+
+  // (a) modelFamily — gemini via agy/gemini-* e bare 'gemini'
+  assert(modelFamily('agy/gemini-3.1-pro') === 'gemini',
+    "(a) modelFamily('agy/gemini-3.1-pro')==='gemini'", `got ${modelFamily('agy/gemini-3.1-pro')}`);
+  assert(modelFamily('gemini') === 'gemini',
+    "(a) modelFamily('gemini')==='gemini'", `got ${modelFamily('gemini')}`);
+  // (a2) regression — claude/gpt não regrediram com a introdução de gemini
+  assert(modelFamily('claude-opus-4-8') === 'claude',
+    "(a2) regression: modelFamily('claude-opus-4-8')==='claude'", `got ${modelFamily('claude-opus-4-8')}`);
+  assert(modelFamily('gpt-5.2') === 'gpt',
+    "(a2) regression: modelFamily('gpt-5.2')==='gpt'", `got ${modelFamily('gpt-5.2')}`);
+
+  // helper de fixture de eventos (mesmo padrão de Section 29/30)
+  const writeEvents = (dir, lines) => {
+    const forgeDir = path.join(dir, '.gsd', 'forge');
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const file = path.join(forgeDir, 'events.jsonl');
+    fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + (lines.length ? '\n' : ''), 'utf8');
+    return file;
+  };
+  const runPairing = (eventsFile, dir, extraArgs) => {
+    const args = ['--slice', 'S02', '--milestone', 'M007', '--cwd', dir, '--events', eventsFile, ...(extraArgs || [])];
+    const r = runScript('forge-review-pairing.js', args);
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout.trim()); } catch {}
+    return { r, parsed };
+  };
+
+  // (b) R1 — normalizeRequest preserva 'gemini' explícito (via CLI --challenger gemini,
+  // aferido pelo campo requested.challenger, não colapsado para 'auto')
+  const dirClaude = mkTmp('gemini-fam-claude');
+  const evClaude = writeEvents(dirClaude, [
+    { event: 'dispatch', unit: 'execute-task/T01', engine: 'claude' },
+  ]);
+  const { parsed: pGeminiExplicit } = runPairing(evClaude, dirClaude, ['--challenger', 'gemini']);
+  assert(pGeminiExplicit && pGeminiExplicit.requested.challenger === 'gemini' && pGeminiExplicit.challenger === 'gemini',
+    "(b) R1: --challenger gemini → requested.challenger='gemini' (preservado, não normalizado para auto), challenger='gemini' (respeitado)",
+    JSON.stringify(pGeminiExplicit));
+
+  // (b2) regression — valor desconhecido colapsa para 'auto' (normalizeRequest não regrediu)
+  const { parsed: pUnknownReq } = runPairing(evClaude, dirClaude, ['--challenger', 'mistral']);
+  assert(pUnknownReq && pUnknownReq.requested.challenger === 'auto',
+    "(b2) regression: --challenger mistral (inválido) → requested.challenger='auto'",
+    JSON.stringify(pUnknownReq));
+
+  // (c) challenger gemini explícito respeitado independente do author (author=gpt)
+  const dirCodex = mkTmp('gemini-fam-codex');
+  const evCodex = writeEvents(dirCodex, [
+    { event: 'dispatch', unit: 'execute-task/T01', engine: 'codex' },
+    { event: 'dispatch', unit: 'execute-task/T02', engine: 'codex' },
+  ]);
+  const { parsed: pGeminiOverGpt } = runPairing(evCodex, dirCodex, ['--challenger', 'gemini']);
+  assert(pGeminiOverGpt && pGeminiOverGpt.author === 'gpt' && pGeminiOverGpt.challenger === 'gemini',
+    "(c) author=gpt + --challenger gemini explícito → challenger='gemini' (explicit vence opposite)",
+    JSON.stringify(pGeminiOverGpt));
+
+  // (d) opposite — auto (sem override): opposite(claude)==='codex' e opposite(gpt)==='claude'
+  const { parsed: pOppositeClaude } = runPairing(evClaude, dirClaude);
+  assert(pOppositeClaude && pOppositeClaude.author === 'claude' && pOppositeClaude.challenger === 'codex',
+    "(d) opposite(claude)==='codex' — author=claude, auto → challenger=codex",
+    JSON.stringify(pOppositeClaude));
+  const { parsed: pOppositeGpt } = runPairing(evCodex, dirCodex);
+  assert(pOppositeGpt && pOppositeGpt.author === 'gpt' && pOppositeGpt.challenger === 'claude',
+    "(d) opposite(gpt)==='claude' — author=gpt, auto → challenger=claude",
+    JSON.stringify(pOppositeGpt));
+
+  cleanup(dirClaude);
+  cleanup(dirCodex);
+
+  // (e) routing — membro gemini na cadeia produz phase-unsupported-family
+  // (NÃO skipped-unknown-family, que é reservado a famílias desconhecidas/null)
+  const dirRouting = mkTmp('gemini-fam-routing');
+  fs.mkdirSync(path.join(dirRouting, '.gsd'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dirRouting, '.gsd', 'claude-agent-prefs.md'),
+    'routing:\n  backend:\n    executor:\n      standard: [claude-sonnet-5, agy/gemini-3.1-pro]\n',
+    'utf8'
+  );
+  const rGemini = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirRouting });
+  assert(rGemini.chain.length === 1 && rGemini.chain[0].id === 'claude-sonnet-5',
+    '(e) membro gemini pulado da cadeia resolvida → só o membro claude sobrevive',
+    JSON.stringify(rGemini.chain));
+  assert(/phase-unsupported-family/.test(rGemini.reason),
+    '(e) reason contém phase-unsupported-family', rGemini.reason);
+  assert(!/skipped-unknown-family/.test(rGemini.reason),
+    '(e) reason NÃO contém skipped-unknown-family (gemini é família conhecida, discriminador distinto)',
+    rGemini.reason);
+  cleanup(dirRouting);
+
+  // (f) R5 — reconciliação de whitelist nos dois lados: spec (shared/forge-review.md)
+  // e CLI (VALID_REQUESTS de forge-review-pairing.js) precisam bater em gemini.
+  const ROOT35 = path.join(__dirname, '..');
+  const reviewSpecTxt = fs.readFileSync(path.join(ROOT35, 'shared', 'forge-review.md'), 'utf8');
+  const pairingSrcTxt = fs.readFileSync(path.join(ROOT35, 'scripts', 'forge-review-pairing.js'), 'utf8');
+  const specHasWhitelist = /claude\|codex\|gemini/.test(reviewSpecTxt);
+  const cliHasGemini = /VALID_REQUESTS\s*=\s*\[[^\]]*'gemini'[^\]]*\]/.test(pairingSrcTxt);
+  assert(specHasWhitelist,
+    "(f) R5: shared/forge-review.md contém a whitelist 'claude|codex|gemini'",
+    'padrão claude|codex|gemini não encontrado em shared/forge-review.md');
+  assert(cliHasGemini,
+    "(f) R5: VALID_REQUESTS em forge-review-pairing.js inclui 'gemini'",
+    'VALID_REQUESTS sem gemini em forge-review-pairing.js');
+  assert(specHasWhitelist === cliHasGemini,
+    '(f) R5: os 2 lados batem (nenhum drift entre spec e CLI)',
+    `spec=${specHasWhitelist} cli=${cliHasGemini}`);
+}
+
+function smokeRoutingScaffoldDocs() {
+  process.stdout.write('\n▸ Section 36: scaffold routing: + docs fase 4 (drift-guard)\n');
+  const ROOT36 = path.join(__dirname, '..');
+  const prefsTxt = fs.readFileSync(path.join(ROOT36, 'forge-agent-prefs.md'), 'utf8');
+  const readmeTxt = fs.readFileSync(path.join(ROOT36, 'README.md'), 'utf8');
+  const tiersTxt = fs.readFileSync(path.join(ROOT36, 'shared', 'forge-tiers.md'), 'utf8');
+
+  assert(/## Routing Settings/.test(prefsTxt),
+    'forge-agent-prefs.md contém "## Routing Settings"',
+    '"## Routing Settings" não encontrado em forge-agent-prefs.md');
+
+  assert(/#\s*routing:/.test(prefsTxt),
+    'forge-agent-prefs.md contém um bloco routing: de exemplo comentado (opt-in)',
+    'linha "# routing:" (comentada) não encontrada em forge-agent-prefs.md');
+
+  assert(/## Multi-LLM fase 4/.test(readmeTxt),
+    'README.md contém "## Multi-LLM fase 4"',
+    '"## Multi-LLM fase 4" não encontrado em README.md');
+
+  assert(/forge-routing\.js/.test(tiersTxt),
+    'shared/forge-tiers.md menciona forge-routing.js (cross-ref do resolver)',
+    'forge-routing.js não encontrado em shared/forge-tiers.md');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -3344,6 +4202,11 @@ async function main() {
     smokeReviewPairing();
     smokeReviewPairingWiring();
     smokeReviewPairingPrefsSchema();
+    smokeRouting();
+    smokeRoutingWiring();
+    smokeDomainEmission();
+    smokeGeminiFamily();
+    smokeRoutingScaffoldDocs();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

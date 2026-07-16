@@ -154,6 +154,13 @@ see [docs/fragment-store.md](docs/fragment-store.md).
 >
 > O forge **não instala nem autentica** tooling de terceiros — apenas invoca o `codex` já configurado pelo usuário via `scripts/forge-xllm.js`, que nunca recebe a credencial por argumento (a auth é gerenciada inteiramente pelo próprio CLI). Sem `codex` disponível, o gate faz **fallback automático para `forge-reviewer` (Claude)** com o evento `review-challenger-fallback` — nunca bloqueia. Implicação de privacidade: com `challenger: codex`, o diff do slice sai da máquina local para a API da OpenAI.
 
+> **Pré-requisito — `review.challenger: gemini`:** o challenger Gemini requer o [Antigravity CLI](https://antigravity.google) (`agy`) instalado e autenticado, por um destes dois caminhos:
+>
+> - **Login no Antigravity** (recomendado): faça login uma vez (IDE ou CLI) — em headless o `agy` usa a auth silenciosa por keyring, com refresh automático de token.
+> - **`GEMINI_API_KEY`** (ou `ANTIGRAVITY_API_KEY`) no ambiente: exporte de uma fonte segura (`.env` gitignored ou secret manager) — **nunca** hardcoded em prefs commitáveis.
+>
+> O modelo é opcional: `challenger_model` aceita um **label** do `agy models` (pode conter espaços — use aspas: `"Gemini 3.1 Pro (High)"`); unset usa o default do CLI. O adapter invoca `agy --print` com `--sandbox` (restrições de terminal) e o mesmo contrato do codex: sem `agy` disponível (binário, auth, quota, rede, stdout vazio), **fallback automático para `forge-reviewer` (Claude)** com o evento `review-challenger-fallback` (`gemini-exit-nonzero`) — nunca bloqueia. Implicação de privacidade: com `challenger: gemini`, o diff do slice sai da máquina local para a API do Google.
+
 ---
 
 ## Multi-LLM fase 2 — workers GPT via sidecar
@@ -221,6 +228,78 @@ review:
   challenger: auto    # resolve de verdade na próxima review dialética
   advocate: auto      # resolve junto
 ```
+
+---
+
+## Multi-LLM fase 4 — routing model-first por domínio
+
+O forge permite rotear os workers — `execute-task` e `plan-slice` — por **domínio de trabalho** e
+**fase**, escolhendo inclusive **cadeias cross-engine** (misturar IDs Claude e GPT numa mesma
+célula). Diferente da fase 2 (`workers:`, que escolhe engine por `unit_type`), o routing é
+inteiramente **opt-in** — sem o bloco `routing:` definido nas prefs, o comportamento é 100%
+idêntico aos tiers legados (`tier_models:`/`workers:` decidem sozinhos). A cascata responde
+à última reescrita **por domínio inteiro** — nunca merge campo-a-campo, para evitar meia-domain
+de um arquivo + meia-domain de outro = misroute silencioso.
+
+Mecanicamente, cada célula `routing.<domínio>.<fase>.<tier> = [cadeia]` contém uma **lista
+ordenada de modelos** (Claude e/ou GPT, cross-engine permitido), com um `fallback:` de categoria
+definindo um modelo Claude mapeado para casos de esgotamento. O resolvedor `scripts/forge-routing.js`
+usa **precedência explícita** (`frontmatter > routing > tier_models legacy`) e **engine derivation**
+por família (IDs `claude-*` → `Agent(model)`, IDs `gpt-*` → sidecar `forge-xllm.js`). Cadeias
+com membros de família não-roteável (ex.: Gemini) skip o membro com `phase-unsupported-family`
+e continuam na próxima.
+
+- **Fases roteáveis:** apenas `executor` (`execute-task`) e `planner` (`plan-slice`). `plan-milestone`
+  **nunca** é capturado por este eixo — permanece locked no tier `max` (Fable).
+- **Nesting:** `routing.<domínio>.<fase>.<tier> = [id, ...]` + `routing.<domínio>.<fase>.fallback = <id>`.
+  `<tier>` é qualquer alias de tier (`light`, `standard`, `heavy`, `max`).
+- **Domínios:** chaves de domínio são abertas — `default` é recomendado (usado quando a task/slice
+  não declara `domain:`); sem ele, unidades sem `domain:` correspondente caem direto no legado
+  (`tier_models`), nunca erro. Qualquer outra chave (`backend`, `frontend`, ...) é definida pelo operador.
+- **Precedência:** frontmatter `tier:`/`worker:` na task (item 1, sempre ganha) > bloco `routing:` aqui
+  (quando célula resolve) > comportamento legado `tier_models:`/`workers:` (quando não há `routing:` ou
+  a célula não resolve).
+- **Engine derivation:** resolvida por `modelFamily()` (`scripts/forge-model-alias.js`) — aliases
+  `claude`/`fable`/`opus`/`sonnet`/`haiku` → engine `Agent` (nativo em contexto); `gpt`/`codex` → engine
+  `codex` (sidecar `forge-xllm.js`); família desconhecida (`modelFamily()` retorna `null`) → membro
+  pulado com `skipped-unknown-family`; `gemini` (família conhecida, mas não roteável) → pulado com
+  `phase-unsupported-family`.
+- **Fallback de categoria:** `fallback:` deve apontar para **1 modelo Claude mapeado**. Um `fallback:`
+  presente porém inválido (família não-Claude ou não mapeada) é substituído pelo fallback legado
+  (`tier_models:`) e registrado como `fallback-invalid-substituted` no reason. Um `fallback:` ausente
+  usa o fallback legado silenciosamente (sem reason — é o comportamento natural, não uma config inválida)
+  — nunca aborta o dispatch.
+- **Caveat gemini (`phase-unsupported-family`):** um ID de família `gemini` numa cadeia é reconhecido
+  mas **não é roteável** como `executor`/`planner` hoje — não há worker nativo Gemini. Um membro gemini
+  é pulado silenciosamente e a resolução segue para o próximo membro.
+
+### Ativar:
+
+Edite `forge-agent-prefs.md` (ou `.gsd/prefs.local.md`), vá para `## Routing Settings` e descomente o
+bloco `routing:`. Exemplo de célula cross-engine:
+
+```yaml
+routing:
+  default:
+    executor:
+      standard: [claude-sonnet-5]
+      heavy:    [claude-opus-4-8, gpt-5]     # cadeia cross-engine (claude → gpt sidecar)
+      fallback: claude-sonnet-5              # categoria: 1 Claude mapeado
+  backend:
+    executor:
+      standard: [gpt-5, claude-sonnet-5]     # gpt primário, claude fallback
+      fallback: claude-sonnet-5
+```
+
+Para inspecionar a resolução sem disparar dispatch real, use o CLI:
+
+```bash
+node scripts/forge-routing.js --unit-type execute-task --tier heavy \
+  --domain backend --explain
+```
+
+A matriz canônica de resolver está em [`scripts/forge-routing.js`](scripts/forge-routing.js)
+(`resolveRoute(opts)`); precedência completa em [`shared/forge-dispatch.md`](shared/forge-dispatch.md).
 
 ---
 
