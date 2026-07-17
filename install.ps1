@@ -284,9 +284,9 @@ if (Test-Path $PrefsJsonc) {
 } elseif (Get-Command node -ErrorAction SilentlyContinue) {
     $prefsScript = Join-Path $RepoDir 'scripts/forge-prefs.js'
     if ($DryRun) {
-        Dry "node $prefsScript --scaffold --out $PrefsJsonc"
+        Dry "node $prefsScript --scaffold --out $PrefsJsonc --schema-ref forge-prefs.schema.json"
     } else {
-        & node $prefsScript --scaffold --out $PrefsJsonc
+        & node $prefsScript --scaffold --out $PrefsJsonc --schema-ref forge-prefs.schema.json
         Info "  forge-agent-prefs.jsonc (catálogo global default)"
     }
 } else {

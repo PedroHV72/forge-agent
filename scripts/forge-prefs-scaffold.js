@@ -11,6 +11,14 @@ const { loadSchema, parseJsonc, stripJsonc, validatePrefs } = require('./forge-p
 
 const OFF_MARKER = /^(\s*)\/\/ (?=["{}\]])/;
 
+const SETUP_KNOBS = [
+  'auto_commit', 'merge_strategy', 'main_branch', 'auto_push',
+  'review.mode', 'review.style', 'review.challenger', 'review.advocate',
+  'review.challenger_model', 'review.advocate_model',
+  'tier_models.light', 'tier_models.standard', 'tier_models.heavy', 'tier_models.max',
+  'routing', 'forge_isolation.mode',
+];
+
 function isOffMarker(line) {
   return OFF_MARKER.test(line);
 }
@@ -138,6 +146,87 @@ function generateScaffold(schema, opts = {}) {
     if (line.startsWith('  // ')) return line;
     return line;
   }).join('\n') + '\n';
+}
+
+function setupTree() {
+  const root = {};
+  for (const dottedPath of SETUP_KNOBS) {
+    const parts = dottedPath.split('.');
+    let cursor = root;
+    parts.forEach((part, index) => {
+      if (!cursor[part]) cursor[part] = { children: {}, paths: [] };
+      if (index < parts.length - 1) cursor = cursor[part].children;
+      else cursor[part].paths.push(dottedPath);
+    });
+  }
+  return root;
+}
+
+function setupHasActive(entry, activeValues) {
+  return entry.paths.some((key) => Object.prototype.hasOwnProperty.call(activeValues, key)) ||
+    Object.values(entry.children).some((child) => setupHasActive(child, activeValues));
+}
+
+function setupOff(lines) {
+  return lines.map((line) => {
+    if (/^\s*\/\//.test(line)) return line;
+    const indentation = line.match(/^\s*/)[0];
+    return `${indentation}// ${line.slice(indentation.length)}`;
+  });
+}
+
+function renderSetupEntry(key, entry, schemaEntry, indent, activeValues, pathParts, isLast) {
+  const dottedPath = pathParts.concat(key).join('.');
+  const hasChildren = Object.keys(entry.children).length > 0;
+  const active = setupHasActive(entry, activeValues);
+  if (!hasChildren) {
+    const node = Object.prototype.hasOwnProperty.call(activeValues, dottedPath)
+      ? { ...schemaEntry, default: activeValues[dottedPath] }
+      : schemaEntry;
+    const lines = [];
+    if (node.description) lines.push(...docLines(node.description, indent));
+    lines.push(...renderKnob(key, node, indent, isLast));
+    return active ? lines : setupOff(lines);
+  }
+
+  const childEntries = Object.entries(entry.children);
+  const activeChildren = childEntries.filter(([, child]) => setupHasActive(child, activeValues));
+  const lines = [];
+  if (schemaEntry.description) lines.push(...docLines(schemaEntry.description, indent));
+  lines.push(`${indent}"${key}": {`);
+  childEntries.forEach(([childKey, child], index) => {
+    const childSchema = schemaEntry.properties[childKey];
+    const childIsLast = activeChildren.length === 0
+      ? index === childEntries.length - 1
+      : index === childEntries.length - 1 || !childEntries.slice(index + 1).some(([, next]) => setupHasActive(next, activeValues));
+    lines.push(...renderSetupEntry(childKey, child, childSchema, `${indent}  `, activeValues, pathParts.concat(key), childIsLast));
+  });
+  lines.push(`${indent}}${isLast ? '' : ','}`);
+  return active ? lines : setupOff(lines);
+}
+
+function generateSetupScaffold(schema, opts = {}) {
+  if (!schema || typeof schema !== 'object' || !schema.properties) {
+    throw new TypeError('schema with properties is required');
+  }
+  const activeValues = opts.activeValues || {};
+  const tree = setupTree();
+  const lines = [
+    `// ${opts.header || 'Setup inicial do projeto'}`,
+    '// Configure as escolhas abaixo; linhas comentadas mostram os defaults do schema.',
+    '{',
+    `  "$schema": ${jsonValue(opts.schemaRef || 'forge-prefs.schema.json')},`,
+  ];
+  const entries = Object.entries(tree);
+  const activeEntries = entries.filter(([, entry]) => setupHasActive(entry, activeValues));
+  entries.forEach(([key, entry], index) => {
+    const node = schema.properties[key];
+    if (!node) throw new Error(`schema path missing: ${key}`);
+    const isLastActive = !entries.slice(index + 1).some(([, next]) => setupHasActive(next, activeValues));
+    lines.push(...renderSetupEntry(key, entry, node, '  ', activeValues, [], isLastActive || activeEntries.length === 0));
+  });
+  lines.push('}');
+  return `${lines.join('\n')}\n`;
 }
 
 // Catalog merging is deliberately based on this shape-preserving JSONC mask,
@@ -378,6 +467,11 @@ module.exports = {
   defaultsFromSchema,
   renderSection,
   renderKnob,
+  renderNode,
+  docLines,
+  jsonValue,
+  generateSetupScaffold,
+  SETUP_KNOBS,
   generateScaffold,
   segmentCatalog,
   rescaffoldCatalog,

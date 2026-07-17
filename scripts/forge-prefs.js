@@ -800,10 +800,23 @@ function buildProvenance(globalPrefs, localPrefs) {
 }
 
 function parseCliArgs(argv) {
-  const args = { resolved: false, scaffold: false, rescaffold: null, write: false, out: null, key: null, explain: false, cwd: process.cwd(), globalDir: null, localDir: null };
+  const args = { resolved: false, scaffold: false, setupScaffold: false, schemaRef: null, setActive: [], rescaffold: null, write: false, out: null, key: null, explain: false, cwd: process.cwd(), globalDir: null, localDir: null };
   for (let index = 0; index < argv.length; index++) {
     if (argv[index] === '--resolved') args.resolved = true;
     else if (argv[index] === '--scaffold') args.scaffold = true;
+    else if (argv[index] === '--setup-scaffold') args.setupScaffold = true;
+    else if (argv[index] === '--schema-ref') args.schemaRef = argv[++index] || '';
+    else if (argv[index] === '--set-active') {
+      const assignment = argv[++index] || '';
+      const separator = assignment.indexOf('=');
+      if (separator > 0) {
+        const key = assignment.slice(0, separator);
+        const rawValue = assignment.slice(separator + 1);
+        let value;
+        try { value = JSON.parse(rawValue); } catch { value = rawValue; }
+        args.setActive.push([key, value]);
+      }
+    }
     else if (argv[index] === '--rescaffold') args.rescaffold = path.resolve(argv[++index] || '');
     else if (argv[index] === '--write') args.write = true;
     else if (argv[index] === '--out') args.out = path.resolve(argv[++index] || '');
@@ -876,15 +889,30 @@ function runCli(argv) {
     const { generateScaffold } = loadScaffoldModule();
     const schema = loadSchema();
     if (!schema) return 1;
-    const schemaRef = args.out
+    const schemaRef = args.schemaRef || (args.out
       ? path.relative(path.dirname(args.out), path.join(__dirname, '..', 'forge-prefs.schema.json')) || path.basename(path.join(__dirname, '..', 'forge-prefs.schema.json'))
-      : 'forge-prefs.schema.json';
+      : 'forge-prefs.schema.json');
     const output = generateScaffold(schema, { schemaRef: schemaRef.split(path.sep).join('/') });
     if (args.out) {
       fs.mkdirSync(path.dirname(args.out), { recursive: true });
       fs.writeFileSync(args.out, output, 'utf8');
     }
     else process.stdout.write(output);
+    return 0;
+  }
+  if (args.setupScaffold) {
+    const schema = loadSchema();
+    if (!schema) return 1;
+    const schemaRef = args.schemaRef || (args.out
+      ? path.relative(path.dirname(args.out), path.join(__dirname, '..', 'forge-prefs.schema.json')) || path.basename(path.join(__dirname, '..', 'forge-prefs.schema.json'))
+      : 'forge-prefs.schema.json');
+    const { generateSetupScaffold } = loadScaffoldModule();
+    const activeValues = Object.fromEntries(args.setActive);
+    const output = generateSetupScaffold(schema, { activeValues, schemaRef: schemaRef.split(path.sep).join('/') });
+    if (args.out) {
+      fs.mkdirSync(path.dirname(args.out), { recursive: true });
+      fs.writeFileSync(args.out, output, 'utf8');
+    } else process.stdout.write(output);
     return 0;
   }
   if (!args.resolved) {

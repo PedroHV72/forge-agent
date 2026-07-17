@@ -30,6 +30,8 @@ ls CLAUDE.md 2>/dev/null
 
 ### Case A: `.gsd/` exists (existing gsd-pi project)
 
+<!-- Compatibilidade: este fluxo não lê conteúdo dos prefs .md legados; apenas preserva arquivos existentes. -->
+
 The project is already managed by gsd-pi. Your job is to:
 
 1. **Read current state:**
@@ -42,12 +44,24 @@ The project is already managed by gsd-pi. Your job is to:
 
 3. **Create `.gsd/AUTO-MEMORY.md`** if it doesn't exist (empty, with header only)
 
-4. **Create `.gsd/claude-agent-prefs.md`** if it doesn't exist (project-level overrides, committed)
+4. **Create `.gsd/forge-prefs.jsonc`** only when no preferences file exists yet:
+   - If `.gsd/forge-prefs.jsonc`, `.gsd/claude-agent-prefs.md`, or `.gsd/prefs.local.md` already exists, preserve it and do not force a migration. Migration of legacy preferences belongs to `/forge-update`.
+   - Otherwise, create the curated local preferences scaffold with:
+     ```bash
+     FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+     node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --setup-scaffold \
+       --out .gsd/forge-prefs.jsonc
+     ```
+     (No `--schema-ref` — the engine auto-computes the relative path from `.gsd/forge-prefs.jsonc` to the installed `~/.claude/forge-prefs.schema.json`.)
+   - If `node` is unavailable, report that the scaffold was skipped. Do not recreate either legacy `.md` file.
 
-5. **Add `.gsd/prefs.local.md` to `.gitignore`** if not already present:
-   ```bash
-   grep -q "prefs.local.md" .gitignore 2>/dev/null || echo ".gsd/prefs.local.md" >> .gitignore
-   ```
+5. **Keep existing preference files backward-compatible:** Case A does not migrate or overwrite legacy `.md` preferences. The local JSONC file is gitignored by the shared preference tooling when it is created; do not reimplement `.gitignore` editing here.
+   - When step 4 creates `.gsd/forge-prefs.jsonc`, run the same helper:
+     ```bash
+     FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs-migrate.js ] && echo scripts || echo "$HOME/.claude/scripts")
+     node -e "require('$FORGE_SCRIPTS_DIR/forge-prefs-migrate.js').ensureGitignore(process.cwd())"
+     ```
+   - If a JSONC or legacy preference file already exists, leave both the file and its ignore state untouched.
 
 6. **Apply Layer 1 ignore rules** — run:
    ```bash
@@ -76,7 +90,7 @@ The project is already managed by gsd-pi. Your job is to:
     - CLAUDE.md ✓
     - .claude/settings.json ✓ (bypass permissions + MCPs)
     - .gsd/AUTO-MEMORY.md ✓
-    - .gsd/claude-agent-prefs.md ✓
+    - .gsd/forge-prefs.jsonc ✓ (created when no existing prefs were found; otherwise preserved)
     - .gsd/CODING-STANDARDS.md ✓ (auto-detected)
 
     MCPs configured:
@@ -95,8 +109,9 @@ The project is already managed by gsd-pi. Your job is to:
 
 2. **Ask about git management:**
    - Ask: "Deseja que o Forge Agent gerencie os commits automaticamente? (sim/não)"
-   - `sim` → set `auto_commit: true` in `.gsd/claude-agent-prefs.md`
-   - `não` → set `auto_commit: false` in `.gsd/claude-agent-prefs.md`
+   - Keep the answer as the active `auto_commit` value for the local JSONC preferences scaffold.
+   - `sim` → use `auto_commit=true`
+   - `não` → use `auto_commit=false`
    - **IMPORTANT:** Never run `git init`. If the project has no `.git/`, that's the user's choice. The agent works with or without git.
 
 3. **Create `.gsd/` structure:**
@@ -165,13 +180,22 @@ The project is already managed by gsd-pi. Your job is to:
 
 3. **Create `CLAUDE.md`** (see template below)
 
-4. **Create `.gsd/claude-agent-prefs.md`** (project-level overrides, committed)
-
-5. **Add `.gsd/prefs.local.md` to `.gitignore`** — personal local overrides should never be committed:
+4. **Create the curated local preferences JSONC** using the answer from step 2:
    ```bash
-   # Append to .gitignore if not already present
-   grep -q "prefs.local.md" .gitignore 2>/dev/null || echo ".gsd/prefs.local.md" >> .gitignore
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --setup-scaffold \
+     --out .gsd/forge-prefs.jsonc \
+     --set-active auto_commit=<true|false conforme resposta>
    ```
+   (No `--schema-ref` — the engine auto-computes the relative path from `.gsd/forge-prefs.jsonc` to the installed `~/.claude/forge-prefs.schema.json`.)
+   The scaffold is local and curated, and the active `auto_commit` value must be the answer selected by the user. If `node` is unavailable, report an informative fallback and skip this scaffold; the global preferences dual-read still applies. Do not recreate `.gsd/claude-agent-prefs.md` or `.gsd/prefs.local.md`.
+
+5. **Add `.gsd/forge-prefs.jsonc` to `.gitignore` by reusing the migration helper:**
+   ```bash
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs-migrate.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   node -e "require('$FORGE_SCRIPTS_DIR/forge-prefs-migrate.js').ensureGitignore(process.cwd())"
+   ```
+   Do not replace this with a `grep`/`echo` implementation. If `node` is unavailable, report that the helper was skipped alongside the scaffold fallback.
 
 6. **Apply Layer 1 ignore rules** — run:
    ```bash
@@ -210,17 +234,16 @@ The project is already managed by gsd-pi. Your job is to:
     - .gsd/KNOWLEDGE.md
     - .gsd/AUTO-MEMORY.md
     - .gsd/CODING-STANDARDS.md    ← auto-detected coding standards
-    - .gsd/claude-agent-prefs.md  ← repo shared prefs (commit this)
+    - .gsd/forge-prefs.jsonc      ← setup inicial guiado (local, gitignored)
     .gitignore updated:
-    - .gsd/prefs.local.md         ← gitignored personal overrides
+    - .gsd/forge-prefs.jsonc      ← gitignored local preferences
 
     MCPs configured:
     - <name>: <status> (or "nenhum MCP configurado")
 
     Prefs resolution order (later overrides earlier):
-      1. ~/.claude/forge-agent-prefs.md  (user-global)
-      2. .gsd/claude-agent-prefs.md      (repo shared)
-      3. .gsd/prefs.local.md             (local personal, gitignored)
+      1. ~/.claude/forge-agent-prefs.jsonc  (global)
+      2. .gsd/forge-prefs.jsonc             (local, gitignored — sobrescreve)
 
     Next: /forge-new-milestone <descrição do que entregar primeiro>
     ```
@@ -499,27 +522,9 @@ If the user chooses to skip, do not configure any MCPs. Print:
 
 ---
 
-## `.gsd/claude-agent-prefs.md` Template (project-level overrides)
+## Local preferences (JSONC)
 
-```markdown
----
-# GSD Claude Agent Preferences — Project Level
-# Overrides ~/.claude/forge-agent-prefs.md for this project
-# Leave empty to use global defaults
-version: 1
-project: <project name>
----
-
-## Phase Overrides (uncomment to override global)
-
-<!-- execute: opus    # use opus for execution in this project -->
-<!-- skip_research: true -->
-<!-- skip_discuss: false -->
-
-## Git Settings
-
-auto_commit: <true or false — based on user answer in step 2>
-merge_strategy: squash
-main_branch: master
-auto_push: false
-```
+For a new project, `/forge-init` creates the curated `.gsd/forge-prefs.jsonc` through
+`scripts/forge-prefs.js --setup-scaffold` and applies the user's `auto_commit` answer.
+The file is local and gitignored. Existing legacy `.md` preferences are preserved for
+backward compatibility; migration is handled by `/forge-update`.

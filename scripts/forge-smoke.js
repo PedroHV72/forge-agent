@@ -22,7 +22,7 @@
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
-const { spawnSync } = require('child_process');
+const { spawnSync, execFileSync } = require('child_process');
 
 const SCRIPTS = __dirname;
 const KEEP = process.argv.includes('--keep');
@@ -5383,6 +5383,63 @@ scalar_guard:
   cleanup(unknown.root);
 }
 
+// ── Section 44: curated setup scaffold + schema ref + init/installer wiring ──
+function smokeInitSetupScaffold() {
+  process.stdout.write('\n▸ Section 44: curated setup scaffold, schema ref and init/installer wiring\n');
+  const { generateSetupScaffold, SETUP_KNOBS } = require('./forge-prefs-scaffold.js');
+  const { loadSchema, parseJsonc } = require('./forge-prefs.js');
+  const schema = loadSchema();
+  const out = generateSetupScaffold(schema, {
+    activeValues: { auto_commit: false },
+    schemaRef: 'forge-prefs.schema.json',
+  });
+  const parsed = parseJsonc(out);
+  assert(parsed.ok, '(a) setup scaffold é JSONC válido', JSON.stringify(parsed));
+  assert(/Setup inicial do projeto/.test(out), '(a) setup scaffold contém o header esperado');
+  assert(/^\s*"auto_commit":\s*false\b/m.test(out) && parsed.value.auto_commit === false,
+    '(a) auto_commit activeValue=false aparece ativo e parseia como false', out);
+
+  for (const key of ['merge_strategy', 'main_branch', 'auto_push', 'review', 'tier_models', 'routing', 'forge_isolation']) {
+    assert(new RegExp(`^\\s*//\\s*"${key.replace('.', '\\.')}(?:"|\\.)`, 'm').test(out),
+      `(a) ${key} permanece comentado`, `linha comentada não encontrada`);
+    assert(!Object.prototype.hasOwnProperty.call(parsed.value, key),
+      `(a) ${key} não é uma chave ativa no resultado parseado`, JSON.stringify(parsed.value));
+  }
+  assert(SETUP_KNOBS.includes('auto_commit') && SETUP_KNOBS.includes('routing'),
+    '(a) scaffold usa o subconjunto SETUP_KNOBS curado');
+  assert(!/\b(?:token_budget|evidence|multi_run)\b/.test(out),
+    '(b) knobs fora do subconjunto curado estão ausentes do scaffold', out);
+  assert(/"\$schema":\s*"forge-prefs\.schema\.json"/.test(out),
+    '(b) generateSetupScaffold honra --schema-ref');
+
+  const repo = path.dirname(SCRIPTS);
+  const scaffold = execFileSync('node', [path.join(SCRIPTS, 'forge-prefs.js'), '--scaffold'], {
+    cwd: repo, encoding: 'utf8',
+  });
+  assert(/"\$schema":\s*"forge-prefs\.schema\.json"/.test(scaffold),
+    '(c) --scaffold sem --schema-ref mantém a referência default', scaffold.slice(0, 300));
+  const custom = execFileSync('node', [path.join(SCRIPTS, 'forge-prefs.js'), '--scaffold', '--schema-ref', 'custom.json'], {
+    cwd: repo, encoding: 'utf8',
+  });
+  assert(/"\$schema":\s*"custom\.json"/.test(custom),
+    '(c) --scaffold --schema-ref custom.json emite custom.json', custom.slice(0, 300));
+
+  const read = (file) => fs.readFileSync(path.join(repo, file), 'utf8');
+  const init = read('commands/forge-init.md');
+  assert(init.includes('--setup-scaffold'), '(d) forge-init referencia --setup-scaffold');
+  assert(init.includes('ensureGitignore'), '(d) forge-init referencia ensureGitignore');
+  const caseBStart = init.indexOf('### Case B:');
+  const caseBEnd = init.indexOf('\n### ', caseBStart + 1);
+  const caseB = init.slice(caseBStart, caseBEnd < 0 ? init.length : caseBEnd);
+  assert(!/(?:mkdir|touch|cat|echo|tee|writeFile|cp)[^\n]*(?:claude-agent-prefs\.md|prefs\.local\.md)/i.test(caseB),
+    '(d) Case B não contém criação dos .md legados');
+  assert(read('install.sh').includes('--schema-ref forge-prefs.schema.json'),
+    '(e) install.sh passa --schema-ref forge-prefs.schema.json ao scaffold global');
+  assert(read('install.ps1').includes('--schema-ref forge-prefs.schema.json'),
+    '(e) install.ps1 passa --schema-ref forge-prefs.schema.json ao scaffold global');
+  pass('(final) Section 44: setup scaffold curado, schema ref e wiring verificados');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -5433,6 +5490,7 @@ async function main() {
     smokePrefsMigration();
     smokePrefsViewerDoctor();
     smokePrefsMigrationFidelity();
+    smokeInitSetupScaffold();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

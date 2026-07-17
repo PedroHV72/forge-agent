@@ -355,9 +355,9 @@ if [ -f "$PREFS_JSONC" ]; then
   info "  forge-agent-prefs.jsonc já existe — não sobrescrito"
 elif command -v node >/dev/null 2>&1; then
   if $DRY_RUN; then
-    dry "node \"${REPO_DIR}/scripts/forge-prefs.js\" --scaffold --out \"${PREFS_JSONC}\""
+    dry "node \"${REPO_DIR}/scripts/forge-prefs.js\" --scaffold --out \"${PREFS_JSONC}\" --schema-ref forge-prefs.schema.json"
   else
-    node "${REPO_DIR}/scripts/forge-prefs.js" --scaffold --out "$PREFS_JSONC"
+    node "${REPO_DIR}/scripts/forge-prefs.js" --scaffold --out "$PREFS_JSONC" --schema-ref forge-prefs.schema.json
     info "  forge-agent-prefs.jsonc (catálogo global default)"
   fi
 else
