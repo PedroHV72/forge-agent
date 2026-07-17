@@ -43,7 +43,7 @@ function assertEq(actual, expected, msg) {
 
 // Build an isolated cascade. Sets $HOME so os.homedir() (and therefore the
 // home prefs path) resolves inside the temp root — fully deterministic.
-function withCascade({ home = null, repo = null, local = null }, fn) {
+function withCascade({ home = null, repo = null, local = null, homeJsonc = null, repoJsonc = null }, fn) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-routing-test-'));
   const homeDir = path.join(root, 'home');
   const repoDir = path.join(root, 'repo');
@@ -52,6 +52,8 @@ function withCascade({ home = null, repo = null, local = null }, fn) {
   if (home !== null) fs.writeFileSync(path.join(homeDir, '.claude', 'forge-agent-prefs.md'), home);
   if (repo !== null) fs.writeFileSync(path.join(repoDir, '.gsd', 'claude-agent-prefs.md'), repo);
   if (local !== null) fs.writeFileSync(path.join(repoDir, '.gsd', 'prefs.local.md'), local);
+  if (homeJsonc !== null) fs.writeFileSync(path.join(homeDir, '.claude', 'forge-agent-prefs.jsonc'), homeJsonc);
+  if (repoJsonc !== null) fs.writeFileSync(path.join(repoDir, '.gsd', 'forge-prefs.jsonc'), repoJsonc);
 
   const savedHome = process.env.HOME;
   process.env.HOME = homeDir;
@@ -269,6 +271,59 @@ withCascade({
     assertEq(r.routing.backend.executor.standard, ['claude-sonnet-5']));
   test('fallback parsed', () =>
     assertEq(r.routing.backend.executor.fallback, 'claude-opus-4-8'));
+});
+
+// --- Scenario 15: cutover goldens (engine adapter contract) ---
+console.log('\nScenario 15: engine adapter preserves golden routing objects');
+withCascade({
+  home:
+    'routing:\n' +
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: [global, global-fallback] # ignored comment\n',
+  repo:
+    'routing:\n' +
+    '  backend:\n' +
+    '    planner:\n' +
+    '      heavy: repo-planner\n' +
+    '  default:\n' +
+    '    executor:\n' +
+    '      standard: default-model\n',
+  local:
+    'routing:\n' +
+    '  backend:\n' +
+    '    executor:\n' +
+    '      standard: local-model\n' +
+    '      fallback: local-fallback\n',
+}, (cwd) => {
+  const r = readRoutingConfig(cwd);
+  const golden = {
+    backend: { executor: { standard: ['local-model'], fallback: 'local-fallback' } },
+    default: { executor: { standard: ['default-model'] } },
+  };
+  test('Markdown cascade golden retains atomic last-wins domain replacement', () =>
+    assertEq(r, { present: true, ok: true, routing: golden, error: null }));
+});
+
+withCascade({
+  repoJsonc: '{\n  // JSONC reaches the same adapter contract\n  "routing": {\n    "backend": { "executor": { "standard": ["jsonc-model"], "fallback": "jsonc-fallback" } }\n  }\n}',
+}, (cwd) => {
+  test('JSONC routing golden flows through the same contract', () =>
+    assertEq(readRoutingConfig(cwd), {
+      present: true,
+      ok: true,
+      routing: { backend: { executor: { standard: ['jsonc-model'], fallback: 'jsonc-fallback' } } },
+      error: null,
+    }));
+});
+
+withCascade({
+  repo: 'routing:\n  backend:\n      executor:\n    standard: broken\n',
+}, (cwd) => {
+  test('malformed-block golden degrades the whole cascade', () =>
+    assertEq(readRoutingConfig(cwd), {
+      present: true, ok: false, routing: {}, error: 'routing-parse-error',
+    }));
 });
 
 // --- Summary ---

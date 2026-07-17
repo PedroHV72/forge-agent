@@ -27,34 +27,26 @@ The gate is **not** a second plan-checker pass — it is a human-arbitration mom
   - **`forge-next`**: no scalar `PLAN_FILE`; Step 4 loops over every file matched by `PLAN_GLOB` (`{S##}-PLAN.md` + `tasks/*/T##-PLAN.md`)
 - `plan_check_counts` — `{pass, warn, fail}` (parsed from the plan-checker `---GSD-WORKER-RESULT---` block; already in scope after the existing plan-check dispatch in forge-next; not applicable in forge-task legacy plans)
 
-## Step 0 — Read plan_gate prefs (3-file cascade)
+## Step 0 — Read plan_gate prefs (via the canonical prefs CLI)
+
+Resolve prefs once through the S01 engine CLI (`scripts/forge-prefs.js --resolved`, the canonical per-unit helper defined in `shared/forge-dispatch.md § Per-unit prefs resolution`) — it dual-reads legacy md OR jsonc per layer, so no `files=[…forge-agent-prefs.md…]` cascade merge is re-implemented here. Read the `plan_gate.*` knobs off `.prefs`:
 
 ```bash
-PLAN_GATE_CFG=$(node -e "
-const fs=require('fs'),path=require('path'),os=require('os');
-const wd=process.env.WORKING_DIR||process.cwd();
-const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-             path.join(wd,'.gsd','claude-agent-prefs.md'),
-             path.join(wd,'.gsd','prefs.local.md')];
-let interactive='always',askAuto='defer';
-for(const f of files){try{
-  const r=fs.readFileSync(f,'utf8');
-  const blk=(r.match(/^plan_gate:[ \t]*\n((?:[ \t]+.*\n?)*)/m)||[])[1]||'';
-  let m;
-  if(m=blk.match(/^[ \t]+interactive:[ \t]*(\w+)/m))interactive=m[1].toLowerCase();
-  if(m=blk.match(/^[ \t]+ask_in_auto:[ \t]*(\w+)/m))askAuto=m[1].toLowerCase();
-}catch(e){}}
-if(!['always','auto','off'].includes(interactive))interactive='always';
-if(!['defer','off'].includes(askAuto))askAuto='defer';
-process.stdout.write(JSON.stringify({interactive,askAuto}));
-" WORKING_DIR=\"$WORKING_DIR\")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
+if [ $? -ne 0 ]; then
+  # M008-CONTEXT decision #2 — loud stop, never a silent default. errors[] (file+line)
+  # on stdout ($PREFS_JSON); human message + fix hint on stderr. Halt the gate loop.
+  echo "✗ prefs parse error — plan gate halted (see stderr for arquivo:linha)" >&2
+  # ...deactivate run + STOP...
+fi
+
+# Extract plan_gate knobs off .prefs, preserving the exact whitelist + defaults.
+INTERACTIVE=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let v=(JSON.parse(d).prefs.plan_gate||{}).interactive;v=(typeof v==='string')?v.toLowerCase():'';process.stdout.write(['always','auto','off'].includes(v)?v:'always')}catch(e){process.stdout.write('always')}})")
+ASK_AUTO=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let v=(JSON.parse(d).prefs.plan_gate||{}).ask_in_auto;v=(typeof v==='string')?v.toLowerCase():'';process.stdout.write(['defer','off'].includes(v)?v:'defer')}catch(e){process.stdout.write('defer')}})")
 ```
 
-Parse the output into shell variables:
-```bash
-INTERACTIVE=$(node -e "process.stdout.write(JSON.parse(process.env.PLAN_GATE_CFG).interactive)" PLAN_GATE_CFG="$PLAN_GATE_CFG")
-ASK_AUTO=$(node -e    "process.stdout.write(JSON.parse(process.env.PLAN_GATE_CFG).askAuto)"    PLAN_GATE_CFG="$PLAN_GATE_CFG")
-```
+Defaults preserved byte-for-byte: absent `.prefs.plan_gate` (or an out-of-whitelist value) → `INTERACTIVE=always`, `ASK_AUTO=defer` — identical to the old inline cascade.
 
 **Pref semantics:**
 
@@ -68,7 +60,7 @@ ASK_AUTO=$(node -e    "process.stdout.write(JSON.parse(process.env.PLAN_GATE_CFG
 - `MODE == auto` (forge-auto) → **skip the gate regardless of `interactive`.** See `## Degradation by mode`.
 - `interactive == auto` AND `plan_check_counts.warn == 0` AND `plan_check_counts.fail == 0` → **auto-approve.** Skip conduct, write approval marker, proceed. (Not applicable to forge-task legacy plans — see `## Step 4`.)
 
-**Regex note:** the cascade uses `/^plan_gate:[ \t]*\n((?:[ \t]+.*\n?)*)/m` (block-capture) then per-key sub-matches with `/^[ \t]+interactive:[ \t]*(\w+)/m`. The `[ \t]` character class and `m` flag are mandatory. **Never use `\Z`** — it does not exist in JS regex (silently becomes the literal char `Z`, causing EOF blocks to be ignored — the same bug that broke `forge_isolation`).
+**Resolution note:** prefs parsing (block capture, `[ \t]` class, EOF-safe boundaries, `\Z` avoidance) now lives entirely in `scripts/forge-prefs.js` (S01) — the gate only extracts resolved knobs off `.prefs`. The whitelist fallbacks above (`always`/`defer` on absent or invalid) are the gate's own concern; the CLI resolves values without defaulting them.
 
 ## Step 0a — Idempotency / approval marker
 
@@ -326,5 +318,5 @@ For `forge-task`, `{M###}` may be omitted or set to `""` if the task runs outsid
 - `skills/forge-auto/SKILL.md` — MODE=auto; gate is skipped unconditionally. No wiring change needed beyond confirming the skip in the event log.
 - `agents/forge-plan-checker.md` — the plan-checker runs before this gate and produces `plan_check_counts: {pass, warn, fail}`. The gate reads these counts. The checker's artifact `{S##}-PLAN-CHECK.md` is NOT the approval marker.
 - `scripts/forge-must-haves.js` — re-validation CLI in Step 4. Command: `node "$FORGE_SCRIPTS_DIR/forge-must-haves.js" --check <plan.md>` → `{legacy, valid, errors}` JSON to stdout. Exit 0 for legacy-or-valid, exit 2 for malformed structured plan. **Legacy plans always return `{legacy:true, valid:true}` — no schema enforcement.**
-- `forge-agent-prefs.md § Plan Gate Settings` — the `plan_gate:` pref block (`interactive`, `ask_in_auto`). Cascade-read in Step 0 above.
+- `forge-agent-prefs.md § Plan Gate Settings` — the `plan_gate:` pref block (`interactive`, `ask_in_auto`). Resolved via the prefs CLI in Step 0 above.
 - Approval marker: `{S##}-PLAN-GATE.md` (per-slice) or `{TASK_ID}-PLAN-GATE.md` (per-task), written in Step 5. Not committed; cleaned by `milestone_cleanup` with the slice artifacts.

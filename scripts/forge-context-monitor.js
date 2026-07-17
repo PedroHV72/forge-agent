@@ -35,9 +35,7 @@
  *     Cascades user→repo→local prefs. Regex-only, zero YAML parser (MEM004).
  */
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
+const { readPrefsCached } = require('./forge-prefs.js');
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -161,7 +159,7 @@ function buildAdditionalContext(severity, thresholds) {
 // ── Prefs reader ───────────────────────────────────────────────────────────────
 
 /**
- * readContextMonitorPrefs — cascade user→repo→local, regex-only (MEM004).
+ * readContextMonitorPrefs — read the merged preference engine result.
  *
  * Reads context_monitor.* keys:
  *   enabled: true|false            (default true)
@@ -172,45 +170,27 @@ function buildAdditionalContext(severity, thresholds) {
  * @returns {{ enabled: boolean, thresholds: { warning: number, critical: number } }}
  */
 function readContextMonitorPrefs(cwd) {
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
-
   let enabled = true;
   let warning = DEFAULT_THRESHOLDS.warning;
   let critical = DEFAULT_THRESHOLDS.critical;
-
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-
-      // Scope sub-key reads to the context_monitor: block ONLY (S03 review R6 —
-      // an indented `enabled:` in a SIBLING block must not leak in here).
-      // Block = the contiguous indented lines right after `context_monitor:`.
-      const block = raw.match(/^context_monitor:[ \t]*\n((?:[ \t]+\S.*(?:\n|$))*)/m);
-      if (!block) continue;
-      const body = block[1];
-
-      const mEnabled = body.match(/^[ \t]+enabled:[ \t]*(true|false)/m);
-      if (mEnabled) enabled = mEnabled[1] === 'true';
-
-      const mWarning = body.match(/^[ \t]+warning_threshold:[ \t]*([0-9]*\.?[0-9]+)/m);
-      if (mWarning) {
-        let v = parseFloat(mWarning[1]);
-        if (v > 1) v = v / 100; // percent → fraction
-        warning = v;
-      }
-
-      const mCritical = body.match(/^[ \t]+critical_threshold:[ \t]*([0-9]*\.?[0-9]+)/m);
-      if (mCritical) {
-        let v = parseFloat(mCritical[1]);
-        if (v > 1) v = v / 100; // percent → fraction
-        critical = v;
-      }
-    } catch { /* missing file — skip */ }
+  const monitor = readPrefsCached(cwd).prefs.context_monitor;
+  if (!monitor || typeof monitor !== 'object' || Array.isArray(monitor)) {
+    return { enabled, thresholds: { warning, critical } };
   }
+
+  if (typeof monitor.enabled === 'boolean') enabled = monitor.enabled;
+  const normalize = (value, fallback) => {
+    let n = value;
+    // Tolerate numeric-string-with-suffix (e.g. "85%", "85abc") — parse the
+    // leading numeric prefix so the old reader's tolerance is preserved.
+    if (typeof n === 'string' && /^-?[0-9]*\.?[0-9]+/.test(n)) {
+      n = parseFloat(n);
+    }
+    if (typeof n !== 'number' || !Number.isFinite(n)) return fallback;
+    return n > 1 ? n / 100 : n;
+  };
+  warning = normalize(monitor.warning_threshold, warning);
+  critical = normalize(monitor.critical_threshold, critical);
 
   return { enabled, thresholds: { warning, critical } };
 }

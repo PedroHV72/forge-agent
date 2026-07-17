@@ -113,7 +113,7 @@ bash ~/.claude/scripts/codebase-collect.sh apps packages
 
 Substituir `apps packages` pelos ROOTS reais. O script produz todas as seções separadas por `::LABEL::`.
 
-Se o script não existir (`command not found`), copiar de: `$(grep -m1 'repo_path:' ~/.claude/forge-agent-prefs.md | cut -d: -f2 | tr -d ' ')/scripts/codebase-collect.sh`
+Se o script não existir (`command not found`), copiar de: `$(node "$([ -f scripts/forge-prefs.js ] && echo scripts/forge-prefs.js || echo "$HOME/.claude/scripts/forge-prefs.js")" --resolved --key repo_path 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(v?String(v):'')}catch{process.stdout.write('')}})")/scripts/codebase-collect.sh`
 
 > 1 tool call = **1 roundtrip**. Produz TUDO: fingerprint, file list, line counts, exports, defs, funções, tamanhos, frontend checks.
 

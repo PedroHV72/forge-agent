@@ -2,9 +2,9 @@
 /**
  * forge-tier-chain.js
  *
- * Reads the intra-tier fallback chain for a given tier from the raw 3-file
- * prefs cascade (home > repo > local, last wins). NEVER reads
- * `.gsd/prefs-resolved.json` — that file is never written (see MEM001 M005).
+ * Reads the intra-tier fallback chain for a given tier from the shared prefs
+ * engine. NEVER reads `.gsd/prefs-resolved.json` — that file is never written
+ * (see MEM001 M005).
  *
  * `tier_models.<tier>` may be a scalar model ID (single-member chain, the
  * legacy/common case) or an inline flow list `[a, b]` (ordered primary-first
@@ -24,10 +24,8 @@
 
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 const { modelToAlias } = require('./forge-model-alias');
+const { readPrefsCached } = require('./forge-prefs.js');
 
 // ── Canonical default map — mirrors shared/forge-tiers.md § Tier → Default Model
 // heavy is WITHOUT the [1m] suffix here (matches § Tier Resolution default).
@@ -40,47 +38,19 @@ const DEFAULT_TIER_MODEL = {
 
 const VALID_TIERS = ['light', 'standard', 'heavy', 'max'];
 
-// ── Raw prefs cascade reader ────────────────────────────────────────────────
-// Pattern mirrors readEvidenceMode in forge-hook.js: regex-only, `[ \t]`
-// (never `\s`), no `\Z` anchor (invalid in JS), silent-fail to safe default.
-function readRawTierModelsValue(tier, cwd) {
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
-
-  let value = null; // last-wins across the cascade
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      const blockMatch = raw.match(/^tier_models:[ \t]*\n((?:[ \t]+.+\n?)+)/m);
-      if (!blockMatch) continue;
-      const block = blockMatch[1];
-      const lineRe = new RegExp('^[ \\t]+' + tier + ':[ \\t]*(.+)$', 'm');
-      const lineMatch = block.match(lineRe);
-      if (lineMatch) {
-        // Strip trailing YAML comment (# ...) outside of brackets/quotes.
-        let v = lineMatch[1].trim();
-        const hashIdx = v.indexOf('#');
-        if (hashIdx !== -1 && v.indexOf('[') === -1) {
-          v = v.slice(0, hashIdx).trim();
-        } else if (hashIdx !== -1 && v.indexOf(']') !== -1 && hashIdx > v.indexOf(']')) {
-          v = v.slice(0, hashIdx).trim();
-        }
-        value = v;
-      }
-    } catch { /* missing file — skip */ }
+// ── Engine value-shape normalization ────────────────────────────────────────
+// legacyRead() has already parsed Markdown flow lists: engine values are an
+// Array for valid lists, a string for scalars (and malformed bracket strings),
+// or native JSONC arrays/strings. Keep the malformed-string check solely to
+// preserve the legacy stderr warning and default degradation contract.
+function parseTierValue(value, tier) {
+  if (Array.isArray(value)) {
+    return value.length > 0 ? value : [DEFAULT_TIER_MODEL[tier]];
   }
-  return value;
-}
-
-// ── Value parsing: scalar OR inline flow list ───────────────────────────────
-function parseTierValue(raw, tier) {
-  if (!raw || !raw.trim()) {
+  if (typeof value !== 'string' || !value.trim()) {
     return [DEFAULT_TIER_MODEL[tier]];
   }
-  const trimmed = raw.trim();
+  const trimmed = value.trim();
   if (trimmed.startsWith('[')) {
     if (!trimmed.endsWith(']')) {
       throw new Error(`malformed tier_models list: unbalanced brackets in "${trimmed}"`);
@@ -104,10 +74,11 @@ function readTierChain(tier, cwd) {
   const normalizedTier = VALID_TIERS.includes(tier) ? tier : 'standard';
   const targetCwd = cwd || process.cwd();
 
-  const raw = readRawTierModelsValue(normalizedTier, targetCwd);
+  const { prefs } = readPrefsCached(targetCwd);
+  const value = prefs.tier_models && prefs.tier_models[normalizedTier];
   let ids;
   try {
-    ids = parseTierValue(raw, normalizedTier);
+    ids = parseTierValue(value, normalizedTier);
   } catch (e) {
     process.stderr.write(
       `⚠ tier_models.${normalizedTier} malformado — usando default ${DEFAULT_TIER_MODEL[normalizedTier]}\n`

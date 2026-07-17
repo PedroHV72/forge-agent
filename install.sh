@@ -339,19 +339,49 @@ done
 echo ""
 info "Installing preferences..."
 PREFS_DST="${CLAUDE_DIR}/forge-agent-prefs.md"
-if [ ! -f "$PREFS_DST" ]; then
+PREFS_JSONC="${CLAUDE_DIR}/forge-agent-prefs.jsonc"
+
+# Ship the global JSONC catalogue on clean installs. The Node renderer owns the
+# bytes (including LF endings); an existing catalogue is always user-owned.
+if [ -f "$PREFS_JSONC" ]; then
+  info "  forge-agent-prefs.jsonc já existe — não sobrescrito"
+elif command -v node >/dev/null 2>&1; then
+  if $DRY_RUN; then
+    dry "node \"${REPO_DIR}/scripts/forge-prefs.js\" --scaffold --out \"${PREFS_JSONC}\""
+  else
+    node "${REPO_DIR}/scripts/forge-prefs.js" --scaffold --out "$PREFS_JSONC"
+    info "  forge-agent-prefs.jsonc (catálogo global default)"
+  fi
+else
+  info "  Node não encontrado — scaffold JSONC pulado (dual-read mantém o md funcionando)"
+fi
+
+# Keep the Markdown file only as a legacy fallback. A JSONC catalogue shadows
+# it, so creating a new md template in that case would be misleading.
+if [ ! -f "$PREFS_JSONC" ] && [ ! -f "$PREFS_DST" ]; then
   copy "${REPO_DIR}/forge-agent-prefs.md" "$PREFS_DST"
   info "  forge-agent-prefs.md (novo)"
-else
+elif [ -f "$PREFS_DST" ]; then
   info "  forge-agent-prefs.md já existe — não sobrescrito"
   info "  (suas preferências foram mantidas)"
+elif $DRY_RUN; then
+  dry "cp ${REPO_DIR}/forge-agent-prefs.md → ${PREFS_DST} (fallback legado; JSONC ainda não criado no dry-run)"
 fi
 
 # ── Store repo path for /forge-update ──────────────────────────────────────────
 # Use sed -i '' for macOS (BSD sed) compatibility; GNU sed ignores the empty string arg
 _sed_inplace() { sed -i '' "$@" 2>/dev/null || sed -i "$@"; }
 
-if ! $DRY_RUN && [ -f "$PREFS_DST" ]; then
+if [ -f "$PREFS_JSONC" ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    info "  Node não encontrado — repo_path no JSONC não atualizado"
+  elif $DRY_RUN; then
+    dry "node \"${REPO_DIR}/scripts/forge-prefs-migrate.js\" --set repo_path=${REPO_DIR} --layer global"
+  else
+    node "${REPO_DIR}/scripts/forge-prefs-migrate.js" --set "repo_path=${REPO_DIR}" --layer global
+  fi
+  info "  repo_path gravado no catálogo global: ${REPO_DIR}"
+elif ! $DRY_RUN && [ -f "$PREFS_DST" ]; then
   if grep -q "^repo_path:" "$PREFS_DST" 2>/dev/null; then
     _sed_inplace "s|^repo_path:.*|repo_path: ${REPO_DIR}|" "$PREFS_DST"
   else
@@ -370,7 +400,16 @@ fi
 # in TaskCreate descriptions. When agents are upgraded (or downgraded) by the probe,
 # the prefs file must be rewritten to match — otherwise the UI shows one model while
 # Agent() dispatches another (the frontmatter wins at dispatch time).
-if $SYNC_PREFS && [ -f "$PREFS_DST" ]; then
+if $SYNC_PREFS && [ -f "$PREFS_JSONC" ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    info "  Node não encontrado — tier_models.heavy no JSONC não sincronizado"
+  elif $DRY_RUN; then
+    dry "node \"${REPO_DIR}/scripts/forge-prefs-migrate.js\" --set tier_models.heavy=${OPUS_TARGET} --layer global"
+  else
+    node "${REPO_DIR}/scripts/forge-prefs-migrate.js" --set "tier_models.heavy=${OPUS_TARGET}" --layer global
+  fi
+  info "  prefs tier_models.heavy sincronizado: ${OPUS_TARGET}"
+elif $SYNC_PREFS && [ -f "$PREFS_DST" ]; then
   if $DRY_RUN; then
     dry "sync prefs opus model → ${OPUS_TARGET}"
   else
@@ -385,7 +424,16 @@ fi
 # claude-fable-5 in tier_models.max; if the user's preserved prefs predate the max
 # tier, the line is inserted after heavy: so the runtime fallback (claude-fable-5)
 # never fires on an account without access.
-if $FABLE_DOWNGRADE && [ -f "$PREFS_DST" ]; then
+if $FABLE_DOWNGRADE && [ -f "$PREFS_JSONC" ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    info "  Node não encontrado — tier_models.max no JSONC não atualizado"
+  elif $DRY_RUN; then
+    dry "node \"${REPO_DIR}/scripts/forge-prefs-migrate.js\" --set tier_models.max=${OPUS_TARGET} --layer global"
+  else
+    node "${REPO_DIR}/scripts/forge-prefs-migrate.js" --set "tier_models.max=${OPUS_TARGET}" --layer global
+  fi
+  info "  tier_models.max redirecionado no catálogo global: ${OPUS_TARGET}"
+elif $FABLE_DOWNGRADE && [ -f "$PREFS_DST" ]; then
   if command -v node >/dev/null 2>&1; then
     FORGE_FABLE_TARGET="$OPUS_TARGET" node -e '
       const fs = require("fs");

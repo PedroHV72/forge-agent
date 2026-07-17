@@ -25,40 +25,35 @@ The human only adjudicates what the two AIs genuinely disagree on. Everything el
 - `{S##}` — slice being completed
 - `MODE` — `interactive` (forge-next) or `auto` (forge-auto)
 
-## Step 0 — Read review prefs (3-file cascade)
+## Step 0 — Read review prefs (via the canonical prefs CLI)
+
+Resolve prefs once through the S01 engine CLI (`scripts/forge-prefs.js --resolved`, the canonical per-unit helper defined in `shared/forge-dispatch.md § Per-unit prefs resolution`) — it dual-reads legacy md OR jsonc per layer, so no `files=[…forge-agent-prefs.md…]` cascade merge is re-implemented here. Read every `review.*` knob off `.prefs`, applying the SAME whitelist/clamp + default each had inline. The single `REVIEW_CFG` JSON below preserves the exact shape downstream steps consume:
 
 ```bash
-REVIEW_CFG=$(node -e "
-const fs=require('fs'),path=require('path'),os=require('os');
-const wd=process.env.WORKING_DIR||process.cwd();
-const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-             path.join(wd,'.gsd','claude-agent-prefs.md'),
-             path.join(wd,'.gsd','prefs.local.md')];
-let mode='enabled',style='dialectic',rounds=1,askAuto='defer',fixConceded=true,engine='agents',challenger='claude',advocate='claude',challengerModel=null,advocateModel='claude-fable-5';
-for(const f of files){try{
-  const r=fs.readFileSync(f,'utf8');
-  const blk=(r.match(/^review:[ \t]*\n((?:[ \t]+.*\n?)*)/m)||[])[1]||'';
-  let m;
-  if(m=blk.match(/^[ \t]+mode:[ \t]*(\w+)/m))mode=m[1].toLowerCase();
-  if(m=blk.match(/^[ \t]+style:[ \t]*(\w+)/m))style=m[1].toLowerCase();
-  if(m=blk.match(/^[ \t]+rounds:[ \t]*(\d+)/m))rounds=parseInt(m[1],10);
-  if(m=blk.match(/^[ \t]+ask_in_auto:[ \t]*(\w+)/m))askAuto=m[1].toLowerCase();
-  if(m=blk.match(/^[ \t]+fix_conceded:[ \t]*(\w+)/m))fixConceded=m[1].toLowerCase()!=='false';
-  if(m=blk.match(/^[ \t]+engine:[ \t]*(\w+)/m))engine=m[1].toLowerCase();
-  if(m=blk.match(/^[ \t]+challenger:[ \t]*(\w+)/m))challenger=m[1].toLowerCase();
-  if(m=blk.match(/^[ \t]+advocate:[ \t]*(\w+)/m))advocate=m[1].toLowerCase();
-  if(m=blk.match(/^[ \t]+challenger_model:[ \t]*([^#\n]+)/m)){const v=m[1].trim().replace(/^["']|["']$/g,'');if(v)challengerModel=v;}
-  if(m=blk.match(/^[ \t]+advocate_model:[ \t]*(\S+)/m))advocateModel=m[1];
-}catch(e){}}
-if(!['enabled','disabled'].includes(mode))mode='enabled';
-if(!['dialectic','flags'].includes(style))style='dialectic';
-if(!Number.isInteger(rounds)||rounds<0||rounds>3)rounds=1;
-if(!['defer','pause'].includes(askAuto))askAuto='defer';
-if(!['agents','workflow'].includes(engine))engine='agents';
-if(!['claude','codex','gemini','auto'].includes(challenger))challenger='claude';
-if(!['claude','auto'].includes(advocate))advocate='claude';
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
+if [ $? -ne 0 ]; then
+  # M008-CONTEXT decision #2 — loud stop, never a silent default. errors[] (file+line)
+  # on stdout ($PREFS_JSON); human message + fix hint on stderr. Halt the review gate.
+  echo "✗ prefs parse error — review gate halted (see stderr for arquivo:linha)" >&2
+  # ...deactivate run + STOP...
+fi
+
+REVIEW_CFG=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{
+const rv=(JSON.parse(d).prefs.review)||{};
+const low=v=>(typeof v==='string')?v.toLowerCase():undefined;
+let mode=low(rv.mode); if(!['enabled','disabled'].includes(mode))mode='enabled';
+let style=low(rv.style); if(!['dialectic','flags'].includes(style))style='dialectic';
+let rounds=rv.rounds; if(!Number.isInteger(rounds)||rounds<0||rounds>3)rounds=1;
+let askAuto=low(rv.ask_in_auto); if(!['defer','pause'].includes(askAuto))askAuto='defer';
+let fixConceded=(low(rv.fix_conceded)==='false')?false:(rv.fix_conceded===false?false:true);
+let engine=low(rv.engine); if(!['agents','workflow'].includes(engine))engine='agents';
+let challenger=low(rv.challenger); if(!['claude','codex','gemini','auto'].includes(challenger))challenger='claude';
+let advocate=low(rv.advocate); if(!['claude','auto'].includes(advocate))advocate='claude';
+let challengerModel=(typeof rv.challenger_model==='string'&&rv.challenger_model.trim())?rv.challenger_model.trim():null;
+let advocateModel=(typeof rv.advocate_model==='string'&&rv.advocate_model)?rv.advocate_model:'claude-fable-5';
 process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engine,challenger,advocate,challengerModel,advocateModel}));
-" WORKING_DIR=\"$WORKING_DIR\")
+}catch(e){process.stdout.write('{\"mode\":\"enabled\",\"style\":\"dialectic\",\"rounds\":1,\"askAuto\":\"defer\",\"fixConceded\":true,\"engine\":\"agents\",\"challenger\":\"claude\",\"advocate\":\"claude\",\"challengerModel\":null,\"advocateModel\":\"claude-fable-5\"}')}})")
 
 CHALLENGER=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challenger||'claude')}catch(e){process.stdout.write('claude')}})")
 CHALLENGER_MODEL=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challengerModel||'')}catch(e){process.stdout.write('')}})")
@@ -75,7 +70,7 @@ XLLM_ENGINE=$([ "$CHALLENGER" = "gemini" ] && echo agy || echo codex)
 - `challenger` — whitelist `claude|codex|gemini`, default `claude`. `claude` (or any invalid value → whitelist fallback) runs the in-context `forge-reviewer`/`forge-advocate` agents unchanged. `codex` and `gemini` route the challenge (Step 2) and rebuttal (Step 4) through the `scripts/forge-xllm.js` adapter — `codex` = GPT via `codex exec` (`--engine codex`), `gemini` = Gemini via the Antigravity CLI `agy --print` (`--engine agy`).
 - `challengerModel` — default `null` (unset). When set, it is forwarded to the adapter as `--model {challenger_model}`; when `null`, `--model` is omitted and the CLI's default model is used. Only meaningful when `challenger != claude`. Codex takes model ids (e.g. `gpt-5.2-codex`); agy takes model **labels which may contain spaces** (e.g. `Gemini 3.1 Pro (High)` — see `agy models`), so the value is read to end-of-line (`#` starts a comment; surrounding quotes are stripped) and must always be expanded quoted (`--model "$CHALLENGER_MODEL"`).
 - `advocateModel` — default `'claude-fable-5'` (literal — not null; the advocate always runs on a resolved model). Overridden by `advocate_model: <x>` in the cascade. Resolved to a dispatch alias via `ADVOCATE_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --id "$ADVOCATE_MODEL")` — the single mapping source (`scripts/forge-model-alias.js`, never duplicated here). An id with no known alias resolves to an empty string; Step 3 then omits `model:` entirely (frontmatter governs) and echoes a warning — degradation is documented, not silent.
-- The regexes use `[ \t]` (never `\s`, which would match `\n` and leak into the next line — MEM), following the `readEvidenceMode` reader model.
+- Prefs parsing (block capture, `[ \t]` class, EOF-safe boundaries) now lives entirely in `scripts/forge-prefs.js` (S01); Step 0 only extracts resolved knobs off `.prefs` and applies the whitelist/clamp fallbacks above. The CLI resolves values without defaulting them — the defaults here are the review gate's own concern.
 
 ### Resolução de pairing (`auto`) — uma vez, antes de tudo
 

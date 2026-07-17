@@ -26,16 +26,11 @@
 const fs   = require('fs');
 const path = require('path');
 const { execSync, spawnSync } = require('child_process');
+const { readPrefsCached } = require('./forge-prefs.js');
 
 const repos = require('./forge-repos.js');
 
 function readIsolationPrefs(cwd) {
-  const os = require('os');
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
   let mode = 'shared';
   let branchPattern = 'forge/{M###}';
   let autoPullMain = true;
@@ -43,22 +38,18 @@ function readIsolationPrefs(cwd) {
   let worktreeCleanupOnComplete = false;
   let prOnComplete = false;
 
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      // Capture only the indented body of the block (plus blank lines). The previous
-      // pattern used `\Z`, which JS treats as a literal "Z" — blocks at end-of-file
-      // were silently ignored, so prefs like `mode: worktree` never took effect.
-      const block = raw.match(/^forge_isolation:[ \t]*\n((?:[ \t]+[^\n]*(?:\n|$)|[ \t]*\n)*)/m);
-      if (!block) continue;
-      const modeM = block[1].match(/mode:[ \t]*(\w+)/);                                if (modeM) mode = modeM[1].toLowerCase();
-      const patM  = block[1].match(/branch_pattern:[ \t]*["']?([^"'\n]+)["']?/);       if (patM)  branchPattern = patM[1].trim();
-      const pullM = block[1].match(/auto_pull_main:[ \t]*(\w+)/);                       if (pullM) autoPullMain = pullM[1].toLowerCase() === 'true';
-      const wtrM  = block[1].match(/worktree_root:[ \t]*["']?([^"'\n]+)["']?/);        if (wtrM)  worktreeRoot = wtrM[1].trim();
-      const wcM   = block[1].match(/worktree_cleanup_on_complete:[ \t]*(\w+)/);         if (wcM)   worktreeCleanupOnComplete = wcM[1].toLowerCase() === 'true';
-      const prM   = block[1].match(/pr_on_complete:[ \t]*(\w+)/);                       if (prM)   prOnComplete = prM[1].toLowerCase() === 'true';
-    } catch {}
+  const isolation = readPrefsCached(cwd).prefs.forge_isolation;
+  if (!isolation || typeof isolation !== 'object' || Array.isArray(isolation)) {
+    return { mode, branchPattern, autoPullMain, worktreeRoot, worktreeCleanupOnComplete, prOnComplete };
   }
+  if (typeof isolation.mode === 'string') mode = isolation.mode.toLowerCase();
+  const stringValue = (value, fallback) => { if (typeof value !== 'string') return fallback; const s = value.replace(/^["']|["']$/g, '').trim(); return s.length > 0 ? s : fallback; };
+  branchPattern = stringValue(isolation.branch_pattern, branchPattern);
+  worktreeRoot = stringValue(isolation.worktree_root, worktreeRoot);
+  const boolValue = (value, fallback) => value === undefined ? fallback : (typeof value === 'boolean' ? value : String(value).toLowerCase() === 'true');
+  autoPullMain = boolValue(isolation.auto_pull_main, autoPullMain);
+  worktreeCleanupOnComplete = boolValue(isolation.worktree_cleanup_on_complete, worktreeCleanupOnComplete);
+  prOnComplete = boolValue(isolation.pr_on_complete, prOnComplete);
   return { mode, branchPattern, autoPullMain, worktreeRoot, worktreeCleanupOnComplete, prOnComplete };
 }
 

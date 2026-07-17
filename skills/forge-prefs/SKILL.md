@@ -1,8 +1,8 @@
 ---
 name: forge-prefs
-description: "Preferencias do agente GSD — modelos, git, skip rules."
+description: "Catálogo de preferências do forge-agent — todos os 87 knobs com estado/valor/camada/descrição, e um caminho de edição via forge-prefs-migrate.js --set."
 disable-model-invocation: true
-allowed-tools: Read, Write, Edit
+allowed-tools: Read, Write, Edit, Bash
 ---
 
 ## Input
@@ -10,128 +10,147 @@ $ARGUMENTS
 
 ---
 
-## Mapa de aliases → model IDs
+## O que este skill faz
 
-Quando o usuário usar um alias, converta para o model ID completo:
+Superfície completa do motor de preferências JSONC (M008): lista **todos os 87
+knobs** do catálogo (`forge-prefs.schema.json`, 38 seções), cada um com:
 
-| Alias | Model ID completo |
-|-------|------------------|
-| `opus` | `claude-opus-4-8[1m]` (fallback `claude-opus-4-7`) |
-| `sonnet` | `claude-sonnet-5` |
-| `haiku` | `claude-haiku-4-5-20251001` |
+- **estado** — ATIVO (usuário setou em alguma camada) ou desligado (default do schema)
+- **valor resolvido** — o valor efetivo, ativo ou default
+- **camada de origem** — `global` (`~/.claude/`), `local` (`.gsd/`), `mixed`, ou `—` (default)
+- **descrição** — a linha do `schema.description` daquele knob (auto-didata, fonte única)
 
-O usuário pode passar tanto o alias quanto o model ID completo — ambos são aceitos.
-
-**Fallback:** Se `claude-opus-4-8[1m]` não estiver disponível na conta, o instalador detecta e faz downgrade para `claude-opus-4-7`. Ao editar agentes Opus manualmente, aceite ambos `claude-opus-4-8[1m]` e `claude-opus-4-7` como válidos.
+O motor real é `scripts/forge-prefs-view.js` (`renderView(cwd)` / `buildCatalog(cwd)`
+/ CLI `--view|--json`). Este skill NUNCA reimplementa a leitura do schema, a
+resolução de camadas ou a escrita de catálogos — apenas invoca o helper e, na
+edição, delega a `scripts/forge-prefs-migrate.js --set` (primitivo
+block-preserving já testado em S05). Resolver o script: preferir
+`scripts/forge-prefs-view.js` do repo; se ausente, `~/.claude/scripts/forge-prefs-view.js`.
 
 ---
 
 ## Operações
 
-### Sem argumento ou "show"
+### Sem argumento, "show" ou "list"
 
-Read `~/.claude/forge-agent-prefs.md`. Display:
+Rode o helper e exiba a saída **verbatim** — não resuma, não reformate:
 
-```
-Forge Agent — Configuração atual
-
-MODELOS DISPONÍVEIS
-  opus   → claude-opus-4-8[1m]           (análise profunda, planejamento — fallback: 4-6)
-  sonnet → claude-sonnet-5         (execução, tarefas padrão)
-  haiku  → claude-haiku-4-5-20251001 (tarefas leves, memórias)
-
-ROTEAMENTO POR FASE
-  discuss    → forge-discusser   [claude-opus-4-8[1m]]
-  research   → forge-researcher  [claude-opus-4-8[1m]]
-  plan       → forge-planner     [claude-opus-4-8[1m]]
-  execute    → forge-executor    [claude-sonnet-5]
-  complete   → forge-completer   [claude-sonnet-5]
-  memory     → forge-memory     [claude-haiku-4-5-20251001]
-
-SKIP RULES
-  skip_discuss:  false
-  skip_research: false
-
-GIT
-  merge_strategy: squash
-  auto_push:      false
-  main_branch:    master
-
-IDS
-  format: timestamp        (timestamp | sequential)
+```bash
+SCRIPT=$([ -f scripts/forge-prefs-view.js ] && echo scripts/forge-prefs-view.js || echo "$HOME/.claude/scripts/forge-prefs-view.js")
+node "$SCRIPT" --cwd .
 ```
 
-(Read actual values from the prefs file — do not hardcode the above. For IDS, if no
-`ids:` block exists in the file, show `format: timestamp (default)`.)
+A saída já traz, nesta ordem: fonte de cada camada (`jsonc` / `md-legacy` — com
+aviso para migrar / `absent`), erros de parse (`✗`) e avisos de valor inválido
+(`⚠`) se houver, legenda `● ATIVO / ○ desligado`, e o catálogo completo
+agrupado pelas 38 seções na ordem do schema.
+
+Se `layers.global.source == "md-legacy"` ou `layers.local.source == "md-legacy"`
+na saída, mencione ao usuário que `node scripts/forge-prefs-migrate.js --cwd .`
+migra para JSONC sem risco de perda (gate `resolvedDiff`, round-trip provado).
 
 ---
 
-### "models"
+### "set \<dotted.key\> \<value\> [global|local]"
 
-Display the full model list with descriptions:
+Exemplos válidos:
+- `/forge-prefs set review.rounds 2`
+- `/forge-prefs set skip_research true local`
+- `/forge-prefs set tier_models.heavy claude-opus-4-8[1m] global`
+
+Rota **sempre** pelo primitivo `--set` de `forge-prefs-migrate.js` — nunca edite
+um `.jsonc`/`.md` de preferências manualmente com `Edit`/`Write`:
+
+```bash
+MIGRATE=$([ -f scripts/forge-prefs-migrate.js ] && echo scripts/forge-prefs-migrate.js || echo "$HOME/.claude/scripts/forge-prefs-migrate.js")
+node "$MIGRATE" --set "<dotted.key>=<value>" --cwd . [--layer global|local] [--create]
+```
+
+Regras:
+- **`$schema` é recusado.** É metadata de tooling (o hook de referência do
+  catálogo), não uma preferência. `set $schema ...` retorna erro
+  (`$schema é metadata de tooling, não pode ser setado como preferência`) e
+  **não** delega ao `--set`. No `show`, o `$schema` aparece com o marcador `◆`
+  e a anotação "metadata de tooling — não é preferência" em vez de
+  ATIVO/desligado.
+- `<value>` é interpretado como JSON quando possível (`true`, `2`, `"texto"`,
+  `["a","b"]`); caso contrário cai para string literal. Passe o argumento do
+  usuário sem aspas extras — o parser (`parseSetExpression`) já cobre isso.
+- Camada: se o usuário não especificar, o primitivo escolhe `local` quando
+  `.gsd/` existe no projeto atual, senão `global`. Se o alvo for `local` e o
+  catálogo ainda não existir, adicione `--create` (senão retorna
+  `local-create-required`, sem escrever nada).
+- `--set` falha com exit≠0 se a chave não existir no schema, se o valor violar
+  `type`/`enum`, ou se a pós-verificação (`getDottedValue` no resolved final)
+  não bater — nesses casos, mostre o `stderr` ao usuário e não afirme sucesso.
+
+Após um `--set` bem-sucedido, **re-rode o viewer** para confirmar visualmente
+o novo estado (mesmo comando de "show" acima) e mostre apenas o knob alterado
+mais o header de camadas — não repita o catálogo inteiro na confirmação.
+
+```
+✓ review.rounds atualizado
+
+  Antes: desligado (default: 1)
+  Agora: ATIVO = 2   (camada: local)
+```
+
+---
+
+### "models" (compatibilidade retroativa — roteamento por fase legado)
+
+Mantido do skill anterior a M008: alguns usuários ainda pensam em "modelo por
+fase" em vez de `tier_models`/`routing`. Trate como um atalho de leitura sobre
+o catálogo atual — não uma rota de escrita separada.
 
 ```
 MODELOS DISPONÍVEIS NO CLAUDE CODE
 
   opus    claude-opus-4-8[1m] (fallback: claude-opus-4-7)
-          Modelo mais capaz. Ideal para: discuss, research, plan.
-          Use quando precisar de raciocínio profundo e decisões arquiteturais.
-          Fallback automático para 4-6 se 4-7 não estiver disponível na conta.
+          Modelo mais capaz. Ideal para: discuss, research, plan, tier heavy/max.
 
   sonnet  claude-sonnet-5
-          Modelo balanceado (padrão para execução). Ideal para: execute, complete.
-          Boa relação entre qualidade e custo.
+          Modelo balanceado (padrão para execução). Ideal para: execute, complete, tier standard.
 
   haiku   claude-haiku-4-5-20251001
-          Modelo mais rápido e barato. Ideal para: memory extraction.
-          Use para tarefas leves que não precisam de raciocínio pesado.
+          Modelo mais rápido e barato. Ideal para: memory extraction, tier light.
 
-Para mudar o modelo de uma fase:
-  /forge-prefs set <fase> <alias ou model ID>
+Para mudar o modelo de um tier:
+  /forge-prefs set tier_models.<tier> <alias ou model ID>
 
 Exemplos:
-  /forge-prefs set execute opus
-  /forge-prefs set execute claude-opus-4-8[1m]
-  /forge-prefs set research haiku
-  /forge-prefs set research claude-haiku-4-5-20251001
+  /forge-prefs set tier_models.heavy opus
+  /forge-prefs set tier_models.standard claude-sonnet-5
 ```
 
----
-
-### "set \<phase\> \<model\>"
-
-Exemplos válidos:
-- `/forge-prefs set research haiku`
-- `/forge-prefs set execute opus`
-- `/forge-prefs set execute claude-opus-4-8[1m]`
-- `/forge-prefs set plan claude-sonnet-5`
+### "set \<phase\> \<model\>" (alias legado)
 
 Fases válidas: `discuss`, `research`, `plan`, `execute`, `complete`, `memory`
+— mapeadas para o tier equivalente (ver `shared/forge-tiers.md`):
 
-Mapa fase → arquivo de agente:
-- `discuss` → `~/.claude/agents/forge-discusser.md`
-- `research` → `~/.claude/agents/forge-researcher.md`
-- `plan` → `~/.claude/agents/forge-planner.md`
-- `execute` → `~/.claude/agents/forge-executor.md`
-- `complete` → `~/.claude/agents/forge-completer.md`
-- `memory` → `~/.claude/agents/forge-memory.md`
+| Fase legada | Tier equivalente |
+|---|---|
+| `discuss`, `research`, `plan` | `heavy` (ou `max` para `plan-milestone`) |
+| `execute` | `standard` |
+| `complete` | `standard` |
+| `memory` | `light` |
 
-Steps:
-1. Resolve o model ID completo (converta alias se necessário)
-2. Atualize a coluna "Model ID" na tabela de Phase → Agent Routing no `~/.claude/forge-agent-prefs.md`
-3. Atualize o campo `model:` no frontmatter do arquivo de agente correspondente
-4. Confirme:
+Converta o alias de modelo (`opus`/`sonnet`/`haiku`) para o model ID completo
+se necessário, e rode:
 
+```bash
+node "$MIGRATE" --set "tier_models.<tier>=<model-id>" --cwd . [--layer global|local] [--create]
 ```
-✓ Fase 'execute' atualizada
+
+Confirme:
+```
+✓ Fase 'execute' (tier standard) atualizada
 
   Antes: claude-sonnet-5
   Agora: claude-opus-4-8[1m]
-
-  Arquivo do agente atualizado: ~/.claude/agents/forge-executor.md
 ```
 
-Se o modelo passado não for reconhecido (nem alias nem model ID válido):
+Modelo não reconhecido (nem alias nem ID válido):
 ```
 Modelo desconhecido: '{input}'
 
@@ -143,89 +162,37 @@ Modelos disponíveis:
 
 ---
 
-### "skip-research \<true|false\>"
-
-Toggle research phase skip. Update `skip_research` in `~/.claude/forge-agent-prefs.md`.
-Confirm the new value.
-
----
-
-### "skip-discuss \<true|false\>"
-
-Toggle discuss phase skip. Update `skip_discuss`.
-Confirm the new value.
-
----
-
-### "git \<setting\> \<value\>"
-
-Exemplos: `git auto_push true`, `git merge_strategy merge`, `git main_branch main`
-
-Update the git setting in `~/.claude/forge-agent-prefs.md`. Confirm.
-
----
-
-### "ids \<timestamp|sequential\> [repo|local]"
-
-Controla o formato dos IDs **gerados** para milestones e tasks soltas (pref `ids.format`,
-consumida por `scripts/forge-ids.js`). A leitura aceita sempre os dois formatos.
-
-Exemplos:
-- `/forge-prefs ids sequential` — seta no user-global (`~/.claude/forge-agent-prefs.md`)
-- `/forge-prefs ids sequential repo` — seta no repo (`.gsd/claude-agent-prefs.md`, commitável)
-- `/forge-prefs ids timestamp local` — seta no local (`.gsd/prefs.local.md`, gitignored)
-
-Scope → arquivo (cascata: user → repo → local, último ganha):
-- (omitido) → `~/.claude/forge-agent-prefs.md`
-- `repo` → `.gsd/claude-agent-prefs.md`
-- `local` → `.gsd/prefs.local.md`
-
-Steps:
-1. Valide o valor: apenas `timestamp` ou `sequential`. Valor inválido → mostre os dois válidos e pare.
-2. Read o arquivo do scope. Se já existe um bloco `ids:` com `format:`, edite o valor in-place.
-   Se não existe, adicione ao final do arquivo:
-   ```
-   ids:
-     format: <valor>
-   ```
-3. Se o valor for `sequential`, inclua o aviso na confirmação:
-   ```
-   ⚠ sequential reintroduz risco de colisão entre devs/branches paralelos
-     (dois devs criando milestone ao mesmo tempo geram o mesmo M00N).
-     Recomendado apenas para repositório de dev único.
-   ```
-4. Confirme mostrando o valor efetivo resolvido pela cascata:
-   ```
-   ✓ ids.format atualizado
-
-     Scope:  {user-global | repo | local} → {arquivo}
-     Valor:  {timestamp | sequential}
-     Efetivo (após cascata): {resultado de node scripts/forge-ids.js --help → ou
-       grep dos 3 arquivos na ordem user → repo → local, último encontrado ganha}
-
-     Formatos gerados a partir de agora:
-       milestone: {M-<ts>-<slug> | M00N}
-       task:      {T-<ts>-<slug> | TASK-00N}
-   ```
-
-Nota: `repo`/`local` exigem `.gsd/` no projeto atual — se não existir, avise que o scope
-exige `/forge-init` primeiro e ofereça o user-global como alternativa.
-
----
-
 ### "reset"
 
-Restore all defaults:
-- discuss/research/plan → `claude-opus-4-8[1m]` (fallback `claude-opus-4-7` se 4-7 indisponível na conta)
-- execute/complete → `claude-sonnet-5`
-- memory → `claude-haiku-4-5-20251001`
-- skip rules → all false
-- git → squash, auto_push false, main_branch master
-- ids → format timestamp (remove o bloco `ids:` apenas do user-global; repo/local não são tocados pelo reset)
-
-Update both `~/.claude/forge-agent-prefs.md` AND all agent frontmatter files.
-Confirm with the restored routing table.
+Não existe um primitivo `--reset` no motor JSONC (M008): resetar significa
+remover as linhas ativas de um knob, voltando-o ao default do schema. Para o
+caso geral, oriente o usuário a editar o `.jsonc` da camada e recomentar a
+linha (prefixo `// `) ou remover a entrada ativa duplicada. Não implemente um
+mutator de reset ad-hoc aqui — está fora do escopo deste skill (S06/T01); é
+um candidato de task futura em `forge-prefs-migrate.js` se houver demanda.
 
 ---
 
-After any change, show the updated routing table.
+### Referência completa
+
+Para a lista longa (todos os 87 knobs, com tipo, enum, default e descrição
+completa, fora do contexto de uma sessão), aponte o usuário para
+`shared/forge-prefs-reference.md` (gerado por `scripts/forge-prefs-reference.js`,
+T03 deste slice) — é o documento de referência versionado, complementar ao
+`/forge-prefs show` interativo.
+
+---
+
+## Notas de implementação (para quem editar este skill)
+
+- **Fonte única de verdade:** `forge-prefs.schema.json` — nunca hardcode uma
+  descrição, default ou lista de knobs aqui. O helper (`forge-prefs-view.js`)
+  lê o schema em runtime; qualquer prosa fixa neste arquivo sobre "quais são
+  os 87 knobs" ficaria desatualizada na primeira mudança de schema.
+- **Nunca escreva `.jsonc`/`.md` de preferências diretamente.** Toda mutação
+  passa por `forge-prefs-migrate.js` (`setPreference`/`--set`), que preserva
+  blocos comentados existentes byte-a-byte e verifica o resultado antes de
+  reportar sucesso.
+- `--resolved --explain` (o CLI de `forge-prefs.js`) só retorna knobs ATIVOS —
+  o viewer funde isso com `loadSchema()`/`defaultsFromSchema()` para mostrar o
+  universo completo. Ver comentário no topo de `scripts/forge-prefs-view.js`.

@@ -23,7 +23,8 @@ que ele pode trocar sem relançar.
 ```bash
 FA="$HOME/.claude/scripts/forge-accounts.js"
 if [ ! -f "$FA" ]; then
-  REPO=$(grep 'repo_path:' ~/.claude/forge-agent-prefs.md 2>/dev/null | cut -d: -f2 | tr -d ' ')
+  PREFS_ENGINE="$FORGE_SCRIPTS_DIR/forge-prefs.js"; [ -f "$PREFS_ENGINE" ] || PREFS_ENGINE="$HOME/.claude/scripts/forge-prefs.js"
+  REPO=$(node "$PREFS_ENGINE" --resolved --key repo_path 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(v?String(v):'')}catch{process.stdout.write('')}})")
   [ -n "$REPO" ] && FA="$REPO/scripts/forge-accounts.js"
 fi
 test -f "$FA" && echo "FA=$FA" || echo "ENGINE_MISSING"

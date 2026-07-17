@@ -1,0 +1,623 @@
+{
+  "$comment": "forge-prefs.schema.json — fonte única de verdade de TODOS os knobs de preferências do forge-agent (M008 S02/T01). Cada leaf carrega type/enum/default/description; os defaults são os fallbacks REAIS hardcoded nos readers (citados em scripts/forge-prefs-schema.test.js), nunca os valores de exemplo do template markdown. Consumido por loadSchema()/validatePrefs() em scripts/forge-prefs.js e projetado como catálogo JSONC comentado pelo gerador de scaffold (S02/T02). JSON puro — nunca adicionar comentários JSONC aqui.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "default": "forge-prefs.schema.json",
+      "description": "Referência ao schema deste catálogo (hook para tooling de editor). O scaffold emite esta chave como única linha ativa por default."
+    },
+    "skip_discuss": {
+      "type": "boolean",
+      "default": false,
+      "description": "true = pula a fase discuss (milestone e slice) e vai direto para research/plan. Use quando as decisões de arquitetura já estão registradas."
+    },
+    "skip_research": {
+      "type": "boolean",
+      "default": false,
+      "description": "true = pula a fase research de milestone e vai direto para plan. Use em codebases já bem documentados em CODING-STANDARDS.md."
+    },
+    "skip_slice_research": {
+      "type": "boolean",
+      "default": false,
+      "description": "true = pula a fase research de slice (research de milestone continua governado por skip_research)."
+    },
+    "reassess_after_slice": {
+      "type": "boolean",
+      "default": false,
+      "description": "true = reavalia o ROADMAP após cada slice completado (permite re-priorizar slices restantes com o aprendizado do slice anterior)."
+    },
+    "auto_commit": {
+      "type": "boolean",
+      "default": true,
+      "description": "false = agentes NÃO fazem commits/merges — o usuário gerencia o git manualmente. Afeta executor (commit por task), completer (squash-merge) e isolation cleanup."
+    },
+    "merge_strategy": {
+      "type": "string",
+      "enum": ["squash", "merge", "rebase"],
+      "default": "squash",
+      "description": "Estratégia de merge do branch do slice na main ao completar. Ignorado quando auto_commit: false."
+    },
+    "auto_push": {
+      "type": "boolean",
+      "default": false,
+      "description": "true = push automático após o squash-merge do slice/milestone. Ignorado quando auto_commit: false."
+    },
+    "main_branch": {
+      "type": "string",
+      "default": "master",
+      "description": "Nome da branch principal do repositório (alvo dos merges). Ajuste para main em repositórios que usam esse padrão."
+    },
+    "milestone_cleanup": {
+      "type": "string",
+      "enum": ["keep", "archive", "delete"],
+      "default": "keep",
+      "description": "Destino dos artefatos .gsd/milestones/{id}/ após o milestone completar (o LEDGER.md compacto é sempre gravado antes). keep = mantém tudo; archive = move para .gsd/archive/; delete = remove inteiramente. Arquivos duráveis (AUTO-MEMORY, DECISIONS, LEDGER, STATE, CODING-STANDARDS) nunca são tocados."
+    },
+    "task_cleanup": {
+      "type": "string",
+      "enum": ["keep", "archive", "delete"],
+      "default": "keep",
+      "description": "Destino dos artefatos .gsd/tasks/{id}/ após uma task solta (/forge-task) completar. keep = mantém; archive = move para .gsd/archive/tasks/; delete = remove."
+    },
+    "compact_after": {
+      "type": ["integer", "string"],
+      "default": "unlimited",
+      "description": "Unidades por sessão do forge-auto antes de um checkpoint manual (reseta contadores e continua — não para o loop). Número inteiro ou \"unlimited\". Ausente/\"unlimited\" = sem checkpoint (o Compaction Resilience Protocol cobre o auto-compact sozinho)."
+    },
+    "notifications": {
+      "type": "string",
+      "enum": ["on", "off"],
+      "default": "on",
+      "description": "on = forge-auto dispara PushNotification nos 3 pontos de espera humana (blocker não-recuperável, triagem final de review, Final Report). off = loop idêntico, sem push. Tool ausente no harness = silent-skip. Valor inválido cai em on."
+    },
+    "repo_path": {
+      "type": "string",
+      "default": "",
+      "description": "Caminho do repositório forge-agent na máquina — preenchido pelo install.sh; usado pela statusline para o update check. Não editar manualmente em condições normais."
+    },
+    "effort": {
+      "type": "object",
+      "description": "Default de effort (intensidade de raciocínio) por fase (unit_type). Eixo ortogonal ao tier: o tier escolhe QUAL modelo, o effort escolhe o quão fundo ele pensa. Escala ordenada: low < medium < high < xhigh < max. Sobreposto por effort: no frontmatter do T##-PLAN.md e clampado pela capacidade do modelo resolvido (haiku/sonnet limitam em medium).",
+      "properties": {
+        "plan-milestone": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "medium",
+          "description": "Effort da fase plan-milestone (decomposição arquitetural em slices)."
+        },
+        "plan-slice": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "medium",
+          "description": "Effort da fase plan-slice (planejamento de tasks). Risk escalation: slice risk:high sobe automaticamente para max."
+        },
+        "discuss-milestone": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "medium",
+          "description": "Effort da fase discuss-milestone (decisões de arquitetura com o usuário)."
+        },
+        "discuss-slice": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "medium",
+          "description": "Effort da fase discuss-slice (decisões de escopo do slice)."
+        },
+        "research-milestone": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "medium",
+          "description": "Effort da fase research-milestone (exploração de codebase)."
+        },
+        "research-slice": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "medium",
+          "description": "Effort da fase research-slice (pesquisa focada no slice)."
+        },
+        "execute-task": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "low",
+          "description": "Effort da fase execute-task (implementação). Override por task via effort: no frontmatter do T##-PLAN.md; clamp em medium quando o modelo resolvido é haiku/sonnet."
+        },
+        "complete-slice": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "low",
+          "description": "Effort da fase complete-slice (summaries, UAT, merge)."
+        },
+        "complete-milestone": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "low",
+          "description": "Effort da fase complete-milestone (fechamento, LEDGER, cleanup)."
+        },
+        "memory-extract": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "default": "low",
+          "description": "Effort da extração de memórias pós-unidade (haiku — leve por design)."
+        }
+      }
+    },
+    "thinking": {
+      "type": "object",
+      "description": "Extended thinking por família de fase. adaptive = o modelo decide quanto pensar. Guard Fable: quando o modelo resolvido é claude-fable-5, o orquestrador força adaptive (Fable retorna HTTP 400 com thinking disabled explícito).",
+      "properties": {
+        "opus_phases": {
+          "type": "string",
+          "enum": ["adaptive", "disabled"],
+          "default": "adaptive",
+          "description": "Thinking das fases que rodam em Opus (discuss/research/plan)."
+        },
+        "sonnet_phases": {
+          "type": "string",
+          "enum": ["adaptive", "disabled"],
+          "default": "disabled",
+          "description": "Thinking das fases que rodam em Sonnet (execute/complete). Sonnet não suporta extended thinking — manter disabled."
+        }
+      }
+    },
+    "ids": {
+      "type": "object",
+      "description": "Formato dos IDs GERADOS para milestones e tasks soltas. A leitura aceita sempre os dois formatos, independente desta pref.",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": ["timestamp", "sequential"],
+          "default": "timestamp",
+          "description": "timestamp = M-<YYYYMMDDHHMMSS>-<slug> / T-<ts>-<slug> (sem colisão entre branches paralelos). sequential = legado M001/TASK-001 (max+1 varrendo .gsd/milestones/ + .gsd/archive/ e .gsd/tasks/ — risco de colisão entre devs). Valor inválido cai silenciosamente em timestamp."
+        }
+      }
+    },
+    "forge_isolation": {
+      "type": "object",
+      "description": "Como múltiplos /forge-auto//forge-task simultâneos isolam suas mudanças (M004 Multi-Run Workspace). Setup roda na ativação; cleanup só no complete — pause/blocked preservam o isolamento para o resume.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["shared", "branch", "worktree"],
+          "default": "shared",
+          "description": "shared = single working tree, concorrência protegida por file-locks; branch = cria forge/{M###} em cada repo afetado e commita ali; worktree = worktree física por milestone, isolamento total de FS."
+        },
+        "branch_pattern": {
+          "type": "string",
+          "default": "forge/{M###}",
+          "description": "Nome da branch quando mode = branch/worktree. Placeholders: {M###} (milestone ID), {id}."
+        },
+        "auto_pull_main": {
+          "type": "boolean",
+          "default": true,
+          "description": "true = git fetch origin <default> antes de ramificar — branch/worktree nascem de origin/<default> fresco, nunca da main local stale. Fallback gracioso para o ref local sem remote origin."
+        },
+        "pr_on_complete": {
+          "type": "boolean",
+          "default": false,
+          "description": "true (opt-in) = complete-milestone roda `npm run pr` / `gh pr create` ao fechar."
+        },
+        "worktree_root": {
+          "type": "string",
+          "default": ".forge-worktrees",
+          "description": "Diretório raiz onde as worktrees são criadas (mode = worktree). Relativo ao workspace; caminho absoluto também aceito."
+        },
+        "worktree_cleanup_on_complete": {
+          "type": "boolean",
+          "default": false,
+          "description": "true = remove a worktree ao completar a milestone. Mesmo com true, NUNCA remove worktree suja (mudanças não commitadas) — cleanup vira skipped (dirty). Com auto_commit: false, commite na branch forge/{id} antes."
+        },
+        "file_locks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ativa o PreToolUse file-lock check contra writes simultâneos no mesmo arquivo (modes shared/branch). Ignorado em mode = worktree (FS já isolado — o hook retorna false automaticamente)."
+        },
+        "repos": {
+          "type": "object",
+          "description": "Descoberta dos repositórios git afetados pelo isolamento (scripts/forge-repos.js).",
+          "properties": {
+            "auto_detect": {
+              "type": "boolean",
+              "default": true,
+              "description": "true = walk de subdiretórios com .git/ na raiz do workspace. Ignorado quando include está definido."
+            },
+            "include": {
+              "type": "array",
+              "default": [],
+              "description": "Globs explícitos de repos a incluir; quando não-vazio, desliga o auto_detect e usa somente esta lista."
+            },
+            "exclude": {
+              "type": "array",
+              "default": ["node_modules/**", "vendor/**", ".forge-worktrees/**", ".gsd/**", "dist/**", "build/**", ".next/**"],
+              "description": "Globs a excluir do auto-detect. Default real do reader (forge-repos.js DEFAULT_EXCLUDE) — mais amplo que o exemplo do template."
+            }
+          }
+        }
+      }
+    },
+    "multi_run": {
+      "type": "object",
+      "description": "Registro e saúde de runs simultâneas (.gsd/forge/runs/*.json) — staleness, refuse sem ID, refresh do dashboard e alias legado.",
+      "properties": {
+        "stale_cleanup_ms": {
+          "type": "integer",
+          "default": 1800000,
+          "description": "30min — registros de run com last_heartbeat mais velho que isso são deletados silenciosamente no boot de qualquer /forge-* skill (cobre kills sem cleanup)."
+        },
+        "stale_warning_ms": {
+          "type": "integer",
+          "default": 180000,
+          "description": "3min — a statusline marca a run como amarela (possível stall). Não bloqueia — só comunica saúde."
+        },
+        "stale_red_ms": {
+          "type": "integer",
+          "default": 300000,
+          "description": "5min — statusline vermelha; a CLI trata a run como morta. Não bloqueia."
+        },
+        "refused_when_active_count": {
+          "type": "integer",
+          "default": 2,
+          "description": "/forge-auto sem ID explícito recusa quando >= N runs ativas (1 = sempre exige ID; 999 = nunca recusa)."
+        },
+        "dashboard_refresh_on": {
+          "type": "array",
+          "default": ["boot", "exit", "phase_change"],
+          "description": "Eventos do ciclo que disparam regen do dashboard .gsd/STATE.md via scripts/forge-dashboard.js. Valores válidos: boot, exit, phase_change, tick (tick = regen periódico, custoso — não recomendado)."
+        },
+        "legacy_alias": {
+          "type": "boolean",
+          "default": true,
+          "description": "true = mantém .gsd/forge/auto-mode.json como espelho da run ativa mais antiga (compat pré-M004). false = o arquivo só é tocado por código legado (deprecation path)."
+        }
+      }
+    },
+    "parallelism": {
+      "type": "object",
+      "description": "Execução paralela de execute-task dentro do mesmo slice + comportamento em overlap entre runs.",
+      "properties": {
+        "max_concurrent": {
+          "type": "integer",
+          "default": 3,
+          "description": "Máximo de execute-task em paralelo dentro do mesmo slice. Range válido 1–8; 1 desliga o paralelismo mantendo o picking depends-aware."
+        },
+        "cross_run_overlap": {
+          "type": "string",
+          "enum": ["defer", "block"],
+          "default": "defer",
+          "description": "Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff)."
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "description": "Retry Handler para falhas transitórias do Agent() (rate-limit, network, server, stream, connection). Classes permanentes/unknown falham imediatamente; model_refusal/context_overflow/tooling_failure são da Failure Taxonomy, não deste handler.",
+      "properties": {
+        "max_transient_retries": {
+          "type": "integer",
+          "default": 3,
+          "description": "Cap de retries transitórios por unidade antes de surfacear o blocker ao usuário."
+        },
+        "base_backoff_ms": {
+          "type": "integer",
+          "default": 2000,
+          "description": "Delay do primeiro retry (ms); dobrado a cada tentativa (backoff exponencial)."
+        },
+        "max_backoff_ms": {
+          "type": "integer",
+          "default": 60000,
+          "description": "Teto do backoff computado (ms)."
+        }
+      }
+    },
+    "tier_models": {
+      "type": "object",
+      "description": "Qual model ID concreto cada alias de tier resolve no dispatch. Aceita escalar ou lista [primário, ...fallbacks] — a lista forma a escada intra-tier consumida pela Failure Taxonomy (model_refusal/429/400). O ID é traduzido para alias de Agent() por scripts/forge-model-alias.js; ID não mapeado é pulado com warning.",
+      "properties": {
+        "light": {
+          "type": ["string", "array"],
+          "default": "claude-haiku-4-5-20251001",
+          "description": "Tier leve — memory-extract, complete-slice, tasks tag: docs. Escalar ou lista de fallback intra-tier."
+        },
+        "standard": {
+          "type": ["string", "array"],
+          "default": "claude-sonnet-5",
+          "description": "Tier padrão — execute-task default, research, discuss. Escalar ou lista de fallback intra-tier."
+        },
+        "heavy": {
+          "type": ["string", "array"],
+          "default": "claude-opus-4-8",
+          "description": "Tier de raciocínio profundo — plan-slice default. Default real SEM o sufixo [1m] (forge-tier-chain.js DEFAULT_TIER_MODEL). Escalar ou lista."
+        },
+        "max": {
+          "type": ["string", "array"],
+          "default": "claude-fable-5",
+          "description": "Tier de fronteira — plan-milestone, plan-slice risk:high, escalação de context_overflow. ~2x o custo do opus. Escalar ou lista."
+        }
+      }
+    },
+    "workers": {
+      "type": "object",
+      "description": "Eixo workers: qual ENGINE (claude nativo em contexto ou sidecar codex via scripts/forge-xllm.js) executa cada unit_type routável. Ortogonal a tier_models (que escolhe o modelo Claude dentro do worker claude). plan-milestone nunca é coberto (locked em max/Fable).",
+      "properties": {
+        "execute-task": {
+          "type": "string",
+          "enum": ["claude", "codex"],
+          "default": "claude",
+          "description": "Engine das unidades execute-task. codex roteia ao sidecar (--mode execute); falha do sidecar reseta ao START_SHA e cai uma única vez no worker Claude (evento worker-engine-fallback). Valor inválido cai em claude."
+        },
+        "plan-slice": {
+          "type": "string",
+          "enum": ["claude", "codex"],
+          "default": "claude",
+          "description": "Engine das unidades plan-slice. codex roteia ao sidecar --mode plan (read-only — o orquestrador materializa o retorno). Valor inválido cai em claude."
+        },
+        "timeout": {
+          "type": "integer",
+          "default": 1800,
+          "description": "Segundos — teto do sidecar codex antes do SIGKILL. Só se aplica quando o engine resolvido é codex; inválido/não-positivo cai em 1800."
+        },
+        "codex_model": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Repassado como -m <valor> ao codex-cli quando definido; null/unset usa o modelo default do CLI instalado (ex.: gpt-5.6-sol). Ignorado quando o engine é claude."
+        }
+      }
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {},
+      "description": "Eixo routing (M007): roteamento domain-first opt-in com precedência sobre tier_models/workers. Chaves de domínio são ABERTAS (default, backend, frontend, ...). Shape por domínio: { <phase executor|planner>: { <tier>: [cadeia de IDs, cross-engine permitido], fallback: <1 ID Claude mapeado> } }. Célula ausente → domínio default → legado (nunca erro). Cascata last-wins por domínio inteiro. Resolvedor: scripts/forge-routing.js."
+    },
+    "verification": {
+      "type": "object",
+      "description": "Verification gate (lint/typecheck/test) antes de marcar task como DONE e antes do squash-merge do slice. Discovery chain: T##-PLAN verify: → preference_commands → package.json scripts do allow-list [typecheck, lint, test] → skipped: no-stack.",
+      "properties": {
+        "preference_commands": {
+          "type": "array",
+          "default": [],
+          "description": "Lista ordenada de comandos shell a executar como gate. Vazio = fallback para o verify: do plano ou auto-detect do package.json. ATENÇÃO: executados no shell do repo — não adicione comandos não revisados."
+        },
+        "command_timeout_ms": {
+          "type": "integer",
+          "default": 120000,
+          "description": "Timeout por comando (ms). Estouro produz exit 124 sintético — tratado como falha, não como skip."
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "description": "Evidence log (PostToolUse) para verificação de claims nos summaries — cada Bash/Write/Edit grava uma linha JSONL em .gsd/forge/evidence-{unitId}.jsonl.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["lenient", "strict", "disabled"],
+          "default": "lenient",
+          "description": "lenient = escreve o log; mismatches viram seção advisory '## Evidence Flags' no S##-SUMMARY (não bloqueia). strict = reservado M004+ (mismatches bloqueiam complete-slice). disabled = hook pula a escrita — zero log. Valor inválido cai em lenient."
+        }
+      }
+    },
+    "file_audit": {
+      "type": "object",
+      "description": "Filtro do file-audit do forge-completer (seção ## File Audit no S##-SUMMARY): git diff AM vs união dos expected_output das tasks do slice.",
+      "properties": {
+        "ignore_list": {
+          "type": "array",
+          "default": ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "dist/**", "build/**", ".next/**", ".gsd/**"],
+          "description": "Globs excluídos de ambos os lados do diff (evita ruído de lockfiles e build). Suporta prefix exato, ** (qualquer profundidade) e * dentro de segmento. Bloco ausente/vazio = este default hardcoded, sem erro."
+        }
+      }
+    },
+    "checker_memory": {
+      "type": "object",
+      "description": "Loop de feedback anti-recidivismo: extrai padrões warn/fail do plan-checker e do verificador para .gsd/CHECKER-MEMORY.md, injetados nas próximas execuções (planner recebe Plan Quality Patterns; executor recebe Verification Patterns).",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["enabled", "disabled"],
+          "default": "enabled",
+          "description": "enabled = forge-completer extrai após cada complete-slice. disabled = pula completamente — nenhum CHECKER-MEMORY.md é gerado/atualizado."
+        }
+      }
+    },
+    "plan_check": {
+      "type": "object",
+      "description": "Gate do forge-plan-checker entre plan-slice e o primeiro execute-task — pontua 10 dimensões estruturais do plano e grava S##-PLAN-CHECK.md.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["advisory", "blocking", "disabled"],
+          "default": "advisory",
+          "description": "advisory = pontua e prossegue independente do veredicto (flags viram documentação). blocking = revision-loop (max 3 rodadas, fails em decremento monotônico; senão pausa e notifica). disabled = pula o gate — nenhum artefato gerado."
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "description": "Review gate dialético antes de complete-slice (branch ainda não-mergeado): challenger (forge-reviewer) × advocate (forge-advocate), humano arbitra só as objeções abertas. Nunca bloqueia o complete. Spec: shared/forge-review.md.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["enabled", "disabled"],
+          "default": "enabled",
+          "description": "enabled = o gate roda por slice. disabled = pula inteiramente — nenhum S##-REVIEW.md é gerado."
+        },
+        "engine": {
+          "type": "string",
+          "enum": ["agents", "workflow"],
+          "default": "agents",
+          "description": "Quem roda o debate (Steps 2–5). agents = dispatch via Agent() no orquestrador (default). workflow = uma única invocação da tool Workflow (Claude Code >= 2.1.154; requer bypassPermissions para não pausar o forge-auto); tool ausente/erro → fallback automático para agents. Ignorado quando style: flags."
+        },
+        "style": {
+          "type": "string",
+          "enum": ["dialectic", "flags"],
+          "default": "dialectic",
+          "description": "dialectic = debate completo (challenge → defense → rebuttal → resolução). flags = single-pass legado — só o challenger, sem defesa nem perguntas."
+        },
+        "rounds": {
+          "type": "integer",
+          "enum": [0, 1, 2, 3],
+          "default": 1,
+          "description": "Rodadas de réplica do reviewer sobre a defesa (0–3). 0 = sem réplica (toda objeção contestada vira aberta)."
+        },
+        "ask_in_auto": {
+          "type": "string",
+          "enum": ["defer", "pause"],
+          "default": "defer",
+          "description": "defer = no forge-auto, objeções abertas NÃO pausam o loop — vão para a triagem final da milestone (honra a AUTONOMY RULE). pause = pergunta ao humano por slice mesmo em modo autônomo (opt-in)."
+        },
+        "fix_conceded": {
+          "type": "boolean",
+          "default": true,
+          "description": "true = objeções concedidas (ambos concordam que o problema é real) disparam um review-fix imediato pelo forge-executor no branch do slice (sem re-review, evita ping-pong). false = concedidas apenas registradas."
+        },
+        "challenger": {
+          "type": "string",
+          "enum": ["claude", "codex", "gemini", "auto"],
+          "default": "claude",
+          "description": "Quem desafia (challenge + rebuttal). codex = GPT via codex exec; gemini = Antigravity CLI agy — ambos via scripts/forge-xllm.js, com fallback automático ao forge-reviewer Claude em qualquer falha. auto = família OPOSTA ao autor do código (reduz viés de auto-preferência). Valor inválido cai em claude."
+        },
+        "advocate": {
+          "type": "string",
+          "enum": ["claude", "auto"],
+          "default": "claude",
+          "description": "Quem defende. auto = MESMA família do autor; enquanto --mode defend externo não existe, autor GPT/Gemini degrada para advocate Claude (evento review-pairing-fallback) — nunca bloqueia."
+        },
+        "challenger_model": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Modelo repassado como --model ao CLI externo quando challenger != claude; null/unset usa o default do CLI. Codex aceita IDs (gpt-5.2-codex); gemini aceita labels com espaços (\"Gemini 3.1 Pro (High)\" — ver agy models). Ignorado com challenger claude."
+        },
+        "advocate_model": {
+          "type": "string",
+          "default": "claude-fable-5",
+          "description": "Modelo do defender (forge-advocate), resolvido para alias de dispatch via scripts/forge-model-alias.js. ID sem alias conhecido omite model: (o frontmatter do agente governa) com warning. Default literal — nunca null."
+        }
+      }
+    },
+    "plan_gate": {
+      "type": "object",
+      "description": "Conduct interativo de lapidação do plano entre plan-slice e o primeiro execute-task (modos interativos forge-task/forge-next): preview + findings acionáveis + edição livre + aprovação. Separado do scoring (plan_check). Spec: shared/forge-plan-gate.md.",
+      "properties": {
+        "interactive": {
+          "type": "string",
+          "enum": ["always", "auto", "off"],
+          "default": "always",
+          "description": "always = conduz o handshake sempre que existe um plano, mesmo all-pass. auto = só quando há warn/fail do plan-checker. off = batch advisory mesmo em modo interativo."
+        },
+        "ask_in_auto": {
+          "type": "string",
+          "enum": ["defer", "off"],
+          "default": "defer",
+          "description": "forge-auto NUNCA conduz o handshake, incondicionalmente (AUTONOMY RULE). defer e off são semanticamente idênticos para o forge-auto — off existe como sinalizador explícito de intenção."
+        }
+      }
+    },
+    "token_budget": {
+      "type": "object",
+      "description": "Cap (em tokens, heurística chars/4) das seções OPCIONAIS injetadas nos prompts dos workers via truncateAtSectionBoundary (scripts/forge-tokens.js). Seções mandatórias nunca são truncadas silenciosamente. Chave ausente = default hardcoded, sem erro.",
+      "properties": {
+        "auto_memory": {
+          "type": "integer",
+          "default": 2000,
+          "description": "Cap em tokens do snippet AUTO-MEMORY ({TOP_MEMORIES}) injetado em cada worker."
+        },
+        "ledger_snapshot": {
+          "type": "integer",
+          "default": 1500,
+          "description": "Cap em tokens do snippet do LEDGER.md ({LEDGER}) quando injetado."
+        },
+        "coding_standards": {
+          "type": "integer",
+          "default": 3000,
+          "description": "Cap compartilhado entre {CS_STRUCTURE} e {CS_RULES} (contado uma vez por dispatch)."
+        }
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "description": "Detectores de qualidade do scripts/forge-verifier.js (nível 4 — test-quality) sobre artefatos de teste declarados em must_haves/expected_output.",
+      "properties": {
+        "test_quality": {
+          "type": "string",
+          "enum": ["advisory", "blocking", "disabled"],
+          "default": "advisory",
+          "description": "advisory = detecta disabled-test/weak-assertion/no-assertion/circular-assertion e registra flags no S##-VERIFICATION.md sem bloquear. blocking = reservado M004+ (flags bloqueiam complete-slice). disabled = pula o nível 4."
+        }
+      }
+    },
+    "symbol_check": {
+      "type": "object",
+      "description": "Drift guard scripts/forge-symbol-check.js: verifica se os símbolos citados nos planos existem no código real, entre plan-check e o primeiro execute-task.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["advisory", "disabled"],
+          "default": "advisory",
+          "description": "advisory = resolve cada símbolo (ripgrep/grep) e emite VERIFIED|MISSING|AMBIGUOUS|UNCHECKABLE em S##-SYMBOL-CHECK.md, sem bloquear. Greenfield (artefatos ainda não criados) não flagga MISSING. disabled = pula o gate."
+        }
+      }
+    },
+    "context_monitor": {
+      "type": "object",
+      "description": "Context-monitor proativo: a statusline grava o % de contexto restante num bridge por sessão; o hook PostToolUse injeta additionalContext (WARNING/CRITICAL) no worker ANTES de bater no muro de contexto. Puramente informativo — nunca bloqueia (por isso nasce enabled).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "true = injeção proativa ativa (debounce de 5 tool-uses; escalada WARNING→CRITICAL fura o debounce). false = branch no-op."
+        },
+        "warning_threshold": {
+          "type": "number",
+          "default": 0.35,
+          "description": "Fração de contexto RESTANTE que dispara WARNING (encerre a task atual, não inicie trabalho complexo novo). Aceita percentual (35) — normalizado para fração quando > 1."
+        },
+        "critical_threshold": {
+          "type": "number",
+          "default": 0.25,
+          "description": "Fração de contexto RESTANTE que dispara CRITICAL (pare, salve o estado em continue.md e retorne partial). Testado antes do warning — mais grave ganha."
+        }
+      }
+    },
+    "repair": {
+      "type": "object",
+      "description": "Node Repair (camada 3 da recuperação de falhas): estratégias RETRY/DECOMPOSE/PRUNE por task antes do fallback blocked→humano.",
+      "properties": {
+        "budget": {
+          "type": "integer",
+          "default": 2,
+          "description": "Máximo de tentativas de reparo por task (repair_count persistido no frontmatter do T##-PLAN.md — sobrevive compaction). Esgotado → blocked → humano. context_overflow nunca consome este budget (pertence à Failure Taxonomy)."
+        }
+      }
+    },
+    "scope_reduction": {
+      "type": "object",
+      "description": "Re-injeção de must_haves planejados mas não entregues (após um PRUNE) nas próximas unidades do slice.",
+      "properties": {
+        "reinject": {
+          "type": "string",
+          "enum": ["auto", "off"],
+          "default": "auto",
+          "description": "auto = must_haves dropados viram seção 'Requisitos pendentes re-injetados' no prompt da próxima unidade (cap de 10 itens). off = opt-out da re-injeção; o PRUNE ainda registra em S##-CONTEXT § Decisions (nunca some em silêncio)."
+        }
+      }
+    },
+    "accounts": {
+      "type": "object",
+      "description": "Handoff de conta por esgotamento de janela de uso (5h/semanal) no /forge-auto — checkpoint + pausa + comando de relançamento em outra conta registrada (/forge-accounts). Nunca é hot-swap; sempre relaunch com resume por disco.",
+      "properties": {
+        "handoff_in_auto": {
+          "type": "string",
+          "enum": ["on", "off"],
+          "default": "on",
+          "description": "on = ao cruzar o threshold na fronteira de unidade, o loop faz checkpoint (continue.md), pausa e indica a troca de conta. off = sem pausa automática (a statusline ainda mostra o alerta de uso)."
+        },
+        "handoff_threshold": {
+          "type": "integer",
+          "default": 90,
+          "description": "% de uso da janela mais apertada (5h OU semanal) que dispara o handoff."
+        }
+      }
+    }
+  }
+}

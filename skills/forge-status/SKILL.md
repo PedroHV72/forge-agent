@@ -13,7 +13,8 @@ ls .gsd/STATE.md 2>/dev/null && echo "ok" || echo "missing"
 ```
 
 ```bash
-REPO=$(grep 'repo_path:' ~/.claude/forge-agent-prefs.md 2>/dev/null | cut -d: -f2 | tr -d ' ')
+PREFS_ENGINE="$FORGE_SCRIPTS_DIR/forge-prefs.js"; [ -f "$PREFS_ENGINE" ] || PREFS_ENGINE="$HOME/.claude/scripts/forge-prefs.js"
+REPO=$(node "$PREFS_ENGINE" --resolved --key repo_path 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(v?String(v):'')}catch{process.stdout.write('')}})")
 if [ -n "$REPO" ] && [ -d "$REPO/.git" ]; then
   LOCAL=$(cd "$REPO" && git describe --tags --always 2>/dev/null)
   REMOTE=$(cd "$REPO" && git ls-remote --tags origin 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
@@ -47,7 +48,11 @@ if command -v forge-status >/dev/null 2>&1; then
   forge-status $ARGUMENTS
 else
   ENGINE="$HOME/.claude/scripts/forge-status.js"
-  [ -f "$ENGINE" ] || ENGINE="$(grep 'repo_path:' ~/.claude/forge-agent-prefs.md 2>/dev/null | cut -d: -f2 | tr -d ' ')/scripts/forge-status.js"
+  if [ ! -f "$ENGINE" ]; then
+    PREFS_ENGINE="$FORGE_SCRIPTS_DIR/forge-prefs.js"; [ -f "$PREFS_ENGINE" ] || PREFS_ENGINE="$HOME/.claude/scripts/forge-prefs.js"
+    REPO_PATH=$(node "$PREFS_ENGINE" --resolved --key repo_path 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(v?String(v):'')}catch{process.stdout.write('')}})")
+    ENGINE="$REPO_PATH/scripts/forge-status.js"
+  fi
   if [ ! -f "$ENGINE" ]; then
     echo "forge-status: engine não encontrado — rode /forge-update ou /forge-init." >&2
   else

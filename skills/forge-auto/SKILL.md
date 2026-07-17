@@ -34,19 +34,41 @@ echo "FORGE_SCRIPTS_DIR=$FORGE_SCRIPTS_DIR"
 
 Read ONLY these files:
 1. `.gsd/STATE.md`
-2. `~/.claude/forge-agent-prefs.md` (user-global defaults — skip silently if missing)
-3. `.gsd/claude-agent-prefs.md` (repo-level shared prefs — overrides user-global)
-4. `.gsd/prefs.local.md` (local personal overrides — gitignored, overrides repo prefs)
-5. `.gsd/AUTO-MEMORY.md` full file (skip silently if missing) — stored as `ALL_MEMORIES` for selective injection per unit
-6. `.gsd/CODING-STANDARDS.md` (skip silently if missing)
+2. `.gsd/AUTO-MEMORY.md` full file (skip silently if missing) — stored as `ALL_MEMORIES` for selective injection per unit
+3. `.gsd/CODING-STANDARDS.md` (skip silently if missing)
 
-**Merge order:** later files override earlier ones for any key present. Missing files are skipped silently. Store merged result as `PREFS`.
+**Resolve PREFS via the canonical engine CLI (ONE call — never a 3-file md merge in-context).** The S01 engine (`scripts/forge-prefs.js`) dual-reads legacy markdown OR new jsonc per layer and applies the exact same user-global → repo-shared → local-personal precedence (last wins) that the old inline prose described. Do NOT read/merge `~/.claude/forge-agent-prefs.md` + `.gsd/claude-agent-prefs.md` + `.gsd/prefs.local.md` by hand — that is exactly what the CLI does. See `shared/forge-dispatch.md § Per-unit prefs resolution` for the canonical helper.
 
-**Extract effort & thinking from PREFS:**
-- `EFFORT_MAP` ← `PREFS.effort` (per-phase effort table; default: opus phases = `medium`, sonnet phases = `low`)
+```bash
+PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --explain --cwd "$WORKING_DIR")
+PREFS_EXIT=$?
+```
+
+**Loud-stop on parse error (M008-CONTEXT decision #2 — the loop ALWAYS stops on a broken config, NEVER degrades to defaults silently):**
+```
+If PREFS_EXIT != 0:
+  - `$PREFS_JSON` carries `errors[]` ({file,line,message}) on stdout; the CLI already printed a
+    human message + "corrija o JSONC…" hint on stderr.
+  - Deactivate this run (same mechanic as the Agent()-failure halt): set auto-mode.json/runs entry
+    inactive, then STOP the loop.
+  - Surface to the operator: arquivo + linha + como-corrigir (from errors[]).
+  - Do NOT proceed on WORKERS_ENGINE=claude / effort defaults / any fallback value.
+```
+`warnings[]` (advisory schema validation, `⚠` on stderr) do NOT stop — only exit≠0 halts.
+
+The resolved object is `{ok, prefs, errors[], warnings[], layers}`. Throughout this skill **`PREFS` = `.prefs`** from this one call. Store as: `STATE`, `PREFS` (the resolved `.prefs` object), `ALL_MEMORIES`, `CODING_STANDARDS`.
+
+**Deprecation warning (once per session):** Inspect `layers` from the `PREFS_JSON`
+already resolved above; do not make another CLI call. If any
+`layers.<name>.source == "md-legacy"`, list that layer's `files` and emit exactly:
+`⚠ Prefs em markdown legado ainda honradas: <files>. Rode /forge-update para migrar para JSONC (remoção do caminho legado na v2.0).`
+Do not emit this warning when every layer is `jsonc` or `absent`. Load context runs
+once per session, so this is naturally one warning per session. Re-warning after
+compaction is accepted because Compaction Resilience re-reads Load context.
+
+**Extract effort & thinking off the resolved `PREFS` object (defaults identical to the old inline snippet):**
+- `EFFORT_MAP` ← `PREFS.effort` (per-phase effort table; default: opus/planning phases = `medium`, sonnet/haiku phases = `low`)
 - `THINKING_OPUS` ← `PREFS.thinking.opus_phases` (default: `adaptive`)
-
-Store as: `STATE`, `PREFS`, `ALL_MEMORIES`, `CODING_STANDARDS`.
 
 **CODING_STANDARDS section extraction** — to minimize token usage, extract these named sections from the file for selective injection:
 - `CS_LINT` — content of `## Lint & Format Commands` section only
@@ -54,8 +76,8 @@ Store as: `STATE`, `PREFS`, `ALL_MEMORIES`, `CODING_STANDARDS`.
 - `CS_RULES` — content of `## Code Rules` section only
 If CODING-STANDARDS.md is missing, all section variables are `"(none)"`.
 
-**Extract notifications pref from PREFS:**
-- `NOTIFICATIONS_ON` ← match `^notifications:[ \t]*(\S+)` (single-line, no `\s`, no `\Z`) in the merged prefs text; if absent or not `on`/`off`, default `on`. Store as `NOTIFICATIONS_ON`.
+**Extract notifications pref off the resolved `PREFS` object:**
+- `NOTIFICATIONS_ON` ← `PREFS.notifications`; if absent or not `on`/`off`, default `on`. Store as `NOTIFICATIONS_ON`.
 
 Initialize:
 ```
@@ -241,8 +263,8 @@ You are the orchestrator. Execute the dispatch loop until the milestone is compl
 
 **COMPACTION RESILIENCE — CRITICAL:** Claude Code may auto-compact the conversation context during a long autonomous run. This is NOT a stopping condition. If you detect that your in-memory variables (`PREFS`, `EFFORT_MAP`, `THINKING_OPUS`, `session_units`, `ALL_MEMORIES`) appear undefined or missing, context was likely compacted. Recovery protocol — execute immediately without telling the user:
 1. Read `.gsd/forge/auto-mode.json` — if `active: true`, the loop MUST continue
-2. Re-read all context files: `.gsd/STATE.md`, prefs files (all 3 layers), `.gsd/AUTO-MEMORY.md`, `.gsd/CODING-STANDARDS.md`
-3. Re-initialize all state variables: merge PREFS, extract EFFORT_MAP and THINKING_OPUS, set `session_units = 0`, re-extract CS sections
+2. Re-read all context files: `.gsd/STATE.md`, `.gsd/AUTO-MEMORY.md`, `.gsd/CODING-STANDARDS.md`; re-resolve PREFS via the single `node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR"` call (NOT a 3-file md re-merge) — same loud-stop-on-exit≠0 posture as Load context
+3. Re-initialize all state variables: `PREFS` = `.prefs` from that call, extract EFFORT_MAP and THINKING_OPUS, set `session_units = 0`, re-extract CS sections
 4. Continue the dispatch loop from Step 1 immediately
 The autonomous loop is active as long as `auto-mode.json` shows `active: true`. Context compaction never deactivates it.
 
@@ -261,10 +283,10 @@ cat .gsd/forge/compact-signal.json 2>/dev/null
 If the file exists:
 1. Re-read all context files from disk:
    - `.gsd/STATE.md` → update `STATE`
-   - `~/.claude/forge-agent-prefs.md`, `.gsd/claude-agent-prefs.md`, `.gsd/prefs.local.md` → re-merge `PREFS`
+   - `PREFS` ← re-resolve via the single `node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR"` call (`.prefs`; same loud-stop-on-exit≠0 posture) — NOT a 3-file md re-merge
    - `.gsd/AUTO-MEMORY.md` → update `ALL_MEMORIES`
    - `.gsd/CODING-STANDARDS.md` → re-extract `CS_LINT`, `CS_STRUCTURE`, `CS_RULES`
-2. Re-derive `EFFORT_MAP` and `THINKING_OPUS` from merged PREFS
+2. Re-derive `EFFORT_MAP` and `THINKING_OPUS` from the resolved PREFS object
 3. Reset `session_units = 0`
 3a. Reset `PUSH_AVAILABLE = null` and re-execute `ToolSearch("select:PushNotification")` at the next opportunity (same "not yet probed" semantics as activation — the probe runs once per context window, not once per process)
 4. Delete the signal: `rm -f .gsd/forge/compact-signal.json`
@@ -308,33 +330,27 @@ Then proceed with dispatch normally (the executor will overwrite the partial wor
 
 ```bash
 # ── Engine Resolution (before Tier Resolution) ────────────────────────────────────
-# Reader — regex-over-raw-prefs (NEVER prefs-resolved.json; MEM001 M005). Cascade 3 files,
-# [ \t] never \s, no \Z. Default-safe claude. Yields WORKERS_ENGINE/WORKERS_TIMEOUT/CODEX_MODEL
-# for the CURRENT unit_type.
-WORKERS_CFG=$(WORKING_DIR="$WORKING_DIR" UNIT_TYPE="$unit_type" node -e "
-const fs=require('fs'),path=require('path'),os=require('os');
-const wd=process.env.WORKING_DIR||process.cwd();
-const unit=process.env.UNIT_TYPE||'execute-task';
-const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-             path.join(wd,'.gsd','claude-agent-prefs.md'),
-             path.join(wd,'.gsd','prefs.local.md')];
-let engine=null,timeout=1800,codexModel=null;
-for(const f of files){try{
-  const r=fs.readFileSync(f,'utf8');
-  const blk=(r.match(/^workers:[ \t]*\n((?:[ \t]+.*\n?)*)/m)||[])[1]||'';
-  let m;
-  const unitRe=new RegExp('^[ \\\\t]+'+unit.replace(/[-]/g,'\\\\-')+':[ \\\\t]*(\\\\w+)','m');
-  if(m=blk.match(unitRe)){const v=m[1].toLowerCase();if(v==='claude'||v==='codex')engine=v;}
-  if(m=blk.match(/^[ \t]+timeout:[ \t]*(\d+)/m))timeout=parseInt(m[1],10);
-  if(m=blk.match(/^[ \t]+codex_model:[ \t]*(\S+)/m))codexModel=m[1];
-}catch(e){}}
-if(engine!=='claude'&&engine!=='codex')engine='claude';
-if(!Number.isInteger(timeout)||timeout<=0)timeout=1800;
-process.stdout.write(JSON.stringify({engine,timeout,codexModel}));
-")
-WORKERS_ENGINE=$(printf '%s' "$WORKERS_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).engine||'claude')}catch(e){process.stdout.write('claude')}})")
-WORKERS_TIMEOUT=$(printf '%s' "$WORKERS_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(String(JSON.parse(d).timeout||1800))}catch(e){process.stdout.write('1800')}})")
-CODEX_MODEL=$(printf '%s' "$WORKERS_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).codexModel||'')}catch(e){process.stdout.write('')}})")
+# Canonical per-unit prefs resolution — ONE forge-prefs.js --resolved call (dual-reads md OR
+# jsonc; NEVER a 3-file `files=[…forge-agent-prefs.md…]` cascade node -e merge, MEM001 M005).
+# See shared/forge-dispatch.md § Per-unit prefs resolution. Read the CURRENT-unit engine +
+# timeout + codex_model off .prefs.workers, default-safe (claude/1800/"" on absence).
+PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
+if [ $? -ne 0 ]; then
+  # Loud stop (M008-CONTEXT #2): errors[] ({file,line,message}) on stdout, human hint on stderr.
+  # Deactivate the run (same mechanic as the Agent()-failure halt) + surface arquivo+linha+
+  # como-corrigir. NEVER degrade to WORKERS_ENGINE=claude et al. on a broken config.
+  echo "✗ prefs parse error — dispatch halted (see stderr for arquivo:linha)" >&2
+  exit 1
+fi
+# CRITICAL loud-stop (M008-CONTEXT #2): a nonzero prefs-CLI exit above HALTS the
+# dispatch — the `exit 1` fires when this block runs in a shell. In the
+# orchestrator loop, mirror the Load-context guard: deactivate this run
+# (set auto-mode.json/runs entry inactive, same mechanic as the Agent()-failure
+# halt), surface arquivo+linha+como-corrigir from `errors[]`, then STOP the loop.
+# Do NOT proceed on WORKERS_ENGINE=claude / effort defaults / any fallback value.
+WORKERS_ENGINE=$(printf '%s' "$PREFS_JSON" | UNIT_TYPE="$unit_type" node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const w=JSON.parse(d).prefs.workers||{};let e=w[process.env.UNIT_TYPE||'execute-task'];e=(typeof e==='string')?e.toLowerCase():null;process.stdout.write((e==='claude'||e==='codex')?e:'claude')}catch(err){process.stdout.write('claude')}})")
+WORKERS_TIMEOUT=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=(JSON.parse(d).prefs.workers||{}).timeout;process.stdout.write(Number.isInteger(t)&&t>0?String(t):'1800')}catch(err){process.stdout.write('1800')}})")
+CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=(JSON.parse(d).prefs.workers||{}).codex_model;process.stdout.write(c!=null&&c!==''?String(c):'')}catch(err){process.stdout.write('')}})")
 
 # Frontmatter worker override (execute-task only; empty otherwise). Passed to forge-routing.js as
 # --frontmatter-worker; also consumed by the legacy compat path (route_source == tier_models).
@@ -363,6 +379,9 @@ fi
 # Engine Resolution below) runs right after it. $WORKERS_ENGINE/$PLAN_WORKER feed both the routing call
 # (as --frontmatter-worker) and that legacy compat path.
 ```
+
+**Loud-stop on the per-unit prefs re-resolution above (M008-CONTEXT #2 — NOT a bare comment):** if the `forge-prefs.js --resolved` call at the top of this block exited non-zero, the orchestrator MUST STOP the loop now — exactly as the Load-context guard does: deactivate this run (set `auto-mode.json`/runs entry inactive, same mechanic as the `Agent()`-failure halt), surface arquivo + linha + como-corrigir from `errors[]`, and do **NOT** proceed on `WORKERS_ENGINE=claude` / effort defaults / any fallback value. The `exit 1` inside the guard halts a shell-executed path; this prose halts the orchestrator-interpreted path. `warnings[]` (advisory) never stop — only exit≠0 halts.
+
 `$DOMAIN`, `$PLAN_WORKER`, `$WORKERS_ENGINE`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL` are now set — the *inputs* to the single `forge-routing.js` call. `ENGINE` is resolved **after** that call (step 1.5 step 4, by `route_source`). When the resolved `ENGINE == codex` AND `unit_type == execute-task` AND `BATCH.length == 1`, take **Branch C** in Step 4 (sidecar). When `ENGINE == codex` AND `unit_type == plan-slice`, take **Branch D** in Step 4 (sidecar plan, read-only). Otherwise (`ENGINE == claude`, or a non-routable unit) fall through to the Effort Resolution + `Agent()` dispatch unchanged — the `claude` path is byte-identical.
 
 **Tier + route resolution (step 1.5)** — resolve `{tier, model, chain, route_source, reason}` for this dispatch via the **single `forge-routing.js` call** (Engine + tier-chain collapsed — ONE call per dispatch). Tier classification (steps 1–3) is pure Markdown rules; step 4 is the resolver call; the engine decision runs right after it. On the codex path Effort Resolution + alias are skipped (re-entered only inside the Branch C/D fallback → Claude dispatch).
@@ -581,21 +600,11 @@ The produced `T##-SECURITY.md` will be injected into that task's worker prompt a
 
 After a successful `plan-slice` unit, before dispatching the first `execute-task` for the same slice, run the plan-check gate:
 
-1. **Read `plan_check.mode` from the 3-file prefs cascade:**
+1. **Read `plan_check.mode` via the canonical engine CLI** (single-knob convenience form — dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge, MEM001 M005):
    ```bash
-   PLAN_CHECK_MODE=$(node -e "
-   const fs=require('fs'),path=require('path'),os=require('os');
-   const wd=process.env.WORKING_DIR||process.cwd();
-   const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-                path.join(wd,'.gsd','claude-agent-prefs.md'),
-                path.join(wd,'.gsd','prefs.local.md')];
-   let mode='advisory';
-   for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^plan_check:[ \t]*\n[ \t]+mode:[ \t]*(\w+)/m);if(m)mode=m[1].toLowerCase();}catch(e){}}
-   if(mode!=='advisory'&&mode!=='blocking'&&mode!=='disabled')mode='advisory';
-   process.stdout.write(mode);
-   " WORKING_DIR="$WORKING_DIR")
+   PLAN_CHECK_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key plan_check.mode --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let m=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write((m==='advisory'||m==='blocking'||m==='disabled')?m:'advisory')}catch(e){process.stdout.write('advisory')}})")
    ```
-   Store as `PLAN_CHECK_MODE`.
+   Store as `PLAN_CHECK_MODE` (default `advisory` on absence/parse error).
 
 2. **If `PLAN_CHECK_MODE == "disabled"`:** skip — do not invoke the plan-checker. Proceed to first `execute-task`.
 
@@ -654,21 +663,11 @@ The path in `forge-auto` at the plan boundary:
 
 After the plan-check gate completes (or is skipped), run the symbol-check gate before dispatching the first `execute-task` for the same slice. This gate runs via Bash shell-out — NOT via `Agent()` — so there is no liveness banner and return is immediate. See `shared/forge-dispatch.md § symbol-check` for artifact format and event schema.
 
-1. **Read `symbol_check.mode` from the 3-file prefs cascade:**
+1. **Read `symbol_check.mode` via the canonical engine CLI** (single-knob convenience form — dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge, MEM001 M005):
    ```bash
-   SYMBOL_CHECK_MODE=$(node -e "
-   const fs=require('fs'),path=require('path'),os=require('os');
-   const wd=process.env.WORKING_DIR||process.cwd();
-   const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-                path.join(wd,'.gsd','claude-agent-prefs.md'),
-                path.join(wd,'.gsd','prefs.local.md')];
-   let mode='advisory';
-   for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^symbol_check:[ \t]*\n[ \t]+mode:[ \t]*(\w+)/m);if(m)mode=m[1].toLowerCase();}catch(e){}}
-   if(mode!=='advisory'&&mode!=='disabled')mode='advisory';
-   process.stdout.write(mode);
-   " WORKING_DIR="$WORKING_DIR")
+   SYMBOL_CHECK_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key symbol_check.mode --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let m=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write((m==='advisory'||m==='disabled')?m:'advisory')}catch(e){process.stdout.write('advisory')}})")
    ```
-   Store as `SYMBOL_CHECK_MODE`.
+   Store as `SYMBOL_CHECK_MODE` (default `advisory` on absence/parse error).
 
 2. **If `SYMBOL_CHECK_MODE == "disabled"`:** skip — proceed to first `execute-task`.
 
@@ -1415,18 +1414,9 @@ Auto-recovery attempts (context_overflow, model_refusal, 429, 400) count as unit
 
 **Node Repair gate (Layer 3 — disjoint from Layers 1 and 2):** Applies ONLY when `unit_type == execute-task`. Trigger: `status: done` AND `S##-VERIFICATION.md` rows show must_have drift (artifacts `substantive:false` / `wired:false`, test-quality flags) OR `status: partial` with must_haves unmet. `Agent()` throws → Layer 1. `status: blocked` → Layer 2. Do NOT overlap. See full spec: `shared/forge-dispatch.md § Node Repair`.
 
-1. **Read prefs:**
+1. **Read prefs via the canonical engine CLI** (single-knob convenience form — dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge, MEM001 M005):
    ```bash
-   REPAIR_BUDGET=$(node -e "
-   const fs=require('fs'),path=require('path'),os=require('os');
-   const wd=process.env.WORKING_DIR||process.cwd();
-   const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-                path.join(wd,'.gsd','claude-agent-prefs.md'),
-                path.join(wd,'.gsd','prefs.local.md')];
-   let v=2;
-   for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^repair:[ \t]*\n[ \t]+budget:[ \t]*(\d+)/m);if(m)v=parseInt(m[1]);}catch(e){}}
-   process.stdout.write(String(v));
-   " WORKING_DIR="$WORKING_DIR")
+   REPAIR_BUDGET=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key repair.budget --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(Number.isInteger(v)&&v>=0?String(v):'2')}catch(e){process.stdout.write('2')}})")
    ```
 
 2. **Context-monitor suppression (S03 bridge):** read `$(node -e "require('os').tmpdir()")/forge-ctx-${SESSION_ID}.json`; if absent/unreadable → treat as non-CRITICAL. If `severity == "CRITICAL"` → suppress DECOMPOSE and PRUNE (force RETRY or blocked).

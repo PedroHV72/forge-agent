@@ -274,17 +274,49 @@ foreach ($skillDir in Get-ChildItem "$RepoDir\skills" -Directory) {
 # ── Install preferences ───────────────────────────────────────────────────────
 Write-Host ""
 Info "Instalando preferências..."
-$prefsFile = "$ClaudeDir\forge-agent-prefs.md"
-if (!(Test-Path $prefsFile)) {
+$prefsFile = Join-Path $ClaudeDir 'forge-agent-prefs.md'
+$PrefsJsonc = Join-Path $ClaudeDir 'forge-agent-prefs.jsonc'
+
+# Ship the global JSONC catalogue through Node so its generated text uses LF.
+# Existing JSONC is user-owned and must never be replaced.
+if (Test-Path $PrefsJsonc) {
+    Info "  forge-agent-prefs.jsonc já existe — não sobrescrito"
+} elseif (Get-Command node -ErrorAction SilentlyContinue) {
+    $prefsScript = Join-Path $RepoDir 'scripts/forge-prefs.js'
+    if ($DryRun) {
+        Dry "node $prefsScript --scaffold --out $PrefsJsonc"
+    } else {
+        & node $prefsScript --scaffold --out $PrefsJsonc
+        Info "  forge-agent-prefs.jsonc (catálogo global default)"
+    }
+} else {
+    Info "  Node não encontrado — scaffold JSONC pulado (dual-read mantém o md funcionando)"
+}
+
+if (!(Test-Path $PrefsJsonc) -and !(Test-Path $prefsFile)) {
     CopyFile "$RepoDir\forge-agent-prefs.md" $prefsFile
     Info "  forge-agent-prefs.md (novo)"
-} else {
+} elseif (Test-Path $prefsFile) {
     Info "  forge-agent-prefs.md já existe — mantido"
     Info "  (suas preferências não foram alteradas)"
+} elseif ($DryRun) {
+    Dry "cp $RepoDir\forge-agent-prefs.md → $prefsFile (fallback legado; JSONC ainda não criado no dry-run)"
 }
 
 # ── Store repo path for /forge-update ──────────────────────────────────────────
-if (-not $DryRun -and (Test-Path $prefsFile)) {
+if (Test-Path $PrefsJsonc) {
+    if (Get-Command node -ErrorAction SilentlyContinue) {
+        $migrateScript = Join-Path $RepoDir 'scripts/forge-prefs-migrate.js'
+        if ($DryRun) {
+            Dry "node $migrateScript --set repo_path=$RepoDir --layer global"
+        } else {
+            & node $migrateScript --set "repo_path=$RepoDir" --layer global
+        }
+        Info "  repo_path gravado no catálogo global: $RepoDir"
+    } else {
+        Info "  Node não encontrado — repo_path no JSONC não atualizado"
+    }
+} elseif (-not $DryRun -and (Test-Path $prefsFile)) {
     $prefsContent = Get-Content $prefsFile -Raw
     $repoPathLine = "repo_path: $RepoDir"
     if ($prefsContent -match "^repo_path:") {
@@ -307,7 +339,19 @@ if (-not $DryRun -and (Test-Path $prefsFile)) {
 # in TaskCreate descriptions. When agents are upgraded (or downgraded) by the probe,
 # the prefs file must be rewritten to match — otherwise the UI shows one model while
 # Agent() dispatches another (the frontmatter wins at dispatch time).
-if ($script:SyncPrefs -and (Test-Path $prefsFile)) {
+if ($script:SyncPrefs -and (Test-Path $PrefsJsonc)) {
+    if (Get-Command node -ErrorAction SilentlyContinue) {
+        $migrateScript = Join-Path $RepoDir 'scripts/forge-prefs-migrate.js'
+        if ($DryRun) {
+            Dry "node $migrateScript --set tier_models.heavy=$($script:OpusTarget) --layer global"
+        } else {
+            & node $migrateScript --set "tier_models.heavy=$($script:OpusTarget)" --layer global
+        }
+        Info "  prefs tier_models.heavy sincronizado: $($script:OpusTarget)"
+    } else {
+        Info "  Node não encontrado — tier_models.heavy no JSONC não sincronizado"
+    }
+} elseif ($script:SyncPrefs -and (Test-Path $prefsFile)) {
     if ($DryRun) {
         Dry "sync prefs opus model → $($script:OpusTarget)"
     } else {
@@ -322,7 +366,19 @@ if ($script:SyncPrefs -and (Test-Path $prefsFile)) {
 # claude-fable-5 in tier_models.max; if the user's preserved prefs predate the max
 # tier, the line is inserted after heavy: so the runtime fallback (claude-fable-5)
 # never fires on an account without access.
-if ($script:FableDowngrade -and (Test-Path $prefsFile)) {
+if ($script:FableDowngrade -and (Test-Path $PrefsJsonc)) {
+    if (Get-Command node -ErrorAction SilentlyContinue) {
+        $migrateScript = Join-Path $RepoDir 'scripts/forge-prefs-migrate.js'
+        if ($DryRun) {
+            Dry "node $migrateScript --set tier_models.max=$($script:OpusTarget) --layer global"
+        } else {
+            & node $migrateScript --set "tier_models.max=$($script:OpusTarget)" --layer global
+        }
+        Info "  tier_models.max redirecionado no catálogo global: $($script:OpusTarget)"
+    } else {
+        Info "  Node não encontrado — tier_models.max no JSONC não atualizado"
+    }
+} elseif ($script:FableDowngrade -and (Test-Path $prefsFile)) {
     $content = Get-Content $prefsFile -Raw
     if ($content -match 'claude-fable-5') {
         $content = $content -replace 'claude-fable-5', $script:OpusTarget

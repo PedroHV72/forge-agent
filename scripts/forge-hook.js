@@ -44,6 +44,49 @@ try {
   } catch { ctxMonitor = null; }
 }
 
+// Preferences engine — same installed/dev dual-path resolution as runs above.
+// A partial install must stay fail-open: hooks are on the user's tool-call path.
+let prefsEngine = null;
+try { prefsEngine = require(path.join(__dirname, 'scripts', 'forge-prefs.js')); }
+catch { try { prefsEngine = require(path.join(__dirname, 'forge-prefs.js')); } catch {} }
+
+// Passive consumer error signal shared with doctor/viewer (S06).  Do not create
+// .gsd/forge in arbitrary repositories: when Forge is not initialized, skip it.
+const updatePrefsErrorFlag = (cwd, error) => {
+  try {
+    const forgeDir = path.join(cwd, '.gsd', 'forge');
+    if (!fs.existsSync(forgeDir)) return;
+    const flag = path.join(forgeDir, 'prefs-error.json');
+    if (error) {
+      fs.writeFileSync(flag, JSON.stringify({
+        file: error.file || cwd,
+        line: error.line == null ? null : error.line,
+        message: String(error.message || 'prefs-read-error'),
+        ts: Date.now(),
+      }), 'utf8');
+    } else {
+      try { fs.unlinkSync(flag); } catch {}
+    }
+  } catch { /* passive error reporting itself must never abort a tool call */ }
+};
+
+// Engine calls are deliberately contained here.  This keeps every hook prefs
+// consumer fail-open, while making malformed config visible to passive tooling.
+const resolvePrefsSafe = (cwd) => {
+  if (!prefsEngine || typeof prefsEngine.readPrefsCached !== 'function') {
+    return { prefs: {}, hadError: false };
+  }
+  try {
+    const result = prefsEngine.readPrefsCached(cwd) || {};
+    const error = Array.isArray(result.errors) && result.errors.length ? result.errors[0] : null;
+    updatePrefsErrorFlag(cwd, error);
+    return { prefs: result.prefs || {}, hadError: Boolean(error) };
+  } catch (err) {
+    updatePrefsErrorFlag(cwd, { file: cwd, line: null, message: err && err.message });
+    return { prefs: {}, hadError: true };
+  }
+};
+
 // Sanitize run_id for safe filesystem use (evidence-{runId}-{unitId}.jsonl)
 function sanitizeRunId(id) {
   return String(id || 'adhoc').replace(/[^\w.\-]/g, '_');
@@ -121,46 +164,18 @@ const resolveUnitContext = (cwd, sessionId) => {
 // Read forge_isolation.file_locks pref (default true). Returns boolean.
 // Skipped check when forge_isolation.mode is worktree (separate FS — no locks needed).
 const readFileLocksEnabled = (cwd) => {
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
-  let enabled = true;
-  let mode = 'shared';
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      const block = raw.match(/^forge_isolation:[ \t]*\n([\s\S]*?)(?=^\w|\Z)/m);
-      if (block) {
-        const modeM = block[1].match(/^[ \t]+mode:[ \t]*(\w+)/m);
-        if (modeM) mode = modeM[1].toLowerCase();
-        const fileM = block[1].match(/^[ \t]+file_locks:[ \t]*(\w+)/m);
-        if (fileM) enabled = fileM[1].toLowerCase() === 'true';
-      }
-    } catch { /* missing file — skip */ }
-  }
+  const isolation = resolvePrefsSafe(cwd).prefs.forge_isolation || {};
+  const mode = String(isolation.mode || 'shared').toLowerCase();
+  const value = isolation.file_locks;
+  const enabled = value === undefined ? true : (value === true || String(value).toLowerCase() === 'true');
   if (mode === 'worktree') return false;
   return enabled;
 };
 
 // Read evidence.mode from merged prefs (user → repo → local, last wins).
 // Valid values: lenient | strict | disabled. Defaults to lenient.
-// Regex-only — no YAML parser required (MEM017 / zero-new-deps rule).
 const readEvidenceMode = (cwd) => {
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
-  let mode = 'lenient'; // default
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      const m = raw.match(/^evidence:[ \t]*\n[ \t]+mode:[ \t]*(\w+)/m);
-      if (m) mode = m[1].toLowerCase();
-    } catch { /* missing file — skip */ }
-  }
+  let mode = String((resolvePrefsSafe(cwd).prefs.evidence || {}).mode || 'lenient').toLowerCase();
   if (mode !== 'lenient' && mode !== 'strict' && mode !== 'disabled') {
     mode = 'lenient';
   }

@@ -15,44 +15,17 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { readPrefsCached } = require('./forge-prefs.js');
 
 const DEFAULT_EXCLUDE = ['node_modules/**', 'vendor/**', '.forge-worktrees/**', '.gsd/**', 'dist/**', 'build/**', '.next/**'];
 
 function readReposPrefs(cwd) {
-  const os = require('os');
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
-  let autoDetect = true;
-  let include = [];
-  let exclude = DEFAULT_EXCLUDE.slice();
-
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      const block = raw.match(/^forge_isolation:[ \t]*\n([\s\S]*?)(?=^\w|\Z)/m);
-      if (!block) continue;
-      const reposBlock = block[1].match(/^[ \t]+repos:[ \t]*\n([\s\S]*?)(?=^[ \t]+\w|^\w|\Z)/m);
-      if (!reposBlock) continue;
-      const autoM = reposBlock[1].match(/auto_detect:[ \t]*(\w+)/);
-      if (autoM) autoDetect = autoM[1].toLowerCase() === 'true';
-      // include/exclude are YAML lists. Parse loosely: lines like "      - 'pattern'" or "      - pattern"
-      const includeBlock = reposBlock[1].match(/include:[ \t]*\n([\s\S]*?)(?=[ \t]+\w|\Z)/);
-      if (includeBlock) include = parseYamlList(includeBlock[1]);
-      const excludeBlock = reposBlock[1].match(/exclude:[ \t]*\n([\s\S]*?)(?=[ \t]+\w|\Z)/);
-      if (excludeBlock) exclude = parseYamlList(excludeBlock[1]);
-    } catch {}
-  }
-  return { autoDetect, include, exclude };
-}
-
-function parseYamlList(text) {
-  return text.split('\n')
-    .map(l => l.trim())
-    .filter(l => l.startsWith('- '))
-    .map(l => l.slice(2).trim().replace(/^["']|["']$/g, ''));
+  const repos = readPrefsCached(cwd).prefs.forge_isolation?.repos || {};
+  return {
+    autoDetect: typeof repos.auto_detect === 'boolean' ? repos.auto_detect : true,
+    include: Array.isArray(repos.include) ? repos.include.slice() : [],
+    exclude: Array.isArray(repos.exclude) ? repos.exclude.slice() : DEFAULT_EXCLUDE.slice(),
+  };
 }
 
 // Lightweight glob matcher (no minimatch — zero deps).

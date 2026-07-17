@@ -155,12 +155,106 @@ Check both prefs files (already loaded). For each routing table row: alias → e
 
 ---
 
+## C5a: Prefs legadas remanescentes
+
+Resolve the same source-of-truth view with provenance before reporting legacy
+files. The full prefs check (C5a legacy listing, C5b parse-error flag, C5c
+invalid values, C5d stale catalog) is complete as of S06.
+
+```bash
+PREFS_ENGINE="$([ -f scripts/forge-prefs.js ] && echo scripts/forge-prefs.js || echo "$HOME/.claude/scripts/forge-prefs.js")"
+SCAFFOLD_ENGINE="$([ -f scripts/forge-prefs-scaffold.js ] && echo scripts/forge-prefs-scaffold.js || echo "$HOME/.claude/scripts/forge-prefs-scaffold.js")"
+PREFS_EXPLAIN=$(node "$PREFS_ENGINE" --resolved --explain --cwd . 2>/dev/null)
+printf '%s' "$PREFS_EXPLAIN"
+```
+
+Inspect `layers.global` and `layers.local` in that existing resolved result:
+
+- If `source: "md-legacy"`, list each `files[]` entry as
+  `⚠ Prefs legada honrada: <arquivo>`. The file is actively read. Show:
+  `Migração: node <scripts>/forge-prefs-migrate.js --cwd . --dry-run` and
+  `Rode /forge-update para migrar para JSONC.`
+- If `source: "jsonc"` and the layer's legacy markdown file is present, list it
+  as `⏭ Prefs legada shadowed (inerte, seguro deletar): <arquivo>`. JSONC wins;
+  the markdown file is not read and is safe to remove after review.
+- If both layers are `jsonc` or `absent` and no shadowed markdown is present,
+  report `✓ Nenhuma prefs markdown legada remanescente.`
+
+Do not alter either catalog as part of this check, even in `--fix` mode. The
+migration gate owns writes and semantic verification.
+
+---
+
+## C5b: Flag de erro de parse pendente
+
+```bash
+test -f .gsd/forge/prefs-error.json && cat .gsd/forge/prefs-error.json
+```
+
+If `.gsd/forge/prefs-error.json` exists, parse it (`{file, line, message}`)
+and report:
+`✗ Prefs com erro de parse: <file>:<line> — <message>` +
+`Corrija e rode /forge-doctor de novo.`
+
+If it does not exist: `✓ Nenhuma flag de erro de parse pendente.`
+
+**--fix:** only delete the flag when the config now parses clean — run
+```bash
+PREFS_ENGINE="$([ -f scripts/forge-prefs.js ] && echo scripts/forge-prefs.js || echo "$HOME/.claude/scripts/forge-prefs.js")"
+node "$PREFS_ENGINE" --resolved --cwd . >/dev/null 2>&1
+```
+and check exit
+code 0. If it exits 0, delete the flag file and report
+`🔧 Flag de erro de parse removida (config já corrigida).` If it still exits
+non-zero, leave the flag untouched and report
+`⏭ Flag de erro de parse mantida (config ainda inválida).`
+
+---
+
+## C5c: Valores inválidos
+
+Reuse the same `$PREFS_EXPLAIN` resolved output from C5a (already ran
+`--resolved --explain`). Read its top-level `warnings[]` array (from
+`validatePrefs` — type/enum/unknown-key issues).
+
+For each entry: `⚠ Valor inválido: <key> — <message>`.
+
+If `warnings` is empty: `✓ Nenhum valor de prefs inválido.`
+
+Never auto-fix — invalid values are semantic decisions the migration gate does
+not own resolving on the user's behalf.
+
+---
+
+## C5d: Catálogo desatualizado
+
+For each of `layers.global` / `layers.local` in `$PREFS_EXPLAIN` whose
+`source == "jsonc"`, take `files[0]` (the catalog path) and run:
+
+```bash
+SCAFFOLD_ENGINE="$([ -f scripts/forge-prefs-scaffold.js ] && echo scripts/forge-prefs-scaffold.js || echo "$HOME/.claude/scripts/forge-prefs-scaffold.js")"
+node "$SCAFFOLD_ENGINE" --diff "<catalog file>"
+```
+
+Parse the printed `{"missingSections":[...]}`. If `missingSections` is
+non-empty:
+`⚠ Catálogo desatualizado (<n> seções novas): <sections joined by ", ">` +
+`Rode /forge-update para re-scaffold (preserva blocos ativos).`
+
+If empty (or the layer's source is not `jsonc`, e.g. `md-legacy`/`absent`):
+`✓ Catálogo <global|local> atualizado.` (skip entirely for `absent`).
+
+Never auto-run the re-scaffold from this check — the migration gate owns
+writes, even in `--fix` mode.
+
+---
+
 ## C6: Agent files
 
 ```bash
 ls ~/.claude/agents/forge-{executor,planner,researcher,discusser,completer,memory}.md 2>&1
 ```
-Missing → Fix: `bash "$(grep repo_path ~/.claude/forge-agent-prefs.md | cut -d' ' -f2)/install.sh" --update`
+Missing → Fix: `bash "$(node "$([ -f scripts/forge-prefs.js ] && echo scripts/forge-prefs.js || echo "$HOME/.claude/scripts/forge-prefs.js")" --resolved --key repo_path 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(v?String(v):'')}catch{process.stdout.write('')}})")/install.sh" --update`
 If repo_path unknown → `[SKIP] execute bash install.sh`.
 
 ---

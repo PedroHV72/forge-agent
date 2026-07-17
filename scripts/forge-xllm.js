@@ -67,6 +67,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawnSync, spawn, execSync } = require('child_process');
+const { readPrefsCached } = require('./forge-prefs.js');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1183,23 +1184,10 @@ function deriveFilesChanged(cwd) {
  * @returns {number|null} positive integer seconds, or null when unset/invalid
  */
 function readWorkersTimeout(baseDir) {
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(baseDir, '.gsd', 'claude-agent-prefs.md'),
-    path.join(baseDir, '.gsd', 'prefs.local.md'),
-  ];
-  let timeout = null;
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      const m = raw.match(/^workers:[ \t]*\n(?:[ \t]+\w+:.*\n)*?[ \t]+timeout:[ \t]*(\d+)/m);
-      if (m) {
-        const n = parseInt(m[1], 10);
-        if (Number.isInteger(n) && n > 0) timeout = n;
-      }
-    } catch { /* missing file — skip */ }
-  }
-  return timeout;
+  const workers = readPrefsCached(baseDir).prefs.workers;
+  const value = workers && workers.timeout;
+  const timeout = parseInt(value, 10);
+  return Number.isInteger(timeout) && timeout > 0 ? timeout : null;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

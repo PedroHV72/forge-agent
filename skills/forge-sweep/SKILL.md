@@ -148,7 +148,7 @@ Drop when frontmatter has `status: closed`. Keep `status: open` sessions untouch
 
 ### Files NOT touched by this sweep
 
-`PROJECT.md`, `REQUIREMENTS.md`, `KNOWLEDGE.md`, `CODING-STANDARDS.md`, `CLAUDE.md`, `LEDGER.md`, `STATE.md`, `claude-agent-prefs.md`, `prefs.local.md`, `.claude/settings.json`, `.gsd/forge/` (telemetry).
+`PROJECT.md`, `REQUIREMENTS.md`, `KNOWLEDGE.md`, `CODING-STANDARDS.md`, `CLAUDE.md`, `LEDGER.md`, `STATE.md`, `claude-agent-prefs.md`, `prefs.local.md`, `forge-prefs.jsonc`, `forge-agent-prefs.jsonc`, `.claude/settings.json`, `.gsd/forge/` (telemetry).
 
 ---
 

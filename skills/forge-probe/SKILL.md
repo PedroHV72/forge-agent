@@ -207,8 +207,9 @@ Adicionar/atualizar a linha deste probe com verdict + tags.
 ### h. Commit (se `auto_commit: true` nas prefs)
 
 ```bash
-# Ler auto_commit das prefs
-AUTO_COMMIT=$(node -e "const fs=require('fs'),path=require('path'),os=require('os');const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),path.join('.gsd','claude-agent-prefs.md'),path.join('.gsd','prefs.local.md')];let v='false';for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^auto_commit:\s*(\w+)/m);if(m)v=m[1].toLowerCase();}catch{}}process.stdout.write(v);")
+# Ler auto_commit das prefs (canonical CLI — dual-read md/jsonc)
+PREFS_ENGINE=$([ -f scripts/forge-prefs.js ] && echo scripts/forge-prefs.js || echo "$HOME/.claude/scripts/forge-prefs.js")
+AUTO_COMMIT=$(node "$PREFS_ENGINE" --resolved --key auto_commit 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(String(v).toLowerCase()==='true'?'true':'false')}catch{process.stdout.write('false')}})")
 
 if [ "$AUTO_COMMIT" = "true" ]; then
   git add .gsd/probes/NNN-descriptive-name/ .gsd/probes/MANIFEST.md

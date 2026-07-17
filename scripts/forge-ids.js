@@ -30,6 +30,8 @@
 
 'use strict';
 
+const { readPrefsCached } = require('./forge-prefs.js');
+
 // ── Stopwords — bilingual (pt-BR + en), checked-in constant, never derived at runtime ──
 const STOPWORDS = Object.freeze(new Set([
   // Portuguese
@@ -200,25 +202,7 @@ function entityKind(id) {
 // NOTE: block regex matches indented lines only — do NOT use \Z (JS treats it
 // as a literal 'Z'; see the readIsolationPrefs regression).
 function readIdFormat(cwd) {
-  const fs = require('fs');
-  const os = require('os');
-  const path = require('path');
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
-  let value = 'timestamp';
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      const block = raw.match(/^ids:[ \t]*\n((?:[ \t]+\S.*(?:\n|$))*)/m);
-      if (block) {
-        const kv = block[1].match(/^[ \t]+format:[ \t]*([a-z]+)/m);
-        if (kv) value = kv[1];
-      }
-    } catch { /* file missing — keep current value */ }
-  }
+  const value = readPrefsCached(cwd).prefs.ids?.format;
   return value === 'sequential' ? 'sequential' : 'timestamp';
 }
 

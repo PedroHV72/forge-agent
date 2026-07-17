@@ -24,6 +24,43 @@ let _facct = null;
 try { _facct = require(path.join(__dirname, 'scripts', 'forge-accounts.js')); }
 catch { try { _facct = require(path.join(__dirname, 'forge-accounts.js')); } catch { /* flat install */ } }
 
+// Preferences engine — matches accountBadge's installed/dev lookup posture.
+let _prefs = null;
+try { _prefs = require(path.join(__dirname, 'scripts', 'forge-prefs.js')); }
+catch { try { _prefs = require(path.join(__dirname, 'forge-prefs.js')); } catch { /* partial install */ } }
+
+// Passive consumers report malformed prefs without making status rendering fail.
+const updatePrefsErrorFlag = (cwd, error) => {
+  try {
+    const forgeDir = path.join(cwd, '.gsd', 'forge');
+    if (!fs.existsSync(forgeDir)) return;
+    const flag = path.join(forgeDir, 'prefs-error.json');
+    if (error) {
+      fs.writeFileSync(flag, JSON.stringify({
+        file: error.file || cwd,
+        line: error.line == null ? null : error.line,
+        message: String(error.message || 'prefs-read-error'),
+        ts: Date.now(),
+      }), 'utf8');
+    } else {
+      try { fs.unlinkSync(flag); } catch {}
+    }
+  } catch { /* statusline must always render */ }
+};
+
+const resolvePrefsSafe = (cwd) => {
+  if (!_prefs || typeof _prefs.readPrefsCached !== 'function') return { prefs: {}, hadError: false };
+  try {
+    const result = _prefs.readPrefsCached(cwd) || {};
+    const error = Array.isArray(result.errors) && result.errors.length ? result.errors[0] : null;
+    updatePrefsErrorFlag(cwd, error);
+    return { prefs: result.prefs || {}, hadError: Boolean(error) };
+  } catch (err) {
+    updatePrefsErrorFlag(cwd, { file: cwd, line: null, message: err && err.message });
+    return { prefs: {}, hadError: true };
+  }
+};
+
 // Resolve the 👤 badge. With FORGE_ACCOUNT set → that name (no disk reads). Without
 // it (plain Keychain login, which the statusline JSON can't identify) → read
 // ~/.claude.json and match its identity to a registered account (recorded via
@@ -70,6 +107,7 @@ process.stdin.on('end', () => {
     const cwd     = d.cwd || '';
     const cwdNorm = cwd.replace(/\\/g, '/');
     const project = cwdNorm.split('/').filter(Boolean).pop() || cwd;
+    const resolvedPrefs = resolvePrefsSafe(cwd);
 
     // --- Context window % ---
     const pct    = Math.round(d.context_window?.used_percentage || 0);
@@ -334,11 +372,15 @@ process.stdin.on('end', () => {
     let forgeVersion = '';
     let forgeUpdate = '';
     try {
-      const prefsFile = path.join(os.homedir(), '.claude', 'forge-agent-prefs.md');
-      const prefs = fs.readFileSync(prefsFile, 'utf8');
-      const repoMatch = prefs.match(/repo_path:\s*(.+)/);
-      if (repoMatch) {
-        const repo = repoMatch[1].trim();
+      // Engine merge intentionally broadens the old global-Markdown-only read:
+      // repo/local layers can override repo_path, as documented by S03 decision 5.
+      // Divergência 3 (S03): repo_path agora tem aspas strippadas via
+      // parseLegacyValue — old mantinha aspas literais e o update-check falhava
+      // calado em path citado (ex.: valor quoted "foo/bar"). Comportamento novo é
+      // uma melhoria e permanece; documentado aqui só para não ficar implícito.
+      const repo = typeof resolvedPrefs.prefs.repo_path === 'string'
+        ? resolvedPrefs.prefs.repo_path.trim() : '';
+      if (repo) {
         const cacheFile = path.join(os.tmpdir(), 'forge-update-check.json');
 
         let cache = null;
@@ -769,6 +811,7 @@ process.stdin.on('end', () => {
     if (forgeUpdate) {
       forgeVersionTail = ` │ ${c.bold}${c.yellow}Forge ${forgeUpdate}${c.reset}`;
     }
+    if (resolvedPrefs.hadError) forgeVersionTail += ' │ ⚠ prefs';
 
     // --- Model segment: only when NOT auto (tier icon covers "what's running" in auto mode) ---
     const segments = [];

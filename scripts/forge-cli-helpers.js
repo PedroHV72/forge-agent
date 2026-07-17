@@ -22,31 +22,16 @@
 const path  = require('path');
 const runs  = require('./forge-runs.js');
 const ids   = require('./forge-ids.js');
+const { readPrefsCached } = require('./forge-prefs.js');
 
 // ── Prefs read (multi_run.refused_when_active_count) ────────────────────────
 function readPref(cwd, dottedKey, fallback) {
-  const fs = require('fs');
-  const os = require('os');
-  const files = [
-    path.join(os.homedir(), '.claude', 'forge-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'claude-agent-prefs.md'),
-    path.join(cwd, '.gsd', 'prefs.local.md'),
-  ];
-  const [section, key] = dottedKey.split('.');
-  let value = fallback;
-  for (const f of files) {
-    try {
-      const raw = fs.readFileSync(f, 'utf8');
-      const re = new RegExp(`^${section}:[ \\t]*\\n([\\s\\S]*?)(?=^\\w|\\Z)`, 'm');
-      const m = raw.match(re);
-      if (m) {
-        const kre = new RegExp(`^[ \\t]+${key}:[ \\t]*([^\\n]+)`, 'm');
-        const km = m[1].match(kre);
-        if (km) value = km[1].trim();
-      }
-    } catch {}
+  let value = readPrefsCached(cwd).prefs;
+  for (const part of dottedKey.split('.')) {
+    if (value === null || value === undefined || !Object.prototype.hasOwnProperty.call(Object(value), part)) return fallback;
+    value = value[part];
   }
-  return value;
+  return value === undefined || value === null ? fallback : value;
 }
 
 // ── ID generation ───────────────────────────────────────────────────────────

@@ -621,7 +621,7 @@ Fields:
 
 #### Prefs contract
 
-The handler reads `PREFS.retry.max_transient_retries` (integer). Default `3` when `PREFS.retry` is absent or the key is missing. The prefs block ships in T05 — until then the handler falls back to `3` silently.
+The handler reads `PREFS.retry.max_transient_retries` (integer) off the resolved object — `PREFS` = `.prefs` from the one canonical `forge-prefs.js --resolved` call (see [§ Per-unit prefs resolution](#per-unit-prefs-resolution)), never a per-file md merge. Default `3` when `.prefs.retry` is absent or the key is missing (`PREFS?.retry?.max_transient_retries ?? 3`).
 
 Per-class behaviour summary:
 
@@ -772,7 +772,7 @@ Do NOT include: raw prompt text, worker output, file paths, exception messages, 
 
 #### Prefs contract
 
-The Budgeted Section Injection subsection (below) reads `PREFS.token_budget.<key>` (integer tokens) to determine per-placeholder budgets. The `token_budget` block ships in T05. Until then, the handler falls back silently to these defaults:
+The Budgeted Section Injection subsection (below) reads `PREFS.token_budget.<key>` (integer tokens) off the resolved object (`PREFS` = `.prefs` from the one canonical `forge-prefs.js --resolved` call — see [§ Per-unit prefs resolution](#per-unit-prefs-resolution)) to determine per-placeholder budgets. Individual missing keys fall back to these defaults:
 
 | key | Default (tokens) | Placeholder(s) governed |
 |-----|-----------------|------------------------|
@@ -942,40 +942,36 @@ fi
 
 This is advisory (stderr only) — it never blocks the dispatch. `--explain` (pt-BR) gives the full precedence trace when the operator wants to know *why* the cell lost.
 
-#### Prefs reader — regex-over-raw-prefs (never `prefs-resolved.json`)
+<a id="per-unit-prefs-resolution"></a>
+#### Per-unit prefs resolution — the canonical helper (one `forge-prefs.js --resolved` call)
 
-**`prefs-resolved.json` does NOT exist** (MEM001 M005): the aggregated-prefs read is broken and never written. The `workers:` reader MUST cascade the three raw prefs files directly, mirroring `readEvidenceMode` / `shared/forge-review.md § Step 0`. Regexes use `[ \t]` (never `\s`, which matches `\n` and leaks into the next line — MEM011) and never anchor with `\Z` (not a JS regex token — it matches a literal `Z`). Last file wins (user-global → repo shared → local personal).
+**`prefs-resolved.json` does NOT exist** (MEM001 M005) and the loop must NEVER re-implement a 3-file `files=[…forge-agent-prefs.md…]` cascade `node -e` merge. All preference reads go through the **single S01 engine CLI** (`scripts/forge-prefs.js`), which dual-reads legacy markdown OR new jsonc per layer transparently and applies the exact same user-global → repo-shared → local-personal precedence. This is the **canonical pattern** that every dispatch-loop skill (`forge-auto`, `forge-next`, `forge-task`) and shared control-flow spec (`forge-plan-gate.md`, `forge-review.md`) reuses — resolve once per unit, then read every knob off the in-memory object.
 
 ```bash
-WORKERS_CFG=$(WORKING_DIR="$WORKING_DIR" UNIT_TYPE="$UNIT_TYPE" node -e "
-const fs=require('fs'),path=require('path'),os=require('os');
-const wd=process.env.WORKING_DIR||process.cwd();
-const unit=process.env.UNIT_TYPE||'execute-task';
-const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-             path.join(wd,'.gsd','claude-agent-prefs.md'),
-             path.join(wd,'.gsd','prefs.local.md')];
-let engine=null,timeout=1800,codexModel=null;   // engine null → 'claude' resolved downstream
-for(const f of files){try{
-  const r=fs.readFileSync(f,'utf8');
-  const blk=(r.match(/^workers:[ \t]*\n((?:[ \t]+.*\n?)*)/m)||[])[1]||'';
-  let m;
-  // per-unit-type engine: workers.<unit_type>
-  const unitRe=new RegExp('^[ \\\\t]+'+unit.replace(/[-]/g,'\\\\-')+':[ \\\\t]*(\\\\w+)','m');
-  if(m=blk.match(unitRe)){const v=m[1].toLowerCase();if(v==='claude'||v==='codex')engine=v;}
-  if(m=blk.match(/^[ \t]+timeout:[ \t]*(\d+)/m))timeout=parseInt(m[1],10);
-  if(m=blk.match(/^[ \t]+codex_model:[ \t]*(\S+)/m))codexModel=m[1];
-}catch(e){}}
-if(engine!=='claude'&&engine!=='codex')engine='claude';   // default-safe
-if(!Number.isInteger(timeout)||timeout<=0)timeout=1800;
-process.stdout.write(JSON.stringify({engine,timeout,codexModel}));
-")
-
-WORKERS_ENGINE=$(printf '%s' "$WORKERS_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).engine||'claude')}catch(e){process.stdout.write('claude')}})")
-WORKERS_TIMEOUT=$(printf '%s' "$WORKERS_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(String(JSON.parse(d).timeout||1800))}catch(e){process.stdout.write('1800')}})")
-CODEX_MODEL=$(printf '%s' "$WORKERS_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).codexModel||'')}catch(e){process.stdout.write('')}})")
+# ── Canonical per-unit prefs resolution (ONE call; read all knobs off $PREFS_JSON) ──
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
+if [ $? -ne 0 ]; then
+  # M008-CONTEXT decision #2 — loud stop, NEVER a silent default. The CLI already
+  # printed the errors[] ({file,line,message}) on stdout ($PREFS_JSON) and a human
+  # message + "corrija o JSONC…" hint on stderr. The loop consumer deactivates the
+  # run (same mechanic as the Agent()-failure halt) and surfaces arquivo+linha+
+  # como-corrigir to the operator. Do NOT degrade to WORKERS_ENGINE=claude et al.
+  echo "✗ prefs parse error — dispatch halted (see stderr for arquivo:linha)" >&2
+  # ...deactivate run + STOP...
+fi
 ```
 
-The reader is safe with **no scaffold present**: absent a `workers:` block, `WORKERS_ENGINE=claude`, `WORKERS_TIMEOUT=1800`, `CODEX_MODEL=""` (unset). The commented `workers:` scaffold in `forge-agent-prefs.md § Workers Settings` ships in **S05** — the S02 reader does not depend on it (no blocking cross-slice dependency; the requirement is merely assigned to the S05 owner to respect one-owner-per-file).
+`$PREFS_JSON` is `{ok, prefs, errors[], warnings[], layers}`. `warnings[]` (advisory schema validation) print `⚠` to stderr and do **not** stop; only exit≠0 (a real parse error) halts. Throughout this doc, **`PREFS` = `.prefs`** from this one call. Read a knob by extracting `.prefs.<path>` locally (never one CLI call per knob):
+
+```bash
+# Extract knobs off .prefs.<path>, applying the SAME default/clamp as the old inline snippet.
+WORKERS_ENGINE=$(printf '%s' "$PREFS_JSON" | UNIT_TYPE="$UNIT_TYPE" node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const w=JSON.parse(d).prefs.workers||{};let e=w[process.env.UNIT_TYPE||'execute-task'];e=(typeof e==='string')?e.toLowerCase():null;process.stdout.write((e==='claude'||e==='codex')?e:'claude')}catch(err){process.stdout.write('claude')}})")
+WORKERS_TIMEOUT=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=(JSON.parse(d).prefs.workers||{}).timeout;process.stdout.write(Number.isInteger(t)&&t>0?String(t):'1800')}catch(err){process.stdout.write('1800')}})")
+CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=(JSON.parse(d).prefs.workers||{}).codex_model;process.stdout.write(c!=null&&c!==''?String(c):'')}catch(err){process.stdout.write('')}})")
+```
+
+**Equivalence with the old cascade (dual-read golden capture):** the per-unit-type engine is read as `.prefs.workers[<unit_type>]` (the legacy reader parses `workers.<unit_type>: codex` into that same shape; the `[A-Za-z0-9_.-]` key class covers hyphenated unit types like `execute-task`); `timeout` as `.prefs.workers.timeout`; `codex_model` as `.prefs.workers.codex_model`. The reader is safe with **no scaffold present**: absent a `workers:` block, `.prefs.workers` is `undefined`, so `WORKERS_ENGINE=claude`, `WORKERS_TIMEOUT=1800`, `CODEX_MODEL=""` (unset) — byte-identical defaults to the old snippet. The commented `workers:` scaffold in `forge-agent-prefs.md § Workers Settings` ships in **S05**; the reader does not depend on it (the CLI resolves absent keys to the same safe defaults).
 
 #### Sidecar dispatch state machine (`ENGINE == codex && UNIT_TYPE == execute-task`)
 
@@ -1637,7 +1633,7 @@ After Tier Resolution has set `$MODEL_ID` (the clamp in step 4 depends on it) an
 
 #### Algorithm
 
-1. **Unit-type default.** `EFFORT = PREFS.effort[unit_type]` (the `EFFORT_MAP` extracted at Load Context from `forge-agent-prefs.md § Effort Settings`). Fall back to the built-in defaults (opus/planning phases = `medium`, sonnet/haiku phases = `low`) when the key is absent. `EFFORT_REASON = "unit-type:<unit_type>"`.
+1. **Unit-type default.** `EFFORT = PREFS.effort[unit_type]` (the `EFFORT_MAP` built at Load Context from `.prefs.effort` — sourced off the one canonical `forge-prefs.js --resolved` object, see [§ Per-unit prefs resolution](#per-unit-prefs-resolution), never a per-file md merge of `forge-agent-prefs.md § Effort Settings`). Fall back to the built-in defaults (opus/planning phases = `medium`, sonnet/haiku phases = `low`) when the key is absent. `EFFORT_REASON = "unit-type:<unit_type>"`.
 2. **Dedicated frontmatter axis (`execute-task` only).** If `effort:` is present in the `T##-PLAN.md` frontmatter → `EFFORT = PLAN_EFFORT`, `EFFORT_REASON = "frontmatter-effort:<val>"`. This is the planner's per-task complexity judgement and wins over the unit-type default. Independent of `tier:` — a task may be `tier: standard` + `effort: medium` or `tier: heavy` + `effort: high` in any combination.
 3. **Risk escalation sync (`plan-slice` only).** When Tier Resolution escalated the slice to `max` (`REASON == "risk-escalation:high"`), the effort also jumps to `max`. A `risk:high` slice plan is the highest leverage-per-dollar spot for frontier reasoning.
 4. **Model capability clamp.** Clamp `EFFORT` down to the resolved model's ceiling. `claude-haiku*` and `claude-sonnet*` cap at `medium`; `claude-opus*` and `claude-fable*` allow the full scale up to `max`. When the clamp lowers the value, append `|clamped:model-cap` to `EFFORT_REASON`. This prevents HTTP 400s (a Sonnet dispatch never receives `high`+) and silently-wasted config. **Consequence:** to actually *run* a task at `high`/`xhigh`/`max`, the task must also be on a `heavy`/`max` tier (opus/fable) — set both `tier:` and `effort:` in the plan, or rely on the planner to set them coherently.

@@ -261,6 +261,53 @@ context_monitor:
   assertEq(prefs.thresholds.warning, 0.45, 'fraction 0.45 stays 0.45');
 });
 
+test('S03-R3: numeric-string-with-suffix threshold (85% → 0.85)', () => {
+  const fakeCwd = path.join(ROOT, 'suffix-project');
+  writeTmp('suffix-project/.gsd/prefs.local.md', `
+context_monitor:
+  warning_threshold: 85%
+  critical_threshold: 70abc
+`);
+  const prefs = readContextMonitorPrefs(fakeCwd);
+  assertEq(prefs.thresholds.warning, 0.85, '"85%" → 0.85 (parseFloat + percent normalize)');
+  assertEq(prefs.thresholds.critical, 0.70, '"70abc" → 0.70 (leading numeric prefix)');
+});
+
+test('S03-R3: clean fraction/number strings still behave', () => {
+  const fakeCwd = path.join(ROOT, 'suffix-clean-project');
+  writeTmp('suffix-clean-project/.gsd/prefs.local.md', `
+context_monitor:
+  warning_threshold: "0.85"
+  critical_threshold: "85"
+`);
+  const prefs = readContextMonitorPrefs(fakeCwd);
+  assertEq(prefs.thresholds.warning, 0.85, '"0.85" string → 0.85');
+  assertEq(prefs.thresholds.critical, 0.85, '"85" string → 0.85');
+});
+
+test('S03-R3: non-numeric string still falls back to default', () => {
+  const fakeCwd = path.join(ROOT, 'suffix-invalid-project');
+  writeTmp('suffix-invalid-project/.gsd/prefs.local.md', `
+context_monitor:
+  warning_threshold: abc
+`);
+  const prefs = readContextMonitorPrefs(fakeCwd);
+  assertEq(prefs.thresholds.warning, 0.35, '"abc" → default 0.35');
+});
+
+test('invalid enabled and thresholds preserve defaults', () => {
+  const fakeCwd = path.join(ROOT, 'invalid-project');
+  writeTmp('invalid-project/.gsd/prefs.local.md', `
+context_monitor:
+  enabled: maybe
+  warning_threshold: abc
+  critical_threshold: null
+`);
+  const prefs = readContextMonitorPrefs(fakeCwd);
+  assertEq(prefs, { enabled: true, thresholds: { warning: 0.35, critical: 0.25 } },
+    'invalid values must fall back to defaults');
+});
+
 // ── S03 review fixes: R6 block scoping + R8 threshold-aware messages ──────────
 
 console.log('\nreview fixes (R6 scoping / R8 thresholds):');
