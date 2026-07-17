@@ -428,6 +428,17 @@ Get-ChildItem -Path "$RepoDir\scripts" -Filter "forge-*.js" -File | ForEach-Obje
     Info "  scripts/$name"
 }
 
+# Config engine schema (M008): loadSchema() resolves it at scripts/../forge-prefs.schema.json,
+# i.e. $ClaudeDir\forge-prefs.schema.json. Without it the installed engine is schema-blind
+# (no array coercion, no validation, viewer degrades) — ship it alongside the scripts.
+# Join-Path everywhere so no literal backslash sequence (e.g. \f) is emitted.
+$SchemaName = "forge-prefs.schema.json"
+$SchemaSrc = Join-Path $RepoDir $SchemaName
+if (Test-Path $SchemaSrc) {
+    CopyFile $SchemaSrc (Join-Path $ClaudeDir $SchemaName)
+    Info "  $SchemaName"
+}
+
 # ── Install CLI wrapper + shell integration (Windows) ─────────────────────────
 # forge-accounts.cmd on PATH + an auto-attach claude() function in $PROFILE, so a
 # plain `claude` enters the active account (and `claude --account <name>` a chosen

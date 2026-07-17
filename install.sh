@@ -276,6 +276,14 @@ for f in "${REPO_DIR}/scripts"/forge-*.js; do
   info "  scripts/${name}"
 done
 
+# Config engine schema (M008): loadSchema() resolves it at scripts/../forge-prefs.schema.json,
+# i.e. ${CLAUDE_DIR}/forge-prefs.schema.json. Without it the installed engine is schema-blind
+# (no array coercion, no validation, viewer degrades) — must ship alongside the scripts.
+if [ -f "${REPO_DIR}/forge-prefs.schema.json" ]; then
+  copy "${REPO_DIR}/forge-prefs.schema.json" "${CLAUDE_DIR}/forge-prefs.schema.json"
+  info "  forge-prefs.schema.json"
+fi
+
 # CLI wrappers → a bin dir on PATH so users type `forge-accounts add x` /
 # `forge-run` instead of `node ~/.claude/scripts/...`.
 if [ -d "${REPO_DIR}/bin" ]; then
