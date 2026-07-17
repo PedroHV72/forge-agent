@@ -5268,6 +5268,121 @@ function smokePrefsViewerDoctor() {
   pass('(e) Section 42 whole-system read-side (viewer + doctor prefs-check) verified end-to-end');
 }
 
+// ── Section 43: prefs migration fidelity (comment-strip, schema-aware arrays, schema gate) ──
+function smokePrefsMigrationFidelity() {
+  process.stdout.write('\n▸ Section 43: prefs migration fidelity (comment-strip, schema-aware arrays, schema gate)\n');
+  const engine = require('./forge-prefs.js');
+  const migrate = require('./forge-prefs-migrate.js');
+  const fixture = `# .bak-shaped legacy preferences
+
+forge_isolation:
+  branch_pattern: "forge/{M###}"    # nome da branch quando mode=branch
+  repos:
+    include: []
+    exclude:
+      - "node_modules/**"
+      - "dist/**"
+  mode: WORKTREE
+
+verification:
+  preference_commands: []
+
+multi_run:
+  dashboard_refresh_on:
+    - boot
+    - exit
+
+file_audit:
+  ignore_list:
+    - "package-lock.json"
+    - "dist/**"
+
+review:
+  mode: disabled
+
+scalar_guard:
+  glob_value: [not, an, array]
+`;
+  const dirs = () => {
+    const root = mkTmp('prefs-fidelity');
+    const globalDir = path.join(root, 'global');
+    const localDir = path.join(root, '.gsd');
+    fs.mkdirSync(globalDir, { recursive: true });
+    fs.mkdirSync(localDir, { recursive: true });
+    return { root, globalDir, localDir };
+  };
+  const cli = (d, extra) => runScript('forge-prefs-migrate.js', [
+    '--cwd', d.root, '--global-dir', d.globalDir, '--local-dir', d.localDir, '--json', ...(extra || []),
+  ], { cwd: d.root });
+  const snapshot = (d) => [d.globalDir, d.localDir].flatMap((dir) => fs.existsSync(dir)
+    ? fs.readdirSync(dir).map((name) => {
+      const file = path.join(dir, name); const stat = fs.statSync(file);
+      return stat.isFile() ? [file, stat.mtimeMs, fs.readFileSync(file, 'utf8')] : null;
+    }).filter(Boolean) : []);
+
+  const d = dirs();
+  const fixturePath = path.join(d.globalDir, 'forge-agent-prefs.md');
+  fs.writeFileSync(fixturePath, fixture, 'utf8');
+  const extracted = engine.legacyReadFile(fixturePath).prefs;
+  assert(extracted.forge_isolation && extracted.forge_isolation.branch_pattern === 'forge/{M###}',
+    '(a) branch_pattern strips the outside comment while preserving {M###}', JSON.stringify(extracted.forge_isolation));
+  const arrayChecks = [
+    ['forge_isolation.repos.include', extracted.forge_isolation?.repos?.include, []],
+    ['forge_isolation.repos.exclude', extracted.forge_isolation?.repos?.exclude, ['node_modules/**', 'dist/**']],
+    ['multi_run.dashboard_refresh_on', extracted.multi_run?.dashboard_refresh_on, ['boot', 'exit']],
+    ['verification.preference_commands', extracted.verification?.preference_commands, []],
+    ['file_audit.ignore_list', extracted.file_audit?.ignore_list, ['package-lock.json', 'dist/**']],
+  ];
+  for (const [key, actual, expected] of arrayChecks) {
+    assert(Array.isArray(actual) && JSON.stringify(actual) === JSON.stringify(expected),
+      `(a) ${key} resolves as a JSON array with the expected items`, JSON.stringify(actual));
+  }
+  assert(typeof extracted.scalar_guard?.glob_value === 'string' && extracted.scalar_guard.glob_value === '[not, an, array]',
+    '(a) non-array bracket value remains a string (schema-aware parsing guard)', JSON.stringify(extracted.scalar_guard));
+
+  const home = path.join(d.root, 'home');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  fs.copyFileSync(fixturePath, path.join(home, '.claude', 'forge-agent-prefs.md'));
+  const resolved = runScript('forge-prefs.js', ['--resolved', '--cwd', d.root], {
+    cwd: d.root, env: { ...process.env, HOME: home, USERPROFILE: home },
+  });
+  let resolvedJson = null;
+  try { resolvedJson = JSON.parse(resolved.stdout); } catch {}
+  const warnings = (resolvedJson && resolvedJson.warnings) || [];
+  const fidelityWarnings = warnings.filter((warning) =>
+    arrayChecks.some(([key]) => warning.key === key) || warning.key === 'forge_isolation.branch_pattern');
+  assert(resolved.status === 0 && !!resolvedJson && fidelityWarnings.length === 0,
+    '(b) --resolved has no schema warnings for branch_pattern or legacy array knobs', resolved.stdout);
+  cleanup(d.root);
+
+  const bad = dirs();
+  const badFixture = fixture.replace('mode: disabled', 'mode: definitely-not-a-review-mode');
+  fs.writeFileSync(path.join(bad.globalDir, 'forge-agent-prefs.md'), badFixture, 'utf8');
+  const before = snapshot(bad);
+  const stopped = cli(bad);
+  const output = `${stopped.stdout}${stopped.stderr}`;
+  assert(stopped.status !== 0 && !fs.existsSync(path.join(bad.globalDir, 'forge-agent-prefs.jsonc'))
+    && JSON.stringify(before) === JSON.stringify(snapshot(bad)) && output.includes('schema'),
+    '(c) schema-aware migration gate stops invalid enum input before any JSONC write', output);
+  assert(!output.includes('[object Object]'),
+    '(c) schema-warning gate never prints "[object Object]" for its warning lines', output);
+  cleanup(bad.root);
+
+  // (d) unknown/legacy top-level key — gate must stop, zero writes, and name it explicitly.
+  const unknown = dirs();
+  const unknownFixture = `${fixture}\nsome_renamed_legacy_key: whatever\n`;
+  fs.writeFileSync(path.join(unknown.globalDir, 'forge-agent-prefs.md'), unknownFixture, 'utf8');
+  const beforeUnknown = snapshot(unknown);
+  const stoppedUnknown = cli(unknown);
+  const outputUnknown = `${stoppedUnknown.stdout}${stoppedUnknown.stderr}`;
+  assert(stoppedUnknown.status !== 0 && !fs.existsSync(path.join(unknown.globalDir, 'forge-agent-prefs.jsonc'))
+    && JSON.stringify(beforeUnknown) === JSON.stringify(snapshot(unknown)),
+    '(d) unknown legacy preference key stops migration with zero writes', outputUnknown);
+  assert(/unknown preference key/i.test(outputUnknown),
+    '(d) gate message explicitly names the unknown preference key', outputUnknown);
+  cleanup(unknown.root);
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -5317,6 +5432,7 @@ async function main() {
     smokeSkillsCutover();
     smokePrefsMigration();
     smokePrefsViewerDoctor();
+    smokePrefsMigrationFidelity();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

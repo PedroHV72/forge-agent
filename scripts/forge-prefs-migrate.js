@@ -7,10 +7,10 @@
 //
 // Pipeline per layer (D3):
 //   capture (legacy old-reader) → generate (scaffold + user-value activation)
-//   → diff-GATE in memory (non-empty diff → exit 3, ZERO writes, not even .bak)
+//   → diff-GATE + schema-GATE in memory (failure → exit 3, ZERO writes, not even .bak)
 //   → copy every legacy md to .md.bak (never clobbers an existing .bak)
 //   → write the jsonc catalog → re-verify with the REAL new-reader
-//   → divergence → rollback (delete the jsonc, originals untouched) → exit 3
+//   → divergence or schema warning → rollback (delete the jsonc, originals untouched) → exit 3
 //   → success → remove the legacy md files (the .bak stays).
 //
 // Malformed legacy markdown (routing parse error, e.g. the flattened
@@ -19,7 +19,7 @@
 //
 // Exit codes (D7):
 //   0 — migrated, already-migrated no-op, or dry-run
-//   3 — resolved diff non-empty (gate STOP) or post-write re-verify rollback
+//   3 — resolved diff/schema warning (gate STOP) or post-write re-verify rollback
 //   4 — legacy markdown parse error (STOP)
 //   1 — unexpected error / bad arguments
 //
@@ -43,6 +43,7 @@ const {
   readPrefs,
   deepMerge,
   loadSchema,
+  validatePrefs,
 } = require('./forge-prefs.js');
 
 const {
@@ -286,6 +287,14 @@ function prepareLayer(layer) {
   if (diff.length > 0) {
     return { name, action: 'stop', reason: 'diff', diff, jsoncPath };
   }
+  // Schema is an independent gate from the round-trip proof above: the
+  // legacy and generated values can agree while still being invalid for the
+  // catalog schema. Keep this before commit so rejection leaves no .bak or
+  // jsonc artifact behind.
+  const warnings = validatePrefs(parsed.value, effectiveSchema);
+  if (warnings.length > 0) {
+    return { name, action: 'stop', reason: 'schema-warnings', warnings, jsoncPath };
+  }
   return { name, action: 'ready', jsoncPath, mdFiles: present, generated, diff: [] };
 }
 
@@ -472,6 +481,9 @@ function migrateAll(cwd, opts) {
     });
     preps.push(prep);
     if (prep.action === 'stop') {
+      if (prep.reason === 'schema-warnings') {
+        return { status: 'schema-warnings', layers: preps, warnings: prep.warnings };
+      }
       return { status: 'diff', layers: preps, diff: prep.diff };
     }
     if (prep.action === 'error') {
@@ -528,11 +540,12 @@ function migrateAll(cwd, opts) {
   // (delete the jsonc) restores the exact previous state.
   const after = resolveCurrent(targetCwd, options);
   const mergedDiff = resolvedDiff(before.prefs, after.prefs);
-  if (after.errors.length > 0 || mergedDiff.length > 0) {
+  const schemaWarnings = validatePrefs(after.prefs, schema);
+  if (after.errors.length > 0 || mergedDiff.length > 0 || schemaWarnings.length > 0) {
     for (const result of migrated) {
       try { fs.unlinkSync(result.jsoncPath); } catch { /* rollback best effort */ }
     }
-    return { status: 'rollback', layers: results, diff: mergedDiff, errors: after.errors };
+    return { status: 'rollback', layers: results, diff: mergedDiff, errors: after.errors, warnings: schemaWarnings };
   }
 
   // Success: retire the legacy md files (the .bak stays as the recovery copy).
@@ -602,7 +615,7 @@ function printDiff(diff, write) {
 
 function exitCodeFor(status) {
   if (status === 'migrated' || status === 'noop' || status === 'dry-run') return 0;
-  if (status === 'diff' || status === 'rollback') return 3;
+  if (status === 'diff' || status === 'schema-warnings' || status === 'rollback') return 3;
   if (status === 'legacy-parse-error') return 4;
   return 1;
 }
@@ -644,12 +657,17 @@ function runCli(argv) {
     if (layer.action === 'skipped') err(`• ${layer.name}: skipped (${layer.reason})\n`);
     else if (layer.action === 'dry-run') err(`• ${layer.name}: would migrate → ${layer.jsoncPath} (gate diff: empty)\n`);
     else if (layer.action === 'migrated') err(`✓ ${layer.name}: migrated → ${layer.jsoncPath} (gate diff: empty; .bak: ${(layer.baks || []).join(', ')})\n`);
+    else if (layer.action === 'stop' && layer.reason === 'schema-warnings') err(`✗ ${layer.name}: schema warnings — migration stopped, zero writes\n`);
     else if (layer.action === 'stop') err(`✗ ${layer.name}: resolved diff NON-EMPTY — migration stopped, zero writes\n`);
   }
   if (result.status === 'diff' || result.status === 'rollback') {
     err(`✗ gate STOP (${result.status}): the old and new resolved objects diverge:\n`);
     printDiff(result.diff || [], err);
     if (result.status === 'rollback') err('✗ jsonc rolled back; legacy md files untouched (.bak kept)\n');
+  }
+  if (result.status === 'schema-warnings' || (result.status === 'rollback' && (result.warnings || []).length > 0)) {
+    for (const warning of result.warnings || []) err(`✗ schema warning: ${warning.key}: ${warning.message}\n`);
+    err('✗ migration refused to avoid corrupting values; legacy sources and any existing .bak preserved\n');
   } else if (result.status === 'legacy-parse-error') {
     for (const entry of result.errors || []) err(`✗ legacy parse error: ${entry.file || ''} — ${entry.message}\n`);
     err('✗ fix the legacy markdown before migrating — never migrating invented state\n');
@@ -660,7 +678,9 @@ function runCli(argv) {
   } else if (result.status === 'dry-run') {
     err('• dry-run: no files written\n');
   }
-  for (const warning of result.warnings || []) err(`⚠ ${warning}\n`);
+  if (result.status === 'migrated') {
+    for (const warning of result.warnings || []) err(`⚠ ${warning}\n`);
+  }
   if (result.gitignore && result.gitignore.action === 'would-append') err(`⚠ ${result.gitignore.warning}\n`);
   return exitCodeFor(result.status);
 }

@@ -11,33 +11,43 @@ const path = require('path');
 // old readers, with the EOF-safe block boundary required by MEM030.
 
 function stripLegacyInlineComment(value) {
-  const hash = value.indexOf('#');
-  if (hash === -1) return value;
-  // A quoted scalar may legitimately contain # (for example the default
-  // forge/{M###} branch pattern). It is data, not a markdown comment.
   let quote = null;
-  for (let index = 0; index < hash; index++) {
+  let escaped = false;
+  let bracketDepth = 0;
+  for (let index = 0; index < value.length; index++) {
     const character = value[index];
-    if ((character === '"' || character === "'") && value[index - 1] !== '\\') {
-      quote = quote === character ? null : (quote || character);
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === '[') {
+      bracketDepth++;
+    } else if (character === ']' && bracketDepth > 0) {
+      bracketDepth--;
+    } else if (character === '#' && bracketDepth === 0) {
+      return value.slice(0, index);
     }
   }
-  if (quote) return value;
-  const open = value.indexOf('[');
-  if (open === -1 || open > hash) return value.slice(0, hash);
-  const close = value.indexOf(']');
-  return close !== -1 && hash > close ? value.slice(0, hash) : value;
+  return value;
 }
 
-function parseLegacyValue(raw) {
+function parseLegacyValue(raw, isArrayPath) {
   const trimmed = stripLegacyInlineComment(String(raw)).trim();
-  if (trimmed.startsWith('[')) {
+  if (isArrayPath && trimmed.startsWith('[')) {
     if (!trimmed.endsWith(']')) return trimmed;
     const parts = trimmed.slice(1, -1)
       .split(',')
       .map((part) => part.trim().replace(/^["']|["']$/g, ''))
       .filter((part) => part.length > 0);
-    return parts.length > 0 ? parts : trimmed;
+    return parts;
   }
   const unquoted = trimmed.replace(/^["']|["']$/g, '');
   if (unquoted === 'true') return true;
@@ -46,9 +56,9 @@ function parseLegacyValue(raw) {
   return unquoted;
 }
 
-function parseLegacyKeyLine(line) {
+function parseLegacyKeyLine(line, isArrayPath) {
   const match = line.match(/^[ \t]+([A-Za-z0-9_.-]+):[ \t]*(.*)$/);
-  return match ? { key: match[1], value: parseLegacyValue(match[2]) } : null;
+  return match ? { key: match[1], rawValue: match[2], value: parseLegacyValue(match[2], isArrayPath) } : null;
 }
 
 // Byte-identical copy of forge-routing.js#parseValue (level-3 tier value).
@@ -140,22 +150,29 @@ function legacySectionBlocks(raw) {
   return blocks;
 }
 
-function parseLegacyRepos(sectionBlock) {
+function parseLegacyRepos(sectionBlock, arrayPaths) {
   const repos = {};
   let activeList = null;
   for (const rawLine of sectionBlock.split(/\r?\n/)) {
     const scalar = rawLine.match(/^\s{4}([A-Za-z0-9_.-]+):\s*(.*)$/);
     if (scalar) {
       const key = scalar[1];
-      if (scalar[2] !== '') repos[key] = parseLegacyValue(scalar[2]);
-      else if (key === 'include' || key === 'exclude') {
+      // Strip the inline comment BEFORE deciding whether the value is empty: a
+      // list-style knob such as `exclude:  # globs` carries only a comment on
+      // the key line, so the raw match is non-empty even though the real value
+      // is the `- item` continuation below.
+      const stripped = stripLegacyInlineComment(scalar[2]).trim();
+      if (stripped !== '') {
+        repos[key] = parseLegacyValue(scalar[2], arrayPaths.has(`forge_isolation.repos.${key}`));
+        activeList = null;
+      } else if (arrayPaths.has(`forge_isolation.repos.${key}`)) {
         repos[key] = [];
         activeList = key;
       } else activeList = null;
       continue;
     }
     const item = rawLine.match(/^\s*-\s+(.+)$/);
-    if (item && activeList) repos[activeList].push(item[1].trim().replace(/^["']|["']$/g, ''));
+    if (item && activeList) repos[activeList].push(stripLegacyInlineComment(item[1]).trim().replace(/^["']|["']$/g, ''));
   }
   return repos;
 }
@@ -196,6 +213,22 @@ function legacyReadFlatKeys(raw) {
   return flat;
 }
 
+// Legacy markdown has no type syntax of its own.  Consult the installed schema
+// so bracket syntax is only coerced where the preference contract says it is an
+// array; a scalar such as a glob or command is otherwise left untouched.
+function schemaArrayPaths(schema) {
+  const paths = new Set();
+  function walk(node, parts) {
+    if (!node || typeof node !== 'object') return;
+    const types = Array.isArray(node.type) ? node.type : [node.type];
+    if (parts.length > 0 && types.includes('array')) paths.add(parts.join('.'));
+    if (!node.properties || typeof node.properties !== 'object') return;
+    for (const key of Object.keys(node.properties)) walk(node.properties[key], parts.concat(key));
+  }
+  walk(schema, []);
+  return paths;
+}
+
 function legacyReadFile(absPath) {
   let raw;
   try {
@@ -204,6 +237,7 @@ function legacyReadFile(absPath) {
     return { ok: true, prefs: {}, routingMalformed: false };
   }
   const prefs = {};
+  const arrayPaths = schemaArrayPaths(loadSchema());
   let routingMalformed = false;
   for (const entry of legacySectionBlocks(raw)) {
     if (entry.section === 'routing') {
@@ -214,11 +248,38 @@ function legacyReadFile(absPath) {
     }
     const section = {};
     if (entry.section === 'forge_isolation' && /(^|\n)[ \t]+repos:[ \t]*\n/.test(entry.block)) {
-      section.repos = parseLegacyRepos(entry.block);
+      section.repos = parseLegacyRepos(entry.block, arrayPaths);
     }
-    for (const line of entry.block.split(/\r?\n/)) {
-      const parsed = parseLegacyKeyLine(line);
-      if (parsed && !(entry.section === 'forge_isolation' && parsed.key === 'repos')) section[parsed.key] = parsed.value;
+    const lines = entry.block.split(/\r?\n/);
+    const directIndent = lines.reduce((minimum, line) => {
+      const match = line.match(/^([ \t]+)[A-Za-z0-9_.-]+:[ \t]*/);
+      return match ? Math.min(minimum, match[1].length) : minimum;
+    }, Infinity);
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index];
+      const keyMatch = line.match(/^([ \t]+)([A-Za-z0-9_.-]+):[ \t]*(.*)$/);
+      if (!keyMatch || keyMatch[1].length !== directIndent) continue;
+      const key = keyMatch[2];
+      if (entry.section === 'forge_isolation' && key === 'repos') continue;
+      const dottedPath = `${entry.section}.${key}`;
+      const isArrayPath = arrayPaths.has(dottedPath);
+      const parsed = parseLegacyKeyLine(line, isArrayPath);
+      if (!parsed) continue;
+      if (isArrayPath && stripLegacyInlineComment(parsed.rawValue).trim() === '') {
+        const items = [];
+        const keyIndent = keyMatch[1].length;
+        let next = index + 1;
+        while (next < lines.length) {
+          const item = lines[next].match(/^([ \t]*)-[ \t]+(.*)$/);
+          if (!item || item[1].length <= keyIndent) break;
+          items.push(stripLegacyInlineComment(item[2]).trim().replace(/^["']|["']$/g, ''));
+          next++;
+        }
+        section[key] = items;
+        index = next - 1;
+      } else {
+        section[key] = parsed.value;
+      }
     }
     prefs[entry.section] = section;
   }
@@ -559,10 +620,10 @@ function preferenceLayerDescriptors(cwd, opts) {
  * Resolve global preferences then project-local preferences.  No cache is
  * created: callers always receive an in-memory result for the current files.
  */
-function readPrefs(cwd) {
+function readPrefs(cwd, opts) {
   const targetCwd = cwd || process.cwd();
   const errors = [];
-  const [globalDescriptor, localDescriptor] = preferenceLayerDescriptors(targetCwd);
+  const [globalDescriptor, localDescriptor] = preferenceLayerDescriptors(targetCwd, opts);
   const globalLayer = resolveLayer(globalDescriptor.jsoncPath, globalDescriptor.mdFiles, errors);
   const localLayer = resolveLayer(localDescriptor.jsoncPath, localDescriptor.mdFiles, errors);
   const merged = deepMerge(globalLayer.prefs, localLayer.prefs);
@@ -739,7 +800,7 @@ function buildProvenance(globalPrefs, localPrefs) {
 }
 
 function parseCliArgs(argv) {
-  const args = { resolved: false, scaffold: false, rescaffold: null, write: false, out: null, key: null, explain: false, cwd: process.cwd() };
+  const args = { resolved: false, scaffold: false, rescaffold: null, write: false, out: null, key: null, explain: false, cwd: process.cwd(), globalDir: null, localDir: null };
   for (let index = 0; index < argv.length; index++) {
     if (argv[index] === '--resolved') args.resolved = true;
     else if (argv[index] === '--scaffold') args.scaffold = true;
@@ -749,6 +810,11 @@ function parseCliArgs(argv) {
     else if (argv[index] === '--explain') args.explain = true;
     else if (argv[index] === '--key') args.key = argv[++index] || '';
     else if (argv[index] === '--cwd') args.cwd = path.resolve(argv[++index] || process.cwd());
+    // Test/round-trip isolation: point either layer at a scratch dir so the
+    // migration proof can resolve the freshly-written file instead of the
+    // operator's real ~/.claude. Mirrors preferenceLayerDescriptors' opts.
+    else if (argv[index] === '--global-dir') args.globalDir = path.resolve(argv[++index] || '');
+    else if (argv[index] === '--local-dir') args.localDir = path.resolve(argv[++index] || '');
   }
   return args;
 }
@@ -833,14 +899,17 @@ function runCli(argv) {
     process.stderr.write('✗ prefs CLI error: use --resolved para resolver as preferências\n');
     return 1;
   }
-  const result = readPrefs(args.cwd);
+  const dirOpts = {};
+  if (args.globalDir) dirOpts.globalDir = args.globalDir;
+  if (args.localDir) dirOpts.localDir = args.localDir;
+  const result = readPrefs(args.cwd, dirOpts);
   const warnings = validatePrefs(result.prefs, loadSchema());
   const schemaWarning = schemaLoadWarning();
   if (schemaWarning) warnings.push(schemaWarning);
   const output = { ok: result.errors.length === 0, prefs: result.prefs, errors: result.errors, warnings, layers: result.layers };
   if (args.explain) {
-    const globalDir = path.join(os.homedir(), '.claude');
-    const localDir = path.join(args.cwd, '.gsd');
+    const globalDir = args.globalDir || path.join(os.homedir(), '.claude');
+    const localDir = args.localDir || path.join(args.cwd, '.gsd');
     output.provenance = buildProvenance(
       readProvenanceLayer(args.cwd, result.layers.global.source, [path.join(globalDir, 'forge-agent-prefs.jsonc'), path.join(globalDir, 'forge-agent-prefs.md')]),
       readProvenanceLayer(args.cwd, result.layers.local.source, [path.join(localDir, 'forge-prefs.jsonc'), path.join(localDir, 'claude-agent-prefs.md'), path.join(localDir, 'prefs.local.md')]),
