@@ -403,11 +403,22 @@ function checkSubstantive(content, lineCount, artifact) {
       effectiveRegexes = [];
     } else {
       // Caller-supplied extras + defaults
-      const extras = stubPatterns.map((src, i) => ({
-        name: `custom_stub_${i}`,
-        regex: new RegExp(src),
-        description: `Custom stub pattern: ${src}`,
-      }));
+      const extras = [];
+      for (let i = 0; i < stubPatterns.length; i++) {
+        const src = stubPatterns[i];
+        try {
+          const regex = new RegExp(src);
+          extras.push({
+            name: `custom_stub_${i}`,
+            regex,
+            description: `Custom stub pattern: ${src}`,
+          });
+        } catch (err) {
+          process.stderr.write(
+            `[forge-verifier] Warning: skipping invalid stub_pattern[${i}] in ${artifact.path}: ${JSON.stringify(src)}: ${err.message}\n`,
+          );
+        }
+      }
       effectiveRegexes = [...DEFAULT_STUB_REGEXES, ...extras];
     }
   } else {

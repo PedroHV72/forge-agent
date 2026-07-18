@@ -5440,6 +5440,42 @@ function smokeInitSetupScaffold() {
   pass('(final) Section 44: setup scaffold curado, schema ref e wiring verificados');
 }
 
+// ── Section 45: stub_pattern malformado não crasha o verifier (regressão) ──
+function smokeStubPatternRobustness() {
+  process.stdout.write('\n▸ Section 45: malformed stub_pattern does not crash the verifier\n');
+  const { _private } = require('./forge-verifier.js');
+  const { checkSubstantive } = _private;
+
+  // Content is inert to every DEFAULT_STUB_REGEXES entry — only a valid
+  // custom pattern (MAGIC_STUB_MARKER_XYZ) can flag it, so assertion (b)
+  // genuinely proves the custom pattern was compiled + applied, not a
+  // default regex incidentally matching (e.g. return_null_function).
+  const content = Array.from({ length: 20 }, (_, i) => `const x${i} = ${i}; // MAGIC_STUB_MARKER_XYZ`).join('\n');
+  const lineCount = content.split('\n').length;
+  const artifact = {
+    path: 'fixture.js',
+    min_lines: 5,
+    stub_patterns: ['assert(true', 'MAGIC_STUB_MARKER_XYZ'],
+  };
+
+  let result;
+  let threw = false;
+  try {
+    result = checkSubstantive(content, lineCount, artifact);
+  } catch (e) {
+    threw = true;
+  }
+  assert(!threw, '(a) stub_pattern malformado não crasha checkSubstantive');
+  assert(result && typeof result === 'object' && typeof result.pass === 'boolean',
+    '(a) checkSubstantive ainda retorna um resultado válido', JSON.stringify(result));
+  const customFlag = result && Array.isArray(result.flags)
+    && result.flags.find((f) => f.regex_name === 'custom_stub_1');
+  assert(result.pass === false && Array.isArray(result.flags) && result.flags.length > 0 && !!customFlag,
+    '(b) pattern customizado válido é compilado e detecta o marcador (não um regex default)', JSON.stringify(result));
+
+  pass('(final) Section 45: stub_pattern malformado tratado com segurança, patterns válidos preservados');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -5491,6 +5527,7 @@ async function main() {
     smokePrefsViewerDoctor();
     smokePrefsMigrationFidelity();
     smokeInitSetupScaffold();
+    smokeStubPatternRobustness();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
