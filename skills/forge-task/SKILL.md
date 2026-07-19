@@ -78,9 +78,8 @@ compaction is accepted because Compaction Resilience re-reads Load context.
 - `CS_RULES` ← `## Code Rules` section
 If missing, all section variables are `"(none)"`.
 
-**Resolve effort off the resolved `PREFS` object (defaults identical to the old inline snippet):**
+**Resolve the plan/discuss-phase effort off the resolved `PREFS` object** (default identical to the old inline snippet). The **executor** effort is NO longer static here — it is resolved dynamically (with model-cap clamp) by `forge-dispatch-resolve.js` in Step 5 (`$EFFORT`):
 - `EFFORT_OPUS = PREFS.effort.plan or "medium"`
-- `EFFORT_EXEC = PREFS.effort.execute or "low"`
 
 Initialize: `session_units = 0`, `COMPACT_AFTER = PREFS.compact_after || 10`
 (0 or "unlimited" in PREFS disables the compact signal entirely)
@@ -675,57 +674,64 @@ Campos:
 git -C "${CODE_DIR:-.}" rev-parse HEAD 2>/dev/null > .gsd/tasks/{TASK_ID}/.start-sha || echo "" > .gsd/tasks/{TASK_ID}/.start-sha
 ```
 
-**Engine resolution (before dispatch)** — resolve `$ENGINE ∈ {claude, codex}`. Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` (canonical, T01) — `forge-task` is single-task and always interactive, but the engine/fallback mechanics are byte-identical to the `forge-auto`/`forge-next` mirrors (T02/T03). `forge-task`'s only `unit_type` is `execute-task`, so the routing is always "active" (no `plan-slice` gating to worry about).
-> Cross-reference: `shared/forge-dispatch.md § Worker Engine Routing` (algorithm, prefs reader, sidecar state machine, fallback). Any change lands there first, then propagates here.
+**Dispatch resolution (before dispatch)** — resolve `{engine, model, alias, tier, domain, route_source, chain, chain_len, reason, effort, effort_reason}` for this dispatch via the **single `forge-dispatch-resolve.js --json` call** (S01). As of M012 S02 T02, this ONE call folds the former Engine Resolution + tier/domain routing + dynamic Effort Resolution + alias into a thin caller — `forge-task` is single-task and always interactive, but the engine/fallback mechanics are byte-identical to the `forge-auto`/`forge-next` mirrors, and it now has full domain-first routing parity. `forge-task`'s only `unit_type` is `execute-task` and it is a **loose task** (no roadmap) → no `--roadmap`, so risk-escalation is inert and the routing is always "active".
+> Cross-reference: `shared/forge-dispatch.md § Worker Engine Routing` (algorithm, prefs reader, engine-by-route_source table, sidecar state machine, fallback) + `scripts/forge-dispatch-resolve.js` (S01). Any change to the pure resolution lands in the resolver; this block is the executable caller.
 
 ```bash
-# ── Engine Resolution (before dispatch; execute-task routes to sidecar) ────────
-# Canonical per-unit prefs resolution — ONE forge-prefs.js --resolved call (dual-reads md OR
-# jsonc; NEVER a 3-file `files=[…forge-agent-prefs.md…]` cascade node -e merge, MEM001 M005).
-# See shared/forge-dispatch.md § Per-unit prefs resolution. forge-task's only unit_type is
-# execute-task, so no UNIT_TYPE indirection is needed. Read engine + timeout + codex_model off
-# .prefs.workers, default-safe (claude/1800/"" on absence).
+# ── Dispatch resolution (before dispatch; execute-task routes to sidecar) ──────
+# The explicit prefs loud-stop gate STAYS even though forge-dispatch-resolve.js also surfaces
+# prefs errors — an early, human-actionable halt on a broken config (M008-CONTEXT #2). ONE
+# forge-prefs.js --resolved call (dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge,
+# MEM001 M005). See shared/forge-dispatch.md § Per-unit prefs resolution.
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
 if [ $? -ne 0 ]; then
   # Loud stop (M008-CONTEXT #2): errors[] ({file,line,message}) on stdout, human hint on stderr.
-  # Stop this task run. NEVER degrade to WORKERS_ENGINE=claude et al. on a broken config.
+  # Stop this task run. NEVER degrade to a claude/effort-default fallback on a broken config.
   echo "✗ prefs parse error — dispatch halted (see stderr for arquivo:linha)" >&2
   exit 1
 fi
 # CRITICAL loud-stop (M008-CONTEXT #2): a nonzero prefs-CLI exit above HALTS the
 # dispatch. The `exit 1` fires when this block runs in a shell. In the
 # orchestrator, STOP this task run now: deactivate the run + surface
-# arquivo+linha+como-corrigir from `errors[]`. NEVER degrade to
-# WORKERS_ENGINE=claude / timeout / codex_model defaults on a broken config.
-WORKERS_ENGINE=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const w=JSON.parse(d).prefs.workers||{};let e=w['execute-task'];e=(typeof e==='string')?e.toLowerCase():null;process.stdout.write((e==='claude'||e==='codex')?e:'claude')}catch(err){process.stdout.write('claude')}})")
-WORKERS_TIMEOUT=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=(JSON.parse(d).prefs.workers||{}).timeout;process.stdout.write(Number.isInteger(t)&&t>0?String(t):'1800')}catch(err){process.stdout.write('1800')}})")
-CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=(JSON.parse(d).prefs.workers||{}).codex_model;process.stdout.write(c!=null&&c!==''?String(c):'')}catch(err){process.stdout.write('')}})")
+# arquivo+linha+como-corrigir from `errors[]`. NEVER degrade on a broken config.
 
-# Frontmatter worker: override — precedence over pref.
+# ONE resolver call — engine/model/alias/tier/domain/route_source/chain/effort all resolved inside
+# it (frontmatter worker: > routing: > pref > default precedence owned by the resolver, MEM018 reads
+# prefs from $WORKING_DIR). Loose task → NO --roadmap (risk-escalation inert). --cwd "$WORKING_DIR".
 PLAN_PATH=".gsd/tasks/{TASK_ID}/{TASK_ID}-PLAN.md"
-PLAN_WORKER=$(node -e "
-  const fs=require('fs');
-  const text=fs.readFileSync('$PLAN_PATH','utf8');
-  const m=text.match(/^---[\s\S]*?---/);
-  if(!m)process.exit(0);
-  let v=((m[0].match(/^worker:[ \t]*(\S+)/m)||[])[1]||'').trim().toLowerCase();
-  if(v!=='claude'&&v!=='codex')v='';   // whitelist; invalid → fall through
-  process.stdout.write(v);
-")
-
-# Resolve ENGINE (precedence: frontmatter > pref > default claude).
-if [ -n "$PLAN_WORKER" ]; then
-  ENGINE="$PLAN_WORKER";        ENGINE_REASON="frontmatter-worker:$PLAN_WORKER"
-elif [ -n "$WORKERS_ENGINE" ] && [ "$WORKERS_ENGINE" != "claude" ]; then
-  ENGINE="$WORKERS_ENGINE";     ENGINE_REASON="workers.execute-task:$WORKERS_ENGINE"
-else
-  ENGINE="claude";              ENGINE_REASON="default:claude"
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-dispatch-resolve.js ] && echo scripts || echo "$HOME/.claude/scripts")
+ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" \
+  --unit-type execute-task --plan "$PLAN_PATH" --unit-id "{TASK_ID}" --cwd "$WORKING_DIR" --json)
+if [ $? -ne 0 ]; then
+  # Non-zero exit == prefs loud-stop (M008-CONTEXT #2) — the resolver only exits 1 on prefs_ok:false.
+  echo "✗ dispatch resolver halted (prefs error) — see forge-dispatch-resolve.js prefs_errors" >&2
+  exit 1
 fi
+MODEL_ID=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).model)" "$ROUTE_JSON")
+MODEL_ALIAS=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).alias||'')" "$ROUTE_JSON")
+TIER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).tier)" "$ROUTE_JSON")
+REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).reason)" "$ROUTE_JSON")
+DOMAIN_USED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain)" "$ROUTE_JSON")
+ROUTE_SOURCE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).route_source)" "$ROUTE_JSON")
+CHAIN_LEN=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain_len))" "$ROUTE_JSON")
+ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine)" "$ROUTE_JSON")
+ENGINE_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine_reason)" "$ROUTE_JSON")
+EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)" "$ROUTE_JSON")
+EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)" "$ROUTE_JSON")
+WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).workers_timeout))" "$ROUTE_JSON")
+CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
+THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
+MODEL_APPLIED_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || printf 'null')
+# The sidecar codex model is fed from the resolved chain (chain[0].id when that member is a
+# gpt-* codex engine), falling back to the workers.codex_model pref for legacy compat.
+SIDECAR_MODEL=$(node -e "const r=JSON.parse(process.argv[1]);const c=(r.chain||[])[0];process.stdout.write(c&&c.engine==='codex'&&c.id?c.id:(r.codex_model||''))" "$ROUTE_JSON")
+# $ROUTE_JSON.chain carries forward unmodified — consumed by Branch codex (SIDECAR_MODEL) and by
+# the Failure Taxonomy via `forge-routing.js ... --next-after "$MODEL_ID"`.
 ```
-**Loud-stop on the per-unit prefs re-resolution above (M008-CONTEXT #2 — NOT a bare comment):** if the `forge-prefs.js --resolved` call at the top of this block exited non-zero, STOP this task run now — deactivate the run, surface arquivo + linha + como-corrigir from `errors[]`, and do **NOT** proceed on `WORKERS_ENGINE=claude` / `CODEX_MODEL` / any fallback value. The `exit 1` in the guard halts a shell-executed path; this prose halts the orchestrator-interpreted path.
+**Loud-stop on the resolution above (M008-CONTEXT #2 — NOT a bare comment):** if either the `forge-prefs.js --resolved` gate OR the `forge-dispatch-resolve.js` call exited non-zero, STOP this task run now — deactivate the run, surface arquivo + linha + como-corrigir from `errors[]`/`prefs_errors`, and do **NOT** proceed on any claude/effort-default fallback value. The `exit 1` guards halt a shell-executed path; this prose halts the orchestrator-interpreted path.
 
-`$ENGINE`, `$ENGINE_REASON`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL`, `$PLAN_PATH` are now set. The dispatch below branches on `$ENGINE`.
+`$ENGINE`, `$ENGINE_REASON`, `$MODEL_ID`, `$MODEL_ALIAS`, `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN`, `$EFFORT`, `$EFFORT_REASON`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL`, `$SIDECAR_MODEL`, `$THINKING_HEADER`, `$MODEL_APPLIED_JSON`, `$PLAN_PATH`, and `$ROUTE_JSON` (with `.chain`) are now set. The dispatch below branches on `$ENGINE`; the resolved `$EFFORT`/`$TIER`/`$DOMAIN_USED`/`$ROUTE_SOURCE`/`$CHAIN_LEN` are injected into the dispatch event (both paths).
 
 **Branch codex — sidecar (`$ENGINE == codex`)** — executable mirror of `shared/forge-dispatch.md § Worker Engine Routing § Sidecar dispatch state machine`. When this branch fires, the Claude machinery below (timeline task, guarded `Agent()` dispatch) is **replaced** by the detached adapter + polling; on any failure it resets and **falls through to that same Claude machinery** (fallback). When `$ENGINE == claude`, skip this branch entirely and proceed with the Claude dispatch below — byte-identical to the current loop.
 
@@ -745,14 +751,14 @@ if [ -n "$(git -C "${CODE_DIR:-.}" status --porcelain)" ]; then
 fi
 ```
 
-3. **Allocate the result-file OUTSIDE `CODE_DIR`** + dispatch detached via `run_in_background: true`. `--model` appended **only when `$CODEX_MODEL` is non-empty**:
+3. **Allocate the result-file OUTSIDE `CODE_DIR`** + dispatch detached via `run_in_background: true`. `--model` appended **only when `$SIDECAR_MODEL` is non-empty** — `$SIDECAR_MODEL` is the resolved chain's codex member (`chain[0].id` when `chain[0].engine == codex`), falling back to the `workers.codex_model` pref (legacy compat), so routing-selected gpt models flow to the sidecar, not only the flat pref:
 ```bash
 RESULT_FILE=$(mktemp -t forge-xllm-result.XXXXXX.json)   # tmpdir, never under CODE_DIR
 printf '{"start_sha":"%s","reason":"","result_file":"%s","code_dir":"%s"}\n' "$START_SHA" "$RESULT_FILE" "${CODE_DIR:-.}" > "$XLLM_STATE"
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
   --plan "$PLAN_PATH" --result-file "$RESULT_FILE" --cwd "${CODE_DIR:-.}" \
   --timeout "$WORKERS_TIMEOUT" \
-  $([ -n "$CODEX_MODEL" ] && printf -- '--model %s' "$CODEX_MODEL")
+  $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
 # ↑ dispatched with the Bash tool's run_in_background: true
 ```
 
@@ -764,8 +770,11 @@ START_SHA=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8'
 CODE_DIR=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).code_dir" 2>/dev/null)
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null)
 mkdir -p "$WORKING_DIR/.gsd/forge/"
-CODEX_MODEL_LABEL="${CODEX_MODEL:-codex-default}"
-echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${CODEX_MODEL_LABEL}\",\"reason\":\"${ENGINE_REASON}\",\"input_tokens\":0,\"output_tokens\":0,\"engine\":\"codex\"}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+CODEX_MODEL_LABEL="${SIDECAR_MODEL:-codex-default}"
+# Full routing-aware dispatch event (M012 S02 T02 — additive fields: tier/effort/effort_reason/
+# domain/route_source/chain_len/model_applied close the observability gap; before this the codex
+# event carried only engine/reason/model).
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${CODEX_MODEL_LABEL}\",\"tier\":\"${TIER}\",\"reason\":\"${ENGINE_REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"codex\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"milestone\":\"\",\"input_tokens\":0,\"output_tokens\":0,\"model_applied\":${MODEL_APPLIED_JSON}}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 # → proceed to "Process result" below. Do NOT run the Claude machinery below.
 ```
 
@@ -808,8 +817,8 @@ BRANCH: {resolved forge/{TASK_ID} branch}  # only when != shared
 CODE_DIR: {CODE_DIR}                       # only when != shared
 Isolation rule: all source-code reads, writes, builds and git commits happen inside CODE_DIR on branch BRANCH. All .gsd/** artifact paths stay under WORKING_DIR. Never commit from WORKING_DIR when CODE_DIR differs.
 auto_commit: {PREFS.auto_commit — true or false}
-effort: {EFFORT_EXEC}
-thinking: disabled
+effort: {EFFORT}
+thinking: {THINKING_HEADER == adaptive ? "adaptive" : "disabled"}
 
 ## Task Plan
 {content of {TASK_ID}-PLAN.md}
@@ -849,6 +858,12 @@ Write {TASK_ID}-SUMMARY.md to .gsd/tasks/{TASK_ID}/ with:
 If auto_commit is true: commit with message "feat({TASK_ID}): {one-liner description}".
 If auto_commit is false: do NOT run any git commands.
 Do NOT modify STATE.md. Return ---GSD-WORKER-RESULT---.
+```
+
+**Emit the dispatch event (claude path)** — once the `forge-executor` returns. This is the observability WIN: before M012 S02 T02 the claude path emitted NO dispatch event at all. Mirror the `forge-auto` claude-path event shape (full routing fields; `milestone` empty for a loose task). `$INPUT_TOKENS`/`$OUTPUT_TOKENS` come from the `Agent()` result usage (0 if unavailable):
+```bash
+mkdir -p "$WORKING_DIR/.gsd/forge/"
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"claude\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"milestone\":\"\",\"input_tokens\":${INPUT_TOKENS:-0},\"output_tokens\":${OUTPUT_TOKENS:-0},\"model_applied\":${MODEL_APPLIED_JSON}}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 ```
 
 **Process result:**
