@@ -5583,6 +5583,231 @@ function smokeDispatchResolve() {
   pass('(final) Section 46: resolver parity, SKILL cutover and routes-by-domain verified');
 }
 
+// ── Section 47: surgical reset — golden demo, overlap-abort, HARD invariant ──────
+// M013 S01 T01: proves scripts/forge-surgical-reset.js undoes ONLY the sidecar's
+// changes while preserving pre-existing uncommitted work byte-intact. This is the
+// single most safety-critical path in the codebase (a bug DESTROYS user work), so
+// every case is a REAL git fixture, not a narrative:
+//   (a) golden demo — pre-existing tracked-modified + untracked survive byte-intact,
+//       codex's tracked change is restored to START_SHA, codex's new file+dir removed.
+//   (b) overlap — codex touches a pre-dirty file (hash diverges) → exit 3, ZERO resets.
+//   (c) HARD invariant — clean tree: surgical target ≡ legacy whole-tree reset,
+//       byte-identical, proven on a twin fixture with the legacy commands.
+//   (d) persistence — --state-init writes start_sha + pre_dirty[{path,hash}] in one
+//       write; --state-update preserves pre_dirty.
+//   (e) purity — computeResetTarget unit asserts (codex deletion → restore,
+//       pre-existing deletion → preserve, rename).
+//   (f) .gsd/** never touched across snapshot/diff/reset.
+function smokeSurgicalReset() {
+  process.stdout.write('\n▸ Section 47: surgical reset — golden demo, overlap, HARD invariant\n');
+  const SR = path.join(SCRIPTS, 'forge-surgical-reset.js');
+  const sr = require(SR);
+
+  function gitq(cwd, args) {
+    const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+    return { status: r.status, stdout: (r.stdout || ''), stderr: (r.stderr || '') };
+  }
+  function initRepo(label) {
+    const dir = mkTmp(label);
+    gitq(dir, ['init', '-q', '-b', 'main']);
+    gitq(dir, ['config', 'user.email', 'smoke@forge']);
+    gitq(dir, ['config', 'user.name', 'smoke']);
+    return dir;
+  }
+  const W = (dir, rel, content) => {
+    const abs = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content, 'utf8');
+  };
+  const R = (dir, rel) => fs.readFileSync(path.join(dir, rel), 'utf8');
+  const runReset = (stateFile) => spawnSync('node', [SR, '--reset', '--state', stateFile], { encoding: 'utf8' });
+
+  // ── (a) golden demo ────────────────────────────────────────────────────────
+  {
+    const dir = initRepo('sr-golden');
+    W(dir, 'tracked.txt', 'baseline-tracked\n');
+    W(dir, 'pre-tracked.txt', 'baseline-pre\n');
+    W(dir, 'codex-tracked.txt', 'baseline-codex\n');
+    gitq(dir, ['add', '-A']); gitq(dir, ['commit', '-qm', 'init']);
+    // pre-existing dirty BEFORE dispatch: modify a tracked file + create an untracked
+    W(dir, 'pre-tracked.txt', 'USER-EDIT\n');
+    W(dir, 'pre-untracked.txt', 'USER-UNTRACKED\n');
+    const preTrackedHash = gitq(dir, ['hash-object', 'pre-tracked.txt']).stdout.trim();
+    const preUntrackedHash = gitq(dir, ['hash-object', 'pre-untracked.txt']).stdout.trim();
+    // snapshot (state file OUTSIDE the repo so it never pollutes the worktree)
+    const stateFile = path.join(dir, '.gsd', 'forge', 'xllm-state.json');
+    const init = spawnSync('node', [SR, '--state-init', '--state', stateFile, '--cwd', dir], { encoding: 'utf8' });
+    assert(init.status === 0 && /^[0-9a-f]{40}/.test(init.stdout.trim()),
+      '(a) --state-init prints the 40-char start_sha', JSON.stringify({ s: init.status, o: init.stdout }));
+    // simulate codex AFTER snapshot: modify a tracked file + create a new file in a new dir with a space
+    W(dir, 'codex-tracked.txt', 'CODEX-EDIT\n');
+    W(dir, 'codex-new.txt', 'CODEX-NEW\n');
+    W(dir, 'dir novo/arquivo com espaço.txt', 'CODEX-SPACE\n');
+    const rr = runReset(stateFile);
+    assert(rr.status === 0, '(a) golden reset exits 0', JSON.stringify({ s: rr.status, o: rr.stdout, e: rr.stderr }));
+    const out = JSON.parse(rr.stdout);
+    assert(out.ok === true && out.verified === true, '(a) result ok + verified', rr.stdout);
+    // pre-existing survives BYTE-INTACT
+    assert(R(dir, 'pre-tracked.txt') === 'USER-EDIT\n', '(a) pre-existing tracked-modified survives byte-intact', R(dir, 'pre-tracked.txt'));
+    assert(gitq(dir, ['hash-object', 'pre-tracked.txt']).stdout.trim() === preTrackedHash, '(a) pre-tracked hash unchanged');
+    assert(fs.existsSync(path.join(dir, 'pre-untracked.txt')) && gitq(dir, ['hash-object', 'pre-untracked.txt']).stdout.trim() === preUntrackedHash,
+      '(a) pre-existing untracked survives byte-intact');
+    // codex changes undone
+    assert(R(dir, 'codex-tracked.txt') === 'baseline-codex\n', '(a) codex tracked change restored to START_SHA', R(dir, 'codex-tracked.txt'));
+    assert(!fs.existsSync(path.join(dir, 'codex-new.txt')), '(a) codex new untracked file removed');
+    assert(!fs.existsSync(path.join(dir, 'dir novo')), '(a) codex new dir (name with space) removed + parent pruned');
+    cleanup(dir);
+  }
+
+  // ── (b) overlap → exit 3, ZERO resets ───────────────────────────────────────
+  {
+    const dir = initRepo('sr-overlap');
+    W(dir, 'pre-tracked.txt', 'baseline-pre\n');
+    gitq(dir, ['add', '-A']); gitq(dir, ['commit', '-qm', 'init']);
+    W(dir, 'pre-tracked.txt', 'USER-EDIT\n'); // pre-existing dirty
+    const stateFile = path.join(dir, '.gsd', 'forge', 'xllm-state.json');
+    spawnSync('node', [SR, '--state-init', '--state', stateFile, '--cwd', dir], { encoding: 'utf8' });
+    // codex ALSO modifies the pre-dirty file (hash diverges) + drops an unrelated new file
+    W(dir, 'pre-tracked.txt', 'CODEX-OVERWRITE\n');
+    W(dir, 'codex-new.txt', 'CODEX-NEW\n');
+    const rr = runReset(stateFile);
+    assert(rr.status === 3, '(b) overlap → exit 3', JSON.stringify({ s: rr.status, o: rr.stdout }));
+    const out = JSON.parse(rr.stdout);
+    assert(Array.isArray(out.overlap) && out.overlap.includes('pre-tracked.txt'), '(b) overlap lists pre-tracked.txt in stdout JSON', rr.stdout);
+    // ZERO resets — even the non-overlapped codex file is untouched
+    assert(fs.existsSync(path.join(dir, 'codex-new.txt')), '(b) non-overlapped codex file NOT removed (zero resets)');
+    assert(R(dir, 'pre-tracked.txt') === 'CODEX-OVERWRITE\n', '(b) overlapped file left as-is (never destructively reset)');
+    cleanup(dir);
+  }
+
+  // ── (c) HARD invariant: clean tree → surgical ≡ legacy whole-tree reset ──────
+  {
+    // codex changes applied AFTER a clean snapshot: tracked modify + untracked
+    // create (incl. a new nested dir) + codex deletes a tracked file.
+    const applyCodexChanges = (dir) => {
+      W(dir, 'codex-tracked.txt', 'CODEX-EDIT\n');
+      W(dir, 'codex-new.txt', 'CODEX-NEW\n');
+      W(dir, 'sub dir/new nested.txt', 'NESTED\n');
+      fs.rmSync(path.join(dir, 'to-delete.txt'));
+    };
+    const seed = (dir) => {
+      W(dir, 'tracked.txt', 'baseline\n');
+      W(dir, 'codex-tracked.txt', 'baseline-codex\n');
+      W(dir, 'to-delete.txt', 'delete-me\n');
+      gitq(dir, ['add', '-A']); gitq(dir, ['commit', '-qm', 'init']);
+      return gitq(dir, ['rev-parse', 'HEAD']).stdout.trim();
+    };
+    // twin A — surgical: snapshot on the CLEAN tree (pre_dirty empty), then codex.
+    const dA = initRepo('sr-hard-surgical');
+    const sA = seed(dA);
+    const sf = path.join(dA, '.gsd', 'forge', 'xllm-state.json');
+    spawnSync('node', [SR, '--state-init', '--state', sf, '--cwd', dA], { encoding: 'utf8' });
+    const stateA = JSON.parse(fs.readFileSync(sf, 'utf8'));
+    assert(Array.isArray(stateA.pre_dirty) && stateA.pre_dirty.length === 0, '(c) clean tree → pre_dirty empty', JSON.stringify(stateA.pre_dirty));
+    applyCodexChanges(dA);
+    const rrA = runReset(sf);
+    assert(rrA.status === 0, '(c) surgical reset on clean-snapshot tree exits 0', rrA.stdout + rrA.stderr);
+    // twin B — legacy whole-tree reset with the SAME codex changes
+    const dB = initRepo('sr-hard-legacy');
+    const sB = seed(dB);
+    applyCodexChanges(dB);
+    // legacy: git checkout <sha> -- . ':(exclude).gsd' && git clean -fd -e .gsd
+    gitq(dB, ['checkout', sB, '--', '.', ':(exclude).gsd']);
+    gitq(dB, ['clean', '-fd', '-e', '.gsd']);
+    // both trees must now be byte-identical on the NON-.gsd tree: porcelain empty +
+    // diff vs sha empty. twin A carries its own .gsd/ state file (deliberately left
+    // untouched by the reset) which twin B never had — filter it out for a fair diff.
+    const noGsd = (s) => s.split('\n').filter((l) => l && !/\.gsd(\/|$)/.test(l)).join('\n');
+    const porcA = noGsd(gitq(dA, ['status', '--porcelain']).stdout);
+    const porcB = noGsd(gitq(dB, ['status', '--porcelain']).stdout);
+    const diffA = noGsd(gitq(dA, ['diff', '--name-only', sA]).stdout);
+    const diffB = noGsd(gitq(dB, ['diff', '--name-only', sB]).stdout);
+    assert(porcA.trim() === '' && porcB.trim() === '', '(c) HARD invariant: both trees clean (porcelain empty)', JSON.stringify({ porcA, porcB }));
+    assert(diffA.trim() === '' && diffB.trim() === '', '(c) HARD invariant: both trees ≡ START_SHA (diff empty)', JSON.stringify({ diffA, diffB }));
+    assert(porcA === porcB && diffA === diffB, '(c) HARD invariant: surgical output byte-identical to legacy whole-tree reset');
+    // restored content matches between twins
+    assert(R(dA, 'codex-tracked.txt') === R(dB, 'codex-tracked.txt'), '(c) restored tracked content identical across twins');
+    assert(fs.existsSync(path.join(dA, 'to-delete.txt')) && fs.existsSync(path.join(dB, 'to-delete.txt')), '(c) codex-deleted tracked file restored in both');
+    cleanup(dA); cleanup(dB);
+  }
+
+  // ── (d) snapshot persistence ─────────────────────────────────────────────────
+  {
+    const dir = initRepo('sr-persist');
+    W(dir, 'a.txt', 'base\n');
+    gitq(dir, ['add', '-A']); gitq(dir, ['commit', '-qm', 'init']);
+    W(dir, 'a.txt', 'dirty\n');
+    W(dir, 'b.txt', 'untracked\n');
+    const stateFile = path.join(dir, '.gsd', 'forge', 'xllm-state.json');
+    spawnSync('node', [SR, '--state-init', '--state', stateFile, '--cwd', dir, '--attempt', '2'], { encoding: 'utf8' });
+    const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert(/^[0-9a-f]{40}$/.test(st.start_sha), '(d) state has 40-char start_sha');
+    assert(st.attempt === 2, '(d) state records attempt');
+    assert(Array.isArray(st.pre_dirty) && st.pre_dirty.length === 2, '(d) pre_dirty has both dirty paths', JSON.stringify(st.pre_dirty));
+    assert(st.pre_dirty.every((d) => typeof d.path === 'string' && (d.hash === null || /^[0-9a-f]{40}$/.test(d.hash))),
+      '(d) pre_dirty entries are {path, hash}');
+    // --state-update preserves pre_dirty
+    spawnSync('node', [SR, '--state-update', '--state', stateFile, '--reason', 'codex-timeout', '--result-file', '/tmp/x.json'], { encoding: 'utf8' });
+    const st2 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert(st2.reason === 'codex-timeout' && st2.result_file === '/tmp/x.json', '(d) --state-update writes reason/result_file');
+    assert(JSON.stringify(st2.pre_dirty) === JSON.stringify(st.pre_dirty), '(d) --state-update preserves pre_dirty intact');
+    assert(st2.start_sha === st.start_sha, '(d) --state-update preserves start_sha');
+    cleanup(dir);
+  }
+
+  // ── (e) purity of computeResetTarget (require, no fixture) ───────────────────
+  {
+    // codex deletion → restore; pre-existing deletion → preserve; codex add → remove; rename.
+    const postChanges = [
+      { path: 'codex-mod.txt', status: 'M' },
+      { path: 'codex-del.txt', status: 'D' },
+      { path: 'codex-new.txt', status: 'A' },
+      { path: 'pre-mod.txt', status: 'M' },      // pre-existing, appears in post-diff but must NOT be reset
+      { path: 'pre-del.txt', status: 'D' },      // pre-existing deletion, intact
+    ];
+    const preDirty = [
+      { path: 'pre-mod.txt', hash: 'aaa' },
+      { path: 'pre-del.txt', hash: null },
+      { path: 'pre-touched.txt', hash: 'bbb' }, // codex ALSO wrote this → overlap
+    ];
+    const hashNow = (p) => ({ 'pre-mod.txt': 'aaa', 'pre-del.txt': null, 'pre-touched.txt': 'DIVERGED' }[p]);
+    const t = sr.computeResetTarget(postChanges, preDirty, hashNow);
+    assert(t.overlap.length === 1 && t.overlap[0] === 'pre-touched.txt', '(e) pure: divergent pre-dirty hash → overlap', JSON.stringify(t));
+    assert(t.preserved.includes('pre-mod.txt') && t.preserved.includes('pre-del.txt'), '(e) pure: intact pre-dirty (incl. deletion) → preserved', JSON.stringify(t));
+    assert(t.restore.includes('codex-mod.txt') && t.restore.includes('codex-del.txt'), '(e) pure: codex M + D → restore', JSON.stringify(t));
+    assert(t.remove.includes('codex-new.txt'), '(e) pure: codex A → remove', JSON.stringify(t));
+    assert(!t.restore.includes('pre-mod.txt') && !t.remove.includes('pre-del.txt'), '(e) pure: pre-existing paths never targeted', JSON.stringify(t));
+    // parsers
+    const porc = sr.parsePorcelainZ('R  new name.txt\0old name.txt\0?? plain.txt\0');
+    assert(porc.length === 2 && porc[0].origPath === 'old name.txt' && porc[1].path === 'plain.txt',
+      '(e) parsePorcelainZ handles rename extra field + spaces', JSON.stringify(porc));
+    const ns = sr.parseNameStatusZ('R100\0old.txt\0new.txt\0M\0mod.txt\0');
+    assert(ns.length === 2 && ns[0].origPath === 'old.txt' && ns[0].path === 'new.txt' && ns[1].status === 'M',
+      '(e) parseNameStatusZ handles rename two-path record', JSON.stringify(ns));
+    assert(sr.isGsdPath('.gsd/STATE.md') && sr.isGsdPath('.gsd') && !sr.isGsdPath('src/.gsdx'), '(e) isGsdPath predicate');
+  }
+
+  // ── (f) .gsd/** never touched (snapshot/diff/reset all exclude it) ───────────
+  {
+    const dir = initRepo('sr-gsd');
+    W(dir, 'code.txt', 'base\n');
+    W(dir, '.gsd/STATE.md', 'committed-state\n');
+    gitq(dir, ['add', '-A']); gitq(dir, ['commit', '-qm', 'init']);
+    const stateFile = path.join(dir, '.gsd', 'forge', 'xllm-state.json');
+    spawnSync('node', [SR, '--state-init', '--state', stateFile, '--cwd', dir], { encoding: 'utf8' });
+    // orchestrator writes .gsd during the run + codex changes a real file
+    W(dir, '.gsd/STATE.md', 'ORCHESTRATOR-UPDATED\n');
+    W(dir, 'code.txt', 'CODEX-EDIT\n');
+    const rr = runReset(stateFile);
+    assert(rr.status === 0, '(f) reset exits 0 with .gsd churn present', rr.stdout + rr.stderr);
+    assert(R(dir, '.gsd/STATE.md') === 'ORCHESTRATOR-UPDATED\n', '(f) .gsd/** left untouched by the reset');
+    assert(R(dir, 'code.txt') === 'base\n', '(f) real codex change still restored');
+    cleanup(dir);
+  }
+
+  pass('(final) Section 47: surgical reset — golden/overlap/HARD-invariant/persistence/purity/.gsd all verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -5636,6 +5861,7 @@ async function main() {
     smokeInitSetupScaffold();
     smokeStubPatternRobustness();
     smokeDispatchResolve();
+    smokeSurgicalReset();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
