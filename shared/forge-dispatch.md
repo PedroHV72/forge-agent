@@ -1105,18 +1105,52 @@ RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf
 
 After materializing, the orchestrator emits the `dispatch` event (`engine:"codex"`, unit `plan-slice/{S##}`) and control **rejoins the normal `plan-slice` completion path** exactly as if a Claude `forge-planner` had just written the files: the **plan-check gate**, the **symbol-check gate** and the interactive **plan_gate** all run over the materialized files, agnostic of origin (locked — **nothing in those gates changes**). No `T##-SUMMARY`/`---GSD-WORKER-RESULT---` is synthesized here — plan-slice produces plan files, not a task result.
 
+#### Layer-1 transient retry (sidecar parity with the Claude Retry Handler)
+
+**Purpose:** give the codex sidecar the same transient/permanent distinction the Claude path already gets from § Retry Handler, **before** any Layer-2 chain-walk or `worker-engine-fallback` degradation is considered. This sub-section is the single place that decision lives — Branch C and Branch D both defer to it; neither reimplements it inline.
+
+**Ordering (explicit).** On a sidecar failure the orchestrator ALWAYS evaluates Layer-1 first: read `error_class`, decide retry-vs-advance, and only on exhaustion (or an immediately-terminal class) does control fall through to Layer-2 (§ Cross-engine chain walk) / the Fallback below. Layer-1 never runs *after* Layer-2 — it is strictly upstream of it, mirroring how the per-`Agent()` Retry Handler is upstream of the claude-member chain-walk.
+
+**Gatilho (trigger).** Any sidecar failure surfaced by the poll loop (`status == "error"` / adapter exit `!= 0` / `codex-orphan`) carries — when the result-file is readable — an `error_class` field written by the adapter (`scripts/forge-xllm.js`, S02/T01): `"transient"` or `"terminal"`. Read it directly off the result JSON (or the `adapter-failed` marker written on a hard adapter crash — same field). **Absent or unrecognized `error_class` defaults to `terminal`** — byte-identical to pre-T02 behavior, so an adapter that hasn't been upgraded yet (or a marker written before this field existed) degrades safely to the existing single-shot fallback, never to an unbounded retry. `codex-timeout` and `codex-orphan` are **always `terminal`** regardless of what a stale/mismatched `error_class` might say (the adapter itself forces `classifyErrorClass()` to return `"terminal"` on its own timeout marker — LOCKED, checked before the general classifier) — a hung/orphaned process is never retried in place.
+
+**Decisão.** Layer-1 retry fires when **both**:
+1. `error_class == "transient"`, AND
+2. `transient_retry_count < retry.max_transient_retries` — read off the SAME resolved knob the Claude Retry Handler uses, `PREFS.retry.max_transient_retries` (default `3`, `PREFS?.retry?.max_transient_retries ?? 3` — see § Per-unit prefs resolution; no new prefs key).
+
+Otherwise (terminal class, or the counter has reached the cap) control falls through to Layer-2 / the Fallback below, unchanged.
+
+**Ação — Branch C (execute-task, read-write).**
+1. **Surgical reset of the codex partial** — same helper and same verified-reset criterion as the Fallback action sequence (`forge-surgical-reset.js --reset --state "$XLLM_STATE"`, S01 engine). `RC == 0` required to proceed; `RC == 3` (`surgical-reset-overlap`) or `RC == 2` (`verified-reset-failed`) abort straight to the Claude fallback exactly as they do in the Fallback section — a Layer-1 retry NEVER dispatches attempt N+1 on top of an unverified or overlapping tree.
+2. **Backoff** — `retry.base_backoff_ms` (default `2000`), applied exponentially per retry (`delay_ms = base * 2^(transient_retry_count)`), mirroring the Claude Retry Handler's exponential override (§ Retry Handler step 7). Sleep via the same cross-platform Node one-liner pattern.
+3. **Persist the counter** via `--state-update --transient-retry-count $((n+1))` on the **CURRENT** attempt's state file `xllm-state-{unitId}-attempt-{N}.json` — never a plain printf (same read-modify-write discipline as step 3 of the state machine above; a hand-written printf would clobber `pre_dirty`/`start_sha`).
+4. **Re-dispatch the SAME codex member** — Branch C step 0 runs again for this attempt WITHOUT incrementing `SIDECAR_ATTEMPT` and WITHOUT allocating a new `-attempt-N` state file: the retry reuses the current attempt's state (fresh `RESULT_FILE` via `--state-update`, same `start_sha`/`pre_dirty`, same `N`). Only `transient_retry_count` advances.
+
+**Ação — Branch D (plan-slice, read-only).** Identical decision + counter + backoff + re-dispatch, but **no surgical reset step** — Branch D never wrote anything to `CODE_DIR` in the first place (read-only twin, no `start_sha`/`pre_dirty` to reset from), consistent with Branch D's existing "no reset machinery" invariant (§ BLOCKER item 3 note). The result JSON is simply discarded and the same codex `--mode plan` dispatch re-runs after backoff, counter incremented via `--state-update` on Branch D's state file (`xllm-state-{unitId}.json`).
+
+**Ortogonalidade (invariante explícito).** `transient_retry_count` is scoped to the CURRENT sidecar attempt `N` — it counts retries **within** that attempt, and is **⊥ (orthogonal to) `SIDECAR_ATTEMPT`**: a Layer-1 retry never increments `SIDECAR_ATTEMPT` and never consumes a codex chain member's budget (the ≤3-members-plus-fallback cap from § BLOCKER item 3). A chain `gpt→claude→gpt` that hits two transient retries on the first `gpt` member still has both `gpt` slots intact in the chain afterward — Layer-1 exhaustion is what advances the chain (via Layer-2), not the retries themselves.
+
+**Exaustão.** When `transient_retry_count == retry.max_transient_retries`, Layer-1 stops retrying and falls through to the existing Layer-2 (§ Cross-engine chain walk → `worker-engine-fallback`), **unchanged** — the same verified-reset-then-advance (or overlap/failed-reset abort) logic in that section runs exactly as if there had been no transient retries at all. Emit one additive event per transient retry attempt (never on the terminal/exhaustion transition — that already emits `worker-engine-fallback` or the chain-walk's own event):
+
+```json
+{"ts":"<ISO>","event":"sidecar-transient-retry","milestone":"{M###}","slice":"{S##}","unit":"execute-task/{T##}","attempt":N,"transient_retry_count":K,"backoff_ms":N}
+```
+
+`unit` mirrors the `worker-engine-fallback` convention (`execute-task/{T##}` on Branch C, `plan-slice/{S##}` on Branch D).
+
+**Invariante HARD.** On the pure-Claude path, or on any clean-tree unit where `ENGINE == claude`, nothing in this sub-section ever runs — Layer-1 transient retry exists **only** on the codex branch (Branch C or Branch D) and only fires when a dispatched sidecar's `error_class` reads `"transient"`. It is not a new recovery layer (MEM001 unaffected — this is retry-before-fallback within the existing dispatch-time degradation, exactly as the Claude Retry Handler is retry-before-chain-walk within the existing Failure Taxonomy).
+
 #### Fallback — `worker-engine-fallback`
 
-Clone of `review-challenger-fallback` (`shared/forge-review.md`). **One event type, triggers discriminated by `reason`.** On any trigger the work reverts to a single Claude dispatch — **no retry of the codex work, no 4th recovery layer**. The fallback target depends on the unit: `execute-task` → `forge-executor` (Branch C), `plan-slice` → `forge-planner` (Branch D).
+Clone of `review-challenger-fallback` (`shared/forge-review.md`). **One event type, triggers discriminated by `reason`.** On any trigger the work reverts to a single Claude dispatch — **no retry of the codex work, no 4th recovery layer**. The fallback target depends on the unit: `execute-task` → `forge-executor` (Branch C), `plan-slice` → `forge-planner` (Branch D). **A trigger below only fires after Layer-1 transient retry (previous sub-section) has been exhausted or the failure was immediately `terminal`** — `codex-exit-nonzero` / `codex-invalid-json` with `error_class: transient` route through Layer-1 first; `codex-timeout` / `codex-orphan` are always terminal and skip Layer-1 entirely.
 
 Triggers (`reason` value):
 
 | `reason` | Cause | Applies to |
 |----------|-------|------------|
-| `codex-exit-nonzero` | adapter exit `!= 0` (binary absent, auth, quota — cause on stderr; **plan: also `must_haves` invalid in-sidecar → exit 2**) | both |
-| `codex-timeout` | adapter hit its `--timeout` backstop | both |
-| `codex-invalid-json` | result-file present but unparseable / schema-invalid | both |
-| `codex-orphan` | heartbeat `updated_at` stale beyond threshold → killed | both |
+| `codex-exit-nonzero` | adapter exit `!= 0` (binary absent, auth, quota — cause on stderr; **plan: also `must_haves` invalid in-sidecar → exit 2**). With `error_class: transient` this trigger routes through **§ Layer-1 transient retry** first — the row here fires only after that retry loop is exhausted (or `error_class: terminal`). | both |
+| `codex-timeout` | adapter hit its `--timeout` backstop. **Always `error_class: terminal`** (LOCKED — forced regardless of message content) → skips § Layer-1 entirely, fires this trigger directly. | both |
+| `codex-invalid-json` | result-file present but unparseable / schema-invalid. Routes through § Layer-1 first when a readable `error_class: transient` is present; otherwise fires directly (unparseable JSON has no `error_class` to read → defaults `terminal`). | both |
+| `codex-orphan` | heartbeat `updated_at` stale beyond threshold → killed. **Always terminal** (an orphaned/hung process is never retried in place) → skips § Layer-1, fires this trigger directly. | both |
 | `surgical-reset-overlap` | `forge-surgical-reset.js --reset` exit 3 — a pre-dirty path's current hash diverged from its snapshot hash (the sidecar ALSO wrote a pre-existing dirty file); **NOTHING was reset**, not even the non-overlapped paths | execute-task only (Branch C) |
 | `verified-reset-failed` | `forge-surgical-reset.js --reset` exit 2 — post-reset verification found a leftover change that isn't an intact pre-dirty path | execute-task only (Branch C) |
 
@@ -1163,7 +1197,7 @@ Triggers (`reason` value):
 
 A cross-engine chain such as `gpt→claude→gpt` dispatches the sidecar **multiple times in the same unit**. The M005 fallback assumed "codex fails → 1 Claude retry"; the multi-member chain breaks that assumption. This contract is defined here as **first-class content** (not an afterthought) and is honored structurally by T01 (this spec) + T02/T03 (executable mirrors) + T04 (smoke doc-presence). Three invariants:
 
-1. **State fresh per attempt.** Each sidecar dispatch in the chain writes its own state file `xllm-state-{unitId}-attempt-{N}.json` (suffix `-attempt-N`, `N` incrementing per codex dispatch of the unit). It **NEVER overwrites** the prior attempt's state — audit preserved, post-compact recovery unambiguous. The success/fallback block re-reads the state of the **CURRENT** attempt `N` from disk (shell vars are gone across the poll loop). This closes risk #2b (state file clobbered between attempts → lost audit).
+1. **State fresh per attempt.** Each sidecar dispatch in the chain writes its own state file `xllm-state-{unitId}-attempt-{N}.json` (suffix `-attempt-N`, `N` incrementing per codex dispatch of the unit). It **NEVER overwrites** the prior attempt's state — audit preserved, post-compact recovery unambiguous. The success/fallback block re-reads the state of the **CURRENT** attempt `N` from disk (shell vars are gone across the poll loop). This closes risk #2b (state file clobbered between attempts → lost audit). **`transient_retry_count` (§ Layer-1 transient retry) lives INSIDE this same per-attempt state file** — it does not create a new attempt and does not create a new state file; a Layer-1 retry re-uses attempt `N`'s file, patching `transient_retry_count` via `--state-update` (never a plain printf — same discipline as `result_file` in step 3 of the state machine above).
 
 2. **Verified reset before the next sidecar attempt — criterion is exit 0 of the helper, not porcelain-clean.** With a legitimate pre-existing dirty tree (step 1's snapshot), `git status --porcelain` clean is **no longer the success criterion** — a pre-dirty file is expected to still show as changed after a correct reset. The advance criterion is instead: `forge-surgical-reset.js --reset --state "$XLLM_STATE"` exits **0** (post-run changes ≡ the snapshot, re-verified by re-hashing every `pre_dirty` path):
    ```bash
@@ -1199,8 +1233,8 @@ Rules by member-failure kind:
 |--------|----------------|--------|
 | **claude** member | `status: blocked` (`model_refusal` / `429` / `400`) | **Layer 2** advances the chain via `--next-after` (this *is* the walk that replaces `forge-tier-chain --next-after` — same layer, new resolver). |
 | **claude** member | `Agent()` **throw** (API 500 / timeout) | **Layer 1** Retry Handler (per member, unchanged) — not the chain walk. |
-| **codex** member | sidecar failure (`codex-exit-nonzero` / `codex-timeout` / `codex-orphan` / `codex-invalid-json`) | **verified reset** (BLOCKER item 2, `RC == 0`) + advance the chain via `--next-after`. |
-| **codex** member | `surgical-reset-overlap` / `verified-reset-failed` (helper `--reset` exit 3/2) | **abort** the chain to the Claude fallback (no advance). |
+| **codex** member | sidecar failure (`codex-exit-nonzero` / `codex-timeout` / `codex-orphan` / `codex-invalid-json`) | **§ Layer-1 transient retry FIRST** when `error_class: transient` and `transient_retry_count < cap` (same member, no chain advance). Only on Layer-1 exhaustion, or an immediately-`terminal` class (`codex-timeout`/`codex-orphan` always terminal) → **verified reset** (BLOCKER item 2, `RC == 0`) + advance the chain via `--next-after`. |
+| **codex** member | `surgical-reset-overlap` / `verified-reset-failed` (helper `--reset` exit 3/2) | **abort** the chain to the Claude fallback (no advance) — this applies identically whether the reset that failed was a Layer-1 retry reset or the Layer-2 advance reset. |
 | **chain exhausted** | `--next-after` returns `''` | dispatch the **category fallback** ONCE (1 mapped Claude, validated S01) → if that too fails, `blocked → human`. |
 
 `worker-engine-fallback` continues to fire **in-band** at dispatch time, once per trigger; it is NOT the chain walk and NOT a new layer. The chain walk is Layer 2 (`status: blocked` results); the fallback is the dispatch-time degradation when a codex member cannot run at all. Both feed the same ≤3-members-plus-fallback budget.
