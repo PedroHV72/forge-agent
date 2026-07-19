@@ -845,6 +845,8 @@ Placeholder classification:
 
 > **Cross-reference:** The resolver call and the cross-engine chain contract are defined in `scripts/forge-routing.js` (S01) — see § Single-call resolver below. The `workers:` prefs reader (legacy compat path) follows the `readEvidenceMode` / [`shared/forge-review.md § Step 0`](forge-review.md) regex-over-raw-prefs model. The fallback (`worker-engine-fallback`) is a clone of the `review-challenger-fallback` in [`shared/forge-review.md § Fallback challenger`](forge-review.md). The sidecar adapter contract (result-file JSON, heartbeat, exit codes) is defined in `scripts/forge-xllm.js` (S01).
 
+> **Fonte executável única (M012):** as of M012 S02, engine resolution described here no longer has its own standalone bash block in the skills — it is one of the fields (`engine`/`engine_reason`) emitted by the **same** `scripts/forge-dispatch-resolve.js --json` call that resolves Tier + Effort + Alias (see § Tier Resolution → Wiring snippet). This section remains the canonical spec for *what* the engine decision means (route_source table, sidecar state machine, BLOCKER contract, fallback); the *executable* implementation of the decision logic lives in the resolver.
+
 #### When to apply
 
 Engine Routing runs at the **top** of the Step 4 dispatch for a worker, **before** Tier Resolution (and therefore before Effort Resolution, which depends on `$MODEL_ID`). The ordering is deliberate: when `ENGINE == codex` the Claude Tier/Effort Resolution is **skipped entirely** (Codex resolves its own model), and only runs on the Claude path — including the fallback path, where the fallback re-enters Tier/Effort Resolution as a normal Claude dispatch.
@@ -1518,102 +1520,82 @@ M005/M006 path (the engine is decided by the legacy Engine Resolution, the model
 
 #### Wiring snippet
 
-Drop this block into the dispatch loop (e.g. `skills/forge-auto/SKILL.md` Step 3, before the `Agent()` call). It is self-contained and copy-paste-adaptable for both `forge-auto` (T04) and `forge-next` (T04).
+**Fonte executável única (M012):** the algorithm described in steps 1-5 above (unit-type default →
+frontmatter precedence → risk escalation → domain extraction → routing/chain resolution) is the
+SPEC. The one and only EXECUTABLE implementation of that spec is
+[`scripts/forge-dispatch-resolve.js`](../scripts/forge-dispatch-resolve.js) — as of M012 S02 it also
+folds in Worker Engine Routing (engine-by-route_source) and Effort Resolution (default, frontmatter
+override, risk-sync, model-cap clamp) into the SAME call, so Tier + Effort + Engine + Alias resolve
+in one shell-out. `skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md`, and
+`skills/forge-task/SKILL.md` are all cut over (T01/T02) — they never re-implement `declare -A
+TIER_DEFAULTS` / `declare -A EFFORT_DEFAULTS` / the clamp regex inline anymore. Any change to the
+pure resolution algorithm (tables, precedence, clamp cap) lands in `forge-dispatch-resolve.js`
+first; this markdown stays in sync as the read-only spec, never re-diverged into duplicate bash
+logic.
+
+Drop this **thin caller** into the dispatch loop (e.g. `skills/forge-auto/SKILL.md` Step 1.5, before
+the `Agent()` call). It is self-contained and copy-paste-adaptable for `forge-auto`, `forge-next`,
+and `forge-task` — the three files above are the canonical live copies; treat any drift from this
+block as a bug.
 
 ```bash
-# ── Tier Resolution (before Agent() call) ─────────────────────────────────────
-# Step 1: unit-type default
-declare -A TIER_DEFAULTS=(
-  [memory-extract]="light" [complete-slice]="light" [complete-milestone]="light"
-  [research-milestone]="standard" [research-slice]="standard"
-  [discuss-milestone]="standard" [discuss-slice]="standard" [execute-task]="standard"
-  [plan-milestone]="max" [plan-slice]="heavy"
-)
-TIER="${TIER_DEFAULTS[$UNIT_TYPE]:-standard}"
-REASON="unit-type:$UNIT_TYPE"
-
-# Step 2: parse frontmatter (execute-task only)
-if [ "$UNIT_TYPE" = "execute-task" ]; then
-  PLAN_TIER=$(node -e "const fs=require('fs');const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);if(!m)process.exit(0);const r=(m[0].match(/^tier:\s*(.+)$/m)||[])[1]||'';process.stdout.write(r.trim())")
-  PLAN_TAG=$(node -e  "const fs=require('fs');const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);if(!m)process.exit(0);const r=(m[0].match(/^tag:\s*(.+)$/m)||[])[1]||'';process.stdout.write(r.trim())")
-  PLAN_EFFORT=$(node -e "const fs=require('fs');const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);if(!m)process.exit(0);const r=(m[0].match(/^effort:\s*(.+)$/m)||[])[1]||'';process.stdout.write(r.trim())")
-
-  # Step 3: apply precedence
-  if [ -n "$PLAN_TIER" ]; then
-    TIER="$PLAN_TIER"; REASON="frontmatter-override:$PLAN_TIER"
-  elif [ "$PLAN_TAG" = "docs" ]; then
-    TIER="light"; REASON="frontmatter-tag:docs"
-  fi
+# ── Dispatch resolution (single call to the shared resolver) ─────────────────────
+# forge-dispatch-resolve.js reads prefs from $WORKING_DIR (MEM018 — never $CODE_DIR), parses the
+# PLAN frontmatter + ROADMAP, and emits the full ordered contract. NEVER reintroduce a bash
+# tier/effort default map or a frontmatter/clamp regex here — that pure logic lives ONLY in the
+# resolver now (S01/S02).
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-dispatch-resolve.js ] && echo scripts || echo "$HOME/.claude/scripts")
+ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" \
+  --unit-type "$UNIT_TYPE" --plan "$PLAN_PATH" --unit-id "$UNIT_ID" \
+  --milestone "$MILESTONE_ID" --roadmap "$ROADMAP_PATH" \
+  --cwd "$WORKING_DIR" --json)    # SEMPRE $WORKING_DIR, nunca $CODE_DIR (MEM018)
+if [ $? -ne 0 ]; then
+  # prefs_ok:false → resolver exit 1 (M008-CONTEXT #2 loud-stop).
+  echo "✗ dispatch resolver halted (prefs error) — see forge-dispatch-resolve.js prefs_errors" >&2
+  exit 1
 fi
-
-# Step 3b: risk escalation (plan-slice only) — risk:high slice escalates heavy → max
-if [ "$UNIT_TYPE" = "plan-slice" ]; then
-  ROADMAP_PATH=".gsd/milestones/${MILESTONE_ID}/${MILESTONE_ID}-ROADMAP.md"
-  if grep -E "${UNIT_ID}.*risk:[[:space:]]*high" "$ROADMAP_PATH" >/dev/null 2>&1; then
-    TIER="max"; REASON="risk-escalation:high"
-  fi
-fi
-
-# Step 3c: extract domain metadata (execute-task frontmatter domain: → slice ROADMAP domain: tag → default)
-DOMAIN=$(node -e "const fs=require('fs');try{const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);process.stdout.write(m?((m[0].match(/^domain:[ \t]*(.+)$/m)||[])[1]||'').trim():'')}catch(e){}" 2>/dev/null)
-if [ -z "$DOMAIN" ]; then
-  ROADMAP_PATH=".gsd/milestones/${MILESTONE_ID}/${MILESTONE_ID}-ROADMAP.md"
-  DOMAIN=$(grep -E "\b${UNIT_ID}\b" "$ROADMAP_PATH" 2>/dev/null | grep -oE 'domain:[A-Za-z0-9_-]+' | head -1 | cut -d: -f2)
-fi
-[ -z "$DOMAIN" ] && DOMAIN="default"
-
-# Step 4: resolve model + cross-engine chain via the SINGLE forge-routing.js call (raw cascade —
-# never prefs-resolved.json). Replaces the old forge-tier-chain.js --json initial resolution;
-# forge-tier-chain.js survives ONLY as an internal legacy reader inside forge-routing.js.
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-routing.js ] && echo scripts || echo "$HOME/.claude/scripts")
-ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" \
-  --unit-type "$UNIT_TYPE" --tier "$TIER" --domain "$DOMAIN" \
-  --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" \
-  --cwd "$WORKING_DIR")     # SEMPRE $WORKING_DIR, nunca $CODE_DIR (MEM018)
-MODEL_ID=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).chain[0].id)" "$ROUTE_JSON")
-ROUTE_SOURCE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).source)" "$ROUTE_JSON")
-CHAIN_LEN=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain.length))" "$ROUTE_JSON")
-DOMAIN_USED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain_used)" "$ROUTE_JSON")
+MODEL_ID=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).model)" "$ROUTE_JSON")
+MODEL_ALIAS=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).alias||'')" "$ROUTE_JSON")
+TIER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).tier)" "$ROUTE_JSON")
+REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).reason)" "$ROUTE_JSON")
+DOMAIN_USED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain)" "$ROUTE_JSON")
+ROUTE_SOURCE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).route_source)" "$ROUTE_JSON")
+CHAIN_LEN=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain_len))" "$ROUTE_JSON")
+ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine)" "$ROUTE_JSON")
+EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)" "$ROUTE_JSON")
+EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)" "$ROUTE_JSON")
+MODEL_ALIAS_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || printf 'null')
+THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
+[ -z "$MODEL_ALIAS" ] && echo "⚠ model \"$MODEL_ID\" sem alias — usando frontmatter do agente" >&2
+# When $MODEL_ALIAS is non-empty, pass model: $MODEL_ALIAS to Agent(); when empty,
+# call Agent() without a model: param (the warning above was already echoed).
 # $ROUTE_JSON.chain carries forward unmodified — consumed by the Failure Taxonomy via
 # `node "$FORGE_SCRIPTS_DIR/forge-routing.js" ... --next-after "$MODEL_ID"` on model_refusal/429/400
 # (walks the cross-engine chain → category fallback → ''), BEFORE any cross-tier escalation
 # (context_overflow's ladder is separate and unchanged — re-resolves THROUGH routing at the
 # escalated tier; see § context_overflow above and shared/forge-tiers.md § Tier Chains).
 
-# Step 4b: Fable 5 thinking guard — claude-fable-5 400s on explicit thinking:disabled.
-# When MODEL_ID is claude-fable-5, inject "thinking: adaptive" in the worker prompt
-# header (or omit the line), overriding any phase-level "thinking: disabled" pref.
-case "$MODEL_ID" in claude-fable-5*) THINKING_HEADER="adaptive";; esac
-
-# Step 4c: Effort Resolution — see "### Effort Resolution" below for the full algorithm.
-# Runs here because the per-model capability clamp needs $MODEL_ID. Sets $EFFORT/$EFFORT_REASON.
-declare -A EFFORT_DEFAULTS=(
-  [plan-milestone]="medium" [plan-slice]="medium" [discuss-milestone]="medium" [discuss-slice]="medium"
-  [research-milestone]="medium" [research-slice]="medium" [execute-task]="low"
-  [complete-slice]="low" [complete-milestone]="low" [memory-extract]="low"
-)
-EFFORT="${EFFORT_MAP[$UNIT_TYPE]:-${EFFORT_DEFAULTS[$UNIT_TYPE]:-low}}"; EFFORT_REASON="unit-type:$UNIT_TYPE"
-if [ "$UNIT_TYPE" = "execute-task" ] && [ -n "$PLAN_EFFORT" ]; then EFFORT="$PLAN_EFFORT"; EFFORT_REASON="frontmatter-effort:$PLAN_EFFORT"; fi
-if [ "$UNIT_TYPE" = "plan-slice" ] && [ "$REASON" = "risk-escalation:high" ]; then EFFORT="max"; EFFORT_REASON="risk-escalation:high"; fi
-EFFORT_CLAMPED=$(node -e "const r={low:0,medium:1,high:2,xhigh:3,max:4};const m='$MODEL_ID';const cap=(/^claude-(haiku|sonnet)/.test(m))?'medium':'max';let e='$EFFORT';if(!(e in r))e='medium';process.stdout.write(r[e]>r[cap]?cap:e)")
-if [ "$EFFORT_CLAMPED" != "$EFFORT" ]; then EFFORT_REASON="${EFFORT_REASON}|clamped:model-cap"; EFFORT="$EFFORT_CLAMPED"; fi
-
-# Step 4d: resolve alias — Agent() model param only accepts sonnet|opus|haiku|fable,
-# never a full model ID. MODEL_ALIAS empty → ID has no known alias → OMIT model:
-# (degrades to the agent's own frontmatter) + a documented warning.
-MODEL_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --id "$MODEL_ID")
-[ -z "$MODEL_ALIAS" ] && echo "⚠ model \"$MODEL_ID\" sem alias — usando frontmatter do agente" >&2
-# When $MODEL_ALIAS is non-empty, pass model: $MODEL_ALIAS to Agent(); when empty,
-# call Agent() without a model: param (the warning above was already echoed).
-
-# Step 5: extend dispatch event (append after Token Telemetry builds dispatchEvent)
-# Add (M002):  ,"tier":"$TIER","reason":"$REASON","effort":"$EFFORT","effort_reason":"$EFFORT_REASON","model_applied":$MODEL_APPLIED_JSON
-# Add (M007 S02, additive):  ,"domain":"$DOMAIN_USED","route_source":"$ROUTE_SOURCE","chain_len":$CHAIN_LEN
-# (build MODEL_APPLIED_JSON safely — never interpolate MODEL_ALIAS directly into JSON)
-# Example (forge-auto line 259 extended):
-MODEL_APPLIED_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || printf 'null')
-echo "{\"ts\":\"$TS\",\"event\":\"dispatch\",\"unit\":\"$UNIT_TYPE/$UNIT_ID\",\"model\":\"$MODEL_ID\",\"input_tokens\":$IN_TOK,\"output_tokens\":$OUT_TOK,\"tier\":\"$TIER\",\"reason\":\"$REASON\",\"effort\":\"$EFFORT\",\"effort_reason\":\"$EFFORT_REASON\",\"model_applied\":$MODEL_APPLIED_JSON,\"engine\":\"$ENGINE\",\"domain\":\"$DOMAIN_USED\",\"route_source\":\"$ROUTE_SOURCE\",\"chain_len\":$CHAIN_LEN}" >> .gsd/forge/events.jsonl
+# Extend the dispatch event (append after Token Telemetry builds dispatchEvent) with the resolver's
+# fields — additive, no existing field renamed/removed:
+echo "{\"ts\":\"$TS\",\"event\":\"dispatch\",\"unit\":\"$UNIT_TYPE/$UNIT_ID\",\"model\":\"$MODEL_ID\",\"input_tokens\":$IN_TOK,\"output_tokens\":$OUT_TOK,\"tier\":\"$TIER\",\"reason\":\"$REASON\",\"effort\":\"$EFFORT\",\"effort_reason\":\"$EFFORT_REASON\",\"model_applied\":$MODEL_ALIAS_JSON,\"engine\":\"$ENGINE\",\"domain\":\"$DOMAIN_USED\",\"route_source\":\"$ROUTE_SOURCE\",\"chain_len\":$CHAIN_LEN}" >> .gsd/forge/events.jsonl
 ```
+
+`MODEL_ID` is always the resolver's `model` field — `chain[0].id`, the primary member (identical to
+today's scalar resolution when `tier_models.<tier>` is a scalar; a scalar is just a one-member
+chain). The full ordered chain `chain[]` (`[{id, alias, mapped, engine}, ...]`) is carried forward
+unmodified — the Failure Taxonomy walks it via `forge-routing.js --next-after <id>` on
+`model_refusal`/429/400 **before** escalating tier (see § Cross-engine chain walk in Worker Engine
+Routing above; this is the SAME Layer 2 with the new resolver, and a **separate ladder** from
+`context_overflow`'s cross-tier `standard→heavy→max` escalation — see the note below). If `tier` is
+not one of `light | standard | heavy | max`, the resolver's internal `readTierChain()` treats it as
+`standard` (defensive fallback) — no separate guard needed here.
+
+> **Fable 5 thinking guard:** when the resolved model is `claude-fable-5`, force the worker prompt
+> header to `thinking: adaptive` (or omit the `thinking:` line) regardless of phase prefs —
+> `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` (Opus 4.7/4.8 accept it).
+> The resolver's `thinking_header` field already carries this — read it instead of re-deriving it.
+
+> **Alias resolution internals (unchanged):** `MODEL_ALIAS`/`model_applied` are still produced by `scripts/forge-model-alias.js`'s `modelToAlias()` — the resolver calls it internally (see `scripts/forge-dispatch-resolve.js`'s own `require('./forge-model-alias.js')`) instead of the SKILL.md shelling out to it directly. No inline alias map is ever reimplemented here or in the SKILL.md callers.
 
 ---
 
@@ -1622,6 +1604,8 @@ echo "{\"ts\":\"$TS\",\"event\":\"dispatch\",\"unit\":\"$UNIT_TYPE/$UNIT_ID\",\"
 **Purpose:** Control-flow section that runs right after [Tier Resolution](#tier-resolution), before the `Agent()` call. It translates `unit_type + frontmatter hint + prefs + resolved model` into a concrete `effort` level injected into the worker prompt header (`effort: {unit_effort}`). Effort controls *reasoning intensity* (token spend per unit), orthogonal to the tier (which controls *which model* runs). A complex task wants both a heavier model **and** higher effort; the two axes are resolved independently but can be set coherently by the planner. Like Tier Resolution, this is pure Markdown rules + a `node -e` clamp — no new script.
 
 > **Why a separate axis from tier:** tier picks the model; effort picks how hard that model thinks. Coupling them to one signal loses granularity (e.g. a `standard`-tier task that is logically intricate but cheap to run still benefits from `medium` over `low`). The planner emits `effort:` per task on its own judgement (see `agents/forge-planner.md § Effort & Tier Hints`).
+
+> **Fonte executável única (M012):** the default table, frontmatter override, risk-escalation sync, and model-cap clamp described below are implemented ONCE, inside `scripts/forge-dispatch-resolve.js` (its `effort`/`effort_reason` output fields) — the same call that resolves Tier + Engine + Alias. The `declare -A EFFORT_DEFAULTS` + clamp `node -e` shown further below is preserved here as the readable spec only; the SKILL.md callers never run it — they read `effort`/`effort_reason` straight off the resolver's JSON.
 
 #### Effort scale
 

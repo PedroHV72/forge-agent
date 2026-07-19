@@ -5481,6 +5481,97 @@ function smokeStubPatternRobustness() {
   pass('(final) Section 45: stub_pattern malformado tratado com segurança, patterns válidos preservados');
 }
 
+// ── Section 46: shared dispatch resolver — parity + cutover + routes-by-domain ──
+// M012 S02 T03: proves shared/forge-dispatch.md's "resolver as single executable
+// source" claim end-to-end. (a) resolveDispatch() reproduces the canonical
+// tier_models-legacy contract for an input with no routing: block. (b) the
+// effort model-cap clamp still fires through the resolver. (c) the 3 cut-over
+// SKILL.md files call forge-dispatch-resolve.js and contain zero duplicated
+// declare -A TIER_DEFAULTS/EFFORT_DEFAULTS/EFFORT_CLAMPED= blocks (mirrors
+// Section 40's absence-guard pattern). (d) the additive win: a fixture plan
+// with domain: backend + a routing: block resolves route_source==='routing'
+// via the SAME resolveDispatch() call forge-task uses. (e) risk-escalation
+// (plan-slice on a risk:high slice) still resolves tier/effort === 'max'.
+function smokeDispatchResolve() {
+  process.stdout.write('\n▸ Section 46: shared dispatch resolver — parity + cutover + routes-by-domain\n');
+  const { resolveDispatch } = require(path.join(SCRIPTS, 'forge-dispatch-resolve.js'));
+
+  function writePlan(dir, frontmatterLines) {
+    fs.mkdirSync(dir, { recursive: true });
+    const planPath = path.join(dir, 'T01-PLAN.md');
+    fs.writeFileSync(planPath, '---\n' + frontmatterLines.join('\n') + '\n---\n\n# fixture plan\n', 'utf8');
+    return planPath;
+  }
+
+  // ── (a) Parity: no routing: block → canonical tier_models-legacy contract ──
+  withHermeticHome(() => {
+    const dir = mkTmp('dispatch-resolve-parity');
+    const planPath = writePlan(dir, ['id: T01', 'slice: S01']);
+    const result = resolveDispatch({ unitType: 'execute-task', planPath, cwd: dir });
+    assert(result.tier === 'standard', '(a) parity: default execute-task tier === standard', JSON.stringify(result));
+    assert(result.route_source === 'tier_models', '(a) parity: no routing: block -> route_source === tier_models', JSON.stringify(result));
+    assert(result.model === 'claude-sonnet-5', '(a) parity: default standard-tier model === claude-sonnet-5 (canonical table)', JSON.stringify(result));
+    assert(result.alias === 'sonnet', '(a) parity: alias === sonnet', JSON.stringify(result));
+    assert(result.effort === 'low', '(a) parity: default execute-task effort === low', JSON.stringify(result));
+    assert(result.engine === 'claude', '(a) parity: default engine === claude', JSON.stringify(result));
+    cleanup(dir);
+  });
+
+  // ── (b) Effort clamp still fires through the resolver ──
+  withHermeticHome(() => {
+    const dir = mkTmp('dispatch-resolve-clamp');
+    const planPath = writePlan(dir, ['id: T01', 'slice: S01', 'effort: xhigh']);
+    const result = resolveDispatch({ unitType: 'execute-task', planPath, cwd: dir });
+    assert(result.effort === 'medium' && /clamped:model-cap/.test(result.effort_reason),
+      '(b) clamp: sonnet-tier + effort:xhigh -> effort=medium, reason has clamped:model-cap',
+      JSON.stringify(result));
+    cleanup(dir);
+  });
+
+  // ── (c) Cutover: the 3 SKILL.md call the resolver and never re-implement it ──
+  const ROOT46 = path.join(__dirname, '..');
+  const cutoverSkills = ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md'];
+  for (const rel of cutoverSkills) {
+    const source = fs.readFileSync(path.join(ROOT46, rel), 'utf8');
+    assert(source.includes('forge-dispatch-resolve.js'), `(c) ${rel}: calls forge-dispatch-resolve.js`);
+    assert(!/declare -A TIER_DEFAULTS/.test(source), `(c) ${rel}: no duplicated declare -A TIER_DEFAULTS`);
+    assert(!/declare -A EFFORT_DEFAULTS/.test(source), `(c) ${rel}: no duplicated declare -A EFFORT_DEFAULTS`);
+    assert(!/EFFORT_CLAMPED=/.test(source), `(c) ${rel}: no duplicated EFFORT_CLAMPED= clamp regex`);
+  }
+
+  // ── (d) forge-task routes-by-domain: additive win via the shared resolver ──
+  withHermeticHome(() => {
+    const dir = mkTmp('dispatch-resolve-domain');
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.gsd', 'claude-agent-prefs.md'),
+      'routing:\n  backend:\n    executor:\n      standard: [claude-opus-4-8]\n',
+      'utf8'
+    );
+    const planPath = writePlan(dir, ['id: T01', 'slice: S01', 'domain: backend']);
+    const result = resolveDispatch({ unitType: 'execute-task', planPath, cwd: dir });
+    assert(result.route_source === 'routing', '(d) forge-task routes-by-domain: route_source === routing', JSON.stringify(result));
+    assert(result.domain === 'backend', '(d) forge-task routes-by-domain: domain === backend', JSON.stringify(result));
+    cleanup(dir);
+  });
+
+  // ── (e) risk-escalation: plan-slice on a risk:high slice still resolves tier/effort=max ──
+  withHermeticHome(() => {
+    const dir = mkTmp('dispatch-resolve-risk');
+    const milestoneId = 'M999';
+    const roadmapDir = path.join(dir, '.gsd', 'milestones', milestoneId);
+    fs.mkdirSync(roadmapDir, { recursive: true });
+    const roadmapPath = path.join(roadmapDir, `${milestoneId}-ROADMAP.md`);
+    fs.writeFileSync(roadmapPath, '- S01: setup (risk:high)\n', 'utf8');
+    const result = resolveDispatch({ unitType: 'plan-slice', unitId: 'S01', roadmapPath, cwd: dir });
+    assert(result.tier === 'max', '(e) risk-escalation: plan-slice on risk:high slice -> tier === max', JSON.stringify(result));
+    assert(result.effort === 'max', '(e) risk-escalation: plan-slice on risk:high slice -> effort === max', JSON.stringify(result));
+    cleanup(dir);
+  });
+
+  pass('(final) Section 46: resolver parity, SKILL cutover and routes-by-domain verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -5533,6 +5624,7 @@ async function main() {
     smokePrefsMigrationFidelity();
     smokeInitSetupScaffold();
     smokeStubPatternRobustness();
+    smokeDispatchResolve();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
