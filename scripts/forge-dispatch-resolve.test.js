@@ -41,6 +41,7 @@ function mkFixture(input) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-dispatch-resolve-'));
   fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
   if (spec.prefs) fs.writeFileSync(path.join(dir, '.gsd', 'claude-agent-prefs.md'), spec.prefs, 'utf8');
+  if (spec.prefsJsonc !== undefined) fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), spec.prefsJsonc, 'utf8');
   let planPath = null;
   if (spec.plan) {
     planPath = path.join(dir, 'T01-PLAN.md');
@@ -225,6 +226,57 @@ withHermeticHome((cliEnv) => {
     const f = mkFixture({ prefs: 'tier_models:\n  standard: claude-fable-5\n' });
     const r = dispatch(f, { unitType: 'execute-task' });
     assertEqual(r.thinking_header, 'adaptive', 'fable thinking header adaptive');
+    cleanup(f);
+  });
+
+  runCase('worker: Codex (capitalized) normalizes identically to lowercase codex', () => {
+    // Fix 2 (M012 S01 review-fix): canonical lowercases the frontmatter worker
+    // value. Capitalized `Codex` must resolve identically to lowercase `codex`.
+    const prefs = 'routing:\n  backend:\n    executor:\n      standard: claude-opus-4-8\n';
+    const domain = 'domain: backend\n';
+    const lower = mkFixture({ prefs, plan: `---\nworker: codex\n${domain}---\n# task\n` });
+    const upper = mkFixture({ prefs, plan: `---\nworker: Codex\n${domain}---\n# task\n` });
+    const rl = dispatch(lower, { unitType: 'execute-task' });
+    const ru = dispatch(upper, { unitType: 'execute-task' });
+    assertEqual(ru.plan_worker, 'codex', 'capitalized worker is lowercased');
+    assertEqual(ru.route_source, rl.route_source, 'capitalized worker keeps same route source');
+    assertEqual(ru.engine, rl.engine, 'capitalized worker resolves same engine as lowercase');
+    assertEqual(ru.engine, 'gpt', 'codex pin resolves to gpt family');
+    cleanup(lower);
+    cleanup(upper);
+  });
+
+  runCase('workers: {execute-task: Codex} (capitalized) normalizes to codex engine', () => {
+    const f = mkFixture({ prefs: 'workers:\n  execute-task: Codex\n  codex_model: gpt-fixture\ntier_models:\n  standard: claude-opus-4-8\n' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.route_source, 'tier_models', 'capitalized workers pref stays legacy source');
+    assertEqual(r.engine, 'codex', 'capitalized workers pref lowercases to codex engine');
+    assertEqual(r.engine_reason, 'workers.execute-task:codex', 'capitalized workers reason is lowercased');
+    cleanup(f);
+  });
+
+  runCase('malformed prefs jsonc surfaces loud-stop (prefs_ok false, CLI exit 1)', () => {
+    // Fix 1 (M012 S01 review-fix): a broken prefs layer must not silently
+    // degrade — prefs_ok:false and the CLI exits non-zero (M008-CONTEXT #2).
+    const f = mkFixture({ prefsJsonc: '{ "workers": { "execute-task": "codex" ' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.prefs_ok, false, 'malformed prefs sets prefs_ok false');
+    assert(Array.isArray(r.prefs_errors) && r.prefs_errors.length > 0, 'malformed prefs records errors', JSON.stringify(r.prefs_errors));
+    const cli = spawnSync('node', [SCRIPT, '--json', '--unit-type', 'execute-task', '--cwd', f.dir], { encoding: 'utf8', env: cliEnv });
+    let parsed = null;
+    try { parsed = JSON.parse(cli.stdout); } catch (error) { fail('loud-stop CLI stdout is valid JSON', error.message); }
+    assertEqual(cli.status, 1, 'CLI exits 1 on prefs loud-stop');
+    assert(parsed && parsed.prefs_ok === false, 'CLI still prints the contract with prefs_ok false', cli.stdout);
+    cleanup(f);
+  });
+
+  runCase('valid prefs keep prefs_ok true and CLI exit 0', () => {
+    const f = mkFixture({ prefs: 'workers:\n  execute-task: codex\n' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.prefs_ok, true, 'valid prefs keep prefs_ok true');
+    assertEqual(r.prefs_errors.length, 0, 'valid prefs have no errors');
+    const cli = spawnSync('node', [SCRIPT, '--json', '--unit-type', 'execute-task', '--cwd', f.dir], { encoding: 'utf8', env: cliEnv });
+    assertEqual(cli.status, 0, 'CLI exits 0 on valid prefs');
     cleanup(f);
   });
 

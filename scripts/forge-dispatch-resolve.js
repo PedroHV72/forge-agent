@@ -77,7 +77,10 @@ function readPlanFrontmatter(planPath) {
     return empty;
   }
   if (!block) return empty;
-  const worker = frontmatterValue(block, /^worker:[ \t]*(\S+)/m);
+  // Canonical (skills/forge-auto/SKILL.md § Engine Resolution) lowercases the
+  // frontmatter worker value before comparing; mirror it so `worker: Codex`
+  // is honoured rather than falling through to claude.
+  const worker = frontmatterValue(block, /^worker:[ \t]*(\S+)/m).toLowerCase();
   return {
     tier: frontmatterValue(block, /^tier:\s*(.+)$/m),
     tag: frontmatterValue(block, /^tag:\s*(.+)$/m),
@@ -116,7 +119,8 @@ function hasHighRisk(roadmapPath, unitId) {
 
 function normalizeWorkers(prefs, unitType) {
   const workers = prefs && prefs.workers && typeof prefs.workers === 'object' ? prefs.workers : {};
-  const requested = text(workers[unitType]);
+  // Canonical WORKERS_ENGINE lowercases before the codex/claude comparison.
+  const requested = text(workers[unitType]).toLowerCase();
   const workersEngine = requested === 'codex' || requested === 'claude' ? requested : 'claude';
   const timeout = Number(workers.timeout);
   return {
@@ -223,6 +227,11 @@ function resolveDispatch(opts) {
     codex_model: workers.codex_model,
     plan_worker: plan.worker,
     thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
+    // Additive loud-stop surface (M008-CONTEXT #2): a malformed prefs layer must
+    // not silently degrade to the claude/effort-default fallback. Callers inspect
+    // prefs_ok; the CLI turns prefs_ok:false into a non-zero exit.
+    prefs_ok: prefsResult ? prefsResult.ok !== false : true,
+    prefs_errors: (prefsResult && prefsResult.errors) || [],
   };
 }
 
@@ -270,16 +279,22 @@ function degradedContract(args) {
     model_applied: alias, engine_reason: 'default:claude', workers_engine: 'claude',
     workers_timeout: 1800, codex_model: '', plan_worker: '',
     thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
+    prefs_ok: true, prefs_errors: [],
   };
 }
 
 module.exports = { resolveDispatch, parseArgs, runCli };
 
 if (require.main === module) {
+  // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a
+  // malformed prefs layer must halt the shell consumer rather than proceed on
+  // the claude/effort-default fallback). The last-resort catch below still
+  // emits the ordered contract and exits 0 for UNEXPECTED runtime errors.
   try {
-    runCli(process.argv.slice(2));
+    const result = runCli(process.argv.slice(2));
+    process.exit(result && result.prefs_ok === false ? 1 : 0);
   } catch {
     process.stdout.write(JSON.stringify(degradedContract(process.argv.slice(2))) + '\n');
+    process.exit(0);
   }
-  process.exit(0);
 }
