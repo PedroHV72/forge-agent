@@ -5552,8 +5552,19 @@ function smokeDispatchResolve() {
     const result = resolveDispatch({ unitType: 'execute-task', planPath, cwd: dir });
     assert(result.route_source === 'routing', '(d) forge-task routes-by-domain: route_source === routing', JSON.stringify(result));
     assert(result.domain === 'backend', '(d) forge-task routes-by-domain: domain === backend', JSON.stringify(result));
+    assert(result.domain_input === 'backend', '(d) resolver exposes raw domain_input === backend for retry replay', JSON.stringify(result));
     cleanup(dir);
   });
+
+  // ── (f) retry re-resolution guard: the 2 loop skills restore DOMAIN/PLAN_TIER/PLAN_WORKER ──
+  // (M012 S02 review-fix R1: the failure-taxonomy paths re-resolve routing with these raw inputs;
+  //  the cutover dropped their assignment, silently collapsing every retry to the default domain.)
+  for (const rel of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md']) {
+    const source = fs.readFileSync(path.join(ROOT46, rel), 'utf8');
+    assert(/^DOMAIN=.*domain_input/m.test(source), `(f) ${rel}: restores DOMAIN= from resolver domain_input`);
+    assert(/^PLAN_TIER=.*frontmatter_tier/m.test(source), `(f) ${rel}: restores PLAN_TIER= from resolver frontmatter_tier`);
+    assert(/^PLAN_WORKER=.*plan_worker/m.test(source), `(f) ${rel}: restores PLAN_WORKER= from resolver plan_worker`);
+  }
 
   // ── (e) risk-escalation: plan-slice on a risk:high slice still resolves tier/effort=max ──
   withHermeticHome(() => {

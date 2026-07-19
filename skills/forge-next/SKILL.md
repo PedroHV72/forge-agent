@@ -225,6 +225,10 @@ EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort
 WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).workers_timeout))" "$ROUTE_JSON")
 CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
 THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
+# Raw resolver inputs restored for the failure-taxonomy re-resolution (--next-after / tier escalation).
+DOMAIN=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain_input||'')" "$ROUTE_JSON")
+PLAN_TIER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).frontmatter_tier||'')" "$ROUTE_JSON")
+PLAN_WORKER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).plan_worker||'')" "$ROUTE_JSON")
 unit_effort="$EFFORT"
 # $ROUTE_JSON.chain carries forward unmodified — consumed by the Failure Taxonomy via
 # `node "$FORGE_SCRIPTS_DIR/forge-routing.js" ... --next-after "$MODEL_ID"` on model_refusal/429/400

@@ -400,6 +400,10 @@ EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort
 WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).workers_timeout))" "$ROUTE_JSON")
 CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
 THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
+# Raw resolver inputs restored for the failure-taxonomy re-resolution (--next-after / tier escalation).
+DOMAIN=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain_input||'')" "$ROUTE_JSON")
+PLAN_TIER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).frontmatter_tier||'')" "$ROUTE_JSON")
+PLAN_WORKER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).plan_worker||'')" "$ROUTE_JSON")
 MODEL_APPLIED_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || printf 'null')
 unit_effort="$EFFORT"
 # $ROUTE_JSON.chain carries forward unmodified — consumed by Branch C/D (codex-member cap) and by
@@ -457,7 +461,7 @@ When `mode == "legacy"`, emit one line (the first time per slice — not every i
 ↻ Legacy plan — dispatching sequentially (no depends/writes frontmatter)
 ```
 
-**Per-task resolution (parallel only):** If `BATCH.length > 1`, the dispatch resolution block above resolved for `$PLAN_PATH` of the **first** task. Before building prompts, re-run the single `forge-dispatch-resolve.js --json` call once per task in the batch (passing that task's `$PLAN_PATH`) so each one carries its own `{TIER, MODEL_ID, MODEL_ALIAS, ENGINE, DOMAIN_USED, ROUTE_SOURCE, CHAIN_LEN, REASON, EFFORT, EFFORT_REASON}`. Security gate (below) also loops over each task in the batch.
+**Per-task resolution (parallel only):** If `BATCH.length > 1`, the dispatch resolution block above resolved for `$PLAN_PATH` of the **first** task. Before building prompts, re-run the single `forge-dispatch-resolve.js --json` call once per task in the batch (passing that task's `$PLAN_PATH`) so each one carries its own `{TIER, MODEL_ID, MODEL_ALIAS, ENGINE, DOMAIN_USED, ROUTE_SOURCE, CHAIN_LEN, REASON, EFFORT, EFFORT_REASON, DOMAIN, PLAN_TIER, PLAN_WORKER}` (the last three — the raw resolver inputs `domain_input`/`frontmatter_tier`/`plan_worker` — feed that task's failure-taxonomy re-resolution). Security gate (below) also loops over each task in the batch.
 
 **Risk radar gate (plan-slice only):** If `unit_type == plan-slice` and the slice is tagged `risk:high` in ROADMAP, check if `S##-RISK.md` already exists. If not:
 ```

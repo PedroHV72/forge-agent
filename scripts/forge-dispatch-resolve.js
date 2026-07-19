@@ -226,6 +226,12 @@ function resolveDispatch(opts) {
     workers_timeout: workers.workers_timeout,
     codex_model: workers.codex_model,
     plan_worker: plan.worker,
+    // Raw resolver INPUTS replayed by the failure-taxonomy retry paths so
+    // --next-after / tier escalation rebuild the identical routing chain.
+    // domain_input is the INPUT domain (frontmatter → roadmap → 'default'),
+    // NOT the effective `domain`/domain_used above.
+    domain_input: requestedDomain,
+    frontmatter_tier: plan.tier,
     thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
     // Additive loud-stop surface (M008-CONTEXT #2): a malformed prefs layer must
     // not silently degrade to the claude/effort-default fallback. Callers inspect
@@ -278,6 +284,7 @@ function degradedContract(args) {
     effort: 'low', effort_reason: `unit-type:${unitType}`,
     model_applied: alias, engine_reason: 'default:claude', workers_engine: 'claude',
     workers_timeout: 1800, codex_model: '', plan_worker: '',
+    domain_input: 'default', frontmatter_tier: '',
     thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
     prefs_ok: true, prefs_errors: [],
   };

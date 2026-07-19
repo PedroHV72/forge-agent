@@ -148,6 +148,21 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  runCase('exposes raw resolver inputs (domain_input, frontmatter_tier) for retry re-resolution', () => {
+    // execute-task with frontmatter domain + tier → raw inputs replayed verbatim.
+    const withInputs = mkFixture({ plan: '---\ntier: heavy\ndomain: backend\n---\n# task\n' });
+    const r1 = dispatch(withInputs, { unitType: 'execute-task', planPath: withInputs.planPath });
+    assertEqual(r1.domain_input, 'backend', 'domain_input reflects raw frontmatter domain');
+    assertEqual(r1.frontmatter_tier, 'heavy', 'frontmatter_tier reflects raw frontmatter tier');
+    cleanup(withInputs);
+    // Absent frontmatter → domain_input falls back to default, frontmatter_tier empty.
+    const bare = mkFixture({ plan: '---\n---\n# task\n' });
+    const r2 = dispatch(bare, { unitType: 'execute-task', planPath: bare.planPath });
+    assertEqual(r2.domain_input, 'default', 'domain_input default when absent');
+    assertEqual(r2.frontmatter_tier, '', 'frontmatter_tier empty when absent');
+    cleanup(bare);
+  });
+
   runCase('plan-milestone is non-routable max and uses tier_models', () => {
     const f = mkFixture({ prefs: 'routing:\n  default:\n    planner:\n      max: gpt-5-codex\n' });
     const r = dispatch(f, { unitType: 'plan-milestone' });
