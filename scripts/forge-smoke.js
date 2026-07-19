@@ -2234,6 +2234,8 @@ async function smokeXllmExecute() {
       && parsed.files_changed.some((f) => f.path === 'task-file.txt' && f.status === 'A'),
       'A: files_changed derived includes real write (status A)', JSON.stringify(parsed && parsed.files_changed));
     assert(!!parsed && parsed.start_sha === beforeHead, 'A: start_sha matches pre-run HEAD', `start_sha=${parsed && parsed.start_sha} beforeHead=${beforeHead}`);
+    assert(!!parsed && Array.isArray(parsed.pre_dirty) && parsed.pre_dirty.length === 0,
+      'A: clean tree → pre_dirty empty (HARD invariant)', JSON.stringify(parsed && parsed.pre_dirty));
     const afterHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
     assert(afterHead === beforeHead, 'A: HEAD unchanged (no-commit)', `before=${beforeHead} after=${afterHead}`);
     const afterLog = spawnSync('git', ['log', '--oneline'], { cwd: repo, encoding: 'utf8' }).stdout;
@@ -2244,7 +2246,9 @@ async function smokeXllmExecute() {
     cleanup(mockDir);
   }
 
-  // Scenario B — dirty guard: sujar o repo antes de rodar; mock never invoked.
+  // Scenario B — dirty guard RELAXED (M013 S01: refuse→snapshot). A pre-existing
+  // dirty tree NO LONGER refuses: the adapter captures a pre_dirty snapshot and the
+  // mock codex IS invoked; the result JSON exposes pre_dirty ([{path,hash}]) for audit.
   {
     const repo = mkGitRepo(mkTmp('xllm-exec-b'));
     const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-plan-'));
@@ -2259,9 +2263,14 @@ async function smokeXllmExecute() {
     writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: `: > "$MARKER"` });
     const r = runExecuteXllm(['--plan', planFile, '--result-file', resultFile, '--cwd', repo], mockDir, repo,
       { env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, MARKER: marker } });
-    assert(r.status !== 0, 'B: dirty tree makes adapter exit non-zero', `status=${r.status}`);
-    assert(/dirty/i.test(r.stderr), 'B: dirty guard message mentions dirty', `stderr=${r.stderr}`);
-    assert(!fs.existsSync(marker), 'B: mock codex never invoked (marker absent)', `marker=${marker}`);
+    assert(r.status === 0, 'B: dirty tree no longer refuses (refuse→snapshot) → exit 0', `status=${r.status} stderr=${r.stderr}`);
+    assert(!/refusing to start/i.test(r.stderr), 'B: no dirty-guard refusal message', `stderr=${r.stderr}`);
+    assert(fs.existsSync(marker), 'B: mock codex IS invoked on dirty tree (marker present)', `marker=${marker}`);
+    let parsed = null;
+    try { parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) { /* leave null */ }
+    assert(!!parsed && Array.isArray(parsed.pre_dirty)
+      && parsed.pre_dirty.some((d) => d.path === 'dirty.txt' && typeof d.hash === 'string'),
+      'B: result JSON exposes pre_dirty with the pre-existing file', JSON.stringify(parsed && parsed.pre_dirty));
     cleanup(repo);
     cleanup(planDir);
     cleanup(resultDir);
@@ -2563,9 +2572,10 @@ function smokeEngineDispatch() {
     cleanup(eventsDir);
   }
 
-  // Scenario C — dirty-tree guard: tree dirty BEFORE dispatch, adapter refuses
-  // (exit != 0) proving the orchestrator never resets/dispatches over
-  // uncommitted work.
+  // Scenario C — dirty-tree guard RELAXED (M013 S01: refuse→snapshot): tree dirty
+  // BEFORE dispatch, adapter NO LONGER refuses — it snapshots (pre_dirty) and the mock
+  // codex IS invoked. The orchestrator owns the post-run surgical reset (T03/T04), not
+  // the adapter (which never resets).
   {
     const repo = mkGitRepo(mkTmp('engine-c'));
     const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-engine-c-plan-'));
@@ -2586,8 +2596,12 @@ function smokeEngineDispatch() {
       cwd: repo,
       env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, MARKER: marker },
     });
-    assert(r.status !== 0, 'C: dirty tree pre-dispatch makes adapter exit non-zero', `status=${r.status}`);
-    assert(!fs.existsSync(marker), 'C: mock codex never invoked (marker absent — dirty-tree-guard)', `marker=${marker}`);
+    assert(r.status === 0, 'C: dirty tree no longer refuses (refuse→snapshot) → exit 0', `status=${r.status} stderr=${r.stderr}`);
+    assert(fs.existsSync(marker), 'C: mock codex IS invoked over dirty tree (snapshot, not refuse)', `marker=${marker}`);
+    let cParsed = null;
+    try { cParsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) { /* leave null */ }
+    assert(!!cParsed && Array.isArray(cParsed.pre_dirty) && cParsed.pre_dirty.some((d) => d.path === 'dirty.txt'),
+      'C: result JSON exposes pre_dirty snapshot of the pre-existing file', JSON.stringify(cParsed && cParsed.pre_dirty));
     cleanup(repo);
     cleanup(planDir);
     cleanup(resultDir);
@@ -5805,7 +5819,60 @@ function smokeSurgicalReset() {
     cleanup(dir);
   }
 
-  pass('(final) Section 47: surgical reset — golden/overlap/HARD-invariant/persistence/purity/.gsd all verified');
+  // ── (g) e2e: sidecar runExecute on a DIRTY tree + surgical reset closes the loop ─
+  // M013 S01 T02: the adapter's dirty-guard is relaxed refuse→snapshot, so runExecute
+  // runs against a pre-existing dirty tree; the orchestrator's state (--state-init /
+  // --reset) undoes the mock codex's write while the pre-existing file survives intact.
+  {
+    const xllmPath = path.join(SCRIPTS, 'forge-xllm.js');
+    const dir = initRepo('sr-e2e-sidecar');
+    W(dir, 'base.txt', 'baseline\n');
+    gitq(dir, ['add', '-A']); gitq(dir, ['commit', '-qm', 'init']);
+    // pre-existing uncommitted work (auto_commit:false) — must survive byte-intact.
+    W(dir, 'pre.txt', 'USER-WORK\n');
+    const preHash = gitq(dir, ['hash-object', 'pre.txt']).stdout.trim();
+
+    // orchestrator captures the authoritative snapshot BEFORE dispatch (state file
+    // outside the repo, but under .gsd/ which the reset excludes).
+    const stateFile = path.join(dir, '.gsd', 'forge', 'xllm-state.json');
+    const init = spawnSync('node', [SR, '--state-init', '--state', stateFile, '--cwd', dir], { encoding: 'utf8' });
+    assert(init.status === 0, '(g) --state-init on dirty tree exits 0', init.stdout + init.stderr);
+
+    // mock codex writes codex.txt then FAILS (invalid JSON) — sidecar must NOT refuse
+    // the dirty tree (the observed error is the codex failure, not the dirty guard).
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-sr-e2e-mock-'));
+    writeMockCodex(mockDir, { payload: 'not { json', exitCode: 0, extraScript: `printf 'CODEX\\n' > "$CODEXCWD/codex.txt"` });
+    const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-sr-e2e-result-'));
+    const resultFile = path.join(resultDir, 'result.json');
+    const planFile = path.join(resultDir, 'plan.md');
+    fs.writeFileSync(planFile, '# T01\ndo the thing\n', 'utf8');
+    const rr = spawnSync(process.execPath, [xllmPath, '--mode', 'execute', '--plan', planFile, '--result-file', resultFile, '--cwd', dir], {
+      encoding: 'utf8', cwd: dir,
+      env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH },
+    });
+    assert(rr.status !== 0, '(g) sidecar fails on codex bad-JSON, NOT on the dirty guard', `status=${rr.status} stderr=${rr.stderr}`);
+    assert(!/refusing to start/i.test(rr.stderr), '(g) no dirty-guard refusal — ran on dirty tree', rr.stderr);
+    assert(fs.existsSync(path.join(dir, 'codex.txt')), '(g) mock codex actually wrote codex.txt (dispatch proceeded)');
+    // best-effort result JSON records pre_dirty with the pre-existing file.
+    let parsed = null;
+    try { parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) { /* leave null */ }
+    // adapter-failed best-effort result may omit pre_dirty; the AUTHORITATIVE audit is the
+    // orchestrator state file, which carries it. Assert on the state file (always present).
+    const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert(Array.isArray(st.pre_dirty) && st.pre_dirty.some((d) => d.path === 'pre.txt'),
+      '(g) orchestrator state snapshot carries the pre-existing dirty file', JSON.stringify(st.pre_dirty));
+
+    // orchestrator resets AFTER the failure: pre.txt intact, codex.txt removed.
+    const rst = runReset(stateFile);
+    assert(rst.status === 0, '(g) surgical --reset after sidecar failure exits 0', rst.stdout + rst.stderr);
+    assert(R(dir, 'pre.txt') === 'USER-WORK\n' && gitq(dir, ['hash-object', 'pre.txt']).stdout.trim() === preHash,
+      '(g) pre-existing file survives the sidecar+reset cycle byte-intact');
+    assert(!fs.existsSync(path.join(dir, 'codex.txt')), '(g) mock codex write undone by surgical reset');
+    void parsed;
+    cleanup(dir); cleanup(mockDir); cleanup(resultDir);
+  }
+
+  pass('(final) Section 47: surgical reset — golden/overlap/HARD-invariant/persistence/purity/.gsd/sidecar-e2e all verified');
 }
 
 async function main() {

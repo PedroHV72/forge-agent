@@ -26,8 +26,10 @@
  * Exit contract: 0 on success. For challenge/rebuttal the normalized JSON goes to stdout
  * (nothing else on stdout). For execute the result-file is the ONLY result channel —
  * stdout stays empty (LOCKED — M005-CONTEXT). ANY failure (bad args, missing binary,
- * non-zero exit, timeout, unparseable/invalid output, dirty tree, HEAD moved) →
+ * non-zero exit, timeout, unparseable/invalid output, HEAD moved) →
  * process.exit(2), cause on stderr. NO RETRY on any path (LOCKED — S01-RISK.md blocker #4).
+ * A pre-existing dirty tree is NO LONGER a failure (M013 S01: refuse→snapshot) — it is
+ * captured as `pre_dirty` in the result JSON (AUDIT ONLY); the adapter never resets.
  * The orchestrator owns fallback behavior, not this adapter.
  *
  * Execute-mode contract (LOCKED — M005-CONTEXT / S01):
@@ -68,6 +70,7 @@ const path = require('path');
 const os = require('os');
 const { spawnSync, spawn, execSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
+const { captureSnapshot } = require('./forge-surgical-reset.js');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1282,16 +1285,25 @@ function gitRead(gitArgs, cwd, what) {
 }
 
 /**
- * Run execute mode: guards → prompt → codex (workspace-write, detached, heartbeat,
- * timeout) → no-commit check → validate → derive files_changed → normalized result-file.
- * The result-file is the ONLY result channel. No git writes, ever.
+ * Run execute mode: guards → pre-dirty snapshot → prompt → codex (workspace-write, detached,
+ * heartbeat, timeout) → no-commit check → validate → derive files_changed → normalized
+ * result-file. The result-file is the ONLY result channel. No git writes, ever.
+ *
+ * Dirty tree (M013 S01): the pre-existing dirty guard was relaxed from refuse→snapshot —
+ * runExecute NO LONGER throws on a pre-existing dirty tree. It captures a pre-dispatch
+ * snapshot via forge-surgical-reset.captureSnapshot and exposes it as `pre_dirty` in the
+ * result JSON (AUDIT ONLY; empty [] on a clean tree — the sole delta vs the prior contract).
+ * The adapter still NEVER resets: the authoritative snapshot that drives the post-failure
+ * surgical reset lives in the orchestrator's state file (T03/T04).
+ *
  * @param {object} opts
  * @param {string} opts.planFile     path to a T##-PLAN.md
  * @param {string} opts.resultFile   path OUTSIDE the workspace for the result JSON
- * @param {string} opts.cwd          the workspace (CODE_DIR) — a clean git repo
+ * @param {string} opts.cwd          the workspace (CODE_DIR) — a git repo (may be dirty)
  * @param {string} [opts.model]
  * @param {number} [opts.timeoutSecs]
- * @returns {Promise<object>} the normalized result object (also written to resultFile)
+ * @returns {Promise<object>} the normalized result object (also written to resultFile);
+ *   includes `pre_dirty: [{path,hash}]` — the pre-dispatch dirty snapshot (AUDIT ONLY)
  */
 async function runExecute(opts) {
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
@@ -1319,11 +1331,14 @@ async function runExecute(opts) {
   const insideRepo = gitRead('rev-parse --is-inside-work-tree', cwd, 'git repo check');
   if (insideRepo !== 'true') throw new Error(`--cwd is not inside a git work tree: ${cwd}`);
 
-  // Dirty guard (BEFORE anything else) — never start on someone else's uncommitted work.
-  const dirty = execSync('git status --porcelain', { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER });
-  if (dirty.trim()) {
-    throw new Error(`working tree dirty at ${cwd} — refusing to start (will never clean someone else's work)`);
-  }
+  // Pre-dispatch dirty SNAPSHOT (refuse→snapshot, M013 S01): the adapter no longer
+  // refuses on a pre-existing dirty tree (auto_commit:false leaves prior work uncommitted).
+  // Instead it captures the pre-dispatch snapshot via forge-surgical-reset.captureSnapshot
+  // ([{path,hash}], .gsd/** excluded; empty on a clean tree) and proceeds with the dispatch.
+  // This snapshot is AUDIT ONLY — exposed as `pre_dirty` in the result JSON for the
+  // orchestrator to cross-check. The AUTHORITATIVE snapshot that drives the post-failure
+  // surgical reset lives in the orchestrator's state file (T03/T04); the adapter NEVER resets.
+  const preDirty = captureSnapshot(cwd);
 
   const startSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
   const startedAt = new Date().toISOString();
@@ -1379,6 +1394,7 @@ async function runExecute(opts) {
     must_haves_status: parsed.must_haves_status,
     files_changed: derived,
     files_changed_declared: parsed.files_changed,
+    pre_dirty: preDirty,
     start_sha: startSha,
     head_sha: headSha,
     started_at: startedAt,
