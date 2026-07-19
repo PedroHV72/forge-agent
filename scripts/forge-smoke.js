@@ -3886,19 +3886,19 @@ function smokeRoutingWiring() {
   }
 
   // (d) contrato BLOCKER (doc-presence): sufixo -attempt- (state fresco por tentativa),
-  // reset verificado (git status --porcelain) e cap SIDECAR_ATTEMPT presentes em
-  // forge-auto e forge-next; o canônico descreve os três.
+  // reset verificado via forge-surgical-reset.js (critério = exit 0 do helper, NÃO porcelain) e cap
+  // SIDECAR_ATTEMPT presentes em forge-auto e forge-next; o canônico descreve os três.
   for (const f of [{ name: 'skills/forge-auto/SKILL.md', txt: autoTxt }, { name: 'skills/forge-next/SKILL.md', txt: nextTxt }]) {
     assert(/-attempt-/.test(f.txt),
       `(d) ${f.name} contém o sufixo -attempt- (state fresco por tentativa)`, 'ausente');
-    assert(/porcelain/.test(f.txt),
-      `(d) ${f.name} contém 'porcelain' (reset verificado via git status --porcelain)`, 'ausente');
+    assert(/forge-surgical-reset\.js --reset/.test(f.txt),
+      `(d) ${f.name} contém o reset verificado via forge-surgical-reset.js --reset`, 'ausente');
     assert(/SIDECAR_ATTEMPT/.test(f.txt),
       `(d) ${f.name} contém o cap SIDECAR_ATTEMPT`, 'ausente');
   }
-  assert(/-attempt-/.test(dispatchTxt) && /porcelain/.test(dispatchTxt) && /SIDECAR_ATTEMPT/.test(dispatchTxt),
-    '(d) shared/forge-dispatch.md descreve os três invariantes do contrato BLOCKER (-attempt-, porcelain, SIDECAR_ATTEMPT)',
-    `attempt=${/-attempt-/.test(dispatchTxt)} porcelain=${/porcelain/.test(dispatchTxt)} cap=${/SIDECAR_ATTEMPT/.test(dispatchTxt)}`);
+  assert(/-attempt-/.test(dispatchTxt) && /forge-surgical-reset\.js --reset/.test(dispatchTxt) && /SIDECAR_ATTEMPT/.test(dispatchTxt),
+    '(d) shared/forge-dispatch.md descreve os três invariantes do contrato BLOCKER (-attempt-, forge-surgical-reset.js --reset, SIDECAR_ATTEMPT)',
+    `attempt=${/-attempt-/.test(dispatchTxt)} reset=${/forge-surgical-reset\.js --reset/.test(dispatchTxt)} cap=${/SIDECAR_ATTEMPT/.test(dispatchTxt)}`);
 
   // (e) Layer 2 / MEM001: forge-routing.js aparece perto de --next-after; context_overflow
   // re-resolve via routing (não forge-tier-chain na row); e o texto reforça "nunca 4ª camada".

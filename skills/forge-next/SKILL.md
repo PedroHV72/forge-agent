@@ -836,30 +836,25 @@ fi
 ```
 When `REASON == sidecar-cap-exceeded`, **skip steps 1–4 entirely** (no `START_SHA` capture, no state/result-file allocation, no sidecar launch) and go DIRECTLY to the **Fallback** block below (R3). Steps 1–3 below run **only** in the `else` — they are guarded by the same `if [ "$REASON" != "sidecar-cap-exceeded" ]` condition.
 
-1. **Capture `START_SHA` (authoritative for the reset — independent of the adapter's own `start_sha`) and persist a FRESH per-attempt state file to disk.** Branch C spans multiple Bash tool invocations (the poll loop) and may cross an auto-compact, so shell vars do NOT survive — the state file (under `WORKING_DIR/.gsd`, never `CODE_DIR`) is the durable carrier of `{attempt, start_sha, reason, result_file, code_dir}`, mirroring `auto-mode-started.txt`. **The name carries the attempt number `N = SIDECAR_ATTEMPT` (`-attempt-$N`) and NEVER overwrites a prior attempt's file** (audit preserved, post-compact recovery unambiguous — BLOCKER invariant #1). The success AND fallback blocks re-read the state of the **CURRENT** attempt from disk. The whole step is gated on the cap (R3 — the real `if/else` whose cap branch went straight to Fallback above):
+1. **Capture `START_SHA` + the pre-dirty snapshot in ONE atomic write, via the surgical-reset helper.** `--state-init` records `{attempt, start_sha, pre_dirty:[{path,hash}], reason, result_file, code_dir}` in the SAME write (`.gsd/**` excluded), so the snapshot survives the poll loop / an auto-compact (BLOCKER invariant #2 — a snapshot in a shell var is lost the moment the process crosses a Bash-tool boundary). Branch C spans multiple Bash tool invocations, so shell vars do NOT survive — the state file (under `WORKING_DIR/.gsd`, never `CODE_DIR`) is the durable carrier. **The name carries the attempt number `N = SIDECAR_ATTEMPT` (`-attempt-$N`) and NEVER overwrites a prior attempt's file** (audit preserved, post-compact recovery unambiguous — BLOCKER invariant #1). The success AND fallback blocks re-read the state of the **CURRENT** attempt from disk. The whole step is gated on the cap (R3 — the real `if/else` whose cap branch went straight to Fallback above):
 ```bash
 if [ "$REASON" != "sidecar-cap-exceeded" ]; then
   CODE_DIR="${WORKER_CWD:-$WORKING_DIR}"
-  START_SHA=$(git -C "$CODE_DIR" rev-parse HEAD)
   N="$SIDECAR_ATTEMPT"                                              # 1, 2, 3 — one per codex member dispatched
   XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${T##}-attempt-${N}.json"
   mkdir -p "$WORKING_DIR/.gsd/forge/"
-  printf '{"attempt":%s,"start_sha":"%s","reason":"","result_file":"","code_dir":"%s"}\n' "$N" "$START_SHA" "$CODE_DIR" > "$XLLM_STATE"
+  START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-init \
+    --state "$XLLM_STATE" --cwd "$CODE_DIR" --attempt "$N")
 fi
 ```
 
-2. **Clean-tree guard.** Dirty tree → do NOT dispatch the sidecar (never discard uncommitted work); go to Fallback with `REASON=dirty-tree-guard` and **skip the reset** (the dirty work predates the never-launched sidecar). Scope the porcelain to exclude `.gsd/` (orchestrator writes `.gsd` during the flow; `.gsd` may be committed in user projects) — R6:
-```bash
-if [ -n "$(git -C "$CODE_DIR" status --porcelain -- . ':(exclude).gsd')" ]; then
-  REASON="dirty-tree-guard"   # → Fallback below WITHOUT reset, then the Claude dispatch
-  printf '{"attempt":%s,"start_sha":"%s","reason":"%s","result_file":"","code_dir":"%s"}\n' "$N" "$START_SHA" "$REASON" "$CODE_DIR" > "$XLLM_STATE"
-fi
-```
+2. **No pre-dispatch clean-tree guard — the pre-dirty snapshot IS the guard** (SUPERSEDED, DECISION 39, see S01-CONTEXT.md). A dirty working tree is a **safe precondition**, not a refusal reason: the fallback reset only ever touches paths that changed relative to the snapshot; pre-existing dirty content is provably untouched (re-hash) or the reset aborts entirely (overlap) rather than guessing. `dirty-tree-guard` is no longer a trigger and the sidecar dispatches over a pre-existing dirty tree.
 
-3. **Allocate the result-file OUTSIDE `CODE_DIR`** (S01 contract — codex could overwrite a file inside the workspace) + dispatch detached via `run_in_background: true` (the Bash tool's 600s foreground ceiling does not apply). `--model` appended **only when `$CODEX_MODEL` is non-empty** (null → CLI default). `$XLLM_STATE` is the `-attempt-$N.json` of the CURRENT attempt — never a prior attempt's file:
+3. **Allocate the result-file OUTSIDE `CODE_DIR`** (S01 contract — codex could overwrite a file inside the workspace) + dispatch detached via `run_in_background: true` (the Bash tool's 600s foreground ceiling does not apply). `--model` appended **only when `$CODEX_MODEL` is non-empty** (null → CLI default). Patch the result-file into the durable state of the CURRENT attempt N via `--state-update` — a READ-MODIFY-WRITE that preserves `start_sha` + `pre_dirty` untouched. **NEVER a plain printf**: a hand-written printf omits `pre_dirty`, clobbering the snapshot and degrading the reset back to whole-tree destruction the moment the Fallback runs:
 ```bash
 RESULT_FILE=$(mktemp -t forge-xllm-result.XXXXXX.json)   # tmpdir, never under $CODE_DIR
-printf '{"attempt":%s,"start_sha":"%s","reason":"","result_file":"%s","code_dir":"%s"}\n' "$N" "$START_SHA" "$RESULT_FILE" "$CODE_DIR" > "$XLLM_STATE"
+node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
+  --state "$XLLM_STATE" --result-file "$RESULT_FILE"
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
   --plan "$PLAN_PATH" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
   --timeout "$WORKERS_TIMEOUT" \
@@ -880,23 +875,26 @@ echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\"
 # → proceed to Step 5 (Process result). Do NOT run the Claude machinery below.
 ```
 
-**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, six triggers by `REASON` (`dirty-tree-guard`, `codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `sidecar-cap-exceeded`); no retry of the codex work; **not a 4th recovery layer**:
+**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`); no retry of the codex work; **not a 4th recovery layer**:
 ```bash
-# Re-read durable state (this block may be a later Bash invocation — shell vars are gone).
-# $XLLM_STATE is the -attempt-$N.json of the CURRENT attempt (BLOCKER invariant #1).
-START_SHA=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).start_sha" 2>/dev/null)
-CODE_DIR=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).code_dir" 2>/dev/null)
-# Reset to START_SHA (scoped to CODE_DIR, excluding .gsd/) — EXCEPT dirty-tree-guard, which skips the reset.
-# The .gsd exclusion protects the orchestrator's own .gsd writes (events.jsonl / evidence) made during
-# the poll — guarded by the dirty-tree-guard + .gsd exclusion scope, NOT by gitignore (user projects
-# may commit .gsd).
-if [ "$REASON" != "dirty-tree-guard" ] && [ "$REASON" != "sidecar-cap-exceeded" ]; then
-  git -C "$CODE_DIR" checkout "$START_SHA" -- . ':(exclude).gsd' && git -C "$CODE_DIR" clean -fd -e .gsd
-  # BLOCKER invariant #2 — VERIFY the reset actually cleaned the tree. A still-dirty tree must NOT be
-  # inherited into a subsequent sidecar attempt (cross-engine chain: the next member may be codex).
-  # Scope to exclude .gsd/ (orchestrator .gsd writes during the poll; .gsd may be committed) — R6.
-  if [ -n "$(git -C "$CODE_DIR" status --porcelain -- . ':(exclude).gsd')" ]; then
-    REASON="verified-reset-failed"   # reset left the tree dirty → abort the chain to the Claude fallback
+# Re-read is delegated to the helper — $XLLM_STATE is the -attempt-$N.json of the CURRENT attempt
+# (BLOCKER invariant #1) and carries start_sha + pre_dirty (this block may be a later Bash invocation
+# — shell vars are gone). BLOCKER invariant #2 — surgical reset via the helper (scoped to CODE_DIR,
+# .gsd/** excluded), EXCEPT sidecar-cap-exceeded (no attempt captured a snapshot → nothing to undo).
+# The pre-dirty snapshot from step 1 makes it safe to reset even over a pre-existing dirty tree: only
+# the codex-authored change set is undone; pre-existing dirty content is re-hashed intact (RC=0) or the
+# reset aborts (RC=3 overlap / RC=2 verify-failed). .gsd/** is excluded by the helper's own predicate,
+# so it never reverts the orchestrator's own .gsd writes (events.jsonl / evidence) made during the poll.
+if [ "$REASON" != "sidecar-cap-exceeded" ]; then
+  RESET_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --reset --state "$XLLM_STATE"); RC=$?
+  # RC=0 → reset verified (only codex-authored changes undone, pre-dirty snapshot intact) → advance.
+  # RC=3 → OVERLAP: a pre-dirty path's hash diverged (the sidecar ALSO wrote it) — the helper reset
+  #        NOTHING (leftovers stay on disk, visible for the human — never silently discarded).
+  # RC=2 → reset ran but post-verification still found a leftover that isn't an intact pre-dirty path.
+  if [ "$RC" = "3" ]; then
+    REASON="surgical-reset-overlap"   # emit event with the overlap path list from $RESET_JSON; abort chain
+  elif [ "$RC" != "0" ]; then
+    REASON="verified-reset-failed"    # abort the chain to the Claude fallback — never inherit a dirty tree
   fi
 fi
 
@@ -905,10 +903,10 @@ fi
 # Step 4b consumes it). This is what makes the CODEX_MEMBERS cap non-dead code (R2). forge-next is
 # step mode: it executes ONE unit, so the advance is NOT dispatched now — the NEXT /forge-next
 # invocation consumes the cursor and dispatches $NEXT (Branch codex if gpt, else the Claude Agent).
-# Abort reasons (dirty-tree-guard / sidecar-cap-exceeded / verified-reset-failed) forbid advancement
-# → no cursor, take the generic Claude fallback below.
+# Abort reasons (surgical-reset-overlap / sidecar-cap-exceeded / verified-reset-failed) forbid
+# advancement → no cursor, take the generic Claude fallback below.
 NEXT=""
-if [ "$REASON" != "dirty-tree-guard" ] && [ "$REASON" != "sidecar-cap-exceeded" ] && [ "$REASON" != "verified-reset-failed" ]; then
+if [ "$REASON" != "surgical-reset-overlap" ] && [ "$REASON" != "sidecar-cap-exceeded" ] && [ "$REASON" != "verified-reset-failed" ]; then
   NEXT=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" \
     --unit-type "$unit_type" --tier "$TIER" --domain "$DOMAIN" \
     --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" \
@@ -1071,7 +1069,7 @@ Parse the `---GSD-WORKER-RESULT---` block:
 |-------|---------|-----------------|
 | `context_overflow` | "context limit", "too long", "token" | "Task too large for one context window. Run `/forge-next` again — it will retry with a more capable model." **Climbs the separate tier ladder (`standard → heavy → max`), does NOT consume `chain[]`** — but S02 re-resolves THROUGH routing at the escalated tier so a domain-specific `routing.<domain>.<phase>.<escalated-tier>` cell is honored: `ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" --unit-type "$unit_type" --tier "$ESCALATED_TIER" --domain "$DOMAIN" --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" --cwd "$WORKING_DIR")` then `MODEL_ID=chain[0].id`. Escalated tier `max` is terminal → `blocked → human`. Persist the cursor `{model, engine, ts}` (engine from `chain[0].engine`) so the next `/forge-next` resumes at the escalated model. |
 | `scope_exceeded` | "out of scope", "too broad" | "Task scope too broad. Ask the planner to split T## before continuing." |
-| `model_refusal` | "cannot", "I'm not able", "policy" | Walk the **cross-engine chain** via routing: `NEXT=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" --unit-type "$unit_type" --tier "$TIER" --domain "$DOMAIN" --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" --cwd "$WORKING_DIR" --next-after "$MODEL_ID")` — this replaces the old `forge-tier-chain.js --next-after` (SAME Layer 2, new resolver — never a 4th layer). It walks the resolved chain → category fallback → `''`. **Persist the cross-engine cursor:** if `$NEXT` is non-empty, re-derive its engine (`NEXT_FAMILY=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --family "$NEXT")`; `gpt→codex`, else `claude`) and write `$WORKING_DIR/.gsd/forge/tier-cursor-${RUN_ID:-legacy}-${unit_type}-${unit_id}.json` as `{"model":"$NEXT","engine":"$NEXT_ENGINE","ts":"<ISO8601 now>"}` (`mkdir -p` first) — Step 4b above consumes-and-deletes it on the *next* `/forge-next`, re-inspecting the engine to route to Branch codex or the Claude Agent. If the `$NEXT` member is codex, the verified reset (BLOCKER invariant #2) runs before that next attempt captures `START_SHA`. `forge-next` does not auto-recover mid-unit (step mode surfaces) — surface: "Model refused the task. Run `/forge-next` again — it will retry with the next model in the chain (`$NEXT`)." If `$NEXT` is empty (chain + category fallback exhausted) → do NOT write a cursor; surface "Model refused the task and the chain is exhausted. Adjust the task plan or routing config." |
+| `model_refusal` | "cannot", "I'm not able", "policy" | Walk the **cross-engine chain** via routing: `NEXT=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" --unit-type "$unit_type" --tier "$TIER" --domain "$DOMAIN" --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" --cwd "$WORKING_DIR" --next-after "$MODEL_ID")` — this replaces the old `forge-tier-chain.js --next-after` (SAME Layer 2, new resolver — never a 4th layer). It walks the resolved chain → category fallback → `''`. **Persist the cross-engine cursor:** if `$NEXT` is non-empty, re-derive its engine (`NEXT_FAMILY=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --family "$NEXT")`; `gpt→codex`, else `claude`) and write `$WORKING_DIR/.gsd/forge/tier-cursor-${RUN_ID:-legacy}-${unit_type}-${unit_id}.json` as `{"model":"$NEXT","engine":"$NEXT_ENGINE","ts":"<ISO8601 now>"}` (`mkdir -p` first) — Step 4b above consumes-and-deletes it on the *next* `/forge-next`, re-inspecting the engine to route to Branch codex or the Claude Agent. If the `$NEXT` member is codex, the verified reset (BLOCKER invariant #2 — `forge-surgical-reset.js --reset` must exit 0) runs before that next attempt captures its snapshot via `--state-init`. `forge-next` does not auto-recover mid-unit (step mode surfaces) — surface: "Model refused the task. Run `/forge-next` again — it will retry with the next model in the chain (`$NEXT`)." If `$NEXT` is empty (chain + category fallback exhausted) → do NOT write a cursor; surface "Model refused the task and the chain is exhausted. Adjust the task plan or routing config." |
 | `429` | "rate limit", "429", "quota" | Same cross-engine chain-walk + cross-engine cursor-persist semantics as `model_refusal` — surface: "Rate limited. Run `/forge-next` again — it will retry with the next model in the chain (`$NEXT`)." or "chain exhausted" message if `$NEXT` empty (no cursor written). This is a `status: blocked` classification (Layer 2), distinct from a transient 429 raised as an `Agent()` exception (Retry Handler, Layer 1). |
 | `400` | "400", "bad request", "invalid" | Same cross-engine chain-walk + cross-engine cursor-persist semantics as `model_refusal`. |
 | `tooling_failure` | "command not found", "permission denied", "ENOENT" | "Tooling error — check that required tools are installed." |
