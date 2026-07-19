@@ -71,6 +71,7 @@ const os = require('os');
 const { spawnSync, spawn, execSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
 const { captureSnapshot } = require('./forge-surgical-reset.js');
+const { classifyError, isTransient } = require('./forge-classify-error.js');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1541,7 +1542,20 @@ module.exports = {
   readWorkersTimeout,
   assertSafeForCmdShell,
   resolveShimJsEntry,
+  classifyErrorClass,
 };
+
+// ── Error classification for adapter-failed markers ─────────────────────────
+/**
+ * Classify a failure message into 'transient' | 'terminal' for the adapter-failed
+ * marker. codex-timeout is forced terminal (LOCKED decision — checked BEFORE
+ * classifyError so a future message-string change can't accidentally reclassify
+ * a timeout as transient). All other messages defer to forge-classify-error.js.
+ */
+function classifyErrorClass(msg) {
+  if (/killed after exceeding timeout/i.test(msg || '')) return 'terminal';
+  return isTransient(classifyError(msg)) ? 'transient' : 'terminal';
+}
 
 // ── CLI entrypoint ────────────────────────────────────────────────────────────
 
@@ -1587,6 +1601,7 @@ if (require.main === module) {
             writeJsonAtomic(path.resolve(resultFile), {
               status: 'adapter-failed',
               reason: e.message,
+              error_class: classifyErrorClass(e.message),
               failed_at: new Date().toISOString(),
             });
           } catch { /* best-effort — never mask the real error */ }
@@ -1620,6 +1635,7 @@ if (require.main === module) {
             writeJsonAtomic(path.resolve(resultFile), {
               status: 'adapter-failed',
               reason: e.message,
+              error_class: classifyErrorClass(e.message),
               ...(startSha ? { start_sha: startSha } : {}),
               failed_at: new Date().toISOString(),
             });

@@ -343,6 +343,7 @@ function initState(stateFile, { cwd, attempt }) {
     reason: '',
     result_file: '',
     code_dir: cwd,
+    transient_retry_count: 0,
   };
   writeJsonAtomic(stateFile, state);
   return state;
@@ -457,6 +458,9 @@ function main() {
       const patch = {};
       if (args.reason != null && args.reason !== true) patch.reason = args.reason;
       if (args['result-file'] != null && args['result-file'] !== true) patch.result_file = args['result-file'];
+      if (args['transient-retry-count'] != null && args['transient-retry-count'] !== true) {
+        patch.transient_retry_count = parseInt(args['transient-retry-count'], 10);
+      }
       updateState(args.state, patch);
       process.exit(0);
     }

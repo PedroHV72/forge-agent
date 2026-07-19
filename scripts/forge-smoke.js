@@ -2453,6 +2453,72 @@ async function smokeXllmExecute() {
     cleanup(resultDir);
     cleanup(mockDir);
   }
+
+  // Scenario I — error_class on the adapter-failed marker (M013 S02 T01): each
+  // failure kind classified via forge-classify-error.js (transient vs terminal),
+  // reached by making the mock codex exit non-zero with a stderr snippet that the
+  // classifier's regex matches (`codex exited N: <snippet>` reaches classifyError).
+  {
+    const cases = [
+      { label: 'I1', stderr: '429 Too Many Requests: rate limit exceeded', expect: 'transient' },
+      { label: 'I2', stderr: 'network error: ECONNRESET', expect: 'transient' },
+      { label: 'I3', stderr: '503 service unavailable: overloaded', expect: 'transient' },
+      { label: 'I4', stderr: 'terminated: other side closed', expect: 'transient' },
+      { label: 'I5', stderr: 'invalid api key: unauthorized', expect: 'terminal' },
+      { label: 'I6', stderr: 'model refused: content policy violation', expect: 'terminal' },
+    ];
+    for (const c of cases) {
+      const repo = mkGitRepo(mkTmp(`xllm-exec-${c.label}`));
+      const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-plan-'));
+      const planFile = path.join(planDir, 'plan.md');
+      fs.writeFileSync(planFile, '# T01\ndo the thing\n', 'utf8');
+      const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-smoke-xllm-exec-${c.label}-result-`));
+      const resultFile = path.join(resultDir, 'result.json');
+      const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-smoke-xllm-exec-${c.label}-mock-`));
+      writeMockCodex(mockDir, {
+        payload: '',
+        writeOutput: false,
+        exitCode: 1,
+        extraScript: `printf '%s' ${shQuote(c.stderr)} 1>&2`,
+      });
+      const r = runExecuteXllm(['--plan', planFile, '--result-file', resultFile, '--cwd', repo], mockDir, repo);
+      assert(r.status !== 0, `${c.label}: adapter exits non-zero on codex failure`, `status=${r.status}`);
+      let parsed = null;
+      try { parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) { /* leave null */ }
+      assert(!!parsed && parsed.status === 'adapter-failed', `${c.label}: result-file marks adapter-failed`, JSON.stringify(parsed));
+      assert(!!parsed && parsed.error_class === c.expect,
+        `${c.label}: error_class === ${c.expect} for "${c.stderr}"`, JSON.stringify(parsed));
+      cleanup(repo);
+      cleanup(planDir);
+      cleanup(resultDir);
+      cleanup(mockDir);
+    }
+  }
+
+  // Scenario J — codex-timeout forced terminal (LOCKED decision) even though the
+  // adapter's own "killed after exceeding timeout" message never matches any of
+  // forge-classify-error.js's transient regexes — this proves the BEFORE-check
+  // guard, not just an accidental fallthrough.
+  {
+    const repo = mkGitRepo(mkTmp('xllm-exec-j'));
+    const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-plan-'));
+    const planFile = path.join(planDir, 'plan.md');
+    fs.writeFileSync(planFile, '# T01\ndo the thing\n', 'utf8');
+    const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-j-result-'));
+    const resultFile = path.join(resultDir, 'result.json');
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-j-mock-'));
+    writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: 'sleep 60 &\nsleep 30' });
+    const r = runExecuteXllm(['--plan', planFile, '--result-file', resultFile, '--cwd', repo, '--timeout', '1'], mockDir, repo);
+    assert(r.status !== 0, 'J: timeout makes adapter exit non-zero', `status=${r.status}`);
+    let parsed = null;
+    try { parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) { /* leave null */ }
+    assert(!!parsed && parsed.status === 'adapter-failed', 'J: result-file marks adapter-failed on timeout', JSON.stringify(parsed));
+    assert(!!parsed && parsed.error_class === 'terminal', 'J: codex-timeout forced error_class terminal', JSON.stringify(parsed));
+    cleanup(repo);
+    cleanup(planDir);
+    cleanup(resultDir);
+    cleanup(mockDir);
+  }
 }
 
 // ── Section 26: engine dispatch (reset + fallback + dirty guard) ────────────
@@ -5760,12 +5826,21 @@ function smokeSurgicalReset() {
     assert(Array.isArray(st.pre_dirty) && st.pre_dirty.length === 2, '(d) pre_dirty has both dirty paths', JSON.stringify(st.pre_dirty));
     assert(st.pre_dirty.every((d) => typeof d.path === 'string' && (d.hash === null || /^[0-9a-f]{40}$/.test(d.hash))),
       '(d) pre_dirty entries are {path, hash}');
+    assert(st.transient_retry_count === 0, '(d) --state-init seeds transient_retry_count: 0', JSON.stringify(st.transient_retry_count));
     // --state-update preserves pre_dirty
     spawnSync('node', [SR, '--state-update', '--state', stateFile, '--reason', 'codex-timeout', '--result-file', '/tmp/x.json'], { encoding: 'utf8' });
     const st2 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     assert(st2.reason === 'codex-timeout' && st2.result_file === '/tmp/x.json', '(d) --state-update writes reason/result_file');
     assert(JSON.stringify(st2.pre_dirty) === JSON.stringify(st.pre_dirty), '(d) --state-update preserves pre_dirty intact');
     assert(st2.start_sha === st.start_sha, '(d) --state-update preserves start_sha');
+    // (d2) M013 S02 T01: --transient-retry-count bumps the counter via read-modify-write,
+    // preserving pre_dirty/start_sha (the S01 BLOCKER item 3 invariant).
+    spawnSync('node', [SR, '--state-update', '--state', stateFile, '--transient-retry-count', '2'], { encoding: 'utf8' });
+    const st3 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert(st3.transient_retry_count === 2, '(d2) --transient-retry-count bumps the counter', JSON.stringify(st3.transient_retry_count));
+    assert(JSON.stringify(st3.pre_dirty) === JSON.stringify(st.pre_dirty), '(d2) --transient-retry-count preserves pre_dirty intact');
+    assert(st3.start_sha === st.start_sha, '(d2) --transient-retry-count preserves start_sha');
+    assert(st3.reason === 'codex-timeout' && st3.result_file === '/tmp/x.json', '(d2) --transient-retry-count preserves prior patch fields');
     cleanup(dir);
   }
 
