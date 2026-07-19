@@ -1332,17 +1332,22 @@ function smokeEffort() {
   const disp = rd('shared/forge-dispatch.md');
   const planner = rd('agents/forge-planner.md');
 
+  const resolver = rd('scripts/forge-dispatch-resolve.js');
   for (const [label, txt] of [['forge-auto', auto], ['forge-next', next]]) {
-    assert(/Effort Resolution \(after Tier Resolution/.test(txt), `${label}: has Effort Resolution block`, 'block missing');
-    assert(/PLAN_EFFORT=\$\(node/.test(txt), `${label}: parses effort: from T##-PLAN frontmatter`, 'PLAN_EFFORT parse missing');
-    assert(/frontmatter-effort:/.test(txt), `${label}: frontmatter-effort reason present`, 'reason missing');
-    assert(/clamped:model-cap/.test(txt), `${label}: model-cap clamp present`, 'clamp missing');
+    // M012 S02 cutover: effort is resolved by forge-dispatch-resolve.js; the SKILL delegates.
+    assert(/forge-dispatch-resolve\.js/.test(txt), `${label}: delegates dispatch resolution to forge-dispatch-resolve.js`, 'resolver call missing');
+    assert(txt.includes('EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)"'), `${label}: extracts effort from the resolver contract`, 'EFFORT extraction missing');
+    assert(txt.includes('EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)"'), `${label}: extracts effort_reason from the resolver contract`, 'EFFORT_REASON extraction missing');
+    // the inline effort block + its default map + clamp must be gone (logic lives only in the resolver)
+    assert(!/declare -A EFFORT_DEFAULTS/.test(txt), `${label}: inline EFFORT_DEFAULTS map removed`, 'inline effort map still present');
     // dispatch event carries effort + effort_reason
     assert(/event.*dispatch[\s\S]*?effort\\?":\\?"\$\{?EFFORT/.test(txt), `${label}: dispatch event includes effort`, 'effort field missing from event');
     assert(/effort_reason\\?":\\?"\$\{?EFFORT_REASON/.test(txt), `${label}: dispatch event includes effort_reason`, 'effort_reason field missing');
-    // old naive resolver must be gone
-    assert(!/EFFORT_MAP\[unit_type\] or \("medium" if opus/.test(txt), `${label}: legacy naive effort resolver removed`, 'naive resolver still present');
   }
+
+  // Effort logic (frontmatter axis + model-cap clamp) now lives in the shared resolver.
+  assert(/frontmatter-effort:/.test(resolver), 'forge-dispatch-resolve: frontmatter-effort reason present', 'reason missing');
+  assert(/clamped:model-cap/.test(resolver), 'forge-dispatch-resolve: model-cap clamp present', 'clamp missing');
 
   assert(/### Effort Resolution/.test(disp), 'forge-dispatch: canonical Effort Resolution section', 'section missing');
   assert(/low < medium < high < xhigh < max/.test(disp), 'forge-dispatch: documents ordered effort scale', 'scale missing');
@@ -1910,8 +1915,8 @@ function smokeModelAlias() {
       const content = files[name];
       assert(content.includes('model: $MODEL_ALIAS'),
         `${name} passes model: $MODEL_ALIAS to Agent()`, 'not found');
-      assert(content.includes('MODEL_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --id "$MODEL_ID")'),
-        `${name} resolves MODEL_ALIAS via the canonical helper invocation`, 'not found');
+      assert(content.includes("MODEL_ALIAS=$(node -e \"process.stdout.write(JSON.parse(process.argv[1]).alias"),
+        `${name} resolves MODEL_ALIAS from the forge-dispatch-resolve.js contract`, 'not found');
     }
   }
 

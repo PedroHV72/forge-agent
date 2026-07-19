@@ -172,125 +172,65 @@ Then proceed with dispatch normally (the executor will overwrite the partial wor
 
 **Effort is resolved in step 1.55 below** (after tier resolution), because the per-model capability clamp needs the resolved `$MODEL_ID`. Do NOT resolve effort here.
 
-**Route resolution (step 1.45) — engine + domain inputs (single-call resolver).** As of M007 S02 the engine decision and the tier-chain resolution **collapse into ONE call** to `forge-routing.js` (made in Tier Resolution step 4 below — never two calls). This step resolves only the *inputs* that call consumes: `$DOMAIN` (domain metadata), `$PLAN_WORKER` (frontmatter `worker:` override, execute-task only), and the legacy-compat `workers:` reader (`$WORKERS_ENGINE`/`$WORKERS_TIMEOUT`/`$CODEX_MODEL`) used only when `route_source == tier_models`. `$ENGINE` itself is decided **after** the routing call, from its `route_source` (see step 1.5 step 4-engine). Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` (canonical). `forge-next` is sequential — no parallel-batch — so this is simpler than `forge-auto`; the block contract (vars, reasons, event) is otherwise **byte-identical** to the `forge-auto` mirror.
-> Cross-reference: `shared/forge-dispatch.md § Worker Engine Routing` (single-call resolver, route_source table, prefs reader, sidecar state machine, fallback). Any change lands there first, then propagates here.
+**Resolver args (step 1.45).** As of M012 S02 the entire dispatch resolution (engine decision + tier-chain + domain + effort + alias) **collapses into ONE call** to `forge-dispatch-resolve.js` (made in step 1.5 below). This step resolves only the *file* args that call consumes: `$PLAN_PATH` (execute-task frontmatter source) and `$ROADMAP_PATH` (domain tag + risk-escalation source). Everything else — `$ENGINE`, `$DOMAIN_USED`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL`, `$MODEL_ALIAS`, `$TIER`, `$EFFORT` — is emitted by the resolver. Thin caller of `shared/forge-dispatch.md § Worker Engine Routing` (canonical). `forge-next` is sequential — no parallel-batch — so this is simpler than `forge-auto`; the resolver contract (vars, reasons, event) is otherwise identical to the `forge-auto` mirror.
+> Cross-reference: `shared/forge-dispatch.md § Worker Engine Routing` (single-call resolver, route_source table, prefs reader, sidecar state machine, fallback) + `scripts/forge-dispatch-resolve.js` (S01). Any change lands there first, then propagates here.
 
-When the resolved `$ENGINE == codex` **and** `$unit_type == execute-task`, the Claude Tier/Effort machinery below (alias, timeline, guarded `Agent()`) is **skipped** (Codex resolves its own model via the sidecar) — it runs only on the Claude path, including the fallback. When `$ENGINE == codex` **and** `$unit_type == plan-slice`, the Claude machinery is likewise **skipped** — Branch D (sidecar plan, read-only) fires instead. `$ENGINE == claude` (or `codex` for a non-routable unit) → control flows straight to the Claude dispatch (byte-identical to the current loop). `execute-task` and `plan-slice` (**active — S03**) are the two routable unit types.
+When the resolved `$ENGINE == codex` **and** `$unit_type == execute-task`, the Claude machinery below (alias warning, timeline, guarded `Agent()`) is **skipped** (Codex resolves its own model via the sidecar) — it runs only on the Claude path, including the fallback. When `$ENGINE == codex` **and** `$unit_type == plan-slice`, the Claude machinery is likewise **skipped** — Branch D (sidecar plan, read-only) fires instead. `$ENGINE == claude` (or `codex` for a non-routable unit) → control flows straight to the Claude dispatch (byte-identical to the current loop). `execute-task` and `plan-slice` (**active — S03**) are the two routable unit types.
 
 ```bash
-# ── Route resolution inputs (engine decided AFTER the routing call — step 1.5 step 4) ──
-# Workers knobs read off the canonical resolved $PREFS_JSON (ONE forge-prefs.js --resolved call
-# at Load context; NEVER a 3-file `files=[…forge-agent-prefs.md…]` cascade node -e merge, MEM001
-# M005). Same defaults/clamps as the old inline snippet: engine default-safe claude, timeout 1800,
-# codex_model "". Per-unit-type engine read as .prefs.workers[<unit_type>].
-WORKERS_ENGINE=$(printf '%s' "$PREFS_JSON" | UNIT_TYPE="$unit_type" node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const w=JSON.parse(d).prefs.workers||{};let e=w[process.env.UNIT_TYPE||'execute-task'];e=(typeof e==='string')?e.toLowerCase():null;process.stdout.write((e==='claude'||e==='codex')?e:'claude')}catch(err){process.stdout.write('claude')}})")
-WORKERS_TIMEOUT=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=(JSON.parse(d).prefs.workers||{}).timeout;process.stdout.write(Number.isInteger(t)&&t>0?String(t):'1800')}catch(err){process.stdout.write('1800')}})")
-CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=(JSON.parse(d).prefs.workers||{}).codex_model;process.stdout.write(c!=null&&c!==''?String(c):'')}catch(err){process.stdout.write('')}})")
-
-# Loud-stop reminder (M008-CONTEXT #2 — NOT a bare comment): this block does NOT
-# re-resolve prefs — it reuses $PREFS_JSON already resolved AND loud-stop-guarded
-# at Load context. If that resolution exited non-zero the run has ALREADY stopped
-# there; there is no silent-fallback dispatch path here. Never proceed on a
-# WORKERS_ENGINE=claude / effort default reached by ignoring that guard.
-# Frontmatter worker: override (execute-task only) — precedence over pref.
-PLAN_WORKER=""
+# ── Resolver args (all pure resolution folded into forge-dispatch-resolve.js — step 1.5) ──
+# Loud-stop reminder (M008-CONTEXT #2 — NOT a bare comment): prefs were already resolved AND
+# loud-stop-guarded by the ONE forge-prefs.js --resolved call at Load context. If that resolution
+# exited non-zero the run has ALREADY stopped there; there is no silent-fallback dispatch path.
+# No engine/domain/worker/tier/effort parsing happens here anymore — the shared resolver reads
+# the PLAN frontmatter + ROADMAP itself. Resolve only the *file* args it needs:
+PLAN_PATH=""
 if [ "$unit_type" = "execute-task" ]; then
   PLAN_PATH=".gsd/milestones/${M###}/slices/${S##}/tasks/${T##}/${T##}-PLAN.md"
-  PLAN_WORKER=$(node -e "
-    const fs=require('fs');
-    const text=fs.readFileSync('$PLAN_PATH','utf8');
-    const m=text.match(/^---[\s\S]*?---/);
-    if(!m)process.exit(0);
-    let v=((m[0].match(/^worker:[ \t]*(\S+)/m)||[])[1]||'').trim().toLowerCase();
-    if(v!=='claude'&&v!=='codex')v='';   // whitelist; invalid → fall through
-    process.stdout.write(v);
-  ")
 fi
-
-# Domain metadata (execute-task frontmatter domain: → slice ROADMAP domain: tag → default).
-# Authoritative shape: shared/forge-dispatch.md § Domain metadata. [ \t] never \s.
-DOMAIN=""
-if [ "$unit_type" = "execute-task" ] && [ -n "$PLAN_PATH" ]; then
-  DOMAIN=$(node -e "const fs=require('fs');try{const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);process.stdout.write(m?((m[0].match(/^domain:[ \t]*(.+)$/m)||[])[1]||'').trim():'')}catch(e){}" 2>/dev/null)
-fi
-if [ -z "$DOMAIN" ]; then
-  # Fall back to the slice's ROADMAP domain: tag (both execute-task and plan-slice grep the slice line).
-  ROADMAP_PATH=".gsd/milestones/${M###}/${M###}-ROADMAP.md"
-  DOMAIN=$(grep -E "\b${S##}\b" "$ROADMAP_PATH" 2>/dev/null | grep -oE 'domain:[A-Za-z0-9_-]+' | head -1 | cut -d: -f2)
-fi
-[ -z "$DOMAIN" ] && DOMAIN="default"
+ROADMAP_PATH=".gsd/milestones/${M###}/${M###}-ROADMAP.md"
 ```
-`$WORKERS_ENGINE`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL`, `$PLAN_WORKER`, `$DOMAIN` (and `$PLAN_PATH` for execute-task) are now set. `$ENGINE`/`$ENGINE_REASON` are resolved by Tier Resolution step 4 (engine decision by `route_source`) **after** the single `forge-routing.js` call — not here. The Step 4 dispatch then branches on `$ENGINE`.
+`$PLAN_PATH`, `$ROADMAP_PATH` are now set — the *file* inputs the shared resolver reads. `$ENGINE`/`$ENGINE_REASON`/`$DOMAIN_USED`/`$WORKERS_TIMEOUT`/`$CODEX_MODEL` are resolved **inside** the single `forge-dispatch-resolve.js` call (step 1.5). The Step 4 dispatch then branches on `$ENGINE`.
 
-**Tier resolution (step 1.5)** — resolve `{tier, model, chain, reason}` for this dispatch via the **SINGLE `forge-routing.js` call** (step 4 below), which also resolves `$ENGINE` from `route_source`. Steps 1–3 (tier classification) always run; the routing call in step 4 always runs (it produces the chain + engine). Once `$ENGINE` is known: **when `$ENGINE == codex` && `$unit_type == execute-task`, skip Effort Resolution (step 1.55), the alias resolution and the Claude `Agent()` machinery** — the sidecar resolves its own model. Effort/alias/`Agent()` run only on the Claude path (including the `worker-engine-fallback` path, which re-enters them).
-> Cross-reference: `shared/forge-dispatch.md § Tier Resolution` (single-call algorithm) and `shared/forge-tiers.md` (canonical tables).
+**Dispatch resolution (step 1.5)** — resolve `{engine, model, alias, tier, domain, route_source, chain, chain_len, reason, effort, effort_reason}` for this dispatch via the **SINGLE `forge-dispatch-resolve.js --json` call**. This one call folds the former Route-resolution-inputs + Tier Resolution + engine-by-route_source + Effort Resolution + Alias Resolution bash — a thin caller now, all pure resolution lives in the resolver. The **tier-chain cursor (Step 4b)** still runs AFTER the resolver as a consume-once override of `$MODEL_ID`/`$ENGINE`/`$REASON`. Once `$ENGINE` is known: **when `$ENGINE == codex` && `$unit_type == execute-task`, skip the alias warning and the Claude `Agent()` machinery** — the sidecar resolves its own model. Alias/`Agent()` run only on the Claude path (including the `worker-engine-fallback` path, which re-enters them).
+> Cross-reference: `shared/forge-dispatch.md § Tier Resolution` + `§ Worker Engine Routing → Single-call resolver` + `§ Effort Resolution` (algorithm) and `shared/forge-tiers.md` (canonical tables). The resolver internally calls `forge-routing.js` (cross-engine chain), `forge-model-alias.js` (alias), and applies the tier/effort defaults + precedence + risk-escalation + model-cap clamp.
 
 ```bash
-# ── Tier Resolution ────────────────────────────────────────────────────────────
-# Step 1: unit-type default
-declare -A TIER_DEFAULTS=(
-  [memory-extract]="light" [complete-slice]="light" [complete-milestone]="light"
-  [research-milestone]="standard" [research-slice]="standard"
-  [discuss-milestone]="standard" [discuss-slice]="standard" [execute-task]="standard"
-  [plan-milestone]="max" [plan-slice]="heavy"
-)
-TIER="${TIER_DEFAULTS[$unit_type]:-standard}"
-REASON="unit-type:$unit_type"
-
-# Step 2: parse frontmatter (execute-task only)
-if [ "$unit_type" = "execute-task" ]; then
-  PLAN_PATH=".gsd/milestones/${M###}/slices/${S##}/tasks/${T##}/${T##}-PLAN.md"
-  PLAN_TIER=$(node -e "const fs=require('fs');const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);if(!m)process.exit(0);const r=(m[0].match(/^tier:\s*(.+)$/m)||[])[1]||'';process.stdout.write(r.trim())")
-  PLAN_TAG=$(node  -e "const fs=require('fs');const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);if(!m)process.exit(0);const r=(m[0].match(/^tag:\s*(.+)$/m)||[])[1]||'';process.stdout.write(r.trim())")
-  PLAN_EFFORT=$(node -e "const fs=require('fs');const t=fs.readFileSync('$PLAN_PATH','utf8');const m=t.match(/^---[\s\S]*?---/);if(!m)process.exit(0);const r=(m[0].match(/^effort:\s*(.+)$/m)||[])[1]||'';process.stdout.write(r.trim())")
-
-  # Step 3: apply precedence (first match wins)
-  if [ -n "$PLAN_TIER" ]; then
-    TIER="$PLAN_TIER"; REASON="frontmatter-override:$PLAN_TIER"
-  elif [ "$PLAN_TAG" = "docs" ]; then
-    TIER="light"; REASON="frontmatter-tag:docs"
-  fi
+# ── Dispatch resolution (single call to the shared resolver) ─────────────────────
+# forge-dispatch-resolve.js reads prefs from $WORKING_DIR (MEM018 — never $CODE_DIR), parses the
+# PLAN frontmatter + ROADMAP, and emits the full ordered contract. NEVER reintroduce a bash
+# tier/effort default map or a frontmatter/clamp regex here — that pure logic lives ONLY in the
+# resolver now (S01). See shared/forge-dispatch.md § Worker Engine Routing.
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-dispatch-resolve.js ] && echo scripts || echo "$HOME/.claude/scripts")
+ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" \
+  --unit-type "$unit_type" --plan "$PLAN_PATH" --unit-id "$unit_id" \
+  --milestone "${RUN_ID:-{M###}}" --roadmap "$ROADMAP_PATH" \
+  --cwd "$WORKING_DIR" --json)   # SEMPRE $WORKING_DIR, nunca $CODE_DIR (MEM018)
+if [ $? -ne 0 ]; then
+  # prefs_ok:false → resolver exit 1 (M008-CONTEXT #2 loud-stop; the Load-context prefs gate stays too).
+  echo "✗ dispatch resolver halted (prefs error) — see forge-dispatch-resolve.js prefs_errors" >&2
+  exit 1
 fi
-
-# Step 3b: risk escalation (plan-slice only) — risk:high slice escalates heavy → max.
-# Same ROADMAP check that triggers the risk radar gate below.
-if [ "$unit_type" = "plan-slice" ]; then
-  ROADMAP_PATH=".gsd/milestones/${M###}/${M###}-ROADMAP.md"
-  if grep -E "${S##}.*risk:[[:space:]]*high" "$ROADMAP_PATH" >/dev/null 2>&1; then
-    TIER="max"; REASON="risk-escalation:high"
-  fi
-fi
-
-# Step 4: resolve model + cross-engine chain via the SINGLE forge-routing.js call (raw cascade —
-# NEVER prefs-resolved.json; MEM001 M005). Replaces the old forge-tier-chain.js --json initial
-# resolution; forge-tier-chain.js survives ONLY as an internal legacy reader inside forge-routing.js.
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-routing.js ] && echo scripts || echo "$HOME/.claude/scripts")
-ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" \
-  --unit-type "$unit_type" --tier "$TIER" --domain "$DOMAIN" \
-  --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" \
-  --cwd "$WORKING_DIR")     # SEMPRE $WORKING_DIR, nunca $CODE_DIR (MEM018)
-MODEL_ID=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).chain[0].id)" "$ROUTE_JSON")
-ROUTE_SOURCE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).source)" "$ROUTE_JSON")
-CHAIN_LEN=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain.length))" "$ROUTE_JSON")
-DOMAIN_USED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain_used)" "$ROUTE_JSON")
-CHAIN0_ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).chain[0].engine||'claude')" "$ROUTE_JSON")
+MODEL_ID=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).model)" "$ROUTE_JSON")
+MODEL_ALIAS=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).alias||'')" "$ROUTE_JSON")
+TIER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).tier)" "$ROUTE_JSON")
+REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).reason)" "$ROUTE_JSON")
+DOMAIN_USED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain)" "$ROUTE_JSON")
+ROUTE_SOURCE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).route_source)" "$ROUTE_JSON")
+CHAIN_LEN=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain_len))" "$ROUTE_JSON")
+ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine)" "$ROUTE_JSON")
+ENGINE_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine_reason)" "$ROUTE_JSON")
+EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)" "$ROUTE_JSON")
+EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)" "$ROUTE_JSON")
+WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).workers_timeout))" "$ROUTE_JSON")
+CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
+THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
+unit_effort="$EFFORT"
 # $ROUTE_JSON.chain carries forward unmodified — consumed by the Failure Taxonomy via
 # `node "$FORGE_SCRIPTS_DIR/forge-routing.js" ... --next-after "$MODEL_ID"` on model_refusal/429/400
 # (walks the cross-engine chain → category fallback → ''), BEFORE any cross-tier escalation
 # (context_overflow's ladder is separate — re-resolves THROUGH routing at the escalated tier; see
 # the Failure Taxonomy below and shared/forge-dispatch.md § context_overflow).
-
-# Step 4-engine: decide ENGINE by route_source (NOT a separate Engine Resolution step).
-# routing/frontmatter → routing drives (chain[0].engine); tier_models → legacy compat (workers pref).
-if [ "$ROUTE_SOURCE" = "routing" ] || [ "$ROUTE_SOURCE" = "frontmatter" ]; then
-  ENGINE="$CHAIN0_ENGINE";      ENGINE_REASON="route:$ROUTE_SOURCE:$CHAIN0_ENGINE"
-elif [ -n "$PLAN_WORKER" ]; then
-  ENGINE="$PLAN_WORKER";        ENGINE_REASON="frontmatter-worker:$PLAN_WORKER"
-elif [ -n "$WORKERS_ENGINE" ] && [ "$WORKERS_ENGINE" != "claude" ]; then
-  ENGINE="$WORKERS_ENGINE";     ENGINE_REASON="workers.$unit_type:$WORKERS_ENGINE"
-else
-  ENGINE="claude";              ENGINE_REASON="default:claude"
-fi
 
 # Step 4-shadow: shadowing warning (risk #3) — routing: configured but not applied (advisory, stderr).
 ROUTING_PRESENT=$(FSD="$FORGE_SCRIPTS_DIR" node -e "const p=require('path').resolve(process.env.FSD,'forge-routing.js');try{process.stdout.write(String(require(p).readRoutingConfig(process.argv[1]).present))}catch(e){process.stdout.write('false')}" "$WORKING_DIR" 2>/dev/null || echo false)
@@ -298,8 +238,9 @@ if [ "$ROUTE_SOURCE" != "routing" ] && [ "$ROUTING_PRESENT" = "true" ]; then
   echo "⚠ routing: configurado mas não aplicado (route_source=$ROUTE_SOURCE) — frontmatter/legado venceu para $unit_type/$unit_id" >&2
 fi
 
-# Step 4b: tier-chain cursor (consume-once) — CROSS-ENGINE. A prior model_refusal/429/400 wrote the
-# next chain member (+ its engine) here; consume it so THIS run dispatches $NEXT, not the refused
+# Step 4b: tier-chain cursor (consume-once) — CROSS-ENGINE — runs AFTER the resolver as an override.
+# A prior model_refusal/429/400 wrote the next chain member (+ its engine) here; consume it so THIS
+# run dispatches $NEXT, not the refused
 # primary. Engine re-derived via forge-model-alias.js --family when absent (legacy cursor). Write side: Failure Taxonomy.
 TIER_CURSOR_FILE="$WORKING_DIR/.gsd/forge/tier-cursor-${RUN_ID:-legacy}-${unit_type}-${unit_id}.json"
 if [ -f "$TIER_CURSOR_FILE" ]; then
@@ -314,54 +255,14 @@ if [ -f "$TIER_CURSOR_FILE" ]; then
   fi
 fi
 ```
-`TIER`, `MODEL_ID`, `ROUTE_JSON` (`chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, and `REASON` are now set. Use `$MODEL_ID`/`$ENGINE` in the dispatch below (Step 4). `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN` are injected into the dispatch event.
+`TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (`chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `THINKING_HEADER`, `unit_effort`, and `REASON` are now set (the tier-chain cursor above may have overridden `MODEL_ID`/`ENGINE`/`REASON`). Use `$MODEL_ID`/`$ENGINE` in the dispatch below (Step 4). `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN`, `$EFFORT`, `$EFFORT_REASON` are injected into the dispatch event.
 
-> **Fable 5 thinking guard:** if `$MODEL_ID` is `claude-fable-5`, inject `thinking: adaptive` in the
-> worker prompt header (or omit the `thinking:` line) regardless of the phase's `thinking:` pref —
-> `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` (Opus 4.7/4.8 accept it).
+> **Fable 5 thinking guard:** the resolver emits `$THINKING_HEADER` (`adaptive` when `$MODEL_ID` is
+> `claude-fable-5`, else empty). When `$THINKING_HEADER` is `adaptive`, inject `thinking: adaptive`
+> in the worker prompt header (or omit the `thinking:` line) regardless of the phase's `thinking:`
+> pref — `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` (Opus 4.7/4.8 accept it).
 
-**Effort resolution (step 1.55)** — resolve `$EFFORT` for this dispatch. Runs **after** tier resolution because the per-model capability clamp needs `$MODEL_ID`.
-> Cross-reference: `shared/forge-dispatch.md § Effort Resolution` (algorithm, scale, clamp table).
-
-```bash
-# ── Effort Resolution (after Tier Resolution; needs $MODEL_ID) ────────────────────
-# Ordered scale (cheap → expensive reasoning): low < medium < high < xhigh < max
-# Step 1: unit-type default — PREFS.effort (EFFORT_MAP) wins; fallback to built-in defaults.
-declare -A EFFORT_DEFAULTS=(
-  [plan-milestone]="medium" [plan-slice]="medium"
-  [discuss-milestone]="medium" [discuss-slice]="medium"
-  [research-milestone]="medium" [research-slice]="medium"
-  [execute-task]="low" [complete-slice]="low" [complete-milestone]="low"
-  [memory-extract]="low"
-)
-EFFORT="${EFFORT_MAP[$unit_type]:-${EFFORT_DEFAULTS[$unit_type]:-low}}"
-EFFORT_REASON="unit-type:$unit_type"
-
-# Step 2: dedicated frontmatter axis (execute-task only) — effort: in T##-PLAN wins, independent of tier:
-if [ "$unit_type" = "execute-task" ] && [ -n "$PLAN_EFFORT" ]; then
-  EFFORT="$PLAN_EFFORT"; EFFORT_REASON="frontmatter-effort:$PLAN_EFFORT"
-fi
-
-# Step 3: risk escalation sync — a risk:high plan-slice (TIER bumped to max) also gets max effort.
-if [ "$unit_type" = "plan-slice" ] && [ "$REASON" = "risk-escalation:high" ]; then
-  EFFORT="max"; EFFORT_REASON="risk-escalation:high"
-fi
-
-# Step 4: clamp to the resolved model's capability ceiling — prevents HTTP 400s + wasted config.
-# haiku/sonnet cap at medium; opus/fable allow the full scale.
-EFFORT_CLAMPED=$(node -e "
-  const rank={low:0,medium:1,high:2,xhigh:3,max:4};
-  const model='$MODEL_ID';
-  const cap=(/^claude-(haiku|sonnet)/.test(model))?'medium':'max';
-  let e='$EFFORT'; if(!(e in rank)) e='medium';
-  process.stdout.write(rank[e]>rank[cap]?cap:e);
-")
-if [ "$EFFORT_CLAMPED" != "$EFFORT" ]; then
-  EFFORT_REASON="${EFFORT_REASON}|clamped:model-cap"; EFFORT="$EFFORT_CLAMPED"
-fi
-unit_effort="$EFFORT"
-```
-`unit_effort` (and `$EFFORT`/`$EFFORT_REASON` for the dispatch event) are now set. Inject `effort: {unit_effort}` and (for opus/fable phases) `thinking: {THINKING_OPUS}` into the worker prompt header.
+`unit_effort` (and `$EFFORT`/`$EFFORT_REASON` for the dispatch event) were set by the resolver above (§ Effort Resolution — unit-type default + frontmatter axis + risk-escalation sync + model-cap clamp). Inject `effort: {unit_effort}` and (for opus/fable phases) `thinking: {THINKING_OPUS}` into the worker prompt header.
 
 **Risk radar gate (plan-slice only):** If `unit_type == plan-slice` and the slice is tagged `risk:high` in ROADMAP, check if `S##-RISK.md` already exists. If not:
 ```
@@ -1130,9 +1031,8 @@ INPUT_TOKENS=$(node "$FORGE_SCRIPTS_DIR/forge-tokens.js" --inline "$worker_promp
 
 > Antes de despachar o worker, exiba o **Spawn Liveness Banner** (ver `shared/forge-dispatch.md § Spawn Liveness Banner`) com a duração estimada para o `unit_type` sendo executado (consulte a tabela de duração na seção canônica).
 
-**Alias Resolution** — `Agent()`'s `model:` param only accepts `sonnet|opus|haiku|fable`, never a full model ID:
+**Alias Resolution** — `Agent()`'s `model:` param only accepts `sonnet|opus|haiku|fable`, never a full model ID. `$MODEL_ALIAS` was already resolved by `forge-dispatch-resolve.js` (its `alias` field) in step 1.5 — just warn if it came back empty:
 ```bash
-MODEL_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --id "$MODEL_ID")
 [ -z "$MODEL_ALIAS" ] && echo "⚠ model \"$MODEL_ID\" sem alias — usando frontmatter do agente" >&2
 ```
 
