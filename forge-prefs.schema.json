@@ -369,6 +369,7 @@
         },
         "require_worktree": {
           "type": ["string", "boolean"],
+          "enum": ["auto", "true", "false", true, false],
           "default": "auto",
           "description": "Elevação estática de isolamento por engine de escrita, resolvida na ativação por scripts/forge-isolation.js resolveEffectiveMode. auto (default): eleva forge_isolation.mode shared→worktree quando um engine externo de escrita (codex via workers.execute-task, ou família gpt/gemini em routing.<domain>.executor) é resolvido p/ execute-task; branch sob auto NÃO eleva. true: sempre exige worktree (eleva shared/branch→worktree). false: nunca eleva — byte-idêntico ao comportamento atual. Paths read-only (plan-slice Branch D, review challenger) não disparam elevação. Falso-positivo aceitável, falso-negativo não."
         }
