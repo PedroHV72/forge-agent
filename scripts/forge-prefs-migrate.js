@@ -407,6 +407,16 @@ function setPreference(cwd, expression, opts) {
   }
   const schema = options.schema || loadSchema();
   if (!schema) throw new Error('forge-prefs.schema.json unavailable');
+  // Enum/type gate — pre-write, reusing validatePrefs (schema is the single
+  // source of truth, DECISION 53). Build a minimal candidate carrying only
+  // the requested key so pre-existing legacy state elsewhere in the resolved
+  // prefs never gets flagged (Pitfall 1); filter warnings by exact key match.
+  const candidate = setDottedValue({}, requested.key, requested.value);
+  const candidateWarnings = validatePrefs(candidate, schema);
+  const hit = candidateWarnings.find((warning) => warning.key === requested.key);
+  if (hit) {
+    throw new Error(hit.message);
+  }
   const schemaRef = path.relative(path.dirname(layer.jsoncPath), path.join(__dirname, '..', 'forge-prefs.schema.json')).split(path.sep).join('/') || 'forge-prefs.schema.json';
   const original = exists ? fs.readFileSync(layer.jsoncPath, 'utf8') : generateScaffold(schema, { schemaRef });
   const next = exists

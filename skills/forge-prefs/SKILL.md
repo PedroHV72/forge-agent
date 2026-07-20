@@ -1,6 +1,6 @@
 ---
 name: forge-prefs
-description: "Catálogo de preferências do forge-agent — todos os 87 knobs com estado/valor/camada/descrição, e um caminho de edição via forge-prefs-migrate.js --set."
+description: "Catálogo de preferências do forge-agent — todos os knobs do schema com estado/valor/camada/descrição, e um caminho de edição via forge-prefs-migrate.js --set."
 disable-model-invocation: true
 allowed-tools: Read, Write, Edit, Bash
 ---
@@ -12,8 +12,8 @@ $ARGUMENTS
 
 ## O que este skill faz
 
-Superfície completa do motor de preferências JSONC (M008): lista **todos os 87
-knobs** do catálogo (`forge-prefs.schema.json`, 38 seções), cada um com:
+Superfície completa do motor de preferências JSONC (M008): lista **todos os
+knobs do schema** (`forge-prefs.schema.json`), agrupados por seção, cada um com:
 
 - **estado** — ATIVO (usuário setou em alguma camada) ou desligado (default do schema)
 - **valor resolvido** — o valor efetivo, ativo ou default
@@ -175,7 +175,7 @@ um candidato de task futura em `forge-prefs-migrate.js` se houver demanda.
 
 ### Referência completa
 
-Para a lista longa (todos os 87 knobs, com tipo, enum, default e descrição
+Para a lista longa (todos os knobs do schema, com tipo, enum, default e descrição
 completa, fora do contexto de uma sessão), aponte o usuário para
 `shared/forge-prefs-reference.md` (gerado por `scripts/forge-prefs-reference.js`,
 T03 deste slice) — é o documento de referência versionado, complementar ao
@@ -188,7 +188,7 @@ T03 deste slice) — é o documento de referência versionado, complementar ao
 - **Fonte única de verdade:** `forge-prefs.schema.json` — nunca hardcode uma
   descrição, default ou lista de knobs aqui. O helper (`forge-prefs-view.js`)
   lê o schema em runtime; qualquer prosa fixa neste arquivo sobre "quais são
-  os 87 knobs" ficaria desatualizada na primeira mudança de schema.
+  os knobs" ficaria desatualizada na primeira mudança de schema.
 - **Nunca escreva `.jsonc`/`.md` de preferências diretamente.** Toda mutação
   passa por `forge-prefs-migrate.js` (`setPreference`/`--set`), que preserva
   blocos comentados existentes byte-a-byte e verifica o resultado antes de

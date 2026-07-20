@@ -6,9 +6,9 @@
 // `--resolved --explain` (forge-prefs.js) only reports ACTIVE knobs (S04/T06,
 // load-bearing decision): a knob absent from every layer never appears in
 // `prefs`/`provenance`. The viewer's whole point is to show the user the
-// FULL 87-knob universe — active AND inactive — so this module merges the
-// schema catalog (loadSchema/defaultsFromSchema, the 87-knob universe with
-// defaults + descriptions) with the resolved output (readPrefs + the CLI's
+// FULL knob universe (every knob in the schema) — active AND inactive — so
+// this module merges the schema catalog (loadSchema/defaultsFromSchema, the
+// full universe of knobs with defaults + descriptions) with the resolved output (readPrefs + the CLI's
 // `--explain` provenance) to decide, per knob: state (ATIVO/desligado),
 // resolved value, origin layer, and description.
 //
@@ -45,8 +45,8 @@ function getDottedValue(value, dotted) {
 // that carry a `default` but no declared sub-schema (e.g. `routing`,
 // additionalProperties: true). `$schema` IS counted as its own knob/section
 // here (the catalog-reference hook itself is a leaf with a default and a
-// description) — the 87-knob / 38-section counts asserted by T01-PLAN
-// include it, matching the top-level property count of forge-prefs.schema.json.
+// description) — the knob/section counts asserted by T01-PLAN include it,
+// matching the top-level property count of forge-prefs.schema.json.
 function walkSchemaLeaves(schema) {
   const leaves = [];
   const sections = [];
@@ -113,7 +113,7 @@ function resolveViaCli(cwd) {
 }
 
 // buildCatalog(cwd) — the structured accessor consumed by the test suite and
-// by `--json`. Returns every schema knob (87), each carrying its resolved
+// by `--json`. Returns every schema knob, each carrying its resolved
 // state, so nothing here is filtered by activity.
 function buildCatalog(cwd) {
   const targetCwd = cwd || process.cwd();
@@ -175,7 +175,7 @@ function sourceLabel(source) {
 function renderView(cwd) {
   const catalog = buildCatalog(cwd);
   const lines = [];
-  lines.push('Forge Agent — Catálogo de preferências (todos os 87 knobs)');
+  lines.push(`Forge Agent — Catálogo de preferências (todos os ${catalog.knobs.length} knobs)`);
   lines.push('');
   lines.push(`  camada global: ${sourceLabel(catalog.layers.global.source)}${catalog.layers.global.files.length ? ` — ${catalog.layers.global.files.join(', ')}` : ''}`);
   lines.push(`  camada local:  ${sourceLabel(catalog.layers.local.source)}${catalog.layers.local.files.length ? ` — ${catalog.layers.local.files.join(', ')}` : ''}`);
