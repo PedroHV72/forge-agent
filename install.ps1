@@ -48,7 +48,8 @@ Success "Claude Code encontrado em $ClaudeDir"
 # ── Check existing installation ───────────────────────────────────────────────
 $hasExisting = (Get-ChildItem "$AgentsDir\forge*.md" -ErrorAction SilentlyContinue) -or
                (Get-ChildItem "$CommandsDir\forge*.md" -ErrorAction SilentlyContinue) -or
-               (Test-Path "$ClaudeDir\forge-agent-prefs.md")
+               (Test-Path (Join-Path $ClaudeDir 'forge-agent-prefs.md')) -or
+               (Test-Path (Join-Path $ClaudeDir 'forge-agent-prefs.jsonc'))
 
 if ($hasExisting -and -not $Update) {
     Write-Host ""
@@ -64,7 +65,10 @@ if ($hasExisting -and $Update) {
         New-Item -ItemType Directory "$BackupDir\commands" -Force | Out-Null
         Get-ChildItem "$AgentsDir\forge*.md"   -ErrorAction SilentlyContinue | Copy-Item -Destination "$BackupDir\agents\"
         Get-ChildItem "$CommandsDir\forge*.md" -ErrorAction SilentlyContinue | Copy-Item -Destination "$BackupDir\commands\"
-        if (Test-Path "$ClaudeDir\forge-agent-prefs.md") { Copy-Item "$ClaudeDir\forge-agent-prefs.md" $BackupDir }
+        $legacyPrefsFile = Join-Path $ClaudeDir 'forge-agent-prefs.md'
+        $prefsJsoncFile = Join-Path $ClaudeDir 'forge-agent-prefs.jsonc'
+        if (Test-Path $legacyPrefsFile) { Copy-Item $legacyPrefsFile $BackupDir }
+        if (Test-Path $prefsJsoncFile) { Copy-Item $prefsJsoncFile $BackupDir }
         if (Test-Path "$ClaudeDir\forge-statusline.js")  { Copy-Item "$ClaudeDir\forge-statusline.js"  $BackupDir }
         if (Test-Path "$ClaudeDir\forge-hook.js")        { Copy-Item "$ClaudeDir\forge-hook.js"        $BackupDir }
         if (Test-Path "$ClaudeDir\forge-settings.js")   { Copy-Item "$ClaudeDir\forge-settings.js"   $BackupDir }
@@ -133,32 +137,6 @@ function Downgrade-OpusTo47 {
             Set-Content $file $content -NoNewline
         }
     }
-}
-
-# Sync opus model references in prefs file with the current agent frontmatter model.
-# Replaces `claude-opus-4-7`, `claude-opus-4-7[1m]` and `claude-opus-4-8[1m]` with $Target.
-# Touches only opus model strings — sonnet/haiku and user customizations for other
-# models are preserved. If user explicitly pinned a phase to claude-opus-4-7, they
-# must reapply manually (edge case; documented in installer output).
-function Sync-PrefsOpusModel {
-    param([string]$Target, [string]$PrefsFile)
-    if (!(Test-Path $PrefsFile)) { return }
-    if ($DryRun) {
-        Dry "sync prefs opus references → $Target"
-        return
-    }
-    $content = Get-Content $PrefsFile -Raw
-    # Placeholder approach: collapse both IDs to a temp token, then expand to Target.
-    # Escape regex-special brackets in the source patterns only.
-    # Order matters: [1m] variants BEFORE the bare ID, or the bare pattern matches as a
-    # substring of claude-opus-4-7[1m] and leaves an orphan [1m] behind (=> "4-8[1m][1m]").
-    # Final collapse repairs files already damaged by the pre-fix migration.
-    $content = $content -replace 'claude-opus-4-8\[1m\]', '@@FORGE_OPUS_TMP@@'
-    $content = $content -replace 'claude-opus-4-7\[1m\]', '@@FORGE_OPUS_TMP@@'
-    $content = $content -replace 'claude-opus-4-7', '@@FORGE_OPUS_TMP@@'
-    $content = $content -replace '@@FORGE_OPUS_TMP@@', $Target
-    $content = $content -replace '\[1m\]\[1m\]', '[1m]'
-    Set-Content $PrefsFile $content -NoNewline
 }
 
 $script:OpusTarget = "claude-opus-4-8[1m]"  # default; flipped to claude-opus-4-7 on downgrade
@@ -277,10 +255,24 @@ Info "Instalando preferências..."
 $prefsFile = Join-Path $ClaudeDir 'forge-agent-prefs.md'
 $PrefsJsonc = Join-Path $ClaudeDir 'forge-agent-prefs.jsonc'
 
-# Ship the global JSONC catalogue through Node so its generated text uses LF.
 # Existing JSONC is user-owned and must never be replaced.
 if (Test-Path $PrefsJsonc) {
     Info "  forge-agent-prefs.jsonc já existe — não sobrescrito"
+} elseif (Test-Path $prefsFile) {
+    $migrateScript = Join-Path $RepoDir 'scripts/forge-prefs-migrate.js'
+    if ($DryRun) {
+        Dry "node $migrateScript --global-only"
+    } elseif (Get-Command node -ErrorAction SilentlyContinue) {
+        & node $migrateScript --global-only
+        if ($LASTEXITCODE -eq 0) {
+            Success "  forge-agent-prefs.md migrado para JSONC"
+        } else {
+            Warn "  Migração automática recusada (código $LASTEXITCODE)."
+            Warn "  Execute manualmente: node $migrateScript --global-only"
+        }
+    } else {
+        Info "  Node não encontrado — migração global pulada"
+    }
 } elseif (Get-Command node -ErrorAction SilentlyContinue) {
     $prefsScript = Join-Path $RepoDir 'scripts/forge-prefs.js'
     if ($DryRun) {
@@ -290,17 +282,7 @@ if (Test-Path $PrefsJsonc) {
         Info "  forge-agent-prefs.jsonc (catálogo global default)"
     }
 } else {
-    Info "  Node não encontrado — scaffold JSONC pulado (dual-read mantém o md funcionando)"
-}
-
-if (!(Test-Path $PrefsJsonc) -and !(Test-Path $prefsFile)) {
-    CopyFile "$RepoDir\forge-agent-prefs.md" $prefsFile
-    Info "  forge-agent-prefs.md (novo)"
-} elseif (Test-Path $prefsFile) {
-    Info "  forge-agent-prefs.md já existe — mantido"
-    Info "  (suas preferências não foram alteradas)"
-} elseif ($DryRun) {
-    Dry "cp $RepoDir\forge-agent-prefs.md → $prefsFile (fallback legado; JSONC ainda não criado no dry-run)"
+    Info "  Node não encontrado — scaffold JSONC pulado"
 }
 
 # ── Store repo path for /forge-update ──────────────────────────────────────────
@@ -316,22 +298,6 @@ if (Test-Path $PrefsJsonc) {
     } else {
         Info "  Node não encontrado — repo_path no JSONC não atualizado"
     }
-} elseif (-not $DryRun -and (Test-Path $prefsFile)) {
-    $prefsContent = Get-Content $prefsFile -Raw
-    $repoPathLine = "repo_path: $RepoDir"
-    if ($prefsContent -match "^repo_path:") {
-        # Update existing line
-        $prefsContent = $prefsContent -replace "(?m)^repo_path:.*", $repoPathLine
-        Set-Content $prefsFile $prefsContent -NoNewline
-    } elseif ($prefsContent -match "repo_path:") {
-        # Update placeholder line
-        $prefsContent = $prefsContent -replace "repo_path:[^\n]*", $repoPathLine
-        Set-Content $prefsFile $prefsContent -NoNewline
-    } else {
-        # Append at end
-        Add-Content $prefsFile "`n## Update Settings`n`n``````repo_path: $RepoDir`n``````"
-    }
-    Info "  repo_path gravado: $RepoDir"
 }
 
 # ── Sync prefs opus model with agent frontmatter ──────────────────────────────
@@ -350,14 +316,6 @@ if ($script:SyncPrefs -and (Test-Path $PrefsJsonc)) {
         Info "  prefs tier_models.heavy sincronizado: $($script:OpusTarget)"
     } else {
         Info "  Node não encontrado — tier_models.heavy no JSONC não sincronizado"
-    }
-} elseif ($script:SyncPrefs -and (Test-Path $prefsFile)) {
-    if ($DryRun) {
-        Dry "sync prefs opus model → $($script:OpusTarget)"
-    } else {
-        Sync-PrefsOpusModel -Target $script:OpusTarget -PrefsFile $prefsFile
-        Info "  prefs opus model sincronizado: $($script:OpusTarget)"
-        Info "  (se você fixou uma fase em claude-opus-4-7 manualmente, reaplique via /forge-prefs)"
     }
 }
 
@@ -378,16 +336,6 @@ if ($script:FableDowngrade -and (Test-Path $PrefsJsonc)) {
     } else {
         Info "  Node não encontrado — tier_models.max no JSONC não atualizado"
     }
-} elseif ($script:FableDowngrade -and (Test-Path $prefsFile)) {
-    $content = Get-Content $prefsFile -Raw
-    if ($content -match 'claude-fable-5') {
-        $content = $content -replace 'claude-fable-5', $script:OpusTarget
-    } elseif ($content -match '(?m)^tier_models:' -and $content -notmatch '(?m)^  max:') {
-        $maxLine = "  max:      " + $script:OpusTarget + "  # claude-fable-5 indisponivel (probe)"
-        $content = $content -replace '(?m)^(  heavy:.*)$', ('$1' + "`n" + $maxLine)
-    }
-    Set-Content $prefsFile $content -NoNewline
-    Info "  tier_models.max redirecionado: $($script:OpusTarget)"
 }
 
 # ── Install shared references ─────────────────────────────────────────────────
