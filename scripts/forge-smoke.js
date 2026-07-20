@@ -6756,12 +6756,38 @@ function smokeSchemaExtraction() {
   const engineStart = reviewSource.indexOf("export const meta = {");
   const engineEnd = reviewSource.indexOf('**Return schema:**', engineStart);
   const engine = reviewSource.slice(engineStart, engineEnd);
-  assert(engine.includes("require('../schemas/challenge.schema.json')")
-      && engine.includes("require('../schemas/verdict.schema.json')"),
-    '(c) Engine workflow references both installed-layout schema files', reviewPath);
-  assert(!/const[ \t]+challengeSchema[ \t]*=[ \t]*\{/.test(engine)
-      && !/verdictSchema[\s\S]{0,300}?type:[ \t]*['"]object['"]/.test(engine),
-    '(c) Engine workflow contains no inline challenge or verdict schema literal', reviewPath);
+  // (c) The Workflow sandbox has no require/fs — the two schemas MUST be inline literals
+  // in the fenced script, kept byte-equal in shape to shared/schemas/*.json. This sync-check
+  // extracts both literals from the markdown and deep-equals them against the JSON files.
+  const challengeLitStart = engine.indexOf('const challengeSchema = {');
+  const challengeLitEnd = engine.indexOf('\n\nlet challenge = null');
+  const verdictLitStart = engine.indexOf('const verdictSchema = function (allowed) {');
+  const verdictLitEnd = engine.indexOf('\n\nlet defense = null');
+  assert(challengeLitStart !== -1 && challengeLitEnd !== -1
+      && verdictLitStart !== -1 && verdictLitEnd !== -1,
+    '(c) Engine workflow contains inline challengeSchema and verdictSchema literal blocks', reviewPath);
+
+  let extractedChallenge = null;
+  let extractedVerdictShape = null;
+  try {
+    const challengeSrc = engine.slice(challengeLitStart, challengeLitEnd);
+    /* eslint-disable no-new-func */
+    extractedChallenge = new Function(challengeSrc + '\nreturn challengeSchema;')();
+    const verdictSrc = engine.slice(verdictLitStart, verdictLitEnd);
+    const extractedVerdictFactory = new Function(verdictSrc + '\nreturn verdictSchema;')();
+    /* eslint-enable no-new-func */
+    extractedVerdictShape = extractedVerdictFactory([]);
+  } catch (e) {
+    fail('(c) inline literals parse as valid JS object/function bodies', e.message);
+  }
+  if (extractedChallenge) pass('(c) inline literals parse as valid JS object/function bodies');
+
+  assert(Boolean(extractedChallenge)
+      && JSON.stringify(extractedChallenge) === JSON.stringify(challenge),
+    '(c) Engine workflow inline challengeSchema is byte-equal (JSON shape) to shared/schemas/challenge.schema.json', reviewPath);
+  assert(Boolean(extractedVerdictShape)
+      && JSON.stringify(extractedVerdictShape) === JSON.stringify(verdict),
+    '(c) Engine workflow inline verdictSchema (static shape, enum=[]) is byte-equal (JSON shape) to shared/schemas/verdict.schema.json', reviewPath);
 
   const tmp = mkTmp('schema-installed-layout');
   try {
