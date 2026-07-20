@@ -59,7 +59,7 @@ AGENTS_DIR="${CLAUDE_DIR}/agents"
 COMMANDS_DIR="${CLAUDE_DIR}/commands"
 
 has_existing=false
-for f in "${AGENTS_DIR}"/forge*.md "${COMMANDS_DIR}"/forge*.md "${CLAUDE_DIR}/forge-agent-prefs.md"; do
+for f in "${AGENTS_DIR}"/forge*.md "${COMMANDS_DIR}"/forge*.md "${CLAUDE_DIR}/forge-agent-prefs.md" "${CLAUDE_DIR}/forge-agent-prefs.jsonc"; do
   [ -f "$f" ] && has_existing=true && break
 done
 
@@ -77,6 +77,7 @@ if $has_existing && $UPDATE; then
     for f in "${AGENTS_DIR}"/forge*.md; do [ -f "$f" ] && cp "$f" "$BACKUP_DIR/agents/"; done
     for f in "${COMMANDS_DIR}"/forge*.md; do [ -f "$f" ] && cp "$f" "$BACKUP_DIR/commands/"; done
     [ -f "${CLAUDE_DIR}/forge-agent-prefs.md" ] && cp "${CLAUDE_DIR}/forge-agent-prefs.md" "$BACKUP_DIR/"
+    [ -f "${CLAUDE_DIR}/forge-agent-prefs.jsonc" ] && cp "${CLAUDE_DIR}/forge-agent-prefs.jsonc" "$BACKUP_DIR/"
     [ -f "${CLAUDE_DIR}/forge-dispatch.md"     ] && cp "${CLAUDE_DIR}/forge-dispatch.md"     "$BACKUP_DIR/"
     [ -f "${CLAUDE_DIR}/forge-statusline.js"  ] && cp "${CLAUDE_DIR}/forge-statusline.js"  "$BACKUP_DIR/"
     [ -f "${CLAUDE_DIR}/forge-hook.js"        ] && cp "${CLAUDE_DIR}/forge-hook.js"         "$BACKUP_DIR/"
@@ -151,27 +152,6 @@ downgrade_opus_to_47() {
       _sed_inplace_probe 's|^model: "claude-opus-4-8\[1m\]"$|model: claude-opus-4-7|' "$f"
     fi
   done
-}
-
-# Sync opus model references in prefs file with the current agent frontmatter model.
-# Replaces `claude-opus-4-7`, `claude-opus-4-7[1m]` and `claude-opus-4-8[1m]` with $1 (target).
-# Touches only opus model strings — sonnet/haiku refs and user-customized rows for other
-# models are preserved. If user explicitly pinned a phase to claude-opus-4-7, they must
-# reapply manually after install (edge case; documented in installer output).
-sync_prefs_opus_model() {
-  local target="$1"
-  local prefs="${CLAUDE_DIR}/forge-agent-prefs.md"
-  [ -f "$prefs" ] || return 0
-  if $DRY_RUN; then
-    dry "sync prefs opus references → ${target}"
-    return 0
-  fi
-  # Placeholder approach: collapse both IDs to a temp token, then expand to target.
-  # [1m] contains regex-special brackets — escape in the pattern only.
-  # Order matters: [1m] variants BEFORE the bare ID, or the bare pattern matches as a
-  # substring of claude-opus-4-7[1m] and leaves an orphan [1m] behind (→ "4-8[1m][1m]").
-  # Final collapse repairs files already damaged by the pre-fix migration.
-  _sed_inplace_probe "s|claude-opus-4-8\[1m\]|@@FORGE_OPUS_TMP@@|g; s|claude-opus-4-7\[1m\]|@@FORGE_OPUS_TMP@@|g; s|claude-opus-4-7|@@FORGE_OPUS_TMP@@|g; s|@@FORGE_OPUS_TMP@@|${target}|g; s|\[1m\]\[1m\]|[1m]|g" "$prefs"
 }
 
 if $DRY_RUN; then
@@ -349,10 +329,22 @@ info "Installing preferences..."
 PREFS_DST="${CLAUDE_DIR}/forge-agent-prefs.md"
 PREFS_JSONC="${CLAUDE_DIR}/forge-agent-prefs.jsonc"
 
-# Ship the global JSONC catalogue on clean installs. The Node renderer owns the
-# bytes (including LF endings); an existing catalogue is always user-owned.
+# JSONC is the canonical global preferences catalogue. Legacy global Markdown is
+# migrated in place before a fresh catalogue is scaffolded.
 if [ -f "$PREFS_JSONC" ]; then
   info "  forge-agent-prefs.jsonc já existe — não sobrescrito"
+elif [ -f "$PREFS_DST" ]; then
+  if $DRY_RUN; then
+    dry "node \"${REPO_DIR}/scripts/forge-prefs-migrate.js\" --global-only"
+  elif command -v node >/dev/null 2>&1; then
+    if node "${REPO_DIR}/scripts/forge-prefs-migrate.js" --global-only; then
+      success "  forge-agent-prefs.jsonc criado por migração global (md.bak mantido)"
+    else
+      warn "  Migração global não concluída; execute manualmente: node \"${REPO_DIR}/scripts/forge-prefs-migrate.js\" --global-only"
+    fi
+  else
+    info "  Node não encontrado — migração pulada (o engine vai parar até a migração manual)"
+  fi
 elif command -v node >/dev/null 2>&1; then
   if $DRY_RUN; then
     dry "node \"${REPO_DIR}/scripts/forge-prefs.js\" --scaffold --out \"${PREFS_JSONC}\" --schema-ref forge-prefs.schema.json"
@@ -361,19 +353,7 @@ elif command -v node >/dev/null 2>&1; then
     info "  forge-agent-prefs.jsonc (catálogo global default)"
   fi
 else
-  info "  Node não encontrado — scaffold JSONC pulado (dual-read mantém o md funcionando)"
-fi
-
-# Keep the Markdown file only as a legacy fallback. A JSONC catalogue shadows
-# it, so creating a new md template in that case would be misleading.
-if [ ! -f "$PREFS_JSONC" ] && [ ! -f "$PREFS_DST" ]; then
-  copy "${REPO_DIR}/forge-agent-prefs.md" "$PREFS_DST"
-  info "  forge-agent-prefs.md (novo)"
-elif [ -f "$PREFS_DST" ]; then
-  info "  forge-agent-prefs.md já existe — não sobrescrito"
-  info "  (suas preferências foram mantidas)"
-elif $DRY_RUN; then
-  dry "cp ${REPO_DIR}/forge-agent-prefs.md → ${PREFS_DST} (fallback legado; JSONC ainda não criado no dry-run)"
+  info "  Node não encontrado — scaffold JSONC pulado"
 fi
 
 # ── Store repo path for /forge-update ──────────────────────────────────────────
@@ -389,25 +369,11 @@ if [ -f "$PREFS_JSONC" ]; then
     node "${REPO_DIR}/scripts/forge-prefs-migrate.js" --set "repo_path=${REPO_DIR}" --layer global
   fi
   info "  repo_path gravado no catálogo global: ${REPO_DIR}"
-elif ! $DRY_RUN && [ -f "$PREFS_DST" ]; then
-  if grep -q "^repo_path:" "$PREFS_DST" 2>/dev/null; then
-    _sed_inplace "s|^repo_path:.*|repo_path: ${REPO_DIR}|" "$PREFS_DST"
-  else
-    # Append repo_path under Update Settings section if present, else append at end
-    if grep -q "repo_path:" "$PREFS_DST" 2>/dev/null; then
-      _sed_inplace "s|repo_path:.*|repo_path: ${REPO_DIR}|" "$PREFS_DST"
-    else
-      printf '\n## Update Settings\n\n```\nrepo_path: %s\n```\n' "${REPO_DIR}" >> "$PREFS_DST"
-    fi
-  fi
-  info "  repo_path gravado: ${REPO_DIR}"
 fi
 
 # ── Sync prefs opus model with agent frontmatter ──────────────────────────────
-# The orchestrator reads the model ID from forge-agent-prefs.md to display the model
-# in TaskCreate descriptions. When agents are upgraded (or downgraded) by the probe,
-# the prefs file must be rewritten to match — otherwise the UI shows one model while
-# Agent() dispatches another (the frontmatter wins at dispatch time).
+# The orchestrator resolves the model catalog from JSONC, including tier_models.heavy,
+# so the prefs catalog must match the installed agent frontmatter model.
 if $SYNC_PREFS && [ -f "$PREFS_JSONC" ]; then
   if ! command -v node >/dev/null 2>&1; then
     info "  Node não encontrado — tier_models.heavy no JSONC não sincronizado"
@@ -417,14 +383,6 @@ if $SYNC_PREFS && [ -f "$PREFS_JSONC" ]; then
     node "${REPO_DIR}/scripts/forge-prefs-migrate.js" --set "tier_models.heavy=${OPUS_TARGET}" --layer global
   fi
   info "  prefs tier_models.heavy sincronizado: ${OPUS_TARGET}"
-elif $SYNC_PREFS && [ -f "$PREFS_DST" ]; then
-  if $DRY_RUN; then
-    dry "sync prefs opus model → ${OPUS_TARGET}"
-  else
-    sync_prefs_opus_model "$OPUS_TARGET"
-    info "  prefs opus model sincronizado: ${OPUS_TARGET}"
-    info "  (se você fixou uma fase em claude-opus-4-7 manualmente, reaplique via /forge-prefs)"
-  fi
 fi
 
 # ── Downgrade fable max tier in prefs (probe-driven) ──────────────────────────
@@ -441,24 +399,6 @@ if $FABLE_DOWNGRADE && [ -f "$PREFS_JSONC" ]; then
     node "${REPO_DIR}/scripts/forge-prefs-migrate.js" --set "tier_models.max=${OPUS_TARGET}" --layer global
   fi
   info "  tier_models.max redirecionado no catálogo global: ${OPUS_TARGET}"
-elif $FABLE_DOWNGRADE && [ -f "$PREFS_DST" ]; then
-  if command -v node >/dev/null 2>&1; then
-    FORGE_FABLE_TARGET="$OPUS_TARGET" node -e '
-      const fs = require("fs");
-      const p = process.argv[1], target = process.env.FORGE_FABLE_TARGET;
-      let t = fs.readFileSync(p, "utf8");
-      if (t.includes("claude-fable-5")) {
-        t = t.split("claude-fable-5").join(target);
-      } else if (/^tier_models:/m.test(t) && !/^  max:/m.test(t)) {
-        t = t.replace(/^(  heavy:.*)$/m, "$1\n  max:      " + target + "  # claude-fable-5 indisponivel (probe)");
-      }
-      fs.writeFileSync(p, t);
-    ' "$PREFS_DST"
-  else
-    # node missing — handle the common case (line present in prefs template)
-    _sed_inplace_probe "s|claude-fable-5|${OPUS_TARGET}|g" "$PREFS_DST"
-  fi
-  info "  tier_models.max redirecionado: ${OPUS_TARGET}"
 fi
 
 # ── Install statusline + hooks ────────────────────────────────────────────────
