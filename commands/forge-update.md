@@ -18,7 +18,21 @@ REPO_PATH=$(node "$PREFS_ENGINE" --resolved --key repo_path 2>/dev/null | node -
 
 If `REPO_PATH` is set and non-empty → use it.
 
-If `repo_path` is NOT set or the file doesn't exist, try to auto-detect by checking if the current working directory is a valid forge-agent repo:
+If the engine returned nothing, try a narrowly-scoped legacy fallback (discovery-only — reads
+the pre-migration global md prefs directly, does not write anything): on a pre-migration install
+`~/.claude/forge-agent-prefs.md` may still hold `repo_path:` while no JSONC layer exists yet, and
+the canonical engine hard-stops with no repo_path in that case. This grep exists specifically so
+those pre-migration users can still reach the migrator below instead of being stranded.
+```bash
+if [ -z "$REPO_PATH" ] && [ -f "$HOME/.claude/forge-agent-prefs.md" ]; then
+  REPO_PATH=$(grep -m1 '^repo_path:' "$HOME/.claude/forge-agent-prefs.md" | sed 's/^repo_path:[[:space:]]*//' | tr -d '"'"'"'' | xargs)
+fi
+```
+
+If `REPO_PATH` is set and non-empty this way → use it (the migration step later in this flow will
+migrate this layer to JSONC).
+
+If `repo_path` is still NOT set, try to auto-detect by checking if the current working directory is a valid forge-agent repo:
 
 ```bash
 test -f "$(pwd)/install.sh" && grep -q "Forge Agent\|GSD Agent" "$(pwd)/install.sh" 2>/dev/null && echo "found" || echo "not-found"

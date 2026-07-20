@@ -257,24 +257,77 @@ if (!schema) {
 }
 
 // ── 2. Mechanical inventory — generated scaffold side ───────────────────────
+// Nesting-aware extraction (M015 S02 review R3 fix): the scaffold comments
+// every preference line with `// `. A structural-line regex uncomments only
+// lines that look like `"key": value`, `"key": {`, or a closing `}`/`]` —
+// prose/header comment lines (descriptions, `── section ──` banners) stay
+// commented. The result is valid JSONC that parseJsonc can parse into a real
+// nested object, from which we derive actual dotted LEAF paths (walking the
+// object structure) instead of matching each dotted-path component
+// independently against the raw text (the old approach: `evidence.mode`
+// "matched" because `"evidence":` and ANY of the 6 unrelated `"mode":`
+// occurrences in the file both matched somewhere, regardless of nesting).
+const STRUCTURAL_COMMENT_LINE = /^(\s*)\/\/ ("(?:[^"\\]|\\.)*"\s*:\s*(?:\{|\[.*|.*[,]?)\s*$|\}[,]?\s*$|\][,]?\s*$)/;
+function uncommentStructuralLines(text) {
+  return text
+    .split('\n')
+    .map((line) => {
+      const m = line.match(STRUCTURAL_COMMENT_LINE);
+      return m ? m[1] + m[2] : line;
+    })
+    .join('\n');
+}
+function collectObjectLeafPaths(obj, prefix, out) {
+  out = out || [];
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    const p = prefix ? `${prefix}.${k}` : k;
+    if (isPlainObject(v)) collectObjectLeafPaths(v, p, out);
+    else out.push(p);
+  }
+  return out;
+}
 const scaffoldKeys = [];
+let scaffoldRawText = '';
 {
   const scaffoldRun = spawnSync(process.execPath, [path.join(__dirname, 'forge-prefs.js'), '--scaffold', '--schema-ref', 'forge-prefs.schema.json'], { encoding: 'utf8' });
   assert(scaffoldRun.status === 0, `scaffold command failed: ${scaffoldRun.stderr || scaffoldRun.stdout}`);
+  scaffoldRawText = scaffoldRun.stdout;
   const parsed = parseJsonc(scaffoldRun.stdout);
   assert(parsed.ok, `generated scaffold is not valid JSONC: ${parsed.error && parsed.error.message}`);
-  // The scaffold intentionally comments every preference example, so the
-  // JSONC parser exposes only $schema. Use the parsed document as the syntax
-  // gate, then inventory the commented catalog against the live schema paths.
-  for (const key of collectLeaves(schema)) {
-    if (key === '$schema') continue;
-    const present = key.split('.').every((part) => new RegExp(`"${part.replace(/[.*+?^${}()|[\\]\\]/g, '\\\\$&')}"\\s*:`).test(scaffoldRun.stdout));
-    if (present) scaffoldKeys.push(key);
+  const uncommented = uncommentStructuralLines(scaffoldRun.stdout);
+  const uncommentedParsed = parseJsonc(uncommented);
+  assert(uncommentedParsed.ok, `structurally-uncommented scaffold is not valid JSONC: ${uncommentedParsed.error && uncommentedParsed.error.message}`);
+  for (const path_ of collectObjectLeafPaths(uncommentedParsed.value)) {
+    if (path_ === '$schema') continue;
+    scaffoldKeys.push(path_);
   }
 }
 
 check('scaffold extraction is non-trivial (>= 50 parseable keys)', () => {
   assert(scaffoldKeys.length >= 50, `only ${scaffoldKeys.length} keys extracted — scaffold or parser regressed`);
+});
+
+// Mutation-proof: deleting the `"mode":` line under `"evidence":` must make
+// `evidence.mode` disappear from scaffoldKeys — proves the extraction is
+// scoped by actual nesting, not a flat substring/regex match anywhere in the
+// file (the bug this fix closes). Mutates only an in-memory copy of the
+// generated text, never a repo file.
+check('mutation-proof: nesting-aware extraction loses evidence.mode when its line is deleted', () => {
+  const mutatedText = scaffoldRawText
+    .split('\n')
+    .filter((line) => !/\/\/ "mode": "lenient"/.test(line))
+    .join('\n');
+  const mutatedUncommented = uncommentStructuralLines(mutatedText);
+  const mutatedParsed = parseJsonc(mutatedUncommented);
+  assert(mutatedParsed.ok, `mutated scaffold failed to parse: ${mutatedParsed.error && mutatedParsed.error.message}`);
+  const mutatedKeys = collectObjectLeafPaths(mutatedParsed.value);
+  assert(!mutatedKeys.includes('evidence.mode'), 'evidence.mode survived deletion of its own line — extraction is not nesting-aware');
+  // Sanity: the flat/naive approach (old bug) WOULD still see evidence.mode
+  // present, because "evidence": and other "mode": occurrences remain in the
+  // mutated text — this documents exactly what the regression would look like.
+  const naivePresent = 'evidence.mode'.split('.').every((part) => new RegExp(`"${part}"\\s*:`).test(mutatedText));
+  assert(naivePresent, 'test fixture invalid: naive flat match should still "see" evidence.mode after mutation (to prove the old bug)');
 });
 
 // Union: curated ∪ generated scaffold (with legacy-flattening aliases applied).
