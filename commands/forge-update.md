@@ -9,17 +9,14 @@ allowed-tools: Read, Bash
 
 **Se não foi passado:**
 
-Resolve `repo_path` through the canonical prefs engine first. This reads JSONC when
-present and retains the markdown fallback for machines that have not migrated yet:
+Resolve `repo_path` through the canonical prefs engine first:
 ```bash
 PREFS_ENGINE="${FORGE_SCRIPTS_DIR:-$HOME/.claude/scripts}/forge-prefs.js"
 [ -f "$PREFS_ENGINE" ] || PREFS_ENGINE="scripts/forge-prefs.js"
 REPO_PATH=$(node "$PREFS_ENGINE" --resolved --key repo_path 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(v?String(v):'')}catch{process.stdout.write('')}})")
 ```
 
-If `REPO_PATH` is set and non-empty → use it. If the engine is unavailable or the
-key is empty, fall back to reading `~/.claude/forge-agent-prefs.md` and look for
-`repo_path: /path/to/forge-agent` (pre-migration compatibility only).
+If `REPO_PATH` is set and non-empty → use it.
 
 If `repo_path` is NOT set or the file doesn't exist, try to auto-detect by checking if the current working directory is a valid forge-agent repo:
 
@@ -27,16 +24,10 @@ If `repo_path` is NOT set or the file doesn't exist, try to auto-detect by check
 test -f "$(pwd)/install.sh" && grep -q "Forge Agent\|GSD Agent" "$(pwd)/install.sh" 2>/dev/null && echo "found" || echo "not-found"
 ```
 
-If "found": use `$(pwd)` as REPO_PATH and persist it. When the global JSONC
-catalog exists, never append to shadowed markdown; use `--set` instead:
+If "found": use `$(pwd)` as REPO_PATH and persist it through the global JSONC
+preferences layer:
 ```bash
-if [ -f "$HOME/.claude/forge-agent-prefs.jsonc" ]; then
-  node "{REPO_PATH}/scripts/forge-prefs-migrate.js" --cwd "$(pwd)" --layer global --set "repo_path=$(pwd)"
-else
-  sed -i '' "s|repo_path:.*|repo_path: $(pwd)|" ~/.claude/forge-agent-prefs.md 2>/dev/null || \
-    sed -i "s|repo_path:.*|repo_path: $(pwd)|" ~/.claude/forge-agent-prefs.md 2>/dev/null || \
-    echo "repo_path: $(pwd)" >> ~/.claude/forge-agent-prefs.md
-fi
+node "{REPO_PATH}/scripts/forge-prefs-migrate.js" --cwd "$(pwd)" --layer global --set "repo_path=$(pwd)"
 ```
 Tell user: `repo_path detectado automaticamente: {REPO_PATH}` and continue.
 
@@ -156,8 +147,9 @@ empty old×new resolved diff) proves zero semantic change.
   bypass and do not proceed to re-scaffold until the user directs the next step.
 - **Exit 4** — legacy markdown could not be parsed. Show its `arquivo`, `linha`
   and old-read message, and explain that the user must correct that markdown and
-  run `/forge-update` again. Leave the `.md` files intact: dual-read continues
-  to honor them. Stop this prefs portion; do not re-scaffold an invalid source.
+  run `/forge-update` again. Leave the `.md` files intact, but note that the
+  engine will hard-stop that layer until the markdown is corrected and
+  re-migrated. Stop this prefs portion; do not re-scaffold an invalid source.
 - **Any other non-zero exit** — surface the diagnostics and stop this prefs
   portion without touching a catalog.
 
@@ -275,15 +267,9 @@ printf '%s\n' "$SAVED_REPO_PATH"
 ```
 
 If repo_path is gone from resolved prefs (shouldn't happen, but just in case),
-persist JSONC-aware: use `--set` when the global JSONC exists; otherwise retain
-the legacy markdown append fallback for pre-migration machines:
+persist it through the global JSONC layer:
 ```bash
-if [ -f "$HOME/.claude/forge-agent-prefs.jsonc" ]; then
-  node "{REPO_PATH}/scripts/forge-prefs-migrate.js" --cwd "$(pwd)" --layer global --set "repo_path={REPO_PATH}"
-else
-  echo "" >> ~/.claude/forge-agent-prefs.md
-  echo "repo_path: {REPO_PATH}" >> ~/.claude/forge-agent-prefs.md
-fi
+node "{REPO_PATH}/scripts/forge-prefs-migrate.js" --cwd "$(pwd)" --layer global --set "repo_path={REPO_PATH}"
 ```
 
 ---
