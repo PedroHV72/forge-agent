@@ -5639,6 +5639,14 @@ function smokeDispatchResolve() {
     assert(!/EFFORT_CLAMPED=/.test(source), `(c) ${rel}: no duplicated EFFORT_CLAMPED= clamp regex`);
   }
 
+  // ── (g) forge-task Step 4 template emits routing frontmatter hints ──
+  {
+    const source = fs.readFileSync(path.join(ROOT46, 'skills/forge-task/SKILL.md'), 'utf8');
+    assert(source.includes('tier:'), '(g) forge-task Step 4 template mentions tier:');
+    assert(source.includes('effort:'), '(g) forge-task Step 4 template mentions effort:');
+    assert(source.includes('domain:'), '(g) forge-task Step 4 template mentions domain:');
+  }
+
   // ── (d) forge-task routes-by-domain: additive win via the shared resolver ──
   withHermeticHome(() => {
     const dir = mkTmp('dispatch-resolve-domain');

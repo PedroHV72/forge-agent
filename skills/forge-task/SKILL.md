@@ -408,7 +408,14 @@ thinking: adaptive
 {TOP_MEMORIES}
 
 ## Instructions
-Write {TASK_ID}-PLAN.md to .gsd/tasks/{TASK_ID}/ with exactly these sections:
+Write {TASK_ID}-PLAN.md to .gsd/tasks/{TASK_ID}/. Open the file with a `---`-fenced YAML
+frontmatter block carrying `tier:` (task complexity: light|standard|heavy), `effort:`
+(ordered scale low|medium|high|xhigh|max), and — only when this task's work maps to a
+domain that is an existing key in the resolved `routing:` block of prefs — `domain:`.
+Omit `domain:` entirely when no such key applies (resolves to `default`, never an error);
+judge domain from the nature of the work, not filenames/keywords. See
+`agents/forge-planner.md § Effort & Tier Hints` / `§ Must-Haves Schema` for the canonical
+contract. After the frontmatter, include exactly these sections:
 
 ## Steps
 [Ordered numbered list of implementation steps. Each step is a single concrete action.]
