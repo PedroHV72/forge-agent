@@ -6912,6 +6912,13 @@ function smokeRequireWorktree() {
     assert(hClaude.detected === false && hClaude.reason === null,
       '(h) detect: claude-only workers+routing → not detected', JSON.stringify(hClaude));
 
+    // (h2) detect-error path fails SAFE (elevates), not open — text-anchor on
+    // the catch block since forcing an internal throw (module-load failure)
+    // isn't feasible without mocking require() internals.
+    const isoSrcForH2 = fs.readFileSync(path.join(SCRIPTS, 'forge-isolation.js'), 'utf8');
+    assert(/catch \{ return \{ detected: true, reason: 'detect-error \(fail-safe: elevating\)' \}; \}/.test(isoSrcForH2),
+      '(h2) detectExternalWriteEngine catch fails safe (detected:true) on internal error');
+
     // (i) require_worktree fallback: invalid/absent → auto (default).
     assert(iso.resolveRequireWorktree(mk('workers:\n  require_worktree: bogus\n')) === 'auto',
       '(i) invalid require_worktree → auto', 'bogus');

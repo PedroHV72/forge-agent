@@ -82,8 +82,9 @@ function resolveRequireWorktree(cwd) {
 //   (2) any routing.<domain>.executor.<tier|fallback> id whose modelFamily is
 //       gpt or gemini. Read-only paths (plan-slice Branch D, review challenger)
 //       are intentionally NOT inspected — they never write.
-// Never throws (never blocks activation): any error → { detected:false,
-// reason:'detect-error' }.
+// Never throws (never blocks activation): any error → { detected:true,
+// reason:'detect-error (fail-safe: elevating)' } — detection fails SAFE
+// (false-positive by design), consistent with the line-62 invariant.
 function detectExternalWriteEngine(cwd) {
   try {
     const { modelFamily } = require('./forge-model-alias.js');
@@ -113,7 +114,7 @@ function detectExternalWriteEngine(cwd) {
       }
     }
     return { detected: false, reason: null };
-  } catch { return { detected: false, reason: 'detect-error' }; }
+  } catch { return { detected: true, reason: 'detect-error (fail-safe: elevating)' }; }
 }
 
 // Resolves the EFFECTIVE isolation mode for a run, applying require_worktree
