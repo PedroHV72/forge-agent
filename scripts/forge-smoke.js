@@ -7653,6 +7653,80 @@ function smokeSidecarEnvPromotion() {
   pass('(final) Section 57: sidecar env-promotion contract regression guard — adapter, promotion matrix, and doc-presence verified');
 }
 
+// ── Section 58: cleanupForRun registry-first mode ──────────────────────────
+function smokeCleanupRegistryMode() {
+  process.stdout.write('\n▸ Section 58: cleanupForRun registry-first mode\n');
+  const dir = mkTmp('cleanup-registry-mode');
+  const isolation = require('./forge-isolation.js');
+  const runPath = id => path.join(dir, '.gsd', 'forge', 'runs', `${id}.json`);
+  const writeRun = (id, record) => fs.writeFileSync(runPath(id), JSON.stringify(record), 'utf8');
+  fs.mkdirSync(path.join(dir, '.gsd', 'forge', 'runs'), { recursive: true });
+  const baseRecord = { id: 'M-CLEANUP', kind: 'milestone', session_id: 'smoke', active: true };
+
+  // Registry worktree wins even when the current preference now resolves shared.
+  fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"shared"},"workers":{"require_worktree":"false"}}', 'utf8');
+  writeRun('M-CLEANUP', { ...baseRecord, isolation_mode: 'worktree' });
+  let result = isolation.cleanupForRun(dir, 'M-CLEANUP');
+  assert(result.mode === 'worktree', '(a) registry isolation_mode selects worktree after pref flip', JSON.stringify(result));
+  assert(result.mode_source === 'registry', '(a) registry selection reports mode_source=registry', JSON.stringify(result));
+  assert(result.user_mode === null && result.elevated === null && result.elevation_reason === null,
+    '(a) registry result keeps additive cleanup metadata keys', JSON.stringify(result));
+  assert(Array.isArray(result.repos), '(a) registry cleanup result retains repos array', JSON.stringify(result));
+  assert(result.mode !== 'shared', '(a) registry worktree cannot short-circuit through shared guard', JSON.stringify(result));
+
+  // A legacy record explicitly re-resolves the current effective mode.
+  writeRun('M-LEGACY', { ...baseRecord, id: 'M-LEGACY' });
+  fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"branch"},"workers":{"require_worktree":"false"}}', 'utf8');
+  result = isolation.cleanupForRun(dir, 'M-LEGACY');
+  assert(result.mode === 'branch', '(b) legacy record re-resolves current effective mode', JSON.stringify(result));
+  assert(result.mode_source === 'fallback-resolve', '(b) legacy record reports fallback-resolve', JSON.stringify(result));
+  assert(result.user_mode === 'branch', '(b) fallback preserves resolved user_mode', JSON.stringify(result));
+  assert(result.elevated === false, '(b) fallback preserves resolved elevation state', JSON.stringify(result));
+  assert(result.elevation_reason === null, '(b) fallback preserves null elevation reason', JSON.stringify(result));
+  assert(result.mode !== 'shared', '(b) legacy fallback is not a hardcoded shared default', JSON.stringify(result));
+
+  // Missing records take the same explicit fallback path.
+  result = isolation.cleanupForRun(dir, 'M-MISSING');
+  assert(result.mode === 'branch', '(c) missing record re-resolves current effective mode', JSON.stringify(result));
+  assert(result.mode_source === 'fallback-resolve', '(c) missing record reports fallback-resolve', JSON.stringify(result));
+  assert(result.user_mode === 'branch', '(c) missing record preserves resolved user_mode', JSON.stringify(result));
+  assert(result.elevated === false, '(c) missing record preserves resolved elevation state', JSON.stringify(result));
+  assert(result.elevation_reason === null, '(c) missing record preserves null elevation reason', JSON.stringify(result));
+
+  // Source-level wiring guards make the contract visible to future refactors.
+  const source = fs.readFileSync(path.join(SCRIPTS, 'forge-isolation.js'), 'utf8');
+  const cleanupStart = source.indexOf('function cleanupForRun');
+  const cleanupEnd = source.indexOf('\n}\n\n// ── CLI', cleanupStart);
+  const cleanupBody = source.slice(cleanupStart, cleanupEnd === -1 ? undefined : cleanupEnd);
+  const helperStart = source.indexOf('function resolveCleanupMode');
+  const helperEnd = source.indexOf('\n}\n\nfunction cleanupForRun', helperStart);
+  const helperBody = source.slice(helperStart, helperEnd === -1 ? undefined : helperEnd);
+  assert(source.includes("require('./forge-runs.js')"), '(d) isolation requires forge-runs.js', source);
+  assert(/runs\.get\(cwd, runId\)/.test(helperBody), '(d) resolveCleanupMode reads runs.get(cwd, runId)', helperBody);
+  assert(/resolveCleanupMode\(cwd, runId\)/.test(cleanupBody), '(d) cleanupForRun uses resolveCleanupMode', cleanupBody);
+  assert(!/const eff = resolveEffectiveMode\(cwd\)/.test(cleanupBody), '(d) cleanupForRun has no direct effective-mode selector', cleanupBody);
+  assert(/source:\s*'registry'/.test(helperBody), '(d) helper labels registry source', helperBody);
+  assert(/source:\s*'fallback-resolve'/.test(helperBody), '(d) helper labels fallback source', helperBody);
+  assert(/typeof rec\.isolation_mode === 'string'/.test(helperBody), '(d) helper validates registry isolation_mode type', helperBody);
+  assert(/rec\.isolation_mode\.trim\(\)/.test(helperBody), '(d) helper rejects blank registry isolation_mode', helperBody);
+  assert(/toLowerCase\(\)/.test(helperBody), '(d) registry mode is normalized case-insensitively', helperBody);
+  assert(/try \{ rec = runs\.get/.test(helperBody), '(d) registry lookup is guarded against read errors', helperBody);
+  assert(/const eff = resolveEffectiveMode\(cwd\)/.test(helperBody), '(d) fallback explicitly calls resolveEffectiveMode', helperBody);
+  assert(/M014 S03-R2/.test(source) && /worktree_root/.test(source), '(d) helper documents debt and root limitation', source);
+  assert(/mode_source: cm\.source/.test(cleanupBody), '(d) cleanup result carries mode_source', cleanupBody);
+  assert(/worktreeCleanupOnComplete/.test(cleanupBody), '(d) cleanup still reads worktree cleanup preference', cleanupBody);
+  assert(/cleanupWorktreeOne/.test(cleanupBody), '(d) cleanup still uses existing worktree helper', cleanupBody);
+  assert(/cleanupBranchOne/.test(cleanupBody), '(d) cleanup still uses existing branch helper', cleanupBody);
+  const smokeSource = fs.readFileSync(__filename, 'utf8');
+  assert(/smokeCleanupRegistryMode\(\);/.test(smokeSource.slice(smokeSource.lastIndexOf('async function main()'))),
+    '(d) Section 58 is registered in main()');
+
+  cleanup(dir);
+  pass('(final) Section 58: cleanupForRun registry-first mode — registry, legacy fallback, missing-record fallback, and wiring verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -7718,6 +7792,7 @@ async function main() {
     smokeSchemaExtraction();
     smokeRequireWorktree();
     smokeSidecarEnvPromotion();
+    smokeCleanupRegistryMode();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

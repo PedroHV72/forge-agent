@@ -29,6 +29,7 @@ const { execSync, spawnSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
 
 const repos = require('./forge-repos.js');
+const runs = require('./forge-runs.js');
 
 function readIsolationPrefs(cwd) {
   let mode = 'shared';
@@ -343,12 +344,39 @@ function setupForRun(cwd, runId, opts) {
   return result;
 }
 
+// Cleanup must honor the effective mode recorded at activation. This closes
+// the M014 S03-R2 debt: a mid-run pref flip worktree→shared must not hit the
+// shared guard and orphan the worktree. Only isolation_mode is registry-backed;
+// a mid-run worktree_root flip remains out of scope.
+function resolveCleanupMode(cwd, runId) {
+  let rec = null;
+  try { rec = runs.get(cwd, runId); } catch { rec = null; }
+  if (rec && typeof rec.isolation_mode === 'string' && rec.isolation_mode.trim()) {
+    return { mode: rec.isolation_mode.toLowerCase(), source: 'registry' };
+  }
+  const eff = resolveEffectiveMode(cwd);
+  return {
+    mode: eff.mode,
+    source: 'fallback-resolve',
+    user_mode: eff.user_mode,
+    elevated: eff.elevated,
+    elevation_reason: eff.elevation_reason,
+  };
+}
+
 function cleanupForRun(cwd, runId, opts) {
   opts = opts || {};
   const prefs = readIsolationPrefs(cwd);
-  const eff = resolveEffectiveMode(cwd);   // symmetry — cleanup targets the SAME effective mode
-  const mode = eff.mode;
-  const result = { mode, user_mode: eff.user_mode, elevated: eff.elevated, elevation_reason: eff.elevation_reason, repos: [] };
+  const cm = resolveCleanupMode(cwd, runId);
+  const mode = cm.mode;
+  const result = {
+    mode,
+    mode_source: cm.source,
+    user_mode: cm.user_mode === undefined ? null : cm.user_mode,
+    elevated: cm.elevated === undefined ? null : cm.elevated,
+    elevation_reason: cm.elevation_reason === undefined ? null : cm.elevation_reason,
+    repos: [],
+  };
 
   if (mode === 'shared') return result;
 
@@ -429,7 +457,7 @@ if (require.main === module) cliMain();
 
 module.exports = {
   setupForRun, cleanupForRun, readIsolationPrefs,
-  resolveEffectiveMode, detectExternalWriteEngine, resolveRequireWorktree,
+  resolveEffectiveMode, detectExternalWriteEngine, resolveRequireWorktree, resolveCleanupMode,
   resolveBranchName, gitDefaultBranch, gitCurrentBranch,
   gitHasOriginRemote, fetchDefaultBranch,
 };
