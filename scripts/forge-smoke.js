@@ -7566,9 +7566,14 @@ function smokeSidecarEnvPromotion() {
   const oldPromotion = checkEnvPromotion(legacy, plan);
   assert(oldPromotion.promote === false && oldPromotion.rejected.length >= 1,
     '(b) byte-identical legacy partial payload does not promote');
+  // M016 S01 review R1: a done result with unmet, non-environment-scope entries is no
+  // longer silently "not-applicable" — it is corroborated and rejected, verdicted
+  // done-with-unverified-env so callers treat it as partial (never a silent accept).
   const donePromotion = checkEnvPromotion({ ...legacy, status: 'done' }, plan);
-  assert(donePromotion.promote === false && donePromotion.reason === 'not-applicable',
-    '(b) done result is not applicable to environment promotion');
+  assert(donePromotion.promote === false && donePromotion.verdict === 'done-with-unverified-env'
+      && donePromotion.rejected.length >= 1,
+    '(b) done result with unmet non-environment entries is rejected, not silently not-applicable',
+    JSON.stringify(donePromotion));
 
   // C — canonical spec, executable mirrors, and planner guidance.
   const dispatch = fs.readFileSync(path.join(REPO, 'shared', 'forge-dispatch.md'), 'utf8');
@@ -7595,6 +7600,55 @@ function smokeSidecarEnvPromotion() {
   const mainBody = source.slice(source.indexOf('async function main()'));
   assert(/smokeSidecarEnvPromotion\(\)/.test(mainBody),
     '(c) Section 57 is registered in main()');
+
+  // D — M016 S01 review R1: status:done with unmet env-scope entries must be
+  // corroborated the same way, never accepted at face value.
+  const { corroborates, corroborateEnvEntries } = require('./forge-env-promote.js');
+  const doneCorroborated = checkEnvPromotion({ status: 'done', summary: 'fixture', files_changed: [],
+    must_haves_status: [
+      met('first'), env('environment', 'gsd-write-refused', 'blocked at .gsd/STATE.md'),
+    ] }, plan);
+  assert(doneCorroborated.verdict === 'done-with-verified-env' && doneCorroborated.rejected.length === 0
+      && doneCorroborated.env_constraints.length === 1,
+    '(d) done result with only a corroborated env-scope unmet entry verdicts done-with-verified-env',
+    JSON.stringify(doneCorroborated));
+  const doneUncorroborated = checkEnvPromotion({ status: 'done', summary: 'fixture', files_changed: [],
+    must_haves_status: [
+      met('first'), env('washed refusal', 'gsd-write-refused', 'worker could not continue'),
+    ] }, plan);
+  assert(doneUncorroborated.verdict === 'done-with-unverified-env' && doneUncorroborated.rejected.length >= 1,
+    '(d) done result with an uncorroborated env-scope unmet entry verdicts done-with-unverified-env (treated as partial)',
+    JSON.stringify(doneUncorroborated));
+  const doneAllMet = checkEnvPromotion({ status: 'done', summary: 'fixture', files_changed: [],
+    must_haves_status: [met('first'), met('second')] }, plan);
+  assert(doneAllMet.reason === 'not-applicable' && doneAllMet.verdict === undefined,
+    '(d) done result with no unmet entries stays not-applicable (ordinary done, unchanged)',
+    JSON.stringify(doneAllMet));
+  assert(typeof corroborateEnvEntries === 'function' && typeof corroborates === 'function',
+    '(d) forge-env-promote.js exports corroborates + corroborateEnvEntries for reuse by forge-repair.js');
+
+  // E — M016 S01 review R2: reinject-diff must corroborate env-scope labels
+  // before dropping them, not trust the label alone.
+  const reinjectPlanDir = mkTmp('repair-env');
+  const reinjectPlanPath = path.join(reinjectPlanDir, 'T04-PLAN.md');
+  fs.writeFileSync(reinjectPlanPath, plan, 'utf8');
+  const corroboratedEnvId = env('environment', 'gsd-write-refused', 'blocked at .gsd/STATE.md');
+  const uncorroboratedEnvId = env('washed refusal', 'gsd-write-refused', 'worker could not continue');
+  const reinjectEnvR = runScript('forge-repair.js', ['--reinject-diff', '--plan', reinjectPlanPath,
+    '--must-haves-status', JSON.stringify({ dropped: [corroboratedEnvId, uncorroboratedEnvId, 'src/bar.js'] })]);
+  assert(reinjectEnvR.status === 0, '(e) reinject-diff with mixed env labels exits 0', `stderr: ${reinjectEnvR.stderr}`);
+  let reinjectEnvResult;
+  try { reinjectEnvResult = JSON.parse(reinjectEnvR.stdout); } catch { reinjectEnvResult = {}; }
+  const reinjectEnvStr = JSON.stringify(reinjectEnvResult.dropped || []);
+  assert(!reinjectEnvStr.includes('environment') || !(reinjectEnvResult.dropped || []).some(d => d && d.item === 'environment'),
+    '(e) corroborated env-scope label is dropped from the reinject diff (not re-injected)',
+    reinjectEnvStr);
+  assert((reinjectEnvResult.dropped || []).some(d => d && d.item === 'washed refusal'),
+    '(e) uncorroborated env-scope label stays pending in the reinject diff (re-injected)',
+    reinjectEnvStr);
+  assert((reinjectEnvResult.dropped || []).includes('src/bar.js'),
+    '(e) non-env dropped entries pass through the reinject diff unchanged',
+    reinjectEnvStr);
 
   pass('(final) Section 57: sidecar env-promotion contract regression guard — adapter, promotion matrix, and doc-presence verified');
 }

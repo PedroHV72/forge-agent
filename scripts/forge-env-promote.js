@@ -49,24 +49,20 @@ function corroborates(entry, planText) {
 }
 
 /**
- * Check whether a partial worker result is exclusively blocked by corroborated
- * environment constraints. This function is pure and intentionally never
- * mutates the worker payload.
+ * Corroborate every environment-scoped, unmet entry in must_haves_status
+ * against the same criteria used for partial→done promotion. Pure helper
+ * shared by checkEnvPromotion (status:partial) and the done-with-env-unmet
+ * path (status:done) so the acceptance logic is defined exactly once.
  *
- * @param {object} result parsed worker result
- * @param {string} planText full task-plan text
- * @returns {{promote:boolean, env_constraints:Array, rejected:Array, reason?:string}}
+ * @param {Array} mustHavesStatus
+ * @param {string} safePlanText
+ * @returns {{env_constraints:Array, rejected:Array}}
  */
-function checkEnvPromotion(result, planText) {
-  if (!result || result.status !== 'partial' || !Array.isArray(result.must_haves_status)) {
-    return { promote: false, env_constraints: [], rejected: [], reason: 'not-applicable' };
-  }
-
+function corroborateEnvEntries(mustHavesStatus, safePlanText) {
   const env_constraints = [];
   const rejected = [];
-  const safePlanText = typeof planText === 'string' ? planText : '';
 
-  for (const entry of result.must_haves_status) {
+  for (const entry of mustHavesStatus) {
     if (!entry || entry.status === 'met') continue;
     const item = typeof entry.item === 'string' ? entry.item : '';
     if (entry.scope !== 'environment') {
@@ -84,6 +80,48 @@ function checkEnvPromotion(result, planText) {
     }
     env_constraints.push({ item, reason: entry.reason, note: typeof entry.note === 'string' ? entry.note : '' });
   }
+
+  return { env_constraints, rejected };
+}
+
+/**
+ * Check whether a partial worker result is exclusively blocked by corroborated
+ * environment constraints. This function is pure and intentionally never
+ * mutates the worker payload.
+ *
+ * M016 S01 review R1: a worker returning status:done with unmet must_haves that
+ * are ALL labelled scope:environment is a second acceptance path — the same
+ * corroboration criteria apply, but the verdict is distinct (`done-with-unverified-env`)
+ * so callers never treat it as a silent, unconditional accept. Any rejected
+ * entry means the orchestrator MUST treat the result as partial (normal failure
+ * flow), never accept the done label at face value.
+ *
+ * @param {object} result parsed worker result
+ * @param {string} planText full task-plan text
+ * @returns {{promote:boolean, env_constraints:Array, rejected:Array, reason?:string, verdict?:string}}
+ */
+function checkEnvPromotion(result, planText) {
+  const safePlanText = typeof planText === 'string' ? planText : '';
+
+  if (result && result.status === 'done' && Array.isArray(result.must_haves_status)) {
+    const unmet = result.must_haves_status.filter(entry => entry && entry.status !== 'met');
+    if (unmet.length === 0) {
+      return { promote: false, env_constraints: [], rejected: [], reason: 'not-applicable' };
+    }
+    const { env_constraints, rejected } = corroborateEnvEntries(unmet, safePlanText);
+    return {
+      promote: false,
+      env_constraints,
+      rejected,
+      verdict: rejected.length > 0 ? 'done-with-unverified-env' : 'done-with-verified-env',
+    };
+  }
+
+  if (!result || result.status !== 'partial' || !Array.isArray(result.must_haves_status)) {
+    return { promote: false, env_constraints: [], rejected: [], reason: 'not-applicable' };
+  }
+
+  const { env_constraints, rejected } = corroborateEnvEntries(result.must_haves_status, safePlanText);
 
   return {
     promote: env_constraints.length > 0 && rejected.length === 0,
@@ -125,4 +163,4 @@ function runCli(args) {
 
 if (require.main === module) process.exitCode = runCli(process.argv.slice(2));
 
-module.exports = { checkEnvPromotion };
+module.exports = { checkEnvPromotion, corroborates, corroborateEnvEntries };

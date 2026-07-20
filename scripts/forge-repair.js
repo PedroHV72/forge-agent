@@ -35,6 +35,7 @@ const fs   = require('fs');
 const path = require('path');
 
 const { hasStructuredMustHaves, parseMustHaves } = require('./forge-must-haves');
+const { corroborates } = require('./forge-env-promote');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -272,11 +273,19 @@ function reinjectDiff({ planContent, verificationContent, prunedIds = [], mustHa
   } else if (mustHavesStatus && Array.isArray(mustHavesStatus.dropped)) {
     // Degradation: use the worker-reported must_haves_status.dropped directly
     const pruned = new Set(prunedIds);
-    // M016 S01 defence-in-depth: env-promoted constraints are not pending work.
-    // Normal orchestrator synthesis omits them already; tolerate a stale object payload.
-    const dropped = mustHavesStatus.dropped.filter(id =>
-      !(id && typeof id === 'object' && id.scope === 'environment') && !pruned.has(id)
-    );
+    const safePlanText = typeof planContent === 'string' ? planContent : '';
+    // M016 S01 review R2: an env-scoped label is not trustworthy on its own —
+    // corroborate it against the same criteria the checker uses before dropping
+    // it from the reinject diff. Uncorroborated labels stay in the diff (they
+    // are re-injected as pending work, not silently discarded).
+    const dropped = mustHavesStatus.dropped.filter(id => {
+      if (pruned.has(id)) return false;
+      if (id && typeof id === 'object' && id.scope === 'environment') {
+        const why = corroborates(id, safePlanText);
+        return why !== null; // corroborated (why === null) → drop; else keep pending
+      }
+      return true;
+    });
     const capped  = dropped.length > REINJECT_CAP;
     return { dropped: capped ? dropped.slice(0, REINJECT_CAP) : dropped, capped };
   } else {
