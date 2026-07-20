@@ -172,9 +172,12 @@ ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$ISO_RU
 ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
 WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
 ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
+ELEVATED=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).elevated||false))" "$ISO_RESULT")
+ELEV_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).elevation_reason||'')" "$ISO_RESULT")
 echo "ISOLATION_MODE=$ISOLATION_MODE"
 echo "WORKTREE_DIR=${WORKTREE_DIR:-—}"
 echo "ISO_ERRORS=${ISO_ERRORS:-none}"
+[ "$ELEVATED" = "true" ] && echo "⚠ require_worktree: elevado a worktree ($ELEV_REASON) → CODE_DIR=${WORKTREE_DIR:-?}"
 ```
 
 Isolation rules (CRITICAL — the operator configured this; honor it):
@@ -184,6 +187,7 @@ Isolation rules (CRITICAL — the operator configured this; honor it):
 - If `ISO_ERRORS` is non-empty AND every repo failed (`WORKTREE_DIR` empty in worktree mode, or no repo succeeded in branch mode) → STOP. Surface the errors to the user. Running un-isolated when the operator explicitly configured isolation is NOT an acceptable fallback.
 - If only some repos failed → emit a warning line listing them and continue.
 - When `ISOLATION_MODE != shared`, emit one line so the operator sees isolation took effect: `⛓ Isolation: {mode} → {branch name or worktree path}`.
+- `workers.require_worktree` elevation is **static-at-activation** — resolved once by `--setup`, never mid-run. `auto` (default) elevates `shared → worktree` only when `execute-task` resolves to an external write engine (`codex`/gpt/gemini); `true` always elevates; `false` never elevates (byte-identical to prior behavior). Read-only paths (Branch D `plan-slice`, review challenger) are exempt — only `execute-task` triggers detection. Elevation is warn-and-proceed (never blocks); a false-positive elevation is acceptable, a false-negative is not. To keep `shared` regardless, set `workers.require_worktree: false`.
 
 Branch on `$STATUS`:
 

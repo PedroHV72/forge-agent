@@ -6958,6 +6958,19 @@ function smokeRequireWorktree() {
   assert(/require_worktree:[ \t]*auto/.test(prefsDoc) && /resolveEffectiveMode/.test(prefsDoc),
     '(m) forge-agent-prefs.md scaffolds require_worktree + names resolveEffectiveMode');
 
+  // (n) doc-presence: elevation-warning wiring present in all 3 skills.
+  const SKILLS = path.join(path.dirname(SCRIPTS), 'skills');
+  const skillFiles = {
+    'forge-auto': path.join(SKILLS, 'forge-auto', 'SKILL.md'),
+    'forge-next': path.join(SKILLS, 'forge-next', 'SKILL.md'),
+    'forge-task': path.join(SKILLS, 'forge-task', 'SKILL.md'),
+  };
+  for (const [name, filePath] of Object.entries(skillFiles)) {
+    const src = fs.readFileSync(filePath, 'utf8');
+    assert(/elevation_reason/.test(src) && /require_worktree/.test(src) && /elevado a worktree/.test(src),
+      `(n) ${name}/SKILL.md wires elevation warning (elevated/elevation_reason + ⚠ marker)`);
+  }
+
   pass('(final) Section 53: require_worktree per-engine elevation — resolver matrix, detect unit, CLI, contract fields, knob-count 90, and scaffold verified');
 }
 
