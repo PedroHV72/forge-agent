@@ -38,7 +38,7 @@ Read:
 1. First 40 lines of `.gsd/AUTO-MEMORY.md` (skip silently if missing)
 2. `.gsd/CODING-STANDARDS.md` (skip silently if missing)
 
-**Resolve PREFS via the canonical engine CLI (ONE call — never a 3-file md merge in-context).** The S01 engine (`scripts/forge-prefs.js`) dual-reads legacy markdown OR new jsonc per layer and applies the exact same user-global → repo-shared → local-personal precedence (last wins) that the old inline prose described. Do NOT read/merge `~/.claude/forge-agent-prefs.md` + `.gsd/claude-agent-prefs.md` + `.gsd/prefs.local.md` by hand — that is exactly what the CLI does. See `shared/forge-dispatch.md § Per-unit prefs resolution` for the canonical helper.
+**Resolve PREFS via the canonical engine CLI (ONE call — never a 3-file md merge in-context).** The S01 engine (`scripts/forge-prefs.js`) reads the jsonc catalog per layer; legacy Markdown without jsonc hard-stops — see `shared/forge-prefs-cutover.md`. It applies the exact same user-global → repo-shared → local-personal precedence (last wins) that the old inline prose described. Do NOT read/merge `~/.claude/forge-agent-prefs.jsonc` + `.gsd/claude-agent-prefs.jsonc` + `.gsd/prefs.local.jsonc` by hand — that is exactly what the CLI does. See `shared/forge-dispatch.md § Per-unit prefs resolution` for the canonical helper.
 
 ```bash
 if [ -f "scripts/forge-prefs.js" ]; then
@@ -458,7 +458,7 @@ Roda o handshake do plan gate (spec autoritativa: `shared/forge-plan-gate.md`) n
 
 #### Gate Step 0 — Read `plan_gate` prefs via the canonical prefs CLI
 
-Resolve prefs once through the S01 engine CLI (never a `files=[…forge-agent-prefs.md…]` cascade merge) — see `shared/forge-dispatch.md § Per-unit prefs resolution` and `shared/forge-plan-gate.md § Step 0`.
+Resolve prefs once through the S01 engine CLI (never a `files=[…forge-agent-prefs.jsonc…]` cascade merge) — see `shared/forge-dispatch.md § Per-unit prefs resolution` and `shared/forge-plan-gate.md § Step 0`.
 
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
@@ -687,7 +687,8 @@ git -C "${CODE_DIR:-.}" rev-parse HEAD 2>/dev/null > .gsd/tasks/{TASK_ID}/.start
 # ── Dispatch resolution (before dispatch; execute-task routes to sidecar) ──────
 # The explicit prefs loud-stop gate STAYS even though forge-dispatch-resolve.js also surfaces
 # prefs errors — an early, human-actionable halt on a broken config (M008-CONTEXT #2). ONE
-# forge-prefs.js --resolved call (dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge,
+# forge-prefs.js --resolved call (reads the jsonc catalog per layer; legacy Markdown without jsonc
+# hard-stops — see shared/forge-prefs-cutover.md; NEVER a 3-file cascade node -e merge,
 # MEM001 M005). See shared/forge-dispatch.md § Per-unit prefs resolution.
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")

@@ -45,7 +45,7 @@ Read ONLY these files:
 2. `.gsd/AUTO-MEMORY.md` full file (skip silently if missing) — stored as `ALL_MEMORIES` for selective injection
 3. `.gsd/CODING-STANDARDS.md` (skip silently if missing)
 
-**Resolve PREFS via the canonical engine CLI (ONE call — never a 3-file md merge in-context).** The S01 engine (`scripts/forge-prefs.js`) dual-reads legacy markdown OR new jsonc per layer and applies the exact same user-global → repo-shared → local-personal precedence (last wins) that the old inline prose described. Do NOT read/merge `~/.claude/forge-agent-prefs.md` + `.gsd/claude-agent-prefs.md` + `.gsd/prefs.local.md` by hand — that is exactly what the CLI does. See `shared/forge-dispatch.md § Per-unit prefs resolution` for the canonical helper.
+**Resolve PREFS via the canonical engine CLI (ONE call — never a 3-file md merge in-context).** The S01 engine (`scripts/forge-prefs.js`) reads the jsonc catalog per layer; legacy Markdown without jsonc hard-stops — see `shared/forge-prefs-cutover.md`. It applies the exact same user-global → repo-shared → local-personal precedence (last wins) that the old inline prose described. Do NOT read/merge `~/.claude/forge-agent-prefs.jsonc` + `.gsd/claude-agent-prefs.jsonc` + `.gsd/prefs.local.jsonc` by hand — that is exactly what the CLI does. See `shared/forge-dispatch.md § Per-unit prefs resolution` for the canonical helper.
 
 ```bash
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --explain --cwd "$WORKING_DIR")
@@ -311,7 +311,7 @@ The produced `T##-SECURITY.md` will be injected into the execute-task worker pro
 
 After a successful `plan-slice` unit, before dispatching the first `execute-task` for the same slice, run the plan-check gate:
 
-1. **Read `plan_check.mode` via the canonical engine CLI** (single-knob convenience form — dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge, MEM001 M005):
+1. **Read `plan_check.mode` via the canonical engine CLI** (single-knob convenience form — reads the jsonc catalog per layer; legacy Markdown without jsonc hard-stops — see `shared/forge-prefs-cutover.md`; NEVER a 3-file cascade node -e merge, MEM001 M005):
    ```bash
    PLAN_CHECK_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key plan_check.mode --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let m=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write((m==='advisory'||m==='blocking'||m==='disabled')?m:'advisory')}catch(e){process.stdout.write('advisory')}})")
    ```
@@ -383,7 +383,7 @@ Roda o handshake interativo do plan gate (spec autoritativa: `shared/forge-plan-
 
 #### Gate Step 0 — Read da pref `plan_gate:` (canonical engine CLI)
 
-Both knobs read via the canonical engine CLI (single-knob convenience form — dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge, MEM001 M005). Defaults byte-identical to the old inline cascade: `interactive=always` (whitelist `always|auto|off`), `ask_in_auto=defer` (whitelist `defer|off`).
+Both knobs read via the canonical engine CLI (single-knob convenience form — reads the jsonc catalog per layer; legacy Markdown without jsonc hard-stops — see `shared/forge-prefs-cutover.md`; NEVER a 3-file cascade node -e merge, MEM001 M005). Defaults byte-identical to the old inline cascade: `interactive=always` (whitelist `always|auto|off`), `ask_in_auto=defer` (whitelist `defer|off`).
 
 ```bash
 INTERACTIVE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key plan_gate.interactive --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(['always','auto','off'].includes(v)?v:'always')}catch(e){process.stdout.write('always')}})")
@@ -625,7 +625,7 @@ Campos:
 
 After the plan-check gate completes (or is skipped), run the symbol-check gate before dispatching the first `execute-task` for the same slice. This gate runs via Bash shell-out — NOT via `Agent()` — so there is no liveness banner and return is immediate. See `shared/forge-dispatch.md § symbol-check` for artifact format and event schema.
 
-1. **Read `symbol_check.mode` via the canonical engine CLI** (single-knob convenience form — dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge, MEM001 M005):
+1. **Read `symbol_check.mode` via the canonical engine CLI** (single-knob convenience form — reads the jsonc catalog per layer; legacy Markdown without jsonc hard-stops — see `shared/forge-prefs-cutover.md`; NEVER a 3-file cascade node -e merge, MEM001 M005):
    ```bash
    SYMBOL_CHECK_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key symbol_check.mode --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{let m=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write((m==='advisory'||m==='disabled')?m:'advisory')}catch(e){process.stdout.write('advisory')}})")
    ```
@@ -1181,7 +1181,7 @@ Parse the `---GSD-WORKER-RESULT---` block:
 
 **Node Repair gate (Layer 3 — disjoint from Layers 1 and 2):** Applies ONLY when `unit_type == execute-task`. Trigger: `status: done` AND `S##-VERIFICATION.md` rows show must_have drift (artifacts `substantive:false` / `wired:false`, test-quality flags) OR `status: partial` with must_haves unmet. `Agent()` throws → Layer 1. `status: blocked` → Layer 2. Do NOT overlap. See full spec: `shared/forge-dispatch.md § Node Repair`.
 
-1. **Read prefs** via the canonical engine CLI (single-knob convenience form — dual-reads md OR jsonc; NEVER a 3-file cascade node -e merge, MEM001 M005; default `2` on absence/parse error):
+1. **Read prefs** via the canonical engine CLI (single-knob convenience form — reads the jsonc catalog per layer; legacy Markdown without jsonc hard-stops — see `shared/forge-prefs-cutover.md`; NEVER a 3-file cascade node -e merge, MEM001 M005; default `2` on absence/parse error):
    ```bash
    REPAIR_BUDGET=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key repair.budget --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(Number.isInteger(v)&&v>=0?String(v):'2')}catch(e){process.stdout.write('2')}})")
    ```

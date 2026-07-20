@@ -188,7 +188,7 @@ The project is already managed by gsd-pi. Your job is to:
      --set-active auto_commit=<true|false conforme resposta>
    ```
    (No `--schema-ref` — the engine auto-computes the relative path from `.gsd/forge-prefs.jsonc` to the installed `~/.claude/forge-prefs.schema.json`.)
-   The scaffold is local and curated, and the active `auto_commit` value must be the answer selected by the user. If `node` is unavailable, report an informative fallback and skip this scaffold; the global preferences dual-read still applies. Do not recreate `.gsd/claude-agent-prefs.md` or `.gsd/prefs.local.md`.
+   The scaffold is local and curated, and the active `auto_commit` value must be the answer selected by the user. If `node` is unavailable, report an informative fallback and skip this scaffold; global preference resolution through the engine CLI still applies. Do not recreate `.gsd/claude-agent-prefs.md` or `.gsd/prefs.local.md`.
 
 5. **Add `.gsd/forge-prefs.jsonc` to `.gitignore` by reusing the migration helper:**
    ```bash

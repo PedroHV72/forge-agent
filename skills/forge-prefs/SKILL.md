@@ -59,7 +59,7 @@ Exemplos válidos:
 - `/forge-prefs set tier_models.heavy claude-opus-4-8[1m] global`
 
 Rota **sempre** pelo primitivo `--set` de `forge-prefs-migrate.js` — nunca edite
-um `.jsonc`/`.md` de preferências manualmente com `Edit`/`Write`:
+um `.jsonc` de preferências manualmente com `Edit`/`Write`:
 
 ```bash
 MIGRATE=$([ -f scripts/forge-prefs-migrate.js ] && echo scripts/forge-prefs-migrate.js || echo "$HOME/.claude/scripts/forge-prefs-migrate.js")
@@ -189,7 +189,7 @@ T03 deste slice) — é o documento de referência versionado, complementar ao
   descrição, default ou lista de knobs aqui. O helper (`forge-prefs-view.js`)
   lê o schema em runtime; qualquer prosa fixa neste arquivo sobre "quais são
   os knobs" ficaria desatualizada na primeira mudança de schema.
-- **Nunca escreva `.jsonc`/`.md` de preferências diretamente.** Toda mutação
+- **Nunca escreva `.jsonc` de preferências diretamente.** Toda mutação
   passa por `forge-prefs-migrate.js` (`setPreference`/`--set`), que preserva
   blocos comentados existentes byte-a-byte e verifica o resultado antes de
   reportar sucesso.
