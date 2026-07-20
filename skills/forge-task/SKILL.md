@@ -773,6 +773,46 @@ echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\"
 # → proceed to "Process result" below. Do NOT run the Claude machinery below.
 ```
 
+**Failure (any `reason`):** first evaluate **Layer-1 transient retry** (sidecar parity with the Claude Retry Handler — `shared/forge-dispatch.md § Layer-1 transient retry`); only on a terminal class / exhaustion / unverified reset does control fall through to the **Layer-2** verified-reset + `worker-engine-fallback` below:
+```bash
+# ── Layer-1 transient retry (sidecar parity with the Claude Retry Handler) — runs BEFORE Layer-2 ──
+# Strictly upstream of the Layer-2 fallback below (mirrors how the per-Agent() Retry Handler is upstream
+# of the claude-member chain walk). Read error_class off the result JSON (or the adapter-failed marker
+# — same field, S02/T01). Absent/unrecognized → terminal: byte-identical to pre-T02 (single-shot
+# fallback, never an unbounded retry). codex-timeout / codex-orphan are ALWAYS terminal (a hung/orphaned
+# process is never retried in place) regardless of a stale error_class.
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
+RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null || echo "$RESULT_FILE")
+ERROR_CLASS=$(node -pe "JSON.parse(require('fs').readFileSync('$RESULT_FILE','utf8')).error_class || 'terminal'" 2>/dev/null || echo terminal)
+case "$REASON" in codex-timeout|codex-orphan) ERROR_CLASS="terminal";; esac
+TRC=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).transient_retry_count || 0" 2>/dev/null || echo 0)
+MAX_TRC=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const r=(JSON.parse(d).prefs.retry||{}).max_transient_retries;process.stdout.write(Number.isInteger(r)&&r>0?String(r):'3')}catch(e){process.stdout.write('3')}})")
+BASE_BACKOFF=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const b=(JSON.parse(d).prefs.retry||{}).base_backoff_ms;process.stdout.write(Number.isInteger(b)&&b>0?String(b):'2000')}catch(e){process.stdout.write('2000')}})")
+TRANSIENT_RETRY=""
+if [ "$ERROR_CLASS" = "transient" ] && [ "$TRC" -lt "$MAX_TRC" ]; then
+  # Layer-1 fires (transient AND under the cap). Branch C reset FIRST — same helper + verified-reset
+  # criterion as Layer-2 (RC=0 required; RC=3 overlap / RC=2 verify-failed do NOT retry — fall through
+  # to Layer-2, which owns the abort→fallback accounting; a retry NEVER runs on an unverified tree).
+  node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --reset --state "$XLLM_STATE"; RC=$?
+  if [ "$RC" = "0" ]; then
+    # Exponential backoff base * 2^count (mirrors the Claude Retry Handler step 7). Cross-platform sleep.
+    DELAY_MS=$(node -pe "$BASE_BACKOFF * Math.pow(2, $TRC)")
+    node -e "setTimeout(()=>{}, $DELAY_MS)"
+    # Bump the counter + allocate a fresh result-file via the S01 helper (read-modify-write — NEVER a
+    # printf, which would clobber pre_dirty/start_sha). A loose task dispatches the sidecar once, so
+    # transient_retry_count is the only counter here (no SIDECAR_ATTEMPT / -attempt-N suffix).
+    RESULT_FILE=$(mktemp -t forge-xllm-result.XXXXXX.json)
+    node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
+      --state "$XLLM_STATE" --transient-retry-count $((TRC + 1)) --result-file "$RESULT_FILE"
+    TRC=$((TRC + 1)); TRANSIENT_RETRY=1
+    mkdir -p "$WORKING_DIR/.gsd/forge/"
+    printf '{"ts":"%s","event":"sidecar-transient-retry","milestone":"%s","slice":"%s","unit":"execute-task/%s","attempt":%s,"transient_retry_count":%s,"backoff_ms":%s}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "" "" "{TASK_ID}" "${SIDECAR_ATTEMPT:-1}" "$TRC" "$DELAY_MS" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+  fi
+fi
+```
+**If `$TRANSIENT_RETRY` is set** (Layer-1 fired, reset verified `RC=0`): re-enter the **Dispatch (detached) + Poll** steps — reusing the same state, `$START_SHA`/`pre_dirty` and the fresh `$RESULT_FILE`; only `transient_retry_count` advances. Do NOT run the Layer-2 block below. **Otherwise** — a `terminal` class, exhaustion (`transient_retry_count == max_transient_retries`), or an unverified reset (`RC≠0`, whose abort→fallback accounting Layer-2 owns) — control falls through to the **Layer-2** `worker-engine-fallback` below **unchanged**.
+
 **Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`); no retry of the codex work; **not a 4th recovery layer**:
 ```bash
 # Re-read is delegated to the helper — $XLLM_STATE carries start_sha + pre_dirty (this block may be a
