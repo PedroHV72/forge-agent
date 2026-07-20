@@ -15,6 +15,37 @@ const path = require('path');
 
 const { readRoutingConfig } = require('./forge-routing');
 
+// M015 jsonc-only cut: production reads never parse legacy markdown routing
+// blocks anymore (forge-prefs.js resolveLayer hard-stops on md-without-jsonc).
+// The adversarial md-parser coverage below (tabs, CRLF, broken indentation,
+// inline comments, blank lines, cascade merge...) still has value — it now
+// lives on, and is exercised through, the SANCTIONED bridge module
+// (forge-prefs-legacy.js legacyReadLayer, used by the migrator). This shim
+// reproduces the exact same cascade/merge contract readRoutingConfig used to
+// expose (present/ok/routing/error), built ONLY from sanctioned exports
+// (legacyReadLayer + forge-prefs.js deepMerge) — never reimplementing parser
+// logic here.
+const { legacyReadLayer } = require('./forge-prefs-legacy.js');
+const { deepMerge } = require('./forge-prefs.js');
+
+function fileExists(file) {
+  try { return fs.statSync(file).isFile(); } catch { return false; }
+}
+
+function legacyRoutingConfig(cwd) {
+  const homeFile = path.join(process.env.HOME, '.claude', 'forge-agent-prefs.md');
+  const repoFile = path.join(cwd, '.gsd', 'claude-agent-prefs.md');
+  const localFile = path.join(cwd, '.gsd', 'prefs.local.md');
+  const globalLayer = legacyReadLayer([homeFile].filter(fileExists));
+  const localLayer = legacyReadLayer([repoFile, localFile].filter(fileExists));
+  if (globalLayer.routingMalformed || localLayer.routingMalformed) {
+    return { present: true, ok: false, routing: {}, error: 'routing-parse-error' };
+  }
+  const merged = deepMerge(globalLayer.prefs, localLayer.prefs);
+  const present = Object.prototype.hasOwnProperty.call(merged, 'routing');
+  return { present, ok: true, routing: merged.routing || {}, error: null };
+}
+
 let passed = 0;
 let failed = 0;
 const failures = [];
@@ -71,7 +102,7 @@ console.log('\n=== forge-routing.js — readRoutingConfig parser suite ===\n');
 // --- Scenario 1: no routing block anywhere → compat path ---
 console.log('Scenario 1: no routing block in the cascade');
 withCascade({ repo: '# just prefs\ntier_models:\n  standard: claude-sonnet-5\n' }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('present false', () => assertEq(r.present, false));
   test('ok true', () => assertEq(r.ok, true));
   test('routing empty', () => assertEq(r.routing, {}));
@@ -83,7 +114,7 @@ console.log('\nScenario 2: valid single domain, space indentation');
 withCascade({
   repo: 'routing:\n  backend:\n    executor:\n      standard: claude-sonnet-5\n      fallback: claude-sonnet-5\n    planner:\n      heavy: claude-opus-4-8\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('present true, ok true', () => assert(r.present && r.ok, JSON.stringify(r)));
   test('backend.executor.standard parsed as list', () =>
     assertEq(r.routing.backend.executor.standard, ['claude-sonnet-5']));
@@ -98,7 +129,7 @@ console.log('\nScenario 3: tab indentation');
 withCascade({
   repo: 'routing:\n\tbackend:\n\t\texecutor:\n\t\t\tstandard: claude-sonnet-5\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('tabs parse ok', () => assert(r.ok && r.present, JSON.stringify(r)));
   test('tabbed value intact', () =>
     assertEq(r.routing.backend.executor.standard, ['claude-sonnet-5']));
@@ -109,7 +140,7 @@ console.log('\nScenario 4: broken indentation → routing-parse-error');
 withCascade({
   repo: 'routing:\n  backend:\n    executor:\n      standard: claude-sonnet-5\n   planner:\n      heavy: claude-opus-4-8\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('present true', () => assertEq(r.present, true));
   test('ok false', () => assertEq(r.ok, false));
   test('routing emptied (never partial)', () => assertEq(r.routing, {}));
@@ -122,7 +153,7 @@ withCascade({
   repo: 'routing:\n  backend:\n    executor:\n      standard: claude-sonnet-5\n    planner:\n      heavy: claude-opus-4-8\n',
   local: 'routing:\n  backend:\n    executor:\n      standard: gpt-5\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('ok true', () => assert(r.ok, JSON.stringify(r)));
   test('local domain replaces repo domain entirely', () =>
     assertEq(r.routing.backend, { executor: { standard: ['gpt-5'] } }));
@@ -135,7 +166,7 @@ console.log('\nScenario 6: fallback: between tier keys');
 withCascade({
   repo: 'routing:\n  backend:\n    executor:\n      standard: claude-sonnet-5\n      fallback: claude-sonnet-5\n      heavy: claude-opus-4-8\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('ok true', () => assert(r.ok, JSON.stringify(r)));
   test('fallback captured mid-tiers', () =>
     assertEq(r.routing.backend.executor.fallback, 'claude-sonnet-5'));
@@ -150,7 +181,7 @@ console.log('\nScenario 7: block at end of file (\\Z-class regression)');
 withCascade({
   repo: 'tier_models:\n  standard: claude-sonnet-5\n\nrouting:\n  default:\n    executor:\n      standard: claude-sonnet-5',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('trailing block captured', () => assert(r.ok && r.present, JSON.stringify(r)));
   test('default domain parsed', () =>
     assertEq(r.routing.default.executor.standard, ['claude-sonnet-5']));
@@ -161,7 +192,7 @@ console.log('\nScenario 8: inline comments and inline list values');
 withCascade({
   repo: 'routing:\n  backend:  # backend domain\n    executor:\n      standard: [claude-sonnet-5, gpt-5]  # mixed cell\n      fallback: claude-sonnet-5 # net\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('ok true', () => assert(r.ok, JSON.stringify(r)));
   test('inline list → array, comment stripped', () =>
     assertEq(r.routing.backend.executor.standard, ['claude-sonnet-5', 'gpt-5']));
@@ -175,7 +206,7 @@ withCascade({
   repo: 'routing:\n  backend:\n    executor:\n      standard: claude-sonnet-5\n',
   local: 'routing:\n  frontend:\n      standard: gpt-5\n', // phase level skipped
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('present true', () => assertEq(r.present, true));
   test('ok false (never partial across files)', () => assertEq(r.ok, false));
   test('routing empty', () => assertEq(r.routing, {}));
@@ -188,7 +219,7 @@ withCascade({
   home: 'routing:\n  default:\n    executor:\n      standard: claude-sonnet-5\n',
   repo: 'routing:\n  backend:\n    planner:\n      heavy: claude-opus-4-8\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('ok true', () => assert(r.ok, JSON.stringify(r)));
   test('home default domain present', () =>
     assertEq(r.routing.default.executor.standard, ['claude-sonnet-5']));
@@ -201,7 +232,7 @@ console.log('\nScenario 11: excessive nesting depth');
 withCascade({
   repo: 'routing:\n  backend:\n    executor:\n      standard:\n        extra: claude-sonnet-5\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('depth>3 → ok false', () => assertEq(r.ok, false));
   test('error routing-parse-error', () => assertEq(r.error, 'routing-parse-error'));
 });
@@ -219,7 +250,7 @@ withCascade({
     '    executor:\n' +
     '      standard: claude-opus-4-8\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('ok true', () => assert(r.ok, JSON.stringify(r)));
   test('present true', () => assertEq(r.present, true));
   test('backend domain parsed', () =>
@@ -244,7 +275,7 @@ withCascade({
     'review:\n' +
     '  mode: dialectic\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('ok true', () => assert(r.ok, JSON.stringify(r)));
   test('backend domain parsed', () =>
     assertEq(r.routing.backend.executor.standard, ['claude-sonnet-5']));
@@ -264,7 +295,7 @@ withCascade({
     '      standard: claude-sonnet-5\r\n' +
     '      fallback: claude-opus-4-8\r\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   test('ok true', () => assert(r.ok, JSON.stringify(r)));
   test('present true', () => assertEq(r.present, true));
   test('backend cell parsed', () =>
@@ -296,7 +327,7 @@ withCascade({
     '      standard: local-model\n' +
     '      fallback: local-fallback\n',
 }, (cwd) => {
-  const r = readRoutingConfig(cwd);
+  const r = legacyRoutingConfig(cwd);
   const golden = {
     backend: { executor: { standard: ['local-model'], fallback: 'local-fallback' } },
     default: { executor: { standard: ['default-model'] } },
@@ -321,7 +352,7 @@ withCascade({
   repo: 'routing:\n  backend:\n      executor:\n    standard: broken\n',
 }, (cwd) => {
   test('malformed-block golden degrades the whole cascade', () =>
-    assertEq(readRoutingConfig(cwd), {
+    assertEq(legacyRoutingConfig(cwd), {
       present: true, ok: false, routing: {}, error: 'routing-parse-error',
     }));
 });

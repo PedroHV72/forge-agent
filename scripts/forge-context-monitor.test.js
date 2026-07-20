@@ -231,21 +231,18 @@ test('cwd without prefs → defaults (enabled:true, 0.35/0.25)', () => {
 
 test('prefs.local.md with enabled: false → disabled', () => {
   const fakeCwd = path.join(ROOT, 'disabled-project');
-  writeTmp('disabled-project/.gsd/prefs.local.md', `
-context_monitor:
-  enabled: false
-`);
+  writeTmp('disabled-project/.gsd/forge-prefs.jsonc', `{
+  "context_monitor": { "enabled": false }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.enabled, false, 'should read enabled: false');
 });
 
 test('percent threshold 40 → 0.40', () => {
   const fakeCwd = path.join(ROOT, 'percent-project');
-  writeTmp('percent-project/.gsd/prefs.local.md', `
-context_monitor:
-  warning_threshold: 40
-  critical_threshold: 20
-`);
+  writeTmp('percent-project/.gsd/forge-prefs.jsonc', `{
+  "context_monitor": { "warning_threshold": 40, "critical_threshold": 20 }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.thresholds.warning, 0.40, 'percent 40 → 0.40');
   assertEq(prefs.thresholds.critical, 0.20, 'percent 20 → 0.20');
@@ -253,21 +250,18 @@ context_monitor:
 
 test('fraction threshold 0.45 stays as-is', () => {
   const fakeCwd = path.join(ROOT, 'fraction-project');
-  writeTmp('fraction-project/.gsd/prefs.local.md', `
-context_monitor:
-  warning_threshold: 0.45
-`);
+  writeTmp('fraction-project/.gsd/forge-prefs.jsonc', `{
+  "context_monitor": { "warning_threshold": 0.45 }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.thresholds.warning, 0.45, 'fraction 0.45 stays 0.45');
 });
 
 test('S03-R3: numeric-string-with-suffix threshold (85% → 0.85)', () => {
   const fakeCwd = path.join(ROOT, 'suffix-project');
-  writeTmp('suffix-project/.gsd/prefs.local.md', `
-context_monitor:
-  warning_threshold: 85%
-  critical_threshold: 70abc
-`);
+  writeTmp('suffix-project/.gsd/forge-prefs.jsonc', `{
+  "context_monitor": { "warning_threshold": "85%", "critical_threshold": "70abc" }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.thresholds.warning, 0.85, '"85%" → 0.85 (parseFloat + percent normalize)');
   assertEq(prefs.thresholds.critical, 0.70, '"70abc" → 0.70 (leading numeric prefix)');
@@ -275,11 +269,9 @@ context_monitor:
 
 test('S03-R3: clean fraction/number strings still behave', () => {
   const fakeCwd = path.join(ROOT, 'suffix-clean-project');
-  writeTmp('suffix-clean-project/.gsd/prefs.local.md', `
-context_monitor:
-  warning_threshold: "0.85"
-  critical_threshold: "85"
-`);
+  writeTmp('suffix-clean-project/.gsd/forge-prefs.jsonc', `{
+  "context_monitor": { "warning_threshold": "0.85", "critical_threshold": "85" }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.thresholds.warning, 0.85, '"0.85" string → 0.85');
   assertEq(prefs.thresholds.critical, 0.85, '"85" string → 0.85');
@@ -287,22 +279,18 @@ context_monitor:
 
 test('S03-R3: non-numeric string still falls back to default', () => {
   const fakeCwd = path.join(ROOT, 'suffix-invalid-project');
-  writeTmp('suffix-invalid-project/.gsd/prefs.local.md', `
-context_monitor:
-  warning_threshold: abc
-`);
+  writeTmp('suffix-invalid-project/.gsd/forge-prefs.jsonc', `{
+  "context_monitor": { "warning_threshold": "abc" }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.thresholds.warning, 0.35, '"abc" → default 0.35');
 });
 
 test('invalid enabled and thresholds preserve defaults', () => {
   const fakeCwd = path.join(ROOT, 'invalid-project');
-  writeTmp('invalid-project/.gsd/prefs.local.md', `
-context_monitor:
-  enabled: maybe
-  warning_threshold: abc
-  critical_threshold: null
-`);
+  writeTmp('invalid-project/.gsd/forge-prefs.jsonc', `{
+  "context_monitor": { "enabled": "maybe", "warning_threshold": "abc", "critical_threshold": null }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs, { enabled: true, thresholds: { warning: 0.35, critical: 0.25 } },
     'invalid values must fall back to defaults');
@@ -314,24 +302,19 @@ console.log('\nreview fixes (R6 scoping / R8 thresholds):');
 
 test('R6: enabled: false em bloco IRMÃO não desliga o monitor', () => {
   const fakeCwd = path.join(ROOT, 'sibling-project');
-  writeTmp('sibling-project/.gsd/prefs.local.md', `
-evidence:
-  enabled: false
-
-context_monitor:
-  warning_threshold: 0.35
-`);
+  writeTmp('sibling-project/.gsd/forge-prefs.jsonc', `{
+  "evidence": { "enabled": false },
+  "context_monitor": { "warning_threshold": 0.35 }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.enabled, true, 'sibling-block enabled must NOT leak into context_monitor');
 });
 
 test('R6: arquivo sem bloco context_monitor → defaults intactos', () => {
   const fakeCwd = path.join(ROOT, 'noblock-project');
-  writeTmp('noblock-project/.gsd/prefs.local.md', `
-repair:
-  enabled: false
-  warning_threshold: 0.99
-`);
+  writeTmp('noblock-project/.gsd/forge-prefs.jsonc', `{
+  "repair": { "enabled": false, "warning_threshold": 0.99 }
+}`);
   const prefs = readContextMonitorPrefs(fakeCwd);
   assertEq(prefs.enabled, true, 'no context_monitor block → default enabled');
   assertEq(prefs.thresholds.warning, 0.35, 'no block → default warning');

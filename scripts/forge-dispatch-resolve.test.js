@@ -164,7 +164,7 @@ withHermeticHome((cliEnv) => {
   });
 
   runCase('plan-milestone is non-routable max and uses tier_models', () => {
-    const f = mkFixture({ prefs: 'routing:\n  default:\n    planner:\n      max: gpt-5-codex\n' });
+    const f = mkFixture({ prefsJsonc: '{"routing":{"default":{"planner":{"max":"gpt-5-codex"}}}}' });
     const r = dispatch(f, { unitType: 'plan-milestone' });
     assertEqual(r.tier, 'max', 'plan-milestone tier max');
     assertEqual(r.route_source, 'tier_models', 'plan-milestone is never captured by routing');
@@ -173,7 +173,7 @@ withHermeticHome((cliEnv) => {
 
   runCase('routing backend executor selects capped routing chain', () => {
     const f = mkFixture({
-      prefs: 'routing:\n  backend:\n    executor:\n      standard: [gpt-5-codex, claude-sonnet-5, claude-opus-4-8, claude-haiku-4-5-20251001]\n',
+      prefsJsonc: '{"routing":{"backend":{"executor":{"standard":["gpt-5-codex","claude-sonnet-5","claude-opus-4-8","claude-haiku-4-5-20251001"]}}}}',
       plan: '---\ndomain: backend\n---\n# task\n',
     });
     const r = dispatch(f, { unitType: 'execute-task' });
@@ -186,7 +186,7 @@ withHermeticHome((cliEnv) => {
 
   runCase('routing falls back to default domain for absent domain cell', () => {
     const f = mkFixture({
-      prefs: 'routing:\n  default:\n    executor:\n      standard: claude-opus-4-8\n',
+      prefsJsonc: '{"routing":{"default":{"executor":{"standard":["claude-opus-4-8"]}}}}',
       plan: '---\ndomain: nonexistent\n---\n# task\n',
     });
     const r = dispatch(f, { unitType: 'execute-task' });
@@ -197,7 +197,7 @@ withHermeticHome((cliEnv) => {
   });
 
   runCase('legacy workers compatibility retains tier_models model', () => {
-    const f = mkFixture({ prefs: 'workers:\n  execute-task: codex\n  codex_model: gpt-fixture\ntier_models:\n  standard: claude-opus-4-8\n' });
+    const f = mkFixture({ prefsJsonc: '{"workers":{"execute-task":"codex","codex_model":"gpt-fixture"},"tier_models":{"standard":"claude-opus-4-8"}}' });
     const r = dispatch(f, { unitType: 'execute-task' });
     const canonical = readTierChain('standard', f.dir)[0];
     assertEqual(r.route_source, 'tier_models', 'legacy compatibility source');
@@ -218,7 +218,7 @@ withHermeticHome((cliEnv) => {
     // canonical engine here is `gpt`. The literal `engine == codex` only arises on the
     // tier_models legacy path via the prefs `workers:` block (covered by the case above).
     const f = mkFixture({
-      prefs: 'routing:\n  backend:\n    executor:\n      standard: claude-opus-4-8\n',
+      prefsJsonc: '{"routing":{"backend":{"executor":{"standard":"claude-opus-4-8"}}}}',
       plan: '---\nworker: codex\ndomain: backend\n---\n# task\n',
     });
     const r = dispatch(f, { unitType: 'execute-task' });
@@ -230,7 +230,7 @@ withHermeticHome((cliEnv) => {
   });
 
   runCase('unknown alias is safely omitted from applied model', () => {
-    const f = mkFixture({ prefs: 'tier_models:\n  standard: gpt-5-codex\n' });
+    const f = mkFixture({ prefsJsonc: '{"tier_models":{"standard":"gpt-5-codex"}}' });
     const r = dispatch(f, { unitType: 'execute-task' });
     assertEqual(r.alias, null, 'unknown model alias is null');
     assertEqual(r.model_applied, null, 'unknown model has no applied alias');
@@ -238,7 +238,7 @@ withHermeticHome((cliEnv) => {
   });
 
   runCase('fable model enables adaptive thinking header', () => {
-    const f = mkFixture({ prefs: 'tier_models:\n  standard: claude-fable-5\n' });
+    const f = mkFixture({ prefsJsonc: '{"tier_models":{"standard":"claude-fable-5"}}' });
     const r = dispatch(f, { unitType: 'execute-task' });
     assertEqual(r.thinking_header, 'adaptive', 'fable thinking header adaptive');
     cleanup(f);
@@ -247,10 +247,10 @@ withHermeticHome((cliEnv) => {
   runCase('worker: Codex (capitalized) normalizes identically to lowercase codex', () => {
     // Fix 2 (M012 S01 review-fix): canonical lowercases the frontmatter worker
     // value. Capitalized `Codex` must resolve identically to lowercase `codex`.
-    const prefs = 'routing:\n  backend:\n    executor:\n      standard: claude-opus-4-8\n';
+    const prefsJsonc = '{"routing":{"backend":{"executor":{"standard":"claude-opus-4-8"}}}}';
     const domain = 'domain: backend\n';
-    const lower = mkFixture({ prefs, plan: `---\nworker: codex\n${domain}---\n# task\n` });
-    const upper = mkFixture({ prefs, plan: `---\nworker: Codex\n${domain}---\n# task\n` });
+    const lower = mkFixture({ prefsJsonc, plan: `---\nworker: codex\n${domain}---\n# task\n` });
+    const upper = mkFixture({ prefsJsonc, plan: `---\nworker: Codex\n${domain}---\n# task\n` });
     const rl = dispatch(lower, { unitType: 'execute-task' });
     const ru = dispatch(upper, { unitType: 'execute-task' });
     assertEqual(ru.plan_worker, 'codex', 'capitalized worker is lowercased');
@@ -262,7 +262,7 @@ withHermeticHome((cliEnv) => {
   });
 
   runCase('workers: {execute-task: Codex} (capitalized) normalizes to codex engine', () => {
-    const f = mkFixture({ prefs: 'workers:\n  execute-task: Codex\n  codex_model: gpt-fixture\ntier_models:\n  standard: claude-opus-4-8\n' });
+    const f = mkFixture({ prefsJsonc: '{"workers":{"execute-task":"Codex","codex_model":"gpt-fixture"},"tier_models":{"standard":"claude-opus-4-8"}}' });
     const r = dispatch(f, { unitType: 'execute-task' });
     assertEqual(r.route_source, 'tier_models', 'capitalized workers pref stays legacy source');
     assertEqual(r.engine, 'codex', 'capitalized workers pref lowercases to codex engine');
@@ -286,7 +286,7 @@ withHermeticHome((cliEnv) => {
   });
 
   runCase('valid prefs keep prefs_ok true and CLI exit 0', () => {
-    const f = mkFixture({ prefs: 'workers:\n  execute-task: codex\n' });
+    const f = mkFixture({ prefsJsonc: '{"workers":{"execute-task":"codex"}}' });
     const r = dispatch(f, { unitType: 'execute-task' });
     assertEqual(r.prefs_ok, true, 'valid prefs keep prefs_ok true');
     assertEqual(r.prefs_errors.length, 0, 'valid prefs have no errors');

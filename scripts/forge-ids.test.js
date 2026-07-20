@@ -327,34 +327,32 @@ test('readIdFormat: no prefs → timestamp (unless user-global sets sequential)'
 test('readIdFormat: repo pref sequential wins over absent local', () => {
   withSandbox(dir => {
     fs.mkdirSync(path.join(dir, '.gsd'));
-    fs.writeFileSync(path.join(dir, '.gsd', 'claude-agent-prefs.md'),
-      '## ID Settings\n\nids:\n  format: sequential\n');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+      '{\n  "ids": { "format": "sequential" }\n}\n');
     assertEq(ids.readIdFormat(dir), 'sequential');
   });
 });
 test('readIdFormat: ids block at EOF without trailing newline still parses', () => {
   withSandbox(dir => {
     fs.mkdirSync(path.join(dir, '.gsd'));
-    fs.writeFileSync(path.join(dir, '.gsd', 'claude-agent-prefs.md'),
-      'auto_commit: false\n\nids:\n  format: sequential');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+      '{ "auto_commit": false, "ids": { "format": "sequential" } }');
     assertEq(ids.readIdFormat(dir), 'sequential');
   });
 });
 test('readIdFormat: local pref overrides repo pref (last wins)', () => {
   withSandbox(dir => {
     fs.mkdirSync(path.join(dir, '.gsd'));
-    fs.writeFileSync(path.join(dir, '.gsd', 'claude-agent-prefs.md'),
-      'ids:\n  format: sequential\n');
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
-      'ids:\n  format: timestamp\n');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+      '{\n  "ids": { "format": "timestamp" }\n}\n');
     assertEq(ids.readIdFormat(dir), 'timestamp');
   });
 });
 test('readIdFormat: invalid value falls back to timestamp', () => {
   withSandbox(dir => {
     fs.mkdirSync(path.join(dir, '.gsd'));
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
-      'ids:\n  format: banana\n');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+      '{\n  "ids": { "format": "banana" }\n}\n');
     assertEq(ids.readIdFormat(dir), 'timestamp');
   });
 });
@@ -370,7 +368,7 @@ test('resolveMilestoneId: sequential scans milestones/ + archive/', () => {
 test('resolveMilestoneId: explicit timestamp override ignores sequential pref', () => {
   withSandbox(dir => {
     fs.mkdirSync(path.join(dir, '.gsd'));
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), 'ids:\n  format: sequential\n');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), '{ "ids": { "format": "sequential" } }');
     const id = ids.resolveMilestoneId(dir, 'minha feature nova', 'timestamp');
     assert(/^M-\d{14}-/.test(id), `expected timestamp format, got ${id}`);
   });
@@ -378,7 +376,7 @@ test('resolveMilestoneId: explicit timestamp override ignores sequential pref', 
 test('resolveMilestoneId: pref sequential picked up from sandbox prefs', () => {
   withSandbox(dir => {
     fs.mkdirSync(path.join(dir, '.gsd', 'milestones', 'M041'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), 'ids:\n  format: sequential\n');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), '{ "ids": { "format": "sequential" } }');
     assertEq(ids.resolveMilestoneId(dir, 'qualquer'), 'M042');
   });
 });
