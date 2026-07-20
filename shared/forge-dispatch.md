@@ -1111,6 +1111,8 @@ After materializing, the orchestrator emits the `dispatch` event (`engine:"codex
 
 **Ordering (explicit).** On a sidecar failure the orchestrator ALWAYS evaluates Layer-1 first: read `error_class`, decide retry-vs-advance, and only on exhaustion (or an immediately-terminal class) does control fall through to Layer-2 (§ Cross-engine chain walk) / the Fallback below. Layer-1 never runs *after* Layer-2 — it is strictly upstream of it, mirroring how the per-`Agent()` Retry Handler is upstream of the claude-member chain-walk.
 
+**Gate (policy `workers.sidecar_on_failure`).** This entire Layer-1 sub-section is gated by the resolved `workers.sidecar_on_failure` policy (§ Sidecar failure policy below): the loop is **entered only when the policy ≠ `fallback`** (`fallback` skips Layer-1 and goes straight to Layer-2), and the **exhaustion transition consults the policy** — under `pause-ask` it hits the pause-ask gate before Layer-2; under `retry-then-fallback` (default) it falls through to Layer-2 unchanged. With the default the gate is a transparent no-op — behavior is **byte-identical to end-of-S02**, no branch below changes.
+
 **Gatilho (trigger).** Any sidecar failure surfaced by the poll loop (`status == "error"` / adapter exit `!= 0` / `codex-orphan`) carries — when the result-file is readable — an `error_class` field written by the adapter (`scripts/forge-xllm.js`, S02/T01): `"transient"` or `"terminal"`. Read it directly off the result JSON (or the `adapter-failed` marker written on a hard adapter crash — same field). **Absent or unrecognized `error_class` defaults to `terminal`** — byte-identical to pre-T02 behavior, so an adapter that hasn't been upgraded yet (or a marker written before this field existed) degrades safely to the existing single-shot fallback, never to an unbounded retry. `codex-timeout` and `codex-orphan` are **always `terminal`** regardless of what a stale/mismatched `error_class` might say (the adapter itself forces `classifyErrorClass()` to return `"terminal"` on its own timeout marker — LOCKED, checked before the general classifier) — a hung/orphaned process is never retried in place.
 
 **Decisão.** Layer-1 retry fires when **both**:
@@ -1138,6 +1140,51 @@ Otherwise (terminal class, or the counter has reached the cap) control falls thr
 `unit` mirrors the `worker-engine-fallback` convention (`execute-task/{T##}` on Branch C, `plan-slice/{S##}` on Branch D).
 
 **Invariante HARD.** On the pure-Claude path, or on any clean-tree unit where `ENGINE == claude`, nothing in this sub-section ever runs — Layer-1 transient retry exists **only** on the codex branch (Branch C or Branch D) and only fires when a dispatched sidecar's `error_class` reads `"transient"`. It is not a new recovery layer (MEM001 unaffected — this is retry-before-fallback within the existing dispatch-time degradation, exactly as the Claude Retry Handler is retry-before-chain-walk within the existing Failure Taxonomy).
+
+#### Sidecar failure policy — `sidecar_on_failure` (gate over Layer-1)
+
+**Purpose.** `workers.sidecar_on_failure` is the operator knob that decides *how* a sidecar failure degrades: retry-then-fall-back autonomously (default), skip retries entirely, or — under `pause-ask` — hand the exhaustion decision to a human when one is present. It is the single gate that wraps the § Layer-1 transient retry loop above; the loop itself is unchanged.
+
+**Policy source.** Resolve `workers.sidecar_on_failure` off the canonical resolved prefs object — `PREFS = .prefs` from the ONE `forge-prefs.js --resolved` call already made per unit (see [§ Per-unit prefs resolution](#per-unit-prefs-resolution)), the same object `MAX_TRC`/`BASE_BACKOFF` are extracted from. Read `PREFS?.workers?.sidecar_on_failure`; **absent or invalid → `retry-then-fallback`** (the schema `enum`+`default` locked in T01, `forge-prefs.schema.json` → `workers.sidecar_on_failure`). No new resolution call, no per-file md hand-merge.
+
+**Gate table.**
+
+| policy | effect on § Layer-1 | on Layer-1 exhaustion |
+|--------|---------------------|-----------------------|
+| `retry-then-fallback` (default) | Layer-1 runs normally | fall through to Layer-2 / Fallback — **byte-identical to end-of-S02** |
+| `fallback` | **skip Layer-1 entirely** — control goes straight to Layer-2 verified-reset + chain/Fallback (= pre-S02 behavior, as if the transient-retry loop did not exist) | n/a (Layer-1 never ran) |
+| `pause-ask` | Layer-1 runs normally | **gate on exhaustion** (see below) before Layer-2 |
+
+**pause-ask trigger — transient-retry exhaustion ONLY.** The pause-ask gate fires at exactly ONE transition: when `transient_retry_count == retry.max_transient_retries` has been reached after Layer-1 has run (the § Exaustão transition of the Layer-1 sub-section above). It fires on **nothing else**. Specifically it does **NOT** fire on:
+- an immediately-`terminal` `error_class` (never entered a retry loop — `codex-timeout`, `codex-orphan`, terminal `codex-exit-nonzero`/`codex-invalid-json`) → straight to Layer-2 as today;
+- `sidecar-cap-exceeded` (the ≤3-members-plus-fallback chain budget from § BLOCKER item 3) → straight to Layer-2/Fallback as today;
+- `surgical-reset-overlap` (helper `--reset` exit 3) or `verified-reset-failed` (exit 2) → abort to the Claude fallback as today.
+
+Those paths are the existing Layer-2 behavior and are **unchanged** by any policy value — pause-ask only ever interposes on the clean transient-exhaustion transition, never on a reset abort or a terminal class.
+
+**Degradation matrix (by dispatch context).** On the pause-ask exhaustion trigger the gate resolves by context:
+
+| context | detection | action |
+|---------|-----------|--------|
+| `forge-task` | always interactive | **ask live** — `AskUserQuestion` |
+| `forge-next` (TTY) | `[ -t 1 ]` true | **ask live** — `AskUserQuestion` |
+| `forge-next` (headless, `claude -p`) | `[ -t 1 ]` false | **degrade** → `fallback` action + emit `sidecar-pause-degraded` |
+| `forge-auto` | always headless (AUTONOMY RULE) | **degrade** → `fallback` action + emit `sidecar-pause-degraded` |
+| `forge-run` (supervisor) | invokes `forge-auto` under `claude -p` | **degrade** (covered by the `forge-auto` row) |
+
+**Ask live (interactive).** `AskUserQuestion` with three options: **retry codex again** (re-enter Layer-1 for one more transient retry against the SAME member — reuses the current attempt's state, counter continues), **fallback to Claude now** (take the Layer-2 `worker-engine-fallback` action immediately for this unit), **pause the milestone** (checkpoint via `continue.md` + `status: paused`, same mechanics as review `ask_in_auto: pause` / account-handoff). The user's answer drives control; the loop never proceeds silently past a genuine ambiguity when a human is present.
+
+**Degrade (headless).** The gate takes the `fallback` action — control falls through to Layer-2 exactly as `retry-then-fallback` would on exhaustion (verified-reset-then-advance / Fallback) — and emits ONE additive event (`<ISO>` from bash, never from inside a script; `unit` mirrors the `worker-engine-fallback` convention — `execute-task/{T##}` on Branch C, `plan-slice/{S##}` on Branch D):
+
+```json
+{"ts":"<ISO>","event":"sidecar-pause-degraded","milestone":"{M###}","slice":"{S##}","unit":"execute-task/{T##}","reason":"pause-ask-headless-degrade","transient_retry_count":K}
+```
+
+A headless loop **never blocks** on pause-ask — it degrades to `fallback` and continues, honoring the AUTONOMY RULE.
+
+**Branch D (plan-slice, read-only).** The policy applies **identically** to Branch D: `fallback` skips Branch D's Layer-1 (§ Ação — Branch D), and pause-ask gates the same exhaustion transition (ask live / degrade + `sidecar-pause-degraded` with `unit: plan-slice/{S##}`). There is **no reset-machinery difference** — Branch D never resets (read-only twin, nothing codex-authored on disk), so the gate simply chooses ask-vs-degrade and the underlying Layer-2 action for plan-slice is the read-only discard-and-dispatch-Claude-planner path (§ Fallback Branch D).
+
+**Sanctioned-exception note.** The `pause the milestone` outcome of pause-ask is a **SANCTIONED exception to the AUTONOMY RULE** — the same class as account-handoff and review `ask_in_auto: pause`. It only ever fires in an interactive context (TTY present); `forge-auto` / `forge-run` / non-TTY `forge-next` degrade to `fallback` and never pause, so the AUTONOMY RULE is intact for every headless loop.
 
 #### Fallback — `worker-engine-fallback`
 
