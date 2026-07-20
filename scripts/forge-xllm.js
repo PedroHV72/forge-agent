@@ -88,6 +88,13 @@ const SEVERITY_ENUM = ['critical', 'high', 'medium', 'low'];
 const VERDICT_ENUM = ['maintained', 'withdrawn'];
 const EXEC_STATUS_ENUM = ['done', 'partial', 'blocked'];
 const MH_STATUS_ENUM = ['met', 'unmet', 'unknown'];
+const MH_SCOPE_ENUM = ['task', 'environment'];
+const ENV_REASON_ENUM = [
+  'git-commit-required',
+  'gsd-write-refused',
+  'out-of-scope-test-failure',
+  'network-required',
+];
 const ENV_POLICY_ENUM = ['minimal', 'inherit'];
 
 // Single-source review schemas — extracted to shared/schemas/*.json (M014 S04) to kill the
@@ -135,12 +142,14 @@ const executeSchema = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['item', 'status', 'note'],
+        required: ['item', 'status', 'note', 'scope', 'reason'],
         additionalProperties: false,
         properties: {
           item: { type: 'string' },
           status: { type: 'string', enum: MH_STATUS_ENUM },
           note: { type: 'string' },
+          scope: { type: 'string', enum: MH_SCOPE_ENUM },
+          reason: { type: 'string', enum: [...ENV_REASON_ENUM, ''] },
         },
       },
     },
@@ -347,6 +356,16 @@ function validateExecuteResult(obj) {
     if (typeof item.item !== 'string') return false;
     if (!MH_STATUS_ENUM.includes(item.status)) return false;
     if (typeof item.note !== 'string') return false;
+    if (Object.prototype.hasOwnProperty.call(item, 'scope')) {
+      if (!MH_SCOPE_ENUM.includes(item.scope)) return false;
+      if (item.scope === 'environment') {
+        if (!ENV_REASON_ENUM.includes(item.reason)) return false;
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(item, 'reason')) {
+      if (typeof item.reason !== 'string') return false;
+      if (item.reason !== '' && !ENV_REASON_ENUM.includes(item.reason)) return false;
+    }
   }
   if (!Array.isArray(obj.files_changed)) return false;
   for (const f of obj.files_changed) {
@@ -448,12 +467,22 @@ function buildExecutePrompt(planText) {
     ' (d) The network is DISABLED — the task must be self-contained. Do not attempt any',
     '     install, fetch, clone, or other network access.',
     '',
+    'Must-have scope classification:',
+    ' Items that structurally cannot be completed because doing so would violate the HARD',
+    ' PROHIBITIONS (git/commit, .gsd/** writes, or network), or items that were already',
+    ' failing before your work (pre-existing/out-of-scope), must be marked with',
+    ' "scope": "environment" and exactly one "reason" from this enum:',
+    ' "git-commit-required" | "gsd-write-refused" | "out-of-scope-test-failure" | "network-required".',
+    ' Include evidence in the "note". These environment items MUST NOT lower the overall',
+    ' status: status reflects ONLY task-scope work. "done" means all task-scope work is',
+    ' complete, even when environment items are unmet.',
+    '',
     'When you are done, respond with ONLY a single JSON object of this exact shape',
     '(no prose before or after the JSON):',
     '{',
     '  "status": "done" | "partial" | "blocked",',
     '  "summary": "<one-paragraph description of what you did>",',
-    '  "must_haves_status": [ { "item": "<must-have text>", "status": "met"|"unmet"|"unknown", "note": "<evidence or reason>" } ],',
+    '  "must_haves_status": [ { "item": "<must-have text>", "status": "met"|"unmet"|"unknown", "note": "<evidence or reason>", "scope": "task"|"environment", "reason": ""|"git-commit-required"|"gsd-write-refused"|"out-of-scope-test-failure"|"network-required" } ],',
     '  "files_changed": [ "<relative path>", ... ]',
     '}',
     'Rules for the JSON: files_changed lists the relative paths you created or modified;',
@@ -1580,6 +1609,8 @@ module.exports = {
   challengeSchema,
   verdictSchema,
   PROTOCOL_VERSION,
+  MH_SCOPE_ENUM,
+  ENV_REASON_ENUM,
   extractLastJsonBlock,
   validateObjections,
   validateVerdicts,
