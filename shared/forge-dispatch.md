@@ -977,6 +977,12 @@ CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('da
 
 #### Sidecar dispatch state machine (`ENGINE == codex && UNIT_TYPE == execute-task`)
 
+**Sidecar environment policy (canonical — mirrors reference this, never copy).** Todo spawn de
+sidecar recebe `env: buildSidecarEnv(policy)`. A resolução é `--env-policy` >
+`sidecars.env_policy` > `minimal`; `minimal` aplica a allowlist menos os prefixos de credenciais,
+enquanto `inherit` é o escape hatch inseguro que entrega o ambiente inteiro. Os mirrors não
+repetem a flag nem esta regra: o adapter resolve o pref sozinho a partir da cascata canônica.
+
 When the dispatched chain member resolves to `engine == codex` **and** the unit is `execute-task`, the orchestrator drives the detached adapter instead of `Agent("forge-executor")`. States: `started → polling → done | failed`. Because a cross-engine chain (e.g. `gpt→claude→gpt`) can dispatch the sidecar **more than once in the same unit**, the state machine is parameterized by a per-unit attempt counter — see § BLOCKER: cross-engine sidecar safety contract below for the invariants (state fresh per attempt, verified reset, hard cap).
 
 **0. Increment the sidecar attempt counter (`SIDECAR_ATTEMPT`).** Before dispatching *any* sidecar for this unit, increment a per-unit counter `SIDECAR_ATTEMPT` (starts at 1 for the first sidecar dispatch of the unit). It is hard-capped by the number of `engine == codex` members in the resolved chain (≤3, S01 cap). Exceeding the cap → abort the chain to the Claude fallback (`reason: sidecar-cap-exceeded`). The counter is persisted in the per-attempt state file (below) so it survives an auto-compact mid-unit.

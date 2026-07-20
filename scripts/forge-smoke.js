@@ -6531,6 +6531,144 @@ function smokeHeartbeatContract() {
   pass('(final) Section 50: heartbeat self-describing contract — canonical snippet behavior, grep-clean docs, formula/probe/grace presence, and adapter wiring verified');
 }
 
+// ── Section 51: sidecar env allowlist contract regression guard ─────────────
+function smokeSidecarEnvContract() {
+  process.stdout.write('\n▸ Section 51: sidecar env allowlist contract\n');
+  const REPO = path.dirname(SCRIPTS);
+  const nodeAssert = require('assert');
+  const { buildSidecarEnv } = require('./forge-xllm.js');
+  const fixture = {
+    ANTHROPIC_AUTH_TOKEN: 'anthropic-planted',
+    CLAUDE_CODE_OAUTH_TOKEN: 'claude-planted',
+    AWS_SECRET_ACCESS_KEY: 'aws-planted',
+    DATABASE_URL: 'database-planted',
+    GCP_PROJECT: 'gcp-planted',
+    PATH: process.env.PATH || '',
+    HOME: process.env.HOME || os.homedir(),
+    FORGE_XLLM_CODEX_BIN: '/fixture/mock-codex.js',
+  };
+
+  const minimal = buildSidecarEnv('minimal', fixture, 'darwin');
+  const denied = ['ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+    'AWS_SECRET_ACCESS_KEY', 'DATABASE_URL', 'GCP_PROJECT'];
+  assert(denied.every(key => !Object.prototype.hasOwnProperty.call(minimal, key)),
+    '(a) minimal removes planted auth tokens and every denylisted prefix',
+    `leaked=${denied.filter(key => Object.prototype.hasOwnProperty.call(minimal, key)).join(',')}`);
+  assert(minimal.PATH === fixture.PATH && minimal.HOME === fixture.HOME
+      && minimal.FORGE_XLLM_CODEX_BIN === fixture.FORGE_XLLM_CODEX_BIN,
+    '(a) minimal preserves PATH, HOME, and FORGE_XLLM_CODEX_BIN');
+  nodeAssert.deepStrictEqual(buildSidecarEnv('yolo', fixture, 'darwin'), minimal);
+  pass('(a) invalid policy securely defaults to minimal');
+
+  nodeAssert.deepStrictEqual(buildSidecarEnv('inherit', fixture, 'darwin'), fixture);
+  pass('(b) inherit is deep-equal to the source env, including denylisted keys');
+
+  const forgeFixture = { PATH: '/bin', FORGE_ONE: 'one', FORGE_TWO: 'two', RANDOM_SECRET: 'no' };
+  const forgeMinimal = buildSidecarEnv('minimal', forgeFixture, 'darwin');
+  assert(forgeMinimal.FORGE_ONE === 'one' && forgeMinimal.FORGE_TWO === 'two'
+      && !Object.prototype.hasOwnProperty.call(forgeMinimal, 'RANDOM_SECRET'),
+    '(c) multiple FORGE_* keys pass while arbitrary non-allowlisted keys do not');
+
+  const platformFixture = {
+    SystemRoot: 'win', COMSPEC: 'win', PATHEXT: 'win', APPDATA: 'win',
+    LOCALAPPDATA: 'win', USERPROFILE: 'win', TEMP: 'win', TMP: 'win',
+    DBUS_SESSION_BUS_ADDRESS: 'linux', XDG_RUNTIME_DIR: 'linux',
+    XDG_DATA_HOME: 'linux', XDG_CONFIG_HOME: 'linux',
+  };
+  const winKeys = ['SystemRoot', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA',
+    'USERPROFILE', 'TEMP', 'TMP'];
+  const linuxKeys = ['DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME',
+    'XDG_CONFIG_HOME'];
+  const winEnv = buildSidecarEnv('minimal', platformFixture, 'win32');
+  const linuxEnv = buildSidecarEnv('minimal', platformFixture, 'linux');
+  const darwinEnv = buildSidecarEnv('minimal', platformFixture, 'darwin');
+  assert(winKeys.every(key => winEnv[key] === 'win')
+      && linuxKeys.every(key => !Object.prototype.hasOwnProperty.call(winEnv, key)),
+    '(d) win32 injected platform keeps its base and excludes Linux keys');
+  assert(linuxKeys.every(key => linuxEnv[key] === 'linux')
+      && winKeys.every(key => !Object.prototype.hasOwnProperty.call(linuxEnv, key)),
+    '(d) linux injected platform keeps its base and excludes Windows keys');
+  assert([...winKeys, ...linuxKeys].every(key => !Object.prototype.hasOwnProperty.call(darwinEnv, key)),
+    '(d) darwin injected platform excludes Windows and Linux-only keys');
+
+  const tmp = mkTmp('sidecar-env');
+  const mockDir = path.join(tmp, 'mock-bin');
+  fs.mkdirSync(mockDir);
+  const mockJs = path.join(mockDir, 'mock-codex.js');
+  const mockSource = [
+    `#!${process.execPath}`,
+    "'use strict';",
+    "const fs = require('fs');",
+    "const args = process.argv.slice(2);",
+    "const outIndex = args.indexOf('-o');",
+    "if (process.env.FORGE_ENV_DUMP) fs.writeFileSync(process.env.FORGE_ENV_DUMP, JSON.stringify(process.env));",
+    "if (outIndex >= 0) fs.writeFileSync(args[outIndex + 1], JSON.stringify({ objections: [] }));",
+    '',
+  ].join('\n');
+  fs.writeFileSync(mockJs, mockSource, 'utf8');
+  fs.chmodSync(mockJs, 0o755);
+  const mockCommand = path.join(mockDir, process.platform === 'win32' ? 'codex.cmd' : 'codex');
+  if (process.platform === 'win32') {
+    fs.writeFileSync(mockCommand, `@"${process.execPath}" "${mockJs}" %*\r\n`, 'utf8');
+    const entry = path.join(mockDir, 'node_modules', '@openai', 'codex', 'bin');
+    fs.mkdirSync(entry, { recursive: true });
+    fs.copyFileSync(mockJs, path.join(entry, 'codex.js'));
+  } else {
+    fs.copyFileSync(mockJs, mockCommand);
+    fs.chmodSync(mockCommand, 0o755);
+  }
+
+  try {
+    const runPolicy = policy => {
+      const dump = path.join(tmp, `${policy}.json`);
+      const plantedEnv = {
+        ...process.env,
+        PATH: mockDir + path.delimiter + (process.env.PATH || ''),
+        FORGE_XLLM_CODEX_BIN: mockJs,
+        FORGE_ENV_DUMP: dump,
+        ANTHROPIC_AUTH_TOKEN: 'child-anthropic-planted',
+        CLAUDE_CODE_OAUTH_TOKEN: 'child-claude-planted',
+      };
+      const diffCmd = `"${process.execPath}" -e "process.stdout.write('diff')"`;
+      const result = spawnSync(process.execPath, [path.join(SCRIPTS, 'forge-xllm.js'),
+        '--mode', 'challenge', '--engine', 'codex', '--diff-cmd', diffCmd,
+        '--env-policy', policy, '--cwd', tmp], { cwd: tmp, env: plantedEnv, encoding: 'utf8' });
+      return { result, dump, env: fs.existsSync(dump) ? JSON.parse(fs.readFileSync(dump, 'utf8')) : {} };
+    };
+    const minimalRun = runPolicy('minimal');
+    assert(minimalRun.result.status === 0,
+      '(e) minimal CLI run reaches the mock codex child', minimalRun.result.stderr || `status=${minimalRun.result.status}`);
+    assert(!minimalRun.env.ANTHROPIC_AUTH_TOKEN && !minimalRun.env.CLAUDE_CODE_OAUTH_TOKEN,
+      '(e) minimal child env dump excludes both planted session tokens');
+    assert(minimalRun.env.FORGE_XLLM_CODEX_BIN === mockJs && minimalRun.env.PATH,
+      '(e) minimal child env dump receives FORGE_XLLM_CODEX_BIN and PATH');
+    const inheritRun = runPolicy('inherit');
+    assert(inheritRun.result.status === 0 && inheritRun.env.ANTHROPIC_AUTH_TOKEN === 'child-anthropic-planted'
+        && inheritRun.env.CLAUDE_CODE_OAUTH_TOKEN === 'child-claude-planted',
+      '(e) inherit CLI run re-exposes planted tokens as the explicit escape hatch', inheritRun.result.stderr);
+    const bogusRun = runPolicy('bogus');
+    assert(bogusRun.result.status === 2,
+      '(e) invalid --env-policy exits 2', `status=${bogusRun.result.status}`);
+  } finally {
+    cleanup(tmp);
+  }
+
+  const adapter = fs.readFileSync(path.join(SCRIPTS, 'forge-xllm.js'), 'utf8');
+  const sidecarEnvSites = adapter.split('env: buildSidecarEnv(').length - 1;
+  assert(sidecarEnvSites === 3,
+    '(f) exactly three sidecar spawn call-sites carry env: buildSidecarEnv(', `count=${sidecarEnvSites}`);
+  const taskkillSites = adapter.split('\n').filter(line => line.includes('taskkill'));
+  assert(taskkillSites.length > 0 && taskkillSites.every(line => !line.includes('env:')),
+    '(f) taskkill call-site does not carry env:', taskkillSites.join('\n'));
+  const schema = require('../forge-prefs.schema.json');
+  const envPolicySchema = schema.properties.sidecars && schema.properties.sidecars.properties.env_policy;
+  assert(envPolicySchema && JSON.stringify(envPolicySchema.enum) === JSON.stringify(['minimal', 'inherit'])
+      && envPolicySchema.default === 'minimal',
+    '(f) schema declares sidecars.env_policy enum [minimal, inherit] with default minimal');
+
+  pass('(final) Section 51: sidecar env allowlist contract — unit, platform, E2E child dump, call-sites, and schema verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -6588,6 +6726,7 @@ async function main() {
     smokeSidecarLayer1Retry();
     smokeSidecarPolicyGuard();
     smokeHeartbeatContract();
+    smokeSidecarEnvContract();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

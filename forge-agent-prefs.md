@@ -528,6 +528,35 @@ workers:
 - Consumidores: `skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md`, `skills/forge-task/SKILL.md`
   (Step 4/5 dispatch — mirror executável do algoritmo canônico).
 
+## Sidecar Settings
+
+Controla o ambiente entregue aos processos externos `codex` e `agy`. O scaffold seguro é:
+
+```yaml
+sidecars:
+  env_policy: minimal
+```
+
+### Semântica
+
+- `minimal` (default) monta uma allowlist e depois aplica a denylist. Preserva a base comum
+  (`PATH`, `HOME`, locale, proxy e chaves explícitas de API), todo prefixo `FORGE_*`, a base
+  Windows (`SystemRoot`, `COMSPEC`, `PATHEXT`, diretórios de perfil e temporários) ou a base
+  Linux (`DBUS_SESSION_BUS_ADDRESS` e diretórios `XDG_*`). Prefixos de credenciais
+  `AWS_`, `AZURE_`, `GCP_`, `DATABASE_`, `ANTHROPIC_` e `CLAUDE_` são sempre removidos.
+- `inherit` preserva o ambiente fonte byte-a-byte, sem denylist. É um **escape hatch inseguro**:
+  reexpõe ao sidecar tokens de sessão como `ANTHROPIC_AUTH_TOKEN` e
+  `CLAUDE_CODE_OAUTH_TOKEN`; use apenas quando o operador aceitar explicitamente esse risco.
+- **Precedência:** flag CLI `--env-policy` > pref `sidecars.env_policy` da cascata resolvida >
+  default seguro `minimal`. Valor inválido na flag é erro; valor inválido no pref degrada para
+  `minimal`.
+
+### Cross-references
+
+- Contrato canônico: [`shared/forge-dispatch.md § Worker Engine Routing`](shared/forge-dispatch.md)
+  — política, precedência e regra anti-drift dos mirrors.
+- Implementação: `scripts/forge-xllm.js` — `buildSidecarEnv(policy)` e os três spawns de sidecar.
+
 ## Routing Settings
 
 Controla o **eixo `routing:`** — roteamento *domain-first* (M007): em vez de escolher tier/engine
