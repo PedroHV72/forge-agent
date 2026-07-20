@@ -847,16 +847,18 @@ Placeholder classification:
 
 > **Fonte executável única (M012):** as of M012 S02, engine resolution described here no longer has its own standalone bash block in the skills — it is one of the fields (`engine`/`engine_reason`) emitted by the **same** `scripts/forge-dispatch-resolve.js --json` call that resolves Tier + Effort + Alias (see § Tier Resolution → Wiring snippet). This section remains the canonical spec for *what* the engine decision means (route_source table, sidecar state machine, BLOCKER contract, fallback); the *executable* implementation of the decision logic lives in the resolver.
 
+> **`dispatch_engine` is the canonical branch trigger (TASK-003).** The resolver emits two distinct engine fields, and the distinction is load-bearing: **`engine`** (and `chain[].engine`) is the model **FAMILY** — `claude` / `gpt` / `gemini`, derived via `modelFamily()` — and it is a **telemetry/event field** (the `dispatch` event records it unchanged; readers depend on it). **`dispatch_engine`** is the additive **normalized dispatch trigger** — `gpt→codex`, `gemini→agy`, everything else (`claude`/unknown/null) → `claude`. The orchestrator gates the sidecar branches (C/D, Branch codex) on **`dispatch_engine == codex`** (the `$DISPATCH_ENGINE` shell var in the mirrors), **never** on `engine`/`chain[].engine`. This makes the trigger literally correct for models routed via `routing:` where `engine` resolves to a family like `gpt` that is not string-equal to `codex`. Wherever this section historically wrote "`ENGINE == codex`" as the branch condition, read it as `dispatch_engine == codex`; `chain[].engine` remaining family is deliberate and MUST NOT be normalized.
+
 #### When to apply
 
-Engine Routing runs at the **top** of the Step 4 dispatch for a worker, **before** Tier Resolution (and therefore before Effort Resolution, which depends on `$MODEL_ID`). The ordering is deliberate: when `ENGINE == codex` the Claude Tier/Effort Resolution is **skipped entirely** (Codex resolves its own model), and only runs on the Claude path — including the fallback path, where the fallback re-enters Tier/Effort Resolution as a normal Claude dispatch.
+Engine Routing runs at the **top** of the Step 4 dispatch for a worker, **before** Tier Resolution (and therefore before Effort Resolution, which depends on `$MODEL_ID`). The ordering is deliberate: when `dispatch_engine == codex` the Claude Tier/Effort Resolution is **skipped entirely** (Codex resolves its own model), and only runs on the Claude path — including the fallback path, where the fallback re-enters Tier/Effort Resolution as a normal Claude dispatch.
 
 Applicability by `unit_type`:
 
 | `unit_type` | Engine routing | Sidecar dispatch |
 |-------------|----------------|--------------------------|
-| `execute-task` | **active** | yes — routes to the sidecar `--mode execute` when `ENGINE == codex` (Branch C) |
-| `plan-slice` | **active** (S03) | yes — routes to the sidecar `--mode plan` (read-only) when `ENGINE == codex` (Branch D) |
+| `execute-task` | **active** | yes — routes to the sidecar `--mode execute` when `dispatch_engine == codex` (Branch C) |
+| `plan-slice` | **active** (S03) | yes — routes to the sidecar `--mode plan` (read-only) when `dispatch_engine == codex` (Branch D) |
 | all others (`plan-milestone`, `discuss-*`, `research-*`, `complete-*`, `memory-extract`, …) | **never** — always Claude | no |
 
 `plan-milestone` is **never** covered by `workers:` (locked) — it stays on tier `max`/Fable regardless of prefs.
@@ -975,7 +977,7 @@ CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('da
 
 **Equivalence with the old cascade (dual-read golden capture):** the per-unit-type engine is read as `.prefs.workers[<unit_type>]` (the legacy reader parses `workers.<unit_type>: codex` into that same shape; the `[A-Za-z0-9_.-]` key class covers hyphenated unit types like `execute-task`); `timeout` as `.prefs.workers.timeout`; `codex_model` as `.prefs.workers.codex_model`. The reader is safe with **no scaffold present**: absent a `workers:` block, `.prefs.workers` is `undefined`, so `WORKERS_ENGINE=claude`, `WORKERS_TIMEOUT=1800`, `CODEX_MODEL=""` (unset) — byte-identical defaults to the old snippet. The commented `workers:` scaffold in `forge-agent-prefs.md § Workers Settings` ships in **S05**; the reader does not depend on it (the CLI resolves absent keys to the same safe defaults).
 
-#### Sidecar dispatch state machine (`ENGINE == codex && UNIT_TYPE == execute-task`)
+#### Sidecar dispatch state machine (`dispatch_engine == codex && UNIT_TYPE == execute-task`)
 
 **Sidecar environment policy (canonical — mirrors reference this, never copy).** Todo spawn de
 sidecar recebe `env: buildSidecarEnv(policy)`. A resolução é `--env-policy` >
@@ -1107,7 +1109,7 @@ After assembling the SUMMARY + result block, control **rejoins the normal Proces
 
 **7. Synthesized evidence (advisory).** Because the PostToolUse hook only logs the orchestrator's own tool calls — not the detached codex process — append synthesized evidence lines to `.gsd/forge/evidence-{unitId}.jsonl` derived read-only from `git -C "$CODE_DIR" diff --name-status $START_SHA`, tagged `source: codex-sidecar`. This is a **documented gap**, advisory only — it never blocks.
 
-#### Sidecar dispatch state machine — Branch D (`ENGINE == codex && UNIT_TYPE == plan-slice`)
+#### Sidecar dispatch state machine — Branch D (`dispatch_engine == codex && UNIT_TYPE == plan-slice`)
 
 When `ENGINE` resolves to `codex` **and** the unit is `plan-slice`, the orchestrator drives the adapter in **`--mode plan`** instead of `Agent("forge-planner")`. Branch D is the **read-only twin** of Branch C: codex only *reads* the codebase + planning context to reason and returns the full markdown content of the slice plan and each task plan in the result JSON. It never writes — **only the orchestrator writes `.gsd/**`** (invariant preserved), materializing the returned content after a successful run. Because nothing is codex-authored on disk, Branch D has **no dirty-tree guard, no `START_SHA` capture, no reset, no no-commit check** (contrast Branch C, which needs all four). States: `started → polling → done | failed`.
 

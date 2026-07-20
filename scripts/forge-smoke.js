@@ -5703,6 +5703,70 @@ function smokeDispatchResolve() {
     cleanup(dir);
   });
 
+  // ── (h) TASK-003 dispatch_engine normalization: gpt→codex, gemini→agy, claude→claude ──
+  // The additive dispatch trigger the orchestrator branches gate on. engine (family)
+  // stays intact; dispatch_engine is the normalized ==codex gate.
+  const { degradedContract, dispatchEngineFor } = require(path.join(SCRIPTS, 'forge-dispatch-resolve.js'));
+  assert(dispatchEngineFor('gpt') === 'codex', '(h) dispatchEngineFor(gpt) === codex');
+  assert(dispatchEngineFor('gemini') === 'agy', '(h) dispatchEngineFor(gemini) === agy');
+  assert(dispatchEngineFor('claude') === 'claude', '(h) dispatchEngineFor(claude) === claude');
+  assert(dispatchEngineFor(null) === 'claude', '(h) dispatchEngineFor(null) === claude (unknown/family fallback)');
+  assert(dispatchEngineFor('') === 'claude', '(h) dispatchEngineFor(empty) === claude');
+  // gemini→agy is covered by the dispatchEngineFor unit asserts above; the routing
+  // fixture uses gpt/claude models that this repo's routing maps to a non-empty chain.
+  for (const [model, wantDispatch, wantFamily] of [
+    ['gpt-5-codex', 'codex', 'gpt'],
+    ['claude-opus-4-8', 'claude', 'claude'],
+  ]) {
+    withHermeticHome(() => {
+      const dir = mkTmp('dispatch-engine-norm');
+      fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, '.gsd', 'claude-agent-prefs.md'),
+        `routing:\n  backend:\n    executor:\n      standard: [${model}]\n`,
+        'utf8'
+      );
+      const planPath = writePlan(dir, ['id: T01', 'slice: S01', 'domain: backend']);
+      const result = resolveDispatch({ unitType: 'execute-task', planPath, cwd: dir });
+      assert(result.route_source === 'routing', `(h) ${model}: route_source === routing`, JSON.stringify(result));
+      assert(result.engine === wantFamily, `(h) ${model}: engine (family) === ${wantFamily} (unchanged)`, JSON.stringify(result));
+      assert(result.dispatch_engine === wantDispatch, `(h) ${model}: dispatch_engine === ${wantDispatch}`, JSON.stringify(result));
+      // chain[].engine stays family — never normalized to codex/agy.
+      assert(result.chain[0] && result.chain[0].engine === wantFamily,
+        `(h) ${model}: chain[0].engine === ${wantFamily} (family, NOT normalized)`, JSON.stringify(result));
+      cleanup(dir);
+    });
+  }
+
+  // ── (i) degradedContract emits dispatch_engine === claude (contract stability on runtime-error path) ──
+  {
+    const dc = degradedContract(['--unit-type', 'execute-task']);
+    assert(dc.engine === 'claude', '(i) degradedContract engine === claude', JSON.stringify(dc));
+    assert(dc.dispatch_engine === 'claude', '(i) degradedContract dispatch_engine === claude (additive, explicit)', JSON.stringify(dc));
+  }
+
+  // ── (j) doc-presence: the 3 SKILLs extract DISPATCH_ENGINE + gate branches on it, ──
+  //     and the old $ENGINE == codex trigger is gone from the branch/trigger sites.
+  for (const rel of cutoverSkills) {
+    const source = fs.readFileSync(path.join(ROOT46, rel), 'utf8');
+    assert(/DISPATCH_ENGINE=\$\(node -e .*dispatch_engine/.test(source),
+      `(j) ${rel}: extracts DISPATCH_ENGINE from ROUTE_JSON .dispatch_engine`);
+    assert(/DISPATCH_ENGINE == codex/.test(source),
+      `(j) ${rel}: gates a sidecar branch on DISPATCH_ENGINE == codex`);
+    // The old fuzzy trigger must be absent from every branch/trigger site. Prose that
+    // legitimately cites the telemetry family value engine:"codex" is not matched by
+    // this anchor (it targets the `== codex` shell/branch condition specifically).
+    assert(!/[^_]ENGINE == codex/.test(source),
+      `(j) ${rel}: no legacy [$]ENGINE == codex trigger remains`);
+  }
+
+  // ── (k) spec canonical: shared/forge-dispatch.md defines dispatch_engine as the branch trigger ──
+  {
+    const spec = fs.readFileSync(path.join(ROOT46, 'shared/forge-dispatch.md'), 'utf8');
+    assert(/dispatch_engine/.test(spec), '(k) spec mentions dispatch_engine');
+    assert(/dispatch_engine == codex/.test(spec), '(k) spec defines dispatch_engine == codex as the sidecar branch trigger');
+  }
+
   pass('(final) Section 46: resolver parity, SKILL cutover and routes-by-domain verified');
 }
 

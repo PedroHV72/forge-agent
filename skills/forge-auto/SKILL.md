@@ -330,7 +330,7 @@ Then proceed with dispatch normally (the executor will overwrite the partial wor
 **Engine, tier, domain, effort and alias are all resolved in step 1.5 below** by the single `forge-dispatch-resolve.js --json` call. Do NOT resolve any of them here — this block only runs the prefs loud-stop gate and computes the resolver's *file* args (`$PLAN_PATH`, `$ROADMAP_PATH`).
 
 **Prefs gate + resolver args (step 1.45)** — run the M008-CONTEXT #2 prefs loud-stop gate, then set `$PLAN_PATH`/`$ROADMAP_PATH`. As of M012 S02 the **engine decision, tier-chain resolution, domain, effort and alias all collapse into ONE `forge-dispatch-resolve.js` call** made in step 1.5 (a thin caller) — so this block resolves only the *file* inputs to that call. When `ENGINE` resolves to `codex` (routable `execute-task`/`plan-slice`) the Claude `Agent()` dispatch + alias warning are **skipped** (Codex resolves its own model) — they run only on the Claude path, including the fallback.
-> Cross-reference: `shared/forge-dispatch.md § Worker Engine Routing` — canonical algorithm (single-call resolver, engine-by-route_source table, sidecar state machine, BLOCKER contract, fallback) + `scripts/forge-dispatch-resolve.js` (S01). This block is the executable mirror; the mechanics are locked there. `plan-slice` engine routing is **active (S03)** — `ENGINE == codex && unit_type == plan-slice` routes to the sidecar `--mode plan` (read-only, **Branch D**, see Step 4 below). `plan-milestone` is never routed through `workers:`/`routing:` (stays tier `max`/Fable).
+> Cross-reference: `shared/forge-dispatch.md § Worker Engine Routing` — canonical algorithm (single-call resolver, engine-by-route_source table, sidecar state machine, BLOCKER contract, fallback) + `scripts/forge-dispatch-resolve.js` (S01). This block is the executable mirror; the mechanics are locked there. `plan-slice` engine routing is **active (S03)** — `DISPATCH_ENGINE == codex && unit_type == plan-slice` routes to the sidecar `--mode plan` (read-only, **Branch D**, see Step 4 below). `plan-milestone` is never routed through `workers:`/`routing:` (stays tier `max`/Fable).
 
 ```bash
 # ── Prefs loud-stop gate (M008-CONTEXT #2) — MUST run before the resolver ─────────
@@ -368,7 +368,7 @@ ROADMAP_PATH=".gsd/milestones/${M###}/${M###}-ROADMAP.md"
 
 **Loud-stop on the per-unit prefs re-resolution above (M008-CONTEXT #2 — NOT a bare comment):** if the `forge-prefs.js --resolved` call at the top of this block exited non-zero, the orchestrator MUST STOP the loop now — exactly as the Load-context guard does: deactivate this run (set `auto-mode.json`/runs entry inactive, same mechanic as the `Agent()`-failure halt), surface arquivo + linha + como-corrigir from `errors[]`, and do **NOT** proceed on `WORKERS_ENGINE=claude` / effort defaults / any fallback value. The `exit 1` inside the guard halts a shell-executed path; this prose halts the orchestrator-interpreted path. `warnings[]` (advisory) never stop — only exit≠0 halts.
 
-`$PLAN_PATH`, `$ROADMAP_PATH` are now set — the *file* inputs the shared resolver reads. `ENGINE`, `$DOMAIN_USED`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL` are resolved **inside** the single `forge-dispatch-resolve.js` call (step 1.5, engine-by-route_source decided within it). When the resolved `ENGINE == codex` AND `unit_type == execute-task` AND `BATCH.length == 1`, take **Branch C** in Step 4 (sidecar). When `ENGINE == codex` AND `unit_type == plan-slice`, take **Branch D** in Step 4 (sidecar plan, read-only). Otherwise (`ENGINE == claude`, or a non-routable unit) fall through to the `Agent()` dispatch unchanged — the `claude` path is byte-identical.
+`$PLAN_PATH`, `$ROADMAP_PATH` are now set — the *file* inputs the shared resolver reads. `ENGINE`, `$DOMAIN_USED`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL` are resolved **inside** the single `forge-dispatch-resolve.js` call (step 1.5, engine-by-route_source decided within it; `DISPATCH_ENGINE` is the additive normalized dispatch trigger — `gpt→codex`, `gemini→agy`, else `claude`). When the resolved `DISPATCH_ENGINE == codex` AND `unit_type == execute-task` AND `BATCH.length == 1`, take **Branch C** in Step 4 (sidecar). When `DISPATCH_ENGINE == codex` AND `unit_type == plan-slice`, take **Branch D** in Step 4 (sidecar plan, read-only). Otherwise (`DISPATCH_ENGINE == claude`, or a non-routable unit) fall through to the `Agent()` dispatch unchanged — the `claude` path is byte-identical.
 
 **Dispatch resolution (step 1.5)** — resolve `{engine, model, alias, tier, domain, route_source, chain, chain_len, reason, effort, effort_reason}` for this dispatch via the **single `forge-dispatch-resolve.js --json` call**. This one call folds the former Engine Resolution + Tier Resolution + engine-by-route_source + Effort Resolution + Alias Resolution bash — a thin caller now, all pure resolution lives in the resolver. `route_source` is still `tier_models` on the legacy byte-identical path (no `routing:` block / frontmatter `worker:` not applied), `routing`/`frontmatter` otherwise.
 > Cross-reference: `shared/forge-dispatch.md § Tier Resolution` + `§ Worker Engine Routing → Single-call resolver` + `§ Effort Resolution` (algorithm) and `shared/forge-tiers.md` (canonical tables). The resolver internally calls `forge-routing.js` (cross-engine chain), `forge-model-alias.js` (alias), and applies the tier/effort defaults + precedence + risk-escalation + model-cap clamp.
@@ -398,6 +398,7 @@ DOMAIN_USED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain)"
 ROUTE_SOURCE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).route_source)" "$ROUTE_JSON")
 CHAIN_LEN=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain_len))" "$ROUTE_JSON")
 ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine)" "$ROUTE_JSON")
+DISPATCH_ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).dispatch_engine||'')" "$ROUTE_JSON")
 ENGINE_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine_reason)" "$ROUTE_JSON")
 EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)" "$ROUTE_JSON")
 EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)" "$ROUTE_JSON")
@@ -421,7 +422,7 @@ if [ "$ROUTE_SOURCE" != "routing" ] && [ "$ROUTING_PRESENT" = "true" ]; then
   echo "⚠ routing: configurado mas não aplicado (route_source=$ROUTE_SOURCE) — frontmatter/legado venceu para $unit_type/$unit_id" >&2
 fi
 ```
-`TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (with `.chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `THINKING_HEADER`, `MODEL_APPLIED_JSON`, `unit_effort`, and `REASON` are now set. On `ENGINE == codex` for a routable `execute-task`/`plan-slice`, take **Branch C/D** in Step 4 (the resolver already emitted `$CODEX_MODEL`/`$WORKERS_TIMEOUT` + `$ROUTE_JSON.chain` those branches read). Otherwise use `$MODEL_ID`/`$MODEL_ALIAS` in the `Agent()` call. `$TIER`/`$REASON`/`$DOMAIN_USED`/`$ROUTE_SOURCE`/`$CHAIN_LEN`/`$ENGINE`/`$EFFORT`/`$EFFORT_REASON` are injected into the dispatch event (additive).
+`TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (with `.chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `DISPATCH_ENGINE`, `THINKING_HEADER`, `MODEL_APPLIED_JSON`, `unit_effort`, and `REASON` are now set. On `DISPATCH_ENGINE == codex` for a routable `execute-task`/`plan-slice`, take **Branch C/D** in Step 4 (the resolver already emitted `$CODEX_MODEL`/`$WORKERS_TIMEOUT` + `$ROUTE_JSON.chain` those branches read). Otherwise use `$MODEL_ID`/`$MODEL_ALIAS` in the `Agent()` call. `$TIER`/`$REASON`/`$DOMAIN_USED`/`$ROUTE_SOURCE`/`$CHAIN_LEN`/`$ENGINE`/`$EFFORT`/`$EFFORT_REASON` are injected into the dispatch event (additive).
 
 > **Fable 5 thinking guard:** the resolver emits `$THINKING_HEADER` (`adaptive` when `$MODEL_ID` is
 > `claude-fable-5`, else empty). When `$THINKING_HEADER` is `adaptive`, inject `thinking: adaptive`
@@ -809,14 +810,14 @@ Do NOT read artifact files here — templates now pass paths; workers read their
 #### 4. Dispatch
 
 **Branch on BATCH size and engine:**
-- `ENGINE == codex` AND `unit_type == execute-task` AND `BATCH.length == 1`: follow **Branch C — sidecar codex** below (dispatch the detached adapter; fall back to Claude on any failure).
-- `ENGINE == codex` AND `unit_type == plan-slice`: follow **Branch D — sidecar codex plan** below (dispatch the detached adapter in `--mode plan`, read-only; fall back to a single Claude `forge-planner` on any failure).
+- `DISPATCH_ENGINE == codex` AND `unit_type == execute-task` AND `BATCH.length == 1`: follow **Branch C — sidecar codex** below (dispatch the detached adapter; fall back to Claude on any failure).
+- `DISPATCH_ENGINE == codex` AND `unit_type == plan-slice`: follow **Branch D — sidecar codex plan** below (dispatch the detached adapter in `--mode plan`, read-only; fall back to a single Claude `forge-planner` on any failure).
 - `BATCH.length == 1` (all non-execute-task unit types, plus execute-task when only one task is ready and `ENGINE == claude`): follow the **single-task flow** below (unchanged from pre-parallelism behavior).
-- `BATCH.length > 1` (execute-task only, when `forge-parallelism.js` returned `mode: parallel`): follow the **parallel-batch flow** in Step 4-P after this section. If `ENGINE == codex` in a parallel batch, see the codex note in Step 4-P (each ready task is handled single-task via Branch C; the Claude parallel batch is never mixed with background sidecars).
+- `BATCH.length > 1` (execute-task only, when `forge-parallelism.js` returned `mode: parallel`): follow the **parallel-batch flow** in Step 4-P after this section. If `DISPATCH_ENGINE == codex` in a parallel batch, see the codex note in Step 4-P (each ready task is handled single-task via Branch C; the Claude parallel batch is never mixed with background sidecars).
 
 ---
 
-**Branch C — sidecar codex (`ENGINE == codex && unit_type == execute-task && BATCH.length == 1`):**
+**Branch C — sidecar codex (`DISPATCH_ENGINE == codex && unit_type == execute-task && BATCH.length == 1`):**
 
 Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` → *Sidecar dispatch state machine* + *BLOCKER — cross-engine sidecar safety contract* + *Fallback*. States: `started → polling → done | failed`. On any failure the work reverts to the next chain member (verified reset first) or the Claude fallback — no 4th recovery layer.
 
@@ -980,27 +981,28 @@ if [ -n "$ADVANCED" ]; then
   # Chain advanced (mutually exclusive with the generic fallback — R1). Select + persist the next
   # member and re-enter the appropriate dispatch path; do NOT emit worker-engine-fallback here.
   if [ "$NEXT_ENGINE" = "codex" ]; then
-    ENGINE="codex"   # → re-enter Branch C step 0 with attempt N+1 (SIDECAR_ATTEMPT increments, fresh
-                     #   state, verified-clean tree). No generic fallback, no fallback event.
+    ENGINE="codex"; DISPATCH_ENGINE="codex"   # → re-enter Branch C step 0 with attempt N+1 (SIDECAR_ATTEMPT
+                     #   increments, fresh state, verified-clean tree). NEXT_ENGINE is already the normalized
+                     #   dispatch-engine, so the branch gate ($DISPATCH_ENGINE == codex) stays consistent.
   else
-    ENGINE="claude"  # → single-task Claude dispatch with $MODEL_ID (Tier/Effort Resolution runs there).
-                     #   No generic fallback, no fallback event.
+    ENGINE="claude"; DISPATCH_ENGINE="claude"  # → single-task Claude dispatch with $MODEL_ID (Tier/Effort
+                     #   Resolution runs there). No generic fallback, no fallback event.
   fi
 else
   # Chain exhausted (NEXT_ID empty) OR an abort reason (surgical-reset-overlap / sidecar-cap-exceeded /
   # verified-reset-failed) forbids advancement → the generic Claude fallback fires exactly ONCE.
-  ENGINE="claude"   # unconditionally Claude before re-entering Tier/Effort Resolution + dispatch
+  ENGINE="claude"; DISPATCH_ENGINE="claude"   # unconditionally Claude before re-entering Tier/Effort Resolution + dispatch
   echo "⚠ worker: codex indisponível ($REASON) — usando forge-executor"
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"execute-task/%s","reason":"%s"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${RUN_ID:-${M###}}" "${S##}" "${T##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 fi
 ```
-When `ENGINE == codex` (chain advanced to a codex member), re-enter **Branch C step 0** with the incremented `SIDECAR_ATTEMPT`. When `ENGINE == claude` (chain advanced to a claude member, OR the generic fallback fired), **NOW run the Tier/Effort Resolution** (step 1.5/1.55, skipped on the codex path) and dispatch **one** `forge-executor` Claude via the **single-task flow below** (reuse — do not duplicate). This Claude dispatch emits its own `dispatch` event with `engine:"claude"`. The generic Claude fallback (with its `worker-engine-fallback` event) fires **only** when the chain is exhausted or an abort reason forbids advancement — mutually exclusive with chain-advance (R1). Not a 4th recovery layer — the chain walk IS Failure Taxonomy Layer 2 (same layer, new resolver — MEM001), and the fallback fires once, in-band, at dispatch time.
+When `DISPATCH_ENGINE == codex` (chain advanced to a codex member), re-enter **Branch C step 0** with the incremented `SIDECAR_ATTEMPT`. When `DISPATCH_ENGINE == claude` (chain advanced to a claude member, OR the generic fallback fired), **NOW run the Tier/Effort Resolution** (step 1.5/1.55, skipped on the codex path) and dispatch **one** `forge-executor` Claude via the **single-task flow below** (reuse — do not duplicate). This Claude dispatch emits its own `dispatch` event with `engine:"claude"`. The generic Claude fallback (with its `worker-engine-fallback` event) fires **only** when the chain is exhausted or an abort reason forbids advancement — mutually exclusive with chain-advance (R1). Not a 4th recovery layer — the chain walk IS Failure Taxonomy Layer 2 (same layer, new resolver — MEM001), and the fallback fires once, in-band, at dispatch time.
 
 ---
 
-**Branch D — sidecar codex plan (`ENGINE == codex && unit_type == plan-slice`):**
+**Branch D — sidecar codex plan (`DISPATCH_ENGINE == codex && unit_type == plan-slice`):**
 
 Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` → *Sidecar dispatch state machine — Branch D* + *BLOCKER contract (state-fresh + cap only)* + *Fallback*. Read-only twin of Branch C: codex only reads the codebase + planning context to reason and returns markdown plan content in the result JSON — it never writes `.gsd/**`, so this branch has **no dirty-tree guard, no `START_SHA` capture, no reset** (BLOCKER item 2 does not apply — nothing codex-authored on disk). Only the **state-fresh-per-attempt** (item 1) and **cap** (item 3) invariants carry over: a multi-codex-member chain for `plan-slice` dispatches the sidecar more than once, so the state file is per-attempt and `SIDECAR_ATTEMPT` is hard-capped. States: `started → polling → done | failed`.
 
@@ -1125,20 +1127,20 @@ if [ -n "$ADVANCED" ]; then
   # Chain advanced (mutually exclusive with the generic fallback — R1). Select the next member and
   # re-enter the appropriate dispatch path; do NOT emit worker-engine-fallback here.
   if [ "$NEXT_ENGINE" = "codex" ]; then
-    ENGINE="codex"   # → re-enter Branch D step 0 (SIDECAR_ATTEMPT increments, fresh state). No fallback event.
+    ENGINE="codex"; DISPATCH_ENGINE="codex"   # → re-enter Branch D step 0 (SIDECAR_ATTEMPT increments, fresh state). NEXT_ENGINE is the normalized dispatch-engine → branch gate stays consistent. No fallback event.
   else
-    ENGINE="claude"  # → single Claude forge-planner with $MODEL_ID (Tier/Effort Resolution runs there). No fallback event.
+    ENGINE="claude"; DISPATCH_ENGINE="claude"  # → single Claude forge-planner with $MODEL_ID (Tier/Effort Resolution runs there). No fallback event.
   fi
 else
   # Chain exhausted (NEXT_ID empty) OR the cap forbids advancement → generic Claude fallback fires ONCE.
-  ENGINE="claude"   # unconditionally Claude before re-entering Tier/Effort Resolution + dispatch
+  ENGINE="claude"; DISPATCH_ENGINE="claude"   # unconditionally Claude before re-entering Tier/Effort Resolution + dispatch
   echo "⚠ worker: codex indisponível ($REASON) — usando forge-planner"
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"plan-slice/%s","reason":"%s"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${RUN_ID:-${M###}}" "${S##}" "${S##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 fi
 ```
-When `ENGINE == codex` (chain advanced to a codex member), re-enter **Branch D step 0** with the incremented `SIDECAR_ATTEMPT`. When `ENGINE == claude` (chain advanced to a claude member, OR the generic fallback fired), **NOW run the Tier/Effort Resolution** (step 1.5/1.55, skipped on the codex path — a `risk:high` slice escalates `heavy → max`/Fable exactly as today) and dispatch **one** `forge-planner` Claude via the **single-task flow below** (reuse — do not duplicate). This Claude dispatch emits its own `dispatch` event with `engine:"claude"`. The generic Claude fallback (with its `worker-engine-fallback` event) fires **only** when the chain is exhausted or the cap forbids advancement — mutually exclusive with chain-advance (R1). Not a 4th recovery layer — it fires once, in-band, at dispatch time.
+When `DISPATCH_ENGINE == codex` (chain advanced to a codex member), re-enter **Branch D step 0** with the incremented `SIDECAR_ATTEMPT`. When `DISPATCH_ENGINE == claude` (chain advanced to a claude member, OR the generic fallback fired), **NOW run the Tier/Effort Resolution** (step 1.5/1.55, skipped on the codex path — a `risk:high` slice escalates `heavy → max`/Fable exactly as today) and dispatch **one** `forge-planner` Claude via the **single-task flow below** (reuse — do not duplicate). This Claude dispatch emits its own `dispatch` event with `engine:"claude"`. The generic Claude fallback (with its `worker-engine-fallback` event) fires **only** when the chain is exhausted or the cap forbids advancement — mutually exclusive with chain-advance (R1). Not a 4th recovery layer — it fires once, in-band, at dispatch time.
 
 ---
 

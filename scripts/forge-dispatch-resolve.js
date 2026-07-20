@@ -130,6 +130,18 @@ function normalizeWorkers(prefs, unitType) {
   };
 }
 
+// dispatch_engine is the DISPATCH normalization of the resolved model family,
+// distinct from `engine` (FAMILY, via modelFamily). It is the canonical trigger
+// the orchestrator tests `== "codex"`. Map: gpt→codex, gemini→agy, everything
+// else (claude / unknown family / null / '') → claude. Additive: never mutates
+// `engine` or `chain[].engine` (readers depend on those staying family).
+function dispatchEngineFor(family) {
+  const f = text(family).toLowerCase();
+  if (f === 'gpt') return 'codex';
+  if (f === 'gemini') return 'agy';
+  return 'claude';
+}
+
 function resolveDispatch(opts) {
   const o = opts || {};
   const unitType = text(o.unitType);
@@ -233,6 +245,10 @@ function resolveDispatch(opts) {
     domain_input: requestedDomain,
     frontmatter_tier: plan.tier,
     thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
+    // Additive dispatch trigger: normalized from the resolved top-level `engine`
+    // (family). gpt→codex, gemini→agy, else→claude. Orchestrator branches gate
+    // on this (`== "codex"`), NOT on `engine`/`chain[].engine` (kept family).
+    dispatch_engine: dispatchEngineFor(engine),
     // Additive loud-stop surface (M008-CONTEXT #2): a malformed prefs layer must
     // not silently degrade to the claude/effort-default fallback. Callers inspect
     // prefs_ok; the CLI turns prefs_ok:false into a non-zero exit.
@@ -286,11 +302,14 @@ function degradedContract(args) {
     workers_timeout: 1800, codex_model: '', plan_worker: '',
     domain_input: 'default', frontmatter_tier: '',
     thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
+    // engine is hard-coded 'claude' here → dispatch_engine resolves to 'claude'.
+    // Emitted explicitly via the same helper for contract stability.
+    dispatch_engine: dispatchEngineFor('claude'),
     prefs_ok: true, prefs_errors: [],
   };
 }
 
-module.exports = { resolveDispatch, parseArgs, runCli };
+module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor };
 
 if (require.main === module) {
   // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a

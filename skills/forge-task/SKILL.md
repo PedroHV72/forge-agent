@@ -727,6 +727,7 @@ DOMAIN_USED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain)"
 ROUTE_SOURCE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).route_source)" "$ROUTE_JSON")
 CHAIN_LEN=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain_len))" "$ROUTE_JSON")
 ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine)" "$ROUTE_JSON")
+DISPATCH_ENGINE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).dispatch_engine||'')" "$ROUTE_JSON")
 ENGINE_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).engine_reason)" "$ROUTE_JSON")
 EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)" "$ROUTE_JSON")
 EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)" "$ROUTE_JSON")
@@ -734,17 +735,19 @@ WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1
 CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
 THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
 MODEL_APPLIED_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || printf 'null')
-# The sidecar codex model is fed from the resolved chain (chain[0].id when that member is a
-# gpt-* codex engine), falling back to the workers.codex_model pref for legacy compat.
-SIDECAR_MODEL=$(node -e "const r=JSON.parse(process.argv[1]);const c=(r.chain||[])[0];process.stdout.write(c&&c.engine==='codex'&&c.id?c.id:(r.codex_model||''))" "$ROUTE_JSON")
+# The sidecar codex model is fed from the resolved chain (chain[0].id when the top-level
+# dispatch_engine == 'codex'), falling back to the workers.codex_model pref for legacy compat.
+# NB: chain[].engine stays FAMILY ('gpt', never 'codex') — readers depend on it — so the gate
+# reads the normalized top-level r.dispatch_engine, not c.engine.
+SIDECAR_MODEL=$(node -e "const r=JSON.parse(process.argv[1]);const c=(r.chain||[])[0];process.stdout.write(r.dispatch_engine==='codex'&&c&&c.id?c.id:(r.codex_model||''))" "$ROUTE_JSON")
 # $ROUTE_JSON.chain carries forward unmodified — consumed by Branch codex (SIDECAR_MODEL) and by
 # the Failure Taxonomy via `forge-routing.js ... --next-after "$MODEL_ID"`.
 ```
 **Loud-stop on the resolution above (M008-CONTEXT #2 — NOT a bare comment):** if either the `forge-prefs.js --resolved` gate OR the `forge-dispatch-resolve.js` call exited non-zero, STOP this task run now — deactivate the run, surface arquivo + linha + como-corrigir from `errors[]`/`prefs_errors`, and do **NOT** proceed on any claude/effort-default fallback value. The `exit 1` guards halt a shell-executed path; this prose halts the orchestrator-interpreted path.
 
-`$ENGINE`, `$ENGINE_REASON`, `$MODEL_ID`, `$MODEL_ALIAS`, `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN`, `$EFFORT`, `$EFFORT_REASON`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL`, `$SIDECAR_MODEL`, `$THINKING_HEADER`, `$MODEL_APPLIED_JSON`, `$PLAN_PATH`, and `$ROUTE_JSON` (with `.chain`) are now set. The dispatch below branches on `$ENGINE`; the resolved `$EFFORT`/`$TIER`/`$DOMAIN_USED`/`$ROUTE_SOURCE`/`$CHAIN_LEN` are injected into the dispatch event (both paths).
+`$ENGINE`, `$ENGINE_REASON`, `$MODEL_ID`, `$MODEL_ALIAS`, `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN`, `$EFFORT`, `$EFFORT_REASON`, `$WORKERS_TIMEOUT`, `$CODEX_MODEL`, `$SIDECAR_MODEL`, `$THINKING_HEADER`, `$MODEL_APPLIED_JSON`, `$PLAN_PATH`, and `$ROUTE_JSON` (with `.chain`) are now set. The dispatch below branches on `$DISPATCH_ENGINE` (the additive normalized dispatch trigger — `gpt→codex`, `gemini→agy`, else `claude`; `$ENGINE`/`chain[].engine` stay family for events); the resolved `$EFFORT`/`$TIER`/`$DOMAIN_USED`/`$ROUTE_SOURCE`/`$CHAIN_LEN` are injected into the dispatch event (both paths).
 
-**Branch codex — sidecar (`$ENGINE == codex`)** — executable mirror of `shared/forge-dispatch.md § Worker Engine Routing § Sidecar dispatch state machine`. When this branch fires, the Claude machinery below (timeline task, guarded `Agent()` dispatch) is **replaced** by the detached adapter + polling; on any failure it resets and **falls through to that same Claude machinery** (fallback). When `$ENGINE == claude`, skip this branch entirely and proceed with the Claude dispatch below — byte-identical to the current loop.
+**Branch codex — sidecar (`$DISPATCH_ENGINE == codex`)** — executable mirror of `shared/forge-dispatch.md § Worker Engine Routing § Sidecar dispatch state machine`. When this branch fires, the Claude machinery below (timeline task, guarded `Agent()` dispatch) is **replaced** by the detached adapter + polling; on any failure it resets and **falls through to that same Claude machinery** (fallback). When `$DISPATCH_ENGINE == claude`, skip this branch entirely and proceed with the Claude dispatch below — byte-identical to the current loop.
 
 1. **Capture `START_SHA` + the pre-dirty snapshot in ONE atomic write, via the surgical-reset helper.** `--state-init` records `{attempt, start_sha, pre_dirty:[{path,hash}], reason, result_file, code_dir}` in the SAME write (`.gsd/**` excluded), so the snapshot survives the poll loop / an auto-compact (a snapshot in a shell var is lost the moment the process crosses a Bash-tool boundary). Branch C spans multiple Bash tool invocations, so shell vars do NOT survive — the state file (under `WORKING_DIR/.gsd`, never `CODE_DIR`) is the durable carrier. The loose task uses a single, unsuffixed state file (no `-attempt-N` — a `/forge-task` unit dispatches the sidecar once). The success AND fallback blocks re-read it from disk:
 ```bash
@@ -864,7 +867,7 @@ mkdir -p "$WORKING_DIR/.gsd/forge/"
 printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"","slice":"","unit":"execute-task/%s","reason":"%s"}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{TASK_ID}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 ```
-Then set `ENGINE=claude` and dispatch the single `forge-executor` Claude worker via the machinery below. No re-resolution of engine (fallback is unconditionally Claude); no retry.
+Then set `ENGINE=claude` and `DISPATCH_ENGINE=claude` and dispatch the single `forge-executor` Claude worker via the machinery below. No re-resolution of engine (fallback is unconditionally Claude); no retry.
 
 **Claude dispatch** (default path, and the fallback target) — the machinery below runs when `$ENGINE == claude`:
 
