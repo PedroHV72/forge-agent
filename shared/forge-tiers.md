@@ -1,7 +1,7 @@
 # Forge Tiers — Canonical Tier-to-Model Reference
 
 Canonical reference for tier-based model routing in the Forge Agent system.
-Consumed by `### Tier Resolution` in `shared/forge-dispatch.md` and by `## Tier Settings` in `forge-agent-prefs.md`.
+Consumed by `### Tier Resolution` in `shared/forge-dispatch.md` and by `## Tier Settings` in `forge-agent-prefs.jsonc`.
 
 ---
 
@@ -28,7 +28,7 @@ unless overridden (see [Override Precedence](#override-precedence)).
 ## Tier → Default Model
 
 The four tiers map to four model aliases. Operators can override the model for any tier via
-`tier_models:` in `forge-agent-prefs.md` without changing unit-type assignments.
+`tier_models:` in `forge-agent-prefs.jsonc` without changing unit-type assignments.
 
 | Tier | Default Model ID | Alias | Intended Workloads | Operator Override Key |
 |---|---|---|---|---|
@@ -45,7 +45,7 @@ The four tiers map to four model aliases. Operators can override the model for a
 > **ID→alias map — the `Agent()` `model:` param only accepts aliases.** The `model` parameter of the
 > `Agent` tool accepts only the four short aliases (`haiku|sonnet|opus|fable`) — it does **not** accept a
 > full model ID string (e.g. `claude-opus-4-8[1m]`). The "Default Model ID" column above is the concrete
-> ID an operator writes into `tier_models.<tier>` in `forge-agent-prefs.md`; before that ID reaches
+> ID an operator writes into `tier_models.<tier>` in `forge-agent-prefs.jsonc`; before that ID reaches
 > `Agent()`, the orchestrator must translate it to its alias. This translation is a single canonical
 > map, implemented once in [`scripts/forge-model-alias.js`](../scripts/forge-model-alias.js)
 > (`modelToAlias(id)` — plain lowercase substring match, checked in order `fable → haiku → sonnet →
@@ -63,8 +63,7 @@ The four tiers map to four model aliases. Operators can override the model for a
 
 ## Tier Chains — Scalar vs. List
 
-`tier_models.<tier>` in the raw prefs cascade (`~/.claude/forge-agent-prefs.md` >
-`.gsd/claude-agent-prefs.md` > `.gsd/prefs.local.md`, last-wins) accepts two forms, both read via
+`tier_models.<tier>` in the raw JSONC prefs cascade (global > repo-shared > local-personal, last-wins) accepts two forms, both read via
 [`scripts/forge-tier-chain.js`](../scripts/forge-tier-chain.js) — **never**
 `.gsd/prefs-resolved.json` (that file is never written; MEM001 M005):
 
@@ -141,10 +140,10 @@ Highest precedence first. The first matching rule wins.
 
 ## Cross-references
 
-- [`forge-agent-prefs.md § Tier Settings`](../forge-agent-prefs.md) — `tier_models:` block maps each tier alias to a concrete model ID; edit there to swap models without touching dispatch logic (to be added in T05).
+- [`forge-agent-prefs.jsonc § Tier Settings`](../forge-agent-prefs.jsonc) — `tier_models:` block maps each tier alias to a concrete model ID; edit there to swap models without touching dispatch logic (to be added in T05).
 - [`shared/forge-dispatch.md § Tier Resolution`](forge-dispatch.md) — the `### Tier Resolution` block reads this file's tables at runtime to resolve the model for each dispatched unit (to be added in T02).
 - [`skills/forge-auto/SKILL.md`](../skills/forge-auto/SKILL.md) — the main dispatch loop; reads resolved tier from `### Tier Resolution` before invoking `Agent()`.
 - [`skills/forge-next/SKILL.md`](../skills/forge-next/SKILL.md) — step-mode execution; same tier resolution path as forge-auto.
 - [`scripts/forge-tier-chain.js`](../scripts/forge-tier-chain.js) — reads `tier_models.<tier>` from the raw prefs cascade (scalar or list), exports `readTierChain(tier, cwd)` and `nextAfter(chain, id)`; sole implementation of the [Tier Chains — Scalar vs. List](#tier-chains--scalar-vs-list) parsing — never reimplemented in markdown.
 - Failure Taxonomy (Failure recovery skills, e.g. `skills/forge-auto/SKILL.md`) — consumes `$TIER_CHAIN` via `--next-after` for `model_refusal`/429/400 recovery; keeps `context_overflow`'s cross-tier `standard→heavy→max` escalation unchanged and separate.
-- **Domain-first routing (M007)** — [`scripts/forge-routing.js`](../scripts/forge-routing.js) implements an optional superset that routes by `<domain>.<phase>.<tier>` with cross-engine chains. Configured in [`forge-agent-prefs.md § Routing Settings`](../forge-agent-prefs.md). When `routing:` is not present, this file's tier resolution applies unchanged (100% backward-compatible).
+- **Domain-first routing (M007)** — [`scripts/forge-routing.js`](../scripts/forge-routing.js) implements an optional superset that routes by `<domain>.<phase>.<tier>` with cross-engine chains. Configured in [`forge-agent-prefs.jsonc § Routing Settings`](../forge-agent-prefs.jsonc). When `routing:` is not present, this file's tier resolution applies unchanged (100% backward-compatible).

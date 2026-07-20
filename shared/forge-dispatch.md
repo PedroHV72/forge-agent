@@ -949,7 +949,7 @@ This is advisory (stderr only) — it never blocks the dispatch. `--explain` (pt
 <a id="per-unit-prefs-resolution"></a>
 #### Per-unit prefs resolution — the canonical helper (one `forge-prefs.js --resolved` call)
 
-**`prefs-resolved.json` does NOT exist** (MEM001 M005) and the loop must NEVER re-implement a 3-file `files=[…forge-agent-prefs.md…]` cascade `node -e` merge. All preference reads go through the **single S01 engine CLI** (`scripts/forge-prefs.js`), which dual-reads legacy markdown OR new jsonc per layer transparently and applies the exact same user-global → repo-shared → local-personal precedence. This is the **canonical pattern** that every dispatch-loop skill (`forge-auto`, `forge-next`, `forge-task`) and shared control-flow spec (`forge-plan-gate.md`, `forge-review.md`) reuses — resolve once per unit, then read every knob off the in-memory object.
+**`prefs-resolved.json` does NOT exist** (MEM001 M005) and the loop must NEVER re-implement a 3-file `files=[…]` cascade `node -e` merge. All preference reads go through the **single S01 engine CLI** (`scripts/forge-prefs.js`), which reads the JSONC catalog per layer; legacy Markdown without JSONC hard-stops with the canonical repair message defined in `shared/forge-prefs-cutover.md`. It applies the exact same user-global → repo-shared → local-personal precedence. This is the **canonical pattern** that every dispatch-loop skill (`forge-auto`, `forge-next`, `forge-task`) and shared control-flow spec (`forge-plan-gate.md`, `forge-review.md`) reuses — resolve once per unit, then read every knob off the in-memory object.
 
 ```bash
 # ── Canonical per-unit prefs resolution (ONE call; read all knobs off $PREFS_JSON) ──
@@ -975,7 +975,7 @@ WORKERS_TIMEOUT=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on
 CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=(JSON.parse(d).prefs.workers||{}).codex_model;process.stdout.write(c!=null&&c!==''?String(c):'')}catch(err){process.stdout.write('')}})")
 ```
 
-**Equivalence with the old cascade (dual-read golden capture):** the per-unit-type engine is read as `.prefs.workers[<unit_type>]` (the legacy reader parses `workers.<unit_type>: codex` into that same shape; the `[A-Za-z0-9_.-]` key class covers hyphenated unit types like `execute-task`); `timeout` as `.prefs.workers.timeout`; `codex_model` as `.prefs.workers.codex_model`. The reader is safe with **no scaffold present**: absent a `workers:` block, `.prefs.workers` is `undefined`, so `WORKERS_ENGINE=claude`, `WORKERS_TIMEOUT=1800`, `CODEX_MODEL=""` (unset) — byte-identical defaults to the old snippet. The commented `workers:` scaffold in `forge-agent-prefs.md § Workers Settings` ships in **S05**; the reader does not depend on it (the CLI resolves absent keys to the same safe defaults).
+**Equivalence with the old cascade (JSONC shape capture):** the JSONC parser exposes the per-unit-type engine as `.prefs.workers[<unit_type>]` (the `[A-Za-z0-9_.-]` key class covers hyphenated unit types such as `execute-task`); `timeout` as `.prefs.workers.timeout`; `codex_model` as `.prefs.workers.codex_model`. The resolver is safe with **no scaffold present**: absent a `workers:` block, `.prefs.workers` is `undefined`, so `WORKERS_ENGINE=claude`, `WORKERS_TIMEOUT=1800`, `CODEX_MODEL=""` (unset) — byte-identical defaults to the old snippet. The commented `workers:` scaffold in `forge-agent-prefs.jsonc § Workers Settings` ships in **S05**; the resolver does not depend on it (the CLI resolves absent keys to the same safe defaults).
 
 #### Sidecar dispatch state machine (`dispatch_engine == codex && UNIT_TYPE == execute-task`)
 
@@ -1394,7 +1394,7 @@ Materialization is **orchestrator-only** — codex never touches `.gsd/**`. Afte
 | `workers.timeout` | int (seconds) | `1800` | Forwarded to the adapter as `--timeout`; non-positive/invalid → `1800` |
 | `workers.codex_model` | string (model id) | unset (`null`) | Forwarded as `--model` only when set; unset → Codex CLI default |
 
-`plan-milestone` is intentionally **absent** from this table — it is never routed through `workers:` (locked; stays tier `max`/Fable). The scaffold that documents these keys (commented) ships in `forge-agent-prefs.md § Workers Settings` (S05); the reader operates with the safe defaults above without it.
+`plan-milestone` is intentionally **absent** from this table — it is never routed through `workers:` (locked; stays tier `max`/Fable). The scaffold that documents these keys (commented) ships in `forge-agent-prefs.jsonc § Workers Settings` (S05); the reader operates with the safe defaults above without it.
 
 #### Domain metadata — format fixed by S02, emitted by S03
 
@@ -1752,7 +1752,7 @@ After Tier Resolution has set `$MODEL_ID` (the clamp in step 4 depends on it) an
 
 #### Algorithm
 
-1. **Unit-type default.** `EFFORT = PREFS.effort[unit_type]` (the `EFFORT_MAP` built at Load Context from `.prefs.effort` — sourced off the one canonical `forge-prefs.js --resolved` object, see [§ Per-unit prefs resolution](#per-unit-prefs-resolution), never a per-file md merge of `forge-agent-prefs.md § Effort Settings`). Fall back to the built-in defaults (opus/planning phases = `medium`, sonnet/haiku phases = `low`) when the key is absent. `EFFORT_REASON = "unit-type:<unit_type>"`.
+1. **Unit-type default.** `EFFORT = PREFS.effort[unit_type]` (the `EFFORT_MAP` built at Load Context from `.prefs.effort` — sourced off the one canonical `forge-prefs.js --resolved` object, see [§ Per-unit prefs resolution](#per-unit-prefs-resolution), never a per-file merge of `forge-agent-prefs.jsonc § Effort Settings`). Fall back to the built-in defaults (opus/planning phases = `medium`, sonnet/haiku phases = `low`) when the key is absent. `EFFORT_REASON = "unit-type:<unit_type>"`.
 2. **Dedicated frontmatter axis (`execute-task` only).** If `effort:` is present in the `T##-PLAN.md` frontmatter → `EFFORT = PLAN_EFFORT`, `EFFORT_REASON = "frontmatter-effort:<val>"`. This is the planner's per-task complexity judgement and wins over the unit-type default. Independent of `tier:` — a task may be `tier: standard` + `effort: medium` or `tier: heavy` + `effort: high` in any combination.
 3. **Risk escalation sync (`plan-slice` only).** When Tier Resolution escalated the slice to `max` (`REASON == "risk-escalation:high"`), the effort also jumps to `max`. A `risk:high` slice plan is the highest leverage-per-dollar spot for frontier reasoning.
 4. **Model capability clamp.** Clamp `EFFORT` down to the resolved model's ceiling. `claude-haiku*` and `claude-sonnet*` cap at `medium`; `claude-opus*` and `claude-fable*` allow the full scale up to `max`. When the clamp lowers the value, append `|clamped:model-cap` to `EFFORT_REASON`. This prevents HTTP 400s (a Sonnet dispatch never receives `high`+) and silently-wasted config. **Consequence:** to actually *run* a task at `high`/`xhigh`/`max`, the task must also be on a `heavy`/`max` tier (opus/fable) — set both `tier:` and `effort:` in the plan, or rely on the planner to set them coherently.
@@ -1962,7 +1962,7 @@ Rationale: starting a DECOMPOSE pass or permanently pruning requirements when th
 
 ### Budget
 
-**Default budget:** `repair.budget = 2` (configurable in `forge-agent-prefs.md § repair:`).
+**Default budget:** `repair.budget = 2` (configurable in `forge-agent-prefs.jsonc § repair:`).
 
 **Counter:** `repair_count` is persisted in the frontmatter of the **`T##-PLAN.md` being repaired** — not in memory. This is intentional: the orchestrator may be compacted between dispatch and result; the frontmatter value survives on disk and is re-read on resume (Compaction Resilience Protocol).
 

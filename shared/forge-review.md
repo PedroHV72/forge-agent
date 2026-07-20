@@ -27,7 +27,7 @@ The human only adjudicates what the two AIs genuinely disagree on. Everything el
 
 ## Step 0 — Read review prefs (via the canonical prefs CLI)
 
-Resolve prefs once through the S01 engine CLI (`scripts/forge-prefs.js --resolved`, the canonical per-unit helper defined in `shared/forge-dispatch.md § Per-unit prefs resolution`) — it dual-reads legacy md OR jsonc per layer, so no `files=[…forge-agent-prefs.md…]` cascade merge is re-implemented here. Read every `review.*` knob off `.prefs`, applying the SAME whitelist/clamp + default each had inline. The single `REVIEW_CFG` JSON below preserves the exact shape downstream steps consume:
+Resolve prefs once through the S01 engine CLI (`scripts/forge-prefs.js --resolved`, the canonical per-unit helper defined in `shared/forge-dispatch.md § Per-unit prefs resolution`) — it reads the JSONC catalog per layer, and legacy Markdown without JSONC hard-stops with the canonical repair message in `shared/forge-prefs-cutover.md`, so no `files=[…]` 3-file cascade merge is re-implemented here. Read every `review.*` knob off `.prefs`, applying the SAME whitelist/clamp + default each had inline. The single `REVIEW_CFG` JSON below preserves the exact shape downstream steps consume:
 
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
@@ -662,5 +662,5 @@ When `style == flags`: run Step 2 only — routed by `challenger` (so `codex`/`g
 - `agents/forge-advocate.md` — defender
 - `skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md` — gate invocation (before `complete-slice`) + milestone-final triage (Step 9, before `complete-milestone`)
 - `scripts/forge-xllm.js` — S01 adapter for the external challengers (`--mode challenge|rebuttal`, `--engine codex|agy` — GPT via Codex CLI, Gemini via Antigravity CLI); parsing/validation lives there, not here
-- `forge-agent-prefs.md § Review Settings` — `review.{mode,style,rounds,ask_in_auto,fix_conceded,engine,challenger,challenger_model,advocate_model}`
+- `forge-agent-prefs.jsonc § Review Settings` — `review.{mode,style,rounds,ask_in_auto,fix_conceded,engine,challenger,challenger_model,advocate_model}`
 - Artifact: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (durable with the milestone; cleaned by `milestone_cleanup`)

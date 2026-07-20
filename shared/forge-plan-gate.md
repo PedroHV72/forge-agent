@@ -29,7 +29,7 @@ The gate is **not** a second plan-checker pass — it is a human-arbitration mom
 
 ## Step 0 — Read plan_gate prefs (via the canonical prefs CLI)
 
-Resolve prefs once through the S01 engine CLI (`scripts/forge-prefs.js --resolved`, the canonical per-unit helper defined in `shared/forge-dispatch.md § Per-unit prefs resolution`) — it dual-reads legacy md OR jsonc per layer, so no `files=[…forge-agent-prefs.md…]` cascade merge is re-implemented here. Read the `plan_gate.*` knobs off `.prefs`:
+Resolve prefs once through the S01 engine CLI (`scripts/forge-prefs.js --resolved`, the canonical per-unit helper defined in `shared/forge-dispatch.md § Per-unit prefs resolution`) — it reads the JSONC catalog per layer, and legacy Markdown without JSONC hard-stops with the canonical repair message in `shared/forge-prefs-cutover.md`, so no `files=[…]` 3-file cascade merge is re-implemented here. Read the `plan_gate.*` knobs off `.prefs`:
 
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
@@ -318,5 +318,5 @@ For `forge-task`, `{M###}` may be omitted or set to `""` if the task runs outsid
 - `skills/forge-auto/SKILL.md` — MODE=auto; gate is skipped unconditionally. No wiring change needed beyond confirming the skip in the event log.
 - `agents/forge-plan-checker.md` — the plan-checker runs before this gate and produces `plan_check_counts: {pass, warn, fail}`. The gate reads these counts. The checker's artifact `{S##}-PLAN-CHECK.md` is NOT the approval marker.
 - `scripts/forge-must-haves.js` — re-validation CLI in Step 4. Command: `node "$FORGE_SCRIPTS_DIR/forge-must-haves.js" --check <plan.md>` → `{legacy, valid, errors}` JSON to stdout. Exit 0 for legacy-or-valid, exit 2 for malformed structured plan. **Legacy plans always return `{legacy:true, valid:true}` — no schema enforcement.**
-- `forge-agent-prefs.md § Plan Gate Settings` — the `plan_gate:` pref block (`interactive`, `ask_in_auto`). Resolved via the prefs CLI in Step 0 above.
+- `forge-agent-prefs.jsonc § Plan Gate Settings` — the `plan_gate:` pref block (`interactive`, `ask_in_auto`). Resolved via the prefs CLI in Step 0 above.
 - Approval marker: `{S##}-PLAN-GATE.md` (per-slice) or `{TASK_ID}-PLAN-GATE.md` (per-task), written in Step 5. Not committed; cleaned by `milestone_cleanup` with the slice artifacts.
