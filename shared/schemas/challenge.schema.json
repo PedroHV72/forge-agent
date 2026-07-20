@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": ["objections"],
+  "additionalProperties": false,
+  "properties": {
+    "objections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "path_line", "claim", "suggested_fix", "challenge", "severity"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "description": "Stable id R1, R2, ... severity-then-order" },
+          "path_line": { "type": "string" },
+          "claim": { "type": "string", "description": "Full text of the issue" },
+          "suggested_fix": { "type": "string" },
+          "challenge": { "type": "string", "description": "The one question that decides whether this is real" },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] }
+        }
+      }
+    }
+  }
+}

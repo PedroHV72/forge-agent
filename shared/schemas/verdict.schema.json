@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "required": ["verdicts"],
+  "additionalProperties": false,
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "verdict", "rationale"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "verdict": { "type": "string", "enum": [] },
+          "rationale": { "type": "string" }
+        }
+      }
+    }
+  }
+}

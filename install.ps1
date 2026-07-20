@@ -412,6 +412,16 @@ if (Test-Path "$RepoDir\shared\forge-principles.md") {
     Info "  forge-principles.md"
 }
 
+# Review dialetico schemas (fonte unica, resolvidos de scripts/../schemas/ em runtime).
+$SchemasSrc = Join-Path (Join-Path $RepoDir 'shared') 'schemas'
+if (Test-Path $SchemasSrc) {
+    $SchemasDst = Join-Path $ClaudeDir 'schemas'
+    Get-ChildItem $SchemasSrc -Filter *.json | ForEach-Object {
+        CopyFile $_.FullName (Join-Path $SchemasDst $_.Name)
+        Info ("  schemas/" + $_.Name)
+    }
+}
+
 # ── Install runtime scripts (scripts/forge-*.js invoked by skills/dispatch) ────
 Write-Host ""
 Info "Instalando scripts runtime..."

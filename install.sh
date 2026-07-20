@@ -483,6 +483,16 @@ if [ -f "${REPO_DIR}/shared/forge-principles.md" ]; then
   info "  forge-principles.md"
 fi
 
+# Review dialético schemas (single source, resolved from scripts/../schemas/ at runtime).
+if [ -d "${REPO_DIR}/shared/schemas" ]; then
+  for schema in "${REPO_DIR}"/shared/schemas/*.json; do
+    [ -f "$schema" ] || continue
+    name="$(basename "$schema")"
+    copy "$schema" "${CLAUDE_DIR}/schemas/${name}"
+    info "  schemas/${name}"
+  done
+fi
+
 echo ""
 info "Installing statusline & hooks..."
 copy "${REPO_DIR}/scripts/forge-statusline.js" "${CLAUDE_DIR}/forge-statusline.js"

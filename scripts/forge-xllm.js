@@ -80,6 +80,7 @@ const { classifyError, isTransient } = require('./forge-classify-error.js');
 const DEFAULT_TIMEOUT_SECS = 300;
 const DEFAULT_EXECUTE_TIMEOUT_SECS = 1800; // 30 min — execute default (workers.timeout override)
 const HEARTBEAT_INTERVAL_MS = 15000; // re-write the running heartbeat every 15s
+const PROTOCOL_VERSION = 2; // result-file payload format (post-M013/M014). Absent or 1 = pre-M014, still valid (additive read).
 const MAX_DIFF_LINES = 4000;
 const MAX_BUFFER = 16 * 1024 * 1024; // 16MB — guards against runaway output (local DoS)
 const MAX_STDERR_SNIPPET = 200; // only the tail of child stderr surfaces in an error cause
@@ -89,55 +90,35 @@ const EXEC_STATUS_ENUM = ['done', 'partial', 'blocked'];
 const MH_STATUS_ENUM = ['met', 'unmet', 'unknown'];
 const ENV_POLICY_ENUM = ['minimal', 'inherit'];
 
-// Duplicated from shared/forge-review.md engine workflow script (challengeSchema).
-// keep in sync with shared/forge-review.md
-const challengeSchema = {
-  type: 'object',
-  required: ['objections'],
-  additionalProperties: false,
-  properties: {
-    objections: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['id', 'path_line', 'claim', 'suggested_fix', 'challenge', 'severity'],
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string', description: 'Stable id R1, R2, ... severity-then-order' },
-          path_line: { type: 'string' },
-          claim: { type: 'string', description: 'Full text of the issue' },
-          suggested_fix: { type: 'string' },
-          challenge: { type: 'string', description: 'The one question that decides whether this is real' },
-          severity: { type: 'string', enum: SEVERITY_ENUM },
-        },
-      },
-    },
-  },
-};
+// Single-source review schemas — extracted to shared/schemas/*.json (M014 S04) to kill the
+// "keep in sync" duplication that lived here and in shared/forge-review.md. Loaded once from
+// disk via a __dirname-relative fallback that works in BOTH layouts:
+//   • repo:      scripts/forge-xllm.js → ../shared/schemas/<name>
+//   • installed: ~/.claude/scripts/forge-xllm.js → ../schemas/<name>  (~/.claude/schemas/)
+// First existing candidate wins; none found → throw listing the candidates.
+function loadSchemaFile(name) {
+  const candidates = [
+    path.join(__dirname, '..', 'shared', 'schemas', name),
+    path.join(__dirname, '..', 'schemas', name),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return JSON.parse(fs.readFileSync(candidate, 'utf8'));
+    }
+  }
+  throw new Error(`forge-xllm: schema "${name}" not found (tried: ${candidates.join(', ')})`);
+}
 
-// Duplicated from shared/forge-review.md engine workflow script (verdictSchema).
-// keep in sync with shared/forge-review.md
+const challengeSchema = loadSchemaFile('challenge.schema.json');
+const _verdictBase = loadSchemaFile('verdict.schema.json');
+
+// verdictSchema stays a function: the JSON on disk holds the static shape with a placeholder
+// enum; each call deep-clones the base and injects the runtime `allowed` enum. Deep-clone via
+// JSON round-trip is safe — the schema is pure JSON. All 3 existing call-sites unchanged.
 function verdictSchema(allowed) {
-  return {
-    type: 'object',
-    required: ['verdicts'],
-    additionalProperties: false,
-    properties: {
-      verdicts: {
-        type: 'array',
-        items: {
-          type: 'object',
-          required: ['id', 'verdict', 'rationale'],
-          additionalProperties: false,
-          properties: {
-            id: { type: 'string' },
-            verdict: { type: 'string', enum: allowed },
-            rationale: { type: 'string' },
-          },
-        },
-      },
-    },
-  };
+  const clone = JSON.parse(JSON.stringify(_verdictBase));
+  clone.properties.verdicts.items.properties.verdict.enum = allowed;
+  return clone;
 }
 
 // Output schema HINT for execute mode (codex#15451/#4181 — a hint, not a contract;
@@ -1399,6 +1380,7 @@ async function runExecute(opts) {
   // Initial heartbeat — pid unknown until the child spawns.
   writeJsonAtomic(resultFile, {
     status: 'running',
+    protocol_version: PROTOCOL_VERSION,
     pid: null,
     adapter_pid: process.pid,
     heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
@@ -1410,6 +1392,7 @@ async function runExecute(opts) {
   const onHeartbeat = (pid) => {
     writeJsonAtomic(resultFile, {
       status: 'running',
+      protocol_version: PROTOCOL_VERSION,
       pid,
       adapter_pid: process.pid,
       heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
@@ -1445,6 +1428,7 @@ async function runExecute(opts) {
 
   const result = {
     status: parsed.status,
+    protocol_version: PROTOCOL_VERSION,
     summary: parsed.summary,
     must_haves_status: parsed.must_haves_status,
     files_changed: derived,
@@ -1518,6 +1502,7 @@ async function runPlan(opts) {
   // Initial heartbeat — pid unknown until the child spawns.
   writeJsonAtomic(resultFile, {
     status: 'running',
+    protocol_version: PROTOCOL_VERSION,
     pid: null,
     adapter_pid: process.pid,
     heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
@@ -1528,6 +1513,7 @@ async function runPlan(opts) {
   const onHeartbeat = (pid) => {
     writeJsonAtomic(resultFile, {
       status: 'running',
+      protocol_version: PROTOCOL_VERSION,
       pid,
       adapter_pid: process.pid,
       heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
@@ -1570,6 +1556,7 @@ async function runPlan(opts) {
   const finishedAt = new Date().toISOString();
   const result = {
     status: parsed.status,
+    protocol_version: PROTOCOL_VERSION,
     summary: parsed.summary,
     slice_plan: parsed.slice_plan,
     task_plans: parsed.task_plans,
@@ -1589,6 +1576,10 @@ module.exports = {
   runRebuttal,
   runExecute,
   runPlan,
+  loadSchemaFile,
+  challengeSchema,
+  verdictSchema,
+  PROTOCOL_VERSION,
   extractLastJsonBlock,
   validateObjections,
   validateVerdicts,
@@ -1666,6 +1657,7 @@ if (require.main === module) {
           try {
             writeJsonAtomic(path.resolve(resultFile), {
               status: 'adapter-failed',
+              protocol_version: PROTOCOL_VERSION,
               reason: e.message,
               error_class: classifyErrorClass(e.message),
               failed_at: new Date().toISOString(),
@@ -1700,6 +1692,7 @@ if (require.main === module) {
             } catch { /* no repo / detached — omit */ }
             writeJsonAtomic(path.resolve(resultFile), {
               status: 'adapter-failed',
+              protocol_version: PROTOCOL_VERSION,
               reason: e.message,
               error_class: classifyErrorClass(e.message),
               ...(startSha ? { start_sha: startSha } : {}),
