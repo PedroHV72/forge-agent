@@ -5278,7 +5278,7 @@ function smokePrefsViewerDoctor() {
     const setResult = migrate.setPreference(project, 'review.rounds=3', { layer: 'local', create: true });
     assert(setResult.status === 'set', '(a) setPreference activates review.rounds=3 locally for the viewer fixture', JSON.stringify(setResult));
     const catalog = view.buildCatalog(project);
-    assert(catalog.knobs.length === 87, '(a) viewer lists all 87 knobs', `got ${catalog.knobs.length}`);
+    assert(catalog.knobs.length === 88, '(a) viewer lists all 88 knobs', `got ${catalog.knobs.length}`);
     const sections = new Set(catalog.knobs.map((knob) => knob.section));
     assert(sections.size === 38, '(a) viewer covers all 38 sections', JSON.stringify([...sections]));
     const rounds = catalog.knobs.find((knob) => knob.path === 'review.rounds');

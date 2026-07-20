@@ -477,6 +477,7 @@ workers:
   plan-slice:   claude     # claude | codex  (default claude)
   timeout: 1800            # segundos — teto do sidecar codex antes do SIGKILL
   codex_model:             # unset = default do codex-cli; ex.: gpt-5.6-sol
+  sidecar_on_failure: retry-then-fallback   # retry-then-fallback | fallback | pause-ask (default retry-then-fallback)
 ```
 
 ### Semântica
@@ -493,6 +494,20 @@ workers:
   Aplica-se apenas quando `ENGINE == codex`; irrelevante no caminho `claude`.
 - `codex_model` (padrão unset): repassado como `-m <valor>` ao `codex-cli` quando definido;
   unset usa o modelo default do CLI instalado. Ignorado quando o engine resolvido é `claude`.
+- `sidecar_on_failure` (padrão `retry-then-fallback`): política ao falhar o sidecar `codex`.
+  Só se aplica quando o engine resolvido é `codex`; irrelevante no caminho `claude`. Três valores:
+  - `retry-then-fallback` (default) — retenta o mesmo `codex` em erro transiente (Layer-1, S02)
+    até `max_transient_retries` vezes e só então cai no fallback único ao worker Claude nativo.
+    Gate: este valor é o que **liga** o loop de retry transiente do S02 — os outros dois valores
+    o desativam.
+  - `fallback` — pula o Layer-1 inteiramente e cai direto no fallback Claude na primeira falha
+    (comportamento pré-S02, preservado para quem quer o caminho mais curto).
+  - `pause-ask` — retenta transiente como `retry-then-fallback` e, **só na exaustão** dos retries,
+    pausa e pergunta ao operador (`AskUserQuestion`) em modo interativo; em modo headless
+    (`forge-auto`/CI, sem TTY para perguntar) degrada automaticamente a `fallback` e registra o
+    evento `sidecar-pause-degraded` — nunca trava o loop autônomo.
+  - Valor inválido/desconhecido cai em `retry-then-fallback` (warning de `validatePrefs`, não erro
+    — mesmo padrão de degradação do enum `workers.execute-task`).
 - **`plan-milestone` NÃO é coberto** por este eixo (locked) — permanece sempre no tier `max`
   (Fable), independente do que este bloco configure. Nenhuma outra fase (`discuss-*`,
   `research-*`, `complete-*`, `memory-extract`) é routável por `workers:`.

@@ -360,6 +360,12 @@
           "type": ["string", "null"],
           "default": null,
           "description": "Repassado como -m <valor> ao codex-cli quando definido; null/unset usa o modelo default do CLI instalado (ex.: gpt-5.6-sol). Ignorado quando o engine é claude."
+        },
+        "sidecar_on_failure": {
+          "type": "string",
+          "enum": ["retry-then-fallback", "fallback", "pause-ask"],
+          "default": "retry-then-fallback",
+          "description": "Política ao falhar o sidecar codex. retry-then-fallback (default): Layer-1 retenta o mesmo codex em erro transiente (S02) e só então cai no fallback Claude. fallback: pula o Layer-1 (comportamento pré-S02). pause-ask: retenta transiente e, SÓ na exaustão, pausa + AskUserQuestion (interativo) ou degrada a fallback + evento sidecar-pause-degraded (headless). Valor inválido cai em retry-then-fallback."
         }
       }
     },
