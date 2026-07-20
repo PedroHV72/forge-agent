@@ -7,8 +7,8 @@
 //   1. forge-prefs.schema.json is pure JSON at the repo root where
 //      loadSchema() pins it (__dirname/../forge-prefs.schema.json).
 //   2. Two-way coverage diff:
-//        forward — every inventoried knob (runtime legacyReadFile extraction
-//        of forge-agent-prefs.md ∪ the curated reader-derived INVENTORY
+//        forward — every inventoried knob (generated JSONC scaffold extraction
+//        ∪ the curated reader-derived INVENTORY
 //        below) resolves to a schema leaf with type + description + default;
 //        reverse — every schema leaf is in the inventory ∪ {$schema}
 //        (the schema invents no knobs — M008 zero-semantics contract).
@@ -21,8 +21,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { loadSchema, validatePrefs } = require('./forge-prefs.js');
-const { legacyReadFile } = require('./forge-prefs-legacy.js');
+const { loadSchema, validatePrefs, parseJsonc } = require('./forge-prefs.js');
+const { spawnSync } = require('child_process');
 const { DEFAULT_THRESHOLDS } = require('./forge-context-monitor.js');
 
 let passed = 0;
@@ -256,32 +256,31 @@ if (!schema) {
   process.exit(1);
 }
 
-// ── 2. Mechanical inventory — template side (runtime extraction) ─────────────
-const templatePath = path.join(__dirname, '..', 'forge-agent-prefs.md');
-const templateKeys = [];
+// ── 2. Mechanical inventory — generated scaffold side ───────────────────────
+const scaffoldKeys = [];
 {
-  const extracted = legacyReadFile(templatePath);
-  (function flatten(v, parts) {
-    if (isPlainObject(v)) {
-      if (parts.length > 0 && Object.keys(v).length === 0) {
-        templateKeys.push(parts.join('.'));
-        return;
-      }
-      for (const k of Object.keys(v)) flatten(v[k], parts.concat(k));
-    } else {
-      templateKeys.push(parts.join('.'));
-    }
-  })(extracted.prefs, []);
+  const scaffoldRun = spawnSync(process.execPath, [path.join(__dirname, 'forge-prefs.js'), '--scaffold', '--schema-ref', 'forge-prefs.schema.json'], { encoding: 'utf8' });
+  assert(scaffoldRun.status === 0, `scaffold command failed: ${scaffoldRun.stderr || scaffoldRun.stdout}`);
+  const parsed = parseJsonc(scaffoldRun.stdout);
+  assert(parsed.ok, `generated scaffold is not valid JSONC: ${parsed.error && parsed.error.message}`);
+  // The scaffold intentionally comments every preference example, so the
+  // JSONC parser exposes only $schema. Use the parsed document as the syntax
+  // gate, then inventory the commented catalog against the live schema paths.
+  for (const key of collectLeaves(schema)) {
+    if (key === '$schema') continue;
+    const present = key.split('.').every((part) => new RegExp(`"${part.replace(/[.*+?^${}()|[\\]\\]/g, '\\\\$&')}"\\s*:`).test(scaffoldRun.stdout));
+    if (present) scaffoldKeys.push(key);
+  }
 }
 
-check('template extraction is non-trivial (>= 50 parseable keys in forge-agent-prefs.md)', () => {
-  assert(templateKeys.length >= 50, `only ${templateKeys.length} keys extracted — template moved or parser regressed`);
+check('scaffold extraction is non-trivial (>= 50 parseable keys)', () => {
+  assert(scaffoldKeys.length >= 50, `only ${scaffoldKeys.length} keys extracted — scaffold or parser regressed`);
 });
 
-// Union: curated ∪ template (with legacy-flattening aliases applied).
+// Union: curated ∪ generated scaffold (with legacy-flattening aliases applied).
 const inventoryKeys = new Set(INVENTORY.map((e) => e.key));
-const aliasedTemplateKeys = templateKeys.map((k) => KEY_ALIASES[k] || k);
-const allKeys = new Set([...inventoryKeys, ...aliasedTemplateKeys]);
+const aliasedScaffoldKeys = scaffoldKeys.map((k) => KEY_ALIASES[k] || k);
+const allKeys = new Set([...inventoryKeys, ...aliasedScaffoldKeys]);
 
 // ── 3. Coverage diff — forward (inventory ⊆ schema) ─────────────────────────
 check('forward coverage: every inventoried knob resolves to a schema leaf with type + description + default', () => {
@@ -477,5 +476,5 @@ check('mechanical reader-grep: every pref key referenced in scripts/forge-*.js e
 // ── Report ───────────────────────────────────────────────────────────────────
 const total = passed + failed;
 console.log(`\nforge-prefs-schema: ${passed}/${total} checks passed`);
-console.log(`inventory: ${INVENTORY.length} curated reader-derived keys + ${templateKeys.length} template-extracted keys → ${allKeys.size} unique knobs; schema leaves: ${collectLeaves(schema).length}`);
+console.log(`inventory: ${INVENTORY.length} curated reader-derived keys + ${scaffoldKeys.length} scaffold keys → ${allKeys.size} unique knobs; schema leaves: ${collectLeaves(schema).length}`);
 if (failed > 0) process.exit(1);

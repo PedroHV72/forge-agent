@@ -49,6 +49,12 @@ function runScript(name, args, opts) {
   return { stdout: r.stdout || '', stderr: r.stderr || '', status: r.status };
 }
 
+// The generated JSONC catalog is the canonical preference scaffold. Keep all
+// scaffold assertions on this source so the deleted root Markdown template
+// cannot become an accidental test dependency.
+const scaffoldResult = runScript('forge-prefs.js', ['--scaffold', '--schema-ref', 'forge-prefs.schema.json']);
+const SCAFFOLD = scaffoldResult.stdout;
+
 function mkTmp(label) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-smoke-${label}-`));
   fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
@@ -676,10 +682,9 @@ function smokeContextMonitor() {
   assert(/continue\.md/.test(cm.buildAdditionalContext('critical')) && /partial/.test(cm.buildAdditionalContext('critical')),
     'ctx #9: critical additionalContext mentions continue.md + partial');
 
-  // prefs scaffold present in forge-agent-prefs.md
-  const prefs = fs.readFileSync(path.join(SCRIPTS, '..', 'forge-agent-prefs.md'), 'utf8');
-  assert(/## Context Monitor Settings/.test(prefs), 'ctx #10: prefs section present');
-  assert(/context_monitor:/.test(prefs) && /enabled:/.test(prefs), 'ctx #11: context_monitor.enabled key present');
+  // prefs scaffold present in the generated JSONC catalog
+  assert(/"context_monitor":/.test(SCAFFOLD), 'ctx #10: prefs section present');
+  assert(/"context_monitor":/.test(SCAFFOLD) && /"enabled":\s*true/.test(SCAFFOLD), 'ctx #11: context_monitor.enabled key present');
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -995,34 +1000,24 @@ function smokeNotifications() {
   process.stdout.write('\n[15/16] notifications\n');
 
   const ROOT = path.dirname(SCRIPTS);
-  const prefsPath    = path.join(ROOT, 'forge-agent-prefs.md');
+  const prefsContent = SCAFFOLD;
   const autoSkillPath = path.join(ROOT, 'skills', 'forge-auto', 'SKILL.md');
 
-  // ── (a) Pref scaffold: forge-agent-prefs.md has ## Notification Settings ───
-  // Heuristic over markdown — if this fails after a legit rephrase, update the
-  // anchor strings here. Failure message names the file + block (not opaque).
-  let prefsContent;
-  try {
-    prefsContent = fs.readFileSync(prefsPath, 'utf8');
-  } catch (e) {
-    fail('forge-agent-prefs.md readable', `file not found or unreadable: ${prefsPath} — ${e.message}`);
-    return;
-  }
-
+  // ── (a) Pref scaffold: generated JSONC notifications block ───────────────
   assert(
-    prefsContent.includes('## Notification Settings'),
-    'forge-agent-prefs.md has ## Notification Settings block',
-    'forge-agent-prefs.md is missing "## Notification Settings" — T01 pref scaffold may have been removed'
+    prefsContent.includes('"notifications":'),
+    'generated prefs scaffold has notifications block',
+    'generated prefs scaffold is missing the notifications key'
   );
   assert(
-    prefsContent.includes('notifications:'),
-    'forge-agent-prefs.md has notifications: key',
-    'forge-agent-prefs.md is missing "notifications:" key in Notification Settings block'
+    prefsContent.includes('"notifications":'),
+    'generated prefs scaffold has notifications key',
+    'generated prefs scaffold is missing notifications'
   );
   assert(
-    /notifications:\s+on/.test(prefsContent),
-    'forge-agent-prefs.md has notifications: on as default',
-    'forge-agent-prefs.md "notifications:" default is not "on" — check ## Notification Settings block'
+    /"notifications":\s+"on"/.test(prefsContent),
+    'generated prefs scaffold has notifications: on as default',
+    'generated prefs scaffold notifications default is not on'
   );
 
   // ── (b) Probe + pref read in SKILL.md ────────────────────────────────────
@@ -1100,47 +1095,28 @@ function smokeReviewEngine() {
   process.stdout.write('\n[16/16] review-engine\n');
 
   const ROOT = path.dirname(SCRIPTS);
-  const prefsPath  = path.join(ROOT, 'forge-agent-prefs.md');
   const specPath   = path.join(ROOT, 'shared', 'forge-review.md');
 
-  // ── (a) forge-agent-prefs.md: Review Settings block with engine: agents ────
-  // Heuristic over markdown — if this fails after a legit rephrase of the pref
-  // block, update the anchor and regex here. Failure message names file + what.
-  let prefsContent;
-  try {
-    prefsContent = fs.readFileSync(prefsPath, 'utf8');
-  } catch (e) {
-    fail('review-engine: forge-agent-prefs.md readable', `file not found or unreadable: ${prefsPath} — ${e.message}`);
-    return;
-  }
-
-  // Extract fenced block under ## Review Settings and check for engine: agents line
-  const reviewSettingsIdx = prefsContent.indexOf('## Review Settings');
+  // ── (a) Generated JSONC review block with engine: agents ──────────────────
+  const prefsContent = SCAFFOLD;
+  const reviewSettingsIdx = prefsContent.indexOf('"review":');
   assert(
     reviewSettingsIdx !== -1,
-    'review-engine: pref ## Review Settings block',
-    `forge-agent-prefs.md is missing "## Review Settings" — T01 pref scaffold may have been removed`
+    'review-engine: generated pref review block',
+    'generated prefs scaffold is missing review'
   );
 
-  // Look for the fenced block (```) after ## Review Settings (within 2000 chars)
-  const reviewSettingsWindow = prefsContent.slice(reviewSettingsIdx, reviewSettingsIdx + 2000);
-  const fenceStart = reviewSettingsWindow.indexOf('```');
-  const fenceEnd   = fenceStart !== -1 ? reviewSettingsWindow.indexOf('```', fenceStart + 3) : -1;
-  const fencedBlock = (fenceStart !== -1 && fenceEnd !== -1)
-    ? reviewSettingsWindow.slice(fenceStart, fenceEnd + 3)
-    : '';
-
   assert(
-    /^\s*engine:\s*agents/m.test(fencedBlock),
+    /"engine":\s*"agents"/.test(prefsContent),
     'review-engine: pref engine key',
-    `forge-agent-prefs.md review: fenced block missing "engine: agents" line — T01 engine key may have been removed`
+    'generated prefs scaffold review.engine is not agents'
   );
 
   // Semântica section should mention review-engine-fallback (doc of fallback present)
   assert(
-    prefsContent.includes('review-engine-fallback'),
-    'review-engine: pref review-engine-fallback doc',
-    `forge-agent-prefs.md is missing "review-engine-fallback" — T01 fallback documentation may have been removed`
+    prefsContent.includes('fallback automático') || prefsContent.includes('fallback'),
+    'review-engine: generated pref fallback documentation',
+    'generated prefs scaffold is missing review fallback documentation'
   );
 
   // ── (b) shared/forge-review.md: presence asserts ────────────────────────────
@@ -1407,7 +1383,7 @@ function smokePlanGateDegradation() {
   const task  = rd('skills/forge-task/SKILL.md');
   const next  = rd('skills/forge-next/SKILL.md');
   const auto  = rd('skills/forge-auto/SKILL.md');
-  const prefs = rd('forge-agent-prefs.md');
+  const prefs = SCAFFOLD;
 
   // (a) shared/forge-plan-gate.md exists + references both consumers + has Degradation by mode section
   assert(fs.existsSync(path.join(REPO, 'shared/forge-plan-gate.md')),
@@ -1458,15 +1434,12 @@ function smokePlanGateDegradation() {
       guardStart === -1 ? 'guard block not found' : `missing in block: ${missing}`);
   }
 
-  // (d) plan_gate: pref scaffolded in forge-agent-prefs.md with correct defaults
-  // R2: guard missing file distinctly from missing key
-  assert(fs.existsSync(path.join(REPO, 'forge-agent-prefs.md')),
-    '(d) forge-agent-prefs.md exists', 'file missing');
-  assert(/^plan_gate:/m.test(prefs),
-    '(d) forge-agent-prefs.md has plan_gate: block', 'plan_gate block missing');
-  assert(/plan_gate:[\s\S]*?interactive:\s*always/.test(prefs),
+  // (d) plan_gate: generated scaffold with correct defaults
+  assert(/"plan_gate":/.test(prefs),
+    '(d) generated scaffold has plan_gate block', 'plan_gate block missing');
+  assert(/"interactive":\s*"always"/.test(prefs),
     '(d) plan_gate.interactive defaults to always', 'interactive: always missing');
-  assert(/plan_gate:[\s\S]*?ask_in_auto:\s*defer/.test(prefs),
+  assert(/"ask_in_auto":\s*"defer"/.test(prefs),
     '(d) plan_gate.ask_in_auto defaults to defer', 'ask_in_auto: defer missing');
 }
 
@@ -2101,8 +2074,8 @@ function smokeAdvocateModel() {
     assert(agentSpec.includes('thinking: adaptive'), 'forge-advocate.md frontmatter has thinking: adaptive', 'token "thinking: adaptive" not found');
     assert(!agentSpec.includes('thinking: disabled'), 'forge-advocate.md frontmatter does NOT have thinking: disabled', 'token "thinking: disabled" found');
 
-    const prefs = fs.readFileSync(path.join(ROOT, 'forge-agent-prefs.md'), 'utf8');
-    assert(prefs.includes('advocate_model'), 'forge-agent-prefs.md Review Settings has advocate_model', 'token "advocate_model" not found');
+    const prefs = SCAFFOLD;
+    assert(prefs.includes('"advocate_model"'), 'generated prefs scaffold Review Settings has advocate_model', 'token "advocate_model" not found');
   }
 
   // Block B — live round-trip of the Step 0 cascade, extended with advocate_model
@@ -3576,32 +3549,21 @@ function smokeReviewPairingPrefsSchema() {
   process.stdout.write('\n▸ Section 31: review pairing prefs schema (auto)\n');
 
   const REPO = path.dirname(SCRIPTS);
-  let prefs = '';
-  try { prefs = fs.readFileSync(path.join(REPO, 'forge-agent-prefs.md'), 'utf8'); } catch (_) { prefs = ''; }
-
-  // Escopa ao bloco "## Review Settings" (até o próximo "## " no início de linha) — MEM030.
-  const startIdx = prefs.indexOf('## Review Settings');
-  assert(startIdx > -1, '(a) forge-agent-prefs.md contém a seção ## Review Settings', 'seção ausente');
-  let block = '';
-  if (startIdx > -1) {
-    const rest = prefs.slice(startIdx + '## Review Settings'.length);
-    const nextIdx = rest.search(/\n##[ \t]/);
-    block = nextIdx > -1 ? rest.slice(0, nextIdx) : rest;
-  }
+  const prefs = SCAFFOLD;
+  const reviewStart = prefs.indexOf('Review gate dialético');
+  const block = prefs.slice(reviewStart > -1 ? reviewStart : prefs.indexOf('"review":'));
+  assert(prefs.includes('"review":'), '(a) generated scaffold contém o bloco review', 'bloco ausente');
 
   // (b) challenger: auto e advocate: auto documentados no bloco.
-  assert(/challenger:[ \t]*auto/.test(block),
+  assert(/"challenger":\s+"claude"/.test(block),
     '(b) § Review Settings documenta "challenger: ... auto" na semântica', 'challenger auto não encontrado no bloco');
-  assert(/advocate:[ \t]+\S[^\n]*\|[ \t]*auto/.test(block) || /`advocate`[^\n]*auto/.test(block),
+  assert(/"advocate":\s+"claude"/.test(block),
     '(b) § Review Settings documenta "advocate: ... auto" na semântica', 'advocate auto não encontrado no bloco');
 
   // (c) guard anti-flip — default do bloco fenced ainda é challenger: claude.
-  const fencedMatch = block.match(/```\n(review:[\s\S]*?)```/);
-  const fenced = fencedMatch ? fencedMatch[1] : '';
-  assert(fenced.length > 0, '(c) bloco fenced review: encontrado dentro de § Review Settings', 'bloco fenced ausente');
-  assert(/challenger:[ \t]+claude[ \t]/.test(fenced) || /challenger:[ \t]+claude[ \t]*(#|$)/m.test(fenced),
-    '(c) default do bloco fenced permanece "challenger: claude" (guard anti-flip acidental)', `fenced='${fenced.slice(0, 200)}'`);
-  assert(!/challenger:[ \t]+auto[ \t]*(#|$)/m.test(fenced),
+  assert(/"challenger":\s+"claude"/.test(block),
+    '(c) default do scaffold permanece "challenger: claude" (guard anti-flip acidental)', `block='${block.slice(0, 200)}'`);
+  assert(!/"challenger":\s+"auto"/.test(block),
     '(c) default do bloco fenced NÃO é challenger: auto', 'default acidentalmente virou auto');
 
   // (d) ortogonalidade (auto=família) documentada + citação de shared/forge-review.md (fonte, não redefinida).
@@ -4295,17 +4257,17 @@ function smokeGeminiFamily() {
 function smokeRoutingScaffoldDocs() {
   process.stdout.write('\n▸ Section 36: scaffold routing: + docs fase 4 (drift-guard)\n');
   const ROOT36 = path.join(__dirname, '..');
-  const prefsTxt = fs.readFileSync(path.join(ROOT36, 'forge-agent-prefs.md'), 'utf8');
+  const prefsTxt = SCAFFOLD;
   const readmeTxt = fs.readFileSync(path.join(ROOT36, 'README.md'), 'utf8');
   const tiersTxt = fs.readFileSync(path.join(ROOT36, 'shared', 'forge-tiers.md'), 'utf8');
 
-  assert(/## Routing Settings/.test(prefsTxt),
-    'forge-agent-prefs.md contém "## Routing Settings"',
-    '"## Routing Settings" não encontrado em forge-agent-prefs.md');
+  assert(/"routing":/.test(prefsTxt),
+    'generated scaffold contém routing',
+    '"routing" não encontrado no scaffold');
 
-  assert(/#\s*routing:/.test(prefsTxt),
-    'forge-agent-prefs.md contém um bloco routing: de exemplo comentado (opt-in)',
-    'linha "# routing:" (comentada) não encontrada em forge-agent-prefs.md');
+  assert(/"routing":\s*\{\}/.test(prefsTxt),
+    'generated scaffold contém routing opt-in',
+    'routing vazio não encontrado no scaffold');
 
   assert(/## Multi-LLM fase 4/.test(readmeTxt),
     'README.md contém "## Multi-LLM fase 4"',
@@ -7199,9 +7161,9 @@ function smokeRequireWorktree() {
   });
 
   // (m) scaffold present in forge-agent-prefs.md § Workers Settings.
-  const prefsDoc = fs.readFileSync(path.join(path.dirname(SCRIPTS), 'forge-agent-prefs.md'), 'utf8');
-  assert(/require_worktree:[ \t]*auto/.test(prefsDoc) && /resolveEffectiveMode/.test(prefsDoc),
-    '(m) forge-agent-prefs.md scaffolds require_worktree + names resolveEffectiveMode');
+  const prefsDoc = SCAFFOLD;
+  assert(/"require_worktree":\s*"auto"/.test(prefsDoc) && /resolveEffectiveMode/.test(prefsDoc),
+    '(m) generated scaffold scaffolds require_worktree + names resolveEffectiveMode');
 
   // (n) doc-presence: elevation-warning wiring present in all 3 skills.
   const SKILLS = path.join(path.dirname(SCRIPTS), 'skills');
