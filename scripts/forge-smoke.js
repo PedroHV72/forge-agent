@@ -6714,6 +6714,98 @@ function smokeSidecarEnvContract() {
   pass('(final) Section 51: sidecar env allowlist contract — unit, platform, E2E child dump, call-sites, and schema verified');
 }
 
+// ── Section 52: extracted review schemas single-source regression guard ─────
+// Baseline: 1248 passes (1228 before this section + 20 Section 52 assertions).
+function smokeSchemaExtraction() {
+  process.stdout.write('\n▸ Section 52: extracted review schemas single-source contract\n');
+  const REPO = path.dirname(SCRIPTS);
+  const schemaDir = path.join(REPO, 'shared', 'schemas');
+  const challengePath = path.join(schemaDir, 'challenge.schema.json');
+  const verdictPath = path.join(schemaDir, 'verdict.schema.json');
+
+  assert(fs.existsSync(challengePath), '(a) challenge schema exists', challengePath);
+  assert(fs.existsSync(verdictPath), '(a) verdict schema exists', verdictPath);
+  let challenge;
+  let verdict;
+  try { challenge = JSON.parse(fs.readFileSync(challengePath, 'utf8')); }
+  catch (e) { fail('(a) challenge schema parses as JSON', e.message); }
+  if (challenge) pass('(a) challenge schema parses as JSON');
+  try { verdict = JSON.parse(fs.readFileSync(verdictPath, 'utf8')); }
+  catch (e) { fail('(a) verdict schema parses as JSON', e.message); }
+  if (verdict) pass('(a) verdict schema parses as JSON');
+  assert(Boolean(challenge && challenge.properties && challenge.properties.objections),
+    '(a) challenge schema exposes properties.objections');
+  assert(Boolean(verdict && verdict.properties && verdict.properties.verdicts),
+    '(a) verdict schema exposes properties.verdicts');
+  assert(Boolean(challenge && challenge.additionalProperties === false
+      && verdict && verdict.additionalProperties === false),
+    '(a) both schemas reject additional top-level properties');
+
+  const adapterPath = path.join(SCRIPTS, 'forge-xllm.js');
+  const adapterSource = fs.readFileSync(adapterPath, 'utf8');
+  assert(!/const[ \t]+challengeSchema[ \t]*=[ \t]*\{/.test(adapterSource),
+    '(b) adapter has no inline challengeSchema object literal', adapterPath);
+  const verdictFactorySource = adapterSource.slice(adapterSource.indexOf('function verdictSchema('),
+    adapterSource.indexOf('// Output schema HINT'));
+  assert(!/return[ \t]*\{/.test(verdictFactorySource)
+      && !/type:[ \t]*['"]object['"]/.test(verdictFactorySource),
+    '(b) adapter verdictSchema function has no inline schema object body', adapterPath);
+
+  const reviewPath = path.join(REPO, 'shared', 'forge-review.md');
+  const reviewSource = fs.readFileSync(reviewPath, 'utf8');
+  const engineStart = reviewSource.indexOf("export const meta = {");
+  const engineEnd = reviewSource.indexOf('**Return schema:**', engineStart);
+  const engine = reviewSource.slice(engineStart, engineEnd);
+  assert(engine.includes("require('../schemas/challenge.schema.json')")
+      && engine.includes("require('../schemas/verdict.schema.json')"),
+    '(c) Engine workflow references both installed-layout schema files', reviewPath);
+  assert(!/const[ \t]+challengeSchema[ \t]*=[ \t]*\{/.test(engine)
+      && !/verdictSchema[\s\S]{0,300}?type:[ \t]*['"]object['"]/.test(engine),
+    '(c) Engine workflow contains no inline challenge or verdict schema literal', reviewPath);
+
+  const tmp = mkTmp('schema-installed-layout');
+  try {
+    const installedScripts = path.join(tmp, 'scripts');
+    const installedSchemas = path.join(tmp, 'schemas');
+    fs.mkdirSync(installedScripts, { recursive: true });
+    fs.mkdirSync(installedSchemas, { recursive: true });
+    for (const name of ['forge-xllm.js', 'forge-prefs.js', 'forge-surgical-reset.js', 'forge-classify-error.js']) {
+      fs.copyFileSync(path.join(SCRIPTS, name), path.join(installedScripts, name));
+    }
+    fs.copyFileSync(challengePath, path.join(installedSchemas, 'challenge.schema.json'));
+    fs.copyFileSync(verdictPath, path.join(installedSchemas, 'verdict.schema.json'));
+    let installed;
+    try { installed = require(path.join(installedScripts, 'forge-xllm.js')); }
+    catch (e) { fail('(d) installed-layout adapter loads schemas without throwing', e.stack || e.message); }
+    if (installed) pass('(d) installed-layout adapter loads schemas without throwing');
+    assert(Boolean(installed && installed.challengeSchema.properties.objections),
+      '(d) installed adapter resolves challenge schema through ../schemas/');
+    assert(Boolean(installed && installed.verdictSchema(['open']).properties.verdicts
+      .items.properties.verdict.enum[0] === 'open'),
+    '(d) installed adapter resolves and injects the verdict enum');
+
+    const baseResult = { status: 'done', summary: 'ok', must_haves_status: [], files_changed: [] };
+    assert(Boolean(installed && installed.validateExecuteResult(baseResult)),
+      '(e) execute result without protocol_version remains valid');
+    assert(Boolean(installed && installed.validateExecuteResult({ ...baseResult, protocol_version: 2 })),
+      '(e) execute result with protocol_version 2 is valid');
+    assert(Boolean(installed && installed.PROTOCOL_VERSION === 2
+      && /protocol_version:[ \t]*PROTOCOL_VERSION/.test(adapterSource)),
+      '(e) adapter-produced result payloads carry protocol_version 2');
+  } finally {
+    cleanup(tmp);
+  }
+
+  const installSh = fs.readFileSync(path.join(REPO, 'install.sh'), 'utf8');
+  const installPs1 = fs.readFileSync(path.join(REPO, 'install.ps1'), 'utf8');
+  assert(/shared\/schemas[\s\S]{0,300}?schemas\/\$\{name\}/.test(installSh),
+    '(f) install.sh copies shared/schemas JSON files into schemas/');
+  assert(/Join-Path[ \t]+\$RepoDir[ \t]+'shared'[\s\S]{0,300}?Join-Path[ \t]+\$ClaudeDir[ \t]+'schemas'/.test(installPs1),
+    '(f) install.ps1 copies shared/schemas JSON files into schemas/');
+
+  pass('(final) Section 52: schema files, single-source wiring, installed layout, additive protocol, and installers verified (baseline 1248)');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -6772,6 +6864,7 @@ async function main() {
     smokeSidecarPolicyGuard();
     smokeHeartbeatContract();
     smokeSidecarEnvContract();
+    smokeSchemaExtraction();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

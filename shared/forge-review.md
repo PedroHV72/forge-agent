@@ -417,22 +417,9 @@ phases: [{ title: 'Challenge' }, { title: 'Defense' }, { title: 'Rebuttal' }]
 
 const { wd, unit, diffCmd, rounds } = args
 
-// keep in sync with scripts/forge-xllm.js
-const challengeSchema = {
-  type: 'object', required: ['objections'], additionalProperties: false,
-  properties: { objections: { type: 'array', items: {
-    type: 'object',
-    required: ['id', 'path_line', 'claim', 'suggested_fix', 'challenge', 'severity'],
-    additionalProperties: false,
-    properties: {
-      id: { type: 'string', description: 'Stable id R1, R2, ... severity-then-order' },
-      path_line: { type: 'string' },
-      claim: { type: 'string', description: 'Full text of the issue' },
-      suggested_fix: { type: 'string' },
-      challenge: { type: 'string', description: 'The one question that decides whether this is real' },
-      severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] }
-    } } } }
-}
+// Fonte unica: shared/schemas/*.json. No layout instalado o adapter carrega
+// estes arquivos por ../schemas/ (ver scripts/forge-xllm.js § loadSchemaFile).
+const challengeSchema = require('../schemas/challenge.schema.json')
 
 let challenge = null
 try {
@@ -451,18 +438,10 @@ const objText = challenge.objections.map(function (o) {
     ' — suggested fix: ' + o.suggested_fix + ' — challenge: ' + o.challenge
 }).join('\n')
 
-// keep in sync with scripts/forge-xllm.js
 const verdictSchema = function (allowed) {
-  return {
-    type: 'object', required: ['verdicts'], additionalProperties: false,
-    properties: { verdicts: { type: 'array', items: {
-      type: 'object', required: ['id', 'verdict', 'rationale'], additionalProperties: false,
-      properties: {
-        id: { type: 'string' },
-        verdict: { type: 'string', enum: allowed },
-        rationale: { type: 'string' }
-      } } } }
-  }
+  const schema = JSON.parse(JSON.stringify(require('../schemas/verdict.schema.json')))
+  schema.properties.verdicts.items.properties.verdict.enum = allowed
+  return schema
 }
 
 let defense = null
