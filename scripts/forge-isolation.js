@@ -53,6 +53,96 @@ function readIsolationPrefs(cwd) {
   return { mode, branchPattern, autoPullMain, worktreeRoot, worktreeCleanupOnComplete, prOnComplete };
 }
 
+// ── Effective-mode elevation (require_worktree per write-engine) ────────────
+// S03/M014: `shared` installs that resolve an EXTERNAL WRITE-engine
+// (codex/gpt/gemini) for execute-task are elevated to `worktree` STATICALLY at
+// activation — never mid-run. Elevation reuses the existing worktree mechanics
+// wholesale (setupWorktreeOne/cleanupWorktreeOne); it only swaps the effective
+// mode consumed by setupForRun/cleanupForRun. False-positive of elevation is
+// acceptable; false-negative is NOT — detection is deliberately generous.
+
+// Reads workers.require_worktree from the prefs cascade. Normalizes JSONC
+// boolean true/false → "true"/"false". Valid set {auto,true,false}; anything
+// else (or absent) → "auto" (default).
+function resolveRequireWorktree(cwd) {
+  try {
+    const workers = readPrefsCached(cwd).prefs.workers;
+    if (!workers || typeof workers !== 'object' || Array.isArray(workers)) return 'auto';
+    const raw = workers.require_worktree;
+    if (raw === undefined || raw === null) return 'auto';
+    const v = String(raw).toLowerCase().trim();
+    if (v === 'auto' || v === 'true' || v === 'false') return v;
+    return 'auto';
+  } catch { return 'auto'; }
+}
+
+// Detects whether an external write-engine (codex/gpt/gemini) is configured for
+// execute-task. Returns { detected, reason }. Two signals (generous, OR'd):
+//   (1) workers.execute-task == codex (the sidecar write path);
+//   (2) any routing.<domain>.executor.<tier|fallback> id whose modelFamily is
+//       gpt or gemini. Read-only paths (plan-slice Branch D, review challenger)
+//       are intentionally NOT inspected — they never write.
+// Never throws (never blocks activation): any error → { detected:false,
+// reason:'detect-error' }.
+function detectExternalWriteEngine(cwd) {
+  try {
+    const { modelFamily } = require('./forge-model-alias.js');
+    const { readRoutingConfig } = require('./forge-routing.js');
+
+    const prefs = readPrefsCached(cwd).prefs;
+    if (prefs.workers && String(prefs.workers['execute-task']).toLowerCase() === 'codex') {
+      return { detected: true, reason: 'workers.execute-task:codex' };
+    }
+
+    const cfg = readRoutingConfig(cwd);
+    if (cfg.present && cfg.ok && cfg.routing && typeof cfg.routing === 'object') {
+      for (const [domain, dcfg] of Object.entries(cfg.routing)) {
+        if (!dcfg || typeof dcfg !== 'object') continue;
+        if (!dcfg.executor || typeof dcfg.executor !== 'object') continue;
+        for (const [tier, ids] of Object.entries(dcfg.executor)) {
+          // Both tier chains (arrays) and the `fallback` string are inspected —
+          // a gpt/gemini fallback is still write-engine intent (false-positive OK).
+          const list = Array.isArray(ids) ? ids : [ids];
+          for (const id of list) {
+            const fam = modelFamily(id);
+            if (fam === 'gpt' || fam === 'gemini') {
+              return { detected: true, reason: 'routing.' + domain + '.executor.' + tier + ':' + fam };
+            }
+          }
+        }
+      }
+    }
+    return { detected: false, reason: null };
+  } catch { return { detected: false, reason: 'detect-error' }; }
+}
+
+// Resolves the EFFECTIVE isolation mode for a run, applying require_worktree
+// elevation once at activation. Returns
+//   { mode, user_mode, require_worktree, elevated, elevation_reason, write_engine }
+// Invariants: `false` never elevates (byte-identical); a `worktree` user mode is
+// a no-op; `true` always yields `worktree` from shared/branch; `auto` elevates
+// only from `shared` when a write-engine is detected.
+function resolveEffectiveMode(cwd) {
+  const iso = readIsolationPrefs(cwd);
+  const userMode = iso.mode;
+  const req = resolveRequireWorktree(cwd);
+  const base = { mode: userMode, user_mode: userMode, require_worktree: req, elevated: false, elevation_reason: null, write_engine: null };
+
+  if (req === 'false') return base;            // never elevate — invariant
+  if (userMode === 'worktree') return base;    // already isolated — no-op
+
+  if (req === 'true') {
+    return { ...base, mode: 'worktree', elevated: true, elevation_reason: 'require_worktree:true (' + userMode + '→worktree)' };
+  }
+  if (req === 'auto' && userMode === 'shared') {
+    const det = detectExternalWriteEngine(cwd);
+    if (det.detected) {
+      return { ...base, mode: 'worktree', elevated: true, elevation_reason: 'require_worktree:auto ' + det.reason, write_engine: det.reason };
+    }
+  }
+  return base;
+}
+
 function resolveBranchName(pattern, runId) {
   return pattern.replace(/\{M###\}/gi, runId).replace(/\{id\}/gi, runId);
 }
@@ -233,17 +323,19 @@ function cleanupWorktreeOne(repoPath, worktreePath) {
 function setupForRun(cwd, runId, opts) {
   opts = opts || {};
   const prefs = readIsolationPrefs(cwd);
-  const result = { mode: prefs.mode, repos: [] };
+  const eff = resolveEffectiveMode(cwd);   // may elevate shared→worktree at activation
+  const mode = eff.mode;
+  const result = { mode, user_mode: eff.user_mode, elevated: eff.elevated, elevation_reason: eff.elevation_reason, repos: [] };
 
-  if (prefs.mode === 'shared') return result;  // no-op
+  if (mode === 'shared') return result;  // no-op
 
   const branchName = resolveBranchName(prefs.branchPattern, runId);
   const repoList = repos.discoverRepos(cwd);
 
   for (const r of repoList) {
-    if (prefs.mode === 'branch') {
+    if (mode === 'branch') {
       result.repos.push(setupBranchOne(r, branchName, prefs.autoPullMain));
-    } else if (prefs.mode === 'worktree') {
+    } else if (mode === 'worktree') {
       result.repos.push(setupWorktreeOne(r, branchName, prefs.worktreeRoot, runId, prefs.autoPullMain));
     }
   }
@@ -253,17 +345,19 @@ function setupForRun(cwd, runId, opts) {
 function cleanupForRun(cwd, runId, opts) {
   opts = opts || {};
   const prefs = readIsolationPrefs(cwd);
-  const result = { mode: prefs.mode, repos: [] };
+  const eff = resolveEffectiveMode(cwd);   // symmetry — cleanup targets the SAME effective mode
+  const mode = eff.mode;
+  const result = { mode, user_mode: eff.user_mode, elevated: eff.elevated, elevation_reason: eff.elevation_reason, repos: [] };
 
-  if (prefs.mode === 'shared') return result;
+  if (mode === 'shared') return result;
 
   const branchName = resolveBranchName(prefs.branchPattern, runId);
   const repoList = repos.discoverRepos(cwd);
 
   for (const r of repoList) {
-    if (prefs.mode === 'branch') {
+    if (mode === 'branch') {
       result.repos.push(cleanupBranchOne(r, branchName));
-    } else if (prefs.mode === 'worktree') {
+    } else if (mode === 'worktree') {
       if (!prefs.worktreeCleanupOnComplete) {
         result.repos.push({ path: r, status: 'skipped (worktree_cleanup_on_complete=false)' });
         continue;
@@ -296,22 +390,26 @@ function cliMain() {
   const args = parseArgs(process.argv.slice(2));
   const cwd  = args.cwd || process.cwd();
 
-  if (args.help || (!args.setup && !args.cleanup && !args.prefs)) {
+  if (args.help || (!args.setup && !args.cleanup && !args.prefs && !args['effective-mode'])) {
     process.stdout.write(`forge-isolation — setup/cleanup branch + worktree modes
 
 Flags:
   --setup --run <id>     setup branch or worktree per repo (idempotent)
   --cleanup --run <id>   cleanup (checkout main / remove worktree)
-  --prefs                print resolved prefs
+  --prefs                print resolved forge_isolation prefs
+  --effective-mode       print resolveEffectiveMode JSON (git-free; shows require_worktree elevation)
   --cwd <path>           override working directory
 
-Reads prefs from forge_isolation: block (cascade user → repo → local).
+Reads prefs from forge_isolation: + workers.require_worktree (cascade user → repo → local).
+--setup/--cleanup JSON carry elevated/elevation_reason/user_mode.
 `);
     return;
   }
 
   try {
-    if (args.prefs) {
+    if (args['effective-mode']) {
+      process.stdout.write(JSON.stringify(resolveEffectiveMode(cwd), null, 2) + '\n');
+    } else if (args.prefs) {
       process.stdout.write(JSON.stringify(readIsolationPrefs(cwd), null, 2) + '\n');
     } else if (args.setup) {
       const r = setupForRun(cwd, args.run);
@@ -330,6 +428,7 @@ if (require.main === module) cliMain();
 
 module.exports = {
   setupForRun, cleanupForRun, readIsolationPrefs,
+  resolveEffectiveMode, detectExternalWriteEngine, resolveRequireWorktree,
   resolveBranchName, gitDefaultBranch, gitCurrentBranch,
   gitHasOriginRemote, fetchDefaultBranch,
 };

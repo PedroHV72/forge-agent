@@ -5251,7 +5251,7 @@ function smokePrefsMigration() {
 }
 
 // ── Section 42: prefs viewer + doctor prefs-check (whole-system read side) ─
-// Binds the S06 read-side surface end to end: the viewer's 89-knob catalog
+// Binds the S06 read-side surface end to end: the viewer's 90-knob catalog
 // (state·value·layer·description, no drift against the schema) and the three
 // doctor prefs-check primitives (stale-catalog --diff, the parse-error flag
 // file contract, and validatePrefs warnings surfaced via --resolved
@@ -5266,7 +5266,7 @@ function smokePrefsViewerDoctor() {
   const migrate = require('./forge-prefs-migrate.js');
   const schema = engine.loadSchema();
 
-  // (a) Viewer: 89-knob coverage, activation, and no-drift against schema.
+  // (a) Viewer: 90-knob coverage, activation, and no-drift against schema.
   const project = mkTmp('prefs-viewer');
   const home = path.join(project, 'home');
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
@@ -5278,7 +5278,7 @@ function smokePrefsViewerDoctor() {
     const setResult = migrate.setPreference(project, 'review.rounds=3', { layer: 'local', create: true });
     assert(setResult.status === 'set', '(a) setPreference activates review.rounds=3 locally for the viewer fixture', JSON.stringify(setResult));
     const catalog = view.buildCatalog(project);
-    assert(catalog.knobs.length === 89, '(a) viewer lists all 89 knobs', `got ${catalog.knobs.length}`);
+    assert(catalog.knobs.length === 90, '(a) viewer lists all 90 knobs', `got ${catalog.knobs.length}`);
     const sections = new Set(catalog.knobs.map((knob) => knob.section));
     assert(sections.size === 39, '(a) viewer covers all 39 sections', JSON.stringify([...sections]));
     const rounds = catalog.knobs.find((knob) => knob.path === 'review.rounds');
@@ -6832,6 +6832,135 @@ function smokeSchemaExtraction() {
   pass('(final) Section 52: schema files, single-source wiring, installed layout, additive protocol, and installers verified (baseline 1248)');
 }
 
+// ── Section 53: require_worktree per-engine elevation regression guard ───────
+// S03/M014: resolveEffectiveMode elevates shared→worktree at activation when an
+// external write-engine (codex/gpt/gemini) is configured for execute-task. The
+// resolver matrix is exercised through prefs fixtures + resolveEffectiveMode —
+// NO real git (cheap, deterministic). Runs under withHermeticHome so a global
+// ~/.claude routing: block on the host cannot pollute the claude-only cases.
+function smokeRequireWorktree() {
+  process.stdout.write('\n▸ Section 53: require_worktree per-engine elevation\n');
+  const iso = require('./forge-isolation.js');
+
+  // Fixture: writes forge_isolation:/workers:/routing: to .gsd/prefs.local.md.
+  const mk = (body) => {
+    const dir = mkTmp('require-worktree');
+    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), body, 'utf8');
+    return dir;
+  };
+  const iso_ = (mode) => 'forge_isolation:\n  mode: ' + mode + '\n';
+
+  withHermeticHome(() => {
+    // (a) shared + workers.execute-task: codex + auto → elevated worktree.
+    const a = iso.resolveEffectiveMode(mk(iso_('shared') + 'workers:\n  execute-task: codex\n  require_worktree: auto\n'));
+    assert(a.elevated === true && a.mode === 'worktree' && a.user_mode === 'shared',
+      '(a) shared + codex worker + auto → elevated worktree', JSON.stringify(a));
+    assert(a.elevation_reason === 'require_worktree:auto workers.execute-task:codex' && a.write_engine === 'workers.execute-task:codex',
+      '(a) elevation_reason + write_engine name the codex signal', JSON.stringify(a));
+
+    // (b) shared + gpt id in routing executor + auto → elevated.
+    const b = iso.resolveEffectiveMode(mk(iso_('shared') + 'routing:\n  backend:\n    executor:\n      standard: [claude-sonnet-5, gpt-5.6]\nworkers:\n  require_worktree: auto\n'));
+    assert(b.elevated === true && b.mode === 'worktree',
+      '(b) shared + gpt routing executor + auto → elevated', JSON.stringify(b));
+    assert(/routing\.backend\.executor\.standard:gpt/.test(b.elevation_reason),
+      '(b) elevation_reason names the routing gpt cell', JSON.stringify(b));
+
+    // (b2) gemini routing (false-positive tolerated — bias toward detection).
+    const b2 = iso.resolveEffectiveMode(mk(iso_('shared') + 'routing:\n  frontend:\n    executor:\n      standard: [agy/gemini-3.1-pro]\nworkers:\n  require_worktree: auto\n'));
+    assert(b2.elevated === true && /:gemini/.test(b2.elevation_reason),
+      '(b2) shared + gemini routing executor + auto → elevated (generous detection)', JSON.stringify(b2));
+
+    // (c) shared + claude-only routing/workers + auto → NOT elevated.
+    const c = iso.resolveEffectiveMode(mk(iso_('shared') + 'routing:\n  backend:\n    executor:\n      standard: [claude-opus-4-8]\nworkers:\n  execute-task: claude\n  require_worktree: auto\n'));
+    assert(c.elevated === false && c.mode === 'shared',
+      '(c) shared + claude-only + auto → stays shared (no false-negative concern here)', JSON.stringify(c));
+
+    // (d) worktree user mode + any write-engine → no-op (already isolated).
+    const d = iso.resolveEffectiveMode(mk(iso_('worktree') + 'workers:\n  execute-task: codex\n  require_worktree: auto\n'));
+    assert(d.elevated === false && d.mode === 'worktree' && d.user_mode === 'worktree',
+      '(d) worktree user mode + codex → elevated:false (no-op)', JSON.stringify(d));
+
+    // (e) require_worktree: false + codex → NEVER elevate (byte-identical invariant).
+    const e = iso.resolveEffectiveMode(mk(iso_('shared') + 'workers:\n  execute-task: codex\n  require_worktree: false\n'));
+    assert(e.elevated === false && e.mode === 'shared',
+      '(e) false + codex write-engine → never elevate (invariant)', JSON.stringify(e));
+
+    // (f) require_worktree: true → always worktree, from shared AND from branch.
+    const f1 = iso.resolveEffectiveMode(mk(iso_('shared') + 'workers:\n  require_worktree: true\n'));
+    assert(f1.elevated === true && f1.mode === 'worktree' && f1.user_mode === 'shared',
+      '(f) true + shared (claude-only) → elevated worktree', JSON.stringify(f1));
+    const f2 = iso.resolveEffectiveMode(mk(iso_('branch') + 'workers:\n  require_worktree: true\n'));
+    assert(f2.elevated === true && f2.mode === 'worktree' && f2.user_mode === 'branch',
+      '(f) true + branch → elevated worktree', JSON.stringify(f2));
+
+    // (g) branch + codex + auto → NOT elevated (auto elevation scoped to shared).
+    const g = iso.resolveEffectiveMode(mk(iso_('branch') + 'workers:\n  execute-task: codex\n  require_worktree: auto\n'));
+    assert(g.elevated === false && g.mode === 'branch',
+      '(g) branch + codex + auto → not elevated (auto scoped to shared)', JSON.stringify(g));
+
+    // (h) detectExternalWriteEngine unit: codex/gpt/gemini detected, claude not.
+    const hCodex = iso.detectExternalWriteEngine(mk('workers:\n  execute-task: codex\n'));
+    assert(hCodex.detected === true && hCodex.reason === 'workers.execute-task:codex',
+      '(h) detect: workers.execute-task:codex → detected', JSON.stringify(hCodex));
+    const hGpt = iso.detectExternalWriteEngine(mk('routing:\n  backend:\n    executor:\n      standard: [gpt-5.6]\n'));
+    assert(hGpt.detected === true && /:gpt/.test(hGpt.reason),
+      '(h) detect: routing gpt executor → detected', JSON.stringify(hGpt));
+    const hGem = iso.detectExternalWriteEngine(mk('routing:\n  backend:\n    executor:\n      standard: [agy/gemini-3.1-pro]\n'));
+    assert(hGem.detected === true && /:gemini/.test(hGem.reason),
+      '(h) detect: routing gemini executor → detected', JSON.stringify(hGem));
+    const hClaude = iso.detectExternalWriteEngine(mk('workers:\n  execute-task: claude\nrouting:\n  backend:\n    executor:\n      standard: [claude-opus-4-8]\n'));
+    assert(hClaude.detected === false && hClaude.reason === null,
+      '(h) detect: claude-only workers+routing → not detected', JSON.stringify(hClaude));
+
+    // (i) require_worktree fallback: invalid/absent → auto (default).
+    assert(iso.resolveRequireWorktree(mk('workers:\n  require_worktree: bogus\n')) === 'auto',
+      '(i) invalid require_worktree → auto', 'bogus');
+    assert(iso.resolveRequireWorktree(mk(iso_('shared'))) === 'auto',
+      '(i) absent require_worktree → auto (default)', 'absent');
+  });
+
+  // (j) CLI --effective-mode prints the JSON git-free (spot-check).
+  withHermeticHome(({ env }) => {
+    const dir = mk(iso_('shared') + 'workers:\n  execute-task: codex\n  require_worktree: auto\n');
+    const out = runScript('forge-isolation.js', ['--effective-mode', '--cwd', dir], { env });
+    let parsed = null;
+    try { parsed = JSON.parse(out.stdout); } catch {}
+    assert(parsed && parsed.elevated === true && parsed.mode === 'worktree',
+      '(j) --effective-mode CLI prints elevated worktree JSON', out.stdout.slice(0, 200));
+  });
+
+  // (k) setup/cleanup JSON contract gains elevated/elevation_reason/user_mode.
+  const isoSource = fs.readFileSync(path.join(SCRIPTS, 'forge-isolation.js'), 'utf8');
+  assert(/resolveEffectiveMode/.test(isoSource) && /elevation_reason:[ \t]*eff\.elevation_reason/.test(isoSource),
+    '(k) setupForRun/cleanupForRun consume resolveEffectiveMode + carry elevation_reason');
+  assert(/resolveEffectiveMode,[ \t]*detectExternalWriteEngine,[ \t]*resolveRequireWorktree/.test(isoSource),
+    '(k) three resolvers exported from module.exports');
+
+  // (l) knob-count: require_worktree lands under existing workers section.
+  const engine = require('./forge-prefs.js');
+  const view = require('./forge-prefs-view.js');
+  withHermeticHome(() => {
+    const project = mkTmp('require-worktree-catalog');
+    const catalog = view.buildCatalog(project);
+    assert(catalog.knobs.length === 90, '(l) viewer lists all 90 knobs (require_worktree added)', `got ${catalog.knobs.length}`);
+    assert(new Set(catalog.knobs.map((k) => k.section)).size === 39,
+      '(l) section count stays 39 (require_worktree under existing workers)', '');
+    const rw = catalog.knobs.find((k) => k.path === 'workers.require_worktree');
+    assert(!!rw && rw.section === 'workers', '(l) require_worktree catalogued under workers', JSON.stringify(rw));
+    const schema = engine.loadSchema();
+    assert(schema.properties.workers.properties.require_worktree
+        && schema.properties.workers.properties.require_worktree.default === 'auto',
+      '(l) schema workers.require_worktree default auto');
+  });
+
+  // (m) scaffold present in forge-agent-prefs.md § Workers Settings.
+  const prefsDoc = fs.readFileSync(path.join(path.dirname(SCRIPTS), 'forge-agent-prefs.md'), 'utf8');
+  assert(/require_worktree:[ \t]*auto/.test(prefsDoc) && /resolveEffectiveMode/.test(prefsDoc),
+    '(m) forge-agent-prefs.md scaffolds require_worktree + names resolveEffectiveMode');
+
+  pass('(final) Section 53: require_worktree per-engine elevation — resolver matrix, detect unit, CLI, contract fields, knob-count 90, and scaffold verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -6891,6 +7020,7 @@ async function main() {
     smokeHeartbeatContract();
     smokeSidecarEnvContract();
     smokeSchemaExtraction();
+    smokeRequireWorktree();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

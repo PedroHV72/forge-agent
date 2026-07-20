@@ -366,6 +366,11 @@
           "enum": ["retry-then-fallback", "fallback", "pause-ask"],
           "default": "retry-then-fallback",
           "description": "Política ao falhar o sidecar codex. retry-then-fallback (default): Layer-1 retenta o mesmo codex em erro transiente (S02) e só então cai no fallback Claude. fallback: pula o Layer-1 (comportamento pré-S02). pause-ask: retenta transiente e, SÓ na exaustão, pausa + AskUserQuestion (interativo) ou degrada a fallback + evento sidecar-pause-degraded (headless). Valor inválido cai em retry-then-fallback."
+        },
+        "require_worktree": {
+          "type": ["string", "boolean"],
+          "default": "auto",
+          "description": "Elevação estática de isolamento por engine de escrita, resolvida na ativação por scripts/forge-isolation.js resolveEffectiveMode. auto (default): eleva forge_isolation.mode shared→worktree quando um engine externo de escrita (codex via workers.execute-task, ou família gpt/gemini em routing.<domain>.executor) é resolvido p/ execute-task; branch sob auto NÃO eleva. true: sempre exige worktree (eleva shared/branch→worktree). false: nunca eleva — byte-idêntico ao comportamento atual. Paths read-only (plan-slice Branch D, review challenger) não disparam elevação. Falso-positivo aceitável, falso-negativo não."
         }
       }
     },

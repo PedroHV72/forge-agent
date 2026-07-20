@@ -478,6 +478,7 @@ workers:
   timeout: 1800            # segundos — teto do sidecar codex antes do SIGKILL
   codex_model:             # unset = default do codex-cli; ex.: gpt-5.6-sol
   sidecar_on_failure: retry-then-fallback   # retry-then-fallback | fallback | pause-ask (default retry-then-fallback)
+  require_worktree: auto     # auto | true | false (default auto) — elevação de isolamento por engine de escrita
 ```
 
 ### Semântica
@@ -508,6 +509,19 @@ workers:
     evento `sidecar-pause-degraded` — nunca trava o loop autônomo.
   - Valor inválido/desconhecido cai em `retry-then-fallback` (warning de `validatePrefs`, não erro
     — mesmo padrão de degradação do enum `workers.execute-task`).
+- `require_worktree` (padrão `auto`): eleva **estaticamente na ativação** o modo de isolamento
+  (`forge_isolation.mode`, § acima) para `worktree` quando um **engine externo de escrita** é
+  resolvido p/ `execute-task` — reusa integralmente a mecânica de worktree do `forge-isolation.js`,
+  sem nova mecânica. Resolvido por `scripts/forge-isolation.js resolveEffectiveMode` (uma vez,
+  no `--setup`; nunca mid-run). Três valores:
+  - `auto` (default) — eleva **somente** de `shared` quando há write-engine detectado
+    (`workers.execute-task == codex`, OU qualquer célula `routing.<domain>.executor.<tier>`
+    de família `gpt`/`gemini`). `branch` sob `auto` **não** eleva.
+  - `true` — sempre exige worktree: eleva `shared`/`branch` → `worktree` mesmo em setup claude-only.
+  - `false` — **nunca** eleva: byte-idêntico ao comportamento atual (invariante behavior-preserving).
+  - Paths **read-only** (`plan-slice` Branch D, review challenger) NÃO disparam elevação — a
+    detecção olha só `execute-task` (escrita). Falso-positivo de elevação é aceitável (eleva com
+    warning); falso-negativo NÃO — a heurística é generosa. Um `worktree` já configurado é no-op.
 - **`plan-milestone` NÃO é coberto** por este eixo (locked) — permanece sempre no tier `max`
   (Fable), independente do que este bloco configure. Nenhuma outra fase (`discuss-*`,
   `research-*`, `complete-*`, `memory-extract`) é routável por `workers:`.
