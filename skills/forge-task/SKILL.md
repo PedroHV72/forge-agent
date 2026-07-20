@@ -58,19 +58,14 @@ If PREFS_EXIT != 0:
     human message + "corrija o JSONC…" hint on stderr.
   - Stop this task run (`/forge-task` is single-shot — no auto-mode to deactivate).
   - Surface to the operator: arquivo + linha + como-corrigir (from errors[]).
+  - When any `errors[]` entry has `code == "legacy-md-without-jsonc"`, re-emit that entry's
+    `errors[].message` VERBATIM, without paraphrasing. Use `shared/forge-prefs-cutover.md § Canonical message`
+    as the message contract; STOP without retry or handoff loops (headless-safe).
   - Do NOT proceed on EFFORT_OPUS=medium / WORKERS_ENGINE=claude / any fallback value.
 ```
 `warnings[]` (advisory schema validation, `⚠` on stderr) do NOT stop — only exit≠0 halts.
 
 The resolved object is `{ok, prefs, errors[], warnings[], layers}`. Throughout this skill **`PREFS` = `.prefs`** from this one call. Store as: `PREFS`, `TOP_MEMORIES`.
-
-**Deprecation warning (once per session):** Inspect `layers` from the `PREFS_JSON`
-already resolved above; do not make another CLI call. If any
-`layers.<name>.source == "md-legacy"`, list that layer's `files` and emit exactly:
-`⚠ Prefs em markdown legado ainda honradas: <files>. Rode /forge-update para migrar para JSONC (remoção do caminho legado na v2.0).`
-Do not emit this warning when every layer is `jsonc` or `absent`. Load context runs
-once per session, so this is naturally one warning per session. Re-warning after
-compaction is accepted because Compaction Resilience re-reads Load context.
 
 **CODING_STANDARDS section extraction:**
 - `CS_LINT` ← `## Lint & Format Commands` section
