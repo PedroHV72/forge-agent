@@ -6336,6 +6336,179 @@ function smokeSidecarPolicyGuard() {
   pass('(final) Section 49: sidecar_on_failure policy gate — default byte-identity, degradation matrix, schema/mirror sync, doc-presence, and HARD-invariant cross-check all verified');
 }
 
+// ── Section 50: heartbeat self-describing contract regression guard ─────────
+// The fenced spec snippet is the implementation under test: this section
+// extracts and executes it rather than maintaining a second threshold/probe
+// implementation in the smoke suite.
+function smokeHeartbeatContract() {
+  process.stdout.write('\n▸ Section 50: heartbeat self-describing contract\n');
+  const REPO = path.dirname(SCRIPTS);
+
+  const MIRRORS = [
+    { rel: 'skills/forge-auto/SKILL.md', label: 'forge-auto' },
+    { rel: 'skills/forge-next/SKILL.md', label: 'forge-next' },
+    { rel: 'skills/forge-task/SKILL.md', label: 'forge-task' },
+  ];
+  const DOCS = [{ rel: 'shared/forge-dispatch.md', label: 'shared/forge-dispatch.md' }, ...MIRRORS];
+  const texts = {};
+  for (const d of DOCS) {
+    const p = path.join(REPO, d.rel);
+    assert(fs.existsSync(p), `(setup) ${d.label} exists on disk`, p);
+    texts[d.rel] = fs.readFileSync(p, 'utf8');
+  }
+
+  // Locate the one canonical fenced block by its stable anchor. Keeping the
+  // extraction structural prevents nearby prose or another JS example from
+  // accidentally becoming the tested contract.
+  const spec = texts['shared/forge-dispatch.md'];
+  const anchor = 'forge-sidecar-liveness';
+  const anchorHits = spec.split(anchor).length - 1;
+  assert(anchorHits === 1,
+    '(setup) canonical liveness snippet anchor exists exactly once in the spec',
+    `anchor hits=${anchorHits}`);
+  const jsBlocks = [...spec.matchAll(/```js\n([\s\S]*?)\n```/g)]
+    .map(match => match[1])
+    .filter(block => block.includes(anchor));
+  assert(jsBlocks.length === 1,
+    '(setup) anchor belongs to exactly one extractable fenced js block',
+    `matching fenced blocks=${jsBlocks.length}`);
+
+  const tmp = mkTmp('heartbeat-contract');
+  try {
+    const snippetPath = path.join(tmp, 'forge-sidecar-liveness.js');
+    fs.writeFileSync(snippetPath, jsBlocks.length === 1 ? jsBlocks[0] + '\n' : '', 'utf8');
+
+    const runFixture = (name, payload, raw) => {
+      const resultPath = path.join(tmp, `${name}.json`);
+      fs.writeFileSync(resultPath, raw === undefined ? JSON.stringify(payload) : raw, 'utf8');
+      const result = spawnSync(process.execPath, [snippetPath, resultPath], {
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+      assert(result.status === 0,
+        `(setup) canonical snippet exits zero for ${name}`,
+        `status=${result.status}; stderr=${result.stderr || ''}`);
+      return (result.stdout || '').trim();
+    };
+
+    // A just-exited child supplies a real dead PID. PID recycling in the few
+    // milliseconds before these probes is practically impossible, and this
+    // remains portable because the child uses the current Node binary.
+    const exited = spawnSync(process.execPath, ['-e', ''], { encoding: 'utf8' });
+    const deadPid = exited.pid;
+    assert(Number.isInteger(deadPid) && deadPid > 0,
+      '(setup) spawned-then-exited child yielded a dead PID', String(deadPid));
+
+    const isoAgo = ms => new Date(Date.now() - ms).toISOString();
+    const base = { status: 'running', pid: 123, adapter_pid: process.pid };
+
+    const freshSelfDescribing = runFixture('a-fresh-self-describing', {
+      ...base,
+      heartbeat_interval_ms: 15000,
+      updated_at: isoAgo(20000),
+    });
+    assert(freshSelfDescribing === 'fresh',
+      '(a) 15s-advertised heartbeat at 20s is fresh (legacy ~9s contract would have killed it)',
+      `token=${freshSelfDescribing}`);
+
+    const staleDead = runFixture('b-stale-dead', {
+      ...base,
+      adapter_pid: deadPid,
+      heartbeat_interval_ms: 15000,
+      updated_at: isoAgo(120000),
+    });
+    assert(staleDead === 'stale-dead',
+      '(b) heartbeat older than dynamic threshold with dead adapter_pid is stale-dead',
+      `token=${staleDead}`);
+
+    const legacyFresh = runFixture('c-absent-field-fresh', {
+      ...base,
+      updated_at: isoAgo(45000),
+    });
+    assert(legacyFresh === 'fresh',
+      '(c) absent heartbeat_interval_ms defaults to 15s: 45s-old beat is fresh',
+      `token=${legacyFresh}`);
+    const legacyStale = runFixture('c-absent-field-stale', {
+      ...base,
+      adapter_pid: deadPid,
+      updated_at: isoAgo(120000),
+    });
+    assert(legacyStale === 'stale-dead',
+      '(c) absent heartbeat_interval_ms defaults to 60s threshold: 120s-old dead beat is stale-dead',
+      `token=${legacyStale}`);
+
+    const staleAlive = runFixture('e-stale-alive', {
+      ...base,
+      heartbeat_interval_ms: 15000,
+      updated_at: isoAgo(120000),
+    });
+    assert(staleAlive === 'stale-alive',
+      '(e) stale heartbeat with live adapter_pid is stale-alive (grace, not immediate kill)',
+      `token=${staleAlive}`);
+    const staleDeadAgain = runFixture('e-stale-dead', {
+      ...base,
+      adapter_pid: deadPid,
+      heartbeat_interval_ms: 15000,
+      updated_at: isoAgo(120000),
+    });
+    assert(staleDeadAgain === 'stale-dead',
+      '(e) same stale heartbeat with dead adapter_pid is stale-dead (kill now)',
+      `token=${staleDeadAgain}`);
+
+    const noHeartbeat = runFixture('bonus-unparseable', null, '{not json');
+    assert(noHeartbeat === 'no-heartbeat',
+      '(bonus) unparseable result-file returns no-heartbeat',
+      `token=${noHeartbeat}`);
+  } finally {
+    cleanup(tmp);
+  }
+
+  // ── (d) legacy-cadence grep-clean over the spec and all mirrors ──
+  const forbidden = ['3s cadence', '~9s', '2–3×', '3× the'];
+  for (const d of DOCS) {
+    for (const pattern of forbidden) {
+      assert(!texts[d.rel].includes(pattern),
+        `(d) ${d.label} is grep-clean for legacy cadence pattern ${JSON.stringify(pattern)}`,
+        d.rel);
+    }
+  }
+
+  // ── Doc-presence, anti-copy, and adapter write-site wiring ──
+  const formula = 'max(heartbeat_interval_ms × 4, 30s)';
+  for (const d of DOCS) {
+    assert(texts[d.rel].includes(formula),
+      `(d) ${d.label} carries the exact dynamic-threshold formula`, d.rel);
+  }
+  for (const m of MIRRORS) {
+    assert(!texts[m.rel].includes(anchor),
+      `(d) ${m.label} does not copy the canonical snippet anchor`, m.rel);
+  }
+  assert(/xllm_liveness_probe/.test(spec),
+    '(e) spec documents the xllm_liveness_probe audit event',
+    'shared/forge-dispatch.md');
+  assert(/grace is \*\*exactly the next existing poll cycle\*\*/.test(spec) && /no new sleep/.test(spec),
+    '(e) spec defines grace as exactly one existing poll cycle with no new sleep',
+    'shared/forge-dispatch.md');
+  assert(/field is \*\*absent or non-positive\*\*[\s\S]*?assume `15000`/.test(spec),
+    '(c) spec documents absent-field default as assume 15s',
+    'shared/forge-dispatch.md');
+
+  const adapterPath = path.join(REPO, 'scripts/forge-xllm.js');
+  const adapter = fs.readFileSync(adapterPath, 'utf8');
+  assert(/(?:const|let|var) HEARTBEAT_INTERVAL_MS = 15000;/.test(adapter),
+    '(a) forge-xllm defines HEARTBEAT_INTERVAL_MS = 15000',
+    'scripts/forge-xllm.js');
+  const fieldWrites = adapter.match(/heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS/g) || [];
+  assert(fieldWrites.length === 4,
+    '(a) all four running-payload sites carry heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS',
+    `count=${fieldWrites.length}`);
+  assert(!/heartbeat_interval_ms: 15000/.test(adapter),
+    '(a) adapter has zero literal 15000 heartbeat write sites',
+    'scripts/forge-xllm.js');
+
+  pass('(final) Section 50: heartbeat self-describing contract — canonical snippet behavior, grep-clean docs, formula/probe/grace presence, and adapter wiring verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -6392,6 +6565,7 @@ async function main() {
     smokeSurgicalReset();
     smokeSidecarLayer1Retry();
     smokeSidecarPolicyGuard();
+    smokeHeartbeatContract();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
