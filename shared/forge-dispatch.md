@@ -1025,7 +1025,56 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
 - `status == "done"` → **success** (state `done`). Go to step 6.
 - `status == "error"` / adapter exit `!= 0` / unparseable JSON → **failure** (state `failed`). Go to Fallback with the matching `reason`.
 
-**Orphan detection.** The heartbeat's `updated_at` is the liveness signal. If `updated_at` is older than a threshold of ~2–3× the heartbeat interval (the S01 heartbeat cadence is 3s → stale beyond ~9s while the process should still be alive), treat the sidecar as an **orphan**: `kill "$pid"` (from the heartbeat) and go to Fallback with `reason: codex-orphan`. The adapter's own `--timeout` (process-group SIGKILL) is the backstop for the case where the orchestrator itself stalls.
+**Orphan detection (canonical — mirrors reference this, never copy).** The heartbeat's `updated_at` is the liveness signal, but staleness alone does **not** authorize a kill — a healthy adapter is silent *between* beats, so the threshold is derived from the adapter's own published cadence and a live-but-silent process is given a grace cycle before being reaped. This is the single canonical procedure; the mirrors (forge-auto / forge-next / forge-task) and smoke Section 50 **reference** the formula and the snippet below **by name** — copying numbers or the snippet body into a mirror is a contract violation (that drift class caused the P0: the adapter beats every 15s but the old spec reaped a sidecar well before a single beat interval had elapsed, so any healthy sidecar was killable between beats).
+
+**Threshold formula (stated once — the anti-drift anchor).**
+
+```
+staleAfter = max(heartbeat_interval_ms × 4, 30000)   ms
+```
+
+`heartbeat_interval_ms` is read from the **running payload** the adapter writes into the result-file (added by S01/T01). When the field is **absent or non-positive** — the NORMAL case for an installed adapter that predates M014, an un-upgraded-adapter + new-orchestrator upgrade window (two known drift incidents), **not** an edge case — assume `15000` → a 60s threshold. **Never** assume the old fixed legacy cadence; there is no hardcoded cadence number anywhere in this contract.
+
+**Canonical liveness snippet.** The orchestrator evaluates staleness by executing this exact block (result-file path as `argv[2]`). It reads the running payload, applies the formula, and prints **exactly one** token — `fresh | stale-dead | stale-alive | no-heartbeat` — which the poll loop maps to an action via the decision table below. Probe target is `adapter_pid` (the heartbeat writer, not the child `pid`):
+
+```js
+// forge-sidecar-liveness — canonical (M014 S01)
+// Usage: node <this> <result-file>  →  prints exactly one of: fresh | stale-dead | stale-alive | no-heartbeat
+const fs = require('fs');
+let hb;
+try { hb = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')); }
+catch { console.log('no-heartbeat'); process.exit(0); }              // unparseable JSON → no-heartbeat
+if (!hb || typeof hb.updated_at !== 'string') { console.log('no-heartbeat'); process.exit(0); }
+const interval = Number(hb.heartbeat_interval_ms);
+const beat = interval > 0 ? interval : 15000;                        // absent/invalid → 15000 (NORMAL un-upgraded path)
+const staleAfter = Math.max(beat * 4, 30000);                        // = max(heartbeat_interval_ms × 4, 30s)
+const age = Date.now() - Date.parse(hb.updated_at);
+if (Number.isNaN(age)) { console.log('no-heartbeat'); process.exit(0); }   // unparseable updated_at → no-heartbeat
+if (age <= staleAfter) { console.log('fresh'); process.exit(0); }    // within threshold → keep polling
+try {
+  process.kill(hb.adapter_pid, 0);                                   // signal 0 = existence probe (no signal sent)
+  console.log('stale-alive');                                        // no throw → process is alive
+} catch (e) {
+  if (e.code === 'ESRCH') console.log('stale-dead');                 // no such process → dead
+  else console.log('stale-alive');                                   // EPERM (POSIX = alive) or ANY other error → treat as alive
+}
+```
+
+Probe contract (explicit): `process.kill(adapter_pid, 0)` returning without throwing, **or** throwing `EPERM`, means **alive**; `ESRCH` means **dead**; any other error is **inconclusive → treat as alive**. On doubt the orchestrator never kills — the adapter's own `--timeout` (process-group SIGKILL) is the backstop for a genuinely-hung process, and killing a live worker mid-task is the more expensive mistake.
+
+**Decision table (token → poll-loop action).**
+
+| snippet token | condition | action |
+|---------------|-----------|--------|
+| `fresh` | `age ≤ staleAfter` | keep polling; **clear** `GRACE` |
+| `stale-dead` | stale **and** probe → `ESRCH` | `kill "$pid"` (child pid from the heartbeat), `REASON=codex-orphan`, append `xllm_liveness_probe` (`probe:"dead"`, `decision:"kill"`), go to Fallback |
+| `stale-alive`, `GRACE` unset | stale but probe → alive | set `GRACE=1`, append `xllm_liveness_probe` (`probe:"alive"`, `decision:"grace-period"`), keep polling — grace is **exactly the next existing poll cycle** (~5–10s, LOCKED), **no new sleep** |
+| `stale-alive`, `GRACE=1` | stale **and** alive on the following cycle too | `kill "$pid"`, `REASON=codex-orphan`, append `xllm_liveness_probe` (`probe:"alive"`, `decision:"kill"`), go to Fallback |
+| `no-heartbeat` | unparseable JSON / absent `updated_at` | existing unparseable-JSON handling (step 5 → Fallback `reason: codex-invalid-json`), **unchanged** |
+
+**Invariant.** The probe **defers** the kill, it never **replaces** the staleness check: it runs *only after* `age > staleAfter`, and buys a live adapter exactly one grace cycle — a live-but-silent adapter still beyond grace **is** killed (`REASON=codex-orphan`). A fresh heartbeat at any point clears `GRACE`.
+
+**Audit event.** On every stale verdict append one line to `.gsd/forge/events.jsonl` (the file's existing event-line idiom): `{"event":"xllm_liveness_probe","probe":"dead"|"alive","decision":"kill"|"grace-period","heartbeat_age_ms":<age>,"adapter_alive":<bool>,"unit":"execute-task/{T##}","ts":"<ISO>"}`. `grace-period` fires on the first `stale-alive`; `kill` fires on `stale-dead` and on the second consecutive `stale-alive`.
 
 **6. Success — orchestrator assembles the artifacts (`done` state).** First re-read the durable state from disk (the poll loop crossed multiple Bash invocations — shell vars are gone):
 
@@ -1089,7 +1138,7 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode plan \
 # ↑ dispatched with the Bash tool's run_in_background: true
 ```
 
-**4. Poll the result-file (`polling` state).** Identical to Branch C step 5: read `$RESULT_FILE` every ~5–10s, honor the heartbeat `{status, pid, adapter_pid, started_at, updated_at}`, apply the same orphan detection (`updated_at` stale beyond ~2–3× the heartbeat interval → `kill "$pid"` → Fallback `reason: codex-orphan`). `status == "done"` → step 5; `status == "error"` / exit `!= 0` / unparseable JSON → Fallback with the matching `reason`.
+**4. Poll the result-file (`polling` state).** Identical to Branch C step 5: read `$RESULT_FILE` every ~5–10s, honor the heartbeat `{status, pid, adapter_pid, started_at, updated_at}`, and apply the **identical canonical orphan detection of Branch C step 5** — the same `staleAfter = max(heartbeat_interval_ms × 4, 30000)` formula, the same canonical liveness snippet, and the same probe + grace decision table (`stale-dead` or a second `stale-alive` → `kill "$pid"` → Fallback `reason: codex-orphan`). Branch D restates no numbers of its own. `status == "done"` → step 5; `status == "error"` / exit `!= 0` / unparseable JSON → Fallback with the matching `reason`.
 
 **5. Success — orchestrator materializes the plans (`done` state).** Re-read the durable state from disk (shell vars are gone), then read the result JSON and **write** each plan file into `.gsd/**` (creating dirs). The adapter already validated every task plan's `must_haves` **in-sidecar** (S01/T01 — throw → exit 2 before `status: done`), so a `status: done` result carries only schema-valid plans; the orchestrator trusts the exit but the downstream symbol-check/plan-check gates still run as a second advisory layer.
 
@@ -1197,7 +1246,7 @@ Triggers (`reason` value):
 | `codex-exit-nonzero` | adapter exit `!= 0` (binary absent, auth, quota — cause on stderr; **plan: also `must_haves` invalid in-sidecar → exit 2**). With `error_class: transient` this trigger routes through **§ Layer-1 transient retry** first — the row here fires only after that retry loop is exhausted (or `error_class: terminal`). | both |
 | `codex-timeout` | adapter hit its `--timeout` backstop. **Always `error_class: terminal`** (LOCKED — forced regardless of message content) → skips § Layer-1 entirely, fires this trigger directly. | both |
 | `codex-invalid-json` | result-file present but unparseable / schema-invalid. Routes through § Layer-1 first when a readable `error_class: transient` is present; otherwise fires directly (unparseable JSON has no `error_class` to read → defaults `terminal`). | both |
-| `codex-orphan` | heartbeat `updated_at` stale beyond threshold → killed. **Always terminal** (an orphaned/hung process is never retried in place) → skips § Layer-1, fires this trigger directly. | both |
+| `codex-orphan` | heartbeat `updated_at` stale beyond the dynamic threshold (`max(heartbeat_interval_ms × 4, 30s)`, per Branch C step 5's canonical orphan detection) **and** the liveness probe/grace expired (probe → dead, or a second consecutive `stale-alive`) → killed. **Always terminal** (an orphaned/hung process is never retried in place) → skips § Layer-1, fires this trigger directly. | both |
 | `surgical-reset-overlap` | `forge-surgical-reset.js --reset` exit 3 — a pre-dirty path's current hash diverged from its snapshot hash (the sidecar ALSO wrote a pre-existing dirty file); **NOTHING was reset**, not even the non-overlapped paths | execute-task only (Branch C) |
 | `verified-reset-failed` | `forge-surgical-reset.js --reset` exit 2 — post-reset verification found a leftover change that isn't an intact pre-dirty path | execute-task only (Branch C) |
 
