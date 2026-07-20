@@ -5251,7 +5251,7 @@ function smokePrefsMigration() {
 }
 
 // ── Section 42: prefs viewer + doctor prefs-check (whole-system read side) ─
-// Binds the S06 read-side surface end to end: the viewer's 87-knob catalog
+// Binds the S06 read-side surface end to end: the viewer's 88-knob catalog
 // (state·value·layer·description, no drift against the schema) and the three
 // doctor prefs-check primitives (stale-catalog --diff, the parse-error flag
 // file contract, and validatePrefs warnings surfaced via --resolved
@@ -5266,7 +5266,7 @@ function smokePrefsViewerDoctor() {
   const migrate = require('./forge-prefs-migrate.js');
   const schema = engine.loadSchema();
 
-  // (a) Viewer: 87-knob coverage, activation, and no-drift against schema.
+  // (a) Viewer: 88-knob coverage, activation, and no-drift against schema.
   const project = mkTmp('prefs-viewer');
   const home = path.join(project, 'home');
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
