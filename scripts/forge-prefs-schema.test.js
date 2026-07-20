@@ -21,7 +21,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { legacyReadFile, loadSchema, validatePrefs } = require('./forge-prefs.js');
+const { loadSchema, validatePrefs } = require('./forge-prefs.js');
+const { legacyReadFile } = require('./forge-prefs-legacy.js');
 const { DEFAULT_THRESHOLDS } = require('./forge-context-monitor.js');
 
 let passed = 0;

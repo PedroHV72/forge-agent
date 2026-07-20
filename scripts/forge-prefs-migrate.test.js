@@ -18,7 +18,8 @@ const {
   ensureGitignore,
   setPreference,
 } = require('./forge-prefs-migrate.js');
-const { parseJsonc, loadSchema, legacyReadLayer, deepMerge } = require('./forge-prefs.js');
+const { parseJsonc, loadSchema, deepMerge } = require('./forge-prefs.js');
+const { legacyReadLayer } = require('./forge-prefs-legacy.js');
 const { generateScaffold } = require('./forge-prefs-scaffold.js');
 
 let passes = 0;

@@ -23,8 +23,8 @@
 //   4 — legacy markdown parse error (STOP)
 //   1 — unexpected error / bad arguments
 //
-// Reuse contract (D1): every extractor comes from forge-prefs.js
-// (legacyReadLayer / readPrefs / parseJsonc / deepMerge) and every catalog
+// Reuse contract (D1): the Markdown extractor comes from forge-prefs-legacy.js;
+// parseJsonc / deepMerge and every catalog
 // primitive from forge-prefs-scaffold.js (generateScaffold / segmentCatalog /
 // off-marker grammar). This module declares ZERO markdown-extraction regexes.
 //
@@ -38,13 +38,12 @@ const { execFileSync } = require('child_process');
 
 const {
   parseJsonc,
-  legacyReadLayer,
   preferenceLayerDescriptors,
-  readPrefs,
   deepMerge,
   loadSchema,
   validatePrefs,
 } = require('./forge-prefs.js');
+const { legacyReadLayer } = require('./forge-prefs-legacy.js');
 
 const {
   generateScaffold,
@@ -205,17 +204,13 @@ function existingFiles(files) {
   });
 }
 
-// Resolve the current on-disk state of both layers with readPrefs semantics
+// Resolve the current on-disk state of both layers with composed semantics
 // (jsonc shadows md). Used for the merged capture and the post-write
 // re-verify. With default dirs the CLI path uses the REAL readPrefs(cwd);
 // with test overrides (globalDir/localDir) it composes the identical shape
 // via the same exported primitives (parseJsonc / legacyReadLayer / deepMerge).
 function resolveCurrent(cwd, opts) {
   const options = opts || {};
-  if (!options.globalDir && !options.localDir) {
-    const result = readPrefs(cwd);
-    return { prefs: result.prefs, errors: result.errors };
-  }
   const errors = [];
   const layers = layerDescriptors(cwd, options).map((layer) => {
     if (existingFiles([layer.jsoncPath]).length === 1) {

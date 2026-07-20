@@ -3,7 +3,7 @@
 
 // Standalone, zero-dependency adversarial runner for the JSONC state machine.
 const { parseJsonc, stripJsonc, readPrefs, readPrefsCached, validatePrefs, buildProvenance } = require('./forge-prefs.js');
-const { legacyReadFile, legacyReadLayer } = require('./forge-prefs.js');
+const { legacyReadFile, legacyReadLayer } = require('./forge-prefs-legacy.js');
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
