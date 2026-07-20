@@ -6660,6 +6660,73 @@ function smokePrefsConsumers() {
   pass('(final) Section 55: prefs consumer guards — skill posture, doctor migration, hook telemetry, statusline badge, and Section 54 HARD-invariant verified');
 }
 
+// ── Section 56: S04 grep-zero and canonical cutover guards ─────────────────
+function smokePrefsCutoverGuards() {
+  process.stdout.write('\n▸ Section 56: prefs cutover — grep-zero, no dual-read, canonical message\n');
+  const REPO = path.dirname(SCRIPTS);
+  const allowlist = new Set([
+    'CHANGELOG.md', 'scripts/forge-prefs.js', 'scripts/forge-prefs-legacy.js',
+    'scripts/forge-prefs-migrate.js', 'scripts/forge-prefs.test.js',
+    'scripts/forge-prefs-migrate.test.js', 'scripts/forge-prefs-schema.test.js',
+    'scripts/forge-routing.test.js', 'scripts/forge-verifier.test.js',
+    'scripts/forge-smoke.js', 'install.sh', 'install.ps1',
+    'commands/forge-update.md', 'shared/forge-prefs-cutover.md',
+    // Existing compatibility entry points are deliberately audited rather
+    // than silently missed by the repository-wide scan.
+    'bin/forge-accounts', 'bin/forge-run', 'bin/forge-status',
+    'skills/forge-doctor/SKILL.md', 'CLAUDE.md',
+  ]);
+  const offenders = [];
+  function walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === '.gsd' || entry.name === 'node_modules' || entry.name.endsWith('.bak')) continue;
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else {
+        let text = '';
+        try { text = fs.readFileSync(file, 'utf8'); } catch { return; }
+        if (/forge-agent-prefs\.md/i.test(text)) {
+          const rel = path.relative(REPO, file);
+          if (!allowlist.has(rel)) offenders.push(rel);
+        }
+      }
+    }
+  }
+  walk(REPO);
+  assert(offenders.length === 0,
+    '(a) forge-agent-prefs.md só aparece na allowlist sancionada', offenders.join(', '));
+
+  const dualReadTargets = [
+    'shared/forge-dispatch.md', 'shared/forge-review.md',
+    'shared/forge-plan-gate.md', 'shared/forge-tiers.md',
+    'skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md',
+    'skills/forge-task/SKILL.md', 'skills/forge-probe/SKILL.md',
+    'skills/forge-prefs/SKILL.md', 'commands/forge-init.md',
+  ];
+  const dualReadHits = dualReadTargets.filter((rel) =>
+    /dual-read/i.test(fs.readFileSync(path.join(REPO, rel), 'utf8')));
+  assert(dualReadHits.length === 0,
+    '(b) dual-read ausente das specs e skills sancionadas', dualReadHits.join(', '));
+
+  const loopSkills = ['forge-auto', 'forge-next', 'forge-task'];
+  for (const skill of loopSkills) {
+    const text = fs.readFileSync(path.join(REPO, 'skills', skill, 'SKILL.md'), 'utf8');
+    assert(/never/i.test(text) && /cascade/i.test(text) && /scripts\/forge-prefs\.js/.test(text),
+      `(c) ${skill}/SKILL.md preserva MEM001 (never + cascade + scripts/forge-prefs.js)`);
+  }
+
+  const changelog = fs.readFileSync(path.join(REPO, 'CHANGELOG.md'), 'utf8');
+  const v2 = changelog.slice(0, changelog.indexOf('\n## v1.35.0'));
+  const canonical = fs.readFileSync(path.join(REPO, 'shared/forge-prefs-cutover.md'), 'utf8');
+  const commandFormula = canonical.match(/node \"\{command\}\" --cwd \"\{cwd\}\"/);
+  assert(v2.includes('forge-prefs-migrate.js') && v2.includes('--cwd'),
+    '(d) CHANGELOG v2.0.0 cita forge-prefs-migrate.js + --cwd');
+  assert(commandFormula && v2.includes(commandFormula[0]),
+    '(d) CHANGELOG cita a fórmula exata da mensagem canônica', commandFormula && commandFormula[0]);
+
+  pass('(final) Section 56: grep-zero allowlist, dual-read absence, MEM001 anti-cascade, and canonical CHANGELOG command verified');
+}
+
 // ── Section 50: heartbeat self-describing contract regression guard ─────────
 // The fenced spec snippet is the implementation under test: this section
 // extracts and executes it rather than maintaining a second threshold/probe
@@ -7382,6 +7449,7 @@ async function main() {
     smokeSidecarPolicyGuard();
     smokePrefsChokepoints();
     smokePrefsConsumers();
+    smokePrefsCutoverGuards();
     smokeHeartbeatContract();
     smokeSidecarEnvContract();
     smokeSchemaExtraction();

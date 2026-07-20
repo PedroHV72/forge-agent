@@ -1,3 +1,49 @@
+## v2.0.0 (2026-07-20) — Corte do md-legacy de prefs: JSONC-only
+
+### BREAKING
+
+Preferências em Markdown não são mais lidas. O engine (`forge-prefs.js`) dá
+hard-stop estruturado `legacy-md-without-jsonc` quando uma camada contém
+Markdown sem o catálogo JSONC correspondente; o template
+`forge-agent-prefs.md` também foi removido do repositório.
+
+O comando de migração é o da mensagem canônica em
+`shared/forge-prefs-cutover.md § Canonical message` — use exatamente a
+fórmula `node "{command}" --cwd "{cwd}"` (com `{command}` substituído pelo
+caminho de `forge-prefs-migrate.js` e `{cwd}` pelo workspace). O migrator
+converte as camadas global e local e sempre preserva o original em `.bak`.
+
+O caminho de upgrade comum, sem susto, é rodar `install.sh --update` ou
+`/forge-update`, que auto-migra a camada global, e `forge-doctor --fix`, que
+migra a camada local. O hard-stop é um backstop e o usuário típico não o vê.
+Em workspace já-jsonc não há mudança observável: os bytes permanecem
+idênticos.
+
+### Changed
+
+- Chokepoints de instalação e `/forge-update` agora auto-migram antes de
+  entregar o controle aos consumidores.
+- `forge-doctor --fix` migra a camada local e reporta a mesma mensagem
+  canônica quando a correção não pode ser aplicada.
+- O reader legado real foi realocado para o migrator; engine e skills não
+  emitem mais warnings de depreciação mortos.
+- A documentação foi varrida para manter grep-zero de fontes Markdown
+  legadas e para remover descrições de dual-read.
+
+### Removed
+
+- Template `forge-agent-prefs.md` do repositório.
+- Warnings de depreciação sem efeito no engine e nas skills.
+- Leitura Markdown no engine; a compatibilidade fica restrita à migração.
+
+### Notes
+
+- A entrada canônica e o contrato de erro permanecem em
+  `shared/forge-prefs-cutover.md`; consumidores não devem improvisar outra
+  mensagem ou outro código.
+- A migração é segura para reexecução: o JSONC validado fica ativo e o
+  backup `.bak` conserva o Markdown de origem.
+
 ## v1.35.0 (2026-06-15) — Multi-conta redesenhado: default vs launch, display por identidade, resume run-aware, cross-platform
 
 Revisão estrutural do multi-conta. Tudo backward-compatible (single-account e fluxos `use`/`forge-run` existentes seguem iguais).
@@ -249,5 +295,4 @@ All 9 scripts auto-installed via existing `install.sh` / `install.ps1` globs —
 ### Features
 
 - feat: add CHANGELOG.md generation to release workflow (bfbba43)
-
 
