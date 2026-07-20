@@ -5640,11 +5640,26 @@ function smokeDispatchResolve() {
   }
 
   // ── (g) forge-task Step 4 template emits routing frontmatter hints ──
+  // Text-anchor sliced to the Step 4 planner-template region only (between the
+  // "Write {TASK_ID}-PLAN.md" directive and the "Iron rule:" boundary) so the
+  // assert is mutation-sensitive: generic occurrences of tier:/effort:/domain:
+  // elsewhere in the file must NOT satisfy it.
   {
     const source = fs.readFileSync(path.join(ROOT46, 'skills/forge-task/SKILL.md'), 'utf8');
-    assert(source.includes('tier:'), '(g) forge-task Step 4 template mentions tier:');
-    assert(source.includes('effort:'), '(g) forge-task Step 4 template mentions effort:');
-    assert(source.includes('domain:'), '(g) forge-task Step 4 template mentions domain:');
+    const startAnchor = 'Write {TASK_ID}-PLAN.md';
+    const endAnchor = 'Iron rule:';
+    const startIdx = source.indexOf(startAnchor);
+    const endIdx = source.indexOf(endAnchor, startIdx);
+    assert(startIdx !== -1 && endIdx !== -1 && endIdx > startIdx,
+      '(g) forge-task Step 4 template region found (Write PLAN.md ... Iron rule:)',
+      `startIdx=${startIdx} endIdx=${endIdx}`);
+    const region = startIdx !== -1 && endIdx !== -1 ? source.slice(startIdx, endIdx) : '';
+    assert(/`---`-fenced YAML\s*\nfrontmatter/.test(region),
+      '(g) template region mandates a `---`-fenced YAML frontmatter block', 'directive not found in region');
+    assert(/`tier:`/.test(region), '(g) template region mentions `tier:` frontmatter field');
+    assert(/`effort:`/.test(region), '(g) template region mentions `effort:` frontmatter field');
+    assert(/`domain:`/.test(region) && /Omit `domain:`/.test(region),
+      '(g) template region mentions `domain:` field + the Omit `domain:` rule');
   }
 
   // ── (d) forge-task routes-by-domain: additive win via the shared resolver ──
