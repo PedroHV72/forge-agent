@@ -192,7 +192,7 @@ function parseLegacyRepos(sectionBlock, arrayPaths) {
 // never inside an indented block — legacySectionBlocks only captures
 // `key:\n  indented-content` shapes, so these were silently invisible to the
 // resolver (readers fell back to `key not found` even against a real prefs
-// file). A whitelist (not a generic scanner) is deliberate: `forge-agent-prefs.md`
+// file). A whitelist (not a generic scanner) is deliberate: the legacy catalog
 // also embeds illustrative frontmatter snippets (e.g. `id: T12` / `tier: heavy`
 // inside a fenced ```yaml example) that a generic bare-key-value scan would
 // mis-capture as preference keys — a naive scan was caught corrupting `repo_path`

@@ -188,11 +188,10 @@ const originalHome = process.env.HOME;
 const isolatedHome = path.join(fixtureDir, 'empty-home');
 fs.mkdirSync(isolatedHome);
 process.env.HOME = isolatedHome;
-const { readRoutingConfig } = require('./forge-routing.js');
-const routingIdentity = readRoutingConfig(fixtureDir);
+const routingIdentity = legacyReadLayer([path.join(routingDir, 'claude-agent-prefs.md')]);
 process.env.HOME = originalHome;
-assert(routingIdentity.ok && deepEqual(parsedFixture.prefs.routing, routingIdentity.routing),
-  'legacy routing output is identical to readRoutingConfig for one file');
+assert(routingIdentity.ok && deepEqual(parsedFixture.prefs.routing, routingIdentity.prefs.routing),
+  'legacy routing output is identical to the standalone legacy layer reader');
 
 // ── R2 fix locks — bare scalar wraps, fallback:[a,b] takes list[0] ─────────
 const bareScalarDir = fs.mkdtempSync(path.join(__dirname, '.forge-prefs-test-'));
@@ -206,10 +205,10 @@ assert(deepEqual(bareScalarResult.prefs.routing, { backend: { executor: { standa
 {
   const previousHome = process.env.HOME;
   process.env.HOME = isolatedHome;
-  const expectedBareScalar = readRoutingConfig(bareScalarDir);
+  const expectedBareScalar = legacyReadLayer([bareScalarPath]);
   process.env.HOME = previousHome;
-  assert(expectedBareScalar.ok && deepEqual(expectedBareScalar.routing, bareScalarResult.prefs.routing),
-    'R2: bare-scalar identity matches readRoutingConfig');
+  assert(expectedBareScalar.ok && deepEqual(expectedBareScalar.prefs.routing, bareScalarResult.prefs.routing),
+    'R2: bare-scalar identity matches legacyReadLayer');
 }
 fs.rmSync(bareScalarDir, { recursive: true, force: true });
 
@@ -293,45 +292,38 @@ function write(file, text) {
   fs.writeFileSync(file, text);
 }
 
-const shadowCases = [
-  {
-    name: 'JSONC global and JSONC local shadow their Markdown files',
-    global: 'jsonc', local: 'jsonc', expected: 'local-jsonc',
-  },
-  {
-    name: 'JSONC global shadows Markdown while local uses Markdown',
-    global: 'jsonc', local: 'md', expected: 'local-md',
-  },
-  {
-    name: 'Markdown global is used while JSONC local shadows Markdown',
-    global: 'md', local: 'jsonc', expected: 'local-jsonc',
-  },
-  {
-    name: 'Markdown global and Markdown local are both selected',
-    global: 'md', local: 'md', expected: 'local-md',
-  },
+const layerStates = [
+  ['jsonc-only', 'jsonc', false],
+  ['md-only', 'md-blocked', true],
+  ['md+jsonc', 'jsonc', false],
+  ['absent', 'absent', false],
 ];
 
-for (const scenario of shadowCases) {
-  withPrefsScenario(scenario.name, ({ claude, gsd }) => {
-    // Always place the ignored Markdown files alongside JSONC to prove that
-    // source selection is per layer, never a format mix.
-    write(path.join(claude, 'forge-agent-prefs.md'), 'review:\n  source: global-md\n');
-    write(path.join(gsd, 'claude-agent-prefs.md'), 'review:\n  source: local-md\n');
-    if (scenario.global === 'jsonc') {
+for (const [state, source, blocked] of layerStates) {
+  withPrefsScenario(`hard-stop layer matrix: ${state}`, ({ claude, gsd }) => {
+    if (state === 'jsonc-only' || state === 'md+jsonc') {
       write(path.join(claude, 'forge-agent-prefs.jsonc'), '{"review":{"source":"global-jsonc"}}');
-    }
-    if (scenario.local === 'jsonc') {
       write(path.join(gsd, 'forge-prefs.jsonc'), '{"review":{"source":"local-jsonc"}}');
     }
-  }, (result) => {
-    assert(result.ok, `${scenario.name}: resolves cleanly`);
-    assert(result.layers.global.source === (scenario.global === 'jsonc' ? 'jsonc' : 'md-legacy'),
-      `${scenario.name}: global source is selected format`);
-    assert(result.layers.local.source === (scenario.local === 'jsonc' ? 'jsonc' : 'md-legacy'),
-      `${scenario.name}: local source is selected format`);
-    assert(result.prefs.review.source === scenario.expected,
-      `${scenario.name}: selected files provide the resolved value`);
+    if (state === 'md-only' || state === 'md+jsonc') {
+      write(path.join(claude, 'forge-agent-prefs.md'), 'review:\n  source: global-md\n');
+      write(path.join(gsd, 'claude-agent-prefs.md'), 'review:\n  source: local-md\n');
+      write(path.join(gsd, 'prefs.local.md'), 'review:\n  source: local-personal-md\n');
+    }
+  }, (result, { claude, gsd }) => {
+    assert(result.ok === !blocked, `${state}: resolver ok state follows hard-stop contract`);
+    assert(result.layers.global.source === source && result.layers.local.source === source,
+      `${state}: both layers expose canonical source`);
+    if (blocked) {
+      const names = [path.join(claude, 'forge-agent-prefs.md'), path.join(gsd, 'claude-agent-prefs.md'), path.join(gsd, 'prefs.local.md')];
+      assert(result.errors.length === 2 && result.errors.every((error) => error.code === 'legacy-md-without-jsonc') &&
+        names.every((name) => result.errors.some((error) => error.message.includes(name))) &&
+        result.errors.every((error) => error.message.includes('forge-prefs-migrate.js --cwd')),
+      'md-only: errors name every legacy file and migration command');
+    } else if (state === 'md+jsonc') {
+      assert(result.errors.length === 0 && result.prefs.review.source === 'local-jsonc',
+        'md+jsonc: JSONC shadows Markdown silently');
+    }
   });
 }
 
@@ -376,15 +368,6 @@ withPrefsScenario('routing domains replace atomically', ({ claude, gsd }) => {
     'routing domains not locally supplied remain global');
 });
 
-withPrefsScenario('local legacy pair is merged in order', ({ gsd }) => {
-  write(path.join(gsd, 'claude-agent-prefs.md'), 'review:\n  rounds: 1\n  style: inherited\n');
-  write(path.join(gsd, 'prefs.local.md'), 'review:\n  rounds: 3\n');
-}, (result) => {
-  assert(result.layers.local.source === 'md-legacy', 'local Markdown pair reports legacy source');
-  assert(result.prefs.review.rounds === 3 && result.prefs.review.style === 'inherited',
-    'prefs.local.md is last-wins while retaining earlier local Markdown keys');
-});
-
 withPrefsScenario('broken JSONC reports an error and does not fall back to Markdown', ({ claude, gsd }) => {
   write(path.join(claude, 'forge-agent-prefs.jsonc'), '{"review":{"rounds":5}}');
   write(path.join(gsd, 'forge-prefs.jsonc'), '{\n  "review": {"rounds": 9}\n');
@@ -397,31 +380,17 @@ withPrefsScenario('broken JSONC reports an error and does not fall back to Markd
   assert(result.layers.local.source === 'jsonc', 'broken JSONC still shadows local Markdown');
 });
 
-withPrefsScenario('legacy routing identity matches forge-routing cascade', ({ claude, gsd }) => {
-  write(path.join(claude, 'forge-agent-prefs.md'),
-    'routing:\n  backend:\n    executor:\n      standard: [global]\n');
-  write(path.join(gsd, 'claude-agent-prefs.md'),
-    'routing:\n  backend:\n    planner:\n      heavy: [repo]\n  default:\n    executor:\n      standard: [default]\n');
-  write(path.join(gsd, 'prefs.local.md'),
-    'routing:\n  backend:\n    executor:\n      standard: [local]\n');
+withPrefsScenario('JSONC routing identity matches forge-routing', ({ claude, gsd }) => {
+  write(path.join(claude, 'forge-agent-prefs.jsonc'),
+    '{"routing":{"backend":{"executor":{"standard":["global"]}}}}');
+  write(path.join(gsd, 'forge-prefs.jsonc'),
+    '{"routing":{"backend":{"executor":{"standard":["local"]}}}}');
 }, (actual, { project }) => {
   const expected = require('./forge-routing.js').readRoutingConfig(project);
   assert(expected.ok && deepEqual(actual.prefs.routing, expected.routing),
-    'pure legacy routing is identical to readRoutingConfig');
-  assert(actual.layers.global.source === 'md-legacy' && actual.layers.local.source === 'md-legacy',
-    'routing identity scenario reads Markdown from both layers');
-});
-
-withPrefsScenario('R1: a malformed routing block anywhere in the md cascade drops routing entirely', ({ claude, gsd }) => {
-  write(path.join(claude, 'forge-agent-prefs.md'),
-    'routing:\n  default:\n    executor:\n      standard: [ok]\n');
-  write(path.join(gsd, 'claude-agent-prefs.md'),
-    'routing:\n  backend:\n      executor:\n    standard: [broken]\n');
-}, (result) => {
-  assert(result.ok === false, 'R1: cascade-wide malformed routing block makes resolution not ok');
-  assert(!result.prefs.routing, 'R1: routing is dropped entirely from the merged result, not just the bad file');
-  assert(result.errors.some((error) => /routing-parse-error/.test(error.message)),
-    'R1: an errors[] entry surfaces the routing-parse-error, matching readRoutingConfig semantics');
+    'JSONC routing is identical to readRoutingConfig');
+  assert(actual.layers.global.source === 'jsonc' && actual.layers.local.source === 'jsonc',
+    'routing identity scenario reads JSONC from both layers');
 });
 
 withPrefsScenario('R3: provenance never reports a leaf absent from the atomically-merged routing domain', ({ claude, gsd }) => {
@@ -561,13 +530,13 @@ const oldUserProfile = process.env.USERPROFILE;
 process.env.HOME = cacheHome;
 process.env.USERPROFILE = cacheHome;
 try {
-  write(path.join(cacheRepoA, '.gsd', 'prefs.local.md'), 'review:\n  source: first\n');
+  write(path.join(cacheRepoA, '.gsd', 'forge-prefs.jsonc'), '{"review":{"source":"first"}}');
   const first = readPrefsCached(cacheRepoA);
   const second = readPrefsCached(cacheRepoA);
   assert(first === second && second.prefs.review.source === 'first', 'readPrefsCached hit reuses the in-memory result');
-  write(path.join(cacheRepoA, '.gsd', 'prefs.local.md'), 'review:\n  source: touched\n');
+  write(path.join(cacheRepoA, '.gsd', 'forge-prefs.jsonc'), '{"review":{"source":"touched"}}');
   assert(readPrefsCached(cacheRepoA).prefs.review.source === 'touched', 'readPrefsCached invalidates when a layer changes');
-  write(path.join(cacheRepoB, '.gsd', 'prefs.local.md'), 'review:\n  source: other-cwd\n');
+  write(path.join(cacheRepoB, '.gsd', 'forge-prefs.jsonc'), '{"review":{"source":"other-cwd"}}');
   assert(readPrefsCached(cacheRepoB).prefs.review.source === 'other-cwd', 'readPrefsCached keys entries by cwd');
   const before = fs.readdirSync(path.join(cacheRepoA, '.gsd')).sort();
   readPrefsCached(cacheRepoA);

@@ -73,7 +73,7 @@ routing:
 ## Review Settings
 
 review:
-  mode: on
+  mode: enabled
   rounds: 1
 `;
 
@@ -89,9 +89,6 @@ const LOCAL_MD = `# Local personal prefs
 
 review:
   rounds: 3
-
-my_custom_section:
-  favorite: purple
 
 auto_push: false
 `;
@@ -165,15 +162,12 @@ const userValues = {
   auto_commit: true,
   main_branch: 'main',
   routing: { backend: { execute: { tier: ['standard', 'heavy'], fallback: 'codex' } } },
-  my_custom_section: { favorite: 'purple' },
 };
 const activated = activateValues(scaffold, userValues, schema);
 const activatedParsed = parseJsonc(activated);
 assert(activatedParsed.ok, 'activated catalog parses as JSONC', activatedParsed.error && activatedParsed.error.message);
 assert(deepEqual(resolvedDiff(userValues, activatedParsed.value), []),
   'parse(activateValues(scaffold, values)) deep-equals values (gate-empty)');
-assert(activated.includes('// migrated from legacy md (not in schema)'),
-  'out-of-schema key carries the migration marker comment');
 assert(activated.includes('"$schema"'), 'catalog keeps the $schema metadata key');
 const emptyActivated = activateValues(scaffold, {}, schema);
 assert(deepEqual(resolvedDiff({}, parseJsonc(emptyActivated).value), []), 'empty values → all-commented catalog (gate-empty)');
@@ -204,7 +198,6 @@ process.stdout.write('\nmigrateAll — happy path round-trip\n');
   assert(deepEqual(resolvedDiff(oldMerged, deepMerge(newGlobal, newLocal)), []),
     'post-migration resolved deep-equals pre-migration resolved');
   assert(newLocal.review.rounds === 3, 'fold direction: prefs.local.md wins the conflict (rounds 3)');
-  assert(newLocal.my_custom_section.favorite === 'purple', 'out-of-schema custom key survives migration');
   assert(newGlobal.auto_commit === true && newGlobal.main_branch === 'main', 'legacy flat scalars survive');
   assert(deepEqual(newGlobal.routing.backend.execute.tier, ['standard', 'heavy']), 'routing tier list survives');
   assert(newGlobal.routing.backend.execute.fallback === 'codex', 'routing fallback survives');
@@ -380,7 +373,7 @@ process.stdout.write('\nT02 — directional fold and local absence\n');
 {
   const fx = makeFixture({
     globalMd: GLOBAL_MD,
-    repoMd: 'review:\n  rounds: 2\n  mode: on\n',
+    repoMd: 'review:\n  rounds: 2\n  mode: enabled\n',
     localMd: LOCAL_MD,
   });
   const result = migrateAll(fx.cwd, { globalDir: fx.globalDir, localDir: fx.localDir });
@@ -388,7 +381,7 @@ process.stdout.write('\nT02 — directional fold and local absence\n');
   const global = parseJsonc(fs.readFileSync(path.join(fx.globalDir, 'forge-agent-prefs.jsonc'), 'utf8')).value;
   assert(result.status === 'migrated' && local.review.rounds === 3,
     'conflicting repo-shared/local fold resolves old local last (3)');
-  assert(local.review.mode === 'on', 'repo-shared-only knob remains in folded local catalogue');
+  assert(local.review.mode === 'enabled', 'repo-shared-only knob remains in folded local catalogue');
   assert(global.review.rounds === 1 && local.review.rounds === 3,
     'global stays global while local override is not flattened into it');
   assert(result.warnings.some((warning) => /config de time por commit deixa de existir/.test(warning)),
@@ -428,18 +421,18 @@ process.stdout.write('\nT02 — --set preserves catalogue blocks\n');
 {
   const fx = makeFixture({ globalMd: null, repoMd: undefined, localMd: undefined });
   const localPath = path.join(fx.localDir, 'forge-prefs.jsonc');
-  const created = setPreference(fx.cwd, 'review.rounds=5', {
+  const created = setPreference(fx.cwd, 'review.rounds=2', {
     globalDir: fx.globalDir, localDir: fx.localDir, layer: 'local', create: true,
   });
   const first = fs.readFileSync(localPath, 'utf8');
-  assert(created.status === 'set' && parseJsonc(first).value.review.rounds === 5,
+  assert(created.status === 'set' && parseJsonc(first).value.review.rounds === 2,
     '--set --create activates an off knob in a new local scaffold');
   const protectedBlock = first.slice(0, first.indexOf('// ── review '));
-  const updated = setPreference(fx.cwd, 'review.rounds=7', {
+  const updated = setPreference(fx.cwd, 'review.rounds=3', {
     globalDir: fx.globalDir, localDir: fx.localDir, layer: 'local',
   });
   const second = fs.readFileSync(localPath, 'utf8');
-  assert(updated.status === 'set' && parseJsonc(second).value.review.rounds === 7,
+  assert(updated.status === 'set' && parseJsonc(second).value.review.rounds === 3,
     '--set updates an already-active knob and result parses');
   assert(second.includes(protectedBlock), '--set preserves all unrelated catalogue blocks byte-for-byte');
   fs.unlinkSync(localPath);

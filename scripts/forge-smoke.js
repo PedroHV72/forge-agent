@@ -4297,6 +4297,8 @@ function smokePrefsEngine() {
   assert(requires.length === 4 && requires.every((name) => allowed.has(name)) &&
     requires.includes('./forge-prefs-scaffold.js'),
     '(a) forge-prefs.js usa a allowlist exata (scaffold lazy)', JSON.stringify(requires));
+  assert(!prefsSource.includes('forge-prefs-legacy.js'),
+    '(a) forge-prefs.js never requires forge-prefs-legacy.js (transitivity guard)');
   const scaffoldSource = fs.readFileSync(path.join(SCRIPTS, 'forge-prefs-scaffold.js'), 'utf8');
   const scaffoldRequires = [...scaffoldSource.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]);
   assert(JSON.stringify(scaffoldRequires) === JSON.stringify(['fs', 'path', './forge-prefs.js']),
@@ -4339,37 +4341,49 @@ function smokePrefsEngine() {
   process.env.USERPROFILE = home;
   try {
     const matrix = [
-      ['jsonc', 'jsonc', 'local-jsonc'],
-      ['jsonc', 'md', 'local-md'],
-      ['md', 'jsonc', 'local-jsonc'],
-      ['md', 'md', 'local-md'],
+      ['jsonc-only', 'jsonc', false],
+      ['md-only', 'md-blocked', true],
+      ['md+jsonc', 'jsonc', false],
+      ['absent', 'absent', false],
     ];
-    for (const [globalFormat, localFormat, expected] of matrix) {
+    for (const [state, expectedSource, blocked] of matrix) {
       for (const file of [
         path.join(claude, 'forge-agent-prefs.jsonc'), path.join(claude, 'forge-agent-prefs.md'),
         path.join(gsd, 'forge-prefs.jsonc'), path.join(gsd, 'claude-agent-prefs.md'),
+        path.join(gsd, 'prefs.local.md'),
       ]) remove(file);
-      write(path.join(claude, 'forge-agent-prefs.md'), 'review:\n  source: global-md\n');
-      write(path.join(gsd, 'claude-agent-prefs.md'), 'review:\n  source: local-md\n');
-      if (globalFormat === 'jsonc') write(path.join(claude, 'forge-agent-prefs.jsonc'), '{"review":{"source":"global-jsonc"}}');
-      if (localFormat === 'jsonc') write(path.join(gsd, 'forge-prefs.jsonc'), '{"review":{"source":"local-jsonc"}}');
+      if (state === 'jsonc-only' || state === 'md+jsonc') {
+        write(path.join(claude, 'forge-agent-prefs.jsonc'), '{"review":{"source":"global-jsonc"}}');
+        write(path.join(gsd, 'forge-prefs.jsonc'), '{"review":{"source":"local-jsonc"}}');
+      }
+      if (state === 'md-only' || state === 'md+jsonc') {
+        write(path.join(claude, 'forge-agent-prefs.md'), 'review:\n  source: global-md\n');
+        write(path.join(gsd, 'claude-agent-prefs.md'), 'review:\n  source: local-md\n');
+        write(path.join(gsd, 'prefs.local.md'), 'review:\n  source: local-personal-md\n');
+      }
       const result = readPrefs(project);
-      assert(result.ok, `(c) shadow ${globalFormat}/${localFormat}: resolve ok`);
-      assert(result.layers.global.source === (globalFormat === 'jsonc' ? 'jsonc' : 'md-legacy'),
-        `(c) shadow ${globalFormat}/${localFormat}: global source`, JSON.stringify(result.layers));
-      assert(result.layers.local.source === (localFormat === 'jsonc' ? 'jsonc' : 'md-legacy'),
-        `(c) shadow ${globalFormat}/${localFormat}: local source`, JSON.stringify(result.layers));
-      assert(result.prefs.review.source === expected, `(c) shadow ${globalFormat}/${localFormat}: witness value`, JSON.stringify(result.prefs));
+      assert(result.ok === !blocked, `(c) ${state}: expected resolver ok state`, JSON.stringify(result));
+      assert(result.layers.global.source === expectedSource && result.layers.local.source === expectedSource,
+        `(c) ${state}: both layers report the canonical source`, JSON.stringify(result.layers));
+      if (blocked) {
+        const expectedMd = [path.join(claude, 'forge-agent-prefs.md'),
+          path.join(gsd, 'claude-agent-prefs.md'), path.join(gsd, 'prefs.local.md')];
+        assert(result.errors.length === 2 && result.errors.every((error) => error.code === 'legacy-md-without-jsonc') &&
+          expectedMd.every((file) => result.errors.some((error) => error.message.includes(file))) &&
+          result.errors.every((error) => error.message.includes('forge-prefs-migrate.js --cwd')),
+        '(c) md-only: hard-stop errors name every md file and the migration command', JSON.stringify(result.errors));
+      } else if (state === 'md+jsonc') {
+        assert(result.errors.length === 0 && result.prefs.review.source === 'local-jsonc',
+          '(c) md+jsonc: JSONC wins silently with zero errors', JSON.stringify(result));
+      }
     }
 
-    remove(path.join(claude, 'forge-agent-prefs.jsonc'));
-    remove(path.join(gsd, 'forge-prefs.jsonc'));
-    write(path.join(claude, 'forge-agent-prefs.md'), 'review:\n  rounds: 2\n  style: global\nrouting:\n  backend:\n    executor:\n      standard: [global]\n');
-    write(path.join(gsd, 'claude-agent-prefs.md'), 'review:\n  rounds: 5\nrouting:\n  backend:\n    planner:\n      heavy: [repo]\n');
-    const legacy = readPrefs(project);
+    write(path.join(claude, 'forge-agent-prefs.jsonc'), '{"routing":{"backend":{"executor":{"standard":["global"]}}}}');
+    write(path.join(gsd, 'forge-prefs.jsonc'), '{"routing":{"backend":{"planner":{"heavy":["repo"]}}}}');
+    const jsoncPrefs = readPrefs(project);
     const routing = readRoutingConfig(project);
-    assert(JSON.stringify(legacy.prefs.routing) === JSON.stringify(routing.routing),
-      '(d) md-only routing: readPrefs.routing === readRoutingConfig.routing', JSON.stringify({ legacy, routing }));
+    assert(JSON.stringify(jsoncPrefs.prefs.routing) === JSON.stringify(routing.routing),
+      '(d) jsonc routing: readPrefs.routing === readRoutingConfig.routing', JSON.stringify({ jsoncPrefs, routing }));
 
     const merged = deepMerge(
       { list: ['global'], review: { rounds: 2 }, routing: { backend: { plan: { standard: ['a'], execute: { standard: ['b'] } } } } },
@@ -4595,18 +4609,18 @@ function smokePrefsCutover() {
     '(a) routing uses cached prefs engine without a private parser');
   withHermeticHome(() => {
     const dir = mkTmp('prefs-cutover-tier-golden');
-    const prefs = path.join(dir, '.gsd', 'prefs.local.md');
+    const prefs = path.join(dir, '.gsd', 'forge-prefs.jsonc');
     const { readTierChain } = require('./forge-tier-chain.js');
     fs.writeFileSync(prefs,
-      'tier_models:\n  standard: bare-model # comment\n  heavy: [heavy-primary, heavy-fallback]\n', 'utf8');
+      '{"tier_models":{"standard":"bare-model","heavy":["heavy-primary","heavy-fallback"]}}', 'utf8');
     assert(JSON.stringify(readTierChain('standard', dir)) === JSON.stringify([
       { id: 'bare-model', alias: null, mapped: false },
-    ]), '(a) tier-chain golden preserves bare scalar wrapping');
+    ]), '(a) tier-chain golden preserves JSONC scalar wrapping');
     assert(JSON.stringify(readTierChain('heavy', dir)) === JSON.stringify([
       { id: 'heavy-primary', alias: null, mapped: false },
       { id: 'heavy-fallback', alias: null, mapped: false },
-    ]), '(a) tier-chain golden preserves ordered Markdown lists');
-    fs.writeFileSync(prefs, 'tier_models:\n  standard: [broken, list\n', 'utf8');
+    ]), '(a) tier-chain golden preserves ordered JSONC lists');
+    fs.writeFileSync(prefs, '{"tier_models":{"standard":"[broken"}}', 'utf8');
     let warning = '';
     const originalWrite = process.stderr.write;
     process.stderr.write = (chunk) => { warning += String(chunk); return true; };
@@ -4618,7 +4632,7 @@ function smokePrefsCutover() {
     }
     assert(malformed.length === 1 && malformed[0].id === 'claude-sonnet-5' &&
       /tier_models\.standard malformado/.test(warning),
-    '(a) malformed tier list golden warns and degrades to the standard default');
+    '(a) wrong-shape JSONC tier value warns and degrades to the standard default');
     cleanup(dir);
   });
   const idsSource = fs.readFileSync(path.join(SCRIPTS, 'forge-ids.js'), 'utf8');
@@ -4644,7 +4658,7 @@ function smokePrefsCutover() {
     '(a) xllm: legacy workers parser absent');
   withHermeticHome(() => {
     const dir = mkTmp('prefs-cutover-medium');
-    const write = (body) => fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), body, 'utf8');
+    const write = (body) => fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), body, 'utf8');
     const context = require('./forge-context-monitor.js');
     const isolation = require('./forge-isolation.js');
     const xllm = require('./forge-xllm.js');
@@ -4652,10 +4666,9 @@ function smokePrefsCutover() {
     assert(context.readContextMonitorPrefs(dir).enabled === true, '(b) context absent → enabled true');
     assert(isolation.readIsolationPrefs(dir).mode === 'shared', '(b) isolation absent → shared');
     assert(xllm.readWorkersTimeout(dir) === null, '(b) timeout absent → null');
-    write('context_monitor:\n  enabled: false\n  warning_threshold: 40\n  critical_threshold: 0.2\n' +
-      'forge_isolation:\n  mode: WORKTREE\n  branch_pattern: "x/{M###}"\n  auto_pull_main: false\n' +
-      '  worktree_root: "custom"\n  worktree_cleanup_on_complete: true\n  pr_on_complete: true\n' +
-      'workers:\n  timeout: -5\n');
+    write('{"context_monitor":{"enabled":false,"warning_threshold":40,"critical_threshold":0.2},' +
+      '"forge_isolation":{"mode":"WORKTREE","branch_pattern":"x/{M###}","auto_pull_main":false,' +
+      '"worktree_root":"custom","worktree_cleanup_on_complete":true,"pr_on_complete":true},"workers":{"timeout":-5}}');
     const cm = context.readContextMonitorPrefs(dir);
     const iso = isolation.readIsolationPrefs(dir);
     assert(cm.enabled === false && cm.thresholds.warning === 0.4 && cm.thresholds.critical === 0.2,
@@ -4664,43 +4677,25 @@ function smokePrefsCutover() {
       iso.worktreeRoot === 'custom' && iso.worktreeCleanupOnComplete === true && iso.prOnComplete === true,
       '(b) isolation six keys preserve values');
     assert(xllm.readWorkersTimeout(dir) === null, '(b) negative timeout → null');
-    write('workers:\n  timeout: abc\n');
+    write('{"workers":{"timeout":"abc"}}');
     assert(xllm.readWorkersTimeout(dir) === null, '(b) non-numeric timeout → null');
-    write('workers:\n  timeout: 45\n');
+    write('{"workers":{"timeout":45}}');
     assert(xllm.readWorkersTimeout(dir) === 45, '(b) positive timeout preserved');
-    // R1/R2 review-fix: bool/string equivalence with the old ad-hoc parser.
-    // Old bool semantics: present value = String(v).toLowerCase()==='true'; absent = default.
-    // Old string semantics: present value with >=1 char = value; else = default.
-    write('forge_isolation:\n  auto_pull_main: no\n');
-    assert(isolation.readIsolationPrefs(dir).autoPullMain === false,
-      '(R1) auto_pull_main: no -> false (not true)');
-    write('forge_isolation:\n  auto_pull_main: True\n');
-    assert(isolation.readIsolationPrefs(dir).autoPullMain === true,
-      '(R1) auto_pull_main: True -> true (case fold)');
-    write('');
-    assert(isolation.readIsolationPrefs(dir).autoPullMain === true,
-      '(R1) auto_pull_main absent -> default true');
-    write('forge_isolation:\n  branch_pattern: ""\n');
-    assert(isolation.readIsolationPrefs(dir).branchPattern === 'forge/{M###}',
-      '(R2) branch_pattern: "" -> default forge/{M###} (not empty)');
-    write('forge_isolation:\n  worktree_root: ""\n');
-    assert(isolation.readIsolationPrefs(dir).worktreeRoot === '.forge-worktrees',
-      '(R2) worktree_root: "" -> default .forge-worktrees (not empty)');
     cleanup(dir);
   });
   withHermeticHome(() => {
     const dir = mkTmp('prefs-cutover');
     fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
-    const writePrefs = (body) => fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), body, 'utf8');
+    const writePrefs = (body) => fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), body, 'utf8');
     const ids = require('./forge-ids.js');
     const repos = require('./forge-repos.js');
     writePrefs('');
     assert(ids.readIdFormat(dir) === 'timestamp', '(b) ids absent → timestamp');
-    writePrefs('ids:\n  format: sequential\n');
+    writePrefs('{"ids":{"format":"sequential"}}');
     assert(ids.readIdFormat(dir) === 'sequential', '(b) ids sequential preserved');
-    writePrefs('ids:\n  format: invalid\n');
+    writePrefs('{"ids":{"format":"invalid"}}');
     assert(ids.readIdFormat(dir) === 'timestamp', '(b) ids invalid → timestamp');
-    writePrefs('forge_isolation:\n  repos:\n    auto_detect: false\n    include:\n      - src/**\n    exclude:\n      - tmp/**\n');
+    writePrefs('{"forge_isolation":{"repos":{"auto_detect":false,"include":["src/**"],"exclude":["tmp/**"]}}}');
     const repoPrefs = repos.readReposPrefs(dir);
     assert(repoPrefs.autoDetect === false && JSON.stringify(repoPrefs.include) === JSON.stringify(['src/**']) &&
       JSON.stringify(repoPrefs.exclude) === JSON.stringify(['tmp/**']), '(b) repos nested booleans/lists preserved');
@@ -4711,7 +4706,7 @@ function smokePrefsCutover() {
   const cliResult = withHermeticHome(({ env }) => {
     const dir = mkTmp('prefs-cli-golden');
     fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), 'multi_run:\n  refused_when_active_count: 3\n', 'utf8');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), '{"multi_run":{"refused_when_active_count":3}}', 'utf8');
     const result = runScript('forge-cli-helpers.js', ['--resolve-args', '--args', '', '--command', 'forge-auto', '--cwd', dir], { env });
     cleanup(dir);
     return result;
@@ -4789,6 +4784,63 @@ function smokePrefsCutover() {
     cleanup(dir);
   });
 
+  // S01 v2.0 hard-stop contract. Keep both halves of this double assertion
+  // together: removing the legacy reader from the engine must not remove the
+  // independently supported migration escape hatch.
+  const prefsExports = require('./forge-prefs.js');
+  const prefsEngineSource = fs.readFileSync(path.join(SCRIPTS, 'forge-prefs.js'), 'utf8');
+  assert(!Object.prototype.hasOwnProperty.call(prefsExports, 'legacyReadFile') &&
+    !Object.prototype.hasOwnProperty.call(prefsExports, 'legacyReadLayer') &&
+    !prefsEngineSource.includes('legacyRead') && !prefsEngineSource.includes("require('./forge-prefs-legacy.js')") &&
+    !prefsEngineSource.includes('require("./forge-prefs-legacy.js")'),
+  '(S01 double a) engine exports/source have no legacy reader or legacy-module dependency');
+  withHermeticHome(({ env }) => {
+    const dir = mkTmp('prefs-cutover-migrate-double');
+    const localDir = path.join(dir, '.gsd');
+    fs.mkdirSync(localDir, { recursive: true });
+    const legacy = path.join(localDir, 'prefs.local.md');
+    fs.writeFileSync(legacy, 'review:\n  rounds: 3\n', 'utf8');
+    const migrated = runScript('forge-prefs-migrate.js', ['--cwd', dir, '--json'], { env });
+    let output = null;
+    try { output = JSON.parse(migrated.stdout); } catch {}
+    assert(migrated.status === 0 && output && output.status === 'migrated' &&
+      fs.existsSync(path.join(localDir, 'forge-prefs.jsonc')) && fs.existsSync(`${legacy}.bak`) && !fs.existsSync(legacy),
+    '(S01 double b) migrator CLI converts a test-authored tmpdir md fixture with .bak', JSON.stringify({ migrated, output }));
+    cleanup(dir);
+  });
+
+  withHermeticHome(() => {
+    const dir = mkTmp('prefs-cutover-all-jsonc');
+    const home = path.join(dir, 'home');
+    const globalDir = path.join(home, '.claude');
+    const localDir = path.join(dir, '.gsd');
+    fs.mkdirSync(globalDir, { recursive: true });
+    fs.mkdirSync(localDir, { recursive: true });
+    fs.writeFileSync(path.join(globalDir, 'forge-agent-prefs.jsonc'), '{"review":{"rounds":2,"style":"global"}}', 'utf8');
+    fs.writeFileSync(path.join(localDir, 'forge-prefs.jsonc'), '{"review":{"rounds":7}}', 'utf8');
+    const resolved = prefsExports.readPrefs(dir, { globalDir, localDir });
+    assert(resolved.ok && resolved.errors.length === 0 && resolved.layers.global.source === 'jsonc' &&
+      resolved.layers.local.source === 'jsonc' && JSON.stringify(resolved.prefs) === JSON.stringify({ review: { rounds: 7, style: 'global' } }),
+    '(S01) hermetic all-jsonc golden resolves expected values with byte-identical empty errors', JSON.stringify(resolved));
+    cleanup(dir);
+  });
+
+  withHermeticHome(({ env }) => {
+    const dir = mkTmp('prefs-cutover-spec-parity');
+    const globalDir = path.join(env.HOME, '.claude');
+    fs.mkdirSync(globalDir, { recursive: true });
+    const legacy = path.join(globalDir, 'forge-agent-prefs.md');
+    fs.writeFileSync(legacy, 'review:\n  rounds: 2\n', 'utf8');
+    const contract = fs.readFileSync(path.join(__dirname, '..', 'shared', 'forge-prefs-cutover.md'), 'utf8');
+    const match = /## § Canonical message[^]*?```text\n([^\n]+)\n```/.exec(contract);
+    const actual = prefsExports.readPrefs(dir).errors[0];
+    const command = `node ${path.join(SCRIPTS, 'forge-prefs-migrate.js')}`;
+    const expected = match && match[1].replace('{files}', legacy).replace('{command}', command).replace('{cwd}', dir);
+    assert(match && actual && actual.message === expected,
+      '(S01) spec parity extracts and executes the canonical fenced message template', JSON.stringify({ actual, expected }));
+    cleanup(dir);
+  });
+
   // S03 closed inventory: these are the only production consumers migrated
   // from the Markdown cascade. Keep this list explicit so a newly added
   // parser cannot silently escape the cutover guard.
@@ -4835,6 +4887,9 @@ function smokePrefsCutover() {
   assert(JSON.stringify(legacyHolders) === JSON.stringify(['forge-prefs.js']),
     '(e) forge-prefs.js is the sole production holder of legacy filenames',
     JSON.stringify(legacyHolders));
+  const legacyReaderSource = sourceOf('forge-prefs-legacy.js');
+  assert(legacyFilenameLiterals.every((literal) => !legacyReaderSource.includes(literal)),
+    '(e) forge-prefs-legacy.js receives paths as arguments and holds no legacy filename literals');
 }
 
 // ── Section 40: S04 skills/dispatch cutover: equivalence + absence guards ──

@@ -44,8 +44,8 @@ try {
 
   // ── walkSchemaLeaves — schema-universe shape ──────────────────────────────
   const { leaves, sections } = walkSchemaLeaves(schema);
-  assert(leaves.length === 87, 'walkSchemaLeaves returns all 87 knobs', `got ${leaves.length}`);
-  assert(sections.length === 38, 'walkSchemaLeaves returns all 38 sections', `got ${sections.length}`);
+  assert(leaves.length === 90, 'walkSchemaLeaves returns all 90 knobs', `got ${leaves.length}`);
+  assert(sections.length === 39, 'walkSchemaLeaves returns all 39 sections', `got ${sections.length}`);
   const leafPaths = new Set(leaves.map((leaf) => leaf.path));
   assert(leafPaths.has('review.rounds'), 'includes a known nested leaf (review.rounds)');
   assert(leafPaths.has('$schema'), 'includes the $schema catalog-reference leaf');
@@ -53,9 +53,9 @@ try {
 
   // ── buildCatalog against a virgin project (nothing set anywhere) ─────────
   const virgin = buildCatalog(projectDir);
-  assert(virgin.knobs.length === 87, 'buildCatalog(virgin) lists all 87 knobs', `got ${virgin.knobs.length}`);
+  assert(virgin.knobs.length === 90, 'buildCatalog(virgin) lists all 90 knobs', `got ${virgin.knobs.length}`);
   const virginSections = new Set(virgin.knobs.map((knob) => knob.section));
-  assert(virginSections.size === 38, 'buildCatalog(virgin) covers all 38 sections', `got ${virginSections.size}`);
+  assert(virginSections.size === 39, 'buildCatalog(virgin) covers all 39 sections', `got ${virginSections.size}`);
   assert(virgin.knobs.every((knob) => knob.active === false), 'buildCatalog(virgin) — every knob is desligado');
   assert(
     virgin.knobs.every((knob) => knob.layer === '—'),
@@ -89,7 +89,7 @@ try {
   assert(setResult.status === 'set', 'setPreference activates review.rounds=2 locally', JSON.stringify(setResult));
 
   const active = buildCatalog(projectDir);
-  assert(active.knobs.length === 87, 'buildCatalog(active) still lists all 87 knobs after --set', `got ${active.knobs.length}`);
+  assert(active.knobs.length === 90, 'buildCatalog(active) still lists all 90 knobs after --set', `got ${active.knobs.length}`);
   const activeRounds = active.knobs.find((knob) => knob.path === 'review.rounds');
   assert(activeRounds.active === true, 'review.rounds is ATIVO after --set');
   assert(activeRounds.value === 2, 'review.rounds resolves to the set value (2)', `got ${activeRounds.value}`);
