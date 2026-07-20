@@ -21,7 +21,11 @@ You receive:
 <!-- pre-S04: Step 1 read the monolithic AUTO-MEMORY.md file and parsed extraction_count from its header. Multi-run path resolved per-milestone or global. -->
 ## Step 1 — Read current memories for this unit
 
-Read the existing fragment for this unit (if present) via:
+Read the existing fragment for this unit (if present) via. When `MILESTONE_ID`
+is present and non-empty, use `MILESTONE_ID` as the fragment key (`M###.md`)
+for both read and write; never use `UNIT_ID` in that case. Unit-keyed
+fragments are only for standalone tasks without a milestone. Facts still keep
+`source_unit: <UNIT_TYPE>/<UNIT_ID>` for provenance:
 
 ```bash
 node scripts/forge-memory.js --read <UNIT_ID> --cwd <WORKING_DIR>
@@ -128,7 +132,10 @@ Decay is computed on-projection by the S05 projection engine, not manufactured a
 After building all facts and stat events for this run, pipe a single JSON fragment to `forge-memory.js --write`:
 
 ```bash
-echo '<JSON>' | node scripts/forge-memory.js --write --cwd <WORKING_DIR>
+fragment_unit_id="${MILESTONE_ID:-$UNIT_ID}"
+# Use $fragment_unit_id for both --read/--write fragment identity whenever a
+# milestone is present; only standalone units without MILESTONE_ID use UNIT_ID.
+echo '<JSON with unit_id: fragment_unit_id>' | node scripts/forge-memory.js --write --cwd <WORKING_DIR>
 ```
 
 The JSON shape:
@@ -149,7 +156,8 @@ The CLI merges with any existing fragment (dedup by `mem_id` for facts, dedup by
 
 After the `--write` call, check its exit code. If non-zero, output the stderr to the result block as a warning. Do not retry.
 
-The fragment file is now at:
+The fragment file is now at (milestone key when `MILESTONE_ID` is present,
+otherwise the standalone `UNIT_ID` key):
 ```
 <WORKING_DIR>/.gsd/memory/<UNIT_ID>.md
 ```

@@ -829,7 +829,7 @@ Use `$MODEL_ID` resolved by Tier Resolution (step 1.5) above. Do NOT look up mod
 
 0. **Increment the sidecar attempt counter (`SIDECAR_ATTEMPT`) — BLOCKER cap.** Before dispatching *any* sidecar for this unit, increment a per-unit counter (starts at 1 for the first sidecar dispatch of the unit). It is **hard-capped** by the number of `engine == codex` members in the resolved chain (`$ROUTE_JSON.chain`, ≤3 — the S01 cap). Exceeding the cap → abort the chain to the Claude fallback with `REASON=sidecar-cap-exceeded`. On a cross-engine chain (e.g. `gpt→claude→gpt`) this branch may fire more than once in the same unit; the counter is persisted in the per-attempt state file (below) so it survives an auto-compact:
 ```bash
-CODEX_MEMBERS=$(node -e "process.stdout.write(String((JSON.parse(process.argv[1]).chain||[]).filter(m=>m.engine==='codex').length))" "$ROUTE_JSON")
+CODEX_MEMBERS=$(node -e "process.stdout.write(String((JSON.parse(process.argv[1]).chain||[]).filter(m=>m.engine==='gpt'||m.engine==='codex').length))" "$ROUTE_JSON")
 SIDECAR_ATTEMPT=$(( ${SIDECAR_ATTEMPT:-0} + 1 ))
 if [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
   REASON="sidecar-cap-exceeded"   # → Claude fallback (never a 4th recovery layer)
@@ -995,7 +995,7 @@ fi
 
 0. **Increment the sidecar attempt counter + cap check FIRST (R3).** State is **fresh per attempt** (BLOCKER invariant #1 + #3): on a cross-engine chain with multiple codex members the `-attempt-$N` suffix keeps each attempt's state distinct, and `SIDECAR_ATTEMPT` is hard-capped by the count of `engine == codex` members in `$ROUTE_JSON.chain` (≤3). When the cap is exceeded, **skip steps 1–4 entirely** (no plan-context assembly, no state/result-file allocation, no sidecar launch) and go DIRECTLY to the **Fallback** block below:
 ```bash
-CODEX_MEMBERS=$(node -e "process.stdout.write(String((JSON.parse(process.argv[1]).chain||[]).filter(m=>m.engine==='codex').length))" "$ROUTE_JSON")
+CODEX_MEMBERS=$(node -e "process.stdout.write(String((JSON.parse(process.argv[1]).chain||[]).filter(m=>m.engine==='gpt'||m.engine==='codex').length))" "$ROUTE_JSON")
 SIDECAR_ATTEMPT=$(( ${SIDECAR_ATTEMPT:-0} + 1 ))
 if [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
   REASON="sidecar-cap-exceeded"   # → Claude forge-planner fallback (never a 4th recovery layer)

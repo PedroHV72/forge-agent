@@ -3138,11 +3138,12 @@ function smokeReviewPairing() {
     '(a2) CLI --family gemini-2 → stdout gemini', `status=${rFamily2.status} stdout='${rFamily2.stdout.trim()}'`);
 
   // helper de fixture
-  const writeEvents = (dir, lines) => {
+  const writeEvents = (dir, lines, scoped = true) => {
     const forgeDir = path.join(dir, '.gsd', 'forge');
     fs.mkdirSync(forgeDir, { recursive: true });
     const file = path.join(forgeDir, 'events.jsonl');
-    fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + (lines.length ? '\n' : ''), 'utf8');
+    const payload = scoped ? lines.map((l) => ({ slice: 'S02', milestone: 'M006', ...l })) : lines;
+    fs.writeFileSync(file, payload.map((l) => JSON.stringify(l)).join('\n') + (lines.length ? '\n' : ''), 'utf8');
     return file;
   };
 
@@ -3258,6 +3259,21 @@ function smokeReviewPairing() {
   assert(r1.stdout === r2.stdout && r1.stdout.length > 0,
     '(k) determinismo — stdout byte-idêntico entre duas execuções', `stdout1='${r1.stdout}' stdout2='${r2.stdout}'`);
 
+  // (k2) strict scope wins over a Claude-heavy global stream.
+  const dirScoped = mkTmp('pairing-strict-scope');
+  const evScoped = writeEvents(dirScoped, [
+    { event: 'dispatch', unit: 'execute-task/T01', engine: 'claude', slice: 'S03', milestone: 'M015' },
+    { event: 'dispatch', unit: 'execute-task/T02', engine: 'claude', slice: 'S03', milestone: 'M015' },
+    { event: 'dispatch', unit: 'execute-task/T03', engine: 'claude', slice: 'S03', milestone: 'M015' },
+    { event: 'dispatch', unit: 'execute-task/T04', engine: 'codex', slice: 'S04', milestone: 'M015' },
+    { event: 'dispatch', unit: 'execute-task/T05', engine: 'gpt', slice: 'S04', milestone: 'M015' },
+  ], false);
+  const scopedRun = runScript('forge-review-pairing.js', ['--slice', 'S04', '--milestone', 'M015', '--cwd', dirScoped, '--events', evScoped]);
+  let pScoped = null;
+  try { pScoped = JSON.parse(scopedRun.stdout.trim()); } catch {}
+  assert(pScoped && pScoped.author === 'gpt' && pScoped.counts.codex === 2 && pScoped.counts.claude === 0,
+    '(k2) escopo S04/M015 vence global Claude-heavy → author=gpt', JSON.stringify(pScoped));
+
   // (l) --milestone filtra eventos de mesma slice em milestone diferente
   const dirCrossMs = mkTmp('pairing-cross-milestone');
   const evCrossMs = writeEvents(dirCrossMs, [
@@ -3276,15 +3292,16 @@ function smokeReviewPairing() {
   assert(pNoMs && pNoMs.author === 'gpt' && pNoMs.counts.codex === 2 && pNoMs.counts.claude === 1,
     '(l2) sem --milestone → todos os eventos contam, author=gpt (majority)', JSON.stringify(pNoMs));
 
-  // (m) eventos sem campo milestone permanecem elegíveis (lenient-when-absent)
+  // (m) missing scoped fields are excluded, then global fallback is observable
   const dirNoMsField = mkTmp('pairing-no-milestone-field');
   const evNoMsField = writeEvents(dirNoMsField, [
     { event: 'dispatch', unit: 'execute-task/T01', engine: 'codex' },
     { event: 'dispatch', unit: 'execute-task/T02', engine: 'codex' },
-  ]);
+  ], false);
   const { parsed: pNoMsField } = runPairing(evNoMsField, dirNoMsField);
-  assert(pNoMsField && pNoMsField.author === 'gpt' && pNoMsField.counts.codex === 2,
-    '(m) eventos sem campo milestone continuam elegíveis com --milestone informado', JSON.stringify(pNoMsField));
+  assert(pNoMsField && pNoMsField.author === 'gpt' && pNoMsField.counts.codex === 2 &&
+    pNoMsField.fallbacks.includes('scope-empty-global-fallback'),
+    '(m) campos ausentes acionam fallback global observável', JSON.stringify(pNoMsField));
 
   // (n) --policy last: 3 eventos cross-engine (2 old claude + 1 latest codex)
   // → last-dispatch-wins escolhe o autor da execução mais recente (codex),
@@ -3316,6 +3333,7 @@ function smokeReviewPairing() {
   cleanup(dirCrossMs);
   cleanup(dirNoMsField);
   cleanup(dirLastPolicy);
+  cleanup(dirScoped);
 }
 
 // ── Section 30: review pairing wiring (precedência + pré-escopo + fallbacks) ──
@@ -3385,10 +3403,10 @@ function smokeReviewPairingWiring() {
   assert(scoped.parsed && scoped.parsed.author === 'gpt' && scoped.parsed.counts.codex === 2 && scoped.parsed.counts.claude === 0,
     '(a) pré-escopo estrito → author=gpt (só codex tagueado conta; legados excluídos por construção)', JSON.stringify(scoped.parsed));
 
-  // Contra-teste: SEM pré-escopo (stream inteiro, lenient-when-absent) → legados contam → author claude.
+  // Contra-teste: SEM pré-escopo externo; o reader continua estrito e ignora legados.
   const { parsed: lenient } = cliParse(['--events', rawScope, '--slice', 'S02', '--milestone', 'M006', '--cwd', dirScope]);
-  assert(lenient && lenient.author === 'claude' && lenient.counts.claude === 3 && lenient.counts.codex === 2,
-    '(a) contra-teste sem pré-escopo (lenient) → author=claude (68-legado leak) — demonstra por que o pré-escopo é necessário', JSON.stringify(lenient));
+  assert(lenient && lenient.author === 'gpt' && lenient.counts.claude === 0 && lenient.counts.codex === 2,
+    '(a) reader estrito sem pré-escopo externo → legados continuam excluídos', JSON.stringify(lenient));
   cleanup(dirScope);
 
   // ── (b) PLAN-CHECK FIX — discriminadores presentes mas engine AUSENTE ────────
@@ -6553,6 +6571,8 @@ function smokePrefsChokepoints() {
     '(c) install.ps1 does not CopyFile the repository forge-agent-prefs.md template', 'install.ps1');
   assert(ps.includes('--global-only'),
     '(c) install.ps1 invokes forge-prefs-migrate.js --global-only', 'install.ps1');
+  assert(/forge-prefs-cutover\.md/.test(sh), '(c2) install.sh copies forge-prefs-cutover.md', 'install.sh');
+  assert(/CopyFile[\s\S]*forge-prefs-cutover\.md/.test(ps), '(c2) install.ps1 copies forge-prefs-cutover.md', 'install.ps1');
   const psLegacyStart = ps.indexOf("elseif (Test-Path $prefsFile)");
   const psFirstNextBranch = ps.indexOf("elseif (Get-Command node", psLegacyStart);
   const psScaffoldStart = ps.indexOf("elseif (Get-Command node", psFirstNextBranch + 1);
@@ -6571,10 +6591,11 @@ function smokePrefsChokepoints() {
   if (bashProbe.error || bashProbe.status !== 0) {
     pass('(f) install.sh --dry-run skipped (bash unavailable)');
   } else {
-    const dry = spawnSync('bash', [path.join(REPO, 'install.sh'), '--dry-run'], { encoding: 'utf8' });
+    const dry = spawnSync('bash', [path.join(REPO, 'install.sh'), '--dry-run', '--update'], { encoding: 'utf8' });
     const output = `${dry.stdout || ''}${dry.stderr || ''}`;
     assert(dry.status === 0, '(f) install.sh --dry-run exits 0', output);
     assert(!/[✗]|fatal/i.test(dry.stderr || ''), '(f) install.sh --dry-run has no error/fatal stderr', dry.stderr || '');
+    assert(/forge-prefs-cutover\.md/.test(output), '(f) install.sh --dry-run shows forge-prefs-cutover.md copy', output);
     assert(!/cp\s+[^\n]*forge-agent-prefs\.md/.test(dry.stdout || ''),
       '(f) install.sh --dry-run has no repository template-copy line', dry.stdout || '');
   }
@@ -6676,23 +6697,25 @@ function smokePrefsCutoverGuards() {
     'bin/forge-accounts', 'bin/forge-run', 'bin/forge-status',
     'skills/forge-doctor/SKILL.md', 'CLAUDE.md',
   ]);
+  const untrackedProbe = path.join(REPO, '.forge-smoke-untracked-prefs-probe');
+  fs.writeFileSync(untrackedProbe, 'forge-agent-prefs.md\n', 'utf8');
   const offenders = [];
-  function walk(dir) {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === '.gsd' || entry.name === 'node_modules' || entry.name.endsWith('.bak')) continue;
-      const file = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(file);
-      else {
-        let text = '';
-        try { text = fs.readFileSync(file, 'utf8'); } catch { return; }
-        if (/forge-agent-prefs\.md/i.test(text)) {
-          const rel = path.relative(REPO, file);
-          if (!allowlist.has(rel)) offenders.push(rel);
-        }
-      }
-    }
+  let tracked = [];
+  try {
+    tracked = execFileSync('git', ['ls-files'], { cwd: REPO, encoding: 'utf8' })
+      .split('\n').filter(Boolean);
+  } catch (error) {
+    fail('(setup) git ls-files enumerates tracked files', error.message);
   }
-  walk(REPO);
+  for (const rel of tracked) {
+    if (rel.split('/').includes('.gsd') || rel.split('/').includes('node_modules') || rel.endsWith('.bak')) continue;
+    let text = '';
+    try { text = fs.readFileSync(path.join(REPO, rel), 'utf8'); } catch { continue; }
+    if (/forge-agent-prefs\.md/i.test(text) && !allowlist.has(rel)) offenders.push(rel);
+  }
+  assert(!offenders.includes('.forge-smoke-untracked-prefs-probe'),
+    '(a2) arquivo untracked com forge-agent-prefs.md não vira offender', offenders.join(', '));
+  try { fs.rmSync(untrackedProbe, { force: true }); } catch {}
   assert(offenders.length === 0,
     '(a) forge-agent-prefs.md só aparece na allowlist sancionada', offenders.join(', '));
 
@@ -6920,6 +6943,25 @@ function smokeHeartbeatContract() {
     'scripts/forge-xllm.js');
 
   pass('(final) Section 50: heartbeat self-describing contract — canonical snippet behavior, grep-clean docs, formula/probe/grace presence, and adapter wiring verified');
+}
+
+// ── Sidecar cap formula guards ────────────────────────────────────────────
+function smokeSidecarGptCap() {
+  process.stdout.write('\n▸ Sidecar cap counts gpt and codex family members\n');
+  const REPO = path.dirname(SCRIPTS);
+  const mirrors = ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md'];
+  for (const rel of mirrors) {
+    const text = fs.readFileSync(path.join(REPO, rel), 'utf8');
+    const matches = text.match(/CODEX_MEMBERS=\$\(node -e "[^"]*filter\(m=>m\.engine==='gpt'\|\|m\.engine==='codex'\)[^"]*" \"\$ROUTE_JSON\"[^\n]*/g) || [];
+    assert(matches.length === 2, `(cap) ${rel} has two corrected executable predicates`, `found=${matches.length}`);
+    for (const [index, snippet] of matches.entries()) {
+      const result = spawnSync('bash', ['-c', `${snippet}\nprintf '%s\\n' "$CODEX_MEMBERS"`], {
+        cwd: REPO, env: { ...process.env, ROUTE_JSON: JSON.stringify({ chain: [{ engine: 'gpt' }] }) }, encoding: 'utf8'
+      });
+      assert(result.status === 0 && result.stdout.trim() === '1',
+        `(cap) ${rel} snippet ${index + 1} executes gpt as one member`, `status=${result.status} stdout=${result.stdout}`);
+    }
+  }
 }
 
 // ── Section 51: sidecar env allowlist contract regression guard ─────────────
@@ -7451,6 +7493,7 @@ async function main() {
     smokePrefsConsumers();
     smokePrefsCutoverGuards();
     smokeHeartbeatContract();
+    smokeSidecarGptCap();
     smokeSidecarEnvContract();
     smokeSchemaExtraction();
     smokeRequireWorktree();

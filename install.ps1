@@ -359,6 +359,11 @@ if (Test-Path "$RepoDir\shared\forge-principles.md") {
     CopyFile "$RepoDir\shared\forge-principles.md" "$ClaudeDir\forge-principles.md"
     Info "  forge-principles.md"
 }
+$cutover = Join-Path (Join-Path $RepoDir 'shared') 'forge-prefs-cutover.md'
+if (Test-Path $cutover) {
+    CopyFile $cutover (Join-Path $ClaudeDir 'forge-prefs-cutover.md')
+    Info "  forge-prefs-cutover.md"
+}
 
 # Review dialetico schemas (fonte unica, resolvidos de scripts/../schemas/ em runtime).
 $SchemasSrc = Join-Path (Join-Path $RepoDir 'shared') 'schemas'

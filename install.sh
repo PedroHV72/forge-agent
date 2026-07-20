@@ -422,6 +422,10 @@ if [ -f "${REPO_DIR}/shared/forge-principles.md" ]; then
   copy "${REPO_DIR}/shared/forge-principles.md" "${CLAUDE_DIR}/forge-principles.md"
   info "  forge-principles.md"
 fi
+if [ -f "${REPO_DIR}/shared/forge-prefs-cutover.md" ]; then
+  copy "${REPO_DIR}/shared/forge-prefs-cutover.md" "${CLAUDE_DIR}/forge-prefs-cutover.md"
+  info "  forge-prefs-cutover.md"
+fi
 
 # Review dialético schemas (single source, resolved from scripts/../schemas/ at runtime).
 if [ -d "${REPO_DIR}/shared/schemas" ]; then

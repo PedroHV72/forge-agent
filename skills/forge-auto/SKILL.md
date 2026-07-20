@@ -824,7 +824,7 @@ Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` → *Si
 #    the unit; hard-capped by the number of engine==codex members in the resolved chain (≤3, S01).
 #    Persisted in the per-attempt state file so it survives an auto-compact mid-unit.
 SIDECAR_ATTEMPT="${SIDECAR_ATTEMPT:-0}"; SIDECAR_ATTEMPT=$((SIDECAR_ATTEMPT + 1))
-CODEX_MEMBERS=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain.filter(m=>m.engine==='codex').length))" "$ROUTE_JSON" 2>/dev/null || echo 1)
+CODEX_MEMBERS=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain.filter(m=>m.engine==='gpt'||m.engine==='codex').length))" "$ROUTE_JSON" 2>/dev/null || echo 1)
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
 if [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
   # Cap exceeded → go DIRECTLY to the Claude fallback (R3): no snapshot capture, no state/result-file
@@ -1006,7 +1006,7 @@ Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` → *Si
 # 0. Increment the per-unit sidecar attempt counter — hard-capped by the count of engine==codex
 #    chain members (BLOCKER item 3; read-only branch, so no reset — just fresh state + cap).
 SIDECAR_ATTEMPT="${SIDECAR_ATTEMPT:-0}"; SIDECAR_ATTEMPT=$((SIDECAR_ATTEMPT + 1)); N="$SIDECAR_ATTEMPT"
-CODEX_MEMBERS=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain.filter(m=>m.engine==='codex').length))" "$ROUTE_JSON" 2>/dev/null || echo 1)
+CODEX_MEMBERS=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain.filter(m=>m.engine==='gpt'||m.engine==='codex').length))" "$ROUTE_JSON" 2>/dev/null || echo 1)
 if [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
   # Cap exceeded → go DIRECTLY to the Claude fallback (R3): no plan-context assembly, no state/
   # result-file allocation, no sidecar launch. $REASON drives the Failure/Fallback block below.

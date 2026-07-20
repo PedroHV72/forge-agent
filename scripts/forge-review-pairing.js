@@ -8,10 +8,8 @@
  *
  * Only `dispatch` events whose unit begins with `execute-task/` contribute to
  * authorship. When `--slice` is supplied, events that contain a `slice` field
- * must match it; legacy events without that field remain eligible because the
- * caller may already have supplied a slice-scoped stream. `--milestone`
- * applies the same lenient-when-absent match against an event's `milestone`
- * field, guarding against slice-ID recurrence across milestones.
+ * must match it; when a scope flag is supplied, events missing that field are
+ * excluded. `--milestone` applies the same strict-when-present match.
  *
  * The CLI emits one newline-terminated JSON object with this fixed contract:
  *   { author, author_engine, challenger, advocate, reason, counts, policy,
@@ -80,16 +78,14 @@ function isAuthorshipEvent(event, slice, milestone) {
   if (
     slice !== undefined &&
     slice !== null &&
-    Object.prototype.hasOwnProperty.call(event, 'slice') &&
-    event.slice !== slice
+    (!Object.prototype.hasOwnProperty.call(event, 'slice') || event.slice !== slice)
   ) {
     return false;
   }
   if (
     milestone !== undefined &&
     milestone !== null &&
-    Object.prototype.hasOwnProperty.call(event, 'milestone') &&
-    event.milestone !== milestone
+    (!Object.prototype.hasOwnProperty.call(event, 'milestone') || event.milestone !== milestone)
   ) {
     return false;
   }
@@ -99,53 +95,67 @@ function isAuthorshipEvent(event, slice, milestone) {
 // Missing or invalid additive engine data defaults to Claude without a
 // fallback marker. This differs deliberately from having no task events.
 function eventEngine(event) {
-  return event.engine === 'codex' || event.engine === 'claude'
-    ? event.engine
+  return event.engine === 'codex' || event.engine === 'gpt'
+    ? 'codex'
+    : event.engine === 'claude'
+      ? event.engine
     : 'claude';
 }
 
 function aggregateAuthor(events, opts) {
   const options = opts || {};
   const usePolicy = options.policy === 'last' ? 'last' : 'majority';
-  const counts = { claude: 0, codex: 0 };
-  let lastEngine = null;
+  const eventList = Array.isArray(events) ? events : [];
+  const count = (candidateEvents, candidateOptions) => {
+    const result = { claude: 0, codex: 0 };
+    let last = null;
+    for (const event of candidateEvents) {
+      if (!isAuthorshipEvent(event, candidateOptions.slice, candidateOptions.milestone)) continue;
+      const engine = eventEngine(event);
+      result[engine] += 1;
+      last = engine;
+    }
+    return { counts: result, lastEngine: last };
+  };
 
-  for (const event of Array.isArray(events) ? events : []) {
-    if (!isAuthorshipEvent(event, options.slice, options.milestone)) continue;
-    const engine = eventEngine(event);
-    counts[engine] += 1;
-    lastEngine = engine;
+  let counted = count(eventList, options);
+  let scopeFallback = false;
+  if (counted.lastEngine === null && eventList.length > 0 &&
+      (options.slice !== undefined && options.slice !== null || options.milestone !== undefined && options.milestone !== null)) {
+    counted = count(eventList, {});
+    scopeFallback = counted.lastEngine !== null;
   }
-
-  if (lastEngine === null) {
+  if (counted.lastEngine === null) {
     return {
       author: 'claude',
       author_engine: 'claude',
-      counts,
+      counts: counted.counts,
       policy: 'no-authorship-data',
       fallbacks: ['no-authorship-data'],
     };
   }
 
+  const effectiveCounts = counted.counts;
+  const lastEngine = counted.lastEngine;
   let winnerEngine;
   let policy;
   if (usePolicy === 'last') {
     winnerEngine = lastEngine;
     policy = 'last-dispatch';
-  } else if (counts.claude === counts.codex) {
+  } else if (effectiveCounts.claude === effectiveCounts.codex) {
     winnerEngine = lastEngine;
     policy = 'tie-last';
   } else {
-    winnerEngine = counts.codex > counts.claude ? 'codex' : 'claude';
+    winnerEngine = effectiveCounts.codex > effectiveCounts.claude ? 'codex' : 'claude';
     policy = 'majority';
   }
 
   return {
     author: engineFamily(winnerEngine) || 'claude',
     author_engine: winnerEngine,
-    counts,
-    policy,
-    fallbacks: [],
+    counts: effectiveCounts,
+    policy: scopeFallback ? `${policy}-global-fallback` : policy,
+    fallbacks: scopeFallback ? ['scope-empty-global-fallback'] : [],
   };
 }
 
