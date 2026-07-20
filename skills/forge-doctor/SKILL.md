@@ -164,24 +164,40 @@ invalid values, C5d stale catalog) is complete as of S06.
 ```bash
 PREFS_ENGINE="$([ -f scripts/forge-prefs.js ] && echo scripts/forge-prefs.js || echo "$HOME/.claude/scripts/forge-prefs.js")"
 SCAFFOLD_ENGINE="$([ -f scripts/forge-prefs-scaffold.js ] && echo scripts/forge-prefs-scaffold.js || echo "$HOME/.claude/scripts/forge-prefs-scaffold.js")"
+MIGRATE_ENGINE="$([ -f scripts/forge-prefs-migrate.js ] && echo scripts/forge-prefs-migrate.js || echo "$HOME/.claude/scripts/forge-prefs-migrate.js")"
 PREFS_EXPLAIN=$(node "$PREFS_ENGINE" --resolved --explain --cwd . 2>/dev/null)
 printf '%s' "$PREFS_EXPLAIN"
 ```
 
 Inspect `layers.global` and `layers.local` in that existing resolved result:
 
-- If `source: "md-legacy"`, list each `files[]` entry as
-  `⚠ Prefs legada honrada: <arquivo>`. The file is actively read. Show:
-  `Migração: node <scripts>/forge-prefs-migrate.js --cwd . --dry-run` and
-  `Rode /forge-update para migrar para JSONC.`
+- If `source: "md-blocked"`, list each `files[]` entry as
+  `⚠ Prefs markdown legada bloqueia a camada <global|local>: <arquivo>` and
+  show the migration command:
+  `Migração: node <scripts>/forge-prefs-migrate.js --cwd .`.
+  The blocked markdown layer is not used as a source of preferences. For a
+  global layer, report the block and instruct the user to run the migration
+  chokepoint (`/forge-update`); the doctor never migrates the global layer.
+- In `--fix`, when `layers.local.source` is `md-blocked`, run
+  `node "$MIGRATE_ENGINE" --local-only --cwd .`. The migrator always preserves
+  the source markdown as `.bak`. On success, report:
+  `🔧 Camada local migrada para JSONC (.bak preservado).`
+  If the migrator refuses the migration or exits non-zero (including a custom
+  key refusal), do not abort the doctor. Report:
+  `⏭ Migração local recusada — rode manualmente: node <scripts>/forge-prefs-migrate.js --local-only --cwd .`.
+- In diagnose mode (without `--fix`), do not invoke the migrator or write any
+  file: only report each blocked layer and its migration command. The same
+  no-write behavior applies to `--fix --dry-run`.
 - If `source: "jsonc"` and the layer's legacy markdown file is present, list it
   as `⏭ Prefs legada shadowed (inerte, seguro deletar): <arquivo>`. JSONC wins;
   the markdown file is not read and is safe to remove after review.
 - If both layers are `jsonc` or `absent` and no shadowed markdown is present,
   report `✓ Nenhuma prefs markdown legada remanescente.`
 
-Do not alter either catalog as part of this check, even in `--fix` mode. The
-migration gate owns writes and semantic verification.
+Do not alter the global catalog as part of this check, even in `--fix` mode.
+The local catalog may be migrated only through the `--local-only` command above;
+all other catalog writes and semantic changes remain owned by the migration
+gate.
 
 ---
 
@@ -241,7 +257,7 @@ non-empty:
 `⚠ Catálogo desatualizado (<n> seções novas): <sections joined by ", ">` +
 `Rode /forge-update para re-scaffold (preserva blocos ativos).`
 
-If empty (or the layer's source is not `jsonc`, e.g. `md-legacy`/`absent`):
+If empty (or the layer's source is not `jsonc`, e.g. `md-blocked`/`absent`):
 `✓ Catálogo <global|local> atualizado.` (skip entirely for `absent`).
 
 Never auto-run the re-scaffold from this check — the migration gate owns
