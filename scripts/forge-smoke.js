@@ -6569,6 +6569,33 @@ function smokeSidecarEnvContract() {
       && !Object.prototype.hasOwnProperty.call(forgeMinimal, 'RANDOM_SECRET'),
     '(c) multiple FORGE_* keys pass while arbitrary non-allowlisted keys do not');
 
+  // (a2, O1 regression): the denylist must have TEETH against denylisted prefixes
+  // embedded after a FORGE_ underscore boundary (the original anchor `^(AWS_|...)`
+  // never matched `FORGE_ANTHROPIC_AUTH_TOKEN` because it doesn't start with
+  // ANTHROPIC_ — it starts with FORGE_ — so it survived the FORGE_* allowlist pass
+  // untouched). Real FORGE_* vocabulary (FORGE_ACCOUNT, FORGE_XLLM_*_BIN,
+  // FORGE_ENGINE, FORGE_NEW_WINDOW_DRYRUN, FORGE_SESSION_ID) must still pass.
+  const teethFixture = {
+    PATH: '/bin',
+    FORGE_ANTHROPIC_AUTH_TOKEN: 'LEAK',
+    FORGE_AWS_SECRET: 'LEAK',
+    FORGE_CLAUDE_CODE_OAUTH_TOKEN: 'LEAK',
+    FORGE_XLLM_CODEX_BIN: 'mock-codex.js',
+    FORGE_ACCOUNT: 'work',
+    FORGE_ENGINE: 'codex',
+    FORGE_NEW_WINDOW_DRYRUN: '1',
+    FORGE_SESSION_ID: 'sess-1',
+  };
+  const teethMinimal = buildSidecarEnv('minimal', teethFixture, 'darwin');
+  assert(!('FORGE_ANTHROPIC_AUTH_TOKEN' in teethMinimal) && !('FORGE_AWS_SECRET' in teethMinimal)
+      && !('FORGE_CLAUDE_CODE_OAUTH_TOKEN' in teethMinimal),
+    '(a2) denylist strips denylisted prefixes embedded after a FORGE_ underscore boundary',
+    `leaked=${Object.keys(teethMinimal).filter(k => k.startsWith('FORGE_') && /(^|_)(AWS_|AZURE_|GCP_|DATABASE_|ANTHROPIC_|CLAUDE_)/.test(k)).join(',')}`);
+  assert(teethMinimal.FORGE_XLLM_CODEX_BIN === 'mock-codex.js' && teethMinimal.FORGE_ACCOUNT === 'work'
+      && teethMinimal.FORGE_ENGINE === 'codex' && teethMinimal.FORGE_NEW_WINDOW_DRYRUN === '1'
+      && teethMinimal.FORGE_SESSION_ID === 'sess-1',
+    '(a2) real FORGE_* vocabulary passes through unaffected by the tightened denylist');
+
   const platformFixture = {
     SystemRoot: 'win', COMSPEC: 'win', PATHEXT: 'win', APPDATA: 'win',
     LOCALAPPDATA: 'win', USERPROFILE: 'win', TEMP: 'win', TMP: 'win',
@@ -6654,12 +6681,30 @@ function smokeSidecarEnvContract() {
   }
 
   const adapter = fs.readFileSync(path.join(SCRIPTS, 'forge-xllm.js'), 'utf8');
-  const sidecarEnvSites = adapter.split('env: buildSidecarEnv(').length - 1;
-  assert(sidecarEnvSites === 3,
-    '(f) exactly three sidecar spawn call-sites carry env: buildSidecarEnv(', `count=${sidecarEnvSites}`);
-  const taskkillSites = adapter.split('\n').filter(line => line.includes('taskkill'));
-  assert(taskkillSites.length > 0 && taskkillSites.every(line => !line.includes('env:')),
-    '(f) taskkill call-site does not carry env:', taskkillSites.join('\n'));
+  // Exhaustive coverage guard (O2 fix): every spawn(/spawnSync( call-site in the
+  // adapter must carry env: buildSidecarEnv( — except the documented taskkill
+  // exception (a signal-delivery call, not a sidecar process spawn). This is the
+  // inverse of counting sites that HAVE env: (which silently passes a future 4th
+  // spawn added without it) — it walks every call-site and fails closed.
+  const spawnCallRe = /\b(spawnSync|spawn)\(/g;
+  const spawnMatches = [...adapter.matchAll(spawnCallRe)];
+  assert(spawnMatches.length >= 4,
+    '(f) sanity: adapter still has the expected spawn(/spawnSync( call-sites', `found=${spawnMatches.length}`);
+  const uncovered = [];
+  for (const m of spawnMatches) {
+    const start = m.index;
+    const closeIdx = adapter.indexOf('});', start);
+    const block = adapter.slice(start, closeIdx > start ? closeIdx + 3 : start + 400);
+    const isTaskkill = block.includes('taskkill');
+    const hasEnv = block.includes('env: buildSidecarEnv(');
+    if (isTaskkill) {
+      if (hasEnv) uncovered.push(`taskkill call-site unexpectedly carries env: (index=${start})`);
+      continue;
+    }
+    if (!hasEnv) uncovered.push(`spawn call-site missing env: buildSidecarEnv( (index=${start})`);
+  }
+  assert(uncovered.length === 0,
+    '(f) every non-taskkill spawn(/spawnSync( call-site carries env: buildSidecarEnv(', uncovered.join('; '));
   const schema = require('../forge-prefs.schema.json');
   const envPolicySchema = schema.properties.sidecars && schema.properties.sidecars.properties.env_policy;
   assert(envPolicySchema && JSON.stringify(envPolicySchema.enum) === JSON.stringify(['minimal', 'inherit'])

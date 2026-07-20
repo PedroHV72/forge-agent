@@ -1230,7 +1230,7 @@ function buildSidecarEnv(policy = 'minimal', sourceEnv = process.env, platform =
     if (key.startsWith('FORGE_') && value !== undefined) env[key] = value;
   }
   for (const key of Object.keys(env)) {
-    if (/^(AWS_|AZURE_|GCP_|DATABASE_|ANTHROPIC_|CLAUDE_)/.test(key)) delete env[key];
+    if (/(^|_)(AWS_|AZURE_|GCP_|DATABASE_|ANTHROPIC_|CLAUDE_)/.test(key)) delete env[key];
   }
   return env;
 }
