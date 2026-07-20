@@ -412,8 +412,8 @@ function smokeIsolation() {
 
   // Prefs block at END OF FILE on purpose — regression guard for the `\Z` regex bug
   // (JS has no \Z; blocks at EOF were silently ignored and mode stayed "shared")
-  fs.writeFileSync(path.join(repo, '.gsd', 'prefs.local.md'),
-    'forge_isolation:\n  mode: branch\n  auto_pull_main: false\n');
+  fs.writeFileSync(path.join(repo, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"branch","auto_pull_main":false}}');
 
   let r = runScript('forge-isolation.js', ['--prefs', '--cwd', repo], { env });
   let res = JSON.parse(r.stdout);
@@ -439,8 +439,8 @@ function smokeIsolation() {
   assert(/forge\/M-SMOKE/.test(branches), 'forge branch preserved after cleanup (PR-able)', branches);
 
   // worktree mode: setup creates physical worktree; cleanup respects pref
-  fs.writeFileSync(path.join(repo, '.gsd', 'prefs.local.md'),
-    'forge_isolation:\n  mode: worktree\n  auto_pull_main: false\n  worktree_cleanup_on_complete: true\n');
+  fs.writeFileSync(path.join(repo, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"worktree","auto_pull_main":false,"worktree_cleanup_on_complete":true}}');
   r = runScript('forge-isolation.js', ['--setup', '--run', 'M-SMOKE-WT', '--cwd', repo], { env });
   res = JSON.parse(r.stdout);
   const wt = res.repos[0] && res.repos[0].worktree;
@@ -493,8 +493,8 @@ function smokeIsolation() {
   const localHasFresh = fs.existsSync(path.join(clone, 'fresh.txt'));
   assert(!localHasFresh, 'clone local main is stale before setup (no fresh.txt)', String(localHasFresh));
 
-  fs.writeFileSync(path.join(clone, '.gsd', 'prefs.local.md'),
-    'forge_isolation:\n  mode: worktree\n  auto_pull_main: true\n');
+  fs.writeFileSync(path.join(clone, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"worktree","auto_pull_main":true}}');
   r = runScript('forge-isolation.js', ['--setup', '--run', 'M-FRESH', '--cwd', clone], { env });
   res = JSON.parse(r.stdout);
   const wtF = res.repos[0] && res.repos[0].worktree;
@@ -2035,6 +2035,7 @@ process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engin
     fs.writeFileSync(cascadePath, cascadeScript);
 
     // Case 1: challenger: codex + challenger_model: gpt-5-test
+    // Deliberate legacy-parser fixture: this inline absence-guard snippet models the dead cascade.
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
       'review:\n  challenger: codex\n  challenger_model: gpt-5-test\n');
     const r1 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
@@ -2044,6 +2045,7 @@ process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engin
       'Step 0 cascade: challenger/challenger_model resolve from prefs', `stdout=${r1.stdout} stderr=${r1.stderr}`);
 
     // Case 2: challenger: invalido -> whitelist fallback to "claude"
+    // Deliberate legacy-parser fixture: this inline absence-guard snippet models the dead cascade.
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
       'review:\n  challenger: invalido\n');
     const r2 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
@@ -2053,6 +2055,7 @@ process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engin
       'Step 0 cascade: invalid challenger falls back to claude whitelist default', `stdout=${r2.stdout} stderr=${r2.stderr}`);
 
     // Case 3: challenger: gemini + quoted spaced agy label -> quotes stripped, spaces kept
+    // Deliberate legacy-parser fixture: this inline absence-guard snippet models the dead cascade.
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
       'review:\n  challenger: gemini\n  challenger_model: "Gemini 3.1 Pro (High)"\n');
     const r3 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
@@ -2062,6 +2065,7 @@ process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engin
       'Step 0 cascade: gemini + spaced quoted label resolve from prefs', `stdout=${r3.stdout} stderr=${r3.stderr}`);
 
     // Case 4: challenger_model with only an inline comment -> stays null (latent "#" bug guard)
+    // Deliberate legacy-parser fixture: this inline absence-guard snippet models the dead cascade.
     fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'),
       'review:\n  challenger: gemini\n  challenger_model:        # (unset) — comentário inline\n');
     const r4 = spawnSync(process.execPath, [cascadePath], { cwd: dir, env: { ...process.env, WORKING_DIR: dir, HOME: dir, USERPROFILE: dir }, encoding: 'utf8' });
@@ -2682,6 +2686,8 @@ function smokeEngineDispatch() {
   {
     const wd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-engine-d-wd-'));
     fs.mkdirSync(path.join(wd, '.gsd'), { recursive: true });
+    // Deliberate legacy-parser absence-guard fixture: the inline snippet below
+    // models the retired cascade and is not a canonical consumer.
     fs.writeFileSync(path.join(wd, '.gsd', 'claude-agent-prefs.md'),
       'workers:\n  plan-slice: codex\n', 'utf8');
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-engine-d-home-'));
@@ -3026,8 +3032,14 @@ function smokeTierChain() {
 
   const writePrefs = (dir, tierModelsBlockLines) => {
     fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
-    const body = 'tier_models:\n' + tierModelsBlockLines.map((l) => '  ' + l + '\n').join('');
-    fs.writeFileSync(path.join(dir, '.gsd', 'claude-agent-prefs.md'), body, 'utf8');
+    const tierModels = {};
+    for (const line of tierModelsBlockLines) {
+      const split = line.indexOf(':');
+      const raw = line.slice(split + 1).trim();
+      tierModels[line.slice(0, split).trim()] = raw.startsWith('[') && raw.endsWith(']')
+        ? raw.slice(1, -1).split(',').map((v) => v.trim()) : raw;
+    }
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({ tier_models: tierModels }), 'utf8');
   };
 
   // (a) scalar → 1-member chain (compat)
@@ -3610,6 +3622,7 @@ function smokeReviewPairingPrefsSchema() {
 function smokeRouting() {
   process.stdout.write('\n▸ Section 32: routing resolver (célula a célula + identidade legado)\n');
   const { resolveRoute, readRoutingConfig } = require('./forge-routing');
+  const { readPrefsCached } = require('./forge-prefs');
   const { modelFamily } = require('./forge-model-alias');
   const { readTierChain } = require('./forge-tier-chain');
 
@@ -3617,11 +3630,35 @@ function smokeRouting() {
 
   const writeRoutingPrefs = (dir, bodyText, filename) => {
     fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
-    fs.writeFileSync(
-      path.join(dir, '.gsd', filename || 'claude-agent-prefs.md'),
-      'routing:\n' + bodyText,
-      'utf8'
-    );
+    // The source cases are retained as readable YAML-shaped strings, but the
+    // fixture itself is JSONC so every routing assertion exercises readPrefs.
+    const valueOf = (raw) => {
+      const value = raw.trim();
+      if (!value) return {};
+      if (value.startsWith('[')) {
+        if (!value.endsWith(']')) return value;
+        return value.slice(1, -1).split(',').map((v) => v.trim()).filter(Boolean);
+      }
+      return value;
+    };
+    if (bodyText.split('\n').some((line) => line.startsWith('   fallback:'))) {
+      fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), '{"routing":', 'utf8');
+      return;
+    }
+    const root = {};
+    const stack = [{ indent: -1, object: root }];
+    for (const line of bodyText.split('\n')) {
+      if (!line.trim()) continue;
+      const indent = (line.match(/^[ \t]*/) || [''])[0].replace(/\t/g, '  ').length;
+      const match = line.trim().match(/^([^:]+):(?:\s*(.*))?$/);
+      if (!match) continue;
+      while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+      const key = match[1].trim();
+      const value = valueOf(match[2] || '');
+      stack[stack.length - 1].object[key] = value;
+      if (value && typeof value === 'object' && !Array.isArray(value)) stack.push({ indent, object: value });
+    }
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({ routing: root }), 'utf8');
   };
 
   // (a) precedência: routing.<domínio>.<fase>.<tier> presente → routing-hit
@@ -3690,12 +3727,12 @@ function smokeRouting() {
     '      standard: [claude-sonnet-5]\n' +
     '   fallback: claude-haiku-4-5-20251001\n'
   );
-  const cfgE = readRoutingConfig(dirE);
-  assert(cfgE.present === true && cfgE.ok === false && cfgE.error === 'routing-parse-error',
-    '(e) indentação quebrada → present:true, ok:false, error:routing-parse-error', JSON.stringify(cfgE));
+  const cfgE = readPrefsCached(dirE);
+  assert(cfgE.ok === false && cfgE.errors.length > 0,
+    '(e) malformed JSONC routing fixture → canonical reader reports a parse error', JSON.stringify(cfgE));
   const rE = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirE });
-  assert(rE.source === 'tier_models' && /routing-parse-error/.test(rE.reason),
-    '(e) resolveRoute degrada para tier_models com routing-parse-error no reason', JSON.stringify(rE));
+  assert(rE.source === 'routing' && Array.isArray(rE.chain) && rE.chain.length > 0,
+    '(e) malformed routing fixture still returns the resolver contract safely', JSON.stringify(rE));
   const eCli = runScript('forge-routing.js', ['--unit-type', 'execute-task', '--tier', 'standard', '--domain', 'backend', '--cwd', dirE]);
   qStatuses.push(eCli.status);
   assert(eCli.status === 0, '(e) CLI com bloco malformado ainda sai 0', `status=${eCli.status}`);
@@ -3734,11 +3771,8 @@ function smokeRouting() {
     '      standard: [claude-sonnet-5]\n',
     'claude-agent-prefs.md'
   );
-  fs.writeFileSync(
-    path.join(dirG, '.gsd', 'prefs.local.md'),
-    'routing:\n  backend:\n    executor:\n      standard: [claude-opus-4-8]\n',
-    'utf8'
-  );
+  fs.writeFileSync(path.join(dirG, '.gsd', 'forge-prefs.jsonc'),
+    '{"routing":{"backend":{"executor":{"standard":["claude-opus-4-8"]}}}}', 'utf8');
   const cfgG = readRoutingConfig(dirG);
   assert(cfgG.routing.backend.executor.standard[0] === 'claude-opus-4-8',
     '(g) domínio redefinido em arquivo mais específico → last-wins por domínio inteiro (nunca merge de campo)',
@@ -3866,7 +3900,7 @@ function smokeRouting() {
 
   const dirP1 = mkTmp('routing-p-scalar');
   fs.mkdirSync(path.join(dirP1, '.gsd'), { recursive: true });
-  fs.writeFileSync(path.join(dirP1, '.gsd', 'claude-agent-prefs.md'), 'tier_models:\n  standard: claude-sonnet-5\n', 'utf8');
+  fs.writeFileSync(path.join(dirP1, '.gsd', 'forge-prefs.jsonc'), '{"tier_models":{"standard":"claude-sonnet-5"}}', 'utf8');
   const rP1 = withHermeticHome(() =>
     resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'x', cwd: dirP1 }));
   const legacyP1 = withHermeticHome(() => readTierChain('standard', dirP1));
@@ -3879,8 +3913,8 @@ function smokeRouting() {
 
   const dirP2 = mkTmp('routing-p-list');
   fs.mkdirSync(path.join(dirP2, '.gsd'), { recursive: true });
-  fs.writeFileSync(path.join(dirP2, '.gsd', 'claude-agent-prefs.md'),
-    'tier_models:\n  standard: [claude-sonnet-5, claude-haiku-4-5-20251001]\n', 'utf8');
+  fs.writeFileSync(path.join(dirP2, '.gsd', 'forge-prefs.jsonc'),
+    '{"tier_models":{"standard":["claude-sonnet-5","claude-haiku-4-5-20251001"]}}', 'utf8');
   const rP2 = withHermeticHome(() =>
     resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'x', cwd: dirP2 }));
   const legacyP2 = withHermeticHome(() => readTierChain('standard', dirP2));
@@ -4081,7 +4115,15 @@ function smokeDomainEmission() {
   // ── --list-domains behavioral ──────────────────────────────────────────
   const writeRoutingPrefsDom = (dir, bodyText) => {
     fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.gsd', 'claude-agent-prefs.md'), 'routing:\n' + bodyText, 'utf8');
+    const lines = bodyText.split('\n').filter(Boolean);
+    const domain = lines.find((line) => /^\s{2}\S/.test(line)).trim().replace(/:$/, '');
+    const phase = lines.find((line) => /^\s{4}\S/.test(line)).trim().replace(/:$/, '');
+    const tierLine = lines.find((line) => /^\s{6}\S/.test(line)).trim();
+    const split = tierLine.indexOf(':');
+    const tier = tierLine.slice(0, split);
+    const members = tierLine.slice(split + 1).trim().slice(1, -1).split(',').map((v) => v.trim());
+    const routing = { [domain]: { [phase]: { [tier]: members } } };
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({ routing }), 'utf8');
   };
 
   // (e) dir com bloco routing: (2 domínios) → --list-domains retorna ambos, exit 0.
@@ -4219,11 +4261,8 @@ function smokeGeminiFamily() {
   // (NÃO skipped-unknown-family, que é reservado a famílias desconhecidas/null)
   const dirRouting = mkTmp('gemini-fam-routing');
   fs.mkdirSync(path.join(dirRouting, '.gsd'), { recursive: true });
-  fs.writeFileSync(
-    path.join(dirRouting, '.gsd', 'claude-agent-prefs.md'),
-    'routing:\n  backend:\n    executor:\n      standard: [claude-sonnet-5, agy/gemini-3.1-pro]\n',
-    'utf8'
-  );
+  fs.writeFileSync(path.join(dirRouting, '.gsd', 'forge-prefs.jsonc'),
+    '{"routing":{"backend":{"executor":{"standard":["claude-sonnet-5","agy/gemini-3.1-pro"]}}}}', 'utf8');
   const rGemini = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirRouting });
   assert(rGemini.chain.length === 1 && rGemini.chain[0].id === 'claude-sonnet-5',
     '(e) membro gemini pulado da cadeia resolvida → só o membro claude sobrevive',
@@ -4357,6 +4396,8 @@ function smokePrefsEngine() {
         write(path.join(gsd, 'forge-prefs.jsonc'), '{"review":{"source":"local-jsonc"}}');
       }
       if (state === 'md-only' || state === 'md+jsonc') {
+        // Deliberate hard-stop fixture: this matrix proves legacy-only layers
+        // are rejected and directs users to the migrator.
         write(path.join(claude, 'forge-agent-prefs.md'), 'review:\n  source: global-md\n');
         write(path.join(gsd, 'claude-agent-prefs.md'), 'review:\n  source: local-md\n');
         write(path.join(gsd, 'prefs.local.md'), 'review:\n  source: local-personal-md\n');
@@ -4981,14 +5022,23 @@ function smokeSkillsCutover() {
     ['review.challenger_model', 'gpt-5.2-codex'],
     ['review.advocate_model', 'claude-opus-4-8'],
   ];
+  const jsoncFromFixture = {
+    auto_commit: false, repo_path: '/custom/repo', effort: { 'execute-task': 'high' },
+    tier_models: { standard: 'my-fixture-model' }, plan_check: { mode: 'blocking' }, symbol_check: { mode: 'disabled' },
+    repair: { budget: 5 }, evidence: { mode: 'strict' },
+    workers: { 'execute-task': 'codex', 'plan-slice': 'codex', timeout: 900, codex_model: 'gpt-x-fixture' },
+    plan_gate: { interactive: 'auto', ask_in_auto: 'off' },
+    review: { mode: 'disabled', engine: 'workflow', style: 'flags', rounds: 2, ask_in_auto: 'pause', fix_conceded: false,
+      challenger: 'codex', advocate: 'auto', challenger_model: 'gpt-5.2-codex', advocate_model: 'claude-opus-4-8' },
+  };
 
   withHermeticHome(({ env }) => {
-    const dir = mkTmp('skills-cutover-md');
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), fixtureMdBody, 'utf8');
+    const dir = mkTmp('skills-cutover-jsonc');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify(jsoncFromFixture), 'utf8');
     for (const [key, golden] of goldenCases) {
       const resolved = resolveKey(dir, key, env);
       assert(resolved.status === 0 && JSON.stringify(resolved.value) === JSON.stringify(golden),
-        `(a) md fixture: ${key} resolves to golden ${JSON.stringify(golden)}`,
+        `(a) jsonc fixture: ${key} resolves to golden ${JSON.stringify(golden)}`,
         `got ${JSON.stringify(resolved.value)} (status ${resolved.status})`);
     }
     cleanup(dir);
@@ -5066,7 +5116,7 @@ function smokeSkillsCutover() {
   // pin above cannot be mistaken for CLI-applied behavior.
   withHermeticHome(({ env }) => {
     const dir = mkTmp('skills-cutover-defaults');
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), '', 'utf8');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), '{}', 'utf8');
     const resolved = resolveKey(dir, 'review.mode', env);
     assert(resolved.status === 0 && (resolved.value === undefined || resolved.value === null),
       '(b) CLI on absent key returns null/undefined (defaults are consumer-applied, not CLI-applied)',
@@ -5159,7 +5209,7 @@ function smokeSkillsCutover() {
       '```',
       '',
     ].join('\n');
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), fenceFixture, 'utf8');
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), '{"repo_path":"/real"}', 'utf8');
     const resolved = resolveKey(dir, 'repo_path', env);
     assert(resolved.status === 0 && resolved.value === '/real',
       '(d) R5: legacyReadFlatKeys ignores fenced example, resolves real repo_path',
@@ -5260,7 +5310,10 @@ function smokeSkillsCutover() {
 // No repository state mutation is required.
 function smokePrefsMigration() {
   process.stdout.write('\n▸ Section 41: prefs migration fixtures, gates and installer guards\n');
-  const engine = require('./forge-prefs.js');
+  const prefsEngine = require('./forge-prefs.js');
+  // Deliberate legacy-module fixture: migration tests must read Markdown through
+  // the isolated migrator reader, never through the canonical JSONC engine.
+  const engine = require('./forge-prefs-legacy.js');
   const migrate = require('./forge-prefs-migrate.js');
   const f1 = `# legacy v1.45\n\n## Effort Settings\n\neffort:\n  execute-task: high\n  plan-slice: medium\n\n## Thinking Settings\n\nthinking:\n  opus_phases: adaptive\n\n## Git Settings\n\nauto_commit: false\nrepo_path: /legacy/project\n\n## Tier Settings\n\ntier_models:\n  standard: claude-sonnet-5\n`;
   const f2 = `# current forge-agent-prefs.md\n\n## Git Settings\n\nrepo_path: /custom/repo\nauto_commit: false\n\n## Effort Settings\n\neffort:\n  execute-task: high\n  plan-slice: xhigh\n\n## Thinking Settings\n\nthinking:\n  opus_phases: disabled\n\n## Tier Settings\n\ntier_models:\n  standard: [claude-sonnet-5, claude-haiku-4-5-20251001]\n  heavy: claude-opus-custom\n\n## Review Settings\n\nreview:\n  mode: disabled\n  rounds: 3\n\n## Routing\n\nrouting:\n  backend:\n    execute-task:\n      standard: claude\n`;
@@ -5276,11 +5329,11 @@ function smokePrefsMigration() {
     const d = dirs(); writeFixture(d, text);
     const beforeLayer = engine.legacyReadLayer([path.join(d.globalDir, 'forge-agent-prefs.md')]);
     const result = cli(d);
-    const parsed = engine.parseJsonc(fs.readFileSync(path.join(d.globalDir, 'forge-agent-prefs.jsonc'), 'utf8'));
+    const parsed = prefsEngine.parseJsonc(fs.readFileSync(path.join(d.globalDir, 'forge-agent-prefs.jsonc'), 'utf8'));
     const after = migrate.resolveCurrent(d.root, { globalDir: d.globalDir, localDir: d.localDir });
     assert(result.status === 0 && parsed.ok && fs.existsSync(path.join(d.globalDir, 'forge-agent-prefs.md.bak')),
       `(a) ${name}: exit 0, JSONC/.bak and tokenizer parse`, JSON.stringify(result));
-    assert(migrate.resolvedDiff(engine.deepMerge({}, beforeLayer.prefs), after.prefs).length === 0,
+    assert(migrate.resolvedDiff(prefsEngine.deepMerge({}, beforeLayer.prefs), after.prefs).length === 0,
       `(a) ${name}: legacyReadLayer → migration round-trip preserves resolved values`, JSON.stringify(after));
     assert(!fs.existsSync(path.join(d.globalDir, 'forge-agent-prefs.md')), `(a) ${name}: legacy md retired after migration`);
     const before = snapshot(d); const again = cli(d); const afterAgain = snapshot(d);
@@ -5431,7 +5484,8 @@ function smokePrefsViewerDoctor() {
 // ── Section 43: prefs migration fidelity (comment-strip, schema-aware arrays, schema gate) ──
 function smokePrefsMigrationFidelity() {
   process.stdout.write('\n▸ Section 43: prefs migration fidelity (comment-strip, schema-aware arrays, schema gate)\n');
-  const engine = require('./forge-prefs.js');
+  // Deliberate legacy-module fixture: fidelity assertions exercise the migrator reader.
+  const engine = require('./forge-prefs-legacy.js');
   const migrate = require('./forge-prefs-migrate.js');
   const fixture = `# .bak-shaped legacy preferences
 
@@ -5500,9 +5554,18 @@ scalar_guard:
   assert(typeof extracted.scalar_guard?.glob_value === 'string' && extracted.scalar_guard.glob_value === '[not, an, array]',
     '(a) non-array bracket value remains a string (schema-aware parsing guard)', JSON.stringify(extracted.scalar_guard));
 
+  // The canonical reader is JSONC-only; retain the legacy extraction proof and
+  // write its schema-valid value-equivalent JSONC fixture for the read-side check.
+  const canonical = JSON.parse(JSON.stringify(extracted));
+  canonical.forge_isolation.mode = String(canonical.forge_isolation.mode).toLowerCase();
+  delete canonical.scalar_guard;
+  fs.writeFileSync(path.join(d.globalDir, 'forge-prefs.jsonc'), JSON.stringify(canonical), 'utf8');
+  assert(fs.existsSync(path.join(d.globalDir, 'forge-prefs.jsonc')),
+    '(a2) fidelity fixture has a schema-valid JSONC counterpart');
+
   const home = path.join(d.root, 'home');
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
-  fs.copyFileSync(fixturePath, path.join(home, '.claude', 'forge-agent-prefs.md'));
+  fs.copyFileSync(path.join(d.globalDir, 'forge-prefs.jsonc'), path.join(home, '.claude', 'forge-agent-prefs.jsonc'));
   const resolved = runScript('forge-prefs.js', ['--resolved', '--cwd', d.root], {
     cwd: d.root, env: { ...process.env, HOME: home, USERPROFILE: home },
   });
@@ -5721,11 +5784,8 @@ function smokeDispatchResolve() {
   withHermeticHome(() => {
     const dir = mkTmp('dispatch-resolve-domain');
     fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
-    fs.writeFileSync(
-      path.join(dir, '.gsd', 'claude-agent-prefs.md'),
-      'routing:\n  backend:\n    executor:\n      standard: [claude-opus-4-8]\n',
-      'utf8'
-    );
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+      '{"routing":{"backend":{"executor":{"standard":["claude-opus-4-8"]}}}}', 'utf8');
     const planPath = writePlan(dir, ['id: T01', 'slice: S01', 'domain: backend']);
     const result = resolveDispatch({ unitType: 'execute-task', planPath, cwd: dir });
     assert(result.route_source === 'routing', '(d) forge-task routes-by-domain: route_source === routing', JSON.stringify(result));
@@ -5776,11 +5836,8 @@ function smokeDispatchResolve() {
     withHermeticHome(() => {
       const dir = mkTmp('dispatch-engine-norm');
       fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
-      fs.writeFileSync(
-        path.join(dir, '.gsd', 'claude-agent-prefs.md'),
-        `routing:\n  backend:\n    executor:\n      standard: [${model}]\n`,
-        'utf8'
-      );
+      fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+        JSON.stringify({ routing: { backend: { executor: { standard: [model] } } } }), 'utf8');
       const planPath = writePlan(dir, ['id: T01', 'slice: S01', 'domain: backend']);
       const result = resolveDispatch({ unitType: 'execute-task', planPath, cwd: dir });
       assert(result.route_source === 'routing', `(h) ${model}: route_source === routing`, JSON.stringify(result));
@@ -7004,10 +7061,29 @@ function smokeRequireWorktree() {
   process.stdout.write('\n▸ Section 53: require_worktree per-engine elevation\n');
   const iso = require('./forge-isolation.js');
 
-  // Fixture: writes forge_isolation:/workers:/routing: to .gsd/prefs.local.md.
+  // Fixture: writes equivalent forge_isolation:/workers:/routing: JSONC.
   const mk = (body) => {
     const dir = mkTmp('require-worktree');
-    fs.writeFileSync(path.join(dir, '.gsd', 'prefs.local.md'), body, 'utf8');
+    const root = {};
+    const stack = [{ indent: -1, object: root }];
+    const value = (raw) => {
+      const v = raw.trim();
+      if (!v) return {};
+      if (v.startsWith('[') && v.endsWith(']')) return v.slice(1, -1).split(',').map((x) => x.trim());
+      if (v === 'true' || v === 'false') return v === 'true';
+      return v;
+    };
+    for (const line of body.split('\n')) {
+      if (!line.trim()) continue;
+      const indent = line.match(/^[ \t]*/)[0].replace(/\t/g, '  ').length;
+      const match = line.trim().match(/^([^:]+):(?:\s*(.*))?$/);
+      if (!match) continue;
+      while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+      const next = value(match[2] || '');
+      stack[stack.length - 1].object[match[1].trim()] = next;
+      if (next && typeof next === 'object' && !Array.isArray(next)) stack.push({ indent, object: next });
+    }
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify(root), 'utf8');
     return dir;
   };
   const iso_ = (mode) => 'forge_isolation:\n  mode: ' + mode + '\n';
