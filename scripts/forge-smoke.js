@@ -5332,8 +5332,16 @@ function smokePrefsMigration() {
   assert(ps.includes('Join-Path') && !ps.includes('\f') && !ps.includes(String.fromCharCode(0x0c)), '(e) install.ps1 uses Join-Path and contains no form-feed byte');
   assert(update.indexOf('forge-prefs-migrate.js') < update.indexOf('--rescaffold'), '(e) forge-update migrates before re-scaffold');
   { const repoPathSetCalls = update.match(/--set "repo_path=[^"]*"/g) || []; assert(repoPathSetCalls.length >= 2 && repoPathSetCalls.every((call) => { const idx = update.indexOf(call); const line = update.slice(update.lastIndexOf('\n', idx) + 1, update.indexOf('\n', idx)); return line.includes('--layer global'); }), '(e2) every --set repo_path invocation in forge-update.md carries --layer global (global-only knob must not land in local layer)', JSON.stringify(repoPathSetCalls)); }
-  for (const skill of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) assert(read(skill).includes('source == "md-legacy"') && read(skill).includes('⚠ Prefs em markdown legado'), `(e) ${skill}: md-legacy deprecation warning wired`);
-  assert(read('skills/forge-doctor/SKILL.md').includes('source: "md-legacy"') && read('skills/forge-doctor/SKILL.md').includes('forge-prefs-migrate.js'), '(e) doctor checks and explains legacy prefs');
+  for (const skill of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+    const skillText = read(skill);
+    assert(!skillText.includes('Deprecation warning (once per session)') &&
+      !skillText.includes('md-legacy') && skillText.includes('legacy-md-without-jsonc'),
+      `(e) ${skill}: consumer uses structured legacy-md-without-jsonc posture`);
+  }
+  const doctorText = read('skills/forge-doctor/SKILL.md');
+  assert(doctorText.includes('md-blocked') &&
+    /forge-prefs-migrate\.js[\s\S]{0,180}--local-only/.test(doctorText),
+    '(e) doctor detects blocked prefs and documents local-only migration');
   pass('(f) Section 41 fixtures are substantive real-shaped markdown, not synthetic key-only stubs');
 }
 
@@ -6583,6 +6591,75 @@ function smokePrefsChokepoints() {
   pass('(final) Section 54: prefs chokepoints — installer template exclusion, global auto-migrate/degradation, clean dry-run, and PowerShell byte guard verified');
 }
 
+// ── Section 55: S03 prefs consumer regression guards ───────────────────────
+function smokePrefsConsumers() {
+  process.stdout.write('\n▸ Section 55: prefs consumers — blocked posture propagation\n');
+  const REPO = path.dirname(SCRIPTS);
+
+  // Consumer skills must relay the structured engine code.  Keep these
+  // assertions coupled to the code, rather than to the localized message.
+  const skillFiles = [
+    'skills/forge-auto/SKILL.md',
+    'skills/forge-next/SKILL.md',
+    'skills/forge-task/SKILL.md',
+  ];
+  for (const rel of skillFiles) {
+    const content = fs.readFileSync(path.join(REPO, rel), 'utf8');
+    assert(!content.includes('Deprecation warning (once per session)'),
+      `(a) ${rel} has no deprecation warning`, rel);
+    assert(!content.includes('md-legacy'),
+      `(a) ${rel} has no md-legacy source`, rel);
+    assert(content.includes('legacy-md-without-jsonc'),
+      `(a) ${rel} handles legacy-md-without-jsonc`, rel);
+  }
+
+  // Doctor reports the blocked layer and its --fix path delegates migration
+  // to the local-only migrator, without reviving the removed source label.
+  const doctorRel = 'skills/forge-doctor/SKILL.md';
+  const doctor = fs.readFileSync(path.join(REPO, doctorRel), 'utf8');
+  assert(doctor.includes('md-blocked'),
+    '(b) forge-doctor detects md-blocked', doctorRel);
+  const fixStart = doctor.indexOf('## C5a:');
+  const fixRegion = fixStart >= 0 ? doctor.slice(fixStart, fixStart + 3200) : '';
+  assert(/forge-prefs-migrate\.js[\s\S]{0,180}--local-only/.test(fixRegion),
+    '(b) forge-doctor --fix invokes forge-prefs-migrate.js --local-only', doctorRel);
+  assert(!doctor.includes('source: "md-legacy"'),
+    '(b) forge-doctor has no md-legacy source label', doctorRel);
+
+  // Hook diagnostics are best-effort: one prefs-blocked event per process,
+  // and every filesystem failure is swallowed so hooks remain fail-open.
+  const hookRel = 'scripts/forge-hook.js';
+  const hook = fs.readFileSync(path.join(REPO, hookRel), 'utf8');
+  assert(/let\s+_prefsBlockedEventLogged\s*=\s*false/.test(hook),
+    '(c) forge-hook has a module-level once-per-process guard', hookRel);
+  assert(/appendFileSync\([\s\S]*events\.jsonl[\s\S]*JSON\.stringify\(event\)/.test(hook),
+    '(c) forge-hook appends events.jsonl', hookRel);
+  assert(/event:\s*['"]prefs-blocked['"]/.test(hook),
+    '(c) forge-hook emits prefs-blocked', hookRel);
+  const appendStart = hook.indexOf('const appendPrefsBlockedEvent');
+  const appendRegion = appendStart >= 0 ? hook.slice(appendStart, appendStart + 1400) : '';
+  assert(/^const appendPrefsBlockedEvent[\s\S]*?\{[\s\S]*?try\s*\{[\s\S]*?\}\s*catch\s*\{/.test(appendRegion),
+    '(c) forge-hook prefs event append is silent-fail', hookRel);
+
+  // Statusline consumes the generic hadError signal and still renders a line.
+  const statusRel = 'scripts/forge-statusline.js';
+  const statusline = fs.readFileSync(path.join(REPO, statusRel), 'utf8');
+  assert(/resolvedPrefs\.hadError\)\s*forgeVersionTail\s*\+=\s*['"][^'"\n]*⚠ prefs/.test(statusline),
+    '(d) forge-statusline emits ⚠ prefs through hadError', statusRel);
+  assert(statusline.includes('prefs-error.json'),
+    '(d) forge-statusline has the generic prefs-error.json path', statusRel);
+  assert(/process\.stdout\.write\(line1 \+ line2 \+ ['"]\\n['"]\)/.test(statusline),
+    '(d) forge-statusline renders output after prefs handling', statusRel);
+
+  // HARD-invariant: the prior section remains registered in main().
+  const src = fs.readFileSync(path.join(SCRIPTS, 'forge-smoke.js'), 'utf8');
+  const mainBody = src.slice(src.indexOf('async function main()'));
+  assert(/smokePrefsChokepoints\(\);/.test(mainBody),
+    '(e) Section 54 smokePrefsChokepoints() remains registered in main()', 'forge-smoke.js');
+
+  pass('(final) Section 55: prefs consumer guards — skill posture, doctor migration, hook telemetry, statusline badge, and Section 54 HARD-invariant verified');
+}
+
 // ── Section 50: heartbeat self-describing contract regression guard ─────────
 // The fenced spec snippet is the implementation under test: this section
 // extracts and executes it rather than maintaining a second threshold/probe
@@ -7304,6 +7381,7 @@ async function main() {
     smokeSidecarLayer1Retry();
     smokeSidecarPolicyGuard();
     smokePrefsChokepoints();
+    smokePrefsConsumers();
     smokeHeartbeatContract();
     smokeSidecarEnvContract();
     smokeSchemaExtraction();
