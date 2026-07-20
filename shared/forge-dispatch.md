@@ -1033,7 +1033,7 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
 staleAfter = max(heartbeat_interval_ms × 4, 30000)   ms
 ```
 
-`heartbeat_interval_ms` is read from the **running payload** the adapter writes into the result-file (added by S01/T01). When the field is **absent or non-positive** — the NORMAL case for an installed adapter that predates M014, an un-upgraded-adapter + new-orchestrator upgrade window (two known drift incidents), **not** an edge case — assume `15000` → a 60s threshold. **Never** assume the old fixed legacy cadence; there is no hardcoded cadence number anywhere in this contract.
+`heartbeat_interval_ms` is read from the **running payload** the adapter writes into the result-file (added by S01/T01). When the field is **absent or non-positive** — the NORMAL case for an installed adapter that predates M014, an un-upgraded-adapter + new-orchestrator upgrade window (two known drift incidents), **not** an edge case — assume `15000` → a 60s threshold. **Never** assume the old fixed legacy cadence; there is no hardcoded cadence number anywhere in this contract. An advertised `heartbeat_interval_ms` that is non-finite (e.g. `Infinity`) or exceeds a 300000ms (5min) sane upper bound is treated the same as absent/non-positive — it falls back to the `15000` default rather than disabling orphan detection.
 
 **Canonical liveness snippet.** The orchestrator evaluates staleness by executing this exact block (result-file path as `argv[2]`). It reads the running payload, applies the formula, and prints **exactly one** token — `fresh | stale-dead | stale-alive | no-heartbeat` — which the poll loop maps to an action via the decision table below. Probe target is `adapter_pid` (the heartbeat writer, not the child `pid`):
 
@@ -1046,7 +1046,7 @@ try { hb = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')); }
 catch { console.log('no-heartbeat'); process.exit(0); }              // unparseable JSON → no-heartbeat
 if (!hb || typeof hb.updated_at !== 'string') { console.log('no-heartbeat'); process.exit(0); }
 const interval = Number(hb.heartbeat_interval_ms);
-const beat = interval > 0 ? interval : 15000;                        // absent/invalid → 15000 (NORMAL un-upgraded path)
+const beat = Number.isFinite(interval) && interval > 0 && interval <= 300000 ? interval : 15000;  // absent/invalid/out-of-range (>5min cap, non-finite) → 15000 (NORMAL un-upgraded path)
 const staleAfter = Math.max(beat * 4, 30000);                        // = max(heartbeat_interval_ms × 4, 30s)
 const age = Date.now() - Date.parse(hb.updated_at);
 if (Number.isNaN(age)) { console.log('no-heartbeat'); process.exit(0); }   // unparseable updated_at → no-heartbeat
@@ -1138,7 +1138,7 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode plan \
 # ↑ dispatched with the Bash tool's run_in_background: true
 ```
 
-**4. Poll the result-file (`polling` state).** Identical to Branch C step 5: read `$RESULT_FILE` every ~5–10s, honor the heartbeat `{status, pid, adapter_pid, started_at, updated_at}`, and apply the **identical canonical orphan detection of Branch C step 5** — the same `staleAfter = max(heartbeat_interval_ms × 4, 30000)` formula, the same canonical liveness snippet, and the same probe + grace decision table (`stale-dead` or a second `stale-alive` → `kill "$pid"` → Fallback `reason: codex-orphan`). Branch D restates no numbers of its own. `status == "done"` → step 5; `status == "error"` / exit `!= 0` / unparseable JSON → Fallback with the matching `reason`.
+**4. Poll the result-file (`polling` state).** Identical to Branch C step 5: read `$RESULT_FILE` every ~5–10s, honor the heartbeat `{status, pid, adapter_pid, started_at, updated_at}`, and apply the **identical canonical orphan detection of Branch C step 5** — the same `staleAfter = max(heartbeat_interval_ms × 4, 30000)` formula, the same canonical liveness snippet, and the same probe + grace decision table (`stale-dead` or a second `stale-alive` → `kill "$pid"` → Fallback `reason: codex-orphan`). Branch D restates no snippet body or legacy number of its own — only the canonical formula string `max(heartbeat_interval_ms × 4, 30s)`. `status == "done"` → step 5; `status == "error"` / exit `!= 0` / unparseable JSON → Fallback with the matching `reason`.
 
 **5. Success — orchestrator materializes the plans (`done` state).** Re-read the durable state from disk (shell vars are gone), then read the result JSON and **write** each plan file into `.gsd/**` (creating dirs). The adapter already validated every task plan's `must_haves` **in-sidecar** (S01/T01 — throw → exit 2 before `status: done`), so a `status: done` result carries only schema-valid plans; the orchestrator trusts the exit but the downstream symbol-check/plan-check gates still run as a second advisory layer.
 

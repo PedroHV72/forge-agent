@@ -6459,6 +6459,28 @@ function smokeHeartbeatContract() {
     assert(noHeartbeat === 'no-heartbeat',
       '(bonus) unparseable result-file returns no-heartbeat',
       `token=${noHeartbeat}`);
+
+    // (f) out-of-range / non-finite advertised interval falls back to the
+    // 15000 default rather than disabling orphan detection (R1 fix).
+    const infiniteInterval = runFixture('f-infinite-interval', {
+      ...base,
+      adapter_pid: deadPid,
+      heartbeat_interval_ms: 1e309, // JS numeric literal overflow → Infinity
+      updated_at: isoAgo(65000),
+    });
+    assert(infiniteInterval === 'stale-dead',
+      '(f) Infinity-advertised heartbeat_interval_ms falls back to 15s default (60s threshold): 65s-old dead beat is stale-dead',
+      `token=${infiniteInterval}`);
+
+    const excessiveInterval = runFixture('f-excessive-interval', {
+      ...base,
+      adapter_pid: deadPid,
+      heartbeat_interval_ms: 999999999,
+      updated_at: isoAgo(65000),
+    });
+    assert(excessiveInterval === 'stale-dead',
+      '(f) excessive finite heartbeat_interval_ms (999999999) falls back to 15s default (60s threshold): 65s-old dead beat is stale-dead',
+      `token=${excessiveInterval}`);
   } finally {
     cleanup(tmp);
   }
