@@ -102,6 +102,19 @@ function eventEngine(event) {
     : 'claude';
 }
 
+// True-legacy events carry no scope tagging at all (neither `slice` nor
+// `milestone` fields present). Only these are eligible for the scope-empty
+// fallback below — an event tagged for a *different* slice/milestone must
+// never be recounted as if it were untagged (R1 fix).
+function isTrueLegacyEvent(event) {
+  return (
+    event &&
+    typeof event === 'object' &&
+    !Object.prototype.hasOwnProperty.call(event, 'slice') &&
+    !Object.prototype.hasOwnProperty.call(event, 'milestone')
+  );
+}
+
 function aggregateAuthor(events, opts) {
   const options = opts || {};
   const usePolicy = options.policy === 'last' ? 'last' : 'majority';
@@ -122,7 +135,8 @@ function aggregateAuthor(events, opts) {
   let scopeFallback = false;
   if (counted.lastEngine === null && eventList.length > 0 &&
       (options.slice !== undefined && options.slice !== null || options.milestone !== undefined && options.milestone !== null)) {
-    counted = count(eventList, {});
+    const legacyOnly = eventList.filter(isTrueLegacyEvent);
+    counted = count(legacyOnly, {});
     scopeFallback = counted.lastEngine !== null;
   }
   if (counted.lastEngine === null) {

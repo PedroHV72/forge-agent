@@ -3322,6 +3322,33 @@ function smokeReviewPairing() {
   assert(pMajorityContrast && pMajorityContrast.author === 'claude' && pMajorityContrast.policy === 'majority',
     '(n2) mesma fixture, policy default (majority) → author=claude (contraste com (n))', JSON.stringify(pMajorityContrast));
 
+  // (o) R1 fix: foreign-scoped-only stream requesting --slice S02 must NOT let
+  // S03-tagged events decide authorship via the fallback — must degrade to
+  // no-authorship-data defaults (claude), not recount the S03 events.
+  const dirForeignScope = mkTmp('pairing-foreign-scope-only');
+  const evForeignScope = writeEvents(dirForeignScope, [
+    { event: 'dispatch', unit: 'execute-task/T01', engine: 'codex', slice: 'S03', milestone: 'M015' },
+    { event: 'dispatch', unit: 'execute-task/T02', engine: 'codex', slice: 'S03', milestone: 'M015' },
+  ], false);
+  const { parsed: pForeignScope } = runPairing(evForeignScope, dirForeignScope, ['--slice', 'S02']);
+  assert(pForeignScope && pForeignScope.author === 'claude' && pForeignScope.policy === 'no-authorship-data' &&
+    !pForeignScope.fallbacks.includes('scope-empty-global-fallback'),
+    '(o) R1: stream só com eventos S03 + --slice S02 → no-authorship-data defaults, sem recontar S03', JSON.stringify(pForeignScope));
+
+  // (o2) legacy-only stream (sem slice/milestone em nenhum evento) continua
+  // funcionando via fallback, como antes do fix (contraste com (o)).
+  const dirLegacyOnly = mkTmp('pairing-legacy-only');
+  const evLegacyOnly = writeEvents(dirLegacyOnly, [
+    { event: 'dispatch', unit: 'execute-task/T01', engine: 'codex' },
+    { event: 'dispatch', unit: 'execute-task/T02', engine: 'codex' },
+  ], false);
+  const { parsed: pLegacyOnly } = runPairing(evLegacyOnly, dirLegacyOnly, ['--slice', 'S02']);
+  assert(pLegacyOnly && pLegacyOnly.author === 'gpt' &&
+    pLegacyOnly.fallbacks.includes('scope-empty-global-fallback'),
+    '(o2) stream legacy-only (sem campos de escopo) + --slice S02 → fallback funciona, author=gpt', JSON.stringify(pLegacyOnly));
+
+  cleanup(dirForeignScope);
+  cleanup(dirLegacyOnly);
   cleanup(dirMisto);
   cleanup(dirPuroClaude);
   cleanup(dirPuroCodex);

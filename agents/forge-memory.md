@@ -21,14 +21,16 @@ You receive:
 <!-- pre-S04: Step 1 read the monolithic AUTO-MEMORY.md file and parsed extraction_count from its header. Multi-run path resolved per-milestone or global. -->
 ## Step 1 — Read current memories for this unit
 
-Read the existing fragment for this unit (if present) via. When `MILESTONE_ID`
-is present and non-empty, use `MILESTONE_ID` as the fragment key (`M###.md`)
-for both read and write; never use `UNIT_ID` in that case. Unit-keyed
-fragments are only for standalone tasks without a milestone. Facts still keep
+Read the existing fragment for this unit (if present). Derive the fragment
+key with the same formula used by the write path (Step 3):
+`fragment_unit_id="${MILESTONE_ID:-$UNIT_ID}"` — when `MILESTONE_ID` is
+present and non-empty, use `MILESTONE_ID` as the fragment key (`M###.md`) for
+both read and write; never use `UNIT_ID` in that case. Unit-keyed fragments
+are only for standalone tasks without a milestone. Facts still keep
 `source_unit: <UNIT_TYPE>/<UNIT_ID>` for provenance:
 
 ```bash
-node scripts/forge-memory.js --read <UNIT_ID> --cwd <WORKING_DIR>
+node scripts/forge-memory.js --read <fragment_unit_id> --cwd <WORKING_DIR>
 ```
 
 If the command returns `null` (fragment absent) → this is the first extraction for this unit; start with an empty facts and stats list.

@@ -145,7 +145,9 @@ if [ "$CHALLENGER" = auto ] || [ "$ADVOCATE" = auto ]; then
   PAIR_COUNTS_CLAUDE=$(printf '%s' "$PAIR_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(String((JSON.parse(d).counts||{}).claude??0))}catch(e){process.stdout.write('0')}})")
   PAIR_COUNTS_CODEX=$(printf '%s' "$PAIR_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(String((JSON.parse(d).counts||{}).codex??0))}catch(e){process.stdout.write('0')}})")
 
-  # Emit review-pairing-fallback para cada reason em fallbacks[] (no-authorship-data, defend-mode-unavailable).
+  # Emit review-pairing-fallback para cada reason em fallbacks[] (no-authorship-data, defend-mode-unavailable,
+  # scope-empty-global-fallback — o CLI só recontabiliza o subconjunto true-legacy, nunca eventos
+  # escopados para outra slice/milestone; sem eventos true-legacy → degrada para no-authorship-data).
   # Molde: clone de review-challenger-fallback (abaixo); <ISO> do bash, nunca de dentro de script. NUNCA bloqueia.
   for reason in $(printf '%s' "$PAIR_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write((JSON.parse(d).fallbacks||[]).join(' '))}catch(e){process.stdout.write('')}})"); do
     printf '{"ts":"%s","event":"review-pairing-fallback","milestone":"%s","slice":"%s","reason":"%s","author_engine":"%s"}\n' \
@@ -182,7 +184,7 @@ PAIRING_LINE="**Pairing:** ${PAIR_MODE} — autor ${AUTHOR_ENGINE} → challenge
 A partir daqui, **todo o gate consome os resolvidos**: Steps 2/4 e a regra workflow abaixo usam `$RESOLVED_CHALLENGER`; Steps 3/6 usam `$RESOLVED_ADVOCATE`. `AUTHOR_ENGINE`/`PAIR_MODE`/`PAIR_POLICY`/`PAIR_REASON` alimentam a linha `**Pairing:**` do header (Step 6), já pré-montada em `$PAIRING_LINE`. A resolução ocorre **uma vez por review**; `style: flags` (abaixo) usa o pairing já resolvido (decisão #31 preservada).
 
 **Regra de render da linha `**Pairing:**`:**
-- `<modo>` = `$PAIR_MODE` — `auto` quando a resolução via CLI foi aplicada; `explícito` quando ambos os eixos eram explícitos (CLI não chamado); `fallback` quando houve `review-pairing-fallback` (`codex-unavailable` / `no-authorship-data` / `defend-mode-unavailable`).
+- `<modo>` = `$PAIR_MODE` — `auto` quando a resolução via CLI foi aplicada; `explícito` quando ambos os eixos eram explícitos (CLI não chamado); `fallback` quando houve `review-pairing-fallback` (`codex-unavailable` / `no-authorship-data` / `defend-mode-unavailable` / `scope-empty-global-fallback`). `scope-empty-global-fallback` só dispara sobre o subconjunto true-legacy (eventos sem campos `slice`/`milestone`); um stream só com eventos escopados para outra slice/milestone nunca aciona esse fallback — degrada para `no-authorship-data`.
 - `<engine>` = `$AUTHOR_ENGINE` (`claude`|`codex`), resolvido pelo CLI (ou `claude` no caminho explícito).
 - `<família>` = `$CHALLENGER_FAMILY` — família do challenger resolvido (`claude`|`gpt`), via `forge-model-alias.js --family`.
 - **Slice/task mistos:** quando `$PAIR_POLICY` é `majority`, `tie-last` ou `last-dispatch`, anexa ` (<policy>: <counts.claude> claude / <counts.codex> codex → autor <engine>)` a partir do JSON do CLI. Omitida quando `PAIR_POLICY` é `explicit` ou `no-authorship-data` (sem contagem relevante).
