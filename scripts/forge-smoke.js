@@ -6922,6 +6922,33 @@ function smokeHeartbeatContract() {
     assert(excessiveInterval === 'stale-dead',
       '(f) excessive finite heartbeat_interval_ms (999999999) falls back to 15s default (60s threshold): 65s-old dead beat is stale-dead',
       `token=${excessiveInterval}`);
+
+    const futureBeyondSkew = runFixture('g-future-beyond-skew', {
+      ...base,
+      heartbeat_interval_ms: 15000,
+      updated_at: isoAgo(-90000),
+    });
+    assert(futureBeyondSkew === 'no-heartbeat',
+      '(g) updated_at 90s in the future is no-heartbeat beyond the 60s clock-skew tolerance',
+      `token=${futureBeyondSkew}`);
+
+    const futureBoundary = runFixture('g-future-boundary', {
+      ...base,
+      heartbeat_interval_ms: 15000,
+      updated_at: isoAgo(-61000),
+    });
+    assert(futureBoundary === 'no-heartbeat',
+      '(g) updated_at 61s in the future is no-heartbeat beyond the 60s clock-skew tolerance',
+      `token=${futureBoundary}`);
+
+    const futureWithinSkew = runFixture('g-future-within-skew', {
+      ...base,
+      heartbeat_interval_ms: 15000,
+      updated_at: isoAgo(-30000),
+    });
+    assert(futureWithinSkew === 'fresh',
+      '(g) updated_at 30s in the future remains fresh within the 60s clock-skew tolerance',
+      `token=${futureWithinSkew}`);
   } finally {
     cleanup(tmp);
   }
@@ -6969,7 +6996,7 @@ function smokeHeartbeatContract() {
     '(a) adapter has zero literal 15000 heartbeat write sites',
     'scripts/forge-xllm.js');
 
-  pass('(final) Section 50: heartbeat self-describing contract — canonical snippet behavior, grep-clean docs, formula/probe/grace presence, and adapter wiring verified');
+  pass('(final) Section 50: heartbeat self-describing contract — canonical snippet behavior, clock-skew clamp, grep-clean docs, formula/probe/grace presence, and adapter wiring verified');
 }
 
 // ── Sidecar cap formula guards ────────────────────────────────────────────

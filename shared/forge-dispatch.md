@@ -1047,7 +1047,7 @@ staleAfter = max(heartbeat_interval_ms × 4, 30000)   ms
 
 **`protocol_version` (result-file format marker — additive read).** Every result-file payload written by the adapter (running heartbeats + final `done`/error result + `adapter-failed` markers, in both execute and plan modes) carries `protocol_version: 2` since M014 S04 — the marker for the post-M013/M014 format. **Forward-read policy (LOCKED — deferred enforcement):** the reader is purely additive — it ignores unknown fields (`validateExecuteResult` already tolerates extras). **Absent or `1` = pre-M014, valid** — an un-upgraded adapter (the same two drift-window incidents that motivate the `heartbeat_interval_ms` default) writes no such field and is read normally. A version **higher** than the known `2` → **warn + proceed** (changes are additive, treated as compatible). Enforcement of a major-version mismatch → hard fail is **deferred** (M014-CONTEXT § Deferred Ideas); today no consumer blocks on this field.
 
-**Canonical liveness snippet.** The orchestrator evaluates staleness by executing this exact block (result-file path as `argv[2]`). It reads the running payload, applies the formula, and prints **exactly one** token — `fresh | stale-dead | stale-alive | no-heartbeat` — which the poll loop maps to an action via the decision table below. Probe target is `adapter_pid` (the heartbeat writer, not the child `pid`):
+**Canonical liveness snippet.** The orchestrator evaluates staleness by executing this exact block (result-file path as `argv[2]`). It reads the running payload, applies the formula, and prints **exactly one** token — `fresh | stale-dead | stale-alive | no-heartbeat` — which the poll loop maps to an action via the decision table below. Probe target is `adapter_pid` (the heartbeat writer, not the child `pid`). An `updated_at` more than 60s in the future is treated as `no-heartbeat` because the clock-skewed heartbeat is untrustworthy, preventing an orphan from appearing perpetually `fresh`.
 
 ```js
 // forge-sidecar-liveness — canonical (M014 S01)
@@ -1062,6 +1062,7 @@ const beat = Number.isFinite(interval) && interval > 0 && interval <= 300000 ? i
 const staleAfter = Math.max(beat * 4, 30000);                        // = max(heartbeat_interval_ms × 4, 30s)
 const age = Date.now() - Date.parse(hb.updated_at);
 if (Number.isNaN(age)) { console.log('no-heartbeat'); process.exit(0); }   // unparseable updated_at → no-heartbeat
+if (age < -60000) { console.log('no-heartbeat'); process.exit(0); }    // clock skew: updated_at >60s in the future → untrustworthy heartbeat → no-heartbeat
 if (age <= staleAfter) { console.log('fresh'); process.exit(0); }    // within threshold → keep polling
 try {
   process.kill(hb.adapter_pid, 0);                                   // signal 0 = existence probe (no signal sent)
