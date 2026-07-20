@@ -272,7 +272,11 @@ function reinjectDiff({ planContent, verificationContent, prunedIds = [], mustHa
   } else if (mustHavesStatus && Array.isArray(mustHavesStatus.dropped)) {
     // Degradation: use the worker-reported must_haves_status.dropped directly
     const pruned = new Set(prunedIds);
-    const dropped = mustHavesStatus.dropped.filter(id => !pruned.has(id));
+    // M016 S01 defence-in-depth: env-promoted constraints are not pending work.
+    // Normal orchestrator synthesis omits them already; tolerate a stale object payload.
+    const dropped = mustHavesStatus.dropped.filter(id =>
+      !(id && typeof id === 'object' && id.scope === 'environment') && !pruned.has(id)
+    );
     const capped  = dropped.length > REINJECT_CAP;
     return { dropped: capped ? dropped.slice(0, REINJECT_CAP) : dropped, capped };
   } else {

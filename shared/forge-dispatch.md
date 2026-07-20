@@ -169,6 +169,8 @@ The `---GSD-WORKER-RESULT---` block MAY include the following optional additive 
 must_haves_status:           # OPTIONAL (additive, M-S04) — old readers ignore this field
   satisfied: [<truth or artifact id verified>]
   dropped: [<must_haves the worker could not deliver, with reason>]
+env_constraints:             # OPTIONAL (additive, M016 S01) — orchestrator-synthesized promotion audit trail
+  - {item: <must-have>, reason: <environment reason>, note: <worker evidence>}
 ```
 
 Purpose: structured primary source for Node Repair re-injection (alongside `S##-VERIFICATION.md`). If absent, the orchestrator falls back to `S##-VERIFICATION.md` diff only.
@@ -1094,13 +1096,16 @@ CODE_DIR=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null)
 ```
 
-On `status: done` with exit 0, the orchestrator reads the JSON and **builds** both `T##-SUMMARY.md` and the `---GSD-WORKER-RESULT---` block itself. **Codex NEVER touches `.gsd/**` and NEVER commits** (locked) — `git log` is unchanged and no `.gsd/**` path appears in `git -C "$CODE_DIR" diff --name-status $START_SHA`. JSON fields consumed:
+Before the success/failure boundary, a valid result with `status:"partial"` runs `node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json`. **`scripts/forge-env-promote.js` is the canonical M016 S01 formula-once source** for its closed allowlist and corroboration rules; mirrors call it and never restate its rules. `promote:true` treats this result as `done` and continues to step 6; `promote:false` follows the existing failure path unchanged. A legacy payload lacking `scope` is rejected by the checker, therefore preserves the prior behavior byte-for-byte. For a promotion, write `## Env Constraints` into `T##-SUMMARY.md` (one `item + reason + note` line per entry), synthesize the additive `env_constraints[]` result-block field, omit those entries from `must_haves_status.dropped`, and append `{"event":"sidecar_env_promotion","unit":"execute-task/{T##}","count":N,"reasons":[...],"ts":"<ISO>"}` to events.jsonl.
+
+On `status: done` with exit 0 (including that promoted `partial`), the orchestrator reads the JSON and **builds** both `T##-SUMMARY.md` and the `---GSD-WORKER-RESULT---` block itself. **Codex NEVER touches `.gsd/**` and NEVER commits** (locked) — `git log` is unchanged and no `.gsd/**` path appears in `git -C "$CODE_DIR" diff --name-status $START_SHA`. JSON fields consumed:
 
 | JSON field | Use |
 |------------|-----|
-| `status` | `done` → success; anything else → failure |
+| `status` | `done` → success; valid `partial` is first checked by `forge-env-promote.js`, then only `promote:true` → success; anything else → failure |
 | `summary` | one-liner + narrative seed for `T##-SUMMARY.md` |
 | `must_haves_status` | carried into the returned `---GSD-WORKER-RESULT---` (`must_haves_status`) |
+| `env_constraints` | orchestrator-synthesized audit field for promoted environment-only partials; never re-injected as dropped work |
 | `files_changed` | **primary source of the file-audit** — git-derived (`git diff --name-status $START_SHA` in `$CODE_DIR`), so it can never under-report (codex omitting a self-reported path) nor carry a path-traversal payload (it only ever lists paths git itself touched) |
 | `files_changed_declared` | **advisory cross-check only** (M013 S01 T03) — file-granular codex self-report, logged alongside `files_changed`; a divergence between the two is a `warning`, never a reset target and never grounds to trust the declared list over git's own diff |
 | `start_sha` / `head_sha` | audit trail; the orchestrator's own `$START_SHA` is authoritative for the reset |

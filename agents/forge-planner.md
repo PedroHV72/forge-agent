@@ -173,6 +173,8 @@ effort: low | medium | high | xhigh | max  # how hard it reasons (optional; defa
 
 ## Parallelism Guidance
 
+Plans routable to the codex sidecar must not include steps that create/modify `.gsd/**` — those are orchestrator-owned (TASK-004); a sidecar-refused `.gsd` step becomes an `env_constraint`, not a failure.
+
 When decomposing a slice into tasks, explicitly think about which tasks **can** run concurrently. Two tasks are safely parallel when:
 
 1. Neither depends on the other (`depends` arrays don't reference each other — directly or transitively).
