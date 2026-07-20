@@ -6517,6 +6517,72 @@ function smokeSidecarPolicyGuard() {
   pass('(final) Section 49: sidecar_on_failure policy gate — default byte-identity, degradation matrix, schema/mirror sync, doc-presence, and HARD-invariant cross-check all verified');
 }
 
+// ── Section 54: S02 installer chokepoint regression guards ─────────────────
+function smokePrefsChokepoints() {
+  process.stdout.write('\n▸ Section 54: prefs chokepoints — jsonc-only installers + global auto-migrate\n');
+  const REPO = path.dirname(SCRIPTS);
+  const sh = fs.readFileSync(path.join(REPO, 'install.sh'), 'utf8');
+  const ps = fs.readFileSync(path.join(REPO, 'install.ps1'), 'utf8');
+
+  // The installers must only migrate an existing legacy global file; the
+  // repository's deleted Markdown template is not an installation source.
+  assert(!sh.includes('copy "${REPO_DIR}/forge-agent-prefs.md"'),
+    '(a) install.sh does not copy the repository forge-agent-prefs.md template', 'install.sh');
+  assert(!sh.includes('forge-agent-prefs.md (novo)'),
+    '(a) install.sh has no legacy Portuguese template-copy line', 'install.sh');
+  assert(sh.includes('forge-prefs-migrate.js" --global-only'),
+    '(a) install.sh invokes forge-prefs-migrate.js --global-only', 'install.sh');
+  const shLegacyStart = sh.indexOf('elif [ -f "$PREFS_DST" ]');
+  const shFirstNextBranch = sh.indexOf('elif command -v node', shLegacyStart);
+  const shScaffoldStart = sh.indexOf('elif command -v node', shFirstNextBranch + 1);
+  const shLegacy = sh.slice(shLegacyStart, shScaffoldStart);
+  assert(/if node[\s\S]*else[\s\S]*manual[\s\S]*--global-only[\s\S]*\n\s*fi/.test(shLegacy),
+    '(b) install.sh degrades a refused migration to a manual instruction', shLegacy);
+  assert(!/manual:[\s\S]{0,300}\bexit\b/.test(shLegacy),
+    '(b) install.sh continues after a non-zero migrator exit', shLegacy);
+
+  assert(!ps.includes('CopyFile "$RepoDir\\forge-agent-prefs.md"'),
+    '(c) install.ps1 does not CopyFile the repository forge-agent-prefs.md template', 'install.ps1');
+  assert(ps.includes('--global-only'),
+    '(c) install.ps1 invokes forge-prefs-migrate.js --global-only', 'install.ps1');
+  const psLegacyStart = ps.indexOf("elseif (Test-Path $prefsFile)");
+  const psFirstNextBranch = ps.indexOf("elseif (Get-Command node", psLegacyStart);
+  const psScaffoldStart = ps.indexOf("elseif (Get-Command node", psFirstNextBranch + 1);
+  const psLegacy = ps.slice(psLegacyStart, psScaffoldStart);
+  assert(/LASTEXITCODE\s*-eq\s*0/.test(psLegacy) && /Warn[\s\S]*manual[\s\S]*--global-only/.test(psLegacy),
+    '(d) install.ps1 degrades a refused migration to a manual instruction', psLegacy);
+  assert(!/manual:[\s\S]{0,300}\bexit\b/i.test(psLegacy),
+    '(d) install.ps1 continues after a non-zero migrator exit', psLegacy);
+
+  const psBytes = fs.readFileSync(path.join(REPO, 'install.ps1'));
+  assert(!psBytes.includes(0x0c), '(e) install.ps1 contains no literal 0x0C byte', 'install.ps1');
+
+  // Keep this check read-only and dry-run-only: a real installer invocation
+  // could mutate the operator's ~/.claude directory.
+  const bashProbe = spawnSync('bash', ['--version'], { encoding: 'utf8' });
+  if (bashProbe.error || bashProbe.status !== 0) {
+    pass('(f) install.sh --dry-run skipped (bash unavailable)');
+  } else {
+    const dry = spawnSync('bash', [path.join(REPO, 'install.sh'), '--dry-run'], { encoding: 'utf8' });
+    const output = `${dry.stdout || ''}${dry.stderr || ''}`;
+    assert(dry.status === 0, '(f) install.sh --dry-run exits 0', output);
+    assert(!/[✗]|fatal/i.test(dry.stderr || ''), '(f) install.sh --dry-run has no error/fatal stderr', dry.stderr || '');
+    assert(!/cp\s+[^\n]*forge-agent-prefs\.md/.test(dry.stdout || ''),
+      '(f) install.sh --dry-run has no repository template-copy line', dry.stdout || '');
+  }
+
+  // HARD-invariant cross-check — prior surgical-reset and sidecar sections
+  // remain registered when this chokepoint guard is added.
+  const src = fs.readFileSync(path.join(SCRIPTS, 'forge-smoke.js'), 'utf8');
+  const mainBody = src.slice(src.indexOf('async function main()'));
+  assert(/smokeSurgicalReset\(\);/.test(mainBody),
+    '(g) smokeSurgicalReset() remains registered in main()', 'forge-smoke.js');
+  assert(/smokeSidecarPolicyGuard\(\);/.test(mainBody),
+    '(g) smokeSidecarPolicyGuard() remains registered in main()', 'forge-smoke.js');
+
+  pass('(final) Section 54: prefs chokepoints — installer template exclusion, global auto-migrate/degradation, clean dry-run, and PowerShell byte guard verified');
+}
+
 // ── Section 50: heartbeat self-describing contract regression guard ─────────
 // The fenced spec snippet is the implementation under test: this section
 // extracts and executes it rather than maintaining a second threshold/probe
@@ -7237,6 +7303,7 @@ async function main() {
     smokeSurgicalReset();
     smokeSidecarLayer1Retry();
     smokeSidecarPolicyGuard();
+    smokePrefsChokepoints();
     smokeHeartbeatContract();
     smokeSidecarEnvContract();
     smokeSchemaExtraction();
