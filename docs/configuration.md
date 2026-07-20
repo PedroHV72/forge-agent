@@ -1,6 +1,6 @@
 # Configuração
 
-## Global — `~/.claude/forge-agent-prefs.md`
+## Global — `~/.claude/forge-agent-prefs.jsonc`
 
 Padrões aplicados a todos os projetos. Criado pelo instalador.
 
@@ -23,7 +23,7 @@ auto_push:      false
 main_branch:    master
 ```
 
-## Por projeto — `.gsd/claude-agent-prefs.md`
+## Por projeto — `.gsd/claude-agent-prefs.jsonc`
 
 Overrides específicos do projeto. Criado pelo `/forge-init`.
 
@@ -71,7 +71,7 @@ CLAUDE.md                       ← carregado automaticamente pelo Claude Code e
   REQUIREMENTS.md               ← contrato de capacidades
   KNOWLEDGE.md                  ← conhecimento manual do projeto
   AUTO-MEMORY.md                ← memórias auto-aprendidas (cresce com o uso)
-  claude-agent-prefs.md         ← overrides de modelo e git para este projeto
+  claude-agent-prefs.jsonc      ← overrides de modelo e git para este projeto
   milestones/
     M-20260522143012-oauth/     ← ID timestamp (M### legado lido normalmente)
       M-20260522143012-oauth-ROADMAP.md    ← slices com checkboxes + boundary map

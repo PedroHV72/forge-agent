@@ -91,7 +91,7 @@ Schema completo em [`shared/forge-state.md`](../shared/forge-state.md) §2.
 
 O setup é aplicado automaticamente na ativação de `/forge-auto`, `/forge-next` e `/forge-task` (`scripts/forge-isolation.js --setup`, idempotente). Workers recebem um header de isolamento no prompt (`ISOLATION` / `BRANCH` / `CODE_DIR` — ver `shared/forge-dispatch.md § Isolation Header Convention`). O cleanup roda só no complete da milestone/task — pause/blocked preservam branch/worktree para resume.
 
-Configurável em `forge-agent-prefs.md`:
+Configurável em `forge-agent-prefs.jsonc`:
 
 ```yaml
 forge_isolation:
@@ -242,5 +242,5 @@ Testado em POSIX (Linux/macOS) e NTFS (Windows). Não testado em NFS / certas SM
 | Doc | O que cobre |
 |---|---|
 | [`shared/forge-state.md`](../shared/forge-state.md) | Schemas canônicos |
-| [`forge-agent-prefs.md`](../forge-agent-prefs.md) `forge_isolation:` | Configuração |
+| [`forge-agent-prefs.jsonc`](../shared/forge-prefs-reference.md) `forge_isolation:` | Configuração |
 | [`.gsd/milestones/M004/M004-CONTEXT.md`](../.gsd/milestones/M004/M004-CONTEXT.md) | 12 decisões D-M004-1..12 |

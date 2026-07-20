@@ -101,5 +101,5 @@ resolvidos.
 
 - `shared/forge-review.md` — `DIFF_CMD`, boundaries, Steps 2/4 (challenge/rebuttal).
 - `scripts/forge-xllm.js` — `invokeCodex()` (args do `codex exec`), `resolveCodexCommand()`.
-- `forge-agent-prefs.md § Review Settings` — `review.{challenger,challenger_model,engine,advocate_model}`.
+- `forge-agent-prefs.jsonc § Review Settings` — `review.{challenger,challenger_model,engine,advocate_model}`.
 - `docs/fragment-store-migration-bugs.md` — precedente de gap SVN (mesmo repo WDMA).

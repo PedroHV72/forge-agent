@@ -95,7 +95,7 @@ A partir da v1.0, o Forge Agent usa **3 comandos slash** e **skills** para tudo 
 | `forge-help` | Ajuda completa |
 
 > **Referência completa de preferências:** cada um dos 87 knobs (38 seções) do catálogo de
-> prefs — `forge-agent-prefs.md`/`.gsd/claude-agent-prefs.md`/`.gsd/prefs.local.md`, todos JSONC
+> prefs — `forge-agent-prefs.jsonc`/`.gsd/claude-agent-prefs.jsonc`/`.gsd/prefs.local.jsonc`, todos JSONC
 > com `$schema: forge-prefs.schema.json` — está documentado em
 > [`shared/forge-prefs-reference.md`](shared/forge-prefs-reference.md) (gerado a partir do schema,
 > sem drift possível). Use `forge-prefs` para ver o estado resolvido ao vivo.
@@ -156,7 +156,7 @@ see [docs/fragment-store.md](docs/fragment-store.md).
 > **Pré-requisito — `review.challenger: codex`:** o challenger Codex requer o [Codex CLI](https://github.com/openai/codex) (`codex`) instalado e autenticado, por um destes dois caminhos:
 >
 > - **Login por assinatura ChatGPT** (recomendado): `codex login` — abre um fluxo de browser, credencial gerenciada pelo próprio CLI.
-> - **`OPENAI_API_KEY`** no ambiente: exporte a variável de uma fonte segura (`.env` gitignored ou secret manager) — **nunca** hardcoded em prefs commitáveis (`.gsd/claude-agent-prefs.md` é versionado; uma chave ali seria vazamento).
+> - **`OPENAI_API_KEY`** no ambiente: exporte a variável de uma fonte segura (`.env` gitignored ou secret manager) — **nunca** hardcoded em prefs commitáveis (`.gsd/claude-agent-prefs.jsonc` é versionado; uma chave ali seria vazamento).
 >
 > O forge **não instala nem autentica** tooling de terceiros — apenas invoca o `codex` já configurado pelo usuário via `scripts/forge-xllm.js`, que nunca recebe a credencial por argumento (a auth é gerenciada inteiramente pelo próprio CLI). Sem `codex` disponível, o gate faz **fallback automático para `forge-reviewer` (Claude)** com o evento `review-challenger-fallback` — nunca bloqueia. Implicação de privacidade: com `challenger: codex`, o diff do slice sai da máquina local para a API da OpenAI.
 
@@ -174,7 +174,7 @@ see [docs/fragment-store.md](docs/fragment-store.md).
 Além do challenger de review Codex (acima), o forge permite rotear as próprias fases de trabalho —
 `execute-task` e `plan-slice` — para GPT via o mesmo sidecar `codex exec`, através das prefs
 `workers.execute-task: codex` / `workers.plan-slice: codex` (ver
-[`forge-agent-prefs.md` § Workers Settings](forge-agent-prefs.md)). O default continua `claude`
+[`forge-agent-prefs.jsonc` § Workers Settings](shared/forge-prefs-reference.md)). O default continua `claude`
 — é **opt-in**, não uma migração de engine.
 
 Mecanicamente, `scripts/forge-xllm.js --mode execute|plan` invoca `codex exec` como sidecar,
@@ -228,7 +228,7 @@ A partir da M006, cada review dialético resolve seu challenger e advocate **pel
 
 Autoria é derivada do campo `engine` dos dispatch events (`.gsd/forge/events.jsonl`), agregada por majority determinística — o orquestrador chama `scripts/forge-review-pairing.js` uma única vez por review antes da challenge. Degradações (autor sem evento de autoria, ou GPT sem `--mode defend` disponível) emitem `review-pairing-fallback` e retornam ao padrão Claude — nunca bloqueiam. Matriz canônica de resolver sem redefini-la: `shared/forge-review.md § Step 0`.
 
-**Ativar:** edite `forge-agent-prefs.md` (ou `.gsd/prefs.local.md`):
+**Ativar:** edite `forge-agent-prefs.jsonc` (ou `.gsd/prefs.local.jsonc`):
 ```yaml
 review:
   challenger: auto    # resolve de verdade na próxima review dialética
@@ -281,7 +281,7 @@ e continuam na próxima.
 
 ### Ativar:
 
-Edite `forge-agent-prefs.md` (ou `.gsd/prefs.local.md`), vá para `## Routing Settings` e descomente o
+Edite `forge-agent-prefs.jsonc` (ou `.gsd/prefs.local.jsonc`), vá para `## Routing Settings` e descomente o
 bloco `routing:`. Exemplo de célula cross-engine:
 
 ```yaml

@@ -7,8 +7,8 @@ você digita /forge-auto
         │
         ▼
 forge (orquestrador)
-  1. lê ~/.claude/forge-agent-prefs.md  ← modelo por fase
-  2. lê .gsd/claude-agent-prefs.md    ← overrides do projeto
+  1. lê ~/.claude/forge-agent-prefs.jsonc  ← modelo por fase
+  2. lê .gsd/claude-agent-prefs.jsonc    ← overrides do projeto
   3. lê .gsd/STATE.md                 ← próxima unidade
   4. lê .gsd/AUTO-MEMORY.md           ← top memórias rankeadas
   5. monta prompt com arquivos inlined
@@ -51,7 +51,7 @@ Cada agente roda com **contexto isolado** — equivalente ao `ctx.newSession()` 
 /forge-prefs set execute opus      ← execução com modelo pesado
 ```
 
-Ou edite diretamente `~/.claude/forge-agent-prefs.md` e o frontmatter do agente correspondente em `~/.claude/agents/`.
+Ou edite diretamente `~/.claude/forge-agent-prefs.jsonc` e o frontmatter do agente correspondente em `~/.claude/agents/`.
 
 ## Memória emergente
 

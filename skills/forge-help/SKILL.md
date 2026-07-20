@@ -4,7 +4,7 @@ description: "Ajuda completa do Forge Agent — comandos, skills, agentes."
 allowed-tools: Read
 ---
 
-Read `~/.claude/forge-agent-prefs.md` and `.gsd/claude-agent-prefs.md` (if exists) to get current model config. Then display the following help, filling in actual values where marked.
+Read the resolved model config with `node scripts/forge-prefs.js --resolved` (the JSONC catalogs are `~/.claude/forge-agent-prefs.jsonc` and `.gsd/claude-agent-prefs.jsonc`, if present). Then display the following help, filling in actual values where marked.
 
 ---
 
@@ -127,7 +127,7 @@ REPL interativo com menu. Acesso a todas as funcionalidades sem memorizar comand
 
 ### Agentes especializados (invocados automaticamente)
 
-Read `~/.claude/forge-agent-prefs.md` to get the current model for each agent, then display:
+Read the current model for each agent from the resolved JSONC catalog (`node scripts/forge-prefs.js --resolved`), then display:
 
 | Agente | Modelo atual | Usado em |
 |--------|-------------|----------|
@@ -162,10 +162,10 @@ Read `~/.claude/forge-agent-prefs.md` to get the current model for each agent, t
 
 | Arquivo | Escopo | O que controla |
 |---------|--------|----------------|
-| `~/.claude/forge-agent-prefs.md` | Global | Modelos por fase, skip rules, git |
+| `~/.claude/forge-agent-prefs.jsonc` | Global | Modelos por fase, skip rules, git |
 | `~/.claude/settings.json` | Global | Status line, hooks, MCPs globais |
 | `.claude/settings.json` | Projeto | Bypass permissions, MCPs de projeto |
-| `.gsd/claude-agent-prefs.md` | Projeto | Overrides do projeto (sobrescreve global) |
+| `.gsd/claude-agent-prefs.jsonc` | Projeto | Overrides do projeto (sobrescreve global) |
 | `CLAUDE.md` | Projeto | Carregado automaticamente em toda sessão |
 | `.gsd/AUTO-MEMORY.md` | Projeto | Memórias auto-aprendidas acumuladas |
 

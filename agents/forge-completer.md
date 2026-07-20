@@ -43,19 +43,11 @@ Given all `T##-SUMMARY.md` files from the slice:
 
 1.5. **Evidence cross-ref — write `## Evidence Flags` section to `S##-SUMMARY.md`** (advisory; skipped when `evidence.mode: disabled`).
 
-    Read the merged `evidence.mode` pref (inline Bash):
+    Read the merged `evidence.mode` pref through the JSONC-only engine CLI (default `lenient` on absent prefs or engine errors):
     ```bash
-    node -e "
-    const fs=require('fs'),path=require('path'),os=require('os');
-    const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-                 path.join('{WORKING_DIR}','.gsd','claude-agent-prefs.md'),
-                 path.join('{WORKING_DIR}','.gsd','prefs.local.md')];
-    let mode='lenient';
-    for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^evidence:[ \t]*\n[ \t]+mode:[ \t]*(\w+)/m);if(m)mode=m[1].toLowerCase();}catch{}}
-    process.stdout.write(mode);
-    "
+    EVIDENCE_MODE=$(node scripts/forge-prefs.js --resolved --key evidence.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'lenient')}catch{process.stdout.write('lenient')}}")
     ```
-    If the result is `disabled` → SKIP this entire sub-step. Do NOT write `## Evidence Flags`, not even an empty one.
+    If `EVIDENCE_MODE` is `disabled` → SKIP this entire sub-step. Do NOT write `## Evidence Flags`, not even an empty one.
     For each `T##-SUMMARY.md` in the slice (under `.gsd/milestones/M###/slices/S##/tasks/T##/`):
 
     a. **Parse `verification_evidence:` from the SUMMARY frontmatter.** Use a tiny node one-liner (no new script):
@@ -146,27 +138,9 @@ Given all `T##-SUMMARY.md` files from the slice:
          ```
        Union all results → `EXPECTED`.
 
-    c. **Read `file_audit.ignore_list` from merged prefs** (same cascade order as evidence.mode — user-global → repo → local):
+    c. **Read `file_audit.ignore_list` from the JSONC-only engine CLI** (default list on absent prefs or engine errors):
        ```bash
-       node -e "
-       const fs=require('fs'),path=require('path'),os=require('os');
-       const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-                    path.join('{WORKING_DIR}','.gsd','claude-agent-prefs.md'),
-                    path.join('{WORKING_DIR}','.gsd','prefs.local.md')];
-       const DEFAULT=['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**'];
-       let list=DEFAULT;
-       for(const f of files){
-         try{
-           const r=fs.readFileSync(f,'utf8');
-           const block=r.match(/^file_audit:[ \t]*\n[ \t]+ignore_list:[ \t]*\[([^\]]*)\]/m);
-           if(block){
-             const items=block[1].split(',').map(s=>s.trim().replace(/^[\"']|[\"']$/g,'')).filter(Boolean);
-             if(items.length)list=items;
-           }
-         }catch{}
-       }
-       process.stdout.write(JSON.stringify(list));
-       "
+       FILE_AUDIT_IGNORE=$(node scripts/forge-prefs.js --resolved --key file_audit.ignore_list --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(JSON.stringify(Array.isArray(v)&&v.length?v:['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**']))}catch{process.stdout.write(JSON.stringify(['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**']))}})")
        ```
 
     d. **Filter both sides with ignore_list.** A path matches a glob when:
@@ -261,19 +235,11 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     **Fragment store (M001/S04+):** events are written to `.gsd/checker-memory/{M###}.md` via `scripts/forge-checker-memory.js --write`. The fragment store is durable across `milestone_cleanup` — it is the source of truth. The global `.gsd/CHECKER-MEMORY.md` is now a projection rebuilt by `forge-merger.js` from the fragment store; it is no longer the write target. Legacy single-run fallback: if `{M###}` is not provided, skip this sub-step.
 
-    Read the merged `checker_memory.mode` pref (same cascade as evidence.mode):
+    Read the merged `checker_memory.mode` pref through the JSONC-only engine CLI (default `enabled` on absent prefs or engine errors):
     ```bash
-    node -e "
-    const fs=require('fs'),path=require('path'),os=require('os');
-    const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-                 path.join('{WORKING_DIR}','.gsd','claude-agent-prefs.md'),
-                 path.join('{WORKING_DIR}','.gsd','prefs.local.md')];
-    let mode='enabled';
-    for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^checker_memory:[ \t]*\n[ \t]+mode:[ \t]*(\w+)/m);if(m)mode=m[1].toLowerCase();}catch{}}
-    process.stdout.write(mode);
-    "
+    CHECKER_MEMORY_MODE=$(node scripts/forge-prefs.js --resolved --key checker_memory.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
     ```
-    If the result is `disabled` → SKIP this entire sub-step.
+    If `CHECKER_MEMORY_MODE` is `disabled` → SKIP this entire sub-step.
 
     a. **Extract plan-check results (C1).** Read `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-PLAN-CHECK.md` if it exists.
        Parse all dimension rows from the markdown table. Expected format per row: `| dimension | pass/warn/fail | justification |`.
@@ -327,19 +293,11 @@ Given all `T##-SUMMARY.md` files from the slice:
 
 4. **Review scan** (advisory; skipped when `review.mode: disabled`).
 
-   Read the merged `review.mode` pref (same cascade as evidence.mode):
+   Read the merged `review.mode` pref through the JSONC-only engine CLI (default `enabled` on absent prefs or engine errors):
    ```bash
-   node -e "
-   const fs=require('fs'),path=require('path'),os=require('os');
-   const files=[path.join(os.homedir(),'.claude','forge-agent-prefs.md'),
-                path.join('{WORKING_DIR}','.gsd','claude-agent-prefs.md'),
-                path.join('{WORKING_DIR}','.gsd','prefs.local.md')];
-   let mode='enabled';
-   for(const f of files){try{const r=fs.readFileSync(f,'utf8');const m=r.match(/^review:[ \t]*\n[ \t]+mode:[ \t]*(\w+)/m);if(m)mode=m[1].toLowerCase();}catch{}}
-   process.stdout.write(mode);
-   "
+   REVIEW_MODE=$(node scripts/forge-prefs.js --resolved --key review.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
    ```
-   If the result is `disabled` → SKIP this entire step. Continue to step 5.
+   If `REVIEW_MODE` is `disabled` → SKIP this entire step. Continue to step 5.
 
    > **Note — the adversarial/dialectic review does NOT run here.** It runs in the orchestrator (`shared/forge-review.md`, gated before `complete-slice` is dispatched) because this agent has no `Agent` tool and cannot dispatch `forge-reviewer`/`forge-advocate`. By the time you run, the dialogue already lives in `{S##}-REVIEW.md`. This step only does the deterministic pattern-scan and links to it.
 

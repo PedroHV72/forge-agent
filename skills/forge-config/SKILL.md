@@ -137,7 +137,7 @@ Before running any enable/disable command, check if the script exists:
 test -f ~/.claude/forge-settings.js && echo "exists" || echo "missing"
 ```
 
-If "missing": look for `repo_path` in `~/.claude/forge-agent-prefs.md` and copy the script:
+If "missing": resolve `repo_path` from the JSONC catalog with the engine CLI and copy the script:
 
 ```bash
 PREFS_ENGINE="$FORGE_SCRIPTS_DIR/forge-prefs.js"; [ -f "$PREFS_ENGINE" ] || PREFS_ENGINE="$HOME/.claude/scripts/forge-prefs.js"
