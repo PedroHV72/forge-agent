@@ -6140,6 +6140,201 @@ function smokeSidecarLayer1Retry() {
   pass('(final) Section 48: sidecar Layer-1 retry — error_class real cases, classifier-reuse, state counter, orthogonality + doc-presence all verified');
 }
 
+// ── Section 49 — S03 sidecar_on_failure policy gate + pause-ask degradation ──
+// Consolidated safety net over S01+S02+S03: guards (does not re-run) the
+// exhaustive behavioral proofs Sections 47/48 already own, plus the NEW S03
+// policy/pause-ask/doc-sync surface:
+//   (a) default-policy byte-identity — `[ "$POLICY" != "fallback" ]` wraps the
+//       existing Layer-1 `if` in all 3 mirrors; default resolves to
+//       retry-then-fallback and the guarded body is untouched (prepend, not rewrite).
+//   (b) degradation matrix — forge-auto ALWAYS degrades (no reachable
+//       AskUserQuestion in its pause-ask path + emits sidecar-pause-degraded);
+//       forge-next is TTY-conditional ([ -t 1 ]); forge-task always asks live.
+//   (c) schema + all-3-values — forge-prefs.schema.json enum+default; each
+//       mirror's POLICY whitelist carries all 3 literal values.
+//   (d) doc-presence + sync — spec + 3 mirrors carry the policy/pause-ask/event
+//       terms, and the event reason string is identical everywhere it's emitted.
+//   (e) shipped-behavior guard + HARD-invariant cross-check — the exhaustion
+//       guard is `-eq "$MAX_TRC"` (NOT `-ge`, S03 review R1 deferred, NOT
+//       resolved here); Sections 47+48 remain registered in main().
+function smokeSidecarPolicyGuard() {
+  process.stdout.write('\n▸ Section 49: sidecar_on_failure policy gate + pause-ask degrade matrix + sync\n');
+  const REPO = path.dirname(SCRIPTS);
+
+  const MIRRORS = [
+    { rel: 'skills/forge-auto/SKILL.md', label: 'forge-auto' },
+    { rel: 'skills/forge-next/SKILL.md', label: 'forge-next' },
+    { rel: 'skills/forge-task/SKILL.md', label: 'forge-task' },
+  ];
+  const DOCS = [{ rel: 'shared/forge-dispatch.md', label: 'shared/forge-dispatch.md' }, ...MIRRORS];
+
+  const texts = {};
+  for (const d of DOCS) {
+    const p = path.join(REPO, d.rel);
+    assert(fs.existsSync(p), `(setup) ${d.label} exists on disk`, p);
+    texts[d.rel] = fs.readFileSync(p, 'utf8');
+  }
+
+  // ── (a) default-policy byte-identity gate ──
+  {
+    for (const m of MIRRORS) {
+      const t = texts[m.rel];
+      assert(/POLICY=\$\(printf/.test(t),
+        `(a) ${m.label} has the POLICY= resolution idiom`, m.rel);
+      // Every Layer-1 entry `if` in the file must be prefixed by the
+      // `[ "$POLICY" != "fallback" ]` guard (tolerant to whitespace/quoting).
+      const entryIfs = t.match(/if \[ "\$POLICY" != "fallback" \] && \[ "\$ERROR_CLASS" = "transient" \] && \[ "\$TRC" -lt "\$MAX_TRC" \]; then/g) || [];
+      assert(entryIfs.length > 0,
+        `(a) ${m.label} has ≥1 Layer-1 entry gated by [ "$POLICY" != "fallback" ]`, m.rel);
+      // Absent/invalid whitelist fallback — node one-liner's ternary defaults to retry-then-fallback.
+      assert(/\['retry-then-fallback','fallback','pause-ask'\]\.includes\(v\)\?v:'retry-then-fallback'/.test(t),
+        `(a) ${m.label} POLICY resolver whitelists the 3 values, defaulting absent/invalid to retry-then-fallback`, m.rel);
+      // The guarded body itself is intact — the transient+under-cap condition
+      // is a suffix of the guard, not a replacement (prepend, not rewrite).
+      assert(/"\$POLICY" != "fallback" \] && \[ "\$ERROR_CLASS" = "transient" \] && \[ "\$TRC" -lt "\$MAX_TRC" \]/.test(t),
+        `(a) ${m.label} Layer-1 body ("$ERROR_CLASS" = "transient" && "$TRC" -lt "$MAX_TRC") is intact after the guard`, m.rel);
+    }
+  }
+
+  // ── (b) degradation matrix ──
+  {
+    // forge-auto: extract every pause-ask degrade block; must contain
+    // sidecar-pause-degraded and must NOT contain AskUserQuestion anywhere
+    // in that block (always-degrade, AUTONOMY RULE — never pauses).
+    {
+      const t = texts['skills/forge-auto/SKILL.md'];
+      const blocks = t.match(/\*\*pause-ask degrade[\s\S]*?```\n\*\*If `\$TRANSIENT_RETRY`/g) || [];
+      assert(blocks.length > 0, '(b) forge-auto has ≥1 extractable pause-ask degrade block', 'skills/forge-auto/SKILL.md');
+      for (const b of blocks) {
+        assert(/sidecar-pause-degraded/.test(b),
+          '(b) forge-auto pause-ask block emits sidecar-pause-degraded', b.slice(0, 200));
+        assert(!/AskUserQuestion/.test(b),
+          '(b) forge-auto pause-ask block has NO reachable AskUserQuestion (always degrades)', b.slice(0, 200));
+        assert(/ALWAYS degrades/.test(b) || /never pauses/.test(b),
+          '(b) forge-auto pause-ask block documents always-degrade posture', b.slice(0, 200));
+      }
+    }
+    // forge-next: TTY-conditional — assert both the [ -t 1 ] ask-live branch
+    // AND the headless sidecar-pause-degraded degrade exist in the same gate.
+    {
+      const t = texts['skills/forge-next/SKILL.md'];
+      const blocks = t.match(/\*\*pause-ask gate[\s\S]*?```\n\*\*If `\$TRANSIENT_RETRY`/g) || [];
+      assert(blocks.length > 0, '(b) forge-next has ≥1 extractable pause-ask gate block', 'skills/forge-next/SKILL.md');
+      for (const b of blocks) {
+        assert(/\[ -t 1 \]/.test(b),
+          '(b) forge-next pause-ask block is TTY-conditional ([ -t 1 ])', b.slice(0, 200));
+        assert(/PAUSE_ASK_GATE=1/.test(b),
+          '(b) forge-next pause-ask block sets PAUSE_ASK_GATE=1 on the TTY branch', b.slice(0, 200));
+        assert(/sidecar-pause-degraded/.test(b),
+          '(b) forge-next pause-ask block emits sidecar-pause-degraded on the headless branch', b.slice(0, 200));
+      }
+      assert(/TTY asks live, headless degrades/.test(t),
+        '(b) forge-next documents TTY-asks-live / headless-degrades posture', 'skills/forge-next/SKILL.md');
+    }
+    // forge-task: always-ask (PAUSE_ASK_GATE=1 path) AND a defensive
+    // [ -t 1 ]-false degrade both exist (piped/-p invocation never blocks).
+    {
+      const t = texts['skills/forge-task/SKILL.md'];
+      const blocks = t.match(/\*\*pause-ask gate[\s\S]*?```\n\*\*If `\$PAUSE_ASK_GATE`/g) || [];
+      assert(blocks.length > 0, '(b) forge-task has ≥1 extractable pause-ask gate block', 'skills/forge-task/SKILL.md');
+      for (const b of blocks) {
+        assert(/PAUSE_ASK_GATE=1/.test(b),
+          '(b) forge-task pause-ask block sets PAUSE_ASK_GATE=1 (always-interactive path)', b.slice(0, 200));
+        assert(/\[ -t 1 \]/.test(b) && /sidecar-pause-degraded/.test(b),
+          '(b) forge-task pause-ask block has a defensive [ -t 1 ]-false degrade emitting sidecar-pause-degraded', b.slice(0, 200));
+      }
+      assert(/ALWAYS interactive/.test(t) || /always interactive/.test(t),
+        '(b) forge-task documents its always-interactive posture', 'skills/forge-task/SKILL.md');
+      assert(/AskUserQuestion/.test(texts['skills/forge-task/SKILL.md']),
+        '(b) forge-task pause-ask resolution references AskUserQuestion (asks live)', 'skills/forge-task/SKILL.md');
+    }
+    // Spec degradation-matrix table rows present in shared/forge-dispatch.md.
+    {
+      const t = texts['shared/forge-dispatch.md'];
+      assert(/Degradation matrix/.test(t), '(b) spec has a "Degradation matrix" section', 'shared/forge-dispatch.md');
+      for (const row of [
+        /`forge-task`\s*\|\s*always interactive\s*\|\s*\*\*ask live\*\*/,
+        /`forge-next` \(TTY\)\s*\|\s*`\[ -t 1 \]` true\s*\|\s*\*\*ask live\*\*/,
+        /`forge-next` \(headless, `claude -p`\)\s*\|\s*`\[ -t 1 \]` false\s*\|\s*\*\*degrade\*\*/,
+        /`forge-auto`\s*\|\s*always headless \(AUTONOMY RULE\)\s*\|\s*\*\*degrade\*\*/,
+      ]) {
+        assert(row.test(t), `(b) spec degradation-matrix row matches ${row}`, 'shared/forge-dispatch.md');
+      }
+    }
+  }
+
+  // ── (c) schema + all-3-values ──
+  {
+    const schemaPath = path.join(REPO, 'forge-prefs.schema.json');
+    assert(fs.existsSync(schemaPath), '(c) forge-prefs.schema.json exists', schemaPath);
+    const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+    const node = schema?.properties?.workers?.properties?.sidecar_on_failure;
+    assert(!!node, '(c) schema has properties.workers.properties.sidecar_on_failure', JSON.stringify(Object.keys(schema?.properties?.workers?.properties || {})));
+    assert(JSON.stringify(node?.enum) === JSON.stringify(['retry-then-fallback', 'fallback', 'pause-ask']),
+      '(c) sidecar_on_failure enum is exactly the 3 values', JSON.stringify(node?.enum));
+    assert(node?.default === 'retry-then-fallback',
+      '(c) sidecar_on_failure default is retry-then-fallback', String(node?.default));
+
+    for (const m of MIRRORS) {
+      const t = texts[m.rel];
+      assert(/'retry-then-fallback'/.test(t) && /'fallback'/.test(t) && /'pause-ask'/.test(t),
+        `(c) ${m.label} POLICY whitelist references all 3 literal values`, m.rel);
+    }
+    // codex-timeout → terminal cross-check (Section 48 case 4 proves the
+    // behavior; here we assert the spec/mirrors document it consistently).
+    for (const rel of ['shared/forge-dispatch.md', 'skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+      const t = texts[rel];
+      assert(/codex-timeout/.test(t) && /terminal/.test(t),
+        `(c) ${rel} documents codex-timeout → terminal`, rel);
+    }
+  }
+
+  // ── (d) doc-presence + sync ──
+  {
+    for (const d of DOCS) {
+      const t = texts[d.rel];
+      assert(/sidecar_on_failure/.test(t), `(d) ${d.label} carries sidecar_on_failure`, d.rel);
+      assert(/sidecar-pause-degraded/.test(t), `(d) ${d.label} carries sidecar-pause-degraded`, d.rel);
+      assert(/pause-ask/.test(t), `(d) ${d.label} carries pause-ask`, d.rel);
+    }
+    // Sync — the event reason string must be byte-identical across every
+    // file that emits it (no drift between spec and mirrors).
+    const reasonRe = /"reason":"pause-ask-headless-degrade"/g;
+    let sample = null;
+    for (const d of DOCS) {
+      const t = texts[d.rel];
+      const found = (t.match(reasonRe) || []).length > 0;
+      assert(found, `(d) ${d.label} emits reason:"pause-ask-headless-degrade" (byte-identical)`, d.rel);
+      if (found && sample === null) sample = 'pause-ask-headless-degrade';
+    }
+    assert(sample === 'pause-ask-headless-degrade', '(d) sync sample confirms the shared reason string', String(sample));
+  }
+
+  // ── (e) shipped-behavior guard + HARD-invariant cross-check ──
+  {
+    // Guard (not resolve) the shipped `-eq "$MAX_TRC"` exhaustion condition
+    // in all 3 mirrors — R1 (eq vs ge) is DEFERRED to milestone-final triage.
+    for (const m of MIRRORS) {
+      const t = texts[m.rel];
+      assert(/\[ "\$TRC" -eq "\$MAX_TRC" \]/.test(t),
+        `(e) ${m.label} shipped pause-ask exhaustion guard is -eq "$MAX_TRC" (R1 deferred, NOT changed here)`, m.rel);
+      assert(!/\[ "\$TRC" -ge "\$MAX_TRC" \]/.test(t),
+        `(e) ${m.label} pause-ask exhaustion guard did NOT drift to -ge "$MAX_TRC"`, m.rel);
+    }
+    // HARD-invariant cross-check — Sections 47/48 remain registered in
+    // main() (they own the exhaustive behavioral proof; Section 49 does not
+    // duplicate their git-repo fixtures).
+    const src = fs.readFileSync(path.join(SCRIPTS, 'forge-smoke.js'), 'utf8');
+    const mainBody = src.slice(src.indexOf('async function main()'));
+    assert(/smokeSurgicalReset\(\);/.test(mainBody),
+      '(e) smokeSurgicalReset() (Section 47) still registered in main()', 'forge-smoke.js');
+    assert(/smokeSidecarLayer1Retry\(\);/.test(mainBody),
+      '(e) smokeSidecarLayer1Retry() (Section 48) still registered in main()', 'forge-smoke.js');
+  }
+
+  pass('(final) Section 49: sidecar_on_failure policy gate — default byte-identity, degradation matrix, schema/mirror sync, doc-presence, and HARD-invariant cross-check all verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -6195,6 +6390,7 @@ async function main() {
     smokeDispatchResolve();
     smokeSurgicalReset();
     smokeSidecarLayer1Retry();
+    smokeSidecarPolicyGuard();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
