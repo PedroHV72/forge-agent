@@ -214,7 +214,14 @@ function resolveCurrent(cwd, opts) {
   const errors = [];
   const layers = layerDescriptors(cwd, options).map((layer) => {
     if (existingFiles([layer.jsoncPath]).length === 1) {
-      const parsed = parseJsonc(fs.readFileSync(layer.jsoncPath, 'utf8'));
+      let raw;
+      try {
+        raw = fs.readFileSync(layer.jsoncPath, 'utf8');
+      } catch (error) {
+        errors.push({ file: layer.jsoncPath, line: null, message: error.message });
+        return {};
+      }
+      const parsed = parseJsonc(raw);
       if (!parsed.ok) {
         errors.push({ file: layer.jsoncPath, line: parsed.error.line, message: parsed.error.message });
         return {};

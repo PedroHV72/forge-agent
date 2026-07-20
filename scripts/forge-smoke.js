@@ -4411,7 +4411,7 @@ function smokePrefsEngine() {
           path.join(gsd, 'claude-agent-prefs.md'), path.join(gsd, 'prefs.local.md')];
         assert(result.errors.length === 2 && result.errors.every((error) => error.code === 'legacy-md-without-jsonc') &&
           expectedMd.every((file) => result.errors.some((error) => error.message.includes(file))) &&
-          result.errors.every((error) => error.message.includes('forge-prefs-migrate.js --cwd')),
+          result.errors.every((error) => error.message.includes('forge-prefs-migrate.js" --cwd "')),
         '(c) md-only: hard-stop errors name every md file and the migration command', JSON.stringify(result.errors));
       } else if (state === 'md+jsonc') {
         assert(result.errors.length === 0 && result.prefs.review.source === 'local-jsonc',
@@ -4875,8 +4875,8 @@ function smokePrefsCutover() {
     const contract = fs.readFileSync(path.join(__dirname, '..', 'shared', 'forge-prefs-cutover.md'), 'utf8');
     const match = /## § Canonical message[^]*?```text\n([^\n]+)\n```/.exec(contract);
     const actual = prefsExports.readPrefs(dir).errors[0];
-    const command = `node ${path.join(SCRIPTS, 'forge-prefs-migrate.js')}`;
-    const expected = match && match[1].replace('{files}', legacy).replace('{command}', command).replace('{cwd}', dir);
+    const command = path.join(SCRIPTS, 'forge-prefs-migrate.js');
+    const expected = match && match[1].replace('{files}', legacy).replace('{command}', command).replace('{cwd}', path.resolve(dir));
     assert(match && actual && actual.message === expected,
       '(S01) spec parity extracts and executes the canonical fenced message template', JSON.stringify({ actual, expected }));
     cleanup(dir);

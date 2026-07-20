@@ -270,7 +270,7 @@ function resolveLayer(jsoncFile, markdownFiles, errors, cwd) {
     file: files[0],
     line: null,
     code: 'legacy-md-without-jsonc',
-    message: `Preferências Markdown legadas encontradas: ${files.join(', ')}. Rode: node ${migrate} --cwd ${cwd}`,
+    message: `Preferências Markdown legadas encontradas: ${files.join(', ')}. Rode: node "${migrate}" --cwd "${cwd}"`,
   });
   return {
     prefs: {},
@@ -309,7 +309,7 @@ function preferenceLayerDescriptors(cwd, opts) {
  * created: callers always receive an in-memory result for the current files.
  */
 function readPrefs(cwd, opts) {
-  const targetCwd = cwd || process.cwd();
+  const targetCwd = path.resolve(cwd || process.cwd());
   const errors = [];
   const [globalDescriptor, localDescriptor] = preferenceLayerDescriptors(targetCwd, opts);
   const globalLayer = resolveLayer(globalDescriptor.jsoncPath, globalDescriptor.mdFiles, errors, targetCwd);

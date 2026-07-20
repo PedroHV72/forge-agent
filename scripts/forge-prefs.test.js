@@ -318,7 +318,7 @@ for (const [state, source, blocked] of layerStates) {
       const names = [path.join(claude, 'forge-agent-prefs.md'), path.join(gsd, 'claude-agent-prefs.md'), path.join(gsd, 'prefs.local.md')];
       assert(result.errors.length === 2 && result.errors.every((error) => error.code === 'legacy-md-without-jsonc') &&
         names.every((name) => result.errors.some((error) => error.message.includes(name))) &&
-        result.errors.every((error) => error.message.includes('forge-prefs-migrate.js --cwd')),
+        result.errors.every((error) => error.message.includes('forge-prefs-migrate.js" --cwd "')),
       'md-only: errors name every legacy file and migration command');
     } else if (state === 'md+jsonc') {
       assert(result.errors.length === 0 && result.prefs.review.source === 'local-jsonc',

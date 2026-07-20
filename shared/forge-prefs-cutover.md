@@ -39,17 +39,19 @@ consumers must preserve that text rather than paraphrasing it.
 The fenced line below mirrors the emitter in `forge-prefs.js` § `resolveLayer`.
 It is intentionally extractable for parity tests. `{files}` is the
 comma-space-joined list of offending absolute paths, `{command}` is the
-complete executable command prefix (`node /path/to/forge-prefs-migrate.js`),
-and `{cwd}` is the resolved working directory.
+absolute path to the migration script (`/path/to/forge-prefs-migrate.js`),
+and `{cwd}` is the resolved working directory. `{command}` and `{cwd}` are each
+individually double-quoted in the rendered message so paths containing spaces
+still form a copy-paste-executable command.
 
 ```text
-Preferências Markdown legadas encontradas: {files}. Rode: {command} --cwd {cwd}
+Preferências Markdown legadas encontradas: {files}. Rode: node "{command}" --cwd "{cwd}"
 ```
 
 Concrete rendering:
 
 ```text
-Preferências Markdown legadas encontradas: /Users/alice/.claude/forge-agent-prefs.md. Rode: node /opt/forge/scripts/forge-prefs-migrate.js --cwd /work/project
+Preferências Markdown legadas encontradas: /Users/alice/.claude/forge-agent-prefs.md. Rode: node "/opt/forge/scripts/forge-prefs-migrate.js" --cwd "/work/project"
 ```
 
 The fix command migrates the default scope (both global and local layers);
