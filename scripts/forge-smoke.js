@@ -7460,6 +7460,145 @@ function smokeRequireWorktree() {
   pass('(final) Section 53: require_worktree per-engine elevation — resolver matrix, detect unit, CLI, contract fields, knob-count 90, and scaffold verified');
 }
 
+// ── Section 57: sidecar env-promotion contract regression guard ─────────────
+// Baseline: 1370 passes before this section; the final count is reported by the
+// smoke runner so this guard does not alter any pre-existing section numbering.
+function smokeSidecarEnvPromotion() {
+  process.stdout.write('\n▸ Section 57: sidecar env-promotion contract regression guard\n');
+  const REPO = path.dirname(SCRIPTS);
+  const adapter = require('./forge-xllm.js');
+  const { checkEnvPromotion } = require('./forge-env-promote.js');
+  const legacy = { status: 'partial', summary: 'old worker', must_haves_status: [
+    { item: 'legacy item', status: 'unmet', note: 'old payload' },
+  ], files_changed: [] };
+  const base = { status: 'partial', summary: 'fixture', files_changed: [] };
+  const plan = [
+    '---',
+    'expected_output:',
+    '  - tests/fixture.test.js',
+    'writes:',
+    '  - scripts/forge-smoke.js',
+    '---',
+    'TASK-004 fixture plan',
+  ].join('\n');
+  const env = (item, reason, note) => ({ item, status: 'unmet', note, scope: 'environment', reason });
+  const task = (item, note) => ({ item, status: 'unmet', note, scope: 'task', reason: '' });
+  const met = item => ({ item, status: 'met', note: 'verified' });
+
+  // A — adapter contract and schema shape. The wrapper exposes private schema/
+  // prompt values to this smoke only; production exports remain unchanged.
+  const adapterModule = { exports: {} };
+  const adapterWrapper = new Function('exports', 'require', 'module', '__filename', '__dirname',
+    `${fs.readFileSync(path.join(SCRIPTS, 'forge-xllm.js'), 'utf8').replace(/^#![^\n]*\n/, '')}\n` +
+    'module.exports.__section57 = { executeSchema, buildExecutePrompt };');
+  adapterWrapper(adapterModule.exports, require, adapterModule,
+    path.join(SCRIPTS, 'forge-xllm.js'), SCRIPTS);
+  const internals = adapterModule.exports.__section57;
+  const legacyValid = adapter.validateExecuteResult(legacy);
+  assert(legacyValid === true,
+    '(a) legacy execute payload without scope/reason remains valid', JSON.stringify(legacy));
+  assert(adapter.validateExecuteResult({ ...base, must_haves_status: [
+    env('TASK-004 environment write', 'gsd-write-refused', 'refused .gsd/STATE.md'),
+  ] }) === true,
+  '(a) environment gsd-write-refused payload validates');
+  assert(adapter.validateExecuteResult({ ...base, must_haves_status: [
+    env('bad scope', 'gsd-write-refused', 'refused .gsd/STATE.md'),
+  ].map(entry => ({ ...entry, scope: 'bogus' })) }) === false,
+  '(a) bogus scope is rejected');
+  assert(adapter.validateExecuteResult({ ...base, must_haves_status: [
+    env('bad reason', 'not-a-class', 'refused .gsd/STATE.md'),
+  ] }) === false,
+  '(a) environment reason outside allowlist is rejected');
+
+  const walkObjects = (value, pathName, found) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    if (value.type === 'object') found.push({ path: pathName, value });
+    for (const [key, child] of Object.entries(value)) walkObjects(child, `${pathName}.${key}`, found);
+  };
+  const schemaObjects = [];
+  walkObjects(internals.executeSchema, 'executeSchema', schemaObjects);
+  assert(schemaObjects.length > 0 && schemaObjects.every(({ value }) => value.additionalProperties === false),
+    '(a) executeSchema sets additionalProperties:false on every object level');
+  const itemSchema = internals.executeSchema.properties.must_haves_status.items;
+  assert(itemSchema.properties.scope && itemSchema.properties.reason,
+    '(a) executeSchema item properties include scope and reason');
+  const prompt = internals.buildExecutePrompt('x');
+  assert(prompt.includes('scope') && adapter.MH_SCOPE_ENUM.join('|') === 'task|environment'
+      && adapter.ENV_REASON_ENUM.join('|') === 'git-commit-required|gsd-write-refused|out-of-scope-test-failure|network-required',
+    '(a) adapter exports the canonical scope and environment-reason enums');
+  assert(prompt.includes('"git-commit-required" | "gsd-write-refused" | "out-of-scope-test-failure" | "network-required"'),
+    '(a) execute prompt contains the four canonical environment classes');
+  assert(/status reflects ONLY task-scope work/.test(prompt),
+    '(a) execute prompt says status reflects task-scope-only work');
+
+  // B — promotion matrix. These fixtures stay in memory and never write .gsd.
+  const legitimate = checkEnvPromotion({ ...base, must_haves_status: [
+    env('TASK-004 must-have', 'gsd-write-refused', 'orchestrator refused .gsd/STATE.md'),
+  ] }, plan);
+  assert(legitimate.promote === true && legitimate.env_constraints.length === 1,
+    '(b) TASK-004 legitimate environment refusal promotes with one constraint', JSON.stringify(legitimate));
+  const mixedGood = checkEnvPromotion({ ...base, must_haves_status: [
+    met('first'), met('second'), env('environment', 'gsd-write-refused', 'blocked at .gsd/STATE.md'),
+  ] }, plan);
+  assert(mixedGood.promote === true && mixedGood.env_constraints.length === 1,
+    '(b) met items plus one corroborated environment item promotes');
+  const mixedBad = checkEnvPromotion({ ...base, must_haves_status: [
+    met('first'), env('environment', 'gsd-write-refused', 'blocked at .gsd/STATE.md'), task('real task work', 'must fix implementation'),
+  ] }, plan);
+  assert(mixedBad.promote === false && mixedBad.rejected.length >= 1,
+    '(b) any unmet task-scope item blocks promotion');
+  const washed = checkEnvPromotion({ ...base, must_haves_status: [
+    env('washed refusal', 'gsd-write-refused', 'worker could not continue'),
+  ] }, plan);
+  assert(washed.promote === false && washed.rejected.length >= 1,
+    '(b) gsd-write-refused without .gsd/ evidence is rejected');
+  const outOfScopePresent = checkEnvPromotion({ ...base, must_haves_status: [
+    env('tests/fixture.test.js failed', 'out-of-scope-test-failure', 'see tests/fixture.test.js'),
+  ] }, plan);
+  const absentPlan = plan.replace('tests/fixture.test.js', 'tests/other.test.js');
+  const outOfScopeAbsent = checkEnvPromotion({ ...base, must_haves_status: [
+    env('tests/fixture.test.js failed', 'out-of-scope-test-failure', 'see tests/fixture.test.js'),
+  ] }, absentPlan);
+  assert(outOfScopePresent.promote === false && outOfScopePresent.rejected.length >= 1,
+    '(b) out-of-scope test failure named by the plan does not promote');
+  assert(outOfScopeAbsent.promote === true && outOfScopeAbsent.env_constraints.length === 1,
+    '(b) same out-of-scope label promotes when cited test is absent from plan');
+  const oldPromotion = checkEnvPromotion(legacy, plan);
+  assert(oldPromotion.promote === false && oldPromotion.rejected.length >= 1,
+    '(b) byte-identical legacy partial payload does not promote');
+  const donePromotion = checkEnvPromotion({ ...legacy, status: 'done' }, plan);
+  assert(donePromotion.promote === false && donePromotion.reason === 'not-applicable',
+    '(b) done result is not applicable to environment promotion');
+
+  // C — canonical spec, executable mirrors, and planner guidance.
+  const dispatch = fs.readFileSync(path.join(REPO, 'shared', 'forge-dispatch.md'), 'utf8');
+  assert(/forge-env-promote\.js/.test(dispatch)
+      && ['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required']
+        .every(reason => dispatch.includes(reason))
+      && /env_constraints/.test(dispatch) && /sidecar_env_promotion/.test(dispatch),
+    '(c) dispatch Branch C references checker, allowlist, env_constraints, and promotion event');
+  const skillPaths = ['forge-auto', 'forge-next', 'forge-task'].map(name =>
+    path.join(REPO, 'skills', name, 'SKILL.md'));
+  for (const skillPath of skillPaths) {
+    const skill = fs.readFileSync(skillPath, 'utf8');
+    const name = path.basename(path.dirname(skillPath));
+    assert(/forge-env-promote\.js/.test(skill) && /env_constraints/.test(skill),
+      `(c) ${name} mirror calls the promotion checker and carries env_constraints`);
+    assert(!['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required']
+      .every(reason => new RegExp(`['"]${reason}['"]`).test(skill)),
+    `(c) ${name} mirror does not redefine the environment allowlist`);
+  }
+  const planner = fs.readFileSync(path.join(REPO, 'agents', 'forge-planner.md'), 'utf8');
+  assert(/sidecar/.test(planner) && /\.gsd\/\*\*/.test(planner),
+    '(c) planner guidance marks .gsd/** as sidecar/orchestrator-owned');
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.indexOf('async function main()'));
+  assert(/smokeSidecarEnvPromotion\(\)/.test(mainBody),
+    '(c) Section 57 is registered in main()');
+
+  pass('(final) Section 57: sidecar env-promotion contract regression guard — adapter, promotion matrix, and doc-presence verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -7524,6 +7663,7 @@ async function main() {
     smokeSidecarEnvContract();
     smokeSchemaExtraction();
     smokeRequireWorktree();
+    smokeSidecarEnvPromotion();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
