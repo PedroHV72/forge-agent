@@ -45,7 +45,8 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     Read the merged `evidence.mode` pref through the JSONC-only engine CLI (default `lenient` on absent prefs or engine errors):
     ```bash
-    EVIDENCE_MODE=$(node scripts/forge-prefs.js --resolved --key evidence.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'lenient')}catch{process.stdout.write('lenient')}}")
+    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+    EVIDENCE_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key evidence.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'lenient')}catch{process.stdout.write('lenient')}}")
     ```
     If `EVIDENCE_MODE` is `disabled` → SKIP this entire sub-step. Do NOT write `## Evidence Flags`, not even an empty one.
     For each `T##-SUMMARY.md` in the slice (under `.gsd/milestones/M###/slices/S##/tasks/T##/`):
@@ -140,7 +141,8 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     c. **Read `file_audit.ignore_list` from the JSONC-only engine CLI** (default list on absent prefs or engine errors):
        ```bash
-       FILE_AUDIT_IGNORE=$(node scripts/forge-prefs.js --resolved --key file_audit.ignore_list --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(JSON.stringify(Array.isArray(v)&&v.length?v:['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**']))}catch{process.stdout.write(JSON.stringify(['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**']))}})")
+       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+       FILE_AUDIT_IGNORE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key file_audit.ignore_list --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(JSON.stringify(Array.isArray(v)&&v.length?v:['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**']))}catch{process.stdout.write(JSON.stringify(['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**']))}})")
        ```
 
     d. **Filter both sides with ignore_list.** A path matches a glob when:
@@ -237,7 +239,8 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     Read the merged `checker_memory.mode` pref through the JSONC-only engine CLI (default `enabled` on absent prefs or engine errors):
     ```bash
-    CHECKER_MEMORY_MODE=$(node scripts/forge-prefs.js --resolved --key checker_memory.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
+    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+    CHECKER_MEMORY_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key checker_memory.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
     ```
     If `CHECKER_MEMORY_MODE` is `disabled` → SKIP this entire sub-step.
 
@@ -295,7 +298,8 @@ Given all `T##-SUMMARY.md` files from the slice:
 
    Read the merged `review.mode` pref through the JSONC-only engine CLI (default `enabled` on absent prefs or engine errors):
    ```bash
-   REVIEW_MODE=$(node scripts/forge-prefs.js --resolved --key review.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   REVIEW_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key review.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
    ```
    If `REVIEW_MODE` is `disabled` → SKIP this entire step. Continue to step 5.
 

@@ -228,11 +228,14 @@ A partir da M006, cada review dialético resolve seu challenger e advocate **pel
 
 Autoria é derivada do campo `engine` dos dispatch events (`.gsd/forge/events.jsonl`), agregada por majority determinística — o orquestrador chama `scripts/forge-review-pairing.js` uma única vez por review antes da challenge. Degradações (autor sem evento de autoria, ou GPT sem `--mode defend` disponível) emitem `review-pairing-fallback` e retornam ao padrão Claude — nunca bloqueiam. Matriz canônica de resolver sem redefini-la: `shared/forge-review.md § Step 0`.
 
-**Ativar:** edite `forge-agent-prefs.jsonc` (ou `.gsd/prefs.local.jsonc`):
-```yaml
-review:
-  challenger: auto    # resolve de verdade na próxima review dialética
-  advocate: auto      # resolve junto
+**Ativar:** edite `forge-agent-prefs.jsonc` (ou `.gsd/prefs.local.jsonc`), setando os campos abaixo dentro do bloco `review`:
+```jsonc
+{
+  "review": {
+    "challenger": "auto", // resolve de verdade na próxima review dialética
+    "advocate": "auto"    // resolve junto
+  }
+}
 ```
 
 ---
@@ -281,20 +284,27 @@ e continuam na próxima.
 
 ### Ativar:
 
-Edite `forge-agent-prefs.jsonc` (ou `.gsd/prefs.local.jsonc`), vá para `## Routing Settings` e descomente o
-bloco `routing:`. Exemplo de célula cross-engine:
+Edite `forge-agent-prefs.jsonc` (ou `.gsd/prefs.local.jsonc`) e adicione/edite o bloco `routing`.
+Exemplo de célula cross-engine:
 
-```yaml
-routing:
-  default:
-    executor:
-      standard: [claude-sonnet-5]
-      heavy:    [claude-opus-4-8, gpt-5]     # cadeia cross-engine (claude → gpt sidecar)
-      fallback: claude-sonnet-5              # categoria: 1 Claude mapeado
-  backend:
-    executor:
-      standard: [gpt-5, claude-sonnet-5]     # gpt primário, claude fallback
-      fallback: claude-sonnet-5
+```jsonc
+{
+  "routing": {
+    "default": {
+      "executor": {
+        "standard": ["claude-sonnet-5"],
+        "heavy": ["claude-opus-4-8", "gpt-5"], // cadeia cross-engine (claude -> gpt sidecar)
+        "fallback": "claude-sonnet-5"          // categoria: 1 Claude mapeado
+      }
+    },
+    "backend": {
+      "executor": {
+        "standard": ["gpt-5", "claude-sonnet-5"], // gpt primario, claude fallback
+        "fallback": "claude-sonnet-5"
+      }
+    }
+  }
+}
 ```
 
 Para inspecionar a resolução sem disparar dispatch real, use o CLI:

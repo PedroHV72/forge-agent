@@ -340,12 +340,61 @@ test('readIdFormat: ids block at EOF without trailing newline still parses', () 
     assertEq(ids.readIdFormat(dir), 'sequential');
   });
 });
+// Real cross-layer conflict: global (~/.claude, via HOME override) sets
+// "sequential", local (.gsd/forge-prefs.jsonc) sets "timestamp" — assert the
+// local layer wins (last-wins merge order: global then local). A prior
+// version of this test only ever wrote ONE file, always with "timestamp"
+// (also the fallback default), so it passed even if override merging was
+// completely broken (vacuous — see M015 S04 review R5).
 test('readIdFormat: local pref overrides repo pref (last wins)', () => {
   withSandbox(dir => {
-    fs.mkdirSync(path.join(dir, '.gsd'));
-    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
-      '{\n  "ids": { "format": "timestamp" }\n}\n');
-    assertEq(ids.readIdFormat(dir), 'timestamp');
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-ids-home-'));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    try {
+      fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
+      fs.writeFileSync(path.join(homeDir, '.claude', 'forge-agent-prefs.jsonc'),
+        '{\n  "ids": { "format": "sequential" }\n}\n');
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+
+      fs.mkdirSync(path.join(dir, '.gsd'));
+      fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+        '{\n  "ids": { "format": "timestamp" }\n}\n');
+      assertEq(ids.readIdFormat(dir), 'timestamp',
+        'local .gsd/forge-prefs.jsonc must win over global ~/.claude/forge-agent-prefs.jsonc');
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      if (prevUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUserProfile;
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+});
+// Inverted case: global sets "timestamp", local sets "sequential" — proves
+// the assertion above isn't just an artifact of "timestamp" being the
+// fallback default for absent/invalid prefs.
+test('readIdFormat: local pref overrides repo pref (inverted values)', () => {
+  withSandbox(dir => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-ids-home-'));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    try {
+      fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
+      fs.writeFileSync(path.join(homeDir, '.claude', 'forge-agent-prefs.jsonc'),
+        '{\n  "ids": { "format": "timestamp" }\n}\n');
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+
+      fs.mkdirSync(path.join(dir, '.gsd'));
+      fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+        '{\n  "ids": { "format": "sequential" }\n}\n');
+      assertEq(ids.readIdFormat(dir), 'sequential',
+        'local .gsd/forge-prefs.jsonc must win even when it diverges from the global default');
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      if (prevUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUserProfile;
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
   });
 });
 test('readIdFormat: invalid value falls back to timestamp', () => {
