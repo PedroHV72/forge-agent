@@ -17,11 +17,13 @@
  *   validateExecuteResult(obj) → boolean
  *   deriveFilesChanged(cwd)    → [{status, path}]  (git READ-ONLY)
  *   readWorkersTimeout(dir)    → number|null       (prefs cascade)
+ *   readSidecarsEnvPolicy(dir) → string|null       (prefs cascade)
+ *   buildSidecarEnv(policy)    → object            (minimal/inherit sidecar env)
  *
  * CLI usage:
- *   node scripts/forge-xllm.js --mode challenge --diff-cmd "git diff" [--engine codex|agy] [--model <id>] [--timeout 300] [--cwd <dir>]
- *   node scripts/forge-xllm.js --mode rebuttal --input <file> [--engine codex|agy] [--model <id>] [--timeout 300] [--cwd <dir>]
- *   node scripts/forge-xllm.js --mode execute --plan <T##-PLAN.md> --result-file <path> --cwd <repo> [--model <id>] [--timeout <secs>]
+ *   node scripts/forge-xllm.js --mode challenge --diff-cmd "git diff" [--engine codex|agy] [--model <id>] [--timeout 300] [--env-policy minimal|inherit] [--cwd <dir>]
+ *   node scripts/forge-xllm.js --mode rebuttal --input <file> [--engine codex|agy] [--model <id>] [--timeout 300] [--env-policy minimal|inherit] [--cwd <dir>]
+ *   node scripts/forge-xllm.js --mode execute --plan <T##-PLAN.md> --result-file <path> --cwd <repo> [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit]
  *
  * Exit contract: 0 on success. For challenge/rebuttal the normalized JSON goes to stdout
  * (nothing else on stdout). For execute the result-file is the ONLY result channel —
@@ -85,6 +87,7 @@ const SEVERITY_ENUM = ['critical', 'high', 'medium', 'low'];
 const VERDICT_ENUM = ['maintained', 'withdrawn'];
 const EXEC_STATUS_ENUM = ['done', 'partial', 'blocked'];
 const MH_STATUS_ENUM = ['met', 'unmet', 'unknown'];
+const ENV_POLICY_ENUM = ['minimal', 'inherit'];
 
 // Duplicated from shared/forge-review.md engine workflow script (challengeSchema).
 // keep in sync with shared/forge-review.md
@@ -585,7 +588,7 @@ function resolveCodexCommand() {
  * @throws {Error} on any invocation/parse failure — cause in message
  */
 function invokeCodex(opts) {
-  const { prompt, schema, cwd, model, timeoutSecs } = opts;
+  const { prompt, schema, cwd, model, timeoutSecs, envPolicy = 'minimal' } = opts;
 
   let tmpDir;
   try {
@@ -629,6 +632,7 @@ function invokeCodex(opts) {
       killSignal: 'SIGKILL',
       encoding: 'utf8',
       maxBuffer: MAX_BUFFER,
+      env: buildSidecarEnv(envPolicy),
     });
 
     if (res.error) {
@@ -690,7 +694,7 @@ function invokeCodex(opts) {
  * @returns {Promise<string>} raw content of the -o (last-message) file
  */
 function invokeCodexDetached(opts) {
-  const { prompt, schema, cwd, model, timeoutSecs, onHeartbeat, sandbox } = opts;
+  const { prompt, schema, cwd, model, timeoutSecs, onHeartbeat, sandbox, envPolicy = 'minimal' } = opts;
 
   return new Promise((resolve, reject) => {
     let tmpDir;
@@ -751,6 +755,7 @@ function invokeCodexDetached(opts) {
         detached: true,
         // stdin = pipe (prompt transport), stdout ignored (result via -o file), stderr piped.
         stdio: ['pipe', 'ignore', 'pipe'],
+        env: buildSidecarEnv(envPolicy),
       });
 
       // Feed the prompt and close stdin immediately → codex gets EOF (codex#20919).
@@ -981,7 +986,7 @@ function assertSafeForCmdShell(args) {
  * @throws {Error} on any invocation failure — cause in message
  */
 function invokeAgy(opts) {
-  const { prompt, cwd, model, timeoutSecs } = opts;
+  const { prompt, cwd, model, timeoutSecs, envPolicy = 'minimal' } = opts;
 
   // R3: the tmpdir MUST live INSIDE the cwd. agy's --sandbox roots the agent at the
   // cwd, so a prompt file under os.tmpdir() is UNREADABLE by the sandboxed agent.
@@ -1023,6 +1028,7 @@ function invokeAgy(opts) {
       encoding: 'utf8',
       maxBuffer: MAX_BUFFER,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: buildSidecarEnv(envPolicy),
     });
 
     if (res.error) {
@@ -1061,7 +1067,7 @@ const ENGINE_ENUM = ['codex', 'agy'];
  * (agy has no --output-schema; the prompt text already pins the JSON shape and
  * the defensive parse path never trusted schema conformance anyway).
  * @param {string} engine
- * @param {object} opts — { prompt, schema, cwd, model, timeoutSecs }
+ * @param {object} opts — { prompt, schema, cwd, model, timeoutSecs, envPolicy }
  * @returns {string} raw model output
  */
 function invokeEngine(engine, opts) {
@@ -1194,6 +1200,48 @@ function readWorkersTimeout(baseDir) {
   return Number.isInteger(timeout) && timeout > 0 ? timeout : null;
 }
 
+/**
+ * Construct the environment for a sidecar process. `minimal` is an allowlist minus
+ * a credential denylist; `inherit` is a byte-identical shallow copy without a denylist.
+ * macOS probe (2026-07-19): Codex ChatGPT keychain auth works with the minimal base.
+ * @param {'minimal'|'inherit'} [policy]
+ * @param {NodeJS.ProcessEnv} [sourceEnv]
+ * @param {NodeJS.Platform} [platform]
+ * @returns {NodeJS.ProcessEnv}
+ */
+function buildSidecarEnv(policy = 'minimal', sourceEnv = process.env, platform = process.platform) {
+  if (policy === 'inherit') return { ...sourceEnv };
+
+  const common = [
+    'PATH', 'HOME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'CODEX_HOME',
+    'OPENAI_API_KEY', 'GEMINI_API_KEY', 'ANTIGRAVITY_API_KEY', 'HTTP_PROXY',
+    'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
+  ];
+  const platformKeys = platform === 'win32'
+    ? ['SystemRoot', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'TEMP', 'TMP']
+    : platform === 'linux'
+      ? ['DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME']
+      : [];
+  const env = {};
+  for (const key of [...common, ...platformKeys]) {
+    if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
+  }
+  for (const [key, value] of Object.entries(sourceEnv)) {
+    if (key.startsWith('FORGE_') && value !== undefined) env[key] = value;
+  }
+  for (const key of Object.keys(env)) {
+    if (/^(AWS_|AZURE_|GCP_|DATABASE_|ANTHROPIC_|CLAUDE_)/.test(key)) delete env[key];
+  }
+  return env;
+}
+
+/** Read sidecars.env_policy from the merged prefs cascade, or null when invalid. */
+function readSidecarsEnvPolicy(baseDir) {
+  const sidecars = readPrefsCached(baseDir).prefs.sidecars;
+  const value = sidecars && sidecars.env_policy;
+  return ENV_POLICY_ENUM.includes(value) ? value : null;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -1215,7 +1263,9 @@ function runChallenge(opts) {
 
   const diffText = acquireDiff(opts.diffCmd, cwd);
   const prompt = buildChallengePrompt(diffText);
-  const rawContent = invokeEngine(engine, { prompt, schema: challengeSchema, cwd, model: opts.model, timeoutSecs });
+  const rawContent = invokeEngine(engine, {
+    prompt, schema: challengeSchema, cwd, model: opts.model, timeoutSecs, envPolicy: opts.envPolicy || 'minimal',
+  });
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error(`no parseable JSON block found in ${engine} output`);
@@ -1255,6 +1305,7 @@ function runRebuttal(opts) {
     cwd,
     model: opts.model,
     timeoutSecs,
+    envPolicy: opts.envPolicy || 'minimal',
   });
 
   const parsed = extractLastJsonBlock(rawContent);
@@ -1376,6 +1427,7 @@ async function runExecute(opts) {
     model: opts.model,
     timeoutSecs,
     onHeartbeat,
+    envPolicy: opts.envPolicy || 'minimal',
   });
 
   // No-commit invariant: codex must not have moved HEAD.
@@ -1493,6 +1545,7 @@ async function runPlan(opts) {
     timeoutSecs,
     onHeartbeat,
     sandbox: 'read-only',
+    envPolicy: opts.envPolicy || 'minimal',
   });
 
   const parsed = extractLastJsonBlock(rawContent);
@@ -1544,6 +1597,8 @@ module.exports = {
   buildPlanPrompt,
   deriveFilesChanged,
   readWorkersTimeout,
+  readSidecarsEnvPolicy,
+  buildSidecarEnv,
   assertSafeForCmdShell,
   resolveShimJsEntry,
   classifyErrorClass,
@@ -1568,7 +1623,7 @@ if (require.main === module) {
   const mode = args.mode;
 
   if (mode !== 'challenge' && mode !== 'rebuttal' && mode !== 'execute' && mode !== 'plan') {
-    process.stderr.write('Usage: forge-xllm.js --mode challenge|rebuttal|execute|plan [--engine codex|agy] [--diff-cmd <cmd>] [--input <file>] [--plan <file>] [--plan-context <file>] [--result-file <path>] [--model <id>] [--timeout <secs>] [--cwd <dir>]\n');
+    process.stderr.write('Usage: forge-xllm.js --mode challenge|rebuttal|execute|plan [--engine codex|agy] [--diff-cmd <cmd>] [--input <file>] [--plan <file>] [--plan-context <file>] [--result-file <path>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit] [--cwd <dir>]\n');
     process.exit(2);
   }
 
@@ -1583,6 +1638,13 @@ if (require.main === module) {
     process.exit(2);
   }
 
+  const flagEnvPolicy = args['env-policy'];
+  if (flagEnvPolicy !== undefined && !ENV_POLICY_ENUM.includes(flagEnvPolicy)) {
+    process.stderr.write(`forge-xllm: unknown --env-policy "${flagEnvPolicy}" (expected minimal|inherit)\n`);
+    process.exit(2);
+  }
+  const envPolicy = flagEnvPolicy || readSidecarsEnvPolicy(process.cwd()) || 'minimal';
+
   const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd();
   const model = typeof args.model === 'string' ? args.model : undefined;
 
@@ -1596,7 +1658,7 @@ if (require.main === module) {
       || DEFAULT_EXECUTE_TIMEOUT_SECS;
     const resultFile = typeof args['result-file'] === 'string' ? args['result-file'] : null;
 
-    runPlan({ planContextFile: args['plan-context'], resultFile, cwd, model, timeoutSecs })
+    runPlan({ planContextFile: args['plan-context'], resultFile, cwd, model, timeoutSecs, envPolicy })
       .then(() => process.exit(0)) // result-file is the ONLY channel — nothing on stdout
       .catch((e) => {
         // Best-effort adapter-failed marker in the result-file (if we have a path).
@@ -1626,7 +1688,7 @@ if (require.main === module) {
       || DEFAULT_EXECUTE_TIMEOUT_SECS;
     const resultFile = typeof args['result-file'] === 'string' ? args['result-file'] : null;
 
-    runExecute({ planFile: args.plan, resultFile, cwd, model, timeoutSecs })
+    runExecute({ planFile: args.plan, resultFile, cwd, model, timeoutSecs, envPolicy })
       .then(() => process.exit(0)) // result-file is the ONLY channel — nothing on stdout
       .catch((e) => {
         // Best-effort adapter-failed marker in the result-file (if we have a path).
@@ -1656,9 +1718,9 @@ if (require.main === module) {
   try {
     let result;
     if (mode === 'challenge') {
-      result = runChallenge({ diffCmd: args['diff-cmd'], cwd, engine, model, timeoutSecs });
+      result = runChallenge({ diffCmd: args['diff-cmd'], cwd, engine, model, timeoutSecs, envPolicy });
     } else {
-      result = runRebuttal({ inputFile: args.input, cwd, engine, model, timeoutSecs });
+      result = runRebuttal({ inputFile: args.input, cwd, engine, model, timeoutSecs, envPolicy });
     }
     process.stdout.write(JSON.stringify(result) + '\n');
     process.exit(0);

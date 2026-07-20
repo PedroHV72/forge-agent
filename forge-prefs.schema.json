@@ -369,6 +369,18 @@
         }
       }
     },
+    "sidecars": {
+      "type": "object",
+      "description": "Eixo sidecars: isolamento do ambiente entregue aos processos externos codex e agy.",
+      "properties": {
+        "env_policy": {
+          "type": "string",
+          "enum": ["minimal", "inherit"],
+          "default": "minimal",
+          "description": "Política de ambiente dos sidecars. minimal repassa apenas allowlist e remove prefixos de credenciais; inherit preserva todo o ambiente como escape hatch inseguro."
+        }
+      }
+    },
     "routing": {
       "type": "object",
       "additionalProperties": true,

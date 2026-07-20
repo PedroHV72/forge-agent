@@ -1482,7 +1482,7 @@ function writeMockCodex(dir, opts) {
     '# forge-smoke mock codex — writes payload to the -o file, honors exit code / sleep',
     'OUT=""',
     'CODEXCWD=""',
-    // PROMPTLEN_FILE is intentionally NOT initialized here — it comes from the
+    // FORGE_PROMPTLEN_FILE is intentionally NOT initialized here — it comes from the
     // environment (set by the large-prompt smoke scenario) so the mock can record
     // the stdin-received prompt length. Clobbering it to "" would disable the assert.
     'prev=""',
@@ -1493,9 +1493,9 @@ function writeMockCodex(dir, opts) {
     'done',
     // New transport: the prompt arrives on stdin (`codex exec -`), NOT argv. Drain
     // it fully — this both exercises the stdin pipe/EOF contract and lets callers
-    // that set PROMPTLEN_FILE assert the received byte length (large-prompt test).
+    // that set FORGE_PROMPTLEN_FILE assert the received byte length (large-prompt test).
     'PROMPT="$(cat -)"',
-    'if [ -n "$PROMPTLEN_FILE" ]; then printf %s "${#PROMPT}" > "$PROMPTLEN_FILE"; fi',
+    'if [ -n "$FORGE_PROMPTLEN_FILE" ]; then printf %s "${#PROMPT}" > "$FORGE_PROMPTLEN_FILE"; fi',
     opts.sleepSecs ? `sleep ${opts.sleepSecs}` : '',
     // extraScript runs BEFORE the -o write — same default byte-shape for
     // Section 20–23 callers that never pass it (opts.extraScript undefined).
@@ -1601,7 +1601,7 @@ function smokeXllm() {
 
   // Scenario A2 — large prompt via stdin: a >40KB diff must NOT hit the argv/command-line
   // cap (Windows ENAMETOOLONG). The mock reads the prompt from stdin (`codex exec -`) and
-  // records the received byte length to PROMPTLEN_FILE — proving the full prompt crossed
+  // records the received byte length to FORGE_PROMPTLEN_FILE — proving the full prompt crossed
   // the stdin pipe (not truncated by any argv limit) and the adapter still exits 0.
   {
     const dir = mkTmp('xllm-a2');
@@ -1614,7 +1614,7 @@ function smokeXllm() {
     writeMockCodex(mockDir, { payload, exitCode: 0 });
     const r = runXllm(
       ['--mode', 'challenge', '--diff-cmd', 'cat big.txt', '--cwd', dir],
-      mockDir, dir, { PROMPTLEN_FILE: lenFile },
+      mockDir, dir, { FORGE_PROMPTLEN_FILE: lenFile },
     );
     assert(bigDiff.length > 40 * 1024, 'A2: fixture diff is >40KB', `len=${bigDiff.length}`);
     assert(r.status === 0, 'A2: large-prompt challenge exits 0 (no ENAMETOOLONG)', `status=${r.status} stderr=${r.stderr}`);
@@ -2260,9 +2260,9 @@ async function smokeXllmExecute() {
     const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-b-marker-'));
     const marker = path.join(markerDir, 'invoked.marker');
     const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-b-mock-'));
-    writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: `: > "$MARKER"` });
+    writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: `: > "$FORGE_MARKER"` });
     const r = runExecuteXllm(['--plan', planFile, '--result-file', resultFile, '--cwd', repo], mockDir, repo,
-      { env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, MARKER: marker } });
+      { env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, FORGE_MARKER: marker } });
     assert(r.status === 0, 'B: dirty tree no longer refuses (refuse→snapshot) → exit 0', `status=${r.status} stderr=${r.stderr}`);
     assert(!/refusing to start/i.test(r.stderr), 'B: no dirty-guard refusal message', `stderr=${r.stderr}`);
     assert(fs.existsSync(marker), 'B: mock codex IS invoked on dirty tree (marker present)', `marker=${marker}`);
@@ -2358,9 +2358,9 @@ async function smokeXllmExecute() {
     const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-f-marker-'));
     const marker = path.join(markerDir, 'invoked.marker');
     const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-f-mock-'));
-    writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: `: > "$MARKER"` });
+    writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: `: > "$FORGE_MARKER"` });
     const r = runExecuteXllm(['--plan', planFile, '--result-file', resultFile, '--cwd', repo], mockDir, repo,
-      { env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, MARKER: marker } });
+      { env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, FORGE_MARKER: marker } });
     assert(r.status !== 0, 'F: result-file inside workspace makes adapter exit non-zero', `status=${r.status}`);
     assert(!fs.existsSync(marker), 'F: mock codex never invoked (marker absent)', `marker=${marker}`);
     cleanup(repo);
@@ -2653,14 +2653,14 @@ function smokeEngineDispatch() {
     const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-engine-c-marker-'));
     const marker = path.join(markerDir, 'invoked.marker');
     const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-engine-c-mock-'));
-    writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: `: > "$MARKER"` });
+    writeMockCodex(mockDir, { payload: validPayload, exitCode: 0, extraScript: `: > "$FORGE_MARKER"` });
     const xllmPath = path.join(SCRIPTS, 'forge-xllm.js');
     const r = spawnSync(process.execPath, [
       xllmPath, '--mode', 'execute', '--plan', planFile, '--result-file', resultFile, '--cwd', repo,
     ], {
       encoding: 'utf8',
       cwd: repo,
-      env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, MARKER: marker },
+      env: { ...process.env, PATH: mockDir + path.delimiter + process.env.PATH, FORGE_MARKER: marker },
     });
     assert(r.status === 0, 'C: dirty tree no longer refuses (refuse→snapshot) → exit 0', `status=${r.status} stderr=${r.stderr}`);
     assert(fs.existsSync(marker), 'C: mock codex IS invoked over dirty tree (snapshot, not refuse)', `marker=${marker}`);
@@ -5251,7 +5251,7 @@ function smokePrefsMigration() {
 }
 
 // ── Section 42: prefs viewer + doctor prefs-check (whole-system read side) ─
-// Binds the S06 read-side surface end to end: the viewer's 88-knob catalog
+// Binds the S06 read-side surface end to end: the viewer's 89-knob catalog
 // (state·value·layer·description, no drift against the schema) and the three
 // doctor prefs-check primitives (stale-catalog --diff, the parse-error flag
 // file contract, and validatePrefs warnings surfaced via --resolved
@@ -5266,7 +5266,7 @@ function smokePrefsViewerDoctor() {
   const migrate = require('./forge-prefs-migrate.js');
   const schema = engine.loadSchema();
 
-  // (a) Viewer: 88-knob coverage, activation, and no-drift against schema.
+  // (a) Viewer: 89-knob coverage, activation, and no-drift against schema.
   const project = mkTmp('prefs-viewer');
   const home = path.join(project, 'home');
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
@@ -5278,9 +5278,9 @@ function smokePrefsViewerDoctor() {
     const setResult = migrate.setPreference(project, 'review.rounds=3', { layer: 'local', create: true });
     assert(setResult.status === 'set', '(a) setPreference activates review.rounds=3 locally for the viewer fixture', JSON.stringify(setResult));
     const catalog = view.buildCatalog(project);
-    assert(catalog.knobs.length === 88, '(a) viewer lists all 88 knobs', `got ${catalog.knobs.length}`);
+    assert(catalog.knobs.length === 89, '(a) viewer lists all 89 knobs', `got ${catalog.knobs.length}`);
     const sections = new Set(catalog.knobs.map((knob) => knob.section));
-    assert(sections.size === 38, '(a) viewer covers all 38 sections', JSON.stringify([...sections]));
+    assert(sections.size === 39, '(a) viewer covers all 39 sections', JSON.stringify([...sections]));
     const rounds = catalog.knobs.find((knob) => knob.path === 'review.rounds');
     assert(!!rounds && rounds.active === true && rounds.value === 3 && rounds.layer === 'local',
       '(a) activated knob is ATIVO with the right layer+value', JSON.stringify(rounds));
