@@ -6184,8 +6184,9 @@ function smokeSidecarPolicyGuard() {
       // Every Layer-1 entry `if` in the file must be prefixed by the
       // `[ "$POLICY" != "fallback" ]` guard (tolerant to whitespace/quoting).
       const entryIfs = t.match(/if \[ "\$POLICY" != "fallback" \] && \[ "\$ERROR_CLASS" = "transient" \] && \[ "\$TRC" -lt "\$MAX_TRC" \]; then/g) || [];
-      assert(entryIfs.length > 0,
-        `(a) ${m.label} has ≥1 Layer-1 entry gated by [ "$POLICY" != "fallback" ]`, m.rel);
+      const expectedEntryIfs = m.label === 'forge-task' ? 1 : 2;
+      assert(entryIfs.length === expectedEntryIfs,
+        `(a) ${m.label} has exactly ${expectedEntryIfs} Layer-1 entries gated by [ "$POLICY" != "fallback" ] (Branch C${expectedEntryIfs === 2 ? ' + Branch D' : ' only'})`, `count=${entryIfs.length}`);
       // Absent/invalid whitelist fallback — node one-liner's ternary defaults to retry-then-fallback.
       assert(/\['retry-then-fallback','fallback','pause-ask'\]\.includes\(v\)\?v:'retry-then-fallback'/.test(t),
         `(a) ${m.label} POLICY resolver whitelists the 3 values, defaulting absent/invalid to retry-then-fallback`, m.rel);
@@ -6204,7 +6205,7 @@ function smokeSidecarPolicyGuard() {
     {
       const t = texts['skills/forge-auto/SKILL.md'];
       const blocks = t.match(/\*\*pause-ask degrade[\s\S]*?```\n\*\*If `\$TRANSIENT_RETRY`/g) || [];
-      assert(blocks.length > 0, '(b) forge-auto has ≥1 extractable pause-ask degrade block', 'skills/forge-auto/SKILL.md');
+      assert(blocks.length === 2, '(b) forge-auto has exactly 2 extractable pause-ask degrade blocks (Branch C + Branch D)', `count=${blocks.length}`);
       for (const b of blocks) {
         assert(/sidecar-pause-degraded/.test(b),
           '(b) forge-auto pause-ask block emits sidecar-pause-degraded', b.slice(0, 200));
@@ -6219,7 +6220,7 @@ function smokeSidecarPolicyGuard() {
     {
       const t = texts['skills/forge-next/SKILL.md'];
       const blocks = t.match(/\*\*pause-ask gate[\s\S]*?```\n\*\*If `\$TRANSIENT_RETRY`/g) || [];
-      assert(blocks.length > 0, '(b) forge-next has ≥1 extractable pause-ask gate block', 'skills/forge-next/SKILL.md');
+      assert(blocks.length === 2, '(b) forge-next has exactly 2 extractable pause-ask gate blocks (Branch C + Branch D)', `count=${blocks.length}`);
       for (const b of blocks) {
         assert(/\[ -t 1 \]/.test(b),
           '(b) forge-next pause-ask block is TTY-conditional ([ -t 1 ])', b.slice(0, 200));
@@ -6236,7 +6237,7 @@ function smokeSidecarPolicyGuard() {
     {
       const t = texts['skills/forge-task/SKILL.md'];
       const blocks = t.match(/\*\*pause-ask gate[\s\S]*?```\n\*\*If `\$PAUSE_ASK_GATE`/g) || [];
-      assert(blocks.length > 0, '(b) forge-task has ≥1 extractable pause-ask gate block', 'skills/forge-task/SKILL.md');
+      assert(blocks.length === 1, '(b) forge-task has exactly 1 extractable pause-ask gate block (Branch C only, no Branch D)', `count=${blocks.length}`);
       for (const b of blocks) {
         assert(/PAUSE_ASK_GATE=1/.test(b),
           '(b) forge-task pause-ask block sets PAUSE_ASK_GATE=1 (always-interactive path)', b.slice(0, 200));
