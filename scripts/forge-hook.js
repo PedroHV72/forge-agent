@@ -70,6 +70,25 @@ const updatePrefsErrorFlag = (cwd, error) => {
   } catch { /* passive error reporting itself must never abort a tool call */ }
 };
 
+// MEM022/S03: hooks keep the inert fallback, plus one best-effort diagnostic
+// event per process.  Never create .gsd/forge in an arbitrary repository.
+let _prefsBlockedEventLogged = false;
+const appendPrefsBlockedEvent = (cwd, error) => {
+  try {
+    if (_prefsBlockedEventLogged || !error) return;
+    const forgeDir = path.join(cwd, '.gsd', 'forge');
+    if (!fs.existsSync(forgeDir)) return;
+    const event = {
+      ts: new Date().toISOString(),
+      event: 'prefs-blocked',
+      code: error.code || 'prefs-read-error',
+      file: error.file || cwd,
+    };
+    fs.appendFileSync(path.join(forgeDir, 'events.jsonl'), JSON.stringify(event) + '\n', 'utf8');
+    _prefsBlockedEventLogged = true;
+  } catch { /* diagnostic telemetry must never abort a tool call (MEM008) */ }
+};
+
 // Engine calls are deliberately contained here.  This keeps every hook prefs
 // consumer fail-open, while making malformed config visible to passive tooling.
 const resolvePrefsSafe = (cwd) => {
@@ -80,9 +99,12 @@ const resolvePrefsSafe = (cwd) => {
     const result = prefsEngine.readPrefsCached(cwd) || {};
     const error = Array.isArray(result.errors) && result.errors.length ? result.errors[0] : null;
     updatePrefsErrorFlag(cwd, error);
+    appendPrefsBlockedEvent(cwd, error);
     return { prefs: result.prefs || {}, hadError: Boolean(error) };
   } catch (err) {
-    updatePrefsErrorFlag(cwd, { file: cwd, line: null, message: err && err.message });
+    const error = { code: err && err.code, file: err && err.file || cwd, line: null, message: err && err.message };
+    updatePrefsErrorFlag(cwd, error);
+    appendPrefsBlockedEvent(cwd, error);
     return { prefs: {}, hadError: true };
   }
 };
@@ -164,6 +186,8 @@ const resolveUnitContext = (cwd, sessionId) => {
 // Read forge_isolation.file_locks pref (default true). Returns boolean.
 // Skipped check when forge_isolation.mode is worktree (separate FS — no locks needed).
 const readFileLocksEnabled = (cwd) => {
+  // When prefs are blocked, resolvePrefsSafe intentionally returns {} here;
+  // these existing consumer defaults keep the hook inert and fail-open.
   const isolation = resolvePrefsSafe(cwd).prefs.forge_isolation || {};
   const mode = String(isolation.mode || 'shared').toLowerCase();
   const value = isolation.file_locks;

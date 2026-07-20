@@ -811,6 +811,9 @@ process.stdin.on('end', () => {
     if (forgeUpdate) {
       forgeVersionTail = ` │ ${c.bold}${c.yellow}Forge ${forgeUpdate}${c.reset}`;
     }
+    // Cutover contract (shared/forge-prefs-cutover.md): statusline takes the
+    // generic prefs-error path, badges ⚠ prefs for md-blocked, and NEVER stops
+    // rendering (MEM008), including legacy-md-without-jsonc.
     if (resolvedPrefs.hadError) forgeVersionTail += ' │ ⚠ prefs';
 
     // --- Model segment: only when NOT auto (tier icon covers "what's running" in auto mode) ---
