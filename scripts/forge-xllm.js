@@ -1350,6 +1350,7 @@ async function runExecute(opts) {
     status: 'running',
     pid: null,
     adapter_pid: process.pid,
+    heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
     start_sha: startSha,
     started_at: startedAt,
     updated_at: startedAt,
@@ -1360,6 +1361,7 @@ async function runExecute(opts) {
       status: 'running',
       pid,
       adapter_pid: process.pid,
+      heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
       start_sha: startSha,
       started_at: startedAt,
       updated_at: new Date().toISOString(),
@@ -1466,6 +1468,7 @@ async function runPlan(opts) {
     status: 'running',
     pid: null,
     adapter_pid: process.pid,
+    heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
     started_at: startedAt,
     updated_at: startedAt,
   });
@@ -1475,6 +1478,7 @@ async function runPlan(opts) {
       status: 'running',
       pid,
       adapter_pid: process.pid,
+      heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
       started_at: startedAt,
       updated_at: new Date().toISOString(),
     });
