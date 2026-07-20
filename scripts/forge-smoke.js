@@ -5950,6 +5950,196 @@ function smokeSurgicalReset() {
   pass('(final) Section 47: surgical reset — golden/overlap/HARD-invariant/persistence/purity/.gsd/sidecar-e2e all verified');
 }
 
+// ── Section 48: sidecar Layer-1 retry — error_class + transient_retry_count ──
+// M013 S02 T04: real-case regression guard for the three S02 acceptance criteria:
+//   (a) error_class classification — live-spawns forge-xllm.js --mode execute
+//       against a mock codex for transient/terminal/timeout/auth failures, and
+//       cross-checks against forge-classify-error.js (classifier-reuse proof,
+//       not a reimplementation) — except the timeout case, which is a LOCKED
+//       forced-terminal override regardless of what the classifier would say.
+//   (b) Layer-1 counter — forge-surgical-reset.js --state-init seeds
+//       transient_retry_count:0; --state-update --transient-retry-count bumps
+//       it while preserving pre_dirty/start_sha (read-modify-write, not clobber).
+//   (c) orthogonality + doc-presence — the 3 SKILL mirrors' Layer-1 block never
+//       increments SIDECAR_ATTEMPT, and all 4 docs (shared/forge-dispatch.md +
+//       3 mirrors) carry the Layer-1 retry-before-Layer-2 ordering.
+function smokeSidecarLayer1Retry() {
+  process.stdout.write('\n▸ Section 48: sidecar Layer-1 retry — error_class + transient_retry_count\n');
+  const REPO = path.dirname(SCRIPTS);
+  const { classifyError, isTransient } = require('./forge-classify-error.js');
+
+  // ── (a) error_class classification — real cases via forge-xllm.js --mode execute ──
+  function runExecuteCase(label, mockOpts, timeoutFlag) {
+    const dir = mkTmp(`s48-xllm-${label}`);
+    mkGitRepoS48(dir);
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-smoke-s48-${label}-mock-`));
+    writeMockCodex(mockDir, mockOpts);
+    const planFile = path.join(dir, 'plan.md');
+    fs.writeFileSync(planFile, '# T01\nplan body\n', 'utf8');
+    const resultFile = path.join(os.tmpdir(), `forge-smoke-s48-${label}-result-${process.pid}-${Date.now()}.json`);
+    const args = ['--mode', 'execute', '--plan', planFile, '--result-file', resultFile, '--cwd', dir];
+    if (timeoutFlag) args.push('--timeout', String(timeoutFlag));
+    runXllm(args, mockDir, dir);
+    let result = null;
+    try { result = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch { /* asserted below */ }
+    try { fs.rmSync(resultFile, { force: true }); } catch { /* best-effort */ }
+    cleanup(dir);
+    try { fs.rmSync(mockDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    return result;
+  }
+  function mkGitRepoS48(dir) {
+    const run = (args) => spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
+    run(['init', '-q']);
+    run(['config', 'user.email', 'smoke@forge']);
+    run(['config', 'user.name', 'smoke']);
+    run(['add', '-A']);
+    run(['commit', '-q', '--allow-empty', '-m', 'init']);
+  }
+
+  // Case 1: transient stderr (server-class "overloaded") → error_class: transient
+  {
+    const r = runExecuteCase('transient', { exitCode: 1, writeOutput: false, extraScript: 'echo "500 overloaded" 1>&2' });
+    assert(r && r.status === 'adapter-failed' && r.error_class === 'transient',
+      '(a) transient stderr ("overloaded") → status:adapter-failed, error_class:transient',
+      JSON.stringify(r));
+  }
+
+  // Case 2: auth/quota stderr → error_class: terminal (permanent, not transient)
+  {
+    const r = runExecuteCase('auth', { exitCode: 1, writeOutput: false, extraScript: 'echo "invalid api key" 1>&2' });
+    assert(r && r.status === 'adapter-failed' && r.error_class === 'terminal',
+      '(a) auth stderr ("invalid api key") → error_class:terminal',
+      JSON.stringify(r));
+  }
+
+  // Case 3: invalid/unparseable JSON output → error_class: terminal (unknown kind)
+  {
+    const r = runExecuteCase('invalidjson', { exitCode: 0, payload: 'not valid json at all, no code fences' });
+    assert(r && r.status === 'adapter-failed' && r.error_class === 'terminal',
+      '(a) unparseable codex output → error_class:terminal',
+      JSON.stringify(r));
+  }
+
+  // Case 4: timeout — sleepSecs > --timeout → error_class: terminal (FORCED, LOCKED override)
+  {
+    const r = runExecuteCase('timeout', { sleepSecs: 3, writeOutput: false }, 1);
+    assert(r && r.status === 'adapter-failed' && r.error_class === 'terminal' && /timeout/i.test(r.reason || ''),
+      '(a) codex-timeout → error_class:terminal (forced, LOCKED)',
+      JSON.stringify(r));
+  }
+
+  // ── classifier-reuse proof: same strings, cross-checked against forge-classify-error.js ──
+  {
+    const transientMsg = 'codex exited 1: 500 overloaded';
+    const terminalMsg = 'codex exited 1: invalid api key';
+    assert(isTransient(classifyError(transientMsg)) === true,
+      '(a) classifier-reuse: "overloaded" msg classifies transient via forge-classify-error.js', transientMsg);
+    assert(isTransient(classifyError(terminalMsg)) === false,
+      '(a) classifier-reuse: "invalid api key" msg classifies non-transient via forge-classify-error.js', terminalMsg);
+    // Explicit override assert: a timeout message, if run through the generic classifier alone
+    // (bypassing the adapter's forced check), would NOT necessarily read as transient either —
+    // but the adapter's classifyErrorClass forces terminal BEFORE consulting the classifier at
+    // all, independent of what classifyError(timeoutMsg) would say. Prove the override exists
+    // by reading it directly off the adapter's exported classifyErrorClass.
+    const xllm = require('./forge-xllm.js');
+    assert(typeof xllm.classifyErrorClass === 'function',
+      '(a) forge-xllm.js exports classifyErrorClass for the override proof', Object.keys(xllm).join(','));
+    assert(xllm.classifyErrorClass('codex killed after exceeding timeout (1s)') === 'terminal',
+      '(a) classifyErrorClass forces terminal on a timeout message (override, independent of classifyError)',
+      'expected terminal');
+  }
+
+  // ── (b) Layer-1 counter — forge-surgical-reset.js state seed + bump ──
+  {
+    const SR = path.join(SCRIPTS, 'forge-surgical-reset.js');
+    const dir = mkTmp('s48-state');
+    mkGitRepoS48(dir);
+    const stateFile = path.join(dir, '.gsd', 'forge', 'xllm-state.json');
+    const init = spawnSync('node', [SR, '--state-init', '--state', stateFile, '--cwd', dir], { encoding: 'utf8' });
+    assert(init.status === 0, '(b) --state-init exits 0', JSON.stringify({ s: init.status, o: init.stdout, e: init.stderr }));
+    const seeded = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert(seeded.transient_retry_count === 0,
+      '(b) --state-init seeds transient_retry_count:0', JSON.stringify(seeded));
+    const preDirty = seeded.pre_dirty;
+    const startSha = seeded.start_sha;
+    const upd = spawnSync('node', [SR, '--state-update', '--state', stateFile, '--transient-retry-count', '2'], { encoding: 'utf8' });
+    assert(upd.status === 0, '(b) --state-update exits 0', JSON.stringify({ s: upd.status, o: upd.stdout, e: upd.stderr }));
+    const bumped = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert(bumped.transient_retry_count === 2,
+      '(b) --state-update --transient-retry-count 2 bumps the counter', JSON.stringify(bumped));
+    assert(JSON.stringify(bumped.pre_dirty) === JSON.stringify(preDirty),
+      '(b) --state-update preserves pre_dirty (not clobbered)', JSON.stringify({ before: preDirty, after: bumped.pre_dirty }));
+    assert(bumped.start_sha === startSha,
+      '(b) --state-update preserves start_sha (not clobbered)', JSON.stringify({ before: startSha, after: bumped.start_sha }));
+    cleanup(dir);
+  }
+
+  // ── (c) doc-presence + mirror↔spec sync — Layer-1 retry-before-Layer-2 block ──
+  {
+    const DOCS = [
+      { rel: 'shared/forge-dispatch.md', label: 'shared/forge-dispatch.md' },
+      { rel: 'skills/forge-auto/SKILL.md', label: 'forge-auto' },
+      { rel: 'skills/forge-next/SKILL.md', label: 'forge-next' },
+      { rel: 'skills/forge-task/SKILL.md', label: 'forge-task' },
+    ];
+    const texts = {};
+    for (const d of DOCS) {
+      const p = path.join(REPO, d.rel);
+      assert(fs.existsSync(p), `(c) ${d.label} exists on disk`, p);
+      texts[d.rel] = fs.readFileSync(p, 'utf8');
+    }
+
+    for (const d of DOCS) {
+      const t = texts[d.rel];
+      assert(/Layer-1 transient retry/.test(t),
+        `(c) ${d.label} carries the "Layer-1 transient retry" sub-section`, d.rel);
+      assert(/runs BEFORE Layer-2/.test(t) || /before any Layer-2/.test(t) || /never runs \*after\* Layer-2/.test(t),
+        `(c) ${d.label} states the retry-before-Layer-2 ordering explicitly`, d.rel);
+      assert(/codex-timeout/.test(t) && /terminal/.test(t),
+        `(c) ${d.label} documents codex-timeout → terminal`, d.rel);
+      assert(/transient_retry_count/.test(t),
+        `(c) ${d.label} references transient_retry_count`, d.rel);
+    }
+
+    // Orthogonality invariant (⊥ SIDECAR_ATTEMPT) — spelled out explicitly in the 3 skills
+    // that HAVE a SIDECAR_ATTEMPT concept (auto/next/dispatch); forge-task has no
+    // SIDECAR_ATTEMPT (single-codex, no chain) and documents that fact instead.
+    for (const rel of ['shared/forge-dispatch.md', 'skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md']) {
+      assert(/transient_retry_count.*⊥.*SIDECAR_ATTEMPT|SIDECAR_ATTEMPT.*⊥.*transient_retry_count/.test(texts[rel]),
+        `(c) ${rel} states transient_retry_count ⊥ SIDECAR_ATTEMPT orthogonality`, rel);
+    }
+    assert(/no SIDECAR_ATTEMPT/.test(texts['skills/forge-task/SKILL.md']),
+      '(c) forge-task documents it has no SIDECAR_ATTEMPT (single-codex, no chain)',
+      'skills/forge-task/SKILL.md');
+  }
+
+  // ── (c) counter orthogonality — structural wiring assert (Layer-1 block distinct
+  //        from the SIDECAR_ATTEMPT increment; no increment inside the Layer-1 block) ──
+  {
+    const skillFiles = ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md'];
+    for (const rel of skillFiles) {
+      const t = texts_or_read(rel);
+      // Extract every "# ── Layer-1 transient retry ..." fenced block up to the next
+      // "# ── " header or "**If $TRANSIENT_RETRY..." resolution line, and assert none
+      // of them contain a SIDECAR_ATTEMPT increment (`SIDECAR_ATTEMPT=$((SIDECAR_ATTEMPT + 1))`
+      // or `SIDECAR_ATTEMPT=$(( ... + 1))`).
+      const blocks = t.match(/# ── Layer-1 transient retry[\s\S]*?```\n\*\*If `\$TRANSIENT_RETRY`/g) || [];
+      assert(blocks.length > 0, `(c) ${rel} has at least one extractable Layer-1 block`, rel);
+      for (const b of blocks) {
+        assert(!/SIDECAR_ATTEMPT\s*=\s*\$\(\(\s*SIDECAR_ATTEMPT\s*\+\s*1\s*\)\)/.test(b),
+          `(c) ${rel} Layer-1 block does NOT increment SIDECAR_ATTEMPT`, b.slice(0, 200));
+        assert(/UNTOUCHED/i.test(b) && /SIDECAR_ATTEMPT/.test(b),
+          `(c) ${rel} Layer-1 block explicitly documents SIDECAR_ATTEMPT is untouched`, b.slice(0, 200));
+      }
+    }
+    function texts_or_read(rel) {
+      return fs.readFileSync(path.join(REPO, rel), 'utf8');
+    }
+  }
+
+  pass('(final) Section 48: sidecar Layer-1 retry — error_class real cases, classifier-reuse, state counter, orthogonality + doc-presence all verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -6004,6 +6194,7 @@ async function main() {
     smokeStubPatternRobustness();
     smokeDispatchResolve();
     smokeSurgicalReset();
+    smokeSidecarLayer1Retry();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
