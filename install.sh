@@ -142,9 +142,9 @@ done
 
 echo ""
 info "Installing dispatch templates..."
-for f in "${DISPATCH_TEMPLATES_SRC}"/*.md; do
-  name="$(basename "$f")"
-  copy "$f" "${DISPATCH_TEMPLATES_DIR}/${name}"
+for template in "${DISPATCH_TEMPLATES_SRC}"/*.md; do
+  name="$(basename "$template")"
+  copy "$template" "${DISPATCH_TEMPLATES_DIR}/${name}"
   info "  templates/dispatch/${name}"
 done
 

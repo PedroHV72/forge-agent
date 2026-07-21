@@ -132,9 +132,9 @@ foreach ($f in Get-ChildItem "$RepoDir\agents\forge*.md") {
 
 Write-Host ""
 Info "Instalando templates de dispatch..."
-foreach ($f in Get-ChildItem -LiteralPath $DispatchTemplatesSrc -Filter '*.md' -File) {
-    CopyFile $f.FullName (Join-Path $DispatchTemplatesDir $f.Name)
-    Info "  templates\dispatch\$($f.Name)"
+Get-ChildItem -LiteralPath $DispatchTemplatesSrc -Filter '*.md' -File | ForEach-Object {
+    CopyFile $_.FullName (Join-Path $DispatchTemplatesDir $_.Name)
+    Info "  templates/dispatch/$($_.Name)"
 }
 
 # ── Opus model availability probe ─────────────────────────────────────────────

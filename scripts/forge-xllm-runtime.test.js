@@ -92,7 +92,7 @@ test('Windows containment is case-insensitive', () => {
   );
 });
 
-test('result target rejects symlink/junction path components', () => {
+test('result target canonicalizes external symlink/junction parents and rejects aliases into the workspace', () => {
   const { root, repo } = makeRepo();
   const realOut = path.join(root, 'real-out');
   const linkOut = path.join(root, 'link-out');
@@ -104,9 +104,22 @@ test('result target rejects symlink/junction path components', () => {
     process.stdout.write(`  - symlink/junction test skipped: ${error.code || error.message}\n`);
     return;
   }
+  assert.strictEqual(
+    validateResultFileTarget(path.join(linkOut, 'result.json'), repo),
+    path.join(realOut, 'result.json'),
+  );
+
+  const linkIn = path.join(root, 'link-in');
+  try {
+    fs.symlinkSync(repo, linkIn, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    skipped += 1;
+    process.stdout.write(`  - workspace symlink/junction test skipped: ${error.code || error.message}\n`);
+    return;
+  }
   assert.throws(
-    () => validateResultFileTarget(path.join(linkOut, 'result.json'), repo),
-    /symlink or junction/,
+    () => validateResultFileTarget(path.join(linkIn, 'result.json'), repo),
+    /outside the workspace/,
   );
 });
 

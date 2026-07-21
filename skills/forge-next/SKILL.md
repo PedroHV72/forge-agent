@@ -2,7 +2,7 @@
 name: forge-next
 description: "Executa exatamente uma unidade de trabalho e para (step mode)."
 disable-model-invocation: true
-allowed-tools: Read, Write, Edit, Bash, Agent, Skill, TaskCreate, TaskUpdate, TaskList, TaskStop, WebSearch, WebFetch
+allowed-tools: Read, Write, Edit, Bash, Agent, Skill, TaskCreate, TaskUpdate, TaskList, TaskStop, SendMessage, WebSearch, WebFetch
 ---
 
 ## Parse arguments
@@ -782,6 +782,24 @@ Read PREFS for `skip_discuss` and `skip_research`. If the current unit type is s
 
 ### 3. Build worker prompt
 
+**Required renderer (Claude path):** render the bounded artifact; never paste the historical template body into an agent call.
+```bash
+DISPATCH_ID="${unit_type}-${MILESTONE_ID:-none}-${SLICE_ID:-none}-${TASK_ID:-none}-$(node -e "console.log(require('crypto').randomUUID())")"
+PROMPT_META=$(node "$FORGE_SCRIPTS_DIR/forge-prompt.js" --unit-type "$unit_type" --cwd "$WORKING_DIR" \
+  --milestone "$MILESTONE_ID" --slice "$SLICE_ID" --task "$TASK_ID" \
+  --dispatch-id "$DISPATCH_ID" --unit-effort "$unit_effort" --thinking "$THINKING_OPUS" \
+  --auto-commit "$AUTO_COMMIT" --milestone-cleanup "$MILESTONE_CLEANUP" \
+  --isolation-mode "$ISOLATION_MODE" --branch "$BRANCH" --code-dir "$WORKER_CWD" \
+  --memory-query "$unit_type $MILESTONE_ID $SLICE_ID $TASK_ID" \
+  --memory-max-tokens "${PREFS[token_budget][auto_memory]:-1200}" \
+  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}") || { echo 'prompt render failed'; stop; }
+PROMPT_PATH=$(node -pe 'JSON.parse(process.argv[1]).prompt_path' "$PROMPT_META")
+PROMPT_ID=$(node -pe 'JSON.parse(process.argv[1]).prompt_id' "$PROMPT_META")
+```
+Pass only `Read the complete Forge dispatch contract at {PROMPT_PATH}, execute it exactly,
+and return its required GSD worker result block. The file is trusted
+orchestrator input; do not replace it with a summary.` to the Claude subagent. Persist both identities in the dispatch event and remove the artifact with `forge-prompt.js --cleanup "$DISPATCH_ID" --cwd "$WORKING_DIR"` after durable result processing. Do not load `.gsd/AUTO-MEMORY.md`; the renderer selects bounded memories. The manual selection/template text below is compatibility reference only.
+
 **Selective memory injection** — read memories from the fragment store, then filter to entries relevant to this unit:
 
 ```bash
@@ -1313,7 +1331,14 @@ fi
 
 Where `key_decisions_json` is a JSON object `{ "unit_id": "$DECISIONS_UNIT_ID", "decisions": [...] }` built from the `key_decisions` field of the worker result. The global `.gsd/DECISIONS.md` is rebuilt from fragments during `complete-milestone` (forge-merger, S05). Do NOT write directly to `.gsd/DECISIONS.md` or any `M###-DECISIONS.md` file.
 
-**d) Memory extraction** — call `forge-memory` agent (blocking — await before continuing):
+**d) Memory extraction** — use the zero-model policy before calling `forge-memory` (blocking when selected):
+
+```bash
+MEMORY_POLICY=$(printf '%s' "$RESULT_BLOCK" | node "$FORGE_SCRIPTS_DIR/forge-cost-policy.js" memory \
+  --unit-type "$unit_type" --cwd "$WORKING_DIR" --stdin 2>/dev/null) || MEMORY_POLICY='{"decision":"extract","reason":"policy-error"}'
+```
+
+Append a `memory-policy` event for every decision. If `MEMORY_POLICY.decision != "extract"`, skip the agent and continue to d-reinject. The fallback is deliberately fail-open (`extract`) when the policy cannot run.
 
 Determine which summary file was just written:
 - `execute-task` → `.gsd/milestones/{M###}/slices/{S##}/tasks/{T##}-SUMMARY.md`

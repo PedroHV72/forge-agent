@@ -2,9 +2,9 @@
 
 Canonical control-flow contract shared by `/forge-auto`, `/forge-next`, and `/forge-task`.
 Executable prompt bodies live under `shared/templates/dispatch/` and are rendered by
-`scripts/forge-prompt.js`; the historical template bodies below remain reference material
-for call sites not yet migrated. Changes to an executable prompt must land in its template
-file, never as a new inline copy in a skill.
+`scripts/forge-prompt.js`; the historical template bodies below are compatibility reference
+material only. Claude worker dispatches must use the renderer rather than copying an inline
+template into a skill. Changes to an executable prompt must land in its template file.
 
 ---
 

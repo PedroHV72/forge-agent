@@ -100,7 +100,7 @@ test('auto and next request selective memory without loading the monolith', () =
   for (const filename of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md']) {
     const content = fs.readFileSync(path.join(root, filename), 'utf8');
     assert.match(content, /Do \*{0,2}not\*{0,2} load [`]?\.gsd\/AUTO-MEMORY\.md/i, filename);
-    assert.match(content, /forge-prompt\.js[\s\S]{0,200}(?:select\w*|bounded)[^\n]*memor/i, filename);
+    assert.match(content, /forge-prompt\.js[\s\S]{0,1200}--memory-(?:query|max-tokens)/i, filename);
   }
 });
 

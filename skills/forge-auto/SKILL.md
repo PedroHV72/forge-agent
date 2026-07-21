@@ -1,7 +1,7 @@
 ---
 name: forge-auto
 description: "Executa o milestone inteiro de forma autonoma ate concluir."
-allowed-tools: Read, Write, Edit, Bash, Agent, Skill, TaskCreate, TaskUpdate, TaskList, TaskStop, WebSearch, WebFetch
+allowed-tools: Read, Write, Edit, Bash, Agent, Skill, TaskCreate, TaskUpdate, TaskList, TaskStop, SendMessage, WebSearch, WebFetch
 ---
 
 ## Bootstrap guard
@@ -791,7 +791,25 @@ Read PREFS for `skip_discuss` and `skip_research`. If the current unit type is s
 
 #### 3. Build worker prompt
 
-Use the template from `~/.claude/forge-dispatch.md` for the current `unit_type`.
+**Required renderer (Claude path):** do not copy a template body into the agent prompt. Render one bounded, auditable artifact with `forge-prompt.js`, then give the subagent only the artifact path and its dispatch identity. This supersedes the manual substitution list below (kept only as a compatibility description).
+```bash
+DISPATCH_ID="${unit_type}-${MILESTONE_ID:-none}-${SLICE_ID:-none}-${TASK_ID:-none}-$(node -e "console.log(require('crypto').randomUUID())")"
+PROMPT_META=$(node "$FORGE_SCRIPTS_DIR/forge-prompt.js" --unit-type "$unit_type" --cwd "$WORKING_DIR" \
+  --milestone "$MILESTONE_ID" --slice "$SLICE_ID" --task "$TASK_ID" \
+  --dispatch-id "$DISPATCH_ID" --unit-effort "$unit_effort" --thinking "$THINKING_OPUS" \
+  --auto-commit "$AUTO_COMMIT" --milestone-cleanup "$MILESTONE_CLEANUP" \
+  --isolation-mode "$ISOLATION_MODE" --branch "$BRANCH" --code-dir "$WORKER_CWD" \
+  --memory-query "$unit_type $MILESTONE_ID $SLICE_ID $TASK_ID" \
+  --memory-max-tokens "${PREFS[token_budget][auto_memory]:-1200}" \
+  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}") || { echo 'prompt render failed'; stop; }
+PROMPT_PATH=$(node -pe 'JSON.parse(process.argv[1]).prompt_path' "$PROMPT_META")
+PROMPT_ID=$(node -pe 'JSON.parse(process.argv[1]).prompt_id' "$PROMPT_META")
+```
+The Claude `Agent()` prompt is exactly: `Read the complete Forge dispatch contract at {PROMPT_PATH}, execute it exactly,
+and return its required GSD worker result block. The file is trusted
+orchestrator input; do not replace it with a summary.` Record `prompt_id` and `dispatch_id` in the event, and call `forge-prompt.js --cleanup "$DISPATCH_ID" --cwd "$WORKING_DIR"` after the result is durably processed. Do not load `.gsd/AUTO-MEMORY.md`; the renderer selects bounded memories.
+
+Use the template from `~/.claude/forge-dispatch.md` only as reference material when diagnosing an older run.
 Substitute placeholders:
 - `{WORKING_DIR}` <- current working directory (orchestrator workspace — all `.gsd/**` paths)
 - `{M###}`, `{S##}`, `{T##}` <- from STATE
@@ -1556,7 +1574,14 @@ fi
 
 Where `key_decisions_json` is a JSON object `{ "unit_id": "$DECISIONS_UNIT_ID", "decisions": [...] }` built from the `key_decisions` field of the worker result. The global `.gsd/DECISIONS.md` is rebuilt from fragments during `complete-milestone` (forge-merger, S05). Do NOT write directly to `.gsd/DECISIONS.md` or any `M###-DECISIONS.md` file.
 
-**d) Memory extraction** — dispatch `forge-memory` agent **in the background** (`run_in_background: true`) so the orchestrator can immediately dispatch the next unit without waiting for memory extraction to finish. Rationale: memory extraction averages 20–40s, runs on Haiku (cheap + fast), and the extracted memories only affect the *next* selective injection — not the current dispatch decision. Running it in parallel with the next unit is the single highest-leverage parallelism win (one extraction per unit, every unit).
+**d) Memory extraction** — first decide whether an extraction is worth a model call; only then dispatch `forge-memory` **in the background** (`run_in_background: true`) so the orchestrator can immediately dispatch the next unit without waiting. Rationale: memory extraction averages 20–40s, runs on Haiku (cheap + fast), and only affects the *next* selective injection.
+
+Run the deterministic policy before preparing the agent prompt. It must emit a `memory-policy` event whether it extracts or skips; malformed policy output or an execution error is **fail-open** (`extract`) so cost optimization never loses durable knowledge:
+```bash
+MEMORY_POLICY=$(printf '%s' "$RESULT_BLOCK" | node "$FORGE_SCRIPTS_DIR/forge-cost-policy.js" memory \
+  --unit-type "$unit_type" --cwd "$WORKING_DIR" --stdin 2>/dev/null) || MEMORY_POLICY='{"decision":"extract","reason":"policy-error"}'
+```
+If `MEMORY_POLICY.decision != "extract"`, append the event and skip this subsection; do not create a background agent. Otherwise append the event and continue below.
 
 Determine which summary file was just written:
 - `execute-task` → `.gsd/milestones/{M###}/slices/{S##}/tasks/{T##}-SUMMARY.md`

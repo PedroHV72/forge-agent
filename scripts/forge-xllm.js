@@ -1386,23 +1386,10 @@ function pathKey(value, platform = process.platform) {
   return platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
-function assertNoSymlinkComponents(targetDir) {
-  const resolved = path.resolve(targetDir);
-  const parsed = path.parse(resolved);
-  const relative = resolved.slice(parsed.root.length);
-  let cursor = parsed.root;
-  for (const component of relative.split(path.sep).filter(Boolean)) {
-    cursor = path.join(cursor, component);
-    const stat = fs.lstatSync(cursor);
-    if (stat.isSymbolicLink()) {
-      throw new Error(`result-file path must not contain a symlink or junction: ${cursor}`);
-    }
-  }
-}
-
 /** Canonicalize and validate the result channel before ANY write. The parent must
- * exist, contain no symlink/junction components, and resolve outside the canonical
- * workspace. Windows containment is case-insensitive. Existing targets must be plain
+ * exist and resolve outside the canonical workspace. Resolving the parent first
+ * makes symlink/junction aliases safe without rejecting valid platform aliases such
+ * as macOS `/tmp` → `/private/tmp`. Windows containment is case-insensitive. Existing targets must be plain
  * regular files (never symlinks, junctions, directories, devices, or sockets). */
 function validateResultFileTarget(resultFile, cwd, platform = process.platform) {
   if (typeof resultFile !== 'string' || !resultFile) {
@@ -1411,7 +1398,6 @@ function validateResultFileTarget(resultFile, cwd, platform = process.platform) 
   const workspaceReal = fs.realpathSync.native(path.resolve(cwd));
   const target = path.resolve(resultFile);
   const parent = path.dirname(target);
-  assertNoSymlinkComponents(parent);
   const parentReal = fs.realpathSync.native(parent);
   if (!fs.statSync(parentReal).isDirectory()) throw new Error('result-file parent must be a directory');
 
