@@ -7763,12 +7763,14 @@ function smokeXllmStateSliceQualified() {
   const task = fs.readFileSync(path.join(repo, 'skills', 'forge-task', 'SKILL.md'), 'utf8');
   const spec = fs.readFileSync(path.join(repo, 'shared', 'forge-dispatch.md'), 'utf8');
 
+  const FALLBACK_LINE = '[ -f "$XLLM_STATE" ] || XLLM_STATE=';
+  const EXPECTED_FALLBACK_COUNT = { 'forge-auto': 3, 'forge-next': 2 };
   for (const [name, mirror] of [['forge-auto', auto], ['forge-next', next]]) {
     assert(mirror.includes('xllm-state-${S##}-${T##}-attempt'),
       `(a) ${name} Branch C uses slice-qualified task-level state filename`);
-    assert(mirror.includes('xllm-state-${T##}-attempt-${N}.json')
-        && /fall.?back|fallback/i.test(mirror),
-      `(b) ${name} documents dual-read fallback to the legacy task-level state filename`);
+    const fallbackCount = mirror.split(FALLBACK_LINE).length - 1;
+    assert(fallbackCount === EXPECTED_FALLBACK_COUNT[name],
+      `(b) ${name} has exact dual-format fallback reconstruction count (expected ${EXPECTED_FALLBACK_COUNT[name]}, got ${fallbackCount})`);
   }
   assert(task.includes('xllm-state-{TASK_ID}.json'),
     '(c) forge-task keeps its TASK_ID-only state filename');

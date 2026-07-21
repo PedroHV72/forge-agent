@@ -893,6 +893,8 @@ When `REASON == sidecar-cap-exceeded` here, **skip the timeline task, dispatch a
 # fallback, never an unbounded retry). codex-timeout / codex-orphan are ALWAYS terminal (a hung/orphaned
 # process is never retried in place) regardless of a stale error_class.
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
+XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-${T##}-attempt-${N}.json"
+[ -f "$XLLM_STATE" ] || XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${T##}-attempt-${N}.json"
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null || echo "$RESULT_FILE")
 ERROR_CLASS=$(node -pe "JSON.parse(require('fs').readFileSync('$RESULT_FILE','utf8')).error_class || 'terminal'" 2>/dev/null || echo terminal)
 case "$REASON" in codex-timeout|codex-orphan) ERROR_CLASS="terminal";; esac
