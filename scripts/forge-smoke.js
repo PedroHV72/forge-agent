@@ -7754,6 +7754,41 @@ function smokeCleanupRegistryMode() {
   pass('(final) Section 58: cleanupForRun registry-first mode — registry, legacy fallback, missing-record fallback, and wiring verified');
 }
 
+// ── Section 59: slice-qualified task-level xllm state contract ─────────────
+function smokeXllmStateSliceQualified() {
+  process.stdout.write('\n▸ Section 59: slice-qualified task-level xllm state contract\n');
+  const repo = path.dirname(SCRIPTS);
+  const auto = fs.readFileSync(path.join(repo, 'skills', 'forge-auto', 'SKILL.md'), 'utf8');
+  const next = fs.readFileSync(path.join(repo, 'skills', 'forge-next', 'SKILL.md'), 'utf8');
+  const task = fs.readFileSync(path.join(repo, 'skills', 'forge-task', 'SKILL.md'), 'utf8');
+  const spec = fs.readFileSync(path.join(repo, 'shared', 'forge-dispatch.md'), 'utf8');
+
+  for (const [name, mirror] of [['forge-auto', auto], ['forge-next', next]]) {
+    assert(mirror.includes('xllm-state-${S##}-${T##}-attempt'),
+      `(a) ${name} Branch C uses slice-qualified task-level state filename`);
+    assert(mirror.includes('xllm-state-${T##}-attempt-${N}.json')
+        && /fall.?back|fallback/i.test(mirror),
+      `(b) ${name} documents dual-read fallback to the legacy task-level state filename`);
+  }
+  assert(task.includes('xllm-state-{TASK_ID}.json'),
+    '(c) forge-task keeps its TASK_ID-only state filename');
+  assert(auto.includes('xllm-state-{S##}-attempt-$N.json')
+      && next.includes('xllm-state-${S##}-attempt-${N}.json'),
+    '(d) Branch D slice-level state filenames remain slice-qualified and unchanged');
+  assert(spec.includes('xllm-state-{S##}-{T##}-attempt-{N}.json')
+      && spec.includes('xllm-state-{T##}-attempt-{N}.json')
+      && /two-format read policy|política de leitura|leitura dupla/i.test(spec),
+    '(e) dispatch spec documents canonical task filename and legacy dual-read policy');
+  assert(spec.includes('execute-task/{T##}') && /not reformatted|not be reformatted|não.*reformat/i.test(spec),
+    '(f) event unitId remains execute-task/{T##} and is not reformatted');
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/smokeXllmStateSliceQualified\(\);/.test(mainBody),
+    '(g) Section 59 is registered in main()');
+  pass('(final) Section 59: slice-qualified task-level state, dual-read compatibility, untouched boundaries, and main() registration verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -7820,6 +7855,7 @@ async function main() {
     smokeRequireWorktree();
     smokeSidecarEnvPromotion();
     smokeCleanupRegistryMode();
+    smokeXllmStateSliceQualified();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
