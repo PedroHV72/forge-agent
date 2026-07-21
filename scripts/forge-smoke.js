@@ -7722,6 +7722,14 @@ function smokeCleanupRegistryMode() {
   assert(result.elevated === false, '(c) missing record preserves resolved elevation state', JSON.stringify(result));
   assert(result.elevation_reason === null, '(c) missing record preserves null elevation reason', JSON.stringify(result));
 
+  // Corrupted/unknown registry isolation_mode: no-op, does not re-resolve prefs.
+  writeRun('M-CORRUPT', { ...baseRecord, id: 'M-CORRUPT', isolation_mode: 'bogus' });
+  fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"worktree"},"workers":{"require_worktree":"false"}}', 'utf8');
+  result = isolation.cleanupForRun(dir, 'M-CORRUPT');
+  assert(result.mode === 'shared', '(e) corrupted registry isolation_mode no-ops', JSON.stringify(result));
+  assert(result.mode_source === 'invalid-registry', '(e) corrupted registry isolation_mode reports mode_source=invalid-registry', JSON.stringify(result));
+
   // Source-level wiring guards make the contract visible to future refactors.
   const source = fs.readFileSync(path.join(SCRIPTS, 'forge-isolation.js'), 'utf8');
   const cleanupStart = source.indexOf('function cleanupForRun');

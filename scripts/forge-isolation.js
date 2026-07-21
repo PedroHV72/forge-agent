@@ -348,11 +348,20 @@ function setupForRun(cwd, runId, opts) {
 // the M014 S03-R2 debt: a mid-run pref flip worktree→shared must not hit the
 // shared guard and orphan the worktree. Only isolation_mode is registry-backed;
 // a mid-run worktree_root flip remains out of scope.
+const VALID_ISOLATION_MODES = new Set(['shared', 'branch', 'worktree']);
+
 function resolveCleanupMode(cwd, runId) {
   let rec = null;
   try { rec = runs.get(cwd, runId); } catch { rec = null; }
   if (rec && typeof rec.isolation_mode === 'string' && rec.isolation_mode.trim()) {
-    return { mode: rec.isolation_mode.toLowerCase(), source: 'registry' };
+    const normalized = rec.isolation_mode.trim().toLowerCase();
+    if (VALID_ISOLATION_MODES.has(normalized)) {
+      return { mode: normalized, source: 'registry' };
+    }
+    // Corrupted/unknown registry value: no-op rather than silently falling
+    // back to re-resolving current prefs (that reintroduces the mid-run
+    // pref-flip hazard this slice closed).
+    return { mode: 'shared', source: 'invalid-registry' };
   }
   const eff = resolveEffectiveMode(cwd);
   return {
