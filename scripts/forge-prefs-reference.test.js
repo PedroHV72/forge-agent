@@ -3,8 +3,9 @@
 
 // Coverage + drift guard for shared/forge-prefs-reference.md.
 //   1. Every schema leaf dotted path must appear in the committed doc.
-//   2. The committed doc must byte-equal a fresh renderReference() output —
-//      forces a regen whenever the schema changes (T03-PLAN §Must-Haves).
+//   2. The committed doc must equal a fresh renderReference() output after
+//      normalizing checkout line endings — forces a regen whenever the schema
+//      changes without making Git's Windows CRLF conversion a false failure.
 
 const fs = require('fs');
 const path = require('path');
@@ -55,6 +56,7 @@ test(`committed doc exists at ${DOC_PATH}`, () => {
 });
 
 const committed = fs.readFileSync(DOC_PATH, 'utf8');
+const committedCanonical = committed.replace(/\r\n/g, '\n');
 
 test(`coverage: all ${leafPaths.length} schema leaf paths present in committed doc`, () => {
   const missing = leafPaths.filter((leafPath) => !committed.includes(`\`${leafPath}\``));
@@ -64,7 +66,7 @@ test(`coverage: all ${leafPaths.length} schema leaf paths present in committed d
 test('drift guard: committed doc equals a fresh renderReference(loadSchema()) render', () => {
   const fresh = renderReference(schema);
   assert.strictEqual(
-    committed,
+    committedCanonical,
     fresh,
     'shared/forge-prefs-reference.md is stale — regenerate with: node scripts/forge-prefs-reference.js --out shared/forge-prefs-reference.md'
   );

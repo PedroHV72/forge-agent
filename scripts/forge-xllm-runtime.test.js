@@ -76,7 +76,8 @@ test('plan accepts only done and rejects partial/blocked', () => {
 test('result target is canonicalized outside the workspace and rejects inside paths', () => {
   const { root, repo } = makeRepo();
   const outside = path.join(root, 'result.json');
-  assert.strictEqual(validateResultFileTarget(outside, repo), outside);
+  const expectedOutside = path.join(fs.realpathSync.native(root), 'result.json');
+  assert.strictEqual(validateResultFileTarget(outside, repo), expectedOutside);
   assert.throws(
     () => validateResultFileTarget(path.join(repo, 'result.json'), repo),
     /outside the workspace/,
@@ -111,7 +112,7 @@ test('result target canonicalizes external symlink/junction parents and rejects 
   }
   assert.strictEqual(
     validateResultFileTarget(path.join(linkOut, 'result.json'), repo),
-    path.join(realOut, 'result.json'),
+    path.join(fs.realpathSync.native(realOut), 'result.json'),
   );
 
   const linkIn = path.join(root, 'link-in');
