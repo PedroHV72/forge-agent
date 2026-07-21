@@ -85,7 +85,12 @@ test('result target is canonicalized outside the workspace and rejects inside pa
 
 test('Windows containment is case-insensitive', () => {
   const { repo } = makeRepo();
-  const caseChanged = repo.toUpperCase() === repo ? repo.toLowerCase() : repo.toUpperCase();
+  // Linux/macOS cannot resolve a path whose casing differs from the real path,
+  // whereas Windows resolves both spellings. Still exercise the win32 containment
+  // branch everywhere with an existing path, and use a casing variant on Windows.
+  const caseChanged = process.platform === 'win32'
+    ? (repo.toUpperCase() === repo ? repo.toLowerCase() : repo.toUpperCase())
+    : repo;
   assert.throws(
     () => validateResultFileTarget(path.join(caseChanged, 'result.json'), repo, 'win32'),
     /outside the workspace/,
