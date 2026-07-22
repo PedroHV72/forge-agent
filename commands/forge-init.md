@@ -1,9 +1,9 @@
 ---
-description: "Inicializa o agente GSD no projeto atual. Detecta projeto gsd-pi existente ou cria estrutura nova. Configura o fragment-store layout (.gsd/ledger/, .gsd/decisions/, .gsd/memory/) com ignore rules para os caches de projeção. Use: /forge-init | /forge-init <descrição do projeto>"
+description: "Inicializa o Forge Agent no projeto atual. Detecta projeto gsd-pi existente ou cria estrutura nova. Configura o fragment-store layout (.gsd/ledger/, .gsd/decisions/, .gsd/memory/) com ignore rules para os caches de projeção. Use: /forge-init | /forge-init <descrição do projeto>"
 allowed-tools: Read, Write, Edit, Bash, Glob, AskUserQuestion
 ---
 
-You are initializing GSD agent support for the current project directory. Follow the detection flow below exactly.
+You are initializing Forge Agent support for the current project directory. Follow the detection flow below exactly.
 
 **GIT RULE — CRITICAL:** NEVER run `git init`. If the project has no `.git/` directory, that is the user's choice. The Forge Agent works with or without git. Do not create, initialize, or suggest creating a git repository.
 
@@ -77,7 +77,7 @@ The project is already managed by gsd-pi. Your job is to:
 
 10. **Report:**
     ```
-    ✓ GSD agent initialized on existing project
+    ✓ Forge Agent inicializado em projeto existente
 
     Project: <name from PROJECT.md>
     Active milestone: M### — Title (or "none")
@@ -217,7 +217,7 @@ The project is already managed by gsd-pi. Your job is to:
 
 10. **Report:**
     ```
-    ✓ GSD agent initialized (new project)
+    ✓ Forge Agent inicializado (projeto novo)
 
     Project: <name>
     Structure created: .gsd/
@@ -299,7 +299,7 @@ Se houver `continue.md` no slice ativo → leia, delete, retome de "Next Action"
 
 Hierarquia: Milestone → Slice → Task (iron rule: task deve caber em um context window)
 
-Referência completa: `~/.gsd/agent/GSD-WORKFLOW.md`
+Referência completa: `/forge-help`
 ```
 
 ---
