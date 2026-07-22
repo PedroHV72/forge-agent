@@ -5,8 +5,6 @@ allowed-tools: Read, Write, Edit, Bash, Glob, AskUserQuestion
 
 You are initializing Forge Agent support for the current project directory. Follow the detection flow below exactly.
 
-**GIT RULE — CRITICAL:** NEVER run `git init`. If the project has no `.git/` directory, that is the user's choice. The Forge Agent works with or without git. Do not create, initialize, or suggest creating a git repository.
-
 ## Input
 $ARGUMENTS
 
@@ -23,6 +21,31 @@ ls .gsd/STATE.md 2>/dev/null
 ls .gsd/PROJECT.md 2>/dev/null
 ls CLAUDE.md 2>/dev/null
 ```
+
+---
+
+## Step 1.5: Git guarantee
+
+Run this check once, before routing (covers both Case A and Case B below):
+
+```bash
+git rev-parse --git-dir 2>/dev/null
+```
+
+If it succeeds (exit 0 — the current directory or an ancestor is already a git repo), do nothing and proceed to Step 2.
+
+If it fails (no git anywhere in the tree), use `AskUserQuestion` with two options:
+- **Inicializar git agora (Recommended)** — sidecar multi-LLM, isolation e review dialético dependem de git.
+- **Seguir sem git** — recursos degradados.
+
+If the user approves initialization:
+```bash
+git init -b main
+```
+- Create `.gitignore` **only if it does not already exist** (`[ -f .gitignore ] || ...` — NEVER overwrite an existing `.gitignore`), with a minimal set: `node_modules/`, `dist/`, `.env*`, `*.log`.
+- Create an initial commit `chore: initial commit` **only** if the repo was just created (no existing commits — `git rev-parse --verify HEAD` fails before the commit), staging explicitly with `git add -A` (run AFTER the `.gitignore` is in place, so `node_modules/`, `dist/`, `.env*`, `*.log` are already excluded from the snapshot). This initial commit snapshots the current tree minus the ignores above — nothing more.
+
+If the user declines, print a one-line warning listing degraded features: sidecar codex (START_SHA/reset/files_changed), isolation branch/worktree, `auto_commit`, review dialético diffs (`git diff`).
 
 ---
 
@@ -112,7 +135,7 @@ The project is already managed by gsd-pi. Your job is to:
    - Keep the answer as the active `auto_commit` value for the local JSONC preferences scaffold.
    - `sim` → use `auto_commit=true`
    - `não` → use `auto_commit=false`
-   - **IMPORTANT:** Never run `git init`. If the project has no `.git/`, that's the user's choice. The agent works with or without git.
+   - Git repo presence was already handled once in Step 1.5 above (git guarantee) — no need to check again here.
 
 3. **Create `.gsd/` structure:**
 

@@ -7893,6 +7893,9 @@ function smokeXllmResultFileGuard() {
   assert(spec.includes('codex-unreliable-session'), '(e) canonical names the forbidden anti-example codex-unreliable-session');
   assert(!spec.includes('| `codex-unreliable-session`'), '(e) codex-unreliable-session is never a table row in the enum');
 
+  // (f) sidecar-state-init-failed is a sanctioned enum member — doc-presence in the canonical spec.
+  assert(spec.includes('sidecar-state-init-failed'), '(f) canonical enum includes sidecar-state-init-failed');
+
   const source = fs.readFileSync(__filename, 'utf8');
   const mainBody = source.slice(source.lastIndexOf('async function main()'));
   assert(/smokeXllmResultFileGuard\(\);/.test(mainBody),
@@ -7954,6 +7957,52 @@ function smokeRoutingDomains() {
   assert(/smokeRoutingDomains\(\);/.test(mainBody),
     '(e) Section 61 is registered in main()');
   pass('(final) Section 61: ROUTING_DOMAINS injected into planner prompt templates (canonical + mirrors + self-contained sites) and planner domain contract verified');
+}
+
+// ── Section 62: /forge-init git guarantee — no more NEVER-git-init prohibitions ──
+function smokeInitGitGuarantee() {
+  process.stdout.write('\n▸ Section 62: /forge-init git guarantee (rev-parse check + AskUserQuestion)\n');
+  const repo = path.dirname(SCRIPTS);
+  const read = (file) => fs.readFileSync(path.join(repo, file), 'utf8');
+  const init = read('commands/forge-init.md');
+
+  assert(init.includes('git rev-parse --git-dir'),
+    '(a) commands/forge-init.md runs git rev-parse --git-dir before routing');
+
+  const forbidden = 'NEVER run `git init`';
+  const forbiddenCount = init.split(forbidden).length - 1;
+  assert(forbiddenCount === 0,
+    `(b) commands/forge-init.md has zero occurrences of the old prohibition (got ${forbiddenCount})`);
+
+  assert(init.includes('AskUserQuestion'),
+    '(c) commands/forge-init.md uses AskUserQuestion in the git-guarantee flow');
+
+  // (d) behavioral: --state-init against a non-git cwd is the real precondition the R1
+  // `sidecar-state-init-failed` guard depends on ([ -n "$START_SHA" ] must fail) — assert
+  // forge-surgical-reset.js actually exits non-zero (and prints nothing to stdout) there.
+  const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-nogit-'));
+  try {
+    const rp = spawnSync('git', ['-C', nonGitDir, 'rev-parse', '--git-dir'],
+      { encoding: 'utf8' });
+    assert(rp.status !== 0, '(d) tmpdir fixture is confirmed outside any git repo');
+
+    const stateFile = path.join(nonGitDir, 'state.json');
+    const result = spawnSync('node',
+      [path.join(SCRIPTS, 'forge-surgical-reset.js'), '--state-init', '--state', stateFile, '--cwd', nonGitDir],
+      { encoding: 'utf8' });
+    assert(result.status !== 0,
+      `(d) forge-surgical-reset.js --state-init exits non-zero outside a git repo (got ${result.status})`);
+    assert(!(result.stdout || '').trim(),
+      '(d) forge-surgical-reset.js --state-init prints no START_SHA outside a git repo');
+  } finally {
+    fs.rmSync(nonGitDir, { recursive: true, force: true });
+  }
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/smokeInitGitGuarantee\(\);/.test(mainBody),
+    '(final) Section 62 is registered in main()');
+  pass('(final) Section 62: /forge-init git guarantee verified — no more unconditional NEVER-git-init prohibitions');
 }
 
 async function main() {
@@ -8025,6 +8074,7 @@ async function main() {
     smokeXllmStateSliceQualified();
     smokeXllmResultFileGuard();
     smokeRoutingDomains();
+    smokeInitGitGuarantee();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

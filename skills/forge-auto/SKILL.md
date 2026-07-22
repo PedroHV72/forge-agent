@@ -850,6 +850,9 @@ else
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-init \
     --state "$XLLM_STATE" --cwd "$CODE_DIR" --attempt "$N")
+  # Guard: if --state-init fails (non-zero exit / empty $START_SHA) → REASON="sidecar-state-init-failed"
+  # → Fallback directly, with NO reset (nothing was captured, no valid state file to reset from).
+  [ -n "$START_SHA" ] || REASON="sidecar-state-init-failed"
 
   # 2. No pre-dispatch clean-tree guard — the pre-dirty snapshot IS the guard (SUPERSEDED, DECISION 39,
   #    see S01-CONTEXT.md). A dirty working tree is a SAFE precondition, not a refusal reason: the
@@ -865,6 +868,8 @@ else
     --state "$XLLM_STATE" --result-file "$RESULT_FILE"
 fi
 ```
+With `REASON` now set by the guard above, control goes DIRECTLY to the **Fallback** block below (`worker-engine-fallback`) — no dispatch is attempted and no reset runs, since no valid state was ever captured.
+
 When `REASON == sidecar-cap-exceeded` here, **skip the timeline task, dispatch and poll entirely** — go straight to the **Fallback** block below (no sidecar is launched).
 
 - **Timeline task:** `TaskCreate` with icon `⚡` (same as the Claude execute-task path), model label = `codex${CODEX_MODEL:+ ($CODEX_MODEL)}`; mark `in_progress`.

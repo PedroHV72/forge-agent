@@ -758,7 +758,12 @@ XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-{TASK_ID}.json"
 mkdir -p "$WORKING_DIR/.gsd/forge/"
 START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-init \
   --state "$XLLM_STATE" --cwd "${CODE_DIR:-.}")
+# Guard: if --state-init fails (non-zero exit / empty $START_SHA) → REASON="sidecar-state-init-failed"
+# → Fallback directly, with NO reset (nothing was captured, no valid state file to reset from).
+[ -n "$START_SHA" ] || REASON="sidecar-state-init-failed"
 ```
+
+With `REASON` now set by the guard above, control goes DIRECTLY to the **Fallback** block below (`worker-engine-fallback`) — no dispatch is attempted and no reset runs, since no valid state was ever captured.
 
 2. **No pre-dispatch clean-tree guard — the pre-dirty snapshot IS the guard** (SUPERSEDED, DECISION 39, see S01-CONTEXT.md). A dirty working tree is a **safe precondition**, not a refusal reason: the fallback reset only ever touches paths that changed relative to the snapshot; pre-existing dirty content is provably untouched (re-hash) or the reset aborts entirely (overlap) rather than guessing. `dirty-tree-guard` is no longer a trigger and the sidecar dispatches over a pre-existing dirty tree.
 
@@ -850,7 +855,7 @@ fi
 
 **If `$TRANSIENT_RETRY` is set** (Layer-1 fired, reset verified `RC=0`): re-enter the **Dispatch (detached) + Poll** steps — reusing the same state, `$START_SHA`/`pre_dirty` and the fresh `$RESULT_FILE`; only `transient_retry_count` advances. Do NOT run the Layer-2 block below. **Otherwise** — a `terminal` class, exhaustion (`transient_retry_count == max_transient_retries`), or an unverified reset (`RC≠0`, whose abort→fallback accounting Layer-2 owns) — control falls through to the **Layer-2** `worker-engine-fallback` below **unchanged**.
 
-**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`); no retry of the codex work; **not a 4th recovery layer**:
+**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-state-init-failed`); no retry of the codex work; **not a 4th recovery layer**:
 ```bash
 # Re-read is delegated to the helper — $XLLM_STATE carries start_sha + pre_dirty (this block may be a
 # later Bash invocation — shell vars are gone). Surgical reset via the helper (scoped to CODE_DIR,

@@ -853,8 +853,13 @@ if [ "$REASON" != "sidecar-cap-exceeded" ]; then
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-init \
     --state "$XLLM_STATE" --cwd "$CODE_DIR" --attempt "$N")
+  # Guard: if --state-init fails (non-zero exit / empty $START_SHA) → REASON="sidecar-state-init-failed"
+  # → Fallback directly, with NO reset (nothing was captured, no valid state file to reset from).
+  [ -n "$START_SHA" ] || REASON="sidecar-state-init-failed"
 fi
 ```
+
+With `REASON` now set by the guard above, control goes DIRECTLY to the **Fallback** block below (`worker-engine-fallback`) — no dispatch is attempted and no reset runs, since no valid state was ever captured.
 
 2. **No pre-dispatch clean-tree guard — the pre-dirty snapshot IS the guard** (SUPERSEDED, DECISION 39, see S01-CONTEXT.md). A dirty working tree is a **safe precondition**, not a refusal reason: the fallback reset only ever touches paths that changed relative to the snapshot; pre-existing dirty content is provably untouched (re-hash) or the reset aborts entirely (overlap) rather than guessing. `dirty-tree-guard` is no longer a trigger and the sidecar dispatches over a pre-existing dirty tree.
 
@@ -947,7 +952,7 @@ fi
 
 **If `$PAUSE_ASK_GATE` is set** (TTY present, pause-ask exhaustion): call `AskUserQuestion` with three options — **Retentar codex** (re-enter Layer-1 for one more transient retry against the SAME member: run the Branch C reset→backoff→`--state-update`→re-dispatch sequence with `transient_retry_count` continuing), **Fallback Claude** (take the Layer-2 `worker-engine-fallback` action now), **Pausar milestone** (checkpoint via `continue.md` + `status: paused` and stop the loop — the SAME mechanic as review `ask_in_auto: pause` / account-handoff; do not invent a new pause path). The operator's answer drives control. **Otherwise** (headless degrade, or the gate was not triggered) control falls through unchanged.
 
-**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`); no retry of the codex work; **not a 4th recovery layer**:
+**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`, `sidecar-state-init-failed`); no retry of the codex work; **not a 4th recovery layer**:
 ```bash
 # Re-read is delegated to the helper — $XLLM_STATE is the -attempt-$N.json of the CURRENT attempt
 # (BLOCKER invariant #1) and carries start_sha + pre_dirty (this block may be a later Bash invocation

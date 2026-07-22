@@ -1006,6 +1006,8 @@ START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-init \
   --state "$XLLM_STATE" --cwd "$CODE_DIR" --attempt "$N")
 ```
 
+**Guard: `--state-init` failure.** If `--state-init` fails (non-zero exit / empty `$START_SHA`) → `REASON="sidecar-state-init-failed"` → go straight to Fallback, **with no reset** — there is no valid state file to reset from (nothing was captured).
+
 The state schema is now `{attempt, start_sha, pre_dirty:[{path,hash}], reason, result_file, code_dir}` — `pre_dirty` is the pre-existing dirty snapshot (`hash:null` for a pre-existing deletion), captured in the **same atomic write** as `start_sha` so it survives the poll loop and an auto-compact (Blocker #2 of the S01 risk card — a snapshot captured only in a shell var would be lost the moment the process crosses a Bash-tool boundary). This is the orchestrator's own capture — the **source of truth for the fallback reset**, independent of whatever the adapter reports in its JSON (`start_sha`). The adapter has its own guard (S01), but the reset below trusts only the persisted state. The `-attempt-$N` suffix and the cap gate are unchanged from before this task.
 
 **Task-level filename and two-format read policy (T02).** For `execute-task`, the canonical filename is `xllm-state-{S##}-{T##}-attempt-{N}.json`, written only by `--state-init`. Every success, transient-retry, and fallback/reset re-read reconstructs that slice-qualified path first; when it is absent, the reader falls back to the legacy `xllm-state-{T##}-attempt-{N}.json` so a run spanning this upgrade can finish. This does not change the event `unitId`: events continue to use `execute-task/{T##}`. The slice-level Branch D filename remains `xllm-state-{S##}-attempt-{N}.json` and is unchanged.
@@ -1274,6 +1276,7 @@ Triggers (`reason` value):
 | `codex-orphan` | heartbeat `updated_at` stale beyond the dynamic threshold (`max(heartbeat_interval_ms × 4, 30s)`, per Branch C step 5's canonical orphan detection) **and** the liveness probe/grace expired (probe → dead, or a second consecutive `stale-alive`) → killed. **Always terminal** (an orphaned/hung process is never retried in place) → skips § Layer-1, fires this trigger directly. | both |
 | `surgical-reset-overlap` | `forge-surgical-reset.js --reset` exit 3 — a pre-dirty path's current hash diverged from its snapshot hash (the sidecar ALSO wrote a pre-existing dirty file); **NOTHING was reset**, not even the non-overlapped paths | execute-task only (Branch C) |
 | `verified-reset-failed` | `forge-surgical-reset.js --reset` exit 2 — post-reset verification found a leftover change that isn't an intact pre-dirty path | execute-task only (Branch C) |
+| `sidecar-state-init-failed` | `forge-surgical-reset.js --state-init` precondition failure (e.g. not a git repo, permission denied) — no reset needed, nothing was captured | both |
 
 `dirty-tree-guard` **no longer exists as a fallback trigger** (SUPERSEDED — DECISION 39, see S01-CONTEXT.md): the pre-dirty snapshot (Branch C step 1) replaced the pre-dispatch refusal, so there is no longer a "sidecar never launched because the tree was dirty" case.
 
@@ -1320,7 +1323,7 @@ Triggers (`reason` value):
 
 Event reason strings come from a **closed enum**, documented here and nowhere else (mirrors reference this section, never replicate the list):
 
-- `worker-engine-fallback` (§ Fallback above): `codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `codex-error`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`.
+- `worker-engine-fallback` (§ Fallback above): `codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `codex-error`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`, `sidecar-state-init-failed`.
 - `review-challenger-fallback` (`shared/forge-review.md` § Fallback challenger): `engine-workflow-forced-agents`, `codex-exit-nonzero`, `gemini-exit-nonzero`.
 - `review-pairing-fallback` is a **related-but-distinct** event (own enum: `codex-unavailable`, `no-authorship-data`, `defend-mode-unavailable`, `scope-empty-global-fallback` — see `scripts/forge-review-pairing.js`) — referenced here, NOT folded into the two enums above.
 
