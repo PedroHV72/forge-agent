@@ -219,11 +219,19 @@ Read:
 Emita o banner de liveness (ver `shared/forge-dispatch.md § Spawn Liveness Banner`):
 `◆ Despachando forge-planner… (roda em subagente — sem output até retornar, ~2–5 min; esperado, não é travamento)`
 
+Derive the valid domain list for the header below:
+```bash
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-routing.js ] && echo scripts || echo "$HOME/.claude/scripts")
+routing_domains=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" --list-domains --cwd "$(pwd)" \
+  | node -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(a.length?a.join(", "):"(none — omit domain:)")')
+```
+
 Then delegate to `forge-planner` agent:
 
 ```
 Plan milestone {MILESTONE_ID}: {MILESTONE_DESC}
 WORKING_DIR: {pwd}
+ROUTING_DOMAINS: {routing_domains}
 
 PROJECT:
 {content of .gsd/PROJECT.md}

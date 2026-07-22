@@ -374,12 +374,19 @@ TaskCreate({ subject: "[{TASK_ID}] plan", activeForm: "plan · forge-planner (op
 TaskUpdate({ taskId: <id>, status: "in_progress" })
 ```
 
+Derive the valid domain list for the header below (reuses `$FORGE_SCRIPTS_DIR`/`$WORKING_DIR` set in Load Context):
+```bash
+routing_domains=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" --list-domains --cwd "$WORKING_DIR" \
+  | node -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(a.length?a.join(", "):"(none — omit domain:)")')
+```
+
 Dispatch `forge-planner` (opus) with this prompt:
 ```
 Plan forge-task {TASK_ID}: {TASK_DESCRIPTION}
 WORKING_DIR: {WORKING_DIR}
 effort: {EFFORT_OPUS}
 thinking: adaptive
+ROUTING_DOMAINS: {routing_domains}
 
 ## Task Brief
 {content of {TASK_ID}-BRIEF.md}

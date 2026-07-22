@@ -183,6 +183,7 @@ Plan GSD slice {S##} of milestone {M###}.
 WORKING_DIR: {WORKING_DIR}
 effort: {unit_effort}
 thinking: {THINKING_OPUS}
+ROUTING_DOMAINS: {routing_domains}
 
 ## Risk Assessment
 
@@ -356,6 +357,7 @@ Plan GSD milestone {M###}: {description}.
 WORKING_DIR: {WORKING_DIR}
 effort: {unit_effort}
 thinking: {THINKING_OPUS}
+ROUTING_DOMAINS: {routing_domains}
 
 ## Project
 

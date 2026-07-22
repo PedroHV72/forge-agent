@@ -7900,6 +7900,62 @@ function smokeXllmResultFileGuard() {
   pass('(final) Section 60: forge-xllm --result-file guard (challenge/rebuttal exit 2 + no-file, execute non-regression) and Engine Fallback Discipline rule presence verified');
 }
 
+// ── Section 61: ROUTING_DOMAINS injected into planner prompt templates + planner contract ──
+function smokeRoutingDomains() {
+  process.stdout.write('\n▸ Section 61: ROUTING_DOMAINS injection into planner prompts + contract\n');
+  const repo = path.dirname(SCRIPTS);
+
+  const NEEDLE = 'ROUTING_DOMAINS';
+  const EXPECTED = {
+    'shared/forge-dispatch.md': 2,
+    'skills/forge-auto/SKILL.md': 1,
+    'skills/forge-next/SKILL.md': 1,
+    'skills/forge-task/SKILL.md': 1,
+    'skills/forge-new-milestone/SKILL.md': 1,
+    'agents/forge-planner.md': 2,
+  };
+  const files = {
+    'shared/forge-dispatch.md': path.join(repo, 'shared', 'forge-dispatch.md'),
+    'skills/forge-auto/SKILL.md': path.join(repo, 'skills', 'forge-auto', 'SKILL.md'),
+    'skills/forge-next/SKILL.md': path.join(repo, 'skills', 'forge-next', 'SKILL.md'),
+    'skills/forge-task/SKILL.md': path.join(repo, 'skills', 'forge-task', 'SKILL.md'),
+    'skills/forge-new-milestone/SKILL.md': path.join(repo, 'skills', 'forge-new-milestone', 'SKILL.md'),
+    'agents/forge-planner.md': path.join(repo, 'agents', 'forge-planner.md'),
+  };
+
+  const contents = {};
+  for (const [name, filePath] of Object.entries(files)) {
+    const content = fs.readFileSync(filePath, 'utf8');
+    contents[name] = content;
+    const count = content.split(NEEDLE).length - 1;
+    assert(count === EXPECTED[name],
+      `(a) ${name} has exact "ROUTING_DOMAINS" count (expected ${EXPECTED[name]}, got ${count})`);
+  }
+
+  // (b) canonical templates carry the placeholder form, not a hardcoded value.
+  assert(contents['shared/forge-dispatch.md'].includes('ROUTING_DOMAINS: {routing_domains}'),
+    '(b) canonical templates use the {routing_domains} placeholder');
+
+  // (c) mirrors derive via the canonical forge-routing.js --list-domains helper, never hand-rolled.
+  for (const name of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md', 'skills/forge-new-milestone/SKILL.md']) {
+    assert(contents[name].includes('forge-routing.js" --list-domains'),
+      `(c) ${name} derives ROUTING_DOMAINS via forge-routing.js --list-domains`);
+  }
+
+  // (d) planner contract preserves open-set (never invent a domain key) and no-keyword-matching.
+  const planner = contents['agents/forge-planner.md'];
+  assert(/open-set/i.test(planner), '(d) forge-planner.md still documents open-set domain contract');
+  assert(/No keyword auto-detection/i.test(planner), '(d) forge-planner.md still documents no-keyword-detection rule');
+  assert(planner.includes('omit `domain:`') || /omit.*domain:/i.test(planner),
+    '(d) forge-planner.md documents omitting domain: when ROUTING_DOMAINS is absent/(none)');
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/smokeRoutingDomains\(\);/.test(mainBody),
+    '(e) Section 61 is registered in main()');
+  pass('(final) Section 61: ROUTING_DOMAINS injected into planner prompt templates (canonical + mirrors + self-contained sites) and planner domain contract verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -7968,6 +8024,7 @@ async function main() {
     smokeCleanupRegistryMode();
     smokeXllmStateSliceQualified();
     smokeXllmResultFileGuard();
+    smokeRoutingDomains();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
