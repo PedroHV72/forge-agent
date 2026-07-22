@@ -1312,6 +1312,20 @@ Triggers (`reason` value):
 
 > **Not a 4th recovery layer.** `worker-engine-fallback` is part of the dispatch (Step 4), NOT an extension of the Failure Taxonomy nor the Retry Handler — those layers are mutually exclusive (MEM001). It fires once, in-band, at dispatch time; the Retry Handler and blocker taxonomy operate on the *result* of whichever engine ultimately ran.
 
+#### Engine Fallback Discipline
+
+**CRITICAL.** Engine fallback is **per-dispatch and evidence-based**: it only happens AFTER the real dispatch for THAT unit actually failed with a documented condition (adapter `exit 2`, timeout, invalid result after validation). The orchestrator NEVER pre-emptively deviates from the resolver's configured route based on a failure observed in ANOTHER unit or on suspicion — same family as "executar inline nunca é fallback aceitável" (`skills/forge-auto/SKILL.md:182`, "Running un-isolated ... is NOT an acceptable fallback").
+
+Event reason strings come from a **closed enum**, documented here and nowhere else (mirrors reference this section, never replicate the list):
+
+- `worker-engine-fallback` (§ Fallback above): `codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `codex-error`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`.
+- `review-challenger-fallback` (`shared/forge-review.md` § Fallback challenger): `engine-workflow-forced-agents`, `codex-exit-nonzero`, `gemini-exit-nonzero`.
+- `review-pairing-fallback` is a **related-but-distinct** event (own enum: `codex-unavailable`, `no-authorship-data`, `defend-mode-unavailable`, `scope-empty-global-fallback` — see `scripts/forge-review-pairing.js`) — referenced here, NOT folded into the two enums above.
+
+**Anti-example (forbidden):** `codex-unreliable-session` is NOT in the enum. A session-wide "unreliable" verdict without a real failed dispatch on the unit is prohibited — every fallback traces to one documented failure of one dispatch of one unit, never to an inferred pattern across units.
+
+**Systemic-suspicion procedure.** If genuine systemic engine breakage is suspected (e.g. several consecutive units failing the same way): interactive → STOP and surface to the operator (do not silently degrade); auto (`forge-auto`/`forge-run`, headless) → record the suspicion and still follow the configured route, attempting the real dispatch for the next unit — never skip it preventively. Systemic breakage is confirmed (or not) one evidence-based per-dispatch fallback at a time, not declared in advance.
+
 #### BLOCKER — cross-engine sidecar safety contract (S02-RISK, first-class content)
 
 A cross-engine chain such as `gpt→claude→gpt` dispatches the sidecar **multiple times in the same unit**. The M005 fallback assumed "codex fails → 1 Claude retry"; the multi-member chain breaks that assumption. This contract is defined here as **first-class content** (not an afterthought) and is honored structurally by T01 (this spec) + T02/T03 (executable mirrors) + T04 (smoke doc-presence). Three invariants:

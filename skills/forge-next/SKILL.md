@@ -992,6 +992,7 @@ if [ -z "$NEXT" ]; then
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"execute-task/%s","reason":"%s"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${M###}" "${S##}" "${T##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+  # CRITICAL, per-dispatch + evidence-based fallback discipline: shared/forge-dispatch.md § Engine Fallback Discipline
 fi
 ```
 **If a next member was persisted (`$NEXT` non-empty):** surface "Codex worker failed (`$REASON`). Run `/forge-next` again — it will retry with the next model in the chain (`$NEXT`)." and stop this unit — step mode picks up the advance via the cursor on the next invocation (Step 4b), which re-inspects the engine to route to Branch codex or the Claude Agent. **If `$NEXT` was empty or an abort reason fired:** set `ENGINE=claude` and `DISPATCH_ENGINE=claude`, **run Tier Resolution (step 1.5) and Effort Resolution (step 1.55) now** (they were skipped on the codex path), and dispatch the single `forge-executor` Claude worker via the machinery below. The generic Claude fallback (with its `worker-engine-fallback` event) fires only on the exhausted/abort path — mutually exclusive with the chain-advance cursor (R2). No retry.
@@ -1106,6 +1107,7 @@ echo "⚠ worker: codex indisponível ($REASON) — usando forge-planner"
 mkdir -p "$WORKING_DIR/.gsd/forge/"
 printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"plan-slice/%s","reason":"%s"}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${M###}" "${S##}" "${S##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+# CRITICAL, per-dispatch + evidence-based fallback discipline: shared/forge-dispatch.md § Engine Fallback Discipline
 ```
 Then set `ENGINE=claude` and `DISPATCH_ENGINE=claude`, **run Tier Resolution (step 1.5) and Effort Resolution (step 1.55) now** (a `risk:high` slice escalates `heavy → max`/Fable exactly as today), and dispatch the single `forge-planner` Claude worker via the plan-slice machinery below. No re-resolution of engine (fallback is unconditionally Claude); no retry — not a 4th recovery layer.
 

@@ -1004,6 +1004,7 @@ else
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"execute-task/%s","reason":"%s"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${RUN_ID:-${M###}}" "${S##}" "${T##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+  # CRITICAL, per-dispatch + evidence-based fallback discipline: shared/forge-dispatch.md § Engine Fallback Discipline
 fi
 ```
 When `DISPATCH_ENGINE == codex` (chain advanced to a codex member), re-enter **Branch C step 0** with the incremented `SIDECAR_ATTEMPT`. When `DISPATCH_ENGINE == claude` (chain advanced to a claude member, OR the generic fallback fired), **NOW run the Tier/Effort Resolution** (step 1.5/1.55, skipped on the codex path) and dispatch **one** `forge-executor` Claude via the **single-task flow below** (reuse — do not duplicate). This Claude dispatch emits its own `dispatch` event with `engine:"claude"`. The generic Claude fallback (with its `worker-engine-fallback` event) fires **only** when the chain is exhausted or an abort reason forbids advancement — mutually exclusive with chain-advance (R1). Not a 4th recovery layer — the chain walk IS Failure Taxonomy Layer 2 (same layer, new resolver — MEM001), and the fallback fires once, in-band, at dispatch time.
@@ -1146,6 +1147,7 @@ else
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"plan-slice/%s","reason":"%s"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${RUN_ID:-${M###}}" "${S##}" "${S##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+  # CRITICAL, per-dispatch + evidence-based fallback discipline: shared/forge-dispatch.md § Engine Fallback Discipline
 fi
 ```
 When `DISPATCH_ENGINE == codex` (chain advanced to a codex member), re-enter **Branch D step 0** with the incremented `SIDECAR_ATTEMPT`. When `DISPATCH_ENGINE == claude` (chain advanced to a claude member, OR the generic fallback fired), **NOW run the Tier/Effort Resolution** (step 1.5/1.55, skipped on the codex path — a `risk:high` slice escalates `heavy → max`/Fable exactly as today) and dispatch **one** `forge-planner` Claude via the **single-task flow below** (reuse — do not duplicate). This Claude dispatch emits its own `dispatch` event with `engine:"claude"`. The generic Claude fallback (with its `worker-engine-fallback` event) fires **only** when the chain is exhausted or the cap forbids advancement — mutually exclusive with chain-advance (R1). Not a 4th recovery layer — it fires once, in-band, at dispatch time.

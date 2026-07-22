@@ -235,7 +235,7 @@ Proceed via Steps 2–5 (agents). Defense/rebuttal `null` **never** reach this p
 
 ### Fallback challenger (review-challenger-fallback)
 
-Modeled on **Fallback agents** above. One event type, two triggers discriminated by `reason`:
+Modeled on **Fallback agents** above. One event type, two triggers discriminated by `reason`. Same discipline as `shared/forge-dispatch.md § Engine Fallback Discipline` — per-dispatch, evidence-based, closed reason enum documented there (this section's two reasons are members of that same canonical enum; no separate list is maintained here):
 
 **(a) `engine-workflow-forced-agents`** (precedence, resolved at Step 0 — see the precedence sub-section above): `challenger != 'claude'` AND `engine == 'workflow'` → force `engine = 'agents'`, echo `⚠ challenger: $CHALLENGER força engine agents (workflow não roteia challenger externo)`, append to `{WORKING_DIR}/.gsd/forge/events.jsonl`:
 ```json

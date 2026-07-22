@@ -7799,6 +7799,107 @@ function smokeXllmStateSliceQualified() {
   pass('(final) Section 59: slice-qualified task-level state, dual-read compatibility, untouched boundaries, and main() registration verified');
 }
 
+// ── Section 60: forge-xllm --result-file guard (challenge/rebuttal) + Engine Fallback Discipline ──
+function smokeXllmResultFileGuard() {
+  process.stdout.write('\n▸ Section 60: forge-xllm --result-file guard + Engine Fallback Discipline\n');
+  const repo = path.dirname(SCRIPTS);
+  const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-s60-mock-'));
+  writeMockCodex(mockDir, { payload: '{}', exitCode: 0 });
+
+  // (a) challenge + --result-file → exit 2, stderr mentions result-file, file never created.
+  {
+    const dir = mkTmp('s60-challenge');
+    const resFile = path.join(dir, 'g.json');
+    const r = runXllm(['--mode', 'challenge', '--result-file', resFile, '--diff-cmd', 'echo diff', '--cwd', dir], mockDir, dir);
+    assert(r.status === 2, '(a) challenge --result-file exits 2', `status=${r.status}`);
+    assert(r.stderr.includes('result-file'), '(a) challenge --result-file stderr mentions result-file', r.stderr);
+    assert(!fs.existsSync(resFile), '(a) challenge --result-file never creates the file');
+    cleanup(dir);
+  }
+
+  // (b) rebuttal + --result-file → exit 2, same guard.
+  {
+    const dir = mkTmp('s60-rebuttal');
+    const resFile = path.join(dir, 'g.json');
+    const inputFile = path.join(dir, 'input.json');
+    fs.writeFileSync(inputFile, JSON.stringify({ objections: [] }), 'utf8');
+    const r = runXllm(['--mode', 'rebuttal', '--result-file', resFile, '--input', inputFile, '--cwd', dir], mockDir, dir);
+    assert(r.status === 2, '(b) rebuttal --result-file exits 2', `status=${r.status}`);
+    assert(r.stderr.includes('result-file'), '(b) rebuttal --result-file stderr mentions result-file', r.stderr);
+    assert(!fs.existsSync(resFile), '(b) rebuttal --result-file never creates the file');
+    cleanup(dir);
+  }
+
+  // (c) non-regression: execute + --result-file still succeeds (exit 0 + result JSON written).
+  {
+    const validPayload = JSON.stringify({
+      status: 'done',
+      summary: 'did the task',
+      must_haves_status: [{ item: 'truth 1', status: 'met', note: 'ok' }],
+      files_changed: [],
+    });
+    const gitRepo = mkGitRepo(mkTmp('s60-execute-repo'));
+    const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-s60-plan-'));
+    const planFile = path.join(planDir, 'plan.md');
+    fs.writeFileSync(planFile, '# T05\ndo the thing\n', 'utf8');
+    const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-s60-result-'));
+    const resultFile = path.join(resultDir, 'result.json');
+    const execMockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-s60-execmock-'));
+    writeMockCodex(execMockDir, { payload: validPayload, exitCode: 0 });
+    const r = runXllm(['--mode', 'execute', '--plan', planFile, '--result-file', resultFile, '--cwd', gitRepo], execMockDir, gitRepo);
+    assert(r.status === 0, '(c) execute --result-file still exits 0 (no regression)', `status=${r.status} stderr=${r.stderr}`);
+    let parsed = null;
+    try { parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) { /* leave null */ }
+    assert(!!parsed && parsed.status === 'done', '(c) execute --result-file JSON written and parseable', JSON.stringify(parsed));
+    cleanup(gitRepo);
+    cleanup(planDir);
+    cleanup(resultDir);
+    cleanup(execMockDir);
+  }
+
+  cleanup(mockDir);
+
+  // (d) doc-presence with exact per-file counts — never document-wide includes() (M016 S03 R2 lesson).
+  const spec = fs.readFileSync(path.join(repo, 'shared', 'forge-dispatch.md'), 'utf8');
+  const auto = fs.readFileSync(path.join(repo, 'skills', 'forge-auto', 'SKILL.md'), 'utf8');
+  const next = fs.readFileSync(path.join(repo, 'skills', 'forge-next', 'SKILL.md'), 'utf8');
+  const task = fs.readFileSync(path.join(repo, 'skills', 'forge-task', 'SKILL.md'), 'utf8');
+  const review = fs.readFileSync(path.join(repo, 'shared', 'forge-review.md'), 'utf8');
+
+  const NEEDLE = 'Engine Fallback Discipline';
+  const EXPECTED = {
+    'shared/forge-dispatch.md': 1,
+    'skills/forge-auto/SKILL.md': 2,
+    'skills/forge-next/SKILL.md': 2,
+    'skills/forge-task/SKILL.md': 1,
+    'shared/forge-review.md': 1,
+  };
+  for (const [name, content] of [
+    ['shared/forge-dispatch.md', spec],
+    ['skills/forge-auto/SKILL.md', auto],
+    ['skills/forge-next/SKILL.md', next],
+    ['skills/forge-task/SKILL.md', task],
+    ['shared/forge-review.md', review],
+  ]) {
+    const count = content.split(NEEDLE).length - 1;
+    assert(count === EXPECTED[name],
+      `(d) ${name} has exact "Engine Fallback Discipline" count (expected ${EXPECTED[name]}, got ${count})`);
+  }
+
+  // (e) canonical rule cites "unreliable" as the named anti-example; the invented
+  // reason string never enters the enum.
+  const unreliableCount = spec.split('unreliable').length - 1;
+  assert(unreliableCount === 2, `(e) canonical cites "unreliable" as anti-example (expected 2 occurrences incl. codex-unreliable-session, got ${unreliableCount})`);
+  assert(spec.includes('codex-unreliable-session'), '(e) canonical names the forbidden anti-example codex-unreliable-session');
+  assert(!spec.includes('| `codex-unreliable-session`'), '(e) codex-unreliable-session is never a table row in the enum');
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/smokeXllmResultFileGuard\(\);/.test(mainBody),
+    '(g) Section 60 is registered in main()');
+  pass('(final) Section 60: forge-xllm --result-file guard (challenge/rebuttal exit 2 + no-file, execute non-regression) and Engine Fallback Discipline rule presence verified');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -7866,6 +7967,7 @@ async function main() {
     smokeSidecarEnvPromotion();
     smokeCleanupRegistryMode();
     smokeXllmStateSliceQualified();
+    smokeXllmResultFileGuard();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

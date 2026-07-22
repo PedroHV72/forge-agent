@@ -1667,6 +1667,11 @@ if (require.main === module) {
   }
   const envPolicy = flagEnvPolicy || readSidecarsEnvPolicy(process.cwd()) || 'minimal';
 
+  if ((mode === 'challenge' || mode === 'rebuttal') && args['result-file'] !== undefined) {
+    process.stderr.write(`forge-xllm: --result-file is not supported in --mode ${mode}; challenge/rebuttal write their JSON to stdout — --result-file is exclusive to execute/plan\n`);
+    process.exit(2);
+  }
+
   const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd();
   const model = typeof args.model === 'string' ? args.model : undefined;
 

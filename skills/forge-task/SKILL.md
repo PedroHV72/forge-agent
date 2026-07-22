@@ -865,6 +865,7 @@ echo "⚠ worker: codex indisponível ($REASON) — usando forge-executor"
 mkdir -p "$WORKING_DIR/.gsd/forge/"
 printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"","slice":"","unit":"execute-task/%s","reason":"%s"}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{TASK_ID}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+# CRITICAL, per-dispatch + evidence-based fallback discipline: shared/forge-dispatch.md § Engine Fallback Discipline
 ```
 Then set `ENGINE=claude` and `DISPATCH_ENGINE=claude` and dispatch the single `forge-executor` Claude worker via the machinery below. No re-resolution of engine (fallback is unconditionally Claude); no retry.
 
