@@ -10,7 +10,8 @@
  * stable and ordered: engine, model, alias, tier, domain, route_source,
  * chain, chain_len, reason, effort, effort_reason.  The remaining fields are
  * additive dispatch sidecar data.  CLI flags: --unit-type, --plan, --unit-id,
- * --milestone, --roadmap, --cwd, --json, and --effort-<unit-type> <effort>.
+ * --milestone, --roadmap, --domain, --cwd, --json, and
+ * --effort-<unit-type> <effort>.
  * Unexpected CLI failures degrade to a valid legacy-shaped contract and exit 0.
  */
 
@@ -164,8 +165,14 @@ function resolveDispatch(opts) {
   }
 
   const domainKey = unitType === 'execute-task' ? plan.slice : o.unitId;
+  // Explicit caller/CLI domain (opts.domain / --domain) sits BELOW the plan
+  // frontmatter (canonical precedence, shared/forge-dispatch.md § Domain metadata)
+  // and ABOVE the ROADMAP grep. Additive: no existing caller passes `domain`,
+  // so the frontmatter → roadmap → 'default' chain is unchanged when omitted.
+  // It exists so callers with no plan/roadmap on disk (e.g. forge-phases.js,
+  // the live resolution table) can still project a specific domain.
   const requestedDomain = (unitType === 'execute-task' && plan.domain) ||
-    roadmapDomain(roadmapPath, domainKey) || 'default';
+    text(o.domain) || roadmapDomain(roadmapPath, domainKey) || 'default';
   const route = resolveRoute({
     unitType,
     tier,
@@ -258,7 +265,7 @@ function resolveDispatch(opts) {
 }
 
 function parseArgs(args) {
-  const parsed = { unitType: '', planPath: null, unitId: '', milestoneId: '', roadmapPath: null, cwd: process.cwd(), asJson: false, effortMap: {} };
+  const parsed = { unitType: '', planPath: null, unitId: '', milestoneId: '', roadmapPath: null, domain: '', cwd: process.cwd(), asJson: false, effortMap: {} };
   for (let i = 0; i < args.length; i += 1) {
     const flag = args[i];
     const value = args[i + 1];
@@ -267,6 +274,7 @@ function parseArgs(args) {
     else if (flag === '--unit-id' && value !== undefined) { parsed.unitId = value; i += 1; }
     else if (flag === '--milestone' && value !== undefined) { parsed.milestoneId = value; i += 1; }
     else if (flag === '--roadmap' && value !== undefined) { parsed.roadmapPath = value; i += 1; }
+    else if (flag === '--domain' && value !== undefined) { parsed.domain = value; i += 1; }
     else if (flag === '--cwd' && value !== undefined) { parsed.cwd = value; i += 1; }
     else if (flag === '--json') parsed.asJson = true;
     else if (flag.startsWith('--effort-') && value !== undefined) { parsed.effortMap[flag.slice('--effort-'.length)] = value; i += 1; }
@@ -309,7 +317,7 @@ function degradedContract(args) {
   };
 }
 
-module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor };
+module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, TIER_DEFAULTS };
 
 if (require.main === module) {
   // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a

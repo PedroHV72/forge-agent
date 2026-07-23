@@ -391,7 +391,7 @@
       "type": "object",
       "additionalProperties": true,
       "default": {},
-      "description": "Eixo routing (M007): roteamento domain-first opt-in com precedência sobre tier_models/workers. Chaves de domínio são ABERTAS (default, backend, frontend, ...). Shape por domínio: { <phase executor|planner>: { <tier>: [cadeia de IDs, cross-engine permitido], fallback: <1 ID Claude mapeado> } }. Célula ausente → domínio default → legado (nunca erro). Cascata last-wins por domínio inteiro. Resolvedor: scripts/forge-routing.js."
+      "description": "Eixo routing (M007): roteamento domain-first opt-in com precedência sobre tier_models/workers. Chaves de domínio são ABERTAS (default, backend, frontend, ...). Shape por domínio: { <phase executor|planner>: { <tier>: [cadeia de IDs, cross-engine permitido], fallback: <1 ID Claude mapeado> } }. Célula ausente → domínio default → legado (nunca erro). Cascata last-wins por domínio inteiro. Resolvedor: scripts/forge-routing.js. Somente execute-task (executor) e plan-slice (planner) são capturados; demais unit_types resolvem por tier_models — ver /forge-prefs phases."
     },
     "verification": {
       "type": "object",

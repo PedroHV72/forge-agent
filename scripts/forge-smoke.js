@@ -8285,6 +8285,93 @@ function smokeReviewAgentUnavailable() {
   pass('(final) Section 64: review agent unavailability — retry-first classification is fail-safe and the sanctioned path is documented in the canonical spec + all 3 mirrors');
 }
 
+// ── Section 65: live phases table — resolver-derived rows + anti-drift guard ──
+// The fixture intentionally contains both the default and a named domain. This
+// makes routing resolution observable without relying on developer-machine
+// preferences, and keeps the expected table shape hermetic. Assertions read
+// the structured helper output rather than its human-facing text table: the
+// latter remains free to improve spacing and localisation without weakening
+// these contract checks. The document comparison is bidirectional so a newly
+// added resolver default cannot disappear from the prose table, while an old
+// prose-only row cannot silently claim a dispatch that no longer exists.
+// No synthetic dispatch contract is assembled here. The helper invokes the
+// production resolver once for every row, including the tier-only phases.
+// Consequently this section also protects future resolver-side changes to
+// aliases, engines, fallback chains, and default-domain inheritance.
+// The CLI is separately covered through the ordinary smoke execution path.
+// This test's responsibility is the reusable structured API contract.
+// Keep the assertions in phase order for diagnostic output readability.
+function smokePhasesTable() {
+  process.stdout.write('\n▸ Section 65: live phases table — resolver-derived rows + anti-drift guard\n');
+  const repoRoot = path.join(__dirname, '..');
+  const { buildPhases, renderPhases } = require(path.join(SCRIPTS, 'forge-phases.js'));
+  const { TIER_DEFAULTS } = require(path.join(SCRIPTS, 'forge-dispatch-resolve.js'));
+  const root = mkTmp('phases-table');
+  try {
+    fs.writeFileSync(path.join(root, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({
+      routing: {
+        default: {
+          executor: { standard: ['claude-sonnet-5'] },
+          planner: { heavy: ['claude-opus-4-8[1m]'] },
+        },
+        backend: {
+          executor: { standard: ['gpt-5.6-luna', 'claude-sonnet-5'] },
+          planner: { heavy: ['claude-opus-4-8[1m]'] },
+        },
+      },
+    }), 'utf8');
+    const table = buildPhases(root);
+    const routed = table.rows.filter((row) => row.unit_type === 'execute-task' || row.unit_type === 'plan-slice');
+    const tierOnly = new Set(['research-milestone', 'research-slice', 'discuss-milestone', 'discuss-slice', 'complete-slice', 'complete-milestone', 'memory-extract']);
+
+    assert(routed.every((row) => /^routing\./.test(row.config_key)),
+      '(a) execute-task and plan-slice rows configure through routing', JSON.stringify(routed));
+    assert(table.rows.filter((row) => tierOnly.has(row.unit_type)).every((row) => /^tier_models\./.test(row.config_key)),
+      '(b) non-routable unit types configure through tier_models');
+    const milestone = table.rows.find((row) => row.unit_type === 'plan-milestone');
+    assert(milestone && milestone.config_key === 'tier_models.max' && milestone.routable === false,
+      '(c) plan-milestone is non-routable and configures through tier_models.max', JSON.stringify(milestone));
+    assert(!/travado|locked/i.test(renderPhases(root)),
+      '(c) rendered plan-milestone note has no misleading locked configuration key');
+    assert(renderPhases(root).includes(`tem tier fixo ${TIER_DEFAULTS['plan-milestone']}`)
+      && renderPhases(root).includes(`tier_models.${TIER_DEFAULTS['plan-milestone']}`),
+      '(c) plan-milestone footnote reflects TIER_DEFAULTS, not a hardcoded literal');
+
+    const expected = Object.keys(TIER_DEFAULTS);
+    const actual = table.unit_types;
+    assert(expected.every((unitType) => actual.includes(unitType)) && actual.every((unitType) => expected.includes(unitType)),
+      '(d) buildPhases unit_types and TIER_DEFAULTS match bidirectionally');
+    const tierDoc = fs.readFileSync(path.join(repoRoot, 'shared', 'forge-tiers.md'), 'utf8');
+    const section = tierDoc.slice(tierDoc.indexOf('## Unit Type → Default Tier'))
+      .split(/\n(?:## |---)/)[0];
+    const docTypes = [...section.matchAll(/^\|\s*`([a-z-]+)`\s*\|\s*(light|standard|heavy|max)\s*\|/gm)]
+      .map((match) => match[1]);
+    assert(expected.every((unitType) => docTypes.includes(unitType)) && docTypes.every((unitType) => expected.includes(unitType)),
+      '(d) canonical tier document and TIER_DEFAULTS match bidirectionally', JSON.stringify(docTypes));
+
+    const executeRows = table.rows.filter((row) => row.unit_type === 'execute-task');
+    assert(executeRows.length >= 2 && new Set(executeRows.map((row) => row.config_key)).size >= 2,
+      '(e) execute-task renders multiple domains with distinct routing keys', JSON.stringify(executeRows));
+
+    const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, 'forge-prefs.schema.json'), 'utf8'));
+    const skill = fs.readFileSync(path.join(repoRoot, 'skills', 'forge-prefs', 'SKILL.md'), 'utf8');
+    const resolver = fs.readFileSync(path.join(SCRIPTS, 'forge-dispatch-resolve.js'), 'utf8');
+    assert(/### Domain-routable vs tier_models-only/.test(tierDoc), '(f) tier documentation has routability subsection');
+    assert(schema.properties.routing.description.includes('Somente execute-task (executor) e plan-slice (planner)'),
+      '(f) routing schema description explains captured phases');
+    assert(/### "phases"/.test(skill) && !skill.includes('Fase legada'),
+      '(f) prefs skill exposes phases and removes the drifted legacy table');
+    assert(/flag === '--domain'/.test(resolver), '(f) dispatch resolver parseArgs accepts --domain');
+
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/smokePhasesTable\(\);/.test(mainBody), '(final) Section 65 is registered in main()');
+    pass('(final) Section 65: live phase resolution is resolver-derived and protected against documentation drift');
+  } finally {
+    cleanup(root);
+  }
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -8357,6 +8444,7 @@ async function main() {
     smokeInitGitGuarantee();
     smokeCodeDirMultiRepo();
     smokeReviewAgentUnavailable();
+    smokePhasesTable();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

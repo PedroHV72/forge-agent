@@ -49,6 +49,19 @@ Se `layers.global.source == "md-legacy"` ou `layers.local.source == "md-legacy"`
 na saída, mencione ao usuário que `node scripts/forge-prefs-migrate.js --cwd .`
 migra para JSONC sem risco de perda (gate `resolvedDiff`, round-trip provado).
 
+Para ver qual modelo roda cada fase e onde configurá-lo: `/forge-prefs phases`.
+
+---
+
+### "phases"
+
+Rode o helper e imprima a saída verbatim — não resuma, não reformate:
+
+```bash
+SCRIPT=$([ -f scripts/forge-phases.js ] && echo scripts/forge-phases.js || echo "$HOME/.claude/scripts/forge-phases.js")
+node "$SCRIPT" --cwd .
+```
+
 ---
 
 ### "set \<dotted.key\> \<value\> [global|local]"
@@ -128,12 +141,8 @@ Exemplos:
 Fases válidas: `discuss`, `research`, `plan`, `execute`, `complete`, `memory`
 — mapeadas para o tier equivalente (ver `shared/forge-tiers.md`):
 
-| Fase legada | Tier equivalente |
-|---|---|
-| `discuss`, `research`, `plan` | `heavy` (ou `max` para `plan-milestone`) |
-| `execute` | `standard` |
-| `complete` | `standard` |
-| `memory` | `light` |
+Para a resolução ao vivo por unit_type, domínio e chave de configuração, use
+`/forge-prefs phases` e consulte `shared/forge-tiers.md`.
 
 Converta o alias de modelo (`opus`/`sonnet`/`haiku`) para o model ID completo
 se necessário, e rode:

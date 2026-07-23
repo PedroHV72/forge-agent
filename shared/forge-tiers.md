@@ -23,6 +23,14 @@ unless overridden (see [Override Precedence](#override-precedence)).
 | `plan-milestone` | max | Full decomposition into slices and tasks; 1 unit per milestone — frontier reasoning justifies the 2x premium |
 | `plan-slice` | heavy | Task-level decomposition with dependency analysis and acceptance criteria. Escalates to `max` when the slice is tagged `risk:high` in ROADMAP (see [Override Precedence](#override-precedence)) |
 
+### Domain-routable vs tier_models-only
+
+`execute-task` (mapped to `executor`) and `plan-slice` (mapped to `planner`) are
+the only unit types captured by the `routing` block. The other eight unit types
+always resolve through `tier_models.<tier>`. `plan-milestone` has a fixed `max`
+tier, but its model remains configurable through `tier_models.max`. For the
+live workspace resolution, including domain inheritance, run `/forge-prefs phases`.
+
 ---
 
 ## Tier → Default Model

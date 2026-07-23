@@ -427,13 +427,38 @@ Eixo workers: qual ENGINE (claude nativo em contexto ou sidecar codex via script
 - **Default:** `null`
 - **Descrição:** Repassado como -m <valor> ao codex-cli quando definido; null/unset usa o modelo default do CLI instalado (ex.: gpt-5.6-sol). Ignorado quando o engine é claude.
 
+### `workers.sidecar_on_failure`
+
+- **Tipo:** string
+- **Default:** `"retry-then-fallback"`
+- **Valores permitidos:** `retry-then-fallback`, `fallback`, `pause-ask`
+- **Descrição:** Política ao falhar o sidecar codex. retry-then-fallback (default): Layer-1 retenta o mesmo codex em erro transiente (S02) e só então cai no fallback Claude. fallback: pula o Layer-1 (comportamento pré-S02). pause-ask: retenta transiente e, SÓ na exaustão, pausa + AskUserQuestion (interativo) ou degrada a fallback + evento sidecar-pause-degraded (headless). Valor inválido cai em retry-then-fallback.
+
+### `workers.require_worktree`
+
+- **Tipo:** string \| boolean
+- **Default:** `"auto"`
+- **Valores permitidos:** `auto`, `true`, `false`, `true`, `false`
+- **Descrição:** Elevação estática de isolamento por engine de escrita, resolvida na ativação por scripts/forge-isolation.js resolveEffectiveMode. auto (default): eleva forge_isolation.mode shared→worktree quando um engine externo de escrita (codex via workers.execute-task, ou família gpt/gemini em routing.<domain>.executor) é resolvido p/ execute-task; branch sob auto NÃO eleva. true: sempre exige worktree (eleva shared/branch→worktree). false: nunca eleva — byte-idêntico ao comportamento atual. Paths read-only (plan-slice Branch D, review challenger) não disparam elevação. Falso-positivo aceitável, falso-negativo não.
+
+## sidecars
+
+Eixo sidecars: isolamento do ambiente entregue aos processos externos codex e agy.
+
+### `sidecars.env_policy`
+
+- **Tipo:** string
+- **Default:** `"minimal"`
+- **Valores permitidos:** `minimal`, `inherit`
+- **Descrição:** Política de ambiente dos sidecars. minimal repassa apenas allowlist e remove prefixos de credenciais; inherit preserva todo o ambiente como escape hatch inseguro.
+
 ## routing
 
 ### `routing`
 
 - **Tipo:** object
 - **Default:** `{}`
-- **Descrição:** Eixo routing (M007): roteamento domain-first opt-in com precedência sobre tier_models/workers. Chaves de domínio são ABERTAS (default, backend, frontend, ...). Shape por domínio: { <phase executor|planner>: { <tier>: [cadeia de IDs, cross-engine permitido], fallback: <1 ID Claude mapeado> } }. Célula ausente → domínio default → legado (nunca erro). Cascata last-wins por domínio inteiro. Resolvedor: scripts/forge-routing.js.
+- **Descrição:** Eixo routing (M007): roteamento domain-first opt-in com precedência sobre tier_models/workers. Chaves de domínio são ABERTAS (default, backend, frontend, ...). Shape por domínio: { <phase executor|planner>: { <tier>: [cadeia de IDs, cross-engine permitido], fallback: <1 ID Claude mapeado> } }. Célula ausente → domínio default → legado (nunca erro). Cascata last-wins por domínio inteiro. Resolvedor: scripts/forge-routing.js. Somente execute-task (executor) e plan-slice (planner) são capturados; demais unit_types resolvem por tier_models — ver /forge-prefs phases.
 
 ## verification
 
