@@ -49,6 +49,34 @@ test('collectDiff includes untracked files without shell evaluation', () => {
   }
 });
 
+test('collectDiff counts untracked files when the workspace root is a symlink', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cost-policy-link-'));
+  const linked = `${cwd}-link`;
+  try {
+    assert.strictEqual(spawnSync('git', ['init', '-q'], { cwd }).status, 0);
+    assert.strictEqual(spawnSync('git', [
+      '-c', 'user.name=Forge Test', '-c', 'user.email=forge@example.invalid',
+      'commit', '--allow-empty', '-q', '-m', 'init',
+    ], { cwd }).status, 0);
+    fs.mkdirSync(path.join(cwd, 'src'));
+    fs.writeFileSync(path.join(cwd, 'src', 'new.js'), 'export const linked = true;\n');
+    try {
+      fs.symlinkSync(fs.realpathSync.native(cwd), linked, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (error) {
+      // Some locked-down Windows environments cannot create directory links.
+      process.stdout.write(`  - workspace symlink test skipped: ${error.code || error.message}\n`);
+      return;
+    }
+    const result = collectDiff(linked, 'HEAD');
+    assert.strictEqual(result.ok, true);
+    assert(result.entries.some((entry) => entry.file === 'src/new.js' && entry.added > 0));
+    assert(!String(result.warning || '').includes('untracked-realpath-escaped:src/new.js'));
+  } finally {
+    fs.rmSync(linked, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test('collectDiff rejects option-like bases and caps large untracked reads', () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cost-policy-large-'));
   try {

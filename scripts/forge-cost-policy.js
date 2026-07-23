@@ -68,8 +68,22 @@ function run(cwd, command, args) {
   };
 }
 
+function canonicalRoot(cwd) {
+  const resolved = path.resolve(cwd || process.cwd());
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    // Keep the original path so the caller reports the actual VCS failure.
+    return resolved;
+  }
+}
+
 function collectDiff(cwd, base) {
-  const root = path.resolve(cwd || process.cwd());
+  // Every containment comparison below must use the same canonical namespace as
+  // `realpathSync` on untracked files. On macOS `/tmp` and `/var` commonly
+  // traverse symlinks, so a lexical root would otherwise classify safe new files
+  // as escaped and suppress their diff contribution.
+  const root = canonicalRoot(cwd);
   const insideGit = run(root, 'git', ['rev-parse', '--is-inside-work-tree']);
   if (insideGit.ok) {
     // `git diff <base>` includes committed changes since base plus current
