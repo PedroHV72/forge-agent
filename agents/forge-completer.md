@@ -183,7 +183,8 @@ Given all `T##-SUMMARY.md` files from the slice:
        node "$FORGE_SCRIPTS_DIR/forge-verifier.js" \
          --slice {S##} \
          --milestone {M###} \
-         --cwd {WORKING_DIR}
+         --cwd {WORKING_DIR} \
+         --code-dir {CODE_DIR}
        ```
        Capture stdout into a variable; capture exit code separately. If exit code is non-zero OR stdout is not valid JSON, skip to step (d) below — write the "unavailable" fallback line.
 

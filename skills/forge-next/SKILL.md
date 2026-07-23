@@ -224,6 +224,7 @@ EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)" "$RO
 EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)" "$ROUTE_JSON")
 WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).workers_timeout))" "$ROUTE_JSON")
 CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
+SIDECAR_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).sidecar_model||'')" "$ROUTE_JSON")
 THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
 # Raw resolver inputs restored for the failure-taxonomy re-resolution (--next-after / tier escalation).
 DOMAIN=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain_input||'')" "$ROUTE_JSON")
@@ -260,7 +261,7 @@ if [ -f "$TIER_CURSOR_FILE" ]; then
   fi
 fi
 ```
-`TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (`chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `THINKING_HEADER`, `unit_effort`, and `REASON` are now set (the tier-chain cursor above may have overridden `MODEL_ID`/`ENGINE`/`REASON`). Use `$MODEL_ID`/`$ENGINE` in the dispatch below (Step 4). `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN`, `$EFFORT`, `$EFFORT_REASON` are injected into the dispatch event.
+`TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (`chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `SIDECAR_MODEL`, `THINKING_HEADER`, `unit_effort`, and `REASON` are now set (the tier-chain cursor above may have overridden `MODEL_ID`/`ENGINE`/`REASON`). Use `$MODEL_ID`/`$ENGINE` in the dispatch below (Step 4). `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN`, `$EFFORT`, `$EFFORT_REASON` are injected into the dispatch event.
 
 > **Fable 5 thinking guard:** the resolver emits `$THINKING_HEADER` (`adaptive` when `$MODEL_ID` is
 > `claude-fable-5`, else empty). When `$THINKING_HEADER` is `adaptive`, inject `thinking: adaptive`
@@ -888,7 +889,7 @@ With `REASON` now set by the guard above, control goes DIRECTLY to the **Fallbac
 
 2. **No pre-dispatch clean-tree guard — the pre-dirty snapshot IS the guard** (SUPERSEDED, DECISION 39, see S01-CONTEXT.md). A dirty working tree is a **safe precondition**, not a refusal reason: the fallback reset only ever touches paths that changed relative to the snapshot; pre-existing dirty content is provably untouched (re-hash) or the reset aborts entirely (overlap) rather than guessing. `dirty-tree-guard` is no longer a trigger and the sidecar dispatches over a pre-existing dirty tree.
 
-3. **Allocate the result-file OUTSIDE `CODE_DIR`** (S01 contract — codex could overwrite a file inside the workspace) + dispatch detached via `run_in_background: true` (the Bash tool's 600s foreground ceiling does not apply). `--model` appended **only when `$CODEX_MODEL` is non-empty** (null → CLI default). Patch the result-file into the durable state of the CURRENT attempt N via `--state-update` — a READ-MODIFY-WRITE that preserves `start_sha` + `pre_dirty` untouched. **NEVER a plain printf**: a hand-written printf omits `pre_dirty`, clobbering the snapshot and degrading the reset back to whole-tree destruction the moment the Fallback runs:
+3. **Allocate the result-file OUTSIDE `CODE_DIR`** (S01 contract — codex could overwrite a file inside the workspace) + dispatch detached via `run_in_background: true` (the Bash tool's 600s foreground ceiling does not apply). `--model` is appended only when `$SIDECAR_MODEL` is non-empty; the resolver selects the chain's Codex member, then falls back to `workers.codex_model`. Patch the result-file into the durable state of the CURRENT attempt N via `--state-update` — a READ-MODIFY-WRITE that preserves `start_sha` + `pre_dirty` untouched. **NEVER a plain printf**: a hand-written printf omits `pre_dirty`, clobbering the snapshot and degrading the reset back to whole-tree destruction the moment the Fallback runs:
 ```bash
 RESULT_FILE=$(mktemp -t forge-xllm-result.XXXXXX.json)   # tmpdir, never under $CODE_DIR
 node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
@@ -896,7 +897,7 @@ node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
   --plan "$PLAN_PATH" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
   --timeout "$WORKERS_TIMEOUT" \
-  $([ -n "$CODEX_MODEL" ] && printf -- '--model %s' "$CODEX_MODEL")
+  $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
 # ↑ dispatched with the Bash tool's run_in_background: true
 ```
 
@@ -1068,13 +1069,13 @@ if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
 fi
 ```
 
-3. **Dispatch detached via `run_in_background: true`**, `--mode plan` + `--plan-context` instead of `--plan`; `--model` appended only when `$CODEX_MODEL` is non-empty:
+3. **Dispatch detached via `run_in_background: true`**, `--mode plan` + `--plan-context` instead of `--plan`; `--model` is appended only when `$SIDECAR_MODEL` is non-empty; the resolver selects the chain's Codex member, then falls back to `workers.codex_model`:
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "$HOME/.claude/scripts")
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode plan \
   --plan-context "$CTX_FILE" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
   --timeout "$WORKERS_TIMEOUT" \
-  $([ -n "$CODEX_MODEL" ] && printf -- '--model %s' "$CODEX_MODEL")
+  $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
 ```
 
 4. **Poll `$RESULT_FILE`** (state `polling`) — identical cadence/orphan-detection to Branch codex step 4: `running` → keep polling + liveness check; `done` → success (step 5); `error` / exit `!= 0` / unparseable JSON → failure (`REASON` = `codex-exit-nonzero` / `codex-invalid-json` — a plan that fails `must_haves` validation in-sidecar also yields `codex-exit-nonzero`, exit 2) → Fallback. **Orphan:** heartbeat `updated_at` stale beyond the dynamic threshold `max(heartbeat_interval_ms × 4, 30s)` (identical canonical orphan detection as Branch codex — see `shared/forge-dispatch.md § Orphan detection`; probe + grace before kill) → `kill "$pid"` + `REASON=codex-orphan` → Fallback. `--timeout` backstop → `codex-timeout`.

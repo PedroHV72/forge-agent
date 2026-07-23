@@ -11,13 +11,13 @@
 //
 // This module resolves the ONE worktree the unit's DECLARED paths belong to, or refuses.
 // It is pure: it reads only the isolation-result JSON it is handed plus the plan file.
-// ZERO git calls, ZERO subprocesses, ZERO filesystem mutation (D1). That purity is what
-// makes forge-smoke.js Section 63 fixture-cheap.
+// It makes read-only fs.existsSync probes only in the second pass; ZERO git calls, ZERO
+// subprocesses, and ZERO filesystem mutation (D1). That keeps Section 63 fixture-cheap.
 //
 // Library exports:
 //   resolveCodeDir({ isoResult, planPath, cwd, run }) → { status, code_dir, repo, repos_touched,
 //                                                         paths_considered, paths_unmatched,
-//                                                         source, run, reason }
+//                                                         source, resolution, run, reason }
 //   parseDeclaredPaths(planText) → { paths: string[], source: 'writes+expected_output'|'files-to-change'|'none' }
 //   parseFilesToChange(planText) → string[]
 //   attributeRepo(absPath, repos) → repo|null   (longest-prefix, boundary-aware)
@@ -213,6 +213,7 @@ function emptyResult(extra) {
     paths_considered: 0,
     paths_unmatched: 0,
     source: 'none',
+    resolution: '',
     run: '',
     reason: '',
   }, extra || {});
@@ -277,6 +278,40 @@ function resolveCodeDir(opts) {
     touched.set(normalizePath(repo.path), repo);
   }
 
+  // D3: repo-relative declared paths are not under repo.path, so normal attribution
+  // finds none. Probe repo.path (not worktree) because declarations describe source
+  // repos; a worktree may not yet contain a newly declared file. Limitation C3: when
+  // cwd itself is a repo, attribution already claims every relative path and this
+  // deliberately does not reinterpret that first-pass result.
+  let resolution = touched.size > 0 ? 'attribution' : '';
+  if (touched.size === 0 && considered.length > 0) {
+    const matches = new Map();
+    for (const repo of usable) {
+      let count = 0;
+      for (const p of considered) {
+        const root = globRoot(p);
+        if (!root) continue;
+        if (fs.existsSync(path.join(repo.path, root))) {
+          count += 1;
+          continue;
+        }
+        const parent = path.dirname(root);
+        if (parent !== '.' && fs.existsSync(path.join(repo.path, parent))) count += 1;
+      }
+      if (count > 0) matches.set(normalizePath(repo.path), { repo, count });
+    }
+    let best = null;
+    let tied = false;
+    for (const candidate of matches.values()) {
+      if (!best || candidate.count > best.count) { best = candidate; tied = false; }
+      else if (candidate.count === best.count) tied = true;
+    }
+    if (best && !tied) {
+      touched.set(normalizePath(best.repo.path), best.repo);
+      resolution = 'fs-probe';
+    }
+  }
+
   const reposTouched = Array.from(touched.keys());
 
   // 8. Verdict.
@@ -292,6 +327,7 @@ function resolveCodeDir(opts) {
       paths_considered: considered.length,
       paths_unmatched: unmatched,
       source,
+      resolution,
       run,
     });
   }

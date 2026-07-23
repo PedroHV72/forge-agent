@@ -897,17 +897,19 @@ module.exports = {
 /**
  * Parse argv flags: --slice, --milestone, --cwd, --help/-h
  * @param {string[]} argv  process.argv.slice(2)
- * @returns {{ slice: string|null, milestone: string|null, cwd: string, help: boolean }}
+ * @returns {{ slice: string|null, milestone: string|null, cwd: string, codeDir: string, help: boolean }}
  */
 function parseArgv(argv) {
-  const opts = { slice: null, milestone: null, cwd: process.cwd(), help: false };
+  const opts = { slice: null, milestone: null, cwd: process.cwd(), codeDir: '', help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') { opts.help = true; continue; }
     if (a === '--slice' && argv[i + 1] !== undefined) { opts.slice = argv[++i]; continue; }
     if (a === '--milestone' && argv[i + 1] !== undefined) { opts.milestone = argv[++i]; continue; }
     if (a === '--cwd' && argv[i + 1] !== undefined) { opts.cwd = argv[++i]; continue; }
+    if (a === '--code-dir' && argv[i + 1] !== undefined) { opts.codeDir = argv[++i]; continue; }
   }
+  opts.codeDir = opts.codeDir || opts.cwd;
   return opts;
 }
 
@@ -974,7 +976,7 @@ function aggregateMustHaves(plans) {
 
 /**
  * Run the full slice verification: discover plans, aggregate must-haves, run verifyArtifact.
- * @param {{ slice: string, milestone: string, cwd: string }} opts
+ * @param {{ slice: string, milestone: string, cwd: string, codeDir?: string }} opts
  * @returns {object}  Result object for formatVerificationMd and JSON stdout
  */
 function runSliceVerification(opts) {
@@ -999,8 +1001,9 @@ function runSliceVerification(opts) {
   if (combinedArtifacts.length > 0) {
     const combinedMustHaves = { artifacts: combinedArtifacts, key_links: [] };
     // Pass all artifact paths as sliceFiles so the walker has full candidate set
-    const sliceFilesCandidates = combinedArtifacts.map(a => path.resolve(opts.cwd, a.path));
-    const verifyResult = verifyArtifact(combinedMustHaves, sliceFilesCandidates, { cwd: opts.cwd });
+    const codeDir = opts.codeDir || opts.cwd;
+    const sliceFilesCandidates = combinedArtifacts.map(a => path.resolve(codeDir, a.path));
+    const verifyResult = verifyArtifact(combinedMustHaves, sliceFilesCandidates, { cwd: codeDir });
     for (const row of verifyResult.rows) {
       // Find the sourceTask from the artifact we tagged
       const artifact = combinedArtifacts.find(a => a.path === row.path);
@@ -1236,7 +1239,7 @@ if (require.main === module) {
 
   if (opts.help || !opts.slice || !opts.milestone) {
     process.stderr.write(
-      'Usage: node scripts/forge-verifier.js --slice <S##> --milestone <M###> [--cwd <dir>]\n' +
+      'Usage: node scripts/forge-verifier.js --slice <S##> --milestone <M###> [--cwd <dir>] [--code-dir <dir>]\n' +
       'Writes .gsd/milestones/<M###>/slices/<S##>/<S##>-VERIFICATION.md.\n'
     );
     process.exit(2);

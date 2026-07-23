@@ -8108,6 +8108,20 @@ function smokeCodeDirMultiRepo() {
     assert(d.json.paths_considered === 0 && d.json.source === 'none',
       '(d) single-repo short-circuit did not consult the plan at all');
 
+    // (m)/(n): repo-relative declarations have no workspace prefix, so only the
+    // read-only second pass can resolve them. A tie deliberately remains closed.
+    fs.mkdirSync(path.join(freyrDir, 'src'), { recursive: true });
+    const planRepoRelative = writePlan('plan-repo-relative.md', [
+      '---', 'id: T06', 'writes:', '  - "src/main.rs"', '---', '', '# plan', '',
+    ].join('\n'));
+    const m = resolve(isoMulti, planRepoRelative);
+    assert(m.status === 0 && m.json.status === 'ok' && m.json.repo === freyrDir && m.json.resolution === 'fs-probe',
+      `(m) unique repo-relative directory resolves by fs-probe (got ${m.status}/${m.json.status}/${m.json.repo}/${m.json.resolution})`);
+    fs.mkdirSync(path.join(asgardDir, 'src'), { recursive: true });
+    const n = resolve(isoMulti, planRepoRelative);
+    assert(n.status === 5 && n.json.status === 'undeclared',
+      `(n) tied repo-relative directory fails closed as undeclared (got ${n.status}/${n.json.status})`);
+
     // (e) D4: `.gsd/**` never makes a plan cross-repo.
     const e = resolve(isoMulti, planGsdMixed);
     assert(e.status === 0 && e.json.status === 'ok' && e.json.code_dir === wt('asgard'),
@@ -8184,6 +8198,61 @@ function smokeCodeDirMultiRepo() {
   } finally {
     cleanup(root);
   }
+}
+
+// ── Section 66: sidecar_model resolver and mirrors ──────────────────────────
+function smokeSidecarModel() {
+  process.stdout.write('\n▸ Section 66: sidecar_model contract + mirrors\n');
+  const root = path.dirname(SCRIPTS);
+  const files = ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md', 'shared/forge-dispatch.md'];
+  for (const file of files) {
+    const content = fs.readFileSync(path.join(root, file), 'utf8');
+    const stale = content.split('--model %s\' "$CODEX_MODEL"').length - 1;
+    assert(stale === 0, `(a) ${file} has zero stale --model CODEX_MODEL invocations (got ${stale})`);
+    const sidecar = content.split('SIDECAR_MODEL').length - 1;
+    assert(sidecar > 0, `(b) ${file} documents SIDECAR_MODEL (got ${sidecar})`);
+  }
+  const resolved = runScript('forge-dispatch-resolve.js', ['--unit-type', 'execute-task', '--json']);
+  let parsed = {}; try { parsed = JSON.parse(resolved.stdout); } catch {}
+  assert(resolved.status === 0 && Object.prototype.hasOwnProperty.call(parsed, 'sidecar_model'),
+    '(c) resolver CLI emits additive sidecar_model');
+  const source = fs.readFileSync(__filename, 'utf8');
+  assert(/smokeSidecarModel\(\);/.test(source.slice(source.lastIndexOf('async function main()'))),
+    '(final) Section 66 is registered in main()');
+  pass('(final) Section 66: sidecar_model is resolver-owned and mirrors consume it');
+}
+
+// ── Section 67: verifier code/artifact roots ─────────────────────────────────
+function smokeVerifierCodeDir() {
+  process.stdout.write('\n▸ Section 67: verifier --code-dir roots\n');
+  const usage = runScript('forge-verifier.js', []);
+  assert(usage.status === 2 && usage.stderr.includes('--code-dir'), '(a) verifier usage includes optional --code-dir');
+  const root = mkTmp('verifier-code-dir');
+  const code = mkTmp('verifier-code');
+  try {
+    const taskDir = path.join(root, '.gsd', 'milestones', 'M001', 'slices', 'S01', 'tasks', 'T01');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'T01-PLAN.md'), '---\nid: T01\nmust_haves:\n  truths:\n    - "artifact exists"\n  artifacts:\n    - path: src/only-code.js\n      provides: test\n      min_lines: 1\n  key_links: []\nexpected_output:\n  - src/only-code.js\n---\n', 'utf8');
+    fs.mkdirSync(path.join(code, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(code, 'src', 'only-code.js'), 'module.exports = 1;\n', 'utf8');
+    const args = ['--slice', 'S01', '--milestone', 'M001', '--cwd', root];
+    const sameRun = runScript('forge-verifier.js', args);
+    const explicitRun = runScript('forge-verifier.js', [...args, '--code-dir', root]);
+    const otherRun = runScript('forge-verifier.js', [...args, '--code-dir', code]);
+    let same = {}; let explicit = {}; let other = {};
+    try { same = JSON.parse(sameRun.stdout); explicit = JSON.parse(explicitRun.stdout); other = JSON.parse(otherRun.stdout); } catch {}
+    // The CLI adds generated_at/duration_ms on every independent run; compare the
+    // stable contract bytes after removing those runtime-only observability fields.
+    delete same.generated_at; delete same.duration_ms;
+    delete explicit.generated_at; delete explicit.duration_ms;
+    assert(JSON.stringify(same) === JSON.stringify(explicit), '(b) omitted code-dir keeps the stable JSON contract identical to code-dir=cwd');
+    assert(same.rows.length > 0 && other.rows.length > 0 && other.rows[0].exists === true,
+      '(b) plans remain under cwd while artifacts resolve under code-dir');
+  } finally { cleanup(root); cleanup(code); }
+  const source = fs.readFileSync(__filename, 'utf8');
+  assert(/smokeVerifierCodeDir\(\);/.test(source.slice(source.lastIndexOf('async function main()'))),
+    '(final) Section 67 is registered in main()');
+  pass('(final) Section 67: verifier keeps artifact and code roots distinct');
 }
 
 // ── Section 64: review agent unavailability — classifier behaviour + sanctioned path docs ──
@@ -8445,6 +8514,8 @@ async function main() {
     smokeCodeDirMultiRepo();
     smokeReviewAgentUnavailable();
     smokePhasesTable();
+    smokeSidecarModel();
+    smokeVerifierCodeDir();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

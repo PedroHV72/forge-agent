@@ -400,6 +400,7 @@ EFFORT=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort)" "$RO
 EFFORT_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).effort_reason)" "$ROUTE_JSON")
 WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).workers_timeout))" "$ROUTE_JSON")
 CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
+SIDECAR_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).sidecar_model||'')" "$ROUTE_JSON")
 THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
 # Raw resolver inputs restored for the failure-taxonomy re-resolution (--next-after / tier escalation).
 DOMAIN=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).domain_input||'')" "$ROUTE_JSON")
@@ -418,7 +419,7 @@ if [ "$ROUTE_SOURCE" != "routing" ] && [ "$ROUTING_PRESENT" = "true" ]; then
   echo "⚠ routing: configurado mas não aplicado (route_source=$ROUTE_SOURCE) — frontmatter/legado venceu para $unit_type/$unit_id" >&2
 fi
 ```
-`TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (with `.chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `DISPATCH_ENGINE`, `THINKING_HEADER`, `MODEL_APPLIED_JSON`, `unit_effort`, and `REASON` are now set. On `DISPATCH_ENGINE == codex` for a routable `execute-task`/`plan-slice`, take **Branch C/D** in Step 4 (the resolver already emitted `$CODEX_MODEL`/`$WORKERS_TIMEOUT` + `$ROUTE_JSON.chain` those branches read). Otherwise use `$MODEL_ID`/`$MODEL_ALIAS` in the `Agent()` call. `$TIER`/`$REASON`/`$DOMAIN_USED`/`$ROUTE_SOURCE`/`$CHAIN_LEN`/`$ENGINE`/`$EFFORT`/`$EFFORT_REASON` are injected into the dispatch event (additive).
+`TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (with `.chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `SIDECAR_MODEL`, `DISPATCH_ENGINE`, `THINKING_HEADER`, `MODEL_APPLIED_JSON`, `unit_effort`, and `REASON` are now set. On `DISPATCH_ENGINE == codex` for a routable `execute-task`/`plan-slice`, take **Branch C/D** in Step 4 (the resolver already emitted `$SIDECAR_MODEL`/`$WORKERS_TIMEOUT` + `$ROUTE_JSON.chain` those branches read). Otherwise use `$MODEL_ID`/`$MODEL_ALIAS` in the `Agent()` call. `$TIER`/`$REASON`/`$DOMAIN_USED`/`$ROUTE_SOURCE`/`$CHAIN_LEN`/`$ENGINE`/`$EFFORT`/`$EFFORT_REASON` are injected into the dispatch event (additive).
 
 > **Fable 5 thinking guard:** the resolver emits `$THINKING_HEADER` (`adaptive` when `$MODEL_ID` is
 > `claude-fable-5`, else empty). When `$THINKING_HEADER` is `adaptive`, inject `thinking: adaptive`
@@ -899,12 +900,12 @@ With `REASON` now set by the guard above, control goes DIRECTLY to the **Fallbac
 When `REASON` is `sidecar-cap-exceeded` or one of the two `CODE_DIR` refusals (`sidecar-multirepo-unsupported` / `sidecar-code-dir-undeclared`) here, **skip the timeline task, dispatch and poll entirely** — go straight to the **Fallback** block below (no sidecar is launched, and no reset runs since no state was captured).
 
 - **Timeline task:** `TaskCreate` with icon `⚡` (same as the Claude execute-task path), model label = `codex${CODEX_MODEL:+ ($CODEX_MODEL)}`; mark `in_progress`.
-- **Dispatch (detached):** invoke via the Bash tool with `run_in_background: true` (the 600s foreground ceiling does not apply):
+- **Dispatch (detached):** invoke via the Bash tool with `run_in_background: true` (the 600s foreground ceiling does not apply). `--model` is appended only when `$SIDECAR_MODEL` is non-empty: the resolver selects the chain's Codex member and otherwise falls back to `workers.codex_model`.
   ```bash
   node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
     --plan "$PLAN_PATH" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
     --timeout "$WORKERS_TIMEOUT" \
-    $([ -n "$CODEX_MODEL" ] && printf -- '--model %s' "$CODEX_MODEL")
+    $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
   ```
 - **Poll `$RESULT_FILE`** (`polling` state) every ~5–10s: `status == "running"` → keep polling + liveness check; `status == "done"` (exit 0) → **success**; `status == "error"` / adapter exit `!= 0` / unparseable JSON → **failure** (`reason` = `codex-error`/`codex-exit-nonzero`/`codex-invalid-json`). **Orphan:** heartbeat `updated_at` stale beyond the dynamic threshold `max(heartbeat_interval_ms × 4, 30s)` (field absent → assume 15s → 60s) → run the canonical liveness snippet (`shared/forge-dispatch.md § Orphan detection`): `stale-dead` → `kill "$pid"` (from heartbeat) → failure `reason: codex-orphan`; `stale-alive` → grace of one more poll cycle, then kill if still stale. The adapter `--timeout` is the backstop → `codex-timeout`.
 - **Partial promotion boundary:** if the valid result JSON has `status == "partial"`, run `PROMOTION=$(node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json)` before selecting Success or Failure. Follow `shared/forge-dispatch.md § Sidecar dispatch state machine` for the canonical algorithm/allowlist; do not duplicate it here. If `PROMOTION.promote == true`, treat it as `done`: write `## Env Constraints` (item + reason + note per entry) in `T##-SUMMARY.md`, synthesize `env_constraints[]` in the result block, omit promoted entries from `must_haves_status.dropped`, and append `sidecar_env_promotion` with unit `execute-task/{T##}`, count, reasons and ISO timestamp to events.jsonl. If false (including old payloads without `scope`), take Failure unchanged.
@@ -1086,13 +1087,13 @@ fi
 When `REASON == sidecar-cap-exceeded` here, **skip the timeline task, dispatch and poll entirely** — go straight to the **Failure/Fallback** block below (no sidecar is launched).
 
 - **Timeline task:** `TaskCreate` with icon `⚙` (plan-slice), model label = `codex${CODEX_MODEL:+ ($CODEX_MODEL)}`; mark `in_progress`.
-- **Dispatch (detached):** invoke via the Bash tool with `run_in_background: true`:
+- **Dispatch (detached):** invoke via the Bash tool with `run_in_background: true`. `--model` is appended only when `$SIDECAR_MODEL` is non-empty: the resolver selects the chain's Codex member and otherwise falls back to `workers.codex_model`:
   ```bash
   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "$HOME/.claude/scripts")
   node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode plan \
     --plan-context "$CTX_FILE" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
     --timeout "$WORKERS_TIMEOUT" \
-    $([ -n "$CODEX_MODEL" ] && printf -- '--model %s' "$CODEX_MODEL")
+    $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
   ```
 - **Poll `$RESULT_FILE`** (`polling` state) — identical cadence/orphan-detection to Branch C step 5: `running` → keep polling + liveness check; `done` → success; `error` / exit `!= 0` / unparseable JSON → failure (`reason` = `codex-exit-nonzero` / `codex-invalid-json`; note plan mode also treats an in-sidecar `must_haves` validation failure as `codex-exit-nonzero`, exit 2); heartbeat `updated_at` stale beyond the dynamic threshold `max(heartbeat_interval_ms × 4, 30s)` (identical canonical orphan detection as Branch C — see `shared/forge-dispatch.md § Orphan detection`; probe + grace before kill) → `kill "$pid"` → failure `reason: codex-orphan`. The adapter `--timeout` is the backstop → `codex-timeout`.
 - **Success (`done`):** re-read the durable state from disk (shell vars are gone), read the result JSON, and **materialize** — orchestrator writes, codex never touches `.gsd/**`:

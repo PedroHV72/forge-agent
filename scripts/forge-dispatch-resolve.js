@@ -143,6 +143,14 @@ function dispatchEngineFor(family) {
   return 'claude';
 }
 
+// The sidecar needs the concrete routed Codex model, while legacy workers
+// continue to provide the flat codex_model fallback when no Codex chain leads.
+function sidecarModelFor(dispatchEngine, chain, codexModel) {
+  const first = Array.isArray(chain) ? chain[0] : null;
+  if (dispatchEngine === 'codex' && first && first.id) return first.id;
+  return codexModel || '';
+}
+
 function resolveDispatch(opts) {
   const o = opts || {};
   const unitType = text(o.unitType);
@@ -256,6 +264,8 @@ function resolveDispatch(opts) {
     // (family). gpt→codex, gemini→agy, else→claude. Orchestrator branches gate
     // on this (`== "codex"`), NOT on `engine`/`chain[].engine` (kept family).
     dispatch_engine: dispatchEngineFor(engine),
+    // codex_model remains emitted separately as the legacy flat preference.
+    sidecar_model: sidecarModelFor(dispatchEngineFor(engine), chain, workers.codex_model),
     // Additive loud-stop surface (M008-CONTEXT #2): a malformed prefs layer must
     // not silently degrade to the claude/effort-default fallback. Callers inspect
     // prefs_ok; the CLI turns prefs_ok:false into a non-zero exit.
@@ -313,11 +323,12 @@ function degradedContract(args) {
     // engine is hard-coded 'claude' here → dispatch_engine resolves to 'claude'.
     // Emitted explicitly via the same helper for contract stability.
     dispatch_engine: dispatchEngineFor('claude'),
+    sidecar_model: sidecarModelFor(dispatchEngineFor('claude'), chain, ''),
     prefs_ok: true, prefs_errors: [],
   };
 }
 
-module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, TIER_DEFAULTS };
+module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, TIER_DEFAULTS };
 
 if (require.main === module) {
   // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a

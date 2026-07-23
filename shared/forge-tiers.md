@@ -31,6 +31,8 @@ always resolve through `tier_models.<tier>`. `plan-milestone` has a fixed `max`
 tier, but its model remains configurable through `tier_models.max`. For the
 live workspace resolution, including domain inheritance, run `/forge-prefs phases`.
 
+`routing.<domain>.<role>.<tier>` is a literal list of IDs: `tier_models.<tier>` does not affect it. To change a Claude fallback in a routing chain, edit that chain's Claude member, not `tier_models`.
+
 ---
 
 ## Tier → Default Model

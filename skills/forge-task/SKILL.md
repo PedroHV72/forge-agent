@@ -741,11 +741,9 @@ WORKERS_TIMEOUT=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1
 CODEX_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).codex_model||'')" "$ROUTE_JSON")
 THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thinking_header||'')" "$ROUTE_JSON")
 MODEL_APPLIED_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || printf 'null')
-# The sidecar codex model is fed from the resolved chain (chain[0].id when the top-level
-# dispatch_engine == 'codex'), falling back to the workers.codex_model pref for legacy compat.
-# NB: chain[].engine stays FAMILY ('gpt', never 'codex') — readers depend on it — so the gate
-# reads the normalized top-level r.dispatch_engine, not c.engine.
-SIDECAR_MODEL=$(node -e "const r=JSON.parse(process.argv[1]);const c=(r.chain||[])[0];process.stdout.write(r.dispatch_engine==='codex'&&c&&c.id?c.id:(r.codex_model||''))" "$ROUTE_JSON")
+# The resolver owns sidecar model selection: chain[0].id for a Codex dispatch,
+# with workers.codex_model retained as its legacy fallback.
+SIDECAR_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).sidecar_model||'')" "$ROUTE_JSON")
 # $ROUTE_JSON.chain carries forward unmodified — consumed by Branch codex (SIDECAR_MODEL) and by
 # the Failure Taxonomy via `forge-routing.js ... --next-after "$MODEL_ID"`.
 ```

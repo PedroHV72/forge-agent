@@ -8,7 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { resolveDispatch } = require('./forge-dispatch-resolve.js');
+const { resolveDispatch, degradedContract } = require('./forge-dispatch-resolve.js');
 const { readTierChain } = require('./forge-tier-chain.js');
 
 const SCRIPT = path.join(__dirname, 'forge-dispatch-resolve.js');
@@ -100,6 +100,7 @@ withHermeticHome((cliEnv) => {
     assertEqual(r.effort, 'low', 'defaults effort low');
     assertEqual(r.effort_reason, 'unit-type:execute-task', 'defaults effort reason');
     assertEqual(r.engine, 'claude', 'defaults engine claude');
+    assertEqual(r.sidecar_model, '', 'claude route has empty sidecar model');
     cleanup(f);
   });
 
@@ -181,7 +182,14 @@ withHermeticHome((cliEnv) => {
     assertEqual(r.domain, 'backend', 'routing domain backend');
     assertEqual(r.engine, r.chain[0].engine, 'routing engine comes from primary chain member');
     assertEqual(r.chain_len, 3, 'routing chain respects cap three');
+    assertEqual(r.sidecar_model, r.chain[0].id, 'codex routing chain leads sidecar model');
     cleanup(f);
+  });
+
+  runCase('degraded contract keeps the additive sidecar_model key', () => {
+    const r = degradedContract(['--unit-type', 'execute-task']);
+    assert('sidecar_model' in r, 'degraded contract exposes sidecar_model');
+    assertEqual(r.sidecar_model, '', 'degraded contract sidecar model is empty');
   });
 
   runCase('routing falls back to default domain for absent domain cell', () => {

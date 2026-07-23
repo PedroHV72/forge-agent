@@ -49,7 +49,7 @@ Semantics for workers:
 - **`branch`** — `CODE_DIR == WORKING_DIR`. The orchestrator already checked out `BRANCH`; commit on it and never switch back to the default branch mid-unit.
 - **`worktree`** — `CODE_DIR` is a physical worktree (e.g. `.forge-worktrees/{run-id}/{repo}/`). Use `CODE_DIR` for every source file path and run git with `git -C "{CODE_DIR}" …`. `.gsd/**` reads/writes (plans, summaries, events) keep using `WORKING_DIR` paths — the GSD state never moves into the worktree.
 - Header absent → `shared` mode; nothing changes.
-- When the header is present with `ISOLATION: worktree`, commands in the templates that take `--cwd "{WORKING_DIR}"` for **code verification/build** (e.g. `forge-verify.js`) run with `--cwd "{CODE_DIR}"` instead; `--plan`/artifact paths under `.gsd/**` keep `{WORKING_DIR}`.
+- When the header is present with `ISOLATION: worktree`, commands in the templates that take `--cwd "{WORKING_DIR}"` for **code verification/build** (e.g. `forge-verify.js`) run with `--cwd "{CODE_DIR}"` instead; `--plan`/artifact paths under `.gsd/**` keep `{WORKING_DIR}`. `forge-verifier.js` is the exception: it needs both `--cwd {WORKING_DIR}` for plans and artifacts and `--code-dir {CODE_DIR}` for code/import verification.
 
 The templates below do NOT repeat this header — the orchestrator injects it at dispatch time (see `skills/forge-auto/SKILL.md` and `skills/forge-next/SKILL.md` § Build worker prompt).
 
@@ -981,6 +981,8 @@ WORKERS_TIMEOUT=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on
 CODEX_MODEL=$(printf '%s' "$PREFS_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=(JSON.parse(d).prefs.workers||{}).codex_model;process.stdout.write(c!=null&&c!==''?String(c):'')}catch(err){process.stdout.write('')}})")
 ```
 
+`sidecar_model` is an additive resolver-contract field; `$CODEX_MODEL` remains the legacy preference value, while the sidecar `--model` flag uses `$SIDECAR_MODEL`.
+
 **Equivalence with the old cascade (JSONC shape capture):** the JSONC parser exposes the per-unit-type engine as `.prefs.workers[<unit_type>]` (the `[A-Za-z0-9_.-]` key class covers hyphenated unit types such as `execute-task`); `timeout` as `.prefs.workers.timeout`; `codex_model` as `.prefs.workers.codex_model`. The resolver is safe with **no scaffold present**: absent a `workers:` block, `.prefs.workers` is `undefined`, so `WORKERS_ENGINE=claude`, `WORKERS_TIMEOUT=1800`, `CODEX_MODEL=""` (unset) — byte-identical defaults to the old snippet. The commented `workers:` scaffold in `forge-agent-prefs.jsonc § Workers Settings` ships in **S05**; the resolver does not depend on it (the CLI resolves absent keys to the same safe defaults).
 
 #### Sidecar dispatch state machine (`dispatch_engine == codex && UNIT_TYPE == execute-task`)
@@ -1040,14 +1042,14 @@ node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
   --state "$XLLM_STATE" --result-file "$RESULT_FILE"
 ```
 
-**4. Dispatch detached via `run_in_background`.** The Bash tool's 600s foreground ceiling does not apply to `run_in_background: true` (MEM: sidecar dispatch via background + poll). `--model` is appended **only when `$CODEX_MODEL` is non-empty** (null → CLI default, mirroring the challenger-model pattern):
+**4. Dispatch detached via `run_in_background`.** The Bash tool's 600s foreground ceiling does not apply to `run_in_background: true` (MEM: sidecar dispatch via background + poll). `--model` is appended **only when `$SIDECAR_MODEL` is non-empty**: the resolver selects the chain's Codex member, then falls back to `workers.codex_model`.
 
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "$HOME/.claude/scripts")
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
   --plan "$PLAN_PATH" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
   --timeout "$WORKERS_TIMEOUT" \
-  $([ -n "$CODEX_MODEL" ] && printf -- '--model %s' "$CODEX_MODEL")
+  $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
 # ↑ dispatched with the Bash tool's run_in_background: true
 ```
 
@@ -1167,14 +1169,14 @@ printf '{"reason":"","result_file":"%s","code_dir":"%s","ctx_file":"%s"}\n' \
   "$RESULT_FILE" "$CODE_DIR" "$CTX_FILE" > "$XLLM_STATE"
 ```
 
-**3. Dispatch detached via `run_in_background`.** Same background+poll pattern as Branch C (the Bash 600s foreground ceiling does not apply to `run_in_background: true`), but `--mode plan` and passing `--plan-context` instead of `--plan`. `--model` is appended **only when `$CODEX_MODEL` is non-empty**:
+**3. Dispatch detached via `run_in_background`.** Same background+poll pattern as Branch C (the Bash 600s foreground ceiling does not apply to `run_in_background: true`), but `--mode plan` and passing `--plan-context` instead of `--plan`. `--model` is appended **only when `$SIDECAR_MODEL` is non-empty**: the resolver selects the chain's Codex member, then falls back to `workers.codex_model`:
 
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "$HOME/.claude/scripts")
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode plan \
   --plan-context "$CTX_FILE" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
   --timeout "$WORKERS_TIMEOUT" \
-  $([ -n "$CODEX_MODEL" ] && printf -- '--model %s' "$CODEX_MODEL")
+  $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
 # ↑ dispatched with the Bash tool's run_in_background: true
 ```
 
@@ -1440,7 +1442,7 @@ Materialization is **orchestrator-only** — codex never touches `.gsd/**`. Afte
 | `workers.execute-task` | enum `claude \| codex` | `claude` | Engine for `execute-task` dispatch. `codex` routes to the sidecar; invalid → `claude` |
 | `workers.plan-slice` | enum `claude \| codex` | `claude` | Engine for `plan-slice` dispatch. `codex` routes to the sidecar `--mode plan` (read-only, Branch D); invalid → `claude` |
 | `workers.timeout` | int (seconds) | `1800` | Forwarded to the adapter as `--timeout`; non-positive/invalid → `1800` |
-| `workers.codex_model` | string (model id) | unset (`null`) | Forwarded as `--model` only when set; unset → Codex CLI default |
+| `workers.codex_model` | string (model id) | unset (`null`) | Legacy fallback for the sidecar `--model` when no routed Codex chain member leads; unset **and** no Codex chain → Codex CLI default. The flag itself is driven by `$SIDECAR_MODEL` (`sidecarModelFor`) |
 
 `plan-milestone` is intentionally **absent** from this table — it is never routed through `workers:` (locked; stays tier `max`/Fable). The scaffold that documents these keys (commented) ships in `forge-agent-prefs.jsonc § Workers Settings` (S05); the reader operates with the safe defaults above without it.
 
