@@ -993,6 +993,17 @@ When the dispatched chain member resolves to `engine == codex` **and** the unit 
 
 **0. Increment the sidecar attempt counter (`SIDECAR_ATTEMPT`).** Before dispatching *any* sidecar for this unit, increment a per-unit counter `SIDECAR_ATTEMPT` (starts at 1 for the first sidecar dispatch of the unit). It is hard-capped by the number of `engine == codex` members in the resolved chain (≤3, S01 cap). Exceeding the cap → abort the chain to the Claude fallback (`reason: sidecar-cap-exceeded`). The counter is persisted in the per-attempt state file (below) so it survives an auto-compact mid-unit.
 
+**0.5. Resolve the ONE `CODE_DIR` (multi-repo precondition).** **The sidecar assumes ONE `CODE_DIR` that is a git repository** — `--state-init`, the `START_SHA` capture, the post-run diff and the surgical reset all take a single `--cwd`. A workspace with N repos therefore resolves to the single repo the unit's **declared** paths touch, or the sidecar **refuses**; it never picks `repos[0]` blindly, and never points a helper at the non-git `.forge-worktrees/{RUN_ID}/` root. Resolution is delegated to `scripts/forge-code-dir.js --resolve`, fed with the isolation result the orchestrator already holds (`$ISO_RESULT`) plus the unit's plan — a pure function, no git calls:
+
+```bash
+# Per-unit CODE_DIR resolution — runs where $PLAN_PATH is already known, before the engine branch.
+CD_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-code-dir.js" --resolve \
+  --iso-result "$ISO_RESULT" --plan "$WORKING_DIR/$PLAN_PATH" --cwd "$WORKING_DIR")
+# exit 0 → status ok|shared · 4 → cross-repo · 5 → undeclared
+```
+
+Verdicts: `ok` → `CODE_DIR` is the resolved worktree (**both engines** get it — strictly better than the blind pick, byte-identical in a single-repo workspace, which short-circuits without reading the plan). `cross-repo` → `REASON="sidecar-multirepo-unsupported"`. `undeclared` → `REASON="sidecar-code-dir-undeclared"`. On either refusal, **skip steps 1–4 entirely** (no `START_SHA` capture, no state or result-file allocation, no sidecar launch) and go straight to Fallback — identical control flow to `sidecar-cap-exceeded`, and refused **before** any `--cwd` reaches `forge-surgical-reset.js`. The Claude fallback path then keeps **exactly** today's behavior: it continues on the bootstrap `WORKTREE_DIR`, with one visible warning line naming the ambiguity and the repos touched, and nothing else changes. The refusal **never** blanks `WORKTREE_DIR` — an empty `WORKTREE_DIR` is the orchestrator's "every repo failed" STOP signal and must not be confused with a sidecar refusal.
+
 **1. Capture `START_SHA` + the pre-dirty snapshot in ONE atomic write, via the surgical-reset helper.** BEFORE anything else, delegate state init to `forge-surgical-reset.js` — it captures `START_SHA` **and** snapshots whatever is already dirty in `$CODE_DIR` (as `{path, hash}` pairs, `.gsd/**` excluded) in the SAME write, and persists both to a state file whose name carries the attempt number `N = SIDECAR_ATTEMPT` — **never overwriting a prior attempt's file** (audit preserved, post-compact recovery unambiguous):
 
 ```bash
@@ -1277,6 +1288,8 @@ Triggers (`reason` value):
 | `surgical-reset-overlap` | `forge-surgical-reset.js --reset` exit 3 — a pre-dirty path's current hash diverged from its snapshot hash (the sidecar ALSO wrote a pre-existing dirty file); **NOTHING was reset**, not even the non-overlapped paths | execute-task only (Branch C) |
 | `verified-reset-failed` | `forge-surgical-reset.js --reset` exit 2 — post-reset verification found a leftover change that isn't an intact pre-dirty path | execute-task only (Branch C) |
 | `sidecar-state-init-failed` | `forge-surgical-reset.js --state-init` precondition failure (e.g. not a git repo, permission denied) — no reset needed, nothing was captured | both |
+| `sidecar-multirepo-unsupported` | the unit's declared paths span >= 2 repos in a multi-repo workspace — the sidecar has no single valid `CODE_DIR`/`START_SHA`/reset scope. A **declared precondition**, refused before any `--cwd` is handed to a helper — not an accidental failure | both |
+| `sidecar-code-dir-undeclared` | multi-repo workspace and the plan declares zero attributable paths (`writes:`/`expected_output:`/`## Files to Change` all empty or unmatched) — a planner gap, correctable, deliberately a distinct signal from the row above | both |
 
 `dirty-tree-guard` **no longer exists as a fallback trigger** (SUPERSEDED — DECISION 39, see S01-CONTEXT.md): the pre-dirty snapshot (Branch C step 1) replaced the pre-dispatch refusal, so there is no longer a "sidecar never launched because the tree was dirty" case.
 
@@ -1323,7 +1336,7 @@ Triggers (`reason` value):
 
 Event reason strings come from a **closed enum**, documented here and nowhere else (mirrors reference this section, never replicate the list):
 
-- `worker-engine-fallback` (§ Fallback above): `codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `codex-error`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`, `sidecar-state-init-failed`.
+- `worker-engine-fallback` (§ Fallback above): `codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `codex-error`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`, `sidecar-state-init-failed`, `sidecar-multirepo-unsupported`, `sidecar-code-dir-undeclared`.
 - `review-challenger-fallback` (`shared/forge-review.md` § Fallback challenger): `engine-workflow-forced-agents`, `codex-exit-nonzero`, `gemini-exit-nonzero`.
 - `review-pairing-fallback` is a **related-but-distinct** event (own enum: `codex-unavailable`, `no-authorship-data`, `defend-mode-unavailable`, `scope-empty-global-fallback` — see `scripts/forge-review-pairing.js`) — referenced here, NOT folded into the two enums above.
 

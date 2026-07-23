@@ -178,7 +178,7 @@ echo "ISO_ERRORS=${ISO_ERRORS:-none}"
 Isolation rules (CRITICAL — the operator configured this; honor it):
 - `ISOLATION_MODE == shared` → `WORKER_CWD = $WORKING_DIR`. Nothing else to do.
 - `ISOLATION_MODE == branch` → `WORKER_CWD = $WORKING_DIR`. Workers commit on the `forge/{run}` branch the setup just checked out.
-- `ISOLATION_MODE == worktree` → `WORKER_CWD = $WORKTREE_DIR`. ALL code reads/writes/commits happen inside the worktree; `.gsd/**` artifacts ALWAYS stay under `$WORKING_DIR` (the original workspace — registry, statusline and other tabs depend on it).
+- `ISOLATION_MODE == worktree` → `WORKER_CWD = $WORKTREE_DIR` (bootstrap value). **In a multi-repo workspace `WORKER_CWD`/`CODE_DIR` does NOT come from this bootstrap value**: once `$PLAN_PATH` exists, the per-unit resolver (`forge-code-dir.js`, § Per-unit `CODE_DIR` resolution) attributes the unit's declared paths to ONE repo — when it returns `ok`, `WORKER_CWD = $UNIT_CODE_DIR`; on any refusal (`cross-repo`/`undeclared`) `WORKER_CWD` stays `$WORKTREE_DIR`, exactly today's behavior. ALL code reads/writes/commits happen inside the worktree; `.gsd/**` artifacts ALWAYS stay under `$WORKING_DIR` (the original workspace — registry, statusline and other tabs depend on it).
 - If `ISO_ERRORS` is non-empty AND every repo failed (`WORKTREE_DIR` empty in worktree mode, or no repo succeeded in branch mode) → STOP. Surface the errors to the user. Running un-isolated when the operator explicitly configured isolation is NOT an acceptable fallback.
 - If only some repos failed → emit a warning line listing them and continue.
 - When `ISOLATION_MODE != shared`, emit one line so the operator sees isolation took effect: `⛓ Isolation: {mode} → {branch name or worktree path}`.
@@ -820,6 +820,22 @@ Do NOT read artifact files here — templates now pass paths; workers read their
 
 ---
 
+**Per-unit `CODE_DIR` resolution (multi-repo precondition)** — executable mirror of `shared/forge-dispatch.md § Sidecar dispatch state machine step 0.5` (contract prose lives there, never restated here). Runs HERE because `$PLAN_PATH` is only known per unit — the bootstrap `WORKTREE_DIR` is derived before any plan exists and stays untouched:
+```bash
+UNIT_CODE_DIR=""; CODE_DIR_STATUS="shared"; CODE_DIR_REASON=""
+if [ "$ISOLATION_MODE" = "worktree" ] && [ -n "$PLAN_PATH" ] && [ -n "$ISO_RESULT" ]; then
+  CD_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-code-dir.js" --resolve \
+    --iso-result "$ISO_RESULT" --plan "$WORKING_DIR/$PLAN_PATH" --cwd "$WORKING_DIR"); CD_RC=$?
+  CD_JSON=${CD_JSON:-'{}'}
+  CODE_DIR_STATUS=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).status)||'shared')" "$CD_JSON")
+  UNIT_CODE_DIR=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).code_dir)||'')" "$CD_JSON")
+  CODE_DIR_REASON=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).reason)||'')" "$CD_JSON")
+  [ "$CD_RC" -eq 0 ] || echo "⚠ CODE_DIR ambíguo ($CODE_DIR_STATUS): $(node -e "process.stdout.write(((JSON.parse(process.argv[1]).repos_touched)||[]).join(', '))" "$CD_JSON") — sidecar recusado, executor Claude segue no WORKTREE_DIR do bootstrap"
+  [ "$CODE_DIR_STATUS" = "ok" ] && [ -n "$UNIT_CODE_DIR" ] && CODE_DIR="$UNIT_CODE_DIR"
+fi
+```
+**Never assign to `WORKTREE_DIR` here.** An empty `WORKTREE_DIR` is the "every repo failed" STOP signal of the Isolation rules above — a sidecar refusal must never be mistaken for an isolation failure. The `CODE_DIR="$UNIT_CODE_DIR"` line above (status `ok` only) is what makes the resolved value reach the bash consumers (`--state-init --cwd "$CODE_DIR"`, `forge-xllm --cwd`, `git -C "$CODE_DIR"`) deterministically, without depending on model substitution.
+
 **Branch C — sidecar codex (`DISPATCH_ENGINE == codex && unit_type == execute-task && BATCH.length == 1`):**
 
 Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` → *Sidecar dispatch state machine* + *BLOCKER — cross-engine sidecar safety contract* + *Fallback*. States: `started → polling → done | failed`. On any failure the work reverts to the next chain member (verified reset first) or the Claude fallback — no 4th recovery layer.
@@ -833,7 +849,12 @@ Executable mirror of `shared/forge-dispatch.md § Worker Engine Routing` → *Si
 SIDECAR_ATTEMPT="${SIDECAR_ATTEMPT:-0}"; SIDECAR_ATTEMPT=$((SIDECAR_ATTEMPT + 1))
 CODEX_MEMBERS=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).chain.filter(m=>m.engine==='gpt'||m.engine==='codex').length))" "$ROUTE_JSON" 2>/dev/null || echo 1)
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
-if [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
+# Gate: the sidecar assumes ONE CODE_DIR that is a git repo (shared/forge-dispatch.md § Branch codex 0.5).
+# Executable, never a bare comment. Extends the cap-skip path: a cross-repo/undeclared verdict refuses
+# BEFORE any --cwd reaches a helper — no START_SHA, no state/result-file, no launch.
+if [ -n "$CODE_DIR_REASON" ]; then
+  REASON="$CODE_DIR_REASON"
+elif [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
   # Cap exceeded → go DIRECTLY to the Claude fallback (R3): no snapshot capture, no state/result-file
   # allocation, no sidecar launch. $REASON drives the Fallback block below.
   REASON="sidecar-cap-exceeded"
@@ -870,7 +891,7 @@ fi
 ```
 With `REASON` now set by the guard above, control goes DIRECTLY to the **Fallback** block below (`worker-engine-fallback`) — no dispatch is attempted and no reset runs, since no valid state was ever captured.
 
-When `REASON == sidecar-cap-exceeded` here, **skip the timeline task, dispatch and poll entirely** — go straight to the **Fallback** block below (no sidecar is launched).
+When `REASON` is `sidecar-cap-exceeded` or one of the two `CODE_DIR` refusals (`sidecar-multirepo-unsupported` / `sidecar-code-dir-undeclared`) here, **skip the timeline task, dispatch and poll entirely** — go straight to the **Fallback** block below (no sidecar is launched, and no reset runs since no state was captured).
 
 - **Timeline task:** `TaskCreate` with icon `⚡` (same as the Claude execute-task path), model label = `codex${CODEX_MODEL:+ ($CODEX_MODEL)}`; mark `in_progress`.
 - **Dispatch (detached):** invoke via the Bash tool with `run_in_background: true` (the 600s foreground ceiling does not apply):
@@ -962,7 +983,7 @@ fi
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
 XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-${T##}-attempt-${N}.json"
 [ -f "$XLLM_STATE" ] || XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${T##}-attempt-${N}.json"
-if [ "$REASON" != "sidecar-cap-exceeded" ]; then
+if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
   RESET_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --reset --state "$XLLM_STATE"); RC=$?
   # RC=0 → reset verified (only codex-authored changes undone, pre-dirty snapshot intact) → advance.
   # RC=3 → OVERLAP: a pre-dirty path's hash diverged (the sidecar ALSO wrote it) — the helper reset
@@ -981,7 +1002,7 @@ fi
 # Claude fallback are mutually exclusive — exactly ONE of the two branches below runs.
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-routing.js ] && echo scripts || echo "$HOME/.claude/scripts")
 ADVANCED=""
-if [ "$REASON" != "surgical-reset-overlap" ] && [ "$REASON" != "sidecar-cap-exceeded" ] && [ "$REASON" != "verified-reset-failed" ]; then
+if [ "$REASON" != "surgical-reset-overlap" ] && [ "$REASON" != "sidecar-cap-exceeded" ] && [ "$REASON" != "verified-reset-failed" ] && [ -z "$CODE_DIR_REASON" ]; then
   NEXT_ID=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" \
     --unit-type "$unit_type" --tier "$TIER" --domain "$DOMAIN" \
     --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" \

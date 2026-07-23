@@ -106,7 +106,7 @@ echo "ISOLATION_MODE=$ISOLATION_MODE  WORKTREE_DIR=${WORKTREE_DIR:-—}  ISO_ERR
 Isolation rules (CRITICAL — the operator configured this; honor it):
 - `shared` → `WORKER_CWD = $WORKING_DIR`. Nothing else to do.
 - `branch` → `WORKER_CWD = $WORKING_DIR`. Workers commit on the `forge/{run}` branch the setup just checked out.
-- `worktree` → `WORKER_CWD = $WORKTREE_DIR`. ALL code reads/writes/commits happen inside the worktree; `.gsd/**` artifacts ALWAYS stay under `$WORKING_DIR`.
+- `worktree` → `WORKER_CWD = $WORKTREE_DIR` (bootstrap value). **In a multi-repo workspace `WORKER_CWD`/`CODE_DIR` does NOT come from this bootstrap value**: once `$PLAN_PATH` exists, the per-unit resolver (`forge-code-dir.js`, § Per-unit `CODE_DIR` resolution in Step 4) attributes the unit's declared paths to ONE repo — when it returns `ok`, `WORKER_CWD = $UNIT_CODE_DIR`; on any refusal (`cross-repo`/`undeclared`) `WORKER_CWD` stays `$WORKTREE_DIR`, exactly today's behavior. ALL code reads/writes/commits happen inside the worktree; `.gsd/**` artifacts ALWAYS stay under `$WORKING_DIR`.
 - `ISO_ERRORS` non-empty AND no repo succeeded → STOP and surface the errors. Running un-isolated when the operator configured isolation is NOT an acceptable fallback.
 - When mode != shared, emit one line: `⛓ Isolation: {mode} → {branch name or worktree path}`.
 - `workers.require_worktree` elevation is static-at-activation (never mid-run); `auto` (default) elevates `shared→worktree` only when `execute-task` resolves to an external write engine (codex/gpt/gemini); `true` always elevates; `false` never elevates. Read-only paths (Branch D plan-slice, review challenger) are exempt. Warn-and-proceed — never blocks; false-positive acceptable, false-negative not. Keep `shared`: `workers.require_worktree: false`.
@@ -832,21 +832,41 @@ Do NOT read artifact files here — templates now pass paths; workers read their
 
 Use `$MODEL_ID` resolved by Tier Resolution (step 1.5) above. Do NOT look up model from PREFS directly — `model = PREFS.tier_models[tier]` is already computed.
 
+**Per-unit `CODE_DIR` resolution (multi-repo precondition)** — executable mirror of `shared/forge-dispatch.md § Sidecar dispatch state machine step 0.5` (contract prose lives there, never restated here). Runs HERE because `$PLAN_PATH` is only known per unit — the bootstrap `WORKTREE_DIR` (§ Isolation setup) is derived before any plan exists and stays untouched:
+```bash
+UNIT_CODE_DIR=""; CODE_DIR_STATUS="shared"; CODE_DIR_REASON=""
+if [ "$ISOLATION_MODE" = "worktree" ] && [ -n "$PLAN_PATH" ] && [ -n "$ISO_RESULT" ]; then
+  CD_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-code-dir.js" --resolve \
+    --iso-result "$ISO_RESULT" --plan "$WORKING_DIR/$PLAN_PATH" --cwd "$WORKING_DIR"); CD_RC=$?
+  CD_JSON=${CD_JSON:-'{}'}
+  CODE_DIR_STATUS=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).status)||'shared')" "$CD_JSON")
+  UNIT_CODE_DIR=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).code_dir)||'')" "$CD_JSON")
+  CODE_DIR_REASON=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).reason)||'')" "$CD_JSON")
+  [ "$CD_RC" -eq 0 ] || echo "⚠ CODE_DIR ambíguo ($CODE_DIR_STATUS): $(node -e "process.stdout.write(((JSON.parse(process.argv[1]).repos_touched)||[]).join(', '))" "$CD_JSON") — sidecar recusado, executor Claude segue no WORKTREE_DIR do bootstrap"
+  [ "$CODE_DIR_STATUS" = "ok" ] && [ -n "$UNIT_CODE_DIR" ] && CODE_DIR="$UNIT_CODE_DIR"
+fi
+```
+**Never assign to `WORKTREE_DIR` here.** An empty `WORKTREE_DIR` is the "every repo failed" STOP signal of the Isolation rules — a sidecar refusal must never be mistaken for an isolation failure. The `CODE_DIR="$UNIT_CODE_DIR"` line above (status `ok` only) makes the resolved value reach the bash consumers deterministically, without depending on model substitution.
+
 **Branch codex — sidecar (`$DISPATCH_ENGINE == codex` && `$unit_type == execute-task`)** — executable mirror of `shared/forge-dispatch.md § Worker Engine Routing § Sidecar dispatch state machine`. When this branch fires, the Claude machinery below (timeline task, token telemetry, guarded `Agent()` dispatch) is **replaced** by the detached adapter + polling; on any failure it resets and **falls through to that same Claude machinery** (fallback). When `$DISPATCH_ENGINE == claude` (or the unit is not `execute-task`), skip this branch entirely and proceed with the Claude dispatch below — byte-identical to the current loop. `CODE_DIR` resolves to `${WORKER_CWD:-$WORKING_DIR}` (isolation header).
 
 0. **Increment the sidecar attempt counter (`SIDECAR_ATTEMPT`) — BLOCKER cap.** Before dispatching *any* sidecar for this unit, increment a per-unit counter (starts at 1 for the first sidecar dispatch of the unit). It is **hard-capped** by the number of `engine == codex` members in the resolved chain (`$ROUTE_JSON.chain`, ≤3 — the S01 cap). Exceeding the cap → abort the chain to the Claude fallback with `REASON=sidecar-cap-exceeded`. On a cross-engine chain (e.g. `gpt→claude→gpt`) this branch may fire more than once in the same unit; the counter is persisted in the per-attempt state file (below) so it survives an auto-compact:
 ```bash
 CODEX_MEMBERS=$(node -e "process.stdout.write(String((JSON.parse(process.argv[1]).chain||[]).filter(m=>m.engine==='gpt'||m.engine==='codex').length))" "$ROUTE_JSON")
 SIDECAR_ATTEMPT=$(( ${SIDECAR_ATTEMPT:-0} + 1 ))
-if [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
+# Gate: the sidecar assumes ONE CODE_DIR that is a git repo (shared/forge-dispatch.md § Branch codex 0.5).
+# Executable, never a bare comment. Extends the cap-skip path — refuses BEFORE any --cwd reaches a helper.
+if [ -n "$CODE_DIR_REASON" ]; then
+  REASON="$CODE_DIR_REASON"        # sidecar-multirepo-unsupported | sidecar-code-dir-undeclared
+elif [ "$SIDECAR_ATTEMPT" -gt "${CODEX_MEMBERS:-1}" ]; then
   REASON="sidecar-cap-exceeded"   # → Claude fallback (never a 4th recovery layer)
 fi
 ```
-When `REASON == sidecar-cap-exceeded`, **skip steps 1–4 entirely** (no `START_SHA` capture, no state/result-file allocation, no sidecar launch) and go DIRECTLY to the **Fallback** block below (R3). Steps 1–3 below run **only** in the `else` — they are guarded by the same `if [ "$REASON" != "sidecar-cap-exceeded" ]` condition.
+When `REASON` is `sidecar-cap-exceeded` or one of the two `CODE_DIR` refusals set by the gate above, **skip steps 1–4 entirely** (no `START_SHA` capture, no state/result-file allocation, no sidecar launch) and go DIRECTLY to the **Fallback** block below (R3). Steps 1–3 below run **only** in the `else` — they are guarded by the same `if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]` condition.
 
 1. **Capture `START_SHA` + the pre-dirty snapshot in ONE atomic write, via the surgical-reset helper.** `--state-init` records `{attempt, start_sha, pre_dirty:[{path,hash}], reason, result_file, code_dir}` in the SAME write (`.gsd/**` excluded), so the snapshot survives the poll loop / an auto-compact (BLOCKER invariant #2 — a snapshot in a shell var is lost the moment the process crosses a Bash-tool boundary). Branch C spans multiple Bash tool invocations, so shell vars do NOT survive — the state file (under `WORKING_DIR/.gsd`, never `CODE_DIR`) is the durable carrier. **The name carries the attempt number `N = SIDECAR_ATTEMPT` (`-attempt-$N`) and NEVER overwrites a prior attempt's file** (audit preserved, post-compact recovery unambiguous — BLOCKER invariant #1). The success AND fallback blocks re-read the state of the **CURRENT** attempt from disk. The whole step is gated on the cap (R3 — the real `if/else` whose cap branch went straight to Fallback above):
 ```bash
-if [ "$REASON" != "sidecar-cap-exceeded" ]; then
+if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
   CODE_DIR="${WORKER_CWD:-$WORKING_DIR}"
   N="$SIDECAR_ATTEMPT"                                              # 1, 2, 3 — one per codex member dispatched
   XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-${T##}-attempt-${N}.json"
@@ -952,7 +972,7 @@ fi
 
 **If `$PAUSE_ASK_GATE` is set** (TTY present, pause-ask exhaustion): call `AskUserQuestion` with three options — **Retentar codex** (re-enter Layer-1 for one more transient retry against the SAME member: run the Branch C reset→backoff→`--state-update`→re-dispatch sequence with `transient_retry_count` continuing), **Fallback Claude** (take the Layer-2 `worker-engine-fallback` action now), **Pausar milestone** (checkpoint via `continue.md` + `status: paused` and stop the loop — the SAME mechanic as review `ask_in_auto: pause` / account-handoff; do not invent a new pause path). The operator's answer drives control. **Otherwise** (headless degrade, or the gate was not triggered) control falls through unchanged.
 
-**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`, `sidecar-state-init-failed`); no retry of the codex work; **not a 4th recovery layer**:
+**Fallback — `worker-engine-fallback`** (any codex failure trigger — clone of `review-challenger-fallback`, `shared/forge-dispatch.md § Fallback`). One event type, triggers by `REASON` (`codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`, `sidecar-state-init-failed`, `sidecar-multirepo-unsupported`, `sidecar-code-dir-undeclared`); no retry of the codex work; **not a 4th recovery layer**:
 ```bash
 # Re-read is delegated to the helper — $XLLM_STATE is the -attempt-$N.json of the CURRENT attempt
 # (BLOCKER invariant #1) and carries start_sha + pre_dirty (this block may be a later Bash invocation
@@ -962,7 +982,7 @@ fi
 # the codex-authored change set is undone; pre-existing dirty content is re-hashed intact (RC=0) or the
 # reset aborts (RC=3 overlap / RC=2 verify-failed). .gsd/** is excluded by the helper's own predicate,
 # so it never reverts the orchestrator's own .gsd writes (events.jsonl / evidence) made during the poll.
-if [ "$REASON" != "sidecar-cap-exceeded" ]; then
+if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
   RESET_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --reset --state "$XLLM_STATE"); RC=$?
   # RC=0 → reset verified (only codex-authored changes undone, pre-dirty snapshot intact) → advance.
   # RC=3 → OVERLAP: a pre-dirty path's hash diverged (the sidecar ALSO wrote it) — the helper reset
@@ -983,7 +1003,7 @@ fi
 # Abort reasons (surgical-reset-overlap / sidecar-cap-exceeded / verified-reset-failed) forbid
 # advancement → no cursor, take the generic Claude fallback below.
 NEXT=""
-if [ "$REASON" != "surgical-reset-overlap" ] && [ "$REASON" != "sidecar-cap-exceeded" ] && [ "$REASON" != "verified-reset-failed" ]; then
+if [ "$REASON" != "surgical-reset-overlap" ] && [ "$REASON" != "sidecar-cap-exceeded" ] && [ "$REASON" != "verified-reset-failed" ] && [ -z "$CODE_DIR_REASON" ]; then
   NEXT=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" \
     --unit-type "$unit_type" --tier "$TIER" --domain "$DOMAIN" \
     --frontmatter-tier "$PLAN_TIER" --frontmatter-worker "$PLAN_WORKER" \
@@ -1024,7 +1044,7 @@ fi
 
 1. **Assemble the plan-context file (orchestrator)** — temp file OUTSIDE `.gsd/` and `CODE_DIR`, concatenating the exact artifacts the Claude `forge-planner` would receive for this slice: the slice's ROADMAP entry, `M###-CONTEXT.md` (full), `S##-CONTEXT.md` (if it exists), each dependency slice's `T##-SUMMARY.md`/`S##-SUMMARY.md`, `.gsd/CODING-STANDARDS.md`, and `S##-RISK.md` (if it exists). Guarded by the cap (R3 — the real `if/else` whose cap branch went straight to Fallback above):
 ```bash
-if [ "$REASON" != "sidecar-cap-exceeded" ]; then
+if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
   CODE_DIR="${WORKER_CWD:-$WORKING_DIR}"
   CTX_FILE=$(mktemp -t forge-plan-context.XXXXXX.md)   # tmpdir, never under $CODE_DIR or .gsd
   # → orchestrator appends the artifacts above (Read + concatenate); absent optional files are skipped.
@@ -1033,7 +1053,7 @@ fi
 
 2. **Persist durable state to disk** (no `start_sha` — read-only, nothing to reset). Branch D needs **none of the reset machinery** (read-only — invariant #2 does not apply), only state-fresh-per-attempt + cap. Same cap guard (R3):
 ```bash
-if [ "$REASON" != "sidecar-cap-exceeded" ]; then
+if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
   N="$SIDECAR_ATTEMPT"
   XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-attempt-${N}.json"
   mkdir -p "$WORKING_DIR/.gsd/forge/"

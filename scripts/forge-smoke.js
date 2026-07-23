@@ -8005,6 +8005,185 @@ function smokeInitGitGuarantee() {
   pass('(final) Section 62: /forge-init git guarantee verified — no more unconditional NEVER-git-init prohibitions');
 }
 
+// ── Section 63: CODE_DIR multi-repo resolver (forge-code-dir.js) ────────────
+function smokeCodeDirMultiRepo() {
+  process.stdout.write('\n▸ Section 63: CODE_DIR multi-repo resolver + sidecar refusal reasons\n');
+  const repoRoot = path.dirname(SCRIPTS);
+  const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
+
+  // Fixture: 2 real git repos under a NON-git root (the multi-repo workspace shape that
+  // made the blind find(x=>x.worktree...) point the sidecar at the wrong repo). The
+  // resolver is pure (D1), so $ISO_RESULT is hand-built — no forge-isolation --setup.
+  const root = mkTmp('s63');
+  try {
+    const asgardDir = path.join(root, 'asgard');
+    const freyrDir  = path.join(root, 'freyr');
+    fs.mkdirSync(asgardDir, { recursive: true });
+    fs.mkdirSync(freyrDir, { recursive: true });
+    mkGitRepo(asgardDir);
+    mkGitRepo(freyrDir);
+
+    const wt = (name) => path.join(root, '.forge-worktrees', 'TASK-160', name);
+    const isoMulti = JSON.stringify({
+      mode: 'worktree',
+      repos: [
+        { path: asgardDir, branch: 'forge/TASK-160', worktree: wt('asgard'), status: 'created' },
+        { path: freyrDir,  branch: 'forge/TASK-160', worktree: wt('freyr'),  status: 'created' },
+      ],
+    });
+    const isoSingle = JSON.stringify({
+      mode: 'worktree',
+      repos: [{ path: freyrDir, branch: 'forge/TASK-160', worktree: wt('freyr'), status: 'created' }],
+    });
+
+    const writePlan = (name, body) => {
+      const p = path.join(root, name);
+      fs.writeFileSync(p, body);
+      return p;
+    };
+    const resolve = (iso, plan) => {
+      const r = runScript('forge-code-dir.js',
+        ['--resolve', '--iso-result', iso, '--plan', plan, '--cwd', root, '--run', 'TASK-160']);
+      let json = {};
+      try { json = JSON.parse(r.stdout); } catch { json = {}; }
+      return { status: r.status, json };
+    };
+
+    const planFreyr = writePlan('plan-freyr.md', [
+      '---', 'id: T01', 'writes:', '  - "freyr/src/a.ts"', '  - "freyr/lib/**"', '---',
+      '', '# plan', '',
+    ].join('\n'));
+    const planBoth = writePlan('plan-both.md', [
+      '---', 'id: T02', 'writes:', '  - "freyr/src/a.ts"', '  - "asgard/src/b.ts"', '---',
+      '', '# plan', '',
+    ].join('\n'));
+    const planLegacy = writePlan('plan-legacy.md', [
+      '---', 'id: T03', 'tier: heavy', 'effort: high', '---',
+      '', '# plan', '', '## Steps', '', '1. do a thing', '',
+    ].join('\n'));
+    const planGsdMixed = writePlan('plan-gsd.md', [
+      '---', 'id: T04', 'writes:', '  - ".gsd/tasks/T04/T04-SUMMARY.md"', '  - "asgard/src/c.ts"', '---',
+      '', '# plan', '',
+    ].join('\n'));
+    const planFilesToChange = writePlan('plan-ftc.md', [
+      '---', 'id: T05', 'tier: heavy', '---',
+      '', '# plan', '', '## Files to Change', '',
+      '- `asgard/src/d.ts` — 2 predicados de filter do cap (`:827`, `:1009`) ajustados.',
+      '2. `asgard/docs/e.md` — nota de contrato (`:44`).',
+      'not a bullet — ignored',
+      '', '## Deferred', '', '- `freyr/src/zzz.ts` — out of scope, after the section end.', '',
+    ].join('\n'));
+
+    // (a) multi-repo, all declared paths under freyr/ → freyr's worktree, NEVER repos[0] (asgard).
+    const a = resolve(isoMulti, planFreyr);
+    assert(a.status === 0 && a.json.status === 'ok',
+      `(a) multi-repo plan touching one repo → exit 0 / status ok (got ${a.status}/${a.json.status})`);
+    assert(a.json.code_dir === wt('freyr'),
+      '(a) code_dir is the freyr worktree (attributed), not repos[0]');
+    assert(a.json.code_dir !== wt('asgard'),
+      '(a) anti-regression: code_dir is NOT asgard — the blind find(x=>x.worktree...) would have picked it');
+
+    // (b) declared paths span 2 repos → refusal, never an arbitrary pick.
+    const b = resolve(isoMulti, planBoth);
+    assert(b.status === 4 && b.json.status === 'cross-repo',
+      `(b) cross-repo plan → exit 4 / status cross-repo (got ${b.status}/${b.json.status})`);
+    assert(b.json.code_dir === '' && b.json.reason === 'sidecar-multirepo-unsupported',
+      '(b) cross-repo yields an EMPTY code_dir + reason sidecar-multirepo-unsupported');
+    assert(Array.isArray(b.json.repos_touched) && b.json.repos_touched.length === 2,
+      `(b) repos_touched lists both repos (got ${JSON.stringify(b.json.repos_touched)})`);
+
+    // (c) multi-repo + legacy plan with zero declared paths → distinct "planner gap" signal.
+    const c = resolve(isoMulti, planLegacy);
+    assert(c.status === 5 && c.json.status === 'undeclared',
+      `(c) multi-repo + legacy plan → exit 5 / status undeclared (got ${c.status}/${c.json.status})`);
+    assert(c.json.code_dir === '' && c.json.reason === 'sidecar-code-dir-undeclared',
+      '(c) undeclared yields an EMPTY code_dir + reason sidecar-code-dir-undeclared');
+
+    // (d) D6 non-regression: ONE usable repo → that worktree, plan never consulted.
+    const d = resolve(isoSingle, planLegacy);
+    assert(d.status === 0 && d.json.status === 'ok' && d.json.code_dir === wt('freyr'),
+      `(d) single-repo workspace + legacy plan → exit 0 / ok / freyr worktree (got ${d.status}/${d.json.status})`);
+    assert(d.json.paths_considered === 0 && d.json.source === 'none',
+      '(d) single-repo short-circuit did not consult the plan at all');
+
+    // (e) D4: `.gsd/**` never makes a plan cross-repo.
+    const e = resolve(isoMulti, planGsdMixed);
+    assert(e.status === 0 && e.json.status === 'ok' && e.json.code_dir === wt('asgard'),
+      `(e) .gsd/** mixed with one repo's paths → exit 0 / ok / asgard (got ${e.status}/${e.json.status})`);
+
+    // (f) `## Files to Change` free-text fallback, both bullet shapes + backticked line-refs.
+    const f = resolve(isoMulti, planFilesToChange);
+    assert(f.status === 0 && f.json.status === 'ok' && f.json.code_dir === wt('asgard'),
+      `(f) files-to-change fallback attributes to asgard (got ${f.status}/${f.json.status}/${f.json.code_dir})`);
+    assert(f.json.source === 'files-to-change' && f.json.paths_considered === 2,
+      `(f) source is files-to-change with exactly the 2 in-section paths (got ${f.json.source}/${f.json.paths_considered})`);
+
+    // (g) exact per-file counts of both reasons — never a document-wide includes() (M016 S03 R2).
+    // dispatch: enum bullet + trigger row + step 0.5 verdict prose. task/next: gate + prose
+    // trigger-list. auto has NO prose trigger-list (only the guard prose) → gate only.
+    const REASON_COUNTS = {
+      'shared/forge-dispatch.md':   3,
+      'skills/forge-task/SKILL.md': 2,
+      'skills/forge-next/SKILL.md': 2,
+      'skills/forge-auto/SKILL.md': 1,
+    };
+    for (const [file, expected] of Object.entries(REASON_COUNTS)) {
+      const content = read(file);
+      for (const needle of ['sidecar-multirepo-unsupported', 'sidecar-code-dir-undeclared']) {
+        const got = content.split(needle).length - 1;
+        assert(got === expected, `(g) ${file} mentions ${needle} exactly ${expected}x (got ${got})`);
+      }
+    }
+
+    // (h) contract note authored ONCE in the canonical spec (D13 formula-once).
+    const spec = read('shared/forge-dispatch.md');
+    const note = 'The sidecar assumes ONE `CODE_DIR` that is a git repository';
+    const noteCount = spec.split(note).length - 1;
+    assert(noteCount === 1, `(h) shared/forge-dispatch.md carries the contract note exactly once (got ${noteCount})`);
+
+    // (i) Pitfall 2 guard: the fix is INERT unless the `worktree →` PROSE bullet points at the
+    // per-unit variable — CODE_DIR/WORKER_CWD are prose variables, bash only consumes them.
+    for (const file of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+      const content = read(file);
+      const invocations = content.split('forge-code-dir.js').length - 1;
+      assert(invocations >= 1, `(i) ${file} invokes forge-code-dir.js (got ${invocations})`);
+      const bullet = content.split(/\r?\n/).filter(l => /^- `?(worktree|ISOLATION_MODE == worktree)`? →/.test(l));
+      assert(bullet.length === 1, `(i) ${file} has exactly one \`worktree →\` prose bullet (got ${bullet.length})`);
+      assert(bullet[0].includes('UNIT_CODE_DIR'),
+        `(i) ${file} \`worktree →\` prose bullet points CODE_DIR at UNIT_CODE_DIR (Pitfall 2)`);
+    }
+
+    // (j) allowlist grep: the blind picker must survive EXACTLY once per mirror — the bootstrap
+    // line is legitimate (no plan exists yet, and an empty WORKTREE_DIR is the all-repos-failed
+    // STOP signal). Exactly-one, not zero: a second occurrence would be a new blind pick.
+    for (const file of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+      const got = read(file).split('find(x=>x.worktree').length - 1;
+      assert(got === 1, `(j) ${file} keeps the bootstrap blind picker exactly once, and adds no second one (got ${got})`);
+    }
+
+    // (k) D11: the /forge-task plan template asks the planner for `writes:`.
+    const taskSkill = read('skills/forge-task/SKILL.md');
+    assert(/`writes:` \(an array of the file paths or globs/.test(taskSkill),
+      '(k) skills/forge-task/SKILL.md Step 4 template asks for `writes:` in the frontmatter');
+    const routingDomains = taskSkill.split('ROUTING_DOMAINS').length - 1;
+    assert(routingDomains === 1,
+      `(k) skills/forge-task/SKILL.md ROUTING_DOMAINS count unchanged at 1 (got ${routingDomains})`);
+
+    // (l) CLI contract: no args → exit 2 + a forge-code-dir error line on stderr.
+    const usage = runScript('forge-code-dir.js', []);
+    assert(usage.status === 2 && /forge-code-dir error:/.test(usage.stderr),
+      `(l) no-args invocation exits 2 with a forge-code-dir error line (got ${usage.status})`);
+
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/smokeCodeDirMultiRepo\(\);/.test(mainBody),
+      '(final) Section 63 is registered in main()');
+    pass('(final) Section 63: CODE_DIR multi-repo resolution verified — attributed, refused, or short-circuited, never an arbitrary pick');
+  } finally {
+    cleanup(root);
+  }
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -8075,6 +8254,7 @@ async function main() {
     smokeXllmResultFileGuard();
     smokeRoutingDomains();
     smokeInitGitGuarantee();
+    smokeCodeDirMultiRepo();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
