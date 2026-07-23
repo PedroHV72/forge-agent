@@ -250,6 +250,28 @@ Modeled on **Fallback agents** above. One event type, two triggers discriminated
 
 > `<ISO>` for both comes from bash (`date -u +%Y-%m-%dT%H:%M:%SZ`) — never from inside a script. **Rebuttal has no fallback of its own:** an adapter rebuttal failure degrades non-conceded objections to `maintained` (conservative), it does NOT emit this event nor dispatch an agent (see Step 4).
 
+### Agent unavailability (review-agent-unavailable)
+
+**Escopo.** Cobre o `Agent()` in-context da review **morrer** (429, erro de API, timeout, throw de qualquer natureza) nos Steps 2 (challenge), 3 (defense) e 4 (rebuttal). É distinto de `{challenger}-exit-nonzero` acima, que cobre o **CLI externo** e continua exatamente onde está — sem alterações.
+
+**1. Retry primeiro (binding, formula-once).** Os `Agent()` dos Steps 2/3/4 **não são exceção** ao `shared/forge-dispatch.md § Retry Handler`. On throw → aplicar o handler como está: classificar via `scripts/forge-classify-error.js`, e para `retry: true` (transientes — `rate-limit`, `server`, `network`, `stream`, `connection`) aplicar backoff e **re-despachar o MESMO agente**, limitado por `PREFS.retry.max_transient_retries` (default `3`) e `retry.base_backoff_ms`. O contador `attempt` é **em memória, por dispatch** — a review é uma sequência lógica única no contexto do orquestrador, sem arquivo de estado. A escada é citada, nunca reimplementada aqui.
+
+**2. Override do terminal action (delta central).** O handler roteia `retry: false` e exaustão para o bloco CRITICAL do `skills/forge-auto/SKILL.md` Step 5 (desativa auto-mode, para o loop). Para a review isso é **proibido** — o gate nunca bloqueia. Nesses dois casos: emitir `review-agent-unavailable` (enum de reasons em `shared/forge-dispatch.md § Engine Fallback Discipline`, home canônico — não replicado aqui) e aplicar a política por modo abaixo. **Jamais** o caminho CRITICAL.
+
+**3. Regra de conduta do orquestrador.**
+
+> **REGRA CRÍTICA:** o orquestrador NUNCA produz veredito de review no lugar de um agente indisponível — nem defesa, nem réplica, nem julgamento de objeção alheia. A única ação permitida é registrar a indisponibilidade e escalar ao humano (interativo) ou deferir à triagem final (auto).
+
+Rationale: o orquestrador é o **autor** do dispatch (e, no loop, do próprio código sob review). Arbitrar no lugar do agente ausente destrói exatamente a independência que a review dialética existe para garantir — mesma família de "executar inline nunca é fallback aceitável".
+
+**4. Política por modo.**
+
+- **`review-advocate-unavailable`** (Step 3 não pôde ser ouvido) — todas as objeções ficam `open` **cruas**, sem veredito fabricado, e o **Step 4 (rebuttal) é PULADO**: sem defesa não há contraditório, e forçar a réplica seria o challenger julgando a própria objeção. `MODE == interactive` → as objeções sobem ao humano pelo `AskUserQuestion` do Step 7b já existente, com a ressalva de adversarialidade reduzida escrita no artefato. `MODE == auto` → `ask_in_auto: defer` marca cada uma `**Decisão:** deferido → triagem no fim da milestone` (Step 9), sem pausar o loop.
+- **`review-challenger-unavailable`** (Step 2 in-context não pôde rodar) — não há objeções para debater. Escrever um `{S##}-REVIEW.md` / `{TASK_ID}-REVIEW.md` **mínimo que registra a indisponibilidade** e seguir; o gate prossegue para `complete-slice` normalmente. **PROIBIDO** renderizar esse caminho como limpo — nada de `NO_FLAGS`, "Reviewer found nothing to challenge.", "no flags" ou artefato sem bloco de indisponibilidade: **ausência de review não é aprovação**.
+- **`review-rebuttal-unavailable`** (Step 4 in-context não pôde rodar, defesa já ouvida no Step 3) — a réplica nunca aconteceu, então nenhum veredito de challenger (`maintained`/`withdrawn`) pode ser fabricado pelo orquestrador. Os vereditos do advocate (`refuted`/`open`/`conceded`) são carregados adiante **exatamente como o advocate os deixou**, sem synthesis. `MODE == interactive` → sobem ao humano no `AskUserQuestion` do Step 7b, com a ressalva de que a rodada de réplica não ocorreu escrita no artefato. `MODE == auto` → `ask_in_auto: defer` marca cada item não-`conceded` `**Decisão:** deferido → triagem no fim da milestone` (Step 9), sem pausar o loop.
+
+**5. Limite conhecido (honesto, não promessa de robustez).** A classificação é feita sobre o **texto** da exceção — o tool `Agent()` não expõe código HTTP estruturado. Se o provedor mudar o texto, a classificação degrada para `unknown → retry: false` → indisponibilidade declarada + o caminho sancionado acima. A direção da degradação é **fail-safe**: menos retry, nunca improviso, nunca loop.
+
 ## Step 0a — Idempotency
 
 If `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already exists → **skip the gate** (a prior run, or a resume after compaction, already produced it). Proceed to `complete-slice`.
@@ -296,7 +318,7 @@ Parse the result:
 - `NO_FLAGS` → no objections. Write a clean `{S##}-REVIEW.md` ("Reviewer found nothing to challenge."), proceed. Done.
 - otherwise → capture the severity buckets as `OBJECTIONS` (each line carries a stable id `R#`, a `path:line`, the claim, and a `challenge:` question — see `agents/forge-reviewer.md § Output format`).
 
-If the `Agent()` call **throws** → record a one-line note, write a `{S##}-REVIEW.md` stub noting the review could not run, and proceed. **Review failures never abort `complete-slice`.**
+If the `Agent()` call **throws** → apply **§ Agent unavailability (review-agent-unavailable)** above: retry first (Retry Handler), and only if the agent stays unavailable emit `review-challenger-unavailable` and write a `{S##}-REVIEW.md` **mínimo que registra a indisponibilidade** — never the `NO_FLAGS` clean-artifact branch above (ausência de review não é aprovação). **Review failures never abort `complete-slice`.**
 
 ### `challenger == 'codex' | 'gemini'` (S01 adapter)
 
@@ -341,7 +363,7 @@ fi
 
 **Scope of the override:** this `model:` override only applies to the `engine: agents` dispatch path above (Step 3). Under `engine: workflow`, the advocate runs as `agentType: 'forge-advocate'` inside the workflow script (see `## Engine workflow` below) — the script does not accept a per-call `model:` override, so the agent's own frontmatter (now Fable 5 by default) governs there instead.
 
-Capture per-objection verdicts: `R# → {refuted | conceded | open} + rationale`. A throw here → treat every objection as `open` (the defense couldn't be heard) and continue.
+Capture per-objection verdicts: `R# → {refuted | conceded | open} + rationale`. A throw here → apply **§ Agent unavailability (review-agent-unavailable)** above: retry first (Retry Handler); if the advocate stays unavailable, emit `review-advocate-unavailable`, leave every objection `open` **cru** (no fabricated verdict), **skip Step 4 entirely**, and continue via the per-mode policy (interactive → human at Step 7b; auto → `defer` → Step 9).
 
 ## Step 4 — Rebuttal (rebuttal mode) × `rounds`
 
@@ -354,7 +376,7 @@ Agent({ subagent_type: 'forge-reviewer',
   prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: complete-slice/{S##}\nDIFF_CMD: {DIFF_CMD}\nOBJECTIONS:\n{OBJECTIONS}\nDEFENSE:\n{DEFENSE}" })
 ```
 
-When `DEFENSE` is present the reviewer runs in **rebuttal mode** (`agents/forge-reviewer.md § Rebuttal mode`): it only re-litigates objections the advocate `refuted` or marked `open`, returning `maintained` or `withdrawn` + a reason. Objections the advocate `conceded` are carried through as `conceded` (settled — nothing to rebut). A throw → treat all non-conceded objections as `maintained` (conservative). Only the last round's verdicts count.
+When `DEFENSE` is present the reviewer runs in **rebuttal mode** (`agents/forge-reviewer.md § Rebuttal mode`): it only re-litigates objections the advocate `refuted` or marked `open`, returning `maintained` or `withdrawn` + a reason. Objections the advocate `conceded` are carried through as `conceded` (settled — nothing to rebut). A throw here → apply **§ Agent unavailability (review-agent-unavailable)** above: retry first (Retry Handler); if the challenger stays unavailable at this stage, emit `review-rebuttal-unavailable` and carry every non-conceded objection through with the advocate's own verdict (`refuted`/`open`) **unchanged** — `maintained` is never stamped by the orchestrator, since that label means the challenger heard the defense and held its ground, which did not happen here. If Step 3 ended in `review-advocate-unavailable`, Step 4 **does not run at all** (see **§ Agent unavailability (review-agent-unavailable)**): the objections stay `open` cruas. Only the last round's verdicts count.
 
 ### `challenger == 'codex' | 'gemini'` (S01 adapter)
 
@@ -588,11 +610,11 @@ The artifact is the **dialogue**, not a flag dump. Auditable, durable with the m
 - `path:line` — pattern `{p}` — <context>   ← optional; deterministic grep, same patterns as forge-completer step 4a
 ```
 
-Omit any section with zero items.
+Omit any section with zero items — **exceto** o bloco de indisponibilidade do caminho `review-agent-unavailable`, que é obrigatório sempre que um agente não pôde ser ouvido e nunca pode ser lido como aprovação (ver **§ Agent unavailability (review-agent-unavailable)**).
 
-**`Challenger` line:** `claude` → `**Challenger:** claude`. External challenger with `challengerModel` set → `**Challenger:** codex (gpt-5-x)` / `**Challenger:** gemini (Gemini 3.1 Pro (High))`; model unset → `**Challenger:** codex (default do CLI)` / `**Challenger:** gemini (default do CLI)`. When a challenge fell back from the external CLI to the agent (`review-challenger-fallback` / `{challenger}-exit-nonzero`), stamp `**Challenger:** claude (fallback de codex)` / `**Challenger:** claude (fallback de gemini)` to keep the artifact honest about what actually ran.
+**`Challenger` line:** `claude` → `**Challenger:** claude`. External challenger with `challengerModel` set → `**Challenger:** codex (gpt-5-x)` / `**Challenger:** gemini (Gemini 3.1 Pro (High))`; model unset → `**Challenger:** codex (default do CLI)` / `**Challenger:** gemini (default do CLI)`. When a challenge fell back from the external CLI to the agent (`review-challenger-fallback` / `{challenger}-exit-nonzero`), stamp `**Challenger:** claude (fallback de codex)` / `**Challenger:** claude (fallback de gemini)` to keep the artifact honest about what actually ran. When the in-context challenger itself could not run (`review-challenger-unavailable`), stamp `**Challenger:** claude — indisponível (review-challenger-unavailable)`; the artifact then carries the mandatory unavailability block and states no review was performed.
 
-**`Defender` line:** `ADVOCATE_ALIAS` non-empty → `**Defender:** {advocate_model} ({ADVOCATE_ALIAS})` (e.g. `**Defender:** claude-fable-5 (fable)`); `ADVOCATE_ALIAS` empty (id with no known alias) → `**Defender:** {advocate_model} (frontmatter — sem alias)`, matching the Step 3 warning.
+**`Defender` line:** `ADVOCATE_ALIAS` non-empty → `**Defender:** {advocate_model} ({ADVOCATE_ALIAS})` (e.g. `**Defender:** claude-fable-5 (fable)`); `ADVOCATE_ALIAS` empty (id with no known alias) → `**Defender:** {advocate_model} (frontmatter — sem alias)`, matching the Step 3 warning. Advocate unavailable → `**Defender:** {advocate_model} — indisponível (review-advocate-unavailable)`, with the objections listed as `open` cruas and the reduced-adversariality caveat spelled out.
 
 **`Pairing` line:** written verbatim as `$PAIRING_LINE` (assembled once in Step 0 — see "Regra de render da linha `**Pairing:**`" above). Format: `**Pairing:** <modo> — autor <engine> → challenger <família>`, with the ` (<policy>: <counts.claude> claude / <counts.codex> codex → autor <engine>)` suffix appended only when the resolution was mixed (`PAIR_POLICY` = `majority`|`tie-last`). Boundary-agnostic: identical for `S##-REVIEW.md` and `{TASK_ID}-REVIEW.md` — no per-boundary variant exists.
 
@@ -637,6 +659,14 @@ Append one line per agent dispatch to `{WORKING_DIR}/.gsd/forge/events.jsonl` (I
 
 `conceded_fixed`, `engine`, `challenger` and `advocate` are additive fields (readers that ignore unknown fields stay compatible — same convention as `tier`/`reason` from M002). `engine` is either `"agents"` or `"workflow"` and is emitted by **both** engine paths. `conceded_fixed`: number of conceded items whose Step 7a fix landed. `challenger` is `"claude"`, `"codex"` or `"gemini"` — the challenger that actually ran the challenge (so an external→agent fallback records `"claude"`). `advocate` is the resolved `ADVOCATE_ALIAS` (e.g. `"fable"`) or JSON `null` when the id had no known alias (frontmatter governed instead) — same optional-field glue pattern as the rest of this event.
 
+**Agent unavailability (additive).** When a review `Agent()` stayed unavailable after the Retry Handler (see **§ Agent unavailability (review-agent-unavailable)**), append one extra line — it does **not** replace the `review` line above; both are emitted, and the Step 6 header is stamped honestly with what actually ran:
+
+```json
+{"ts":"<ISO-8601>","event":"review-agent-unavailable","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","reason":"review-advocate-unavailable","attempts":N}
+```
+
+`reason` is a member of the closed enum (`review-advocate-unavailable` | `review-challenger-unavailable` | `review-rebuttal-unavailable`); `attempts` is the in-memory retry count when the agent was declared unavailable. `<ISO>` comes from bash (`date -u +%Y-%m-%dT%H:%M:%SZ`) — never from inside a script. Additive convention as above: readers that ignore unknown events/fields stay compatible.
+
 ## Step 9 — Milestone-final triage (before `complete-milestone`)
 
 Consumer: `forge-auto` / `forge-next`, when the derived unit is `complete-milestone` — **before dispatching `forge-completer`**. This is the operator's arbitration moment: all slice work is done, but the milestone has not yet been finalized (no final merge close-out, no LEDGER entry, no cleanup). Deferred review items get decided HERE, while acting on them is still cheap.
@@ -660,6 +690,8 @@ Consumer: `forge-auto` / `forge-next`, when the derived unit is `complete-milest
 When `style == flags`: run Step 2 only — routed by `challenger` (so `codex`/`gemini` use the adapter's `--mode challenge --engine $XLLM_ENGINE`, `claude` uses `forge-reviewer`). Write the findings (+ optional pattern hits) into `{S##}-REVIEW.md` under a single `## ⚠ Review Flags` heading. No advocate, no rebuttal, no Ask. This reproduces the pre-dialectic advisory behavior for users who opt out of the debate.
 
 ## Cross-references
+- `shared/forge-dispatch.md § Retry Handler` — retry/backoff ladder reused verbatim by **§ Agent unavailability (review-agent-unavailable)** (with the CRITICAL terminal action overridden there)
+- `scripts/forge-classify-error.js` — deterministic classifier behind that retry decision (`unknown → retry:false`, fail-safe)
 - `agents/forge-reviewer.md` — challenger + rebuttal mode
 - `agents/forge-advocate.md` — defender
 - `skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md` — gate invocation (before `complete-slice`) + milestone-final triage (Step 9, before `complete-milestone`)

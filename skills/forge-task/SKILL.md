@@ -1044,7 +1044,11 @@ TaskCreate({ subject: "[{TASK_ID}] review", activeForm: "review · forge-reviewe
 - **Resolve** via the Step 5 truth table; write the dialogue to `{TASK_ID}-REVIEW.md` (Step 6 template, `## Pattern hits` from `PATTERN_HITS`). The header carries the `**Pairing:**` line (`$PAIRING_LINE`, assembled in Step 0 of the shared spec) exactly as in `S##-REVIEW.md` — boundary-agnostic, no task-specific variant.
 - **CONCEDED items → fix now (Step 7a):** dispatch `forge-executor` with `UNIT: review-fix/{TASK_ID}` (isolation header when `ISOLATION_MODE != shared` — fixes land in `CODE_DIR`) to fix ONLY the conceded items, minimal diffs, commit `fix(review): {TASK_ID} conceded items`. Mark each `**Correção:** aplicada — commit {sha}` or `falhou — virou follow-up`. Skip when `review.fix_conceded: false` — then list and ask once (legacy behavior). No re-review of the fix commit.
 - **OPEN items (Step 7b):** for each, `AskUserQuestion` live (`Manter` / `Refatorar agora` — dispatches a `review-fix` unit / `Criar follow-up`) and record the decision.
-- Any `Agent()` throw is recorded; the review **never aborts the task**.
+- Any `Agent()` throw is recorded; the review **never aborts the task**. Follow `shared/forge-review.md § Agent unavailability (review-agent-unavailable)`: retry first via `shared/forge-dispatch.md § Retry Handler`; if the agent stays unavailable, emit `review-agent-unavailable` (`review-advocate-unavailable` | `review-challenger-unavailable`) — **never** the CRITICAL failure path.
+
+  > **REGRA CRÍTICA:** o orquestrador NUNCA produz veredito de review no lugar de um agente indisponível — nem defesa, nem réplica, nem julgamento de objeção alheia. A única ação permitida é registrar a indisponibilidade e escalar ao humano (interativo) ou deferir à triagem final (auto).
+
+- **Política deste modo (`MODE = interactive`):** advogado indisponível ⇒ objeções sobem **cruas** ao humano via `AskUserQuestion`, sem veredito fabricado, com Rebuttal PULADO e a ressalva de adversarialidade reduzida no artefato. Challenger indisponível ⇒ `{TASK_ID}-REVIEW.md` mínimo registrando a indisponibilidade (proibido renderizar como limpo — ausência de review não é aprovação).
 - `style: flags` → single-pass: run the challenge only, write `## ⚠ Review Flags` (+ pattern hits) into `{TASK_ID}-REVIEW.md`. No defense/rebuttal/Ask.
 
 **Append a pointer** to `{TASK_ID}-SUMMARY.md`:

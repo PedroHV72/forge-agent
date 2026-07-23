@@ -588,6 +588,8 @@ Wrap every `Agent()` dispatch call in a try/catch. On throw, run this handler. O
 4. If `result.retry === false` — bail immediately. Route to the CRITICAL failure block in `skills/forge-auto/SKILL.md` Step 5 (deactivate auto-mode, surface the `kind` to the user, stop the loop). Do NOT surface `errorMsg`.
 5. If `result.retry === true` — increment the in-memory `attempt` counter (starts at 0 before the first retry; so first retry is `attempt = 1`).
 6. If `attempt > PREFS.retry.max_transient_retries` (default `3`) — bail with message `"retries exhausted after {attempt} attempts (kind: {result.kind})"` via the same CRITICAL path. Do NOT surface `errorMsg`.
+> **Exceção — dispatches da review.** Quando o `Agent()` que lançou é um dos Steps 2/3/4 de `shared/forge-review.md` (challenge, defense, rebuttal), os passos 4 e 6 acima **não** roteiam para o caminho CRITICAL: a review nunca bloqueia o `complete-slice`/task. O terminal action é substituído por `review-agent-unavailable` + a política por modo de `shared/forge-review.md § Agent unavailability`. Todo o resto do handler (classificação, contador em memória, backoff, evento `retry`, re-dispatch) vale sem alteração.
+
 7. Compute backoff delay:
    - Preferred: use `result.backoffMs` directly when present.
    - Override (exponential): `delay_ms = 2000 * Math.pow(2, attempt - 1)` → 2000 ms / 4000 ms / 8000 ms for attempts 1/2/3.
@@ -1338,6 +1340,7 @@ Event reason strings come from a **closed enum**, documented here and nowhere el
 
 - `worker-engine-fallback` (§ Fallback above): `codex-exit-nonzero`, `codex-timeout`, `codex-invalid-json`, `codex-orphan`, `codex-error`, `surgical-reset-overlap`, `verified-reset-failed`, `sidecar-cap-exceeded`, `sidecar-state-init-failed`, `sidecar-multirepo-unsupported`, `sidecar-code-dir-undeclared`.
 - `review-challenger-fallback` (`shared/forge-review.md` § Fallback challenger): `engine-workflow-forced-agents`, `codex-exit-nonzero`, `gemini-exit-nonzero`.
+- `review-agent-unavailable` (`shared/forge-review.md` § Agent unavailability): `review-advocate-unavailable`, `review-challenger-unavailable`, `review-rebuttal-unavailable`.
 - `review-pairing-fallback` is a **related-but-distinct** event (own enum: `codex-unavailable`, `no-authorship-data`, `defend-mode-unavailable`, `scope-empty-global-fallback` — see `scripts/forge-review-pairing.js`) — referenced here, NOT folded into the two enums above.
 
 **Anti-example (forbidden):** `codex-unreliable-session` is NOT in the enum. A session-wide "unreliable" verdict without a real failed dispatch on the unit is prohibited — every fallback traces to one documented failure of one dispatch of one unit, never to an inferred pattern across units.

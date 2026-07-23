@@ -7872,7 +7872,9 @@ function smokeXllmResultFileGuard() {
     'skills/forge-auto/SKILL.md': 2,
     'skills/forge-next/SKILL.md': 2,
     'skills/forge-task/SKILL.md': 1,
-    'shared/forge-review.md': 1,
+    // 2 since TASK-009: § Agent unavailability cites the canonical enum home
+    // alongside the pre-existing § Fallback challenger reference.
+    'shared/forge-review.md': 2,
   };
   for (const [name, content] of [
     ['shared/forge-dispatch.md', spec],
@@ -8184,6 +8186,105 @@ function smokeCodeDirMultiRepo() {
   }
 }
 
+// ── Section 64: review agent unavailability — classifier behaviour + sanctioned path docs ──
+// Only ONE surface here is mechanically executable: scripts/forge-classify-error.js (the retry
+// decision behind § Agent unavailability). The per-mode policy itself is prose interpreted at
+// runtime by the orchestrator — declared doc-presence-only (same limit as TASK-006 R2 / TASK-007 R3),
+// asserted with exact per-file counts, never a document-wide includes().
+function smokeReviewAgentUnavailable() {
+  process.stdout.write('\n▸ Section 64: review-agent-unavailable — retry classifier + sanctioned path\n');
+  const repoRoot = path.dirname(SCRIPTS);
+  const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
+
+  // (a) behavioural: the classifier CLI drives the retry decision of the review binding.
+  // The CLI always exits 0 — read the JSON on stdout, never the exit status.
+  const classify = (msg) => {
+    const r = runScript('forge-classify-error.js', ['--msg', msg]);
+    return JSON.parse(r.stdout);
+  };
+
+  const rl = classify('429 rate limit');
+  assert(rl.kind === 'rate-limit' && rl.retry === true && rl.backoffMs > 0,
+    '(a) "429 rate limit" → rate-limit, retry:true, positive backoff', JSON.stringify(rl));
+  assert(classify('Too Many Requests').retry === true,
+    '(a) "Too Many Requests" → retry:true (advocate 429 is retried, not improvised around)');
+  const srv = classify('HTTP 503 overloaded');
+  assert(srv.kind === 'server' && srv.retry === true,
+    '(a) "HTTP 503 overloaded" → server, retry:true', JSON.stringify(srv));
+  assert(classify('internal server error 500').retry === true,
+    '(a) "internal server error 500" → retry:true');
+
+  // FAIL-SAFE: an unrecognised provider message must NOT loop forever — it falls into the
+  // declared unavailability path (retry:false → review-agent-unavailable + per-mode policy).
+  const unk = classify('weird opaque thing');
+  assert(unk.kind === 'unknown' && unk.retry === false,
+    '(a) opaque message → unknown, retry:false (fail-safe: declared unavailability, never infinite retry)',
+    JSON.stringify(unk));
+  const perm = classify('invalid api key');
+  assert(perm.kind === 'permanent' && perm.retry === false,
+    '(a) "invalid api key" → permanent, retry:false', JSON.stringify(perm));
+
+  // (b) doc-presence with exact per-file counts.
+  const spec = read('shared/forge-dispatch.md');
+  const review = read('shared/forge-review.md');
+  const auto = read('skills/forge-auto/SKILL.md');
+  const next = read('skills/forge-next/SKILL.md');
+  const task = read('skills/forge-task/SKILL.md');
+  const count = (content, needle) => content.split(needle).length - 1;
+
+  const REASONS = [
+    ['review-agent-unavailable', { 'shared/forge-dispatch.md': 2, 'shared/forge-review.md': 11 }],
+    ['review-advocate-unavailable', { 'shared/forge-dispatch.md': 1, 'shared/forge-review.md': 6 }],
+    ['review-challenger-unavailable', { 'shared/forge-dispatch.md': 1, 'shared/forge-review.md': 5 }],
+    ['review-rebuttal-unavailable', { 'shared/forge-dispatch.md': 1, 'shared/forge-review.md': 3 }],
+  ];
+  for (const [needle, expected] of REASONS) {
+    for (const [name, content] of [['shared/forge-dispatch.md', spec], ['shared/forge-review.md', review]]) {
+      const got = count(content, needle);
+      assert(got === expected[name],
+        `(b) ${name} has exact "${needle}" count (expected ${expected[name]}, got ${got})`);
+    }
+  }
+
+  // (c) REGRA CRÍTICA — verbatim in the canonical spec AND in all 3 orchestrator mirrors
+  // (TASK-008 lesson: a rule only in the canonical spec is inert exactly where the improvisation
+  // happened — the mirrors ARE the orchestrator).
+  const RULE = 'NUNCA produz veredito de review no lugar de um agente indisponível';
+  for (const [name, content] of [
+    ['shared/forge-review.md', review],
+    ['skills/forge-auto/SKILL.md', auto],
+    ['skills/forge-next/SKILL.md', next],
+    ['skills/forge-task/SKILL.md', task],
+  ]) {
+    const got = count(content, RULE);
+    assert(got === 1, `(c) ${name} carries the REGRA CRÍTICA verbatim exactly once (got ${got})`);
+  }
+
+  // (d) anti-approval guard: the challenger-unavailable path may never render as clean.
+  // Stated twice on purpose: once in the § Agent unavailability policy, once at the Step 2
+  // throw binding (the exact spot that could otherwise slip into the NO_FLAGS branch).
+  assert(count(review, 'ausência de review não é aprovação') === 2,
+    `(d) forge-review.md states that absence of review is not approval in both required places (got ${count(review, 'ausência de review não é aprovação')})`);
+  assert(/PROIBIDO.*NO_FLAGS/s.test(review),
+    '(d) forge-review.md forbids the NO_FLAGS/clean-artifact branch on review-challenger-unavailable');
+
+  // (e) override guard: review dispatches never inherit the Retry Handler CRITICAL terminal action.
+  assert(/Exceção — dispatches da review/.test(spec),
+    '(e) forge-dispatch.md § Retry Handler carries the named review exception');
+  assert(/dispatches da review[\s\S]{0,600}caminho CRITICAL/.test(spec),
+    '(e) the exception explicitly overrides the CRITICAL routing for review dispatches');
+
+  // (f) Step 4 is skipped when the advocate could not be heard (no self-judged rebuttal).
+  assert(/Step 4 \(rebuttal\) é PULADO/.test(review),
+    '(f) forge-review.md documents Step 4 as skipped on review-advocate-unavailable');
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/smokeReviewAgentUnavailable\(\);/.test(mainBody),
+    '(final) Section 64 is registered in main()');
+  pass('(final) Section 64: review agent unavailability — retry-first classification is fail-safe and the sanctioned path is documented in the canonical spec + all 3 mirrors');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -8255,6 +8356,7 @@ async function main() {
     smokeRoutingDomains();
     smokeInitGitGuarantee();
     smokeCodeDirMultiRepo();
+    smokeReviewAgentUnavailable();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }
