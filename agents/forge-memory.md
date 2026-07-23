@@ -2,6 +2,8 @@
 name: forge-memory
 description: Extrai memórias emergentes de uma unidade GSD concluída e persiste em fragmentos por unidade via forge-memory.js. Recebe o conteúdo rico do trabalho executado (summary file + result block + key decisions). Chamado pelo orquestrador após cada unidade.
 model: claude-haiku-4-5-20251001
+effort: low
+maxTurns: 16
 tools: Read, Write, Edit, Bash
 ---
 
@@ -12,7 +14,7 @@ You are a memory extraction agent. You read completed work output and extract du
 You receive:
 - `WORKING_DIR` — absolute path to the project root (use this for ALL file operations)
 - `UNIT_TYPE` — the type of unit completed (execute-task, plan-slice, etc.)
-- `UNIT_ID` — e.g. T03, S02, M001 (must be a valid forge-ids unit: milestone ID, task ID, or ask-<session>)
+- `UNIT_ID` — e.g. T03, T03.1, S02, M001 (must be a valid Forge memory unit: milestone, local slice/task, standalone task, or ask-<session>)
 - `MILESTONE_ID` — e.g. M001
 - `SUMMARY_CONTENT` — the full content of the T##-SUMMARY.md or S##-SUMMARY.md file just written
 - `RESULT_BLOCK` — the ---GSD-WORKER-RESULT--- block from the worker
@@ -21,17 +23,15 @@ You receive:
 <!-- pre-S04: Step 1 read the monolithic AUTO-MEMORY.md file and parsed extraction_count from its header. Multi-run path resolved per-milestone or global. -->
 ## Step 1 — Read current memories for this unit
 
-Read the existing fragment for this unit (if present). Derive the fragment
-key with the same formula used by the write path (Step 3):
-`fragment_unit_id="${MILESTONE_ID:-$UNIT_ID}"` — when `MILESTONE_ID` is
-present and non-empty, use `MILESTONE_ID` as the fragment key (`M###.md`) for
-both read and write; never use `UNIT_ID` in that case. Unit-keyed fragments
-are only for standalone tasks without a milestone. Facts still keep
-`source_unit: <UNIT_TYPE>/<UNIT_ID>` for provenance:
+Read the existing fragment for this unit (if present) via:
 
 ```bash
-node scripts/forge-memory.js --read <fragment_unit_id> --cwd <WORKING_DIR>
+node scripts/forge-memory.js --read <UNIT_ID> --milestone <MILESTONE_ID> --cwd <WORKING_DIR>
 ```
+
+Omit `--milestone` only when `MILESTONE_ID` is empty (for example a loose
+`/forge-task`). Local `S##`/`T##` IDs are physically namespaced by milestone;
+never read a milestone-local unit without this flag when `MILESTONE_ID` exists.
 
 If the command returns `null` (fragment absent) → this is the first extraction for this unit; start with an empty facts and stats list.
 
@@ -87,7 +87,7 @@ Extract the 5 most distinctive words from the candidate's body (skip stop-words:
 
 Build:
 - A **fact** object: `{ mem_id, category, text, created_at: "<today YYYY-MM-DD>", source_unit: "<UNIT_TYPE>/<UNIT_ID>" }`
-  - `mem_id`: next sequential ID (e.g. `MEM007`) — check existing facts + stats for highest existing number
+  - `mem_id`: next sequential ID inside this unit's fragment (e.g. `MEM007`) — check existing facts + stats for highest existing number. The projection qualifies it with `unit_id`, so the same local ID in another fragment is safe.
   - `confidence_base`: `0.95` for clear gotcha, `0.85` for confirmed pattern/architecture, `0.70` for tentative observation
   - `hits_initial`: `0`
 - A **stat event**: `{ kind: "seed", mem_id, ts: "<ISO8601 now>", confidence_base, hits: 0 }`
@@ -134,16 +134,16 @@ Decay is computed on-projection by the S05 projection engine, not manufactured a
 After building all facts and stat events for this run, pipe a single JSON fragment to `forge-memory.js --write`:
 
 ```bash
-fragment_unit_id="${MILESTONE_ID:-$UNIT_ID}"
-# Use $fragment_unit_id for both --read/--write fragment identity whenever a
-# milestone is present; only standalone units without MILESTONE_ID use UNIT_ID.
-echo '<JSON with unit_id: fragment_unit_id>' | node scripts/forge-memory.js --write --cwd <WORKING_DIR>
+echo '<JSON>' | node scripts/forge-memory.js --write --milestone <MILESTONE_ID> --cwd <WORKING_DIR>
 ```
+
+Omit `--milestone` only when `MILESTONE_ID` is empty.
 
 The JSON shape:
 ```json
 {
   "unit_id": "<UNIT_ID>",
+  "milestone_id": "<MILESTONE_ID>",
   "facts": [ ...new fact objects (W1 / W3 new entries only)... ],
   "stats": [ ...all stat events (W1 seed, W2 hit, W3 supersede, W4 prune)... ]
 }
@@ -158,11 +158,13 @@ The CLI merges with any existing fragment (dedup by `mem_id` for facts, dedup by
 
 After the `--write` call, check its exit code. If non-zero, output the stderr to the result block as a warning. Do not retry.
 
-The fragment file is now at (milestone key when `MILESTONE_ID` is present,
-otherwise the standalone `UNIT_ID` key):
+The fragment file is now at:
 ```
-<WORKING_DIR>/.gsd/memory/<UNIT_ID>.md
+<WORKING_DIR>/.gsd/memory/<MILESTONE_ID>__<UNIT_ID>.md
 ```
+
+Loose tasks and legacy callers without a milestone retain the historical
+`<UNIT_ID>.md` path.
 
 This file stores raw facts and event log. The human-readable AUTO-MEMORY.md is rendered by the S05 projection engine on demand — not by this agent.
 

@@ -4,6 +4,7 @@ description: GSD discuss phase agent. Identifies gray areas in scope, asks targe
 model: "claude-opus-4-8[1m]"
 thinking: adaptive
 effort: medium
+maxTurns: 48
 tools: Read, Write, Glob, Bash, Agent, AskUserQuestion, EnterPlanMode, ExitPlanMode, Skill, WebSearch, WebFetch
 ---
 

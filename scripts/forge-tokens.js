@@ -164,9 +164,13 @@ function readJsonlLines(absPath) {
 }
 
 /**
- * Aggregate dispatch token telemetry for a milestone by joining the
- * per-milestone events file (membership) with the global events file
- * (token counts) on the exact (ts, unit) key.
+ * Aggregate dispatch token telemetry for a milestone.
+ *
+ * Modern dispatch events carry their own `milestone` discriminator, which is
+ * the canonical attribution source. Older events did not, so they retain the
+ * conservative per-milestone membership fallback on the exact (ts, unit) key.
+ * The fallback intentionally prefers under-attribution to assigning another
+ * milestone's usage to the requested one.
  *
  * Read-only — never writes. Never throws (falls back to a "none" shape on
  * unexpected errors).
@@ -181,7 +185,7 @@ function readJsonlLines(absPath) {
  *   by_phase: Object<string,{count:number,input:number,output:number}>,
  *   has_telemetry: boolean,
  *   has_token_data: boolean,
- *   source: 'per-milestone'|'global'|'unattributable'|'none'
+ *   source: 'global-milestone'|'per-milestone'|'global'|'unattributable'|'none'
  * }}
  */
 function aggregate(cwd, opts) {
@@ -208,6 +212,14 @@ function aggregate(cwd, opts) {
     let selected = [];
 
     if (milestoneId) {
+      // Canonical path: modern dispatch events are self-attributing. This also
+      // keeps telemetry available after the per-milestone log is archived.
+      const canonical = dispatchLines.filter((l) => l.milestone === milestoneId);
+
+      // Compatibility path: only events with NO milestone discriminator may
+      // participate in the legacy join. A line explicitly attributed to a
+      // different milestone must never be pulled in through unit/timestamp
+      // coincidence.
       const perMsPath = path.join(cwd, '.gsd', 'milestones', milestoneId, `${milestoneId}-events.jsonl`);
       const perMsLines = readJsonlLines(perMsPath);
       const membership = new Set();
@@ -217,27 +229,28 @@ function aggregate(cwd, opts) {
         }
       }
 
+      const legacySelected = [];
       if (membership.size > 0) {
-        source = 'per-milestone';
-        // R3 (defensive): dedup on (ts,unit) so a literal duplicate dispatch
-        // line (same ts AND same unit, e.g. from a duplicate-write bug) is
-        // counted at most once. Full fix (a unique dispatch id plumbed
-        // through the telemetry pipeline) is deferred to a follow-up milestone.
-        const seen = new Set();
-        selected = [];
         for (const l of dispatchLines) {
+          if (l.milestone !== undefined && l.milestone !== null) continue;
           const key = `${l.ts}|${l.unit}`;
           if (!membership.has(key)) continue;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          selected.push(l);
+          legacySelected.push(l);
         }
+      }
+
+      if (canonical.length > 0) {
+        source = 'global-milestone';
+        // A milestone may span an upgrade. Include any safely attributable
+        // legacy rows alongside its canonical rows.
+        selected = canonical.concat(legacySelected);
+      } else if (legacySelected.length > 0) {
+        source = 'per-milestone';
+        selected = legacySelected;
       } else {
-        // R2 fix: attribution REQUIRES per-milestone membership. When the
-        // per-milestone events file is missing/empty/corrupt, we must NOT
-        // sum the entire global log under this milestoneId — that would
-        // silently attribute other milestones' totals to this one.
-        // Distinguish: global has dispatches (unattributable) vs. truly empty (none).
+        // No canonical row and no safe legacy match: never sum the whole
+        // global log under this milestone. Distinguish unattributable data
+        // from a truly empty log.
         source = dispatchLines.length > 0 ? 'unattributable' : 'none';
         selected = [];
       }
@@ -249,6 +262,27 @@ function aggregate(cwd, opts) {
     if (selected.length === 0) {
       return emptyResult(source);
     }
+
+    // Prefer the stable dispatch id when present. Legacy, unattributed rows
+    // have no id, so retain the old exact (ts,unit) defensive dedupe for those
+    // rows only. A canonical row without an id cannot be safely identified as
+    // a duplicate; count it rather than risk hiding a legitimate retry.
+    const deduped = [];
+    const seenDispatchIds = new Set();
+    const seenLegacyKeys = new Set();
+    for (const line of selected) {
+      const dispatchId = typeof line.dispatch_id === 'string' ? line.dispatch_id.trim() : '';
+      if (dispatchId) {
+        if (seenDispatchIds.has(dispatchId)) continue;
+        seenDispatchIds.add(dispatchId);
+      } else if (line.milestone === undefined || line.milestone === null) {
+        const legacyKey = `${line.ts}|${line.unit}`;
+        if (seenLegacyKeys.has(legacyKey)) continue;
+        seenLegacyKeys.add(legacyKey);
+      }
+      deduped.push(line);
+    }
+    selected = deduped;
 
     let totalInput = 0;
     let totalOutput = 0;
@@ -304,14 +338,18 @@ module.exports = { countTokens, truncateAtSectionBoundary, aggregate };
 if (require.main === module) {
   const args = process.argv.slice(2);
 
-  if (args.includes('--help') || args.includes('-h')) {
+  if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
     process.stdout.write([
       'Usage:',
       '  echo "text" | node forge-tokens.js',
+      '  echo "text" | node forge-tokens.js --scalar',
+      '  node forge-tokens.js --inline <text>',
       '  node forge-tokens.js --file <path>',
       '  node forge-tokens.js --file <path> --truncate <budgetChars> [--mandatory]',
       '',
       'Flags:',
+      '  --scalar             Read stdin and print the raw integer only',
+      '  --inline <text>      Count inline text and print the raw integer only',
       '  --file <path>        Read from file instead of stdin',
       '  --truncate <n>       Truncate at section boundary to fit n chars',
       '  --mandatory          When used with --truncate: throw (exit 1) if overflow',
@@ -323,13 +361,60 @@ if (require.main === module) {
   }
 
   try {
+    // `--inline` is a deliberately small scalar-output compatibility mode for
+    // the Forge skill call sites. It is exclusive so malformed invocations do
+    // not silently fall through to an empty stdin count.
+    const inlineIdx = args.indexOf('--inline');
+    if (inlineIdx !== -1) {
+      if (args.length !== 2 || inlineIdx !== 0 || args[1] === undefined) {
+        process.stderr.write(JSON.stringify({ error: '--inline requires exactly one text argument and cannot be combined with other flags' }) + '\n');
+        process.exit(2);
+      }
+      process.stdout.write(String(countTokens(args[1])) + '\n');
+      process.exit(0);
+    }
+
+    // Prefer this mode at orchestration call sites: large agent results remain
+    // on stdin instead of crossing argv/command-line limits (notably Windows).
+    if (args.includes('--scalar')) {
+      if (args.length !== 1 || args[0] !== '--scalar') {
+        process.stderr.write(JSON.stringify({ error: '--scalar cannot be combined with other flags' }) + '\n');
+        process.exit(2);
+      }
+      if (process.stdin.isTTY) {
+        process.stdout.write('0\n');
+        process.exit(0);
+      }
+      let input = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => { input += chunk; });
+      process.stdin.on('end', () => {
+        process.stdout.write(String(countTokens(input)) + '\n');
+      });
+      return;
+    }
+
     // Parse flags using indexOf+1 idiom (merge-settings.js style)
     const fileIdx = args.indexOf('--file');
     const truncateIdx = args.indexOf('--truncate');
     const mandatory = args.includes('--mandatory');
 
+    const allowedFlags = new Set(['--file', '--truncate', '--mandatory']);
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (!allowedFlags.has(arg)) {
+        process.stderr.write(JSON.stringify({ error: `unknown argument: ${arg}` }) + '\n');
+        process.exit(2);
+      }
+      if (arg === '--file' || arg === '--truncate') i++;
+    }
+
     let filePath = null;
-    if (fileIdx !== -1 && args[fileIdx + 1] !== undefined) {
+    if (fileIdx !== -1) {
+      if (args[fileIdx + 1] === undefined) {
+        process.stderr.write(JSON.stringify({ error: '--file requires a path argument' }) + '\n');
+        process.exit(2);
+      }
       filePath = args[fileIdx + 1];
     }
 

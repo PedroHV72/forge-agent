@@ -432,6 +432,18 @@
         }
       }
     },
+    "memory": {
+      "type": "object",
+      "description": "Política de custo da memória emergente. A seleção de fatos para prompts é determinística; este bloco controla quando vale pagar uma nova chamada de extração.",
+      "properties": {
+        "extraction": {
+          "type": "string",
+          "enum": ["adaptive", "always", "disabled"],
+          "default": "adaptive",
+          "description": "adaptive = extrai em summaries de boundary e em execute-task com sinal durável (decisão, gotcha, padrão); planos/research/discuss já persistem o conhecimento em artefatos próprios e não disparam outro modelo. always = comportamento legado após toda unidade. disabled = nunca despacha forge-memory."
+        }
+      }
+    },
     "checker_memory": {
       "type": "object",
       "description": "Loop de feedback anti-recidivismo: extrai padrões warn/fail do plan-checker e do verificador para .gsd/CHECKER-MEMORY.md, injetados nas próximas execuções (planner recebe Plan Quality Patterns; executor recebe Verification Patterns).",
@@ -477,6 +489,24 @@
           "enum": ["dialectic", "flags"],
           "default": "dialectic",
           "description": "dialectic = debate completo (challenge → defense → rebuttal → resolução). flags = single-pass legado — só o challenger, sem defesa nem perguntas."
+        },
+        "trigger": {
+          "type": "string",
+          "enum": ["adaptive", "always"],
+          "default": "adaptive",
+          "description": "adaptive = docs-only pula; código comum usa flags (1 chamada); risk:high, checklist de segurança, drift, paths sensíveis ou diff grande usam dialectic. always = preserva o style configurado em todo diff não-vazio. A decisão determinística vem de scripts/forge-cost-policy.js."
+        },
+        "adaptive_flags_lines": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 40,
+          "description": "Limiar informativo de diff pequeno para a razão de auditoria adaptive-small-diff. Código comum continua em flags acima dele até encontrar um sinal de dialectic."
+        },
+        "adaptive_dialectic_lines": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 400,
+          "description": "Total de linhas adicionadas+removidas a partir do qual review.trigger: adaptive escala para o debate dialético completo."
         },
         "rounds": {
           "type": "integer",
@@ -543,6 +573,8 @@
       "properties": {
         "auto_memory": {
           "type": "integer",
+          "minimum": 1,
+          "maximum": 16000,
           "default": 2000,
           "description": "Cap em tokens do snippet AUTO-MEMORY ({TOP_MEMORIES}) injetado em cada worker."
         },
@@ -553,6 +585,8 @@
         },
         "coding_standards": {
           "type": "integer",
+          "minimum": 1,
+          "maximum": 16000,
           "default": 3000,
           "description": "Cap compartilhado entre {CS_STRUCTURE} e {CS_RULES} (contado uma vez por dispatch)."
         }

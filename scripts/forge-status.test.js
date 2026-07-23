@@ -709,6 +709,124 @@ test('aggregate() joins (ts,unit) and sums input/output tokens correctly', () =>
   assert(agg.by_phase['plan-slice'] && agg.by_phase['plan-slice'].count === 1, 'by_phase plan-slice count');
 });
 
+test('aggregate() canonically attributes by dispatch.milestone even when timestamps differ', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-canonical-'));
+  tmpDirs.push(dir);
+  const milestoneId = 'M-20260101120000-alpha';
+  writeEventsFixture(dir, milestoneId, {
+    perMsLines: [
+      { ts: '2026-07-02T19:00:09Z', unit: 'execute-task/T01', milestone: milestoneId, status: 'done' },
+    ],
+    globalLines: [
+      {
+        ts: '2026-07-02T19:00:00Z',
+        event: 'dispatch',
+        dispatch_id: 'dispatch-canonical-1',
+        milestone: milestoneId,
+        unit: 'execute-task/T01',
+        input_tokens: 120,
+        output_tokens: 30,
+      },
+    ],
+  });
+  const agg = tokens.aggregate(dir, { milestoneId });
+  assertEq(agg.source, 'global-milestone', 'canonical source');
+  assertEq(agg.dispatch_count, 1, 'canonical dispatch_count');
+  assertEq(agg.total_input, 120, 'canonical input');
+  assertEq(agg.total_output, 30, 'canonical output');
+});
+
+test('aggregate() uses canonical milestone events after the per-milestone log is archived', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-archived-'));
+  tmpDirs.push(dir);
+  const milestoneId = 'M-20260101120000-alpha';
+  const forgeDir = path.join(dir, '.gsd', 'forge');
+  fs.mkdirSync(forgeDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(forgeDir, 'events.jsonl'),
+    JSON.stringify({
+      ts: '2026-07-02T19:00:00Z',
+      event: 'dispatch',
+      dispatch_id: 'dispatch-archived-1',
+      milestone: milestoneId,
+      unit: 'complete-milestone/' + milestoneId,
+      input_tokens: 40,
+      output_tokens: 20,
+    }) + '\n',
+    'utf8'
+  );
+  const agg = tokens.aggregate(dir, { milestoneId });
+  assertEq(agg.source, 'global-milestone', 'archived canonical source');
+  assertEq(agg.dispatch_count, 1, 'archived dispatch_count');
+  assertEq(agg.total_input, 40, 'archived input');
+});
+
+test('aggregate() never admits another milestone through the legacy timestamp join', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-cross-ms-'));
+  tmpDirs.push(dir);
+  const milestoneId = 'M-20260101120000-alpha';
+  const ts1 = '2026-07-02T19:00:00Z';
+  writeEventsFixture(dir, milestoneId, {
+    perMsLines: [{ ts: ts1, unit: 'execute-task/T01', milestone: milestoneId, status: 'done' }],
+    globalLines: [{
+      ts: ts1,
+      event: 'dispatch',
+      milestone: 'M-20260101130000-beta',
+      unit: 'execute-task/T01',
+      input_tokens: 999,
+      output_tokens: 999,
+    }],
+  });
+  const agg = tokens.aggregate(dir, { milestoneId });
+  assertEq(agg.source, 'unattributable', 'cross-milestone source');
+  assertEq(agg.dispatch_count, 0, 'cross-milestone dispatch excluded');
+  assertEq(agg.total_input, 0, 'cross-milestone input excluded');
+});
+
+test('aggregate() deduplicates by dispatch_id but preserves distinct same-second attempts', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-dispatch-id-'));
+  tmpDirs.push(dir);
+  const milestoneId = 'M-20260101120000-alpha';
+  const base = {
+    ts: '2026-07-02T19:00:00Z',
+    event: 'dispatch',
+    milestone: milestoneId,
+    unit: 'execute-task/T01',
+  };
+  writeEventsFixture(dir, milestoneId, {
+    globalLines: [
+      { ...base, dispatch_id: 'attempt-1', input_tokens: 10, output_tokens: 5 },
+      { ...base, dispatch_id: 'attempt-1', input_tokens: 10, output_tokens: 5 },
+      { ...base, dispatch_id: 'attempt-2', input_tokens: 20, output_tokens: 8 },
+    ],
+  });
+  const agg = tokens.aggregate(dir, { milestoneId });
+  assertEq(agg.dispatch_count, 2, 'same id deduped, distinct id retained');
+  assertEq(agg.total_input, 30, 'dispatch-id input total');
+  assertEq(agg.total_output, 13, 'dispatch-id output total');
+});
+
+test('aggregate() does not guess that id-less canonical same-second rows are duplicates', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-idless-modern-'));
+  tmpDirs.push(dir);
+  const milestoneId = 'M-20260101120000-alpha';
+  const base = {
+    ts: '2026-07-02T19:00:00Z',
+    event: 'dispatch',
+    milestone: milestoneId,
+    unit: 'execute-task/T01',
+  };
+  writeEventsFixture(dir, milestoneId, {
+    globalLines: [
+      { ...base, input_tokens: 10, output_tokens: 5 },
+      { ...base, input_tokens: 20, output_tokens: 8 },
+    ],
+  });
+  const agg = tokens.aggregate(dir, { milestoneId });
+  assertEq(agg.dispatch_count, 2, 'id-less canonical attempts retained');
+  assertEq(agg.total_input, 30, 'id-less canonical input total');
+});
+
 test('aggregate() all-zero-tokens case: has_telemetry true, has_token_data false', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-zero-'));
   tmpDirs.push(dir);

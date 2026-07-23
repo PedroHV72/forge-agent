@@ -4,6 +4,7 @@ description: GSD planning phase agent. Decomposes milestones into slices and sli
 model: "claude-opus-4-8[1m]"
 thinking: adaptive
 effort: medium
+maxTurns: 64
 tools: Read, Write, Glob, Grep, Bash, AskUserQuestion, Skill, WebSearch, WebFetch
 ---
 

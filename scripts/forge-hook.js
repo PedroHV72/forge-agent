@@ -211,6 +211,50 @@ const truncate = (s, max) => {
   return s.length <= max ? s : s.slice(0, max) + '…';
 };
 
+// Forge workers below have a machine-readable return contract consumed by the
+// orchestration skills.  Claude Code's SubagentStop hook can repair a missing
+// contract in-place: blocking the first stop feeds the reason back to the SAME
+// subagent, preserving its context and avoiding a costly fresh dispatch.
+//
+// forge-memory is deliberately absent.  It is a command-only agent whose
+// contract is the fragment written through forge-memory.js, not a final result
+// block.  Unknown/custom agents must remain untouched by a global hook.
+const RESULT_BLOCK_AGENTS = new Set([
+  'forge-advocate',
+  'forge-completer',
+  'forge-discusser',
+  'forge-executor',
+  'forge-plan-checker',
+  'forge-planner',
+  'forge-researcher',
+  'forge-reviewer',
+  'forge-worker',
+]);
+
+const validateForgeSubagentResult = (data) => {
+  const agentType = String(data && data.agent_type || '');
+  if (!RESULT_BLOCK_AGENTS.has(agentType)) return { ok: true, reason: 'not-forge-worker' };
+
+  // Claude Code sets stop_hook_active on the continuation caused by a blocking
+  // stop hook.  Fail open then, even if the worker ignored the feedback, so a
+  // malformed model response can never create an infinite hook loop.
+  if (data && data.stop_hook_active === true) return { ok: true, reason: 'retry-escape' };
+
+  const message = String(data && data.last_assistant_message || '');
+  if (!message.includes('---GSD-WORKER-RESULT---')) {
+    return {
+      ok: false,
+      reason: [
+        `Forge contract missing for ${agentType}.`,
+        'Before stopping, append the required ---GSD-WORKER-RESULT--- block from your agent instructions.',
+        'Do not redo completed work; only inspect your current result and emit the missing structured block.',
+      ].join(' '),
+    };
+  }
+
+  return { ok: true, reason: 'valid' };
+};
+
 // ── Schema-mismatch guard helpers (SessionStart) ──────────────────────────────
 // Lazy-load forge-doctor (owns checkSchema + CURRENT_SCHEMA). Same dev/installed
 // resolution as runs/filelock above: installed → ~/.claude/scripts/, dev → sibling.
@@ -335,6 +379,22 @@ process.stdin.on('end', () => {
 
       const started   = existing.subagent_started || Date.now();
       const durationMs = Date.now() - started;
+
+      const contract = validateForgeSubagentResult(data);
+      if (!contract.ok) {
+        fs.writeFileSync(liveFile, JSON.stringify({
+          ...existing,
+          status           : 'repairing-contract',
+          subagent_duration: durationMs,
+        }), 'utf8');
+
+        bumpHeartbeat(cwd, sessionId);
+        process.stdout.write(JSON.stringify({
+          decision: 'block',
+          reason: contract.reason,
+        }));
+        return;
+      }
 
       fs.writeFileSync(liveFile, JSON.stringify({
         ...existing,

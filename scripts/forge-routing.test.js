@@ -87,12 +87,16 @@ function withCascade({ home = null, repo = null, local = null, homeJsonc = null,
   if (repoJsonc !== null) fs.writeFileSync(path.join(repoDir, '.gsd', 'forge-prefs.jsonc'), repoJsonc);
 
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   process.env.HOME = homeDir;
+  process.env.USERPROFILE = homeDir;
   try {
     return fn(repoDir);
   } finally {
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
     try { fs.rmSync(root, { recursive: true, force: true }); } catch (_) {}
   }
 }

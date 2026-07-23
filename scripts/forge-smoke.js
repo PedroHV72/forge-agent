@@ -5406,7 +5406,7 @@ function smokePrefsViewerDoctor() {
   const migrate = require('./forge-prefs-migrate.js');
   const schema = engine.loadSchema();
 
-  // (a) Viewer: 90-knob coverage, activation, and no-drift against schema.
+  // (a) Viewer: 94-knob coverage, activation, and no-drift against schema.
   const project = mkTmp('prefs-viewer');
   const home = path.join(project, 'home');
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
@@ -5418,9 +5418,9 @@ function smokePrefsViewerDoctor() {
     const setResult = migrate.setPreference(project, 'review.rounds=3', { layer: 'local', create: true });
     assert(setResult.status === 'set', '(a) setPreference activates review.rounds=3 locally for the viewer fixture', JSON.stringify(setResult));
     const catalog = view.buildCatalog(project);
-    assert(catalog.knobs.length === 90, '(a) viewer lists all 90 knobs', `got ${catalog.knobs.length}`);
+    assert(catalog.knobs.length === 94, '(a) viewer lists all 94 knobs', `got ${catalog.knobs.length}`);
     const sections = new Set(catalog.knobs.map((knob) => knob.section));
-    assert(sections.size === 39, '(a) viewer covers all 39 sections', JSON.stringify([...sections]));
+    assert(sections.size === 40, '(a) viewer covers all 40 sections', JSON.stringify([...sections]));
     const rounds = catalog.knobs.find((knob) => knob.path === 'review.rounds');
     assert(!!rounds && rounds.active === true && rounds.value === 3 && rounds.layer === 'local',
       '(a) activated knob is ATIVO with the right layer+value', JSON.stringify(rounds));
@@ -7455,9 +7455,9 @@ function smokeRequireWorktree() {
   withHermeticHome(() => {
     const project = mkTmp('require-worktree-catalog');
     const catalog = view.buildCatalog(project);
-    assert(catalog.knobs.length === 90, '(l) viewer lists all 90 knobs (require_worktree added)', `got ${catalog.knobs.length}`);
-    assert(new Set(catalog.knobs.map((k) => k.section)).size === 39,
-      '(l) section count stays 39 (require_worktree under existing workers)', '');
+    assert(catalog.knobs.length === 94, '(l) viewer lists all 94 knobs', `got ${catalog.knobs.length}`);
+    assert(new Set(catalog.knobs.map((k) => k.section)).size === 40,
+      '(l) section count includes adaptive memory policy', '');
     const rw = catalog.knobs.find((k) => k.path === 'workers.require_worktree');
     assert(!!rw && rw.section === 'workers', '(l) require_worktree catalogued under workers', JSON.stringify(rw));
     const schema = engine.loadSchema();

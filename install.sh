@@ -54,12 +54,19 @@ if [ ! -d "$CLAUDE_DIR" ]; then
 fi
 success "Claude Code found at $CLAUDE_DIR"
 
+DISPATCH_TEMPLATES_SRC="${REPO_DIR}/shared/templates/dispatch"
+if [ ! -d "$DISPATCH_TEMPLATES_SRC" ] || ! compgen -G "${DISPATCH_TEMPLATES_SRC}/*.md" >/dev/null; then
+  echo "✗ Dispatch templates not found at: $DISPATCH_TEMPLATES_SRC"
+  exit 1
+fi
+
 # ── Backup existing if updating ───────────────────────────────────────────────
 AGENTS_DIR="${CLAUDE_DIR}/agents"
 COMMANDS_DIR="${CLAUDE_DIR}/commands"
+DISPATCH_TEMPLATES_DIR="${CLAUDE_DIR}/templates/dispatch"
 
 has_existing=false
-for f in "${AGENTS_DIR}"/forge*.md "${COMMANDS_DIR}"/forge*.md "${CLAUDE_DIR}/forge-agent-prefs.md" "${CLAUDE_DIR}/forge-agent-prefs.jsonc"; do
+for f in "${AGENTS_DIR}"/forge*.md "${COMMANDS_DIR}"/forge*.md "${CLAUDE_DIR}/forge-agent-prefs.jsonc" "${DISPATCH_TEMPLATES_DIR}"/*.md; do
   [ -f "$f" ] && has_existing=true && break
 done
 
@@ -73,10 +80,10 @@ fi
 
 if $has_existing && $UPDATE; then
   if ! $DRY_RUN; then
-    mkdir -p "$BACKUP_DIR/agents" "$BACKUP_DIR/commands"
+    mkdir -p "$BACKUP_DIR/agents" "$BACKUP_DIR/commands" "$BACKUP_DIR/templates/dispatch"
     for f in "${AGENTS_DIR}"/forge*.md; do [ -f "$f" ] && cp "$f" "$BACKUP_DIR/agents/"; done
     for f in "${COMMANDS_DIR}"/forge*.md; do [ -f "$f" ] && cp "$f" "$BACKUP_DIR/commands/"; done
-    [ -f "${CLAUDE_DIR}/forge-agent-prefs.md" ] && cp "${CLAUDE_DIR}/forge-agent-prefs.md" "$BACKUP_DIR/"
+    for f in "${DISPATCH_TEMPLATES_DIR}"/*.md; do [ -f "$f" ] && cp "$f" "$BACKUP_DIR/templates/dispatch/"; done
     [ -f "${CLAUDE_DIR}/forge-agent-prefs.jsonc" ] && cp "${CLAUDE_DIR}/forge-agent-prefs.jsonc" "$BACKUP_DIR/"
     [ -f "${CLAUDE_DIR}/forge-dispatch.md"     ] && cp "${CLAUDE_DIR}/forge-dispatch.md"     "$BACKUP_DIR/"
     [ -f "${CLAUDE_DIR}/forge-statusline.js"  ] && cp "${CLAUDE_DIR}/forge-statusline.js"  "$BACKUP_DIR/"
@@ -131,6 +138,14 @@ for f in "${REPO_DIR}/agents"/forge*.md; do
   name="$(basename "$f")"
   copy "$f" "${AGENTS_DIR}/${name}"
   info "  agents/${name}"
+done
+
+echo ""
+info "Installing dispatch templates..."
+for f in "${DISPATCH_TEMPLATES_SRC}"/*.md; do
+  name="$(basename "$f")"
+  copy "$f" "${DISPATCH_TEMPLATES_DIR}/${name}"
+  info "  templates/dispatch/${name}"
 done
 
 # ── Opus model availability probe ─────────────────────────────────────────────

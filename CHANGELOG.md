@@ -1,3 +1,23 @@
+## Unreleased — Cost-aware dispatch and native Claude Code runtime controls
+
+### Added
+
+- Deterministic, bounded Claude prompts materialized from versioned dispatch templates, with selective memory and coding-standard budgets.
+- Adaptive policy for durable-memory extraction and review depth (`skip`, `flags`, `dialectic`), with conservative high-risk defaults.
+- Per-call telemetry (`dispatch_id`, `prompt_id`, attempt, status and token estimates) and a cross-platform standalone test runner.
+- Bounded Claude subagents, `SubagentStop` result-contract enforcement and optional experimental agent-team resumption.
+
+### Changed
+
+- Sidecar file changes are Git-derived and authoritative; model-declared paths are advisory only.
+- Installers deploy and back up dispatch templates. The preference schema adds cost-policy controls.
+
+### Documentation
+
+- Added `docs/cost-optimization.md`, including Claude Code commands that complement the Forge workflow.
+
+---
+
 ## v2.0.0 (2026-07-20) — Corte do md-legacy de prefs: JSONC-only
 
 ### BREAKING

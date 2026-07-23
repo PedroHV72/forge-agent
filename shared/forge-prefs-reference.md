@@ -497,6 +497,17 @@ Filtro do file-audit do forge-completer (seção ## File Audit no S##-SUMMARY): 
 - **Default:** `["package-lock.json","yarn.lock","pnpm-lock.yaml","dist/**","build/**",".next/**",".gsd/**"]`
 - **Descrição:** Globs excluídos de ambos os lados do diff (evita ruído de lockfiles e build). Suporta prefix exato, ** (qualquer profundidade) e * dentro de segmento. Bloco ausente/vazio = este default hardcoded, sem erro.
 
+## memory
+
+Política de custo da memória emergente. A seleção de fatos para prompts é determinística; este bloco controla quando vale pagar uma nova chamada de extração.
+
+### `memory.extraction`
+
+- **Tipo:** string
+- **Default:** `"adaptive"`
+- **Valores permitidos:** `adaptive`, `always`, `disabled`
+- **Descrição:** adaptive = extrai em summaries de boundary e em execute-task com sinal durável (decisão, gotcha, padrão); planos/research/discuss já persistem o conhecimento em artefatos próprios e não disparam outro modelo. always = comportamento legado após toda unidade. disabled = nunca despacha forge-memory.
+
 ## checker_memory
 
 Loop de feedback anti-recidivismo: extrai padrões warn/fail do plan-checker e do verificador para .gsd/CHECKER-MEMORY.md, injetados nas próximas execuções (planner recebe Plan Quality Patterns; executor recebe Verification Patterns).
@@ -543,6 +554,25 @@ Review gate dialético antes de complete-slice (branch ainda não-mergeado): cha
 - **Default:** `"dialectic"`
 - **Valores permitidos:** `dialectic`, `flags`
 - **Descrição:** dialectic = debate completo (challenge → defense → rebuttal → resolução). flags = single-pass legado — só o challenger, sem defesa nem perguntas.
+
+### `review.trigger`
+
+- **Tipo:** string
+- **Default:** `"adaptive"`
+- **Valores permitidos:** `adaptive`, `always`
+- **Descrição:** adaptive = docs-only pula; código comum usa flags (1 chamada); risk:high, checklist de segurança, drift, paths sensíveis ou diff grande usam dialectic. always = preserva o style configurado em todo diff não-vazio. A decisão determinística vem de scripts/forge-cost-policy.js.
+
+### `review.adaptive_flags_lines`
+
+- **Tipo:** integer
+- **Default:** `40`
+- **Descrição:** Limiar informativo de diff pequeno para a razão de auditoria adaptive-small-diff. Código comum continua em flags acima dele até encontrar um sinal de dialectic.
+
+### `review.adaptive_dialectic_lines`
+
+- **Tipo:** integer
+- **Default:** `400`
+- **Descrição:** Total de linhas adicionadas+removidas a partir do qual review.trigger: adaptive escala para o debate dialético completo.
 
 ### `review.rounds`
 

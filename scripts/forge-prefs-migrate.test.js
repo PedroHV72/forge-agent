@@ -436,7 +436,7 @@ process.stdout.write('\nT02 — --set preserves catalogue blocks\n');
     '--set updates an already-active knob and result parses');
   assert(second.includes(protectedBlock), '--set preserves all unrelated catalogue blocks byte-for-byte');
   fs.unlinkSync(localPath);
-  const refused = setPreference(fx.cwd, 'review.rounds=9', {
+  const refused = setPreference(fx.cwd, 'review.rounds=1', {
     globalDir: fx.globalDir, localDir: fx.localDir, layer: 'local',
   });
   assert(refused.status === 'local-create-required' && !fs.existsSync(localPath),

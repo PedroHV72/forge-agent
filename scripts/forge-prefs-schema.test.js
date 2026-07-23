@@ -127,6 +127,8 @@ const INVENTORY = [
   { key: 'evidence.mode', type: 'string', default: 'lenient', source: "scripts/forge-hook.js readEvidenceMode (let mode = 'lenient'; whitelist fallback lenient)" },
   // — file_audit —
   { key: 'file_audit.ignore_list', type: 'array', default: ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'dist/**', 'build/**', '.next/**', '.gsd/**'], source: 'agents/forge-completer.md:156 hardcoded DEFAULT list' },
+  // — memory cost policy —
+  { key: 'memory.extraction', type: 'string', default: 'adaptive', source: 'scripts/forge-cost-policy.js normalizeMemoryMode; skills forge-auto/next/task adaptive gate' },
   // — checker_memory —
   { key: 'checker_memory.mode', type: 'string', default: 'enabled', source: 'agents/forge-completer.md sub-step 1.9 (enabled unless explicitly disabled)' },
   // — plan_check —
@@ -135,6 +137,9 @@ const INVENTORY = [
   { key: 'review.mode', type: 'string', default: 'enabled', source: 'shared/forge-review.md § Step 0 (gate runs unless disabled)' },
   { key: 'review.engine', type: 'string', default: 'agents', source: 'shared/forge-review.md:217 "engine == agents (default)"' },
   { key: 'review.style', type: 'string', default: 'dialectic', source: 'shared/forge-review.md:216 "style == dialectic (default)"' },
+  { key: 'review.trigger', type: 'string', default: 'adaptive', source: 'scripts/forge-cost-policy.js normalizeReviewConfig; shared/forge-review.md Step 1.5' },
+  { key: 'review.adaptive_flags_lines', type: 'integer', default: 40, source: 'scripts/forge-cost-policy.js normalizeReviewConfig flagsLines' },
+  { key: 'review.adaptive_dialectic_lines', type: 'integer', default: 400, source: 'scripts/forge-cost-policy.js normalizeReviewConfig dialecticLines' },
   { key: 'review.rounds', type: 'integer', default: 1, source: 'shared/forge-review.md:16 "review.rounds, default 1"' },
   { key: 'review.ask_in_auto', type: 'string', default: 'defer', source: 'shared/forge-review.md § Step 7b auto branch (defer default)' },
   { key: 'review.fix_conceded', type: 'boolean', default: true, source: 'shared/forge-review.md § resolution table (fix_conceded default true)' },
