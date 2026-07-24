@@ -17,6 +17,7 @@ const {
   migrateAll,
   ensureGitignore,
   setPreference,
+  resolveCurrent,
 } = require('./forge-prefs-migrate.js');
 const { parseJsonc, loadSchema, deepMerge } = require('./forge-prefs.js');
 const { legacyReadLayer } = require('./forge-prefs-legacy.js');
@@ -441,6 +442,54 @@ process.stdout.write('\nT02 — --set preserves catalogue blocks\n');
   });
   assert(refused.status === 'local-create-required' && !fs.existsSync(localPath),
     '--set does not create a local catalogue without explicit --create');
+}
+
+// Regression: --set used to append a duplicate root key and lean on JSON
+// last-wins. Two defects followed. (a) Every repeat stacked another block — a
+// real global catalogue reached 29 tier_models blocks, one per /forge-update.
+// (b) The appended block SHADOWED the documented block, so a user hand-editing
+// the catalogue changed nothing. --set now rewrites in place.
+process.stdout.write('\nT02 — --set rewrites in place instead of appending\n');
+{
+  const fx = makeFixture({ globalMd: null, repoMd: undefined, localMd: undefined });
+  const localPath = path.join(fx.localDir, 'forge-prefs.jsonc');
+  const opts = { globalDir: fx.globalDir, localDir: fx.localDir, layer: 'local' };
+  setPreference(fx.cwd, 'review.rounds=1', { ...opts, create: true });
+  const blocks = (text, key) => (text.match(new RegExp(`^ {2}"${key}":`, 'gm')) || []).length;
+  for (const rounds of [2, 3, 0, 2]) setPreference(fx.cwd, `review.rounds=${rounds}`, opts);
+  for (const value of ['/tmp/a', '/tmp/b', '/tmp/c']) setPreference(fx.cwd, `repo_path=${value}`, opts);
+  const repeated = fs.readFileSync(localPath, 'utf8');
+  const parsedRepeat = parseJsonc(repeated);
+  assert(blocks(repeated, 'review') === 1 && blocks(repeated, 'repo_path') === 1,
+    'repeated --set leaves exactly one active block per section',
+    `review=${blocks(repeated, 'review')} repo_path=${blocks(repeated, 'repo_path')}`);
+  assert(parsedRepeat.ok && parsedRepeat.value.review.rounds === 2 && parsedRepeat.value.repo_path === '/tmp/c',
+    'the last --set is what the catalogue resolves to');
+  assert(!repeated.includes('set by forge-prefs-migrate --set'),
+    'a known section needs no marker comment — it is rewritten where it belongs');
+  assert(repeated.includes('// ── review ') && repeated.indexOf('// ── review ') < repeated.indexOf('  "review":'),
+    'the documentation banner above a rewritten section survives');
+  // The original defect was unbounded growth: another full round must reproduce
+  // the same bytes rather than appending more.
+  for (const rounds of [3, 0, 2]) setPreference(fx.cwd, `review.rounds=${rounds}`, opts);
+  for (const value of ['/tmp/a', '/tmp/c']) setPreference(fx.cwd, `repo_path=${value}`, opts);
+  assert(fs.readFileSync(localPath, 'utf8') === repeated,
+    'a second round of identical --set calls is byte-for-byte a fixed point');
+  // Sibling keys written by separate calls must survive the rewrite.
+  setPreference(fx.cwd, 'review.style=flags', opts);
+  const sibling = parseJsonc(fs.readFileSync(localPath, 'utf8'));
+  assert(sibling.ok && sibling.value.review.style === 'flags' && sibling.value.review.rounds === 2,
+    'rewriting a section keeps knobs written by earlier calls');
+  // The point of the whole change: a hand edit is authoritative, and a later
+  // --set on a sibling knob must not resurrect the value the human replaced.
+  const handEdited = fs.readFileSync(localPath, 'utf8').replace('"rounds": 2', '"rounds": 3');
+  fs.writeFileSync(localPath, handEdited, 'utf8');
+  const afterHand = resolveCurrent(fx.cwd, opts).prefs;
+  assert(afterHand.review.rounds === 3, 'a hand edit to the documented block is what resolves — never shadowed');
+  setPreference(fx.cwd, 'review.style=dialectic', opts);
+  const afterSet = resolveCurrent(fx.cwd, opts).prefs;
+  assert(afterSet.review.rounds === 3 && afterSet.review.style === 'dialectic',
+    'a later --set reads the hand-edited value forward instead of overwriting it');
 }
 
 process.stdout.write(`\n${passes} passed, ${failures} failed\n`);

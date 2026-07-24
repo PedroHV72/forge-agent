@@ -476,6 +476,10 @@ module.exports = {
   segmentCatalog,
   rescaffoldCatalog,
   catalogDiff,
+  // Root-level locators, exported so other modules can address duplicate keys
+  // precisely instead of growing a competing JSONC grammar.
+  rootKeys,
+  readQuoted,
   fs,
   path,
   parseJsonc,

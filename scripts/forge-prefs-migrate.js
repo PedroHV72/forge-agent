@@ -38,6 +38,7 @@ const { execFileSync } = require('child_process');
 
 const {
   parseJsonc,
+  stripJsonc,
   preferenceLayerDescriptors,
   deepMerge,
   loadSchema,
@@ -48,6 +49,8 @@ const { legacyReadLayer } = require('./forge-prefs-legacy.js');
 const {
   generateScaffold,
   segmentCatalog,
+  rootKeys,
+  readQuoted,
   OFF_MARKER,
 } = require('./forge-prefs-scaffold.js');
 
@@ -361,29 +364,126 @@ function ensureGitignore(cwd, opts) {
   return { action: 'appended', path: gitignore, warning: `adicionado .gsd/forge-prefs.jsonc ao .gitignore; ${warning}` };
 }
 
-// Set a dotted knob while retaining every existing catalogue segment verbatim.
-// JSON permits later duplicate object keys; the JSONC reader resolves the last
-// one. Appending an active replacement section therefore edits only new bytes,
-// preserving the user-owned source block byte-for-byte. Fresh catalogues go
-// through activateValues, which shares the scaffold's OFF_MARKER grammar.
+const SET_MARKER = 'set by forge-prefs-migrate --set';
+
+// End offset of the root entry anchored at `keyStart`, just past its trailing
+// comma and newline. Walks the comment-masked text (offset-preserving), so the
+// extent is the real JSON value rather than a guess at how it was rendered.
+function rootEntryEnd(mask, text, keyStart) {
+  const quoted = readQuoted(mask, keyStart);
+  if (!quoted) return null;
+  let index = mask.indexOf(':', quoted.end);
+  if (index === -1) return null;
+  let depth = 0;
+  for (index += 1; index < mask.length; index++) {
+    const character = mask[index];
+    if (character === '"') {
+      const string = readQuoted(mask, index);
+      if (!string) continue;
+      index = string.end - 1;
+      if (depth === 0) { index += 1; break; }
+      continue;
+    }
+    if (character === '{' || character === '[') { depth += 1; continue; }
+    if (character === '}' || character === ']') {
+      if (depth === 0) break;
+      depth -= 1;
+      if (depth === 0) { index += 1; break; }
+      continue;
+    }
+    if (depth === 0 && character === ',') break;
+  }
+  while (index < mask.length && (mask[index] === ' ' || mask[index] === '\t')) index += 1;
+  if (mask[index] === ',') index += 1;
+  const newline = text.indexOf('\n', index);
+  return newline === -1 ? text.length : newline + 1;
+}
+
+// Every ACTIVE occurrence of `section` as an absolute source range, in document
+// order. A range covers the entry plus the `// set by …` marker line when one
+// labels it, so rewriting a range leaves no orphaned marker. Anchors come from
+// rootKeys — segmentCatalog draws its boundaries for the rescaffold use case and
+// clamps consecutive duplicates in a way that misattributes markers.
+function activeSectionRanges(text, section) {
+  const needle = `// ${SET_MARKER}`;
+  const mask = stripJsonc(text);
+  const lineStartOf = (index) => text.lastIndexOf('\n', Math.max(0, index - 1)) + 1;
+  const ranges = [];
+  for (const anchor of rootKeys(mask)) {
+    if (anchor.key !== section) continue;
+    const end = rootEntryEnd(mask, text, anchor.start);
+    if (end === null) continue;
+    let start = lineStartOf(anchor.start);
+    const head = text.slice(0, start);
+    const marker = head.lastIndexOf(needle);
+    // Whitespace-only between the marker and the key proves the marker labels
+    // THIS entry and not an unrelated earlier one.
+    if (marker !== -1 && head.slice(marker + needle.length).trim() === '') start = lineStartOf(marker);
+    ranges.push({ start, end });
+  }
+  return ranges;
+}
+
+// Set a dotted knob by rewriting the touched section IN PLACE, leaving every
+// other byte of the catalogue untouched. Three cases, in order:
+//
+//   1. the section is already active → rewrite the FIRST occurrence where it
+//      sits (its documentation banner is outside the range and survives) and
+//      delete any later duplicate a pre-v2 append left behind;
+//   2. the section exists only as commented scaffold → activateValues turns it
+//      on right below its own docs, not at the end of the file;
+//   3. the schema does not know the section at all → append before the root
+//      close with a marker comment explaining the stray key.
+//
+// Rewriting in place is what makes hand-editing trustworthy. The predecessor
+// appended a duplicate root key and relied on JSON last-wins, so an appended
+// block silently SHADOWED the documented block a user had edited by hand — the
+// edit parsed fine and did nothing. Case 1 exists to make those two paths agree.
 function setCatalogValue(catalogText, dotted, value, schema) {
   const parsed = parseJsonc(catalogText);
   if (!parsed.ok) throw new Error(`cannot set value in invalid JSONC: ${parsed.error.message}`);
   const keys = dotted.split('.');
   const section = keys[0];
+  // Read from the last-wins parse BEFORE any rewrite, so collapsing duplicate
+  // keys can never change what the catalogue resolves to.
   const next = setDottedValue(parsed.value, dotted, value);
-  // segmentCatalog is the only catalogue locator used here; OFF_MARKER comes
-  // from the scaffold module rather than defining a competing on/off grammar.
-  const segments = segmentCatalog(catalogText);
-  const hasSection = segments.some((segment) => segment.key === section);
-  if (!hasSection && !OFF_MARKER) throw new Error('scaffold off-marker unavailable');
-  let output = catalogText;
-  const close = output.lastIndexOf('}');
-  if (close === -1) throw new Error('catalog has no root close');
-  const head = output.slice(0, close);
-  output = `${head.endsWith('\n') ? head : `${head}\n`}${renderActiveEntry(section, next[section], 'set by forge-prefs-migrate --set')}${output.slice(close)}`;
+  const occurrences = activeSectionRanges(catalogText, section);
+  let output;
+  if (occurrences.length > 0) {
+    const entry = renderActiveEntry(section, next[section]);
+    output = '';
+    let cursor = 0;
+    for (let index = 0; index < occurrences.length; index++) {
+      const range = occurrences[index];
+      if (range.start < cursor) continue;
+      output += catalogText.slice(cursor, range.start);
+      if (index === 0) output += entry;
+      cursor = range.end;
+    }
+    output += catalogText.slice(cursor);
+  } else {
+    // segmentCatalog is the only catalogue locator used here; OFF_MARKER comes
+    // from the scaffold module rather than defining a competing on/off grammar.
+    const hasSection = segmentCatalog(catalogText).some((segment) => segment.key === section);
+    if (hasSection) {
+      // Schema is withheld: activateValues' gate is a bidirectional diff, which
+      // a single-key payload would trip against every other active knob. The
+      // value gate below covers this path instead.
+      output = activateValues(catalogText, { [section]: next[section] }, null);
+    } else {
+      if (!OFF_MARKER) throw new Error('scaffold off-marker unavailable');
+      const close = catalogText.lastIndexOf('}');
+      if (close === -1) throw new Error('catalog has no root close');
+      const head = catalogText.slice(0, close);
+      output = `${head.endsWith('\n') ? head : `${head}\n`}${renderActiveEntry(section, next[section], SET_MARKER)}${catalogText.slice(close)}`;
+    }
+  }
   const checked = parseJsonc(output);
   if (!checked.ok) throw new Error(`--set produced invalid JSONC: ${checked.error.message}`);
+  // Value gate: the touched section must resolve to exactly the requested state
+  // and nothing else may have moved.
+  const drift = resolvedDiff(next, checked.value);
+  if (drift.length > 0) throw new Error(`--set changed unrelated values: ${drift.map((entry) => entry.path).join(', ')}`);
   return output;
 }
 
