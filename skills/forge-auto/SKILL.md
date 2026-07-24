@@ -921,10 +921,16 @@ When `REASON` is `sidecar-cap-exceeded` or one of the two `CODE_DIR` refusals (`
 
 - **Timeline task:** `TaskCreate` with icon `⚡` (same as the Claude execute-task path), model label = `codex${CODEX_MODEL:+ ($CODEX_MODEL)}`; mark `in_progress`.
 - **Dispatch (detached):** invoke via the Bash tool with `run_in_background: true` (the 600s foreground ceiling does not apply). `--model` is appended only when `$SIDECAR_MODEL` is non-empty: the resolver selects the chain's Codex member and otherwise falls back to `workers.codex_model`.
+  The canonical context-parity semantics live in `shared/forge-dispatch.md § Branch C`: Security is inlined as a must-have and the bundle is informational; missing files are tolerated by the adapter.
   ```bash
+  SECURITY_FILE="${PLAN_PATH%-PLAN.md}-SECURITY.md"
+  CTX_BUNDLE=$(mktemp -t forge-ctx-bundle.XXXXXX.md)
+  node "$FORGE_SCRIPTS_DIR/forge-context-bundle.js" --cwd "$WORKING_DIR" \
+    --slice-context "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/{S##}-CONTEXT.md" --out "$CTX_BUNDLE"
   node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
     --plan "$PLAN_PATH" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
     --timeout "$WORKERS_TIMEOUT" \
+    --security "$SECURITY_FILE" --context-bundle "$CTX_BUNDLE" \
     $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
   ```
 - **Poll `$RESULT_FILE`** (`polling` state) every ~5–10s: `status == "running"` → keep polling + liveness check; `status == "done"` (exit 0) → **success**; `status == "error"` / adapter exit `!= 0` / unparseable JSON → **failure** (`reason` = `codex-error`/`codex-exit-nonzero`/`codex-invalid-json`). **Orphan:** heartbeat `updated_at` stale beyond the dynamic threshold `max(heartbeat_interval_ms × 4, 30s)` (field absent → assume 15s → 60s) → run the canonical liveness snippet (`shared/forge-dispatch.md § Orphan detection`): `stale-dead` → `kill "$pid"` (from heartbeat) → failure `reason: codex-orphan`; `stale-alive` → grace of one more poll cycle, then kill if still stale. The adapter `--timeout` is the backstop → `codex-timeout`.

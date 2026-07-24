@@ -914,9 +914,15 @@ With `REASON` now set by the guard above, control goes DIRECTLY to the **Fallbac
 RESULT_FILE=$(mktemp -t forge-xllm-result.XXXXXX.json)   # tmpdir, never under $CODE_DIR
 node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
   --state "$XLLM_STATE" --result-file "$RESULT_FILE"
+# Canonical context-parity semantics: shared/forge-dispatch.md § Branch C; Security is a must-have, the bundle informational, and missing files are tolerated.
+SECURITY_FILE="${PLAN_PATH%-PLAN.md}-SECURITY.md"
+CTX_BUNDLE=$(mktemp -t forge-ctx-bundle.XXXXXX.md)
+node "$FORGE_SCRIPTS_DIR/forge-context-bundle.js" --cwd "$WORKING_DIR" \
+  --slice-context "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/{S##}-CONTEXT.md" --out "$CTX_BUNDLE"
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
   --plan "$PLAN_PATH" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
   --timeout "$WORKERS_TIMEOUT" \
+  --security "$SECURITY_FILE" --context-bundle "$CTX_BUNDLE" \
   $([ -n "$SIDECAR_MODEL" ] && printf -- '--model %s' "$SIDECAR_MODEL")
 # ↑ dispatched with the Bash tool's run_in_background: true
 ```

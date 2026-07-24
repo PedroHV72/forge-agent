@@ -2502,6 +2502,134 @@ async function smokeXllmExecute() {
   }
 }
 
+// ── Section 69: sidecar context parity (Security + informational bundle) ────
+async function smokeSidecarContextParity() {
+  process.stdout.write('\n▸ Section 69: sidecar context parity\n');
+  const { buildExecutePrompt } = require('./forge-xllm.js');
+  const { buildContextBundle } = require('./forge-context-bundle.js');
+  const root = mkTmp('sidecar-context');
+  const repo = mkGitRepo(root);
+  const plan = path.join(root, 'T69-PLAN.md');
+  const security = path.join(root, 'T69-SECURITY.md');
+  const bundle = path.join(root, 'context.md');
+  // Result files (and the mock's captured-prompt sink) must resolve OUTSIDE the
+  // repo workspace — forge-xllm's validateResultFileTarget() rejects targets under
+  // --cwd. Allocate a sibling tmpdir, matching the Scenario H pattern above.
+  const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-sidecar-context-result-'));
+  const result = path.join(resultDir, 'result.json');
+  const promptFile = path.join(resultDir, 'captured-prompt.txt');
+  const mock = mkTmp('sidecar-context-mock');
+  const payload = JSON.stringify({ status: 'done', summary: 'ok', must_haves_status: [], files_changed: [] });
+  try {
+    fs.writeFileSync(plan, '# T69\nExecute context parity.\n', 'utf8');
+    fs.writeFileSync(security, '## Security Checklist\n\n- SENTINEL-SEC-XYZ\n', 'utf8');
+    fs.writeFileSync(bundle, '## Lint & Format Commands\n\nSENTINEL-CTX-XYZ\n', 'utf8');
+    writeMockCodex(mock, { payload, extraScript: 'printf %s "$PROMPT" > "$FORGE_PROMPT_FILE"' });
+    const env = { ...process.env, PATH: mock + path.delimiter + process.env.PATH, FORGE_PROMPT_FILE: promptFile };
+    const inline = runScript('forge-xllm.js', ['--mode', 'execute', '--plan', plan, '--result-file', result,
+      '--cwd', repo, '--security', security, '--context-bundle', bundle], { cwd: repo, env });
+    const captured = fs.existsSync(promptFile) ? fs.readFileSync(promptFile, 'utf8') : '';
+    assert(inline.status === 0, '69a: execute with context exits 0', inline.stderr || captured);
+    assert(captured.includes('SENTINEL-SEC-XYZ') && captured.includes('SENTINEL-CTX-XYZ'),
+      '69a: mock stdin contains security and context sentinels', captured);
+    assert(captured.includes('--- SECURITY CHECKLIST START ---') && captured.includes('must-have and verify'),
+      '69a: security markers and mandatory instruction are inline', captured);
+    // 69a-pos: the mandatory security instruction must be inserted right after the plan's
+    // Standards item and BEFORE "HARD PROHIBITIONS" — a hardcoded/unanchored splice index
+    // would silently drift out of that window on any edit above it.
+    {
+      const anchorPos = captured.indexOf("Treat the plan's");
+      const secInstrPos = captured.indexOf('must-have and verify all of them before reporting done');
+      const prohibitionsPos = captured.indexOf('HARD PROHIBITIONS');
+      assert(anchorPos !== -1 && secInstrPos !== -1 && prohibitionsPos !== -1
+        && anchorPos < secInstrPos && secInstrPos < prohibitionsPos,
+      '69a-pos: security instruction lands after the Standards anchor and before HARD PROHIBITIONS',
+      `anchor=${anchorPos} secInstr=${secInstrPos} prohibitions=${prohibitionsPos}`);
+    }
+
+    const missingResult = path.join(resultDir, 'missing-result.json');
+    const absent = runScript('forge-xllm.js', ['--mode', 'execute', '--plan', plan, '--result-file', missingResult,
+      '--cwd', repo, '--security', path.join(root, 'missing-security.md'), '--context-bundle', path.join(root, 'missing-context.md')], { cwd: repo, env });
+    const absentPrompt = fs.existsSync(promptFile) ? fs.readFileSync(promptFile, 'utf8') : '';
+    let missingPayload = null;
+    try { missingPayload = JSON.parse(fs.readFileSync(missingResult, 'utf8')); } catch { /* asserted below */ }
+    assert(absent.status === 0 && missingPayload && missingPayload.status === 'done',
+      '69b: missing optional files are silently omitted', absent.stderr || JSON.stringify(missingPayload));
+    assert(!absentPrompt.includes('SECURITY CHECKLIST') && !absentPrompt.includes('FORGE CONTEXT'),
+      '69b: missing optional files leave no orphan headers', absentPrompt);
+
+    const oldPrompt = buildExecutePrompt(fs.readFileSync(plan, 'utf8'));
+    assert(!oldPrompt.includes('SECURITY CHECKLIST') && !oldPrompt.includes('FORGE CONTEXT'),
+      '69c: no-extras prompt remains legacy-shaped');
+    assert(oldPrompt === buildExecutePrompt(fs.readFileSync(plan, 'utf8'), undefined),
+      '69c: no-extras prompt is byte-identical');
+
+    const oversized = path.join(root, 'oversized-security.md');
+    const oversizedResult = path.join(resultDir, 'oversized-result.json');
+    fs.writeFileSync(oversized, `## Security Checklist\n\n${'x'.repeat(24001)}`, 'utf8');
+    const tooLarge = runScript('forge-xllm.js', ['--mode', 'execute', '--plan', plan, '--result-file', oversizedResult,
+      '--cwd', repo, '--security', oversized], { cwd: repo, env });
+    let oversizedPayload = null;
+    try { oversizedPayload = JSON.parse(fs.readFileSync(oversizedResult, 'utf8')); } catch { /* asserted below */ }
+    assert(tooLarge.status === 2 && oversizedPayload && oversizedPayload.status === 'adapter-failed'
+      && oversizedPayload.error_class === 'terminal',
+    '69d: oversized security fails terminally instead of truncating', JSON.stringify(oversizedPayload));
+
+    fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.gsd', 'CODING-STANDARDS.md'), '## Lint & Format Commands\n\nnpm test\n', 'utf8');
+    const slice = path.join(root, 'S69-CONTEXT.md');
+    fs.writeFileSync(slice, '## Decisions\n\nUse sentinels.\n', 'utf8');
+    const assembled = buildContextBundle({ cwd: root, sliceContext: slice });
+    assert(assembled.includes('## Lint & Format Commands') && assembled.includes('## Slice Decisions'),
+      '69f: bundle assembler emits available source sections', assembled);
+    const empty = mkTmp('sidecar-context-empty');
+    assert(buildContextBundle({ cwd: empty }) === '', '69f: bundle assembler tolerates empty sources');
+    cleanup(empty);
+
+    // 69g: memory limiting must actually cap entries. If firstMemoryEntries() matches the
+    // wrong delimiter (e.g. a markdown `###` heading that renderMemory never emits), the
+    // "starts.length <= limit" guard always passes and the whole fragments file leaks
+    // through uncapped — this fixture reproduces that regression class directly by writing
+    // real memory fragments (the only supported input to renderMemory) and re-reading
+    // through the real assembler.
+    const memRoot = mkTmp('sidecar-context-memlimit');
+    const memoryMod = require('./forge-memory.js');
+    const entryCount = 15;
+    const facts = [];
+    for (let i = 1; i <= entryCount; i++) {
+      const id = `MEM${String(i).padStart(3, '0')}`;
+      facts.push({
+        mem_id: id,
+        category: 'pattern',
+        text: `Fixture entry number ${i} for context-bundle capping.`,
+        confidence_base: 0.9 - i * 0.01, // strictly descending -> deterministic rank order
+        created_at: '2026-07-01T00:00:00Z',
+        source_unit: 'execute-task/T01',
+      });
+    }
+    memoryMod.writeFragment(memRoot, { unit_id: 'T01', facts, stats: [] });
+    const memBundle = buildContextBundle({ cwd: memRoot });
+    const cappedDelimiters = (memBundle.match(/^<!-- gsd-auto-memory /gm) || []).length;
+    assert(cappedDelimiters === 10,
+      `69g: memory section is capped at 10 entries (got ${cappedDelimiters})`, memBundle.slice(0, 400));
+    assert(memBundle.includes('MEM001') && !memBundle.includes('MEM011'),
+      '69g: capped bundle keeps the highest-ranked entries and drops entries past the limit', memBundle.slice(0, 400));
+    cleanup(memRoot);
+
+    const sourcePaths = ['shared/forge-dispatch.md', 'skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md'];
+    for (const relative of sourcePaths) {
+      const text = fs.readFileSync(path.join(__dirname, '..', relative), 'utf8');
+      assert((text.match(/--security/g) || []).length >= 1 && (text.match(/--context-bundle/g) || []).length >= 1
+        && (text.match(/forge-context-bundle\.js/g) || []).length >= 1,
+      `69e: ${relative} wires both context flags and assembler`);
+    }
+  } finally {
+    cleanup(root);
+    cleanup(mock);
+    cleanup(resultDir);
+  }
+}
+
 // ── Section 26: engine dispatch (reset + fallback + dirty guard) ────────────
 // Validates the SCRIPTABLE pieces of the T01/S02 "worker-engine-fallback"
 // contract in isolation: (A) happy path — result JSON carries the fields the
@@ -8569,6 +8697,7 @@ async function main() {
     smokePlanGateDegradation();
     smokeXllm();
     await smokeXllmExecute();
+    await smokeSidecarContextParity();
     smokeModelAlias();
     smokeChallengerWiring();
     smokeAdvocateModel();

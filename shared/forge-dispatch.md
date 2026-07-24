@@ -1062,13 +1062,20 @@ node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
 
 **4. Dispatch detached via `run_in_background`.** The Bash tool's 600s foreground ceiling does not apply to `run_in_background: true` (MEM: sidecar dispatch via background + poll). `--model` is appended **only when `$SIDECAR_MODEL` is non-empty**: the resolver selects the chain's Codex member, then falls back to `workers.codex_model`.
 
+**Context parity (canonical).** The sidecar receives Security and the informational context core **inlined**, rather than paths: its `workspace-write -C CODE_DIR` sandbox cannot read `.gsd/**` under `WORKING_DIR`. Both flags below are unconditional; absent or empty files simply omit their prompt section. Security is a non-truncatable must-have, while the assembled bundle contains only informational data. Follow-up, intentionally out of scope: `## Slice Plan`, `## Prior Context`, and `## Checker Feedback`.
+
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "$HOME/.claude/scripts")
 SIDECAR_DISPATCH_ID=$(node -e "process.stdout.write(require('crypto').randomUUID())")
 node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
   --state "$XLLM_STATE" --dispatch-id "$SIDECAR_DISPATCH_ID"
+SECURITY_FILE="${PLAN_PATH%-PLAN.md}-SECURITY.md"
+CTX_BUNDLE=$(mktemp -t forge-ctx-bundle.XXXXXX.md)
+node "$FORGE_SCRIPTS_DIR/forge-context-bundle.js" --cwd "$WORKING_DIR" \
+  --slice-context "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/{S##}-CONTEXT.md" --out "$CTX_BUNDLE"
 XLLM_ARGS=(--mode execute --plan "$PLAN_PATH" --result-file "$RESULT_FILE" \
-  --cwd "$CODE_DIR" --timeout "$WORKERS_TIMEOUT" --dispatch-id "$SIDECAR_DISPATCH_ID")
+  --cwd "$CODE_DIR" --timeout "$WORKERS_TIMEOUT" --dispatch-id "$SIDECAR_DISPATCH_ID" \
+  --security "$SECURITY_FILE" --context-bundle "$CTX_BUNDLE")
 [ -n "$SIDECAR_MODEL" ] && XLLM_ARGS+=(--model "$SIDECAR_MODEL")
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" "${XLLM_ARGS[@]}"
 # ↑ dispatched with the Bash tool's run_in_background: true
