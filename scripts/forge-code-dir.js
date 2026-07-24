@@ -17,7 +17,8 @@
 // Library exports:
 //   resolveCodeDir({ isoResult, planPath, cwd, run }) → { status, code_dir, repo, repos_touched,
 //                                                         paths_considered, paths_unmatched,
-//                                                         source, resolution, run, reason }
+//                                                         source, resolution, run, reason,
+//                                                         multi_repo_root }
 //   parseDeclaredPaths(planText) → { paths: string[], source: 'writes+expected_output'|'files-to-change'|'none' }
 //   parseFilesToChange(planText) → string[]
 //   attributeRepo(absPath, repos) → repo|null   (longest-prefix, boundary-aware)
@@ -216,7 +217,29 @@ function emptyResult(extra) {
     resolution: '',
     run: '',
     reason: '',
+    multi_repo_root: '',
   }, extra || {});
+}
+
+// The single directory that contains EVERY usable worktree.
+//
+// `code_dir` stays EMPTY on a refusal because the SIDECAR contract demands one
+// git repo and there isn't one. The Claude executor has no such constraint — it
+// reads and writes across repos fine — yet on refusal it inherited the bootstrap
+// `WORKTREE_DIR`, i.e. the blind `repos.find(...)` first pick, and so ran inside
+// whichever repo happened to come first. This field gives that consumer (and
+// only that consumer) somewhere honest to stand.
+//
+// Derived from the literal worktree values, never recomputed from prefs: the
+// worktree root differs between single- and multi-repo workspaces. Offered only
+// when 2+ worktrees genuinely share a parent — with a single repo the bootstrap
+// value is already correct, and its parent would not even be a git repository.
+function commonWorktreeRoot(usable) {
+  const list = Array.isArray(usable) ? usable : [];
+  if (list.length < 2) return '';
+  const parents = list.map((r) => normalizePath(path.dirname(String(r.worktree || ''))));
+  if (parents.some((p) => p === '' || p === '.')) return '';
+  return parents.every((p) => p === parents[0]) ? parents[0] : '';
 }
 
 function resolveCodeDir(opts) {
@@ -343,6 +366,7 @@ function resolveCodeDir(opts) {
       source,
       run,
       reason: REASON_CROSS_REPO,
+      multi_repo_root: commonWorktreeRoot(usable),
     });
   }
 
@@ -356,6 +380,7 @@ function resolveCodeDir(opts) {
     source,
     run,
     reason: REASON_UNDECLARED,
+    multi_repo_root: commonWorktreeRoot(usable),
   });
 }
 

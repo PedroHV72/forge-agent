@@ -1944,6 +1944,32 @@ function smokeChallengerWiring() {
   assert(spec.includes('--engine "$XLLM_ENGINE"'), 'spec Steps 2/4 pass --engine to the adapter', 'token not found');
   assert(spec.includes('--model "$CHALLENGER_MODEL"'), 'spec Steps 2/4 quote --model (agy labels have spaces)', 'token not found');
 
+  // Context guard: a challenger that dies on a large diff returns no verdict, and
+  // downstream that is indistinguishable from "found nothing". Four agents were
+  // burned on one diff before the real defect was found by hand.
+  assert(spec.includes('REVIEW_SHARDS'), 'spec Step 2.0 derives REVIEW_SHARDS from the policy object', 'token not found');
+  assert(/REVIEW_SHARDS <= 1.*(exactly as before|byte-identical)/s.test(spec),
+    'spec keeps the unsharded single-dispatch path unchanged', 'no-split path not stated');
+  assert(/never hunks|never see half a function|Shards are files/.test(spec),
+    'spec splits by file, never by hunk', 'file-granularity rule not stated');
+  assert(spec.includes('REVIEWER_AGENT_ID[R#]'),
+    'spec keeps each objection routed back to the challenger that authored it', 'per-objection agent id not stated');
+  // \s+ not a literal space: the sentence wraps mid-phrase in the source.
+  assert(/Cobertura incompleta/.test(spec) && /never\s+render\s+as\s+clean/.test(spec),
+    'spec forbids a partially-failed sharded review from rendering as clean', 'partial-coverage rule not stated');
+  {
+    const policy = require(path.join(ROOT, 'scripts', 'forge-cost-policy.js'));
+    const many = (n, lines) => Array.from({ length: n }, (_, i) => ({ file: `src/f${i}.ts`, added: lines, deleted: 0 }));
+    const small = policy.planReviewShards(many(4, 50));
+    const large = policy.planReviewShards(many(30, 500));
+    assert(small.length === 1, `(shard) a small diff still dispatches once (got ${small.length})`);
+    assert(large.length > 1 && large.length <= 6, `(shard) a large diff splits within the cap (got ${large.length})`);
+    assert(large.flatMap((s) => s.files).length === 30 && new Set(large.flatMap((s) => s.files)).size === 30,
+      '(shard) every changed file lands in exactly one shard — none dropped, none duplicated');
+    assert(JSON.stringify(policy.planReviewShards(many(30, 500))) === JSON.stringify(large),
+      '(shard) the split is deterministic, so a resumed review re-derives it');
+  }
+
   // Live scenario — reuse the Section 20 mock-codex harness in challenge mode
   // and assert the normalized {objections:[...]} contract the spec's Codex
   // branch parses (path_line -> file/line, claim/suggested_fix -> issue/fix).
@@ -8286,6 +8312,31 @@ function smokeCodeDirMultiRepo() {
       `(d) single-repo workspace + legacy plan → exit 0 / ok / freyr worktree (got ${d.status}/${d.json.status})`);
     assert(d.json.paths_considered === 0 && d.json.source === 'none',
       '(d) single-repo short-circuit did not consult the plan at all');
+
+    // (c2)/(b2) Refusal still refuses the SIDECAR, but the Claude executor gets a
+    // real place to stand. Before this, it inherited the bootstrap WORKTREE_DIR —
+    // the blind repos.find() first pick — so a two-repo task ran inside whichever
+    // repo sorted first and the operator had to override CODE_DIR by hand.
+    const runRoot = path.dirname(wt('freyr'));
+    assert(b.json.multi_repo_root === runRoot,
+      `(b2) cross-repo exposes the run root holding every worktree (got ${b.json.multi_repo_root})`);
+    assert(c.json.multi_repo_root === runRoot,
+      `(c2) undeclared in a multi-repo workspace exposes the run root (got ${c.json.multi_repo_root})`);
+    assert(b.json.code_dir === '' && c.json.code_dir === '',
+      '(b2) code_dir stays empty on refusal — it is the sidecar field and the sidecar still has no answer');
+    assert(d.json.multi_repo_root === '',
+      `(d2) single-repo workspace exposes NO run root — its parent is not a git repo (got ${d.json.multi_repo_root})`);
+
+    // The three orchestrator mirrors must consume it, or the resolver change is inert.
+    for (const skill of ['forge-auto', 'forge-next', 'forge-task']) {
+      const body = fs.readFileSync(path.join(path.dirname(SCRIPTS), 'skills', skill, 'SKILL.md'), 'utf8');
+      assert(/CODE_DIR_MULTI_ROOT=\$\(node -e .*multi_repo_root/.test(body),
+        `(e2) ${skill} reads multi_repo_root from the resolver`);
+      assert(/\[ "\$CODE_DIR_STATUS" != "ok" \] && \[ -n "\$CODE_DIR_MULTI_ROOT" \] && CODE_DIR="\$CODE_DIR_MULTI_ROOT"/.test(body),
+        `(e2) ${skill} stands the Claude fallback in the run root on refusal`);
+      assert(!/executor Claude segue no WORKTREE_DIR do bootstrap/.test(body),
+        `(e2) ${skill} no longer claims the fallback keeps the bootstrap worktree`);
+    }
 
     // (m)/(n): repo-relative declarations have no workspace prefix, so only the
     // read-only second pass can resolve them. A tie deliberately remains closed.
