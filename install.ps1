@@ -357,28 +357,10 @@ if ($script:FableDowngrade -and (Test-Path $PrefsJsonc)) {
 # ── Install shared references ─────────────────────────────────────────────────
 Write-Host ""
 Info "Instalando referências compartilhadas..."
-CopyFile "$RepoDir\shared\forge-dispatch.md" "$ClaudeDir\forge-dispatch.md"
-Info "  forge-dispatch.md"
-if (Test-Path "$RepoDir\shared\forge-review.md") {
-    CopyFile "$RepoDir\shared\forge-review.md" "$ClaudeDir\forge-review.md"
-    Info "  forge-review.md"
-}
-if (Test-Path "$RepoDir\shared\forge-mcps.md") {
-    CopyFile "$RepoDir\shared\forge-mcps.md" "$ClaudeDir\forge-mcps.md"
-    Info "  forge-mcps.md"
-}
-if (Test-Path "$RepoDir\shared\forge-domain-probes.md") {
-    CopyFile "$RepoDir\shared\forge-domain-probes.md" "$ClaudeDir\forge-domain-probes.md"
-    Info "  forge-domain-probes.md"
-}
-if (Test-Path "$RepoDir\shared\forge-principles.md") {
-    CopyFile "$RepoDir\shared\forge-principles.md" "$ClaudeDir\forge-principles.md"
-    Info "  forge-principles.md"
-}
-$cutover = Join-Path (Join-Path $RepoDir 'shared') 'forge-prefs-cutover.md'
-if (Test-Path $cutover) {
-    CopyFile $cutover (Join-Path $ClaudeDir 'forge-prefs-cutover.md')
-    Info "  forge-prefs-cutover.md"
+$SharedSrc = Join-Path $RepoDir 'shared'
+Get-ChildItem -Path $SharedSrc -Filter '*.md' -File | ForEach-Object {
+    CopyFile $_.FullName (Join-Path $ClaudeDir $_.Name)
+    Info ("  " + $_.Name)
 }
 
 # Review dialetico schemas (fonte unica, resolvidos de scripts/../schemas/ em runtime).

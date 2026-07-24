@@ -6618,8 +6618,10 @@ function smokePrefsChokepoints() {
     '(c) install.ps1 does not CopyFile the repository forge-agent-prefs.md template', 'install.ps1');
   assert(ps.includes('--global-only'),
     '(c) install.ps1 invokes forge-prefs-migrate.js --global-only', 'install.ps1');
-  assert(/forge-prefs-cutover\.md/.test(sh), '(c2) install.sh copies forge-prefs-cutover.md', 'install.sh');
-  assert(/CopyFile[\s\S]*forge-prefs-cutover\.md/.test(ps), '(c2) install.ps1 copies forge-prefs-cutover.md', 'install.ps1');
+  assert(/for f in .*shared\/\*\.md/.test(sh),
+    '(c2) install.sh copies shared references through the glob loop', 'install.sh');
+  assert(/Get-ChildItem[\s\S]*-Path \$SharedSrc[\s\S]*-Filter '\*\.md'/m.test(ps),
+    '(c2) install.ps1 copies shared references through the Get-ChildItem loop', 'install.ps1');
   const psLegacyStart = ps.indexOf("elseif (Test-Path $prefsFile)");
   const psFirstNextBranch = ps.indexOf("elseif (Get-Command node", psLegacyStart);
   const psScaffoldStart = ps.indexOf("elseif (Get-Command node", psFirstNextBranch + 1);
@@ -8403,6 +8405,55 @@ function smokeReviewAgentUnavailable() {
   pass('(final) Section 64: review agent unavailability — retry-first classification is fail-safe and the sanctioned path is documented in the canonical spec + all 3 mirrors');
 }
 
+// ── Section 68: shared reference glob — installer anti-drift guard ─────────
+function smokeSharedGlob() {
+  process.stdout.write('\n▸ Section 68: shared/*.md installer glob — dynamic anti-drift guard\n');
+  const repo = path.dirname(SCRIPTS);
+  const shPath = path.join(repo, 'install.sh');
+  const psPath = path.join(repo, 'install.ps1');
+  const sh = fs.readFileSync(shPath, 'utf8');
+  const ps = fs.readFileSync(psPath, 'utf8');
+  const expected = fs.readdirSync(path.join(repo, 'shared'))
+    .filter((name) => name.endsWith('.md'));
+
+  // PowerShell is not available on the Unix smoke runner, so sh↔ps1
+  // behavioral parity is checked here by source-level grep guards only.
+  assert(/for f in .*shared\/\*\.md/.test(sh),
+    '(a) install.sh iterates shared/*.md with one glob loop', sh);
+  assert(!/^\s*copy "\$\{REPO_DIR\}\/shared\/forge-[^"]+\.md"/m.test(sh),
+    '(b) install.sh has no individual shared forge copy blocks', sh);
+  assert(/Get-ChildItem[\s\S]*-Path \$SharedSrc[\s\S]*-Filter '\*\.md'/m.test(ps),
+    '(c) install.ps1 iterates shared/*.md with Get-ChildItem', ps);
+  assert(!/^\s*if \(Test-Path "\$RepoDir\\shared\\forge-[^"]+\.md"\)/m.test(ps),
+    '(d) install.ps1 has no individual shared forge Test-Path blocks', ps);
+  assert(!fs.readFileSync(psPath).includes(0x0c),
+    '(e) install.ps1 contains no literal 0x0C byte', psPath);
+
+  const bashProbe = spawnSync('bash', ['--version'], { encoding: 'utf8' });
+  if (bashProbe.error || bashProbe.status !== 0) {
+    pass('(f) shared/*.md dry-run guard skipped (bash unavailable)');
+  } else {
+    const dryHome = mkTmp('install-shared-glob-home');
+    try {
+      fs.mkdirSync(path.join(dryHome, '.claude'), { recursive: true });
+      const dry = spawnSync('bash', [shPath, '--dry-run', '--update'], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: dryHome },
+      });
+      const output = `${dry.stdout || ''}${dry.stderr || ''}`;
+      assert(dry.status === 0, '(g) shared/*.md dry-run exits 0', output);
+      for (const name of expected) {
+        assert(output.includes(name),
+          `(g) shared/*.md dry-run includes ${name}`, output);
+      }
+    } finally {
+      cleanup(dryHome);
+    }
+  }
+
+  pass('(final) Section 68: shared reference installers are glob-driven and protected against new-file drift');
+}
+
 // ── Section 65: live phases table — resolver-derived rows + anti-drift guard ──
 // The fixture intentionally contains both the default and a named domain. This
 // makes routing resolution observable without relying on developer-machine
@@ -8562,6 +8613,7 @@ async function main() {
     smokeInitGitGuarantee();
     smokeCodeDirMultiRepo();
     smokeReviewAgentUnavailable();
+    smokeSharedGlob();
     smokePhasesTable();
     smokeSidecarModel();
     smokeVerifierCodeDir();

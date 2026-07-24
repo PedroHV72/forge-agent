@@ -419,28 +419,12 @@ fi
 # ── Install statusline + hooks ────────────────────────────────────────────────
 echo ""
 info "Installing shared references..."
-copy "${REPO_DIR}/shared/forge-dispatch.md" "${CLAUDE_DIR}/forge-dispatch.md"
-info "  forge-dispatch.md"
-if [ -f "${REPO_DIR}/shared/forge-review.md" ]; then
-  copy "${REPO_DIR}/shared/forge-review.md" "${CLAUDE_DIR}/forge-review.md"
-  info "  forge-review.md"
-fi
-if [ -f "${REPO_DIR}/shared/forge-mcps.md" ]; then
-  copy "${REPO_DIR}/shared/forge-mcps.md" "${CLAUDE_DIR}/forge-mcps.md"
-  info "  forge-mcps.md"
-fi
-if [ -f "${REPO_DIR}/shared/forge-domain-probes.md" ]; then
-  copy "${REPO_DIR}/shared/forge-domain-probes.md" "${CLAUDE_DIR}/forge-domain-probes.md"
-  info "  forge-domain-probes.md"
-fi
-if [ -f "${REPO_DIR}/shared/forge-principles.md" ]; then
-  copy "${REPO_DIR}/shared/forge-principles.md" "${CLAUDE_DIR}/forge-principles.md"
-  info "  forge-principles.md"
-fi
-if [ -f "${REPO_DIR}/shared/forge-prefs-cutover.md" ]; then
-  copy "${REPO_DIR}/shared/forge-prefs-cutover.md" "${CLAUDE_DIR}/forge-prefs-cutover.md"
-  info "  forge-prefs-cutover.md"
-fi
+for f in "${REPO_DIR}"/shared/*.md; do
+  [ -f "$f" ] || continue
+  name="$(basename "$f")"
+  copy "$f" "${CLAUDE_DIR}/${name}"
+  info "  ${name}"
+done
 
 # Review dialético schemas (single source, resolved from scripts/../schemas/ at runtime).
 if [ -d "${REPO_DIR}/shared/schemas" ]; then
