@@ -2406,7 +2406,9 @@ async function smokeXllmExecute() {
     cleanup(mockDir);
   }
 
-  // Scenario H — .gsd/ warning: advisory only, run still succeeds.
+  // Scenario H — new .gsd/ delta from the sidecar is TERMINAL (PR #52); a
+  // pre-existing dirty .gsd/ is exempt (pre-dirty snapshot — covered by
+  // scripts/forge-xllm-runtime.test.js).
   {
     const repo = mkGitRepo(mkTmp('xllm-exec-h'));
     const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-exec-plan-'));
@@ -2421,11 +2423,13 @@ async function smokeXllmExecute() {
       extraScript: `mkdir -p "$CODEXCWD/.gsd" && printf 'x' > "$CODEXCWD/.gsd/x.md"`,
     });
     const r = runExecuteXllm(['--plan', planFile, '--result-file', resultFile, '--cwd', repo], mockDir, repo);
-    assert(r.status === 0, 'H: .gsd/ touch is advisory only — exit 0', `status=${r.status} stderr=${r.stderr}`);
-    assert(/\.gsd/.test(r.stderr) && /warn/i.test(r.stderr), 'H: stderr contains .gsd warning', `stderr=${r.stderr}`);
+    assert(r.status === 2, 'H: new .gsd/ delta from the sidecar is terminal — exit 2', `status=${r.status} stderr=${r.stderr}`);
+    assert(/protected \.gsd/.test(r.stderr), 'H: stderr contains protected .gsd message', `stderr=${r.stderr}`);
     let parsed = null;
     try { parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch (e) { /* leave null */ }
-    assert(!!parsed && parsed.status === 'done', 'H: run still completes normally (status done)', JSON.stringify(parsed));
+    assert(!!parsed && parsed.status === 'adapter-failed', 'H: result marker is adapter-failed', JSON.stringify(parsed));
+    assert(!!parsed && /touched protected \.gsd/.test(parsed.reason || ''), 'H: reason names the touched protected .gsd path', JSON.stringify(parsed));
+    assert(!!parsed && parsed.error_class === 'terminal', 'H: error_class is terminal', JSON.stringify(parsed));
     cleanup(repo);
     cleanup(resultDir);
     cleanup(mockDir);
@@ -6989,8 +6993,8 @@ function smokeHeartbeatContract() {
     '(a) forge-xllm defines HEARTBEAT_INTERVAL_MS = 15000',
     'scripts/forge-xllm.js');
   const fieldWrites = adapter.match(/heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS/g) || [];
-  assert(fieldWrites.length === 4,
-    '(a) all four running-payload sites carry heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS',
+  assert(fieldWrites.length === 6,
+    '(a) all six running-payload sites carry heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS',
     `count=${fieldWrites.length}`);
   assert(!/heartbeat_interval_ms: 15000/.test(adapter),
     '(a) adapter has zero literal 15000 heartbeat write sites',
@@ -7282,7 +7286,30 @@ function smokeSchemaExtraction() {
     const installedSchemas = path.join(tmp, 'schemas');
     fs.mkdirSync(installedScripts, { recursive: true });
     fs.mkdirSync(installedSchemas, { recursive: true });
-    for (const name of ['forge-xllm.js', 'forge-prefs.js', 'forge-surgical-reset.js', 'forge-classify-error.js']) {
+    function localRequires(file) {
+      const src = fs.readFileSync(path.join(SCRIPTS, file), 'utf8');
+      const out = new Set();
+      const re = /require\('\.\/([^']+)'\)/g;
+      let m;
+      while ((m = re.exec(src))) {
+        let dep = m[1];
+        if (!dep.endsWith('.js')) dep += '.js';
+        out.add(dep);
+      }
+      return out;
+    }
+    const neededScripts = new Set(['forge-xllm.js']);
+    const queue = ['forge-xllm.js'];
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const dep of localRequires(cur)) {
+        if (!neededScripts.has(dep)) {
+          neededScripts.add(dep);
+          queue.push(dep);
+        }
+      }
+    }
+    for (const name of neededScripts) {
       fs.copyFileSync(path.join(SCRIPTS, name), path.join(installedScripts, name));
     }
     fs.copyFileSync(challengePath, path.join(installedSchemas, 'challenge.schema.json'));

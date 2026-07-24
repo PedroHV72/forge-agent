@@ -1159,7 +1159,7 @@ function normalizeRebuttal(obj) {
 // ── Execute helpers (git READ-ONLY + prefs) ────────────────────────────────────
 
 function gitBuffer(cwd, args, what) {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'buffer', maxBuffer: MAX_BUFFER });
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'buffer', maxBuffer: MAX_BUFFER, env: buildSidecarEnv() });
   if (result.error || result.status !== 0) {
     const cause = result.error
       ? result.error.message
