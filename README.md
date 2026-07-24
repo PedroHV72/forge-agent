@@ -293,7 +293,7 @@ Exemplo de célula cross-engine:
     "default": {
       "executor": {
         "standard": ["claude-sonnet-5"],
-        "heavy": ["claude-opus-4-8", "gpt-5"], // cadeia cross-engine (claude -> gpt sidecar)
+        "heavy": ["claude-opus-5", "gpt-5"],   // cadeia cross-engine (claude -> gpt sidecar)
         "fallback": "claude-sonnet-5"          // categoria: 1 Claude mapeado
       }
     },

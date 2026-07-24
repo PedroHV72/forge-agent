@@ -28,11 +28,11 @@ const { modelToAlias } = require('./forge-model-alias');
 const { readPrefsCached } = require('./forge-prefs.js');
 
 // ── Canonical default map — mirrors shared/forge-tiers.md § Tier → Default Model
-// heavy is WITHOUT the [1m] suffix here (matches § Tier Resolution default).
+// heavy is claude-opus-5: 1M context is the model's default, no [1m] suffix needed.
 const DEFAULT_TIER_MODEL = {
   light: 'claude-haiku-4-5-20251001',
   standard: 'claude-sonnet-5',
-  heavy: 'claude-opus-4-8',
+  heavy: 'claude-opus-5',
   max: 'claude-fable-5',
 };
 

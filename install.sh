@@ -149,22 +149,22 @@ for template in "${DISPATCH_TEMPLATES_SRC}"/*.md; do
 done
 
 # ── Opus model availability probe ─────────────────────────────────────────────
-# Agents default to claude-opus-4-8[1m]. If the user's account doesn't have access
-# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-7.
-# Runs a minimal API probe (~1 token). Skip with --no-model-probe.
+# Agents default to claude-opus-5. If the user's account doesn't have access
+# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-8[1m]
+# (the previous baseline). Runs a minimal API probe (~1 token). Skip with --no-model-probe.
 _sed_inplace_probe() { sed -i '' "$@" 2>/dev/null || sed -i "$@"; }
 
-OPUS_TARGET="claude-opus-4-8[1m]"  # default; flipped to claude-opus-4-7 on probe downgrade
-SYNC_PREFS=true                     # default; false when probe is inconclusive (keep prefs unchanged)
+OPUS_TARGET="claude-opus-5"  # default; flipped to claude-opus-4-8[1m] on probe downgrade
+SYNC_PREFS=true              # default; false when probe is inconclusive (keep prefs unchanged)
 
-downgrade_opus_to_47() {
+downgrade_opus_to_48() {
   for agent in forge-planner.md forge-discusser.md forge-researcher.md; do
     local f="${AGENTS_DIR}/${agent}"
     [ -f "$f" ] || continue
     if $DRY_RUN; then
-      dry "downgrade model in agents/${agent}: claude-opus-4-8[1m] → claude-opus-4-7"
+      dry "downgrade model in agents/${agent}: claude-opus-5 → claude-opus-4-8[1m]"
     else
-      _sed_inplace_probe 's|^model: "claude-opus-4-8\[1m\]"$|model: claude-opus-4-7|' "$f"
+      _sed_inplace_probe 's|^model: "claude-opus-5"$|model: "claude-opus-4-8[1m]"|' "$f"
     fi
   done
 }
@@ -173,27 +173,27 @@ if $DRY_RUN; then
   :  # skip probe in dry-run
 elif $NO_MODEL_PROBE; then
   info ""
-  info "  (--no-model-probe: mantendo claude-opus-4-8[1m] como padrão)"
+  info "  (--no-model-probe: mantendo claude-opus-5 como padrão)"
 elif ! command -v claude >/dev/null 2>&1; then
   info ""
-  info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-4-8[1m])"
+  info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-5)"
   SYNC_PREFS=false  # can't verify — leave prefs untouched
 else
   echo ""
-  info "Verificando disponibilidade de claude-opus-4-8[1m]..."
+  info "Verificando disponibilidade de claude-opus-5..."
   set +e
-  probe_out=$(claude -p "ok" --model 'claude-opus-4-8[1m]' --max-turns 1 2>&1)
+  probe_out=$(claude -p "ok" --model 'claude-opus-5' --max-turns 1 2>&1)
   probe_exit=$?
   set -e
   if [ $probe_exit -eq 0 ]; then
-    success "  claude-opus-4-8[1m] disponível — usando como modelo Opus padrão"
+    success "  claude-opus-5 disponível — usando como modelo Opus padrão"
   elif echo "$probe_out" | grep -qiE "model.*not.*(found|available|supported|allowed)|invalid.*model|404|not_found|does not have access|issue with.*model|may not exist|may not have access"; then
-    warn "  claude-opus-4-8[1m] indisponível nesta conta — fallback para claude-opus-4-7"
-    downgrade_opus_to_47
+    warn "  claude-opus-5 indisponível nesta conta — fallback para claude-opus-4-8[1m]"
+    downgrade_opus_to_48
     info "  Agents atualizados: forge-planner, forge-discusser, forge-researcher"
-    OPUS_TARGET="claude-opus-4-7"
+    OPUS_TARGET="claude-opus-4-8[1m]"
   else
-    info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-4-8[1m]"
+    info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-5"
     info "  Se houver problemas em runtime, rode: bash install.sh --update (com conectividade)"
     SYNC_PREFS=false  # can't verify — leave prefs untouched
   fi

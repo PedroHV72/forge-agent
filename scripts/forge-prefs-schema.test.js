@@ -111,7 +111,7 @@ const INVENTORY = [
   // — tier_models (scalar-or-list → type ["string","array"]) —
   { key: 'tier_models.light', type: ['string', 'array'], default: 'claude-haiku-4-5-20251001', source: 'scripts/forge-tier-chain.js:35 DEFAULT_TIER_MODEL.light' },
   { key: 'tier_models.standard', type: ['string', 'array'], default: 'claude-sonnet-5', source: 'scripts/forge-tier-chain.js:36 DEFAULT_TIER_MODEL.standard' },
-  { key: 'tier_models.heavy', type: ['string', 'array'], default: 'claude-opus-4-8', source: 'scripts/forge-tier-chain.js:37 DEFAULT_TIER_MODEL.heavy (no [1m] suffix — differs from template example)' },
+  { key: 'tier_models.heavy', type: ['string', 'array'], default: 'claude-opus-5', source: 'scripts/forge-tier-chain.js:37 DEFAULT_TIER_MODEL.heavy (opus-5: 1M context is the model default, no [1m] suffix)' },
   { key: 'tier_models.max', type: ['string', 'array'], default: 'claude-fable-5', source: 'scripts/forge-tier-chain.js:38 DEFAULT_TIER_MODEL.max' },
   // — workers —
   { key: 'workers.execute-task', type: 'string', default: 'claude', source: 'shared/forge-dispatch.md:1259 (whitelist claude|codex, default-safe claude)' },
@@ -398,7 +398,7 @@ const WITNESSES = [
   ['plan_gate.interactive', 'always', "shared/forge-plan-gate.md:39 let interactive='always'"],
   // tier defaults (forge-tier-chain.js DEFAULT_TIER_MODEL — not exported, cited)
   ['tier_models.light', 'claude-haiku-4-5-20251001', 'scripts/forge-tier-chain.js:35'],
-  ['tier_models.heavy', 'claude-opus-4-8', 'scripts/forge-tier-chain.js:37 (no [1m] suffix)'],
+  ['tier_models.heavy', 'claude-opus-5', 'scripts/forge-tier-chain.js:37 (opus-5: no [1m] suffix)'],
   // effort defaults (shared/forge-dispatch.md EFFORT_DEFAULTS)
   ['effort.execute-task', 'low', 'shared/forge-dispatch.md:1595'],
   ['effort.plan-slice', 'medium', 'shared/forge-dispatch.md:1594'],

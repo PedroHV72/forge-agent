@@ -44,17 +44,20 @@ The four tiers map to four model aliases. Operators can override the model for a
 |---|---|---|---|---|
 | `light` | `claude-haiku-4-5-20251001` | `haiku` | Memory extraction, aggregation, fast summaries | `tier_models.light` |
 | `standard` | `claude-sonnet-5` | `sonnet` | Code execution, research, discussion, scoped planning | `tier_models.standard` |
-| `heavy` | `claude-opus-4-8[1m]` | `opus` | Deep architectural planning, slice decomposition | `tier_models.heavy` |
+| `heavy` | `claude-opus-5` | `opus` | Deep architectural planning, slice decomposition. 1M context is the model's default — no `[1m]` suffix needed | `tier_models.heavy` |
 | `max` | `claude-fable-5` | `fable` | Milestone planning, `risk:high` slice planning, last rung of blocker escalation. 2x the cost of opus ($10/$50 vs $5/$25 per MTok) — never a default for high-volume unit types | `tier_models.max` |
 
-> **Fable 5 thinking guard:** `claude-fable-5` returns HTTP 400 on an explicit `thinking: {type: "disabled"}`
-> (Opus 4.7/4.8 accept it). Whenever the resolved model is `claude-fable-5`, the orchestrator must inject
-> `thinking: adaptive` in the worker prompt header — or omit the `thinking:` line entirely — even if the
-> phase prefs say `disabled`. Never forward `disabled` to a `max`-tier dispatch.
+> **Thinking guard (Fable 5 + Opus 5):** `claude-fable-5` returns HTTP 400 on an explicit
+> `thinking: {type: "disabled"}` at any effort; `claude-opus-5` accepts `disabled` only at effort
+> `high` or below and returns HTTP 400 when paired with `xhigh`/`max` (Opus 4.7/4.8 accept it at any
+> effort). Whenever the resolved model is `claude-fable-5` — or `claude-opus-5` with resolved effort
+> `xhigh`/`max` — the orchestrator must inject `thinking: adaptive` in the worker prompt header (or
+> omit the `thinking:` line entirely), even if the phase prefs say `disabled`. The shared resolver
+> (`scripts/forge-dispatch-resolve.js` → `thinking_header`) is the single implementation of this rule.
 
 > **ID→alias map — the `Agent()` `model:` param only accepts aliases.** The `model` parameter of the
 > `Agent` tool accepts only the four short aliases (`haiku|sonnet|opus|fable`) — it does **not** accept a
-> full model ID string (e.g. `claude-opus-4-8[1m]`). The "Default Model ID" column above is the concrete
+> full model ID string (e.g. `claude-opus-5`). The "Default Model ID" column above is the concrete
 > ID an operator writes into `tier_models.<tier>` in `forge-agent-prefs.jsonc`; before that ID reaches
 > `Agent()`, the orchestrator must translate it to its alias. This translation is a single canonical
 > map, implemented once in [`scripts/forge-model-alias.js`](../scripts/forge-model-alias.js)

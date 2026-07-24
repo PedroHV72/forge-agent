@@ -138,25 +138,25 @@ Get-ChildItem -LiteralPath $DispatchTemplatesSrc -Filter '*.md' -File | ForEach-
 }
 
 # ── Opus model availability probe ─────────────────────────────────────────────
-# Agents default to claude-opus-4-8[1m]. If the user's account doesn't have access
-# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-7.
-# Runs a minimal API probe (~1 token). Skip with -NoModelProbe.
-function Downgrade-OpusTo47 {
+# Agents default to claude-opus-5. If the user's account doesn't have access
+# (tier/region), downgrade the installed agent frontmatters to claude-opus-4-8[1m]
+# (the previous baseline). Runs a minimal API probe (~1 token). Skip with -NoModelProbe.
+function Downgrade-OpusTo48 {
     foreach ($agent in @("forge-planner.md", "forge-discusser.md", "forge-researcher.md")) {
-        $file = "$AgentsDir\$agent"
+        $file = Join-Path $AgentsDir $agent
         if (!(Test-Path $file)) { continue }
         if ($DryRun) {
-            Dry "downgrade model in agents\${agent}: claude-opus-4-8[1m] → claude-opus-4-7"
+            Dry "downgrade model in agents\${agent}: claude-opus-5 → claude-opus-4-8[1m]"
         } else {
             $content = Get-Content $file -Raw
-            $content = $content -replace '(?m)^model: "claude-opus-4-8\[1m\]"$', 'model: claude-opus-4-7'
+            $content = $content -replace '(?m)^model: "claude-opus-5"$', 'model: "claude-opus-4-8[1m]"'
             Set-Content $file $content -NoNewline
         }
     }
 }
 
-$script:OpusTarget = "claude-opus-4-8[1m]"  # default; flipped to claude-opus-4-7 on downgrade
-$script:SyncPrefs  = $true                   # false when probe inconclusive
+$script:OpusTarget = "claude-opus-5"  # default; flipped to claude-opus-4-8[1m] on downgrade
+$script:SyncPrefs  = $true            # false when probe inconclusive
 
 $ClaudeForProbe = Get-Command claude -ErrorAction SilentlyContinue
 
@@ -164,32 +164,32 @@ if ($DryRun) {
     # skip probe in dry-run
 } elseif ($NoModelProbe) {
     Info ""
-    Info "  (-NoModelProbe: mantendo claude-opus-4-8[1m] como padrão)"
+    Info "  (-NoModelProbe: mantendo claude-opus-5 como padrão)"
 } elseif (-not $ClaudeForProbe) {
     Info ""
-    Info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-4-8[1m])"
+    Info "  Claude CLI não encontrado — probe de modelo pulado (mantendo claude-opus-5)"
     $script:SyncPrefs = $false  # can't verify — leave prefs untouched
 } else {
     Write-Host ""
-    Info "Verificando disponibilidade de claude-opus-4-8[1m]..."
+    Info "Verificando disponibilidade de claude-opus-5..."
     $probeOut = ""
     $probeExit = 1
     try {
-        $probeOut = & claude -p "ok" --model 'claude-opus-4-8[1m]' --max-turns 1 2>&1 | Out-String
+        $probeOut = & claude -p "ok" --model 'claude-opus-5' --max-turns 1 2>&1 | Out-String
         $probeExit = $LASTEXITCODE
     } catch {
         $probeOut = $_.Exception.Message
         $probeExit = 1
     }
     if ($probeExit -eq 0) {
-        Success "  claude-opus-4-8[1m] disponível — usando como modelo Opus padrão"
+        Success "  claude-opus-5 disponível — usando como modelo Opus padrão"
     } elseif ($probeOut -imatch "model.*not.*(found|available|supported|allowed)|invalid.*model|404|not_found|does not have access|issue with.*model|may not exist|may not have access") {
-        Warn "  claude-opus-4-8[1m] indisponível nesta conta — fallback para claude-opus-4-7"
-        Downgrade-OpusTo47
+        Warn "  claude-opus-5 indisponível nesta conta — fallback para claude-opus-4-8[1m]"
+        Downgrade-OpusTo48
         Info "  Agents atualizados: forge-planner, forge-discusser, forge-researcher"
-        $script:OpusTarget = "claude-opus-4-7"
+        $script:OpusTarget = "claude-opus-4-8[1m]"
     } else {
-        Info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-4-8[1m]"
+        Info "  Probe inconclusivo (erro não relacionado a modelo) — mantendo claude-opus-5"
         Info "  Se houver problemas em runtime, rode: .\install.ps1 -Update (com conectividade)"
         $script:SyncPrefs = $false  # can't verify — leave prefs untouched
     }

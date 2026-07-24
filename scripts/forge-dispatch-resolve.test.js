@@ -252,6 +252,25 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  runCase('opus-5 at xhigh/max effort forces adaptive thinking header', () => {
+    // claude-opus-5 rejects thinking: disabled when effort is xhigh/max (HTTP
+    // 400); at high or below the pref is honored (empty header, no override).
+    const f = mkFixture({ plan: '---\ntier: heavy\neffort: xhigh\n---\n# task\n' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.model, 'claude-opus-5', 'heavy tier default is opus-5');
+    assertEqual(r.effort, 'xhigh', 'opus-5 allows xhigh effort');
+    assertEqual(r.thinking_header, 'adaptive', 'opus-5 xhigh thinking header adaptive');
+    cleanup(f);
+  });
+
+  runCase('opus-5 at high effort or below honors the thinking pref', () => {
+    const f = mkFixture({ plan: '---\ntier: heavy\neffort: high\n---\n# task\n' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.model, 'claude-opus-5', 'heavy tier default is opus-5');
+    assertEqual(r.thinking_header, '', 'opus-5 high effort emits no override');
+    cleanup(f);
+  });
+
   runCase('worker: Codex (capitalized) normalizes identically to lowercase codex', () => {
     // Fix 2 (M012 S01 review-fix): canonical lowercases the frontmatter worker
     // value. Capitalized `Codex` must resolve identically to lowercase `codex`.

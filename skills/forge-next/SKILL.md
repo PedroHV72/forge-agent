@@ -263,10 +263,12 @@ fi
 ```
 `TIER`, `MODEL_ID`, `MODEL_ALIAS`, `ROUTE_JSON` (`chain`), `ROUTE_SOURCE`, `CHAIN_LEN`, `DOMAIN_USED`, `ENGINE`, `ENGINE_REASON`, `EFFORT`, `EFFORT_REASON`, `WORKERS_TIMEOUT`, `CODEX_MODEL`, `SIDECAR_MODEL`, `THINKING_HEADER`, `unit_effort`, and `REASON` are now set (the tier-chain cursor above may have overridden `MODEL_ID`/`ENGINE`/`REASON`). Use `$MODEL_ID`/`$ENGINE` in the dispatch below (Step 4). `$TIER`, `$REASON`, `$DOMAIN_USED`, `$ROUTE_SOURCE`, `$CHAIN_LEN`, `$EFFORT`, `$EFFORT_REASON` are injected into the dispatch event.
 
-> **Fable 5 thinking guard:** the resolver emits `$THINKING_HEADER` (`adaptive` when `$MODEL_ID` is
-> `claude-fable-5`, else empty). When `$THINKING_HEADER` is `adaptive`, inject `thinking: adaptive`
-> in the worker prompt header (or omit the `thinking:` line) regardless of the phase's `thinking:`
-> pref — `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` (Opus 4.7/4.8 accept it).
+> **Thinking guard (Fable 5 + Opus 5):** the resolver emits `$THINKING_HEADER` (`adaptive` when
+> `$MODEL_ID` is `claude-fable-5`, or `claude-opus-5` with resolved effort `xhigh`/`max`; else empty).
+> When `$THINKING_HEADER` is `adaptive`, inject `thinking: adaptive` in the worker prompt header (or
+> omit the `thinking:` line) regardless of the phase's `thinking:` pref — `claude-fable-5` returns
+> HTTP 400 on an explicit `thinking: disabled` at any effort, and `claude-opus-5` returns HTTP 400
+> when `disabled` is paired with effort `xhigh`/`max` (Opus 4.7/4.8 accept it at any effort).
 
 `unit_effort` (and `$EFFORT`/`$EFFORT_REASON` for the dispatch event) were set by the resolver above (§ Effort Resolution — unit-type default + frontmatter axis + risk-escalation sync + model-cap clamp). Inject `effort: {unit_effort}` and (for opus/fable phases) `thinking: {THINKING_OPUS}` into the worker prompt header.
 

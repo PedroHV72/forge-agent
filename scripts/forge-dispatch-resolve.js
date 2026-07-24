@@ -143,6 +143,20 @@ function dispatchEngineFor(family) {
   return 'claude';
 }
 
+// Thinking guard (single source — skills read the emitted thinking_header):
+// - claude-fable-5 returns HTTP 400 on an explicit `thinking: disabled` at ANY
+//   effort → always force adaptive.
+// - claude-opus-5 has thinking on by default and accepts `thinking: disabled`
+//   ONLY at effort `high` or below — pairing disabled with xhigh/max is a 400
+//   → force adaptive when the resolved effort is xhigh/max.
+// Empty string means "no override — honor the phase's thinking: pref".
+function thinkingHeaderFor(model, effort) {
+  const id = text(model);
+  if (id.startsWith('claude-fable-5')) return 'adaptive';
+  if (id.startsWith('claude-opus-5') && (effort === 'xhigh' || effort === 'max')) return 'adaptive';
+  return '';
+}
+
 // The sidecar needs the concrete routed Codex model, while legacy workers
 // continue to provide the flat codex_model fallback when no Codex chain leads.
 function sidecarModelFor(dispatchEngine, chain, codexModel) {
@@ -259,7 +273,7 @@ function resolveDispatch(opts) {
     // NOT the effective `domain`/domain_used above.
     domain_input: requestedDomain,
     frontmatter_tier: plan.tier,
-    thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
+    thinking_header: thinkingHeaderFor(model, effort),
     // Additive dispatch trigger: normalized from the resolved top-level `engine`
     // (family). gpt→codex, gemini→agy, else→claude. Orchestrator branches gate
     // on this (`== "codex"`), NOT on `engine`/`chain[].engine` (kept family).
@@ -319,7 +333,7 @@ function degradedContract(args) {
     model_applied: alias, engine_reason: 'default:claude', workers_engine: 'claude',
     workers_timeout: 1800, codex_model: '', plan_worker: '',
     domain_input: 'default', frontmatter_tier: '',
-    thinking_header: model.startsWith('claude-fable-5') ? 'adaptive' : '',
+    thinking_header: thinkingHeaderFor(model, 'low'),
     // engine is hard-coded 'claude' here → dispatch_engine resolves to 'claude'.
     // Emitted explicitly via the same helper for contract stability.
     dispatch_engine: dispatchEngineFor('claude'),
@@ -328,7 +342,7 @@ function degradedContract(args) {
   };
 }
 
-module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, TIER_DEFAULTS };
+module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, thinkingHeaderFor, TIER_DEFAULTS };
 
 if (require.main === module) {
   // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a

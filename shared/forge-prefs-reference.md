@@ -198,7 +198,7 @@ Default de effort (intensidade de raciocínio) por fase (unit_type). Eixo ortogo
 
 ## thinking
 
-Extended thinking por família de fase. adaptive = o modelo decide quanto pensar. Guard Fable: quando o modelo resolvido é claude-fable-5, o orquestrador força adaptive (Fable retorna HTTP 400 com thinking disabled explícito).
+Extended thinking por família de fase. adaptive = o modelo decide quanto pensar. Guard de thinking: quando o modelo resolvido é claude-fable-5 (qualquer effort) ou claude-opus-5 com effort xhigh/max, o orquestrador força adaptive — ambos retornam HTTP 400 com thinking disabled explícito nessas condições (Opus 5 aceita disabled só com effort high ou menor).
 
 ### `thinking.opus_phases`
 
@@ -388,8 +388,8 @@ Qual model ID concreto cada alias de tier resolve no dispatch. Aceita escalar ou
 ### `tier_models.heavy`
 
 - **Tipo:** string \| array
-- **Default:** `"claude-opus-4-8"`
-- **Descrição:** Tier de raciocínio profundo — plan-slice default. Default real SEM o sufixo [1m] (forge-tier-chain.js DEFAULT_TIER_MODEL). Escalar ou lista.
+- **Default:** `"claude-opus-5"`
+- **Descrição:** Tier de raciocínio profundo — plan-slice default. claude-opus-5 tem 1M de contexto por default (sem sufixo [1m]); fonte: forge-tier-chain.js DEFAULT_TIER_MODEL. Escalar ou lista.
 
 ### `tier_models.max`
 

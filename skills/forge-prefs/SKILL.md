@@ -69,7 +69,7 @@ node "$SCRIPT" --cwd .
 Exemplos válidos:
 - `/forge-prefs set review.rounds 2`
 - `/forge-prefs set skip_research true local`
-- `/forge-prefs set tier_models.heavy claude-opus-4-8[1m] global`
+- `/forge-prefs set tier_models.heavy claude-opus-5 global`
 
 Rota **sempre** pelo primitivo `--set` de `forge-prefs-migrate.js` — nunca edite
 um `.jsonc` de preferências manualmente com `Edit`/`Write`:
@@ -119,7 +119,7 @@ o catálogo atual — não uma rota de escrita separada.
 ```
 MODELOS DISPONÍVEIS NO CLAUDE CODE
 
-  opus    claude-opus-4-8[1m] (fallback: claude-opus-4-7)
+  opus    claude-opus-5 (fallback: claude-opus-4-8[1m])
           Modelo mais capaz. Ideal para: discuss, research, plan, tier heavy/max.
 
   sonnet  claude-sonnet-5
@@ -156,7 +156,7 @@ Confirme:
 ✓ Fase 'execute' (tier standard) atualizada
 
   Antes: claude-sonnet-5
-  Agora: claude-opus-4-8[1m]
+  Agora: claude-opus-5
 ```
 
 Modelo não reconhecido (nem alias nem ID válido):
@@ -164,7 +164,7 @@ Modelo não reconhecido (nem alias nem ID válido):
 Modelo desconhecido: '{input}'
 
 Modelos disponíveis:
-  opus    → claude-opus-4-8[1m] (fallback claude-opus-4-7)
+  opus    → claude-opus-5 (fallback claude-opus-4-8[1m])
   sonnet  → claude-sonnet-5
   haiku   → claude-haiku-4-5-20251001
 ```

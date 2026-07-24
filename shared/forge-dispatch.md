@@ -663,7 +663,7 @@ Classifier output: `{"kind":"server","retry":true,"backoffMs":30000}`
 Exponential override for attempt 2: `2000 * 2^1 = 4000 ms`. Use `Math.min(30000, 4000) = 4000 ms`.
 Event log entry:
 ```json
-{"ts":"2026-04-16T10:01:12Z","event":"retry","unit":"plan-slice/S02","class":"server","attempt":2,"backoff_ms":4000,"model":"claude-opus-4-8"}
+{"ts":"2026-04-16T10:01:12Z","event":"retry","unit":"plan-slice/S02","class":"server","attempt":2,"backoff_ms":4000,"model":"claude-opus-5"}
 ```
 
 **Example 3 — ECONNRESET network error (attempt 3 of 3, exhausted)**
@@ -674,7 +674,7 @@ Attempt counter is now `3 > max_transient_retries (3)`? No, `3 === 3` — this I
 If the re-dispatch also throws: `attempt` becomes `4 > 3` → bail with CRITICAL message `"retries exhausted after 4 attempts (kind: network)"`.
 Event log entry for attempt 3:
 ```json
-{"ts":"2026-04-16T10:02:44Z","event":"retry","unit":"research-slice/S01","class":"network","attempt":3,"backoff_ms":3000,"model":"claude-opus-4-8"}
+{"ts":"2026-04-16T10:02:44Z","event":"retry","unit":"research-slice/S01","class":"network","attempt":3,"backoff_ms":3000,"model":"claude-opus-5"}
 ```
 
 #### Wiring into a dispatch template
@@ -1573,9 +1573,11 @@ Before every `Agent()` dispatch, after Retry Handler setup but before Token Tele
    `light | standard | heavy | max`, the internal `readTierChain()` treats it as `standard`
    (defensive fallback) — no separate guard needed here.
 
-   > **Fable 5 thinking guard:** when the resolved model is `claude-fable-5`, force the worker prompt
-   > header to `thinking: adaptive` (or omit the `thinking:` line) regardless of phase prefs —
-   > `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` (Opus 4.7/4.8 accept it).
+   > **Thinking guard (Fable 5 + Opus 5):** when the resolved model is `claude-fable-5` — or
+   > `claude-opus-5` with resolved effort `xhigh`/`max` — force the worker prompt header to
+   > `thinking: adaptive` (or omit the `thinking:` line) regardless of phase prefs.
+   > `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` at any effort;
+   > `claude-opus-5` accepts `disabled` only at effort `high` or below (Opus 4.7/4.8 accept it at any effort).
 5. **Build `reason` string.** By this step `reason` is already set by step 3. Confirm it is exactly one of:
    - `"unit-type:<unit_type>"` — no frontmatter override; default used.
    - `"frontmatter-override:<tier>"` — `tier:` field present in T##-PLAN frontmatter.
@@ -1605,7 +1607,7 @@ This "climbs tiers" — it does **not** consume `$TIER_CHAIN`/`chain[]` (that is
 |-----|------|-----------------------|-------------|
 | `tier_models.light` | string (model ID) | `claude-haiku-4-5-20251001` | Model used when tier resolves to `light` |
 | `tier_models.standard` | string (model ID) | `claude-sonnet-5` | Model used when tier resolves to `standard` |
-| `tier_models.heavy` | string (model ID) | `claude-opus-4-8` | Model used when tier resolves to `heavy` |
+| `tier_models.heavy` | string (model ID) | `claude-opus-5` | Model used when tier resolves to `heavy` |
 | `tier_models.max` | string (model ID) | `claude-fable-5` | Model used when tier resolves to `max` (plan-milestone, `risk:high` plan-slice, blocker escalation). 2x the cost of opus — never a default for high-volume unit types |
 
 Each `tier_models.<tier>` key accepts either form:
@@ -1682,13 +1684,13 @@ PLAN_TIER  : heavy   ← explicit; wins over tag
 PLAN_TAG   : docs
 
 → tier   = heavy   (manual tier: overrides tag: docs downgrade)
-→ model  = claude-opus-4-8
+→ model  = claude-opus-5
 → reason = "frontmatter-override:heavy"
 ```
 
 Dispatch event:
 ```json
-{"ts":"2026-04-16T10:06:00Z","event":"dispatch","dispatch_id":"execute-task-T07-f2310b-a1","prompt_id":"execute-task-T07-f2310b","attempt":1,"status":"done","unit":"execute-task/T07","model":"claude-opus-4-8","input_tokens":3200,"output_tokens":540,"token_method":"heuristic-chars-4","tier":"heavy","reason":"frontmatter-override:heavy"}
+{"ts":"2026-04-16T10:06:00Z","event":"dispatch","dispatch_id":"execute-task-T07-f2310b-a1","prompt_id":"execute-task-T07-f2310b","attempt":1,"status":"done","unit":"execute-task/T07","model":"claude-opus-5","input_tokens":3200,"output_tokens":540,"token_method":"heuristic-chars-4","tier":"heavy","reason":"frontmatter-override:heavy"}
 ```
 
 **Example C — `execute-task` with ONLY `tag: docs` in frontmatter (downgrade applied)**
@@ -1805,9 +1807,11 @@ Routing above; this is the SAME Layer 2 with the new resolver, and a **separate 
 not one of `light | standard | heavy | max`, the resolver's internal `readTierChain()` treats it as
 `standard` (defensive fallback) — no separate guard needed here.
 
-> **Fable 5 thinking guard:** when the resolved model is `claude-fable-5`, force the worker prompt
-> header to `thinking: adaptive` (or omit the `thinking:` line) regardless of phase prefs —
-> `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` (Opus 4.7/4.8 accept it).
+> **Thinking guard (Fable 5 + Opus 5):** when the resolved model is `claude-fable-5` — or
+> `claude-opus-5` with resolved effort `xhigh`/`max` — force the worker prompt header to
+> `thinking: adaptive` (or omit the `thinking:` line) regardless of phase prefs.
+> `claude-fable-5` returns HTTP 400 on an explicit `thinking: disabled` at any effort;
+> `claude-opus-5` accepts `disabled` only at effort `high` or below (Opus 4.7/4.8 accept it at any effort).
 > The resolver's `thinking_header` field already carries this — read it instead of re-deriving it.
 
 > **Alias resolution internals (unchanged):** `MODEL_ALIAS`/`model_applied` are still produced by `scripts/forge-model-alias.js`'s `modelToAlias()` — the resolver calls it internally (see `scripts/forge-dispatch-resolve.js`'s own `require('./forge-model-alias.js')`) instead of the SKILL.md shelling out to it directly. No inline alias map is ever reimplemented here or in the SKILL.md callers.
@@ -1856,7 +1860,7 @@ The `dispatch` event schema is extended additively with `effort` and `effort_rea
   "attempt": 1,
   "status": "done",
   "unit": "execute-task/T03",
-  "model": "claude-opus-4-8",
+  "model": "claude-opus-5",
   "tier": "heavy",
   "reason": "frontmatter-override:heavy",
   "effort": "high",
@@ -1871,7 +1875,7 @@ The `dispatch` event schema is extended additively with `effort` and `effort_rea
 
 **A — routine execute-task (defaults).** `unit_type=execute-task`, no `effort:`/`tier:` → `tier=standard`, `model=claude-sonnet-5`, `EFFORT=low` (unit default), no clamp → `effort=low`, `effort_reason="unit-type:execute-task"`.
 
-**B — complex execute-task (planner sets both axes).** Frontmatter `tier: heavy` + `effort: high` → `model=claude-opus-4-8`; effort `high` ≤ opus cap `max`, no clamp → `effort=high`, `effort_reason="frontmatter-effort:high"`.
+**B — complex execute-task (planner sets both axes).** Frontmatter `tier: heavy` + `effort: high` → `model=claude-opus-5`; effort `high` ≤ opus cap `max`, no clamp → `effort=high`, `effort_reason="frontmatter-effort:high"`.
 
 **C — effort set high but task left on Sonnet (clamp fires).** Frontmatter `effort: xhigh`, no `tier:` → `tier=standard`, `model=claude-sonnet-5`; `xhigh` > sonnet cap `medium` → clamp → `effort=medium`, `effort_reason="frontmatter-effort:xhigh|clamped:model-cap"`. The operator sees in telemetry that effort was capped because the model wasn't bumped.
 
