@@ -30,3 +30,7 @@ jobs:
 
       - name: Run test suites
         run: node scripts/run-tests.js
+
+      - name: Smoke suite (release gate)
+        if: runner.os != 'Windows'
+        run: node scripts/forge-smoke.js
