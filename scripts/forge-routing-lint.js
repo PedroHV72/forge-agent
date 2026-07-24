@@ -8,7 +8,7 @@
 'use strict';
 
 const { readRoutingConfig } = require('./forge-routing');
-const { modelToAlias, modelFamily } = require('./forge-model-alias');
+const { modelToAlias, modelFamily, isMalformedId } = require('./forge-model-alias');
 
 function memberDetails(id) {
   const aliasInfo = modelToAlias(id);
@@ -90,7 +90,18 @@ function lintRouting(cwd) {
 
         for (const member of chain) {
           let item = null;
-          if (member.engine === 'gemini') {
+          // Checked BEFORE unmapped-chain-member: a composite id is unmapped
+          // too, but "you wrote one string where the list needs two entries"
+          // is the actionable message — the generic one sends the reader
+          // hunting for a model that does not exist.
+          if (isMalformedId(member.id)) {
+            item = finding(
+              'error',
+              'malformed-model-id',
+              'ID composto — a vírgula está DENTRO da string; use uma entrada de lista por modelo.',
+              { id: member.id }
+            );
+          } else if (member.engine === 'gemini') {
             item = finding(
               'warning',
               'phase-unsupported-family',
@@ -108,7 +119,16 @@ function lintRouting(cwd) {
           if (item) cell.findings.push(item);
         }
 
-        if (fallback && (fallback.engine !== 'claude' || !fallback.mapped)) {
+        if (fallback && isMalformedId(fallback.id)) {
+          cell.findings.push(
+            finding(
+              'error',
+              'malformed-model-id',
+              'ID composto no fallback — a vírgula está DENTRO da string; o fallback aceita UM modelo.',
+              { id: fallback.id }
+            )
+          );
+        } else if (fallback && (fallback.engine !== 'claude' || !fallback.mapped)) {
           cell.findings.push(
             finding(
               'error',

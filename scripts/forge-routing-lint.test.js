@@ -171,6 +171,56 @@ scenario('fase só-com-fallback valida fallback e avisa sobre tiers', `{
   assert.strictEqual(invalid.cli.status, 1);
 });
 
+// Regression: a chain entry written as ONE comma-joined string used to lint
+// clean — substring matching mapped it to a real alias, so `mapped` was true
+// and no finding fired. 22/22 cells reported "nenhum" on a config with 5 of
+// these. The finding must name the actual mistake, not just "unmapped".
+scenario('id composto na cadeia', `{
+  "routing": {
+    "default": {
+      "planner": {
+        "max": ["claude-fable-5, claude-opus-5"]
+      }
+    }
+  }
+}`, (report, cli) => {
+  assert.deepStrictEqual(codes(report.errors), ['malformed-model-id']);
+  assert.strictEqual(report.errors[0].id, 'claude-fable-5, claude-opus-5');
+  assert.strictEqual(report.errors[0].tier, 'max');
+  assert.strictEqual(cli.status, 1);
+  assert.match(formatText(report), /ID composto/);
+});
+
+scenario('id composto no fallback', `{
+  "routing": {
+    "default": {
+      "executor": {
+        "standard": ["claude-sonnet-5"],
+        "fallback": "claude-sonnet-5, claude-opus-5"
+      }
+    }
+  }
+}`, (report, cli) => {
+  assert.deepStrictEqual(codes(report.errors), ['malformed-model-id']);
+  assert.strictEqual(report.errors[0].id, 'claude-sonnet-5, claude-opus-5');
+  assert.strictEqual(cli.status, 1);
+});
+
+// The correctly-split form of the same intent must stay clean, so the guard
+// cannot be satisfied by simply rejecting every multi-model chain.
+scenario('a forma correta da mesma intenção passa limpa', `{
+  "routing": {
+    "default": {
+      "planner": {
+        "max": ["claude-fable-5", "claude-opus-5"]
+      }
+    }
+  }
+}`, (report, cli) => {
+  assert.strictEqual(report.errors.length, 0);
+  assert.strictEqual(cli.status, 0);
+});
+
 const text = formatText({
   present: true,
   ok: true,

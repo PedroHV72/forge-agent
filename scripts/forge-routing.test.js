@@ -361,6 +361,75 @@ withCascade({
     }));
 });
 
+// --- Composite model IDs and walk termination -------------------------------
+// Regression: a list written as ONE string ("claude-fable-5, claude-opus-5" —
+// the comma inside the quotes) used to reach modelToAlias, whose substring
+// match happily returned `fable`, so the rest of the chain vanished and a
+// model nobody chose got dispatched. Seen in the wild both in routing cells and
+// in a T##-PLAN frontmatter `worker:`.
+{
+  const { resolveRoute } = require('./forge-routing');
+  const { modelToAlias, isMalformedId } = require('./forge-model-alias');
+
+  test('composite id is not mapped to a plausible alias', () => {
+    assertEq(modelToAlias('claude-fable-5, claude-opus-5'), { alias: null, mapped: false });
+    assertEq(modelToAlias('gpt-5.6-terra, claude-opus-5'), { alias: null, mapped: false });
+  });
+  test('a legitimate id with surrounding whitespace still maps', () =>
+    assertEq(modelToAlias('  claude-sonnet-5  '), { alias: 'sonnet', mapped: true }));
+  test('the [1m] suffix is not treated as malformed', () =>
+    assert(isMalformedId('claude-opus-4-8[1m]') === false));
+
+  test('a composite frontmatter worker is skipped, not dispatched', () => {
+    const r = resolveRoute({
+      unitType: 'execute-task', tier: 'heavy',
+      frontmatterWorker: 'gpt-5.6-terra, claude-opus-5', cwd: process.cwd(),
+    });
+    assertEq(r.chain, [], 'no chain member may carry a composite id');
+    assert(/skipped-malformed-id/.test(r.reason), `reason must surface the skip: ${r.reason}`);
+  });
+}
+
+// Regression: the category fallback defaults to the tier head, so the raw walk
+// order repeated an id. --next-after then never returned '' and the Failure
+// Taxonomy's "chain exhausted → stop the loop" branch was unreachable.
+{
+  const { parseArgs, nextInChain } = require('./forge-routing');
+  // Bounded walk: before the fix this loop would run out its 8 iterations
+  // instead of ending, which is exactly what `ended` asserts against.
+  const walk = (chain, fallback, start) => {
+    const seen = [];
+    let cur = start;
+    for (let i = 0; i < 8 && cur; i++) {
+      seen.push(cur);
+      cur = nextInChain(chain, fallback, cur);
+    }
+    return { seen, ended: !cur };
+  };
+  const member = (id) => ({ id });
+
+  test('single-member chain whose fallback repeats it terminates', () => {
+    const r = walk([member('claude-fable-5')], { id: 'claude-fable-5' }, 'claude-fable-5');
+    assertEq(r.seen, ['claude-fable-5']);
+    assert(r.ended, 'walk must exhaust instead of handing back the same model');
+  });
+  test('two-member chain does not ping-pong through the fallback', () => {
+    const r = walk(
+      [member('claude-fable-5'), member('claude-opus-5')],
+      { id: 'claude-fable-5' }, 'claude-fable-5'
+    );
+    assertEq(r.seen, ['claude-fable-5', 'claude-opus-5']);
+    assert(r.ended, 'walk must exhaust after the last distinct member');
+  });
+  test('a fallback outside the chain is still walked once', () => {
+    const r = walk([member('claude-fable-5')], { id: 'claude-opus-5' }, 'claude-fable-5');
+    assertEq(r.seen, ['claude-fable-5', 'claude-opus-5']);
+    assert(r.ended);
+  });
+  test('parseArgs still reads --next-after', () =>
+    assertEq(parseArgs(['--next-after', 'claude-opus-5']).nextAfter, 'claude-opus-5'));
+}
+
 // --- Summary ---
 console.log(`\n=== Result: ${passed} passed, ${failed} failed ===`);
 

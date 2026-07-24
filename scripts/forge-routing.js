@@ -119,7 +119,7 @@ function readRoutingConfig(cwd) {
 // JSON, --next-after, --explain) is built in T03 on top of these exports.
 
 const { readTierChain } = require('./forge-tier-chain');
-const { modelToAlias, modelFamily } = require('./forge-model-alias');
+const { modelToAlias, modelFamily, isMalformedId } = require('./forge-model-alias');
 
 const CHAIN_CAP = 3; // resolved chain hard cap (fallback is separate, uncapped)
 
@@ -176,7 +176,16 @@ function buildChain(ids, reasonParts) {
   const chain = [];
   let skippedUnknown = false;
   let skippedUnsupported = false;
+  let skippedMalformed = false;
   for (const id of list) {
+    // Checked before modelFamily: a composite like "gpt-5.6-terra,
+    // claude-opus-5" contains BOTH families, and family detection would pick
+    // whichever it tests first — dispatching to a model nobody chose. Drop it
+    // instead of admitting a member whose id is not a model.
+    if (isMalformedId(id)) {
+      skippedMalformed = true;
+      continue;
+    }
     const engine = modelFamily(id);
     if (engine === null) {
       skippedUnknown = true;
@@ -191,6 +200,7 @@ function buildChain(ids, reasonParts) {
   }
   if (skippedUnsupported && reasonParts) reasonParts.push('phase-unsupported-family');
   if (skippedUnknown && reasonParts) reasonParts.push('skipped-unknown-family');
+  if (skippedMalformed && reasonParts) reasonParts.push('skipped-malformed-id');
   return chain;
 }
 
@@ -226,8 +236,15 @@ function validateFallback(fallbackId, tier, cwd, reasonParts) {
 // Cross-engine aware: does NOT filter by mapped (a gpt member routes via the
 // sidecar and is a legitimate next target). T03's --next-after builds on this.
 function nextInChain(chain, fallback, id) {
-  const ids = (Array.isArray(chain) ? chain : []).map((m) => m.id);
-  if (fallback && fallback.id) ids.push(fallback.id);
+  const ordered = (Array.isArray(chain) ? chain : []).map((m) => m.id);
+  if (fallback && fallback.id) ordered.push(fallback.id);
+  // Dedupe, keeping first position. A MISSING category fallback substitutes the
+  // tier default, which on the legacy path IS the chain head — so the raw walk
+  // order routinely repeats an id. Left duplicated the walk hands back a member
+  // it already tried and never returns '', making the Failure Taxonomy's
+  // "chain exhausted → stop the loop" branch unreachable: a single-member chain
+  // re-dispatches the same model forever, and a two-member one ping-pongs.
+  const ids = ordered.filter((entry, index) => ordered.indexOf(entry) === index);
   const idx = ids.indexOf(id);
   if (idx === -1) return '';
   return idx + 1 < ids.length ? ids[idx + 1] : '';

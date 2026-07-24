@@ -17,14 +17,29 @@
  *   modelToAlias(id) -> { alias: 'haiku'|'sonnet'|'opus'|'fable'|null, mapped: boolean }
  *   modelFamily(id) -> 'claude'|'gpt'|'gemini'|null
  *   engineFamily(engine) -> 'claude'|'gpt'|null
+ *   isMalformedId(id) -> boolean
  *
  * CLI usage:
  *   node forge-model-alias.js --id <modelId>            # prints alias or '' (exit 0)
  *   node forge-model-alias.js --id <modelId> --json      # prints {"alias":...,"mapped":...}
  *   node forge-model-alias.js --family <modelId>         # prints family or '' (exit 0)
+ *   node forge-model-alias.js --malformed <modelId>      # prints 'true'|'false' (exit 0)
  */
 
 'use strict';
+
+// ── Malformed-ID guard — one grammar, used by modelToAlias and the lint ────
+// A model ID is a single token. A comma or inner whitespace means the value is
+// really a LIST that was written as one string — the classic hand-edit typo
+// `["claude-fable-5, claude-opus-5"]` instead of two array entries. Substring
+// matching would happily map that to `fable` and silently discard the rest of
+// the chain, so it is rejected here rather than dispatched.
+function isMalformedId(id) {
+  if (id === null || id === undefined) return false;
+  const str = String(id).trim();
+  if (str === '') return false;
+  return /[,\s]/.test(str);
+}
 
 // ── Alias detection order — fable BEFORE haiku/sonnet/opus ─────────────────
 // Substring match on the lowercased id; the [1m] context-window suffix
@@ -32,6 +47,10 @@
 // no special-casing needed.
 function modelToAlias(id) {
   const str = id === null || id === undefined ? '' : String(id).toLowerCase();
+
+  // A composite string is not a model — never let substring matching turn it
+  // into a plausible alias (the documented degradation: caller omits `model:`).
+  if (isMalformedId(str)) return { alias: null, mapped: false };
 
   let alias = null;
   if (str.indexOf('fable') !== -1) {
@@ -91,7 +110,7 @@ function engineFamily(engine) {
 }
 
 // ── Exports ──────────────────────────────────────────────────────────────
-module.exports = { modelToAlias, modelFamily, engineFamily };
+module.exports = { modelToAlias, modelFamily, engineFamily, isMalformedId };
 
 // ── CLI entrypoint ───────────────────────────────────────────────────────
 if (require.main === module) {
@@ -100,11 +119,16 @@ if (require.main === module) {
   let asJson = false;
   let family = null;
   let familyRequested = false;
+  let malformed = null;
+  let malformedRequested = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--family' && args[i + 1] !== undefined) {
       family = args[++i];
       familyRequested = true;
+    } else if (args[i] === '--malformed' && args[i + 1] !== undefined) {
+      malformed = args[++i];
+      malformedRequested = true;
     } else if (args[i] === '--id' && args[i + 1] !== undefined) {
       id = args[++i];
     } else if (args[i] === '--json') {
@@ -114,6 +138,11 @@ if (require.main === module) {
 
   if (familyRequested) {
     process.stdout.write((modelFamily(family) || '') + '\n');
+    process.exit(0);
+  }
+
+  if (malformedRequested) {
+    process.stdout.write(String(isMalformedId(malformed)) + '\n');
     process.exit(0);
   }
 
