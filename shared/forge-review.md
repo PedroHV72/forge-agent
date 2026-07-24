@@ -354,12 +354,56 @@ one-pass choice into a dialectic.
 
 Routed by `challenger` (from Step 0). `challenger == 'claude'` (default) runs the in-context agent unchanged; `challenger == 'codex' | 'gemini'` runs the S01 adapter with `--engine $XLLM_ENGINE`.
 
+### Step 2.0 — Shard the diff by file (context guard)
+
+A challenger handed a whole large diff runs out of context and returns **nothing** —
+and a challenger that returns nothing is indistinguishable, downstream, from one that
+found nothing. That failure mode is silent and lands on exactly the changes most
+likely to hide a defect. The policy object from Step 1.5 already carries the split:
+
+```bash
+REVIEW_SHARDS=$(node -e "process.stdout.write(String((JSON.parse(process.argv[1]).shards||[]).length))" "$REVIEW_POLICY")
+shard_files() { node -e "process.stdout.write(((JSON.parse(process.argv[1]).shards||[])[Number(process.argv[2])]||{files:[]}).files.join(' '))" "$REVIEW_POLICY" "$1"; }
+```
+
+`REVIEW_SHARDS <= 1` → **dispatch exactly as before**, one challenger, unscoped
+`$DIFF_CMD`. Nothing below applies. This is the common case and stays byte-identical.
+
+`REVIEW_SHARDS > 1` → dispatch one challenger **per shard**, each with the diff
+scoped to its own files (`DIFF_CMD -- <files>`), and merge. Shards are files, never
+hunks: an agent must never see half a function. Splitting is deterministic
+(`planReviewShards`, files sorted by size into the lightest shard), so a resumed
+review re-derives the identical split. Cap: 6 challengers.
+
+**Merging.** Renumber the surviving objections sequentially in shard order (`R1`,
+`R2`, …) so Steps 3–5 keep one flat, stably-identified list — they are unchanged and
+never learn that sharding happened. Every objection already carries its own
+`path:line`, so provenance survives renumbering.
+
+**Keep each objection's author.** Step 4 sends the defense back to *the* challenger
+that wrote the objection (LOCKED) — with N shards there are N challengers, so record
+the originating `agent_id` per objection as `REVIEWER_AGENT_ID[R#]` instead of one
+scalar. A sharded rebuttal groups objections by author and sends each group to its
+own agent; an unsharded review keeps exactly one group and one id, which is today's
+behavior. Any shard whose id is missing takes the existing per-agent compatibility
+fallback on its own, without dragging the others into a fresh dispatch.
+
+**A shard that fails is not a shard that passed.** Apply § Agent unavailability
+per shard. If some shards return and others stay unavailable, keep the objections
+you have AND record the unavailable shards (with their files) in the artifact under
+`## Cobertura incompleta` — a review missing a third of the diff must never render
+as clean. Only when **every** shard returns `NO_FLAGS` is the clean artifact correct.
+
 ### `challenger == 'claude'` (default agent)
 
 ```
 Agent({ subagent_type: 'forge-reviewer',
   prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: complete-slice/{S##}\nDIFF_CMD: {DIFF_CMD}" })
 ```
+
+When `REVIEW_SHARDS > 1`, the prompt's `DIFF_CMD` is the shard-scoped form
+`{DIFF_CMD} -- $(shard_files $i)`, one `Agent()` per shard `i`. Everything else about
+the agent contract is unchanged.
 
 Capture the completed subagent's `agent_id` as `REVIEWER_AGENT_ID`. Claude Code
 returns this id with a custom subagent result. It is used in Step 4 to resume the
@@ -421,7 +465,7 @@ Capture per-objection verdicts: `R# → {refuted | conceded | open} + rationale`
 
 ## Step 4 — Rebuttal (rebuttal mode) × `rounds`
 
-Skip if `rounds == 0`. Otherwise, for `i` in `1..rounds` (default 1), feed the defense back to the **same challenger** that ran Step 2 (LOCKED — a rebuttal is only meaningful from the agent that wrote the original objections). Routed by `challenger`.
+Skip if `rounds == 0`. Otherwise, for `i` in `1..rounds` (default 1), feed the defense back to the **same challenger** that ran Step 2 (LOCKED — a rebuttal is only meaningful from the agent that wrote the original objections). Routed by `challenger`. When Step 2.0 sharded, "the same challenger" is per objection: group the objections by their recorded `REVIEWER_AGENT_ID[R#]` and run the round once per author, sending each only the defense of its own objections. One shard → one group → identical to the unsharded flow.
 
 ### `challenger == 'claude'` (default agent)
 

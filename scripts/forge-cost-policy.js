@@ -202,6 +202,52 @@ function normalizeReviewConfig(review) {
   };
 }
 
+// ── Review sharding — keep a challenger's context bounded ───────────────────
+// A single challenger reading a whole slice diff dies on context once the diff
+// is big enough, and a dead challenger returns NO verdict at all: the gate
+// degrades to "no objections" on exactly the changes most likely to carry one.
+// (Observed: four agents burned on one diff, the real defect found later by
+// hand.) Splitting by FILE keeps each challenger's read bounded and, unlike
+// splitting by hunk, never shows an agent half a function.
+//
+// Deterministic bin-packing: files sorted by size descending, each placed in the
+// lightest shard so far. Same input always yields the same shards, so a resumed
+// review re-derives the identical split. One shard means "no split" — the caller
+// keeps today's single unscoped dispatch.
+const SHARD_MIN_LINES   = 1500; // below this a single challenger is comfortable
+const SHARD_TARGET_LINES = 800; // aim per shard once splitting
+const SHARD_MAX          = 6;   // ceiling on parallel challengers per review
+
+function planReviewShards(entries, opts) {
+  const o = opts || {};
+  const minLines = positiveInt(o.minLines, SHARD_MIN_LINES);
+  const target = positiveInt(o.targetLines, SHARD_TARGET_LINES);
+  const maxShards = positiveInt(o.maxShards, SHARD_MAX);
+  const list = (Array.isArray(entries) ? entries : [])
+    .map((entry) => ({
+      file: normalizePath(entry && entry.file),
+      // A binary file carries no line counts but still costs a read; charge it
+      // one line so it cannot make a shard look free.
+      lines: Number(entry && entry.added || 0) + Number(entry && entry.deleted || 0) || 1,
+    }))
+    .filter((entry) => entry.file);
+  const total = list.reduce((sum, entry) => sum + entry.lines, 0);
+  if (list.length <= 1 || total < minLines) {
+    return list.length ? [{ files: list.map((e) => e.file), lines: total }] : [];
+  }
+  const count = Math.max(2, Math.min(maxShards, list.length, Math.ceil(total / target)));
+  const shards = Array.from({ length: count }, () => ({ files: [], lines: 0 }));
+  for (const entry of list.slice().sort((a, b) => b.lines - a.lines || a.file.localeCompare(b.file))) {
+    let lightest = shards[0];
+    for (const shard of shards) if (shard.lines < lightest.lines) lightest = shard;
+    lightest.files.push(entry.file);
+    lightest.lines += entry.lines;
+  }
+  // A shard can end up empty when files < count is impossible by construction,
+  // but stay defensive: never hand the caller a dispatch with no files.
+  return shards.filter((shard) => shard.files.length > 0);
+}
+
 function decideReview(input) {
   const config = normalizeReviewConfig(input && input.review);
   const entries = Array.isArray(input && input.entries) ? input.entries : [];
@@ -267,6 +313,9 @@ function decideReview(input) {
     risk_signals: riskSignals,
     estimated_calls: estimatedCalls,
     saved_calls_vs_dialectic: Math.max(0, fullCalls - estimatedCalls),
+    // Additive. Length 1 (or 0) = no split, the caller dispatches exactly as
+    // before. Only computed when a challenger will actually run.
+    shards: decision === 'skip' ? [] : planReviewShards(entries),
   };
 }
 
@@ -382,6 +431,7 @@ module.exports = {
   collectDiff,
   normalizeReviewConfig,
   decideReview,
+  planReviewShards,
   decideMemory,
   failOpenOnDiffError,
   runCli,

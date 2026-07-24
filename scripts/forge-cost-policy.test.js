@@ -12,6 +12,7 @@ const {
   decideReview,
   decideMemory,
   failOpenOnDiffError,
+  planReviewShards,
 } = require('./forge-cost-policy.js');
 
 let passed = 0;
@@ -199,6 +200,57 @@ test('boundary summaries always receive adaptive memory extraction', () => {
 test('memory always/disabled knobs are authoritative', () => {
   assert.strictEqual(decideMemory({ memory: { extraction: 'always' }, unitType: 'plan-slice' }).decision, 'extract');
   assert.strictEqual(decideMemory({ memory: { extraction: 'disabled' }, unitType: 'complete-milestone' }).decision, 'skip');
+});
+
+// A challenger handed a whole large diff dies on context and returns no verdict,
+// which downstream is indistinguishable from "found nothing". Sharding by file
+// bounds each read.
+const many = (n, lines) => Array.from({ length: n }, (_, i) => file(`src/f${i}.ts`, lines, 0));
+
+test('a small diff is not split — one challenger, today\'s behavior', () => {
+  const shards = planReviewShards(many(5, 100));
+  assert.strictEqual(shards.length, 1);
+  assert.strictEqual(shards[0].files.length, 5);
+});
+
+test('an empty diff yields no shards at all', () => {
+  assert.deepStrictEqual(planReviewShards([]), []);
+});
+
+test('a large diff splits and every file lands in exactly one shard', () => {
+  const shards = planReviewShards(many(20, 400));
+  assert.ok(shards.length > 1 && shards.length <= 6, `shard count ${shards.length}`);
+  const placed = shards.flatMap((s) => s.files);
+  assert.strictEqual(placed.length, 20, 'no file dropped or duplicated');
+  assert.strictEqual(new Set(placed).size, 20);
+  assert.ok(shards.every((s) => s.files.length > 0), 'no empty dispatch');
+});
+
+test('the shard cap holds even on a huge diff', () => {
+  assert.ok(planReviewShards(many(500, 900)).length <= 6);
+});
+
+test('splitting is deterministic, so a resumed review re-derives it', () => {
+  assert.deepStrictEqual(planReviewShards(many(20, 400)), planReviewShards(many(20, 400)));
+});
+
+test('one oversized file stays whole — never half a function', () => {
+  const shards = planReviewShards([file('src/huge.ts', 50000, 0)]);
+  assert.strictEqual(shards.length, 1);
+  assert.deepStrictEqual(shards[0].files, ['src/huge.ts']);
+});
+
+test('a binary file is charged a line so it cannot look free', () => {
+  const shards = planReviewShards([{ file: 'a.png', added: 0, deleted: 0, binary: true }]);
+  assert.strictEqual(shards[0].lines, 1);
+});
+
+test('decideReview carries the shards, and skip computes none', () => {
+  const run = decideReview({ review: { trigger: 'always' }, entries: many(20, 400) });
+  assert.ok(run.shards.length > 1);
+  const skipped = decideReview({ review: { mode: 'disabled' }, entries: [file('src/a.js')] });
+  assert.strictEqual(skipped.decision, 'skip');
+  assert.deepStrictEqual(skipped.shards, []);
 });
 
 process.stdout.write(`\n${passed} passed, 0 failed\n`);
