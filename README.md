@@ -94,7 +94,7 @@ A partir da v1.0, o Forge Agent usa **3 comandos slash** e **skills** para tudo 
 | `forge-config`, `forge-mcps` | Status line, hooks e MCPs |
 | `forge-help` | Ajuda completa |
 
-> **Referência completa de preferências:** cada um dos 87 knobs (38 seções) do catálogo de
+> **Referência completa de preferências:** cada um dos 94 knobs (40 seções) do catálogo de
 > prefs — `forge-agent-prefs.jsonc`/`.gsd/claude-agent-prefs.jsonc`/`.gsd/prefs.local.jsonc`, todos JSONC
 > com `$schema: forge-prefs.schema.json` — está documentado em
 > [`shared/forge-prefs-reference.md`](shared/forge-prefs-reference.md) (gerado a partir do schema,

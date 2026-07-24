@@ -257,20 +257,29 @@ function decayConfidence(baseConfidence, lastAccessTs, nowMs) {
   return Math.min(1, Math.max(0, baseConfidence * factor));
 }
 
+function finiteNumber(value, fallback) {
+  const parsed = typeof value === 'number' ? value : parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function memoryIdentity(unitId, memId) {
+  return `${unitId}\x00${memId}`;
+}
+
 // ── renderMemory ──────────────────────────────────────────────────────────────
-// Reconstructs AUTO-MEMORY.md from .gsd/memory/*.md fragments.
-// For each fragment, folds stats[] events (hit, prune, promote, confirm, supersede)
-// on top of seed facts to compute derived hits + confidence (with decay).
-// Emits <!-- gsd-auto-memory ... --> blocks ranked by (confidence * hits) DESC.
-// Caps at MEMORY_CAP entries.
-function renderMemory(cwd) {
+// Fold every fragment into structured entries with decay computed on-read.
+function projectMemoryEntries(cwd, opts) {
   const fragments = memoryMod.listFragments(cwd);
-  const nowMs = Date.now();
+  const nowMs = opts && Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
 
-  // Accumulate all facts + their stat events keyed by mem_id
-  const factMap = new Map(); // mem_id → { fact, hits, confidence, lastAccessTs, pruned, promoted }
+  // mem_id is fragment-local: independent extractors commonly start at MEM001.
+  // Key runtime state by (unitId, mem_id) so facts and stats cannot bleed
+  // across fragments while the stored/display ID remains backward compatible.
+  const factMap = new Map();
+  const validRawIds = new Set();
+  const pendingOrphans = [];
 
-  for (const { unitId, path: fpath } of fragments) {
+  for (const { unitId, milestoneId, storageKey, path: fpath } of fragments) {
     // legacy-orphan: block format (not YAML-frontmatter fragment) — special-case before parseFragment
     if (unitId === 'legacy-orphan') {
       try {
@@ -279,9 +288,7 @@ function renderMemory(cwd) {
         for (const entry of orphanEntries) {
           const mid = String(entry.fact.mem_id || '');
           if (!mid) continue;
-          // Valid fragments win — orphans are fallback; skip if already in factMap
-          if (factMap.has(mid)) continue;
-          factMap.set(mid, entry);
+          pendingOrphans.push({ entry, mid, unitId });
         }
       } catch (e) {
         process.stderr.write(`[forge-projection] warn: skipping legacy-orphan memory: ${e.message}\n`);
@@ -298,15 +305,26 @@ function renderMemory(cwd) {
       continue;
     }
 
-    // Register facts
+    const localKeys = new Map();
+    const fragmentNamespace = milestoneId ? `${milestoneId}/${unitId}` : unitId;
+
+    // Register facts. First-write-wins remains unchanged inside one fragment;
+    // only cross-fragment collisions are separated.
     for (const fact of (frag.facts || [])) {
       const mid = String(fact.mem_id || '');
       if (!mid) continue;
-      if (!factMap.has(mid)) {
-        factMap.set(mid, {
+      const identity = memoryIdentity(fragmentNamespace, mid);
+      localKeys.set(mid, identity);
+      validRawIds.add(mid);
+      if (!factMap.has(identity)) {
+        factMap.set(identity, {
+          identity: `${fragmentNamespace}/${mid}`,
+          unitId,
+          milestoneId: milestoneId || null,
+          storageKey,
           fact,
           hits: 0,
-          confidence: parseFloat(fact.confidence) || 0.5,
+          confidence: finiteNumber(fact.confidence_base, finiteNumber(fact.confidence, 0.5)),
           lastAccessTs: fact.created_at || null,
           pruned: false,
           promoted: false,
@@ -317,9 +335,13 @@ function renderMemory(cwd) {
 
     // Fold stat events (sorted by ts — already sorted in fragment)
     for (const evt of (frag.stats || [])) {
-      const mid = String(evt.mem_id || '');
-      if (!mid || !factMap.has(mid)) continue;
-      const entry = factMap.get(mid);
+      // The documented supersede event uses old_id/new_id, not mem_id.
+      const mid = String(evt.kind === 'supersede'
+        ? (evt.old_id || evt.mem_id || '')
+        : (evt.mem_id || ''));
+      const identity = localKeys.get(mid);
+      if (!identity || !factMap.has(identity)) continue;
+      const entry = factMap.get(identity);
 
       switch (evt.kind) {
         case 'seed': {
@@ -329,7 +351,10 @@ function renderMemory(cwd) {
             process.stderr.write(`[forge-projection] warn: non-first seed event for ${mid} — applying last-seed-wins\n`);
           }
           entry.hits = (typeof evt.hits === 'number' ? evt.hits : parseInt(evt.hits, 10)) || 0;
-          entry.confidence = parseFloat(evt.confidence) || entry.confidence;
+          entry.confidence = finiteNumber(
+            evt.confidence_base,
+            finiteNumber(evt.confidence, entry.confidence)
+          );
           entry.lastAccessTs = evt.ts || entry.lastAccessTs;
           entry._seenSeed = true;
           break;
@@ -361,13 +386,25 @@ function renderMemory(cwd) {
           entry._mutated = true;
           // Explicit decay events reduce confidence
           if (evt.new_confidence !== undefined) {
-            entry.confidence = parseFloat(evt.new_confidence) || entry.confidence;
+            entry.confidence = finiteNumber(evt.new_confidence, entry.confidence);
           }
           break;
         default:
           break;
       }
     }
+  }
+
+  // Process the fallback bucket last so valid fragments win regardless of the
+  // platform's localeCompare ordering for uppercase vs lowercase filenames.
+  for (const { entry, mid, unitId } of pendingOrphans) {
+    if (validRawIds.has(mid)) continue;
+    const identity = memoryIdentity(unitId, mid);
+    factMap.set(identity, {
+      ...entry,
+      identity: `${unitId}/${mid}`,
+      unitId,
+    });
   }
 
   // Apply time-based decay and filter pruned
@@ -378,13 +415,154 @@ function renderMemory(cwd) {
     active.push({ ...entry, confidence: decayed });
   }
 
-  // Sort by (confidence * hits) DESC, then mem_id for stability
+  // Sort by (confidence * hits) DESC, then collision-safe identity for stability.
   active.sort((a, b) => {
     const scoreA = a.confidence * Math.max(1, a.hits);
     const scoreB = b.confidence * Math.max(1, b.hits);
     if (scoreB !== scoreA) return scoreB - scoreA;
-    return String(a.fact.mem_id || '').localeCompare(String(b.fact.mem_id || ''));
+    return a.identity.localeCompare(b.identity);
   });
+
+  return active;
+}
+
+// Deterministic, model-free selector used by `forge-memory.js --query`.
+// It replaces list+one-read-per-fragment orchestration and applies the context
+// budget before any memory text enters a worker prompt.
+const QUERY_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'this', 'that', 'into', 'are', 'was',
+  'uma', 'para', 'com', 'dos', 'das', 'que', 'por', 'como', 'sem', 'sobre',
+]);
+
+function queryTerms(text) {
+  const words = String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .match(/[a-z0-9_][a-z0-9_.-]{2,}/g) || [];
+  return new Set(words.filter(word => !QUERY_STOPWORDS.has(word)));
+}
+
+const MAX_QUERY_BYTES = 512 * 1024;
+const MAX_QUERY_TOKENS = 16000;
+
+function boundedQueryInteger(value, fallback, min, max, label) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const text = String(value);
+  if (!/^\d+$/.test(text)) throw new Error(`${label} must be a positive integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed) || parsed < min) {
+    throw new Error(`${label} must be an integer >= ${min}`);
+  }
+  return Math.min(max, parsed);
+}
+
+function queryText(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') throw new Error('query must be a string');
+  if (value.includes('\0')) throw new Error('query must not contain NUL bytes');
+  if (Buffer.byteLength(value, 'utf8') > MAX_QUERY_BYTES) {
+    throw new Error(`query exceeds ${MAX_QUERY_BYTES} bytes`);
+  }
+  return value;
+}
+
+function inlineLabel(value, fallback) {
+  const normalized = String(value || fallback).replace(/[\x00-\x1f\x7f\[\]]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return normalized.slice(0, 160) || fallback;
+}
+
+function queryMemoryEntries(cwd, opts) {
+  opts = opts || {};
+  const unitType = String(opts.unitType || 'other').toLowerCase();
+  const terms = queryTerms(queryText(opts.query));
+  const limit = boundedQueryInteger(opts.limit, 8, 1, 50, 'limit');
+  const maxTokens = boundedQueryInteger(opts.maxTokens, 2000, 2, MAX_QUERY_TOKENS, 'maxTokens');
+  const maxChars = maxTokens * 4;
+
+  const execution = unitType === 'execute-task' || unitType === 'execute-loose-task' || unitType === 'review-fix';
+  const planning = /^(?:plan|research|discuss)-/.test(unitType);
+  const preferred = execution
+    ? new Map([['gotcha', 3], ['convention', 2], ['architecture', 1], ['pattern', 1]])
+    : planning
+      ? new Map([['architecture', 3], ['pattern', 3], ['convention', 1], ['gotcha', 1]])
+      : new Map();
+
+  const ranked = [];
+  for (const entry of projectMemoryEntries(cwd, opts)) {
+    const factTerms = queryTerms(`${entry.fact.text || ''} ${entry.fact.source_unit || ''}`);
+    const matched = [...terms].filter(term => factTerms.has(term)).sort();
+    const minimumOverlap = terms.size === 0 ? 0 : execution ? Math.min(2, terms.size) : planning ? 1 : 0;
+    if (matched.length < minimumOverlap) continue;
+
+    const category = String(entry.fact.category || 'unknown').toLowerCase();
+    const quality = entry.confidence * Math.max(1, entry.hits);
+    const score = (matched.length * 100) + ((preferred.get(category) || 0) * 10) + quality;
+    ranked.push({ ...entry, matched, score });
+  }
+
+  ranked.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.identity.localeCompare(b.identity);
+  });
+
+  const selected = [];
+  const lines = [];
+  let chars = 0;
+  let truncated = ranked.length > limit;
+
+  for (const entry of ranked.slice(0, limit)) {
+    const category = inlineLabel(entry.fact.category, 'unknown');
+    const identity = inlineLabel(entry.identity, 'memory');
+    const prefix = `- [${identity}] (${category}) `;
+    const fullText = String(entry.fact.text || '').replace(/\s+/g, ' ').trim();
+    let line = prefix + fullText;
+    const separatorChars = lines.length === 0 ? 0 : 1;
+    const remaining = maxChars - chars - separatorChars;
+    if (remaining <= prefix.length) {
+      truncated = true;
+      break;
+    }
+
+    let selectedText = fullText;
+    if (line.length > remaining) {
+      selectedText = fullText.slice(0, Math.max(0, remaining - prefix.length - 1)).trimEnd() + '…';
+      line = prefix + selectedText;
+      truncated = true;
+    }
+
+    lines.push(line);
+    chars += separatorChars + line.length;
+    selected.push({
+      identity: entry.identity,
+      unit_id: entry.unitId,
+      milestone_id: entry.milestoneId || null,
+      mem_id: entry.fact.mem_id,
+      category,
+      text: selectedText,
+      source_unit: entry.fact.source_unit || null,
+      confidence: Number(entry.confidence.toFixed(4)),
+      hits: entry.hits,
+      score: Number(entry.score.toFixed(4)),
+      matched_terms: entry.matched,
+    });
+    if (line.length >= remaining) break;
+  }
+
+  const markdown = lines.length ? lines.join('\n') : '(none)';
+  return {
+    entries: selected,
+    markdown,
+    estimated_tokens: Math.ceil(markdown.length / 4),
+    truncated,
+    considered: ranked.length,
+  };
+}
+
+// ── renderMemory ─────────────────────────────────────────────────────────────────
+// Reconstructs AUTO-MEMORY.md from the structured, collision-safe projection.
+function renderMemory(cwd) {
+  const active = projectMemoryEntries(cwd);
 
   // Cap at MEMORY_CAP
   const capped = active.slice(0, MEMORY_CAP);
@@ -606,6 +784,8 @@ function writeAll(cwd, opts) {
 module.exports = {
   renderLedger,
   renderDecisions,
+  projectMemoryEntries,
+  queryMemoryEntries,
   renderMemory,
   renderChecker,
   isStale,

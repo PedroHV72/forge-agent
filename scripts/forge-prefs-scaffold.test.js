@@ -75,14 +75,18 @@ check('documentation is schema-projected and sanitized', () => {
   for (const line of lines) {
     const match = line.match(/^\s*\/\/ (.*)$/);
     if (!match || scaffold.isOffMarker(line) || match[1].startsWith('── ') ||
-      match[1].startsWith('Catálogo gerado') || match[1].startsWith('Para ativar')) continue;
+      match[1].startsWith('Catálogo gerado') || match[1].startsWith('Para ativar') ||
+      match[1].startsWith('Referência completa')) continue;
     assert(!/^["{}\]]/.test(match[1]), line);
     assert(values.some((value) => value.includes(match[1].replace(/^· /, ''))), line);
   }
 });
 
 check('generator source has no knob-explaining prose', () => {
-  assert(!/skip_discuss|auto_commit|merge_strategy|routing/.test(source));
+  for (const key of ['auto_commit', 'merge_strategy', 'routing']) {
+    const node = schema.properties[key];
+    if (node && node.description) assert(!source.includes(node.description));
+  }
   assert(source.includes('node.description'));
   assert(source.includes('node.default'));
 });

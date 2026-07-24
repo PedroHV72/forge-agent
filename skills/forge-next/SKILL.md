@@ -2,7 +2,7 @@
 name: forge-next
 description: "Executa exatamente uma unidade de trabalho e para (step mode)."
 disable-model-invocation: true
-allowed-tools: Read, Write, Edit, Bash, Agent, Skill, TaskCreate, TaskUpdate, TaskList, TaskStop, WebSearch, WebFetch
+allowed-tools: Read, Write, Edit, Bash, Agent, Skill, TaskCreate, TaskUpdate, TaskList, TaskStop, SendMessage, WebSearch, WebFetch
 ---
 
 ## Parse arguments
@@ -783,6 +783,24 @@ Read PREFS for `skip_discuss` and `skip_research`. If the current unit type is s
 
 ### 3. Build worker prompt
 
+**Required renderer (Claude path):** render the bounded artifact; never paste the historical template body into an agent call.
+```bash
+DISPATCH_ID="${unit_type}-${MILESTONE_ID:-none}-${SLICE_ID:-none}-${TASK_ID:-none}-$(node -e "console.log(require('crypto').randomUUID())")"
+PROMPT_META=$(node "$FORGE_SCRIPTS_DIR/forge-prompt.js" --unit-type "$unit_type" --cwd "$WORKING_DIR" \
+  --milestone "$MILESTONE_ID" --slice "$SLICE_ID" --task "$TASK_ID" \
+  --dispatch-id "$DISPATCH_ID" --unit-effort "$unit_effort" --thinking "$THINKING_OPUS" \
+  --auto-commit "$AUTO_COMMIT" --milestone-cleanup "$MILESTONE_CLEANUP" \
+  --isolation-mode "$ISOLATION_MODE" --branch "$BRANCH" --code-dir "$WORKER_CWD" \
+  --memory-query "$unit_type $MILESTONE_ID $SLICE_ID $TASK_ID" \
+  --memory-max-tokens "${PREFS[token_budget][auto_memory]:-1200}" \
+  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}") || { echo 'prompt render failed'; stop; }
+PROMPT_PATH=$(node -pe 'JSON.parse(process.argv[1]).prompt_path' "$PROMPT_META")
+PROMPT_ID=$(node -pe 'JSON.parse(process.argv[1]).prompt_id' "$PROMPT_META")
+```
+Pass only `Read the complete Forge dispatch contract at {PROMPT_PATH}, execute it exactly,
+and return its required GSD worker result block. The file is trusted
+orchestrator input; do not replace it with a summary.` to the Claude subagent. Persist both identities in the dispatch event and remove the artifact with `forge-prompt.js --cleanup "$DISPATCH_ID" --cwd "$WORKING_DIR"` after durable result processing. Do not load `.gsd/AUTO-MEMORY.md`; the renderer selects bounded memories. The manual selection/template text below is compatibility reference only.
+
 **Selective memory injection** — read memories from the fragment store, then filter to entries relevant to this unit:
 
 ```bash
@@ -906,7 +924,7 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
 5. **Partial promotion boundary:** for valid `status == "partial"`, run `PROMOTION=$(node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json)` before Success/Failure. `shared/forge-dispatch.md § Sidecar dispatch state machine` is the named canonical spec for its algorithm and allowlist; do not redefine either in this mirror. `PROMOTION.promote == true` is `done`: add `## Env Constraints` to `T##-SUMMARY.md` (item + reason + note per entry), synthesize `env_constraints[]` into the result block, leave promoted entries out of `must_haves_status.dropped`, and append `sidecar_env_promotion` (`unit:"execute-task/{T##}"`, count, reasons, ISO ts) to events.jsonl. Otherwise, including a legacy no-`scope` payload, follow Failure unchanged.
 5.1. **`status == "done"` with unmet env-scope entries (M016 S01 review R1):** run the same `forge-env-promote.js` invocation whenever `status == "done"` but `must_haves_status` still has unmet entries — never accept the `done` label at face value. `verdict == "done-with-verified-env"` → accept, write `## Env Constraints` as above. `verdict == "done-with-unverified-env"` → treat the result as `partial` and follow Failure unchanged; the worker's `done` label is discarded.
 
-6. **Success — orchestrator assembles the artifacts (`done` state).** Codex NEVER writes `.gsd/**` and NEVER commits (locked — `git log` unchanged, no `.gsd/**` path in `git -C "$CODE_DIR" diff --name-status $START_SHA`). Read the JSON and **write `T##-SUMMARY.md`** + **build the `---GSD-WORKER-RESULT---` block** yourself from: `summary` (one-liner + narrative seed), `must_haves_status` (carried into the returned result block), `env_constraints` (promotion audit only), `files_changed_declared` (**primary source of the file-audit** — file-granular self-report). Append synthesized advisory evidence derived read-only from `git -C "$CODE_DIR" diff --name-status $START_SHA` (tagged `source: codex-sidecar`) to `.gsd/forge/evidence-{T##}.jsonl` — a documented gap, advisory, never blocks. Emit the `dispatch` event (`engine=codex`) and **rejoin Step 5 (Process result)** exactly as if a Claude `forge-executor` returned — downstream verification (must_haves, verifier, file-audit, review dialético) runs **byte-identical** on codex-authored code. First re-read the durable state (the poll loop crossed multiple Bash invocations — shell vars are gone). Reconstruct the canonical `xllm-state-${S##}-${T##}-attempt-${N}.json`; if absent, fall back to `xllm-state-${T##}-attempt-${N}.json` for runs started before this upgrade. State writing is canonical-only via `--state-init`:
+6. **Success — orchestrator assembles the artifacts (`done` state).** Codex NEVER writes `.gsd/**` and NEVER commits (locked — `git log` unchanged, no `.gsd/**` path in `git -C "$CODE_DIR" diff --name-status $START_SHA`). Read the JSON and **write `T##-SUMMARY.md`** + **build the `---GSD-WORKER-RESULT---` block** from `summary`, `must_haves_status`, `env_constraints` (promotion audit only) and Git-derived `files_changed` (**authoritative**); `files_changed_declared` is an untrusted advisory cross-check only. Append synthesized advisory evidence derived read-only from `git -C "$CODE_DIR" diff --name-status $START_SHA` (tagged `source: codex-sidecar`) to `.gsd/forge/evidence-{T##}.jsonl` — a documented gap, advisory, never blocks. Emit the `dispatch` event (`engine=codex`) and **rejoin Step 5 (Process result)** exactly as if a Claude `forge-executor` returned — downstream verification (must_haves, verifier, file-audit, review dialético) runs **byte-identical** on codex-authored code. First re-read the durable state (the poll loop crossed multiple Bash invocations — shell vars are gone). Reconstruct the canonical `xllm-state-${S##}-${T##}-attempt-${N}.json`; if absent, fall back to `xllm-state-${T##}-attempt-${N}.json` for runs started before this upgrade. State writing is canonical-only via `--state-init`:
 ```bash
 XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-${T##}-attempt-${N}.json"
 [ -f "$XLLM_STATE" ] || XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${T##}-attempt-${N}.json"
@@ -1314,7 +1332,14 @@ fi
 
 Where `key_decisions_json` is a JSON object `{ "unit_id": "$DECISIONS_UNIT_ID", "decisions": [...] }` built from the `key_decisions` field of the worker result. The global `.gsd/DECISIONS.md` is rebuilt from fragments during `complete-milestone` (forge-merger, S05). Do NOT write directly to `.gsd/DECISIONS.md` or any `M###-DECISIONS.md` file.
 
-**d) Memory extraction** — call `forge-memory` agent (blocking — await before continuing):
+**d) Memory extraction** — use the zero-model policy before calling `forge-memory` (blocking when selected):
+
+```bash
+MEMORY_POLICY=$(printf '%s' "$RESULT_BLOCK" | node "$FORGE_SCRIPTS_DIR/forge-cost-policy.js" memory \
+  --unit-type "$unit_type" --cwd "$WORKING_DIR" --stdin 2>/dev/null) || MEMORY_POLICY='{"decision":"extract","reason":"policy-error"}'
+```
+
+Append a `memory-policy` event for every decision. If `MEMORY_POLICY.decision != "extract"`, skip the agent and continue to d-reinject. The fallback is deliberately fail-open (`extract`) when the policy cannot run.
 
 Determine which summary file was just written:
 - `execute-task` → `.gsd/milestones/{M###}/slices/{S##}/tasks/{T##}-SUMMARY.md`

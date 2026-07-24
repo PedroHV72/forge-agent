@@ -4,6 +4,7 @@ description: Author-side defender in the dialectic review. Receives a reviewer's
 model: claude-fable-5
 thinking: adaptive
 effort: medium
+maxTurns: 16
 tools: Read, Bash, Grep, Glob
 ---
 

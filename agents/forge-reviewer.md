@@ -4,6 +4,7 @@ description: Adversarial code reviewer. Scans a git diff as a senior reviewer an
 model: claude-sonnet-5
 thinking: disabled
 effort: medium
+maxTurns: 20
 tools: Read, Bash, Grep, Glob
 ---
 

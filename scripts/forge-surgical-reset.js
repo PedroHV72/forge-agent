@@ -349,6 +349,22 @@ function initState(stateFile, { cwd, attempt }) {
   return state;
 }
 
+/** Initialize the durable read-only plan-sidecar state without shell-built JSON.
+ * Unlike initState this deliberately performs no git snapshot because plan mode cannot
+ * write the workspace. Atomic JSON serialization keeps Windows paths and quotes valid. */
+function initReadOnlyState(stateFile, { cwd, attempt, resultFile, contextFile }) {
+  const state = {
+    attempt: attempt == null ? 1 : attempt,
+    reason: '',
+    result_file: resultFile,
+    code_dir: cwd,
+    ctx_file: contextFile,
+    transient_retry_count: 0,
+  };
+  writeJsonAtomic(stateFile, state);
+  return state;
+}
+
 /** Read-modify-write, atomic, preserving all fields (esp. pre_dirty + start_sha). */
 function updateState(stateFile, patch) {
   const state = readState(stateFile);
@@ -410,6 +426,7 @@ module.exports = {
   writeJsonAtomic,
   readState,
   initState,
+  initReadOnlyState,
   updateState,
   resetFromState,
 };
@@ -453,11 +470,32 @@ function main() {
       process.exit(0);
     }
 
+    if (args['state-init-read-only']) {
+      if (!args.state || !args.cwd || !args['result-file'] || !args['ctx-file']) {
+        usageError('--state-init-read-only requires --state <file> --cwd <dir> --result-file <file> --ctx-file <file>');
+      }
+      const attempt = args.attempt != null && args.attempt !== true ? parseInt(args.attempt, 10) : 1;
+      initReadOnlyState(args.state, {
+        cwd: args.cwd,
+        attempt,
+        resultFile: args['result-file'],
+        contextFile: args['ctx-file'],
+      });
+      process.exit(0);
+    }
+
     if (args['state-update']) {
       if (!args.state) usageError('--state-update requires --state <file>');
       const patch = {};
       if (args.reason != null && args.reason !== true) patch.reason = args.reason;
       if (args['result-file'] != null && args['result-file'] !== true) patch.result_file = args['result-file'];
+      if (args['dispatch-id'] != null && args['dispatch-id'] !== true) {
+        const dispatchId = String(args['dispatch-id']);
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(dispatchId)) {
+          usageError('--dispatch-id must be 1-128 safe identifier characters');
+        }
+        patch.dispatch_id = dispatchId;
+      }
       if (args['transient-retry-count'] != null && args['transient-retry-count'] !== true) {
         patch.transient_retry_count = parseInt(args['transient-retry-count'], 10);
       }
@@ -472,7 +510,7 @@ function main() {
       process.exit(code);
     }
 
-    usageError('one of --state-init | --state-update | --reset is required');
+    usageError('one of --state-init | --state-init-read-only | --state-update | --reset is required');
   } catch (e) {
     process.stderr.write(`forge-surgical-reset: ${e.message}\n`);
     process.exit(1);

@@ -15,6 +15,8 @@ $ClaudeDir  = "$env:USERPROFILE\.claude"
 $AgentsDir  = "$ClaudeDir\agents"
 $CommandsDir = "$ClaudeDir\commands"
 $BackupDir  = "$ClaudeDir\forge-agent-backup-$(Get-Date -Format 'yyyyMMddHHmmss')"
+$DispatchTemplatesDir = Join-Path (Join-Path $ClaudeDir 'templates') 'dispatch'
+$DispatchTemplatesSrc = Join-Path (Join-Path (Join-Path $RepoDir 'shared') 'templates') 'dispatch'
 
 function Info($msg)    { Write-Host "  $msg" }
 function Success($msg) { Write-Host "✓ $msg" -ForegroundColor Green }
@@ -45,11 +47,16 @@ if (!(Test-Path $ClaudeDir)) {
 }
 Success "Claude Code encontrado em $ClaudeDir"
 
+if (!(Test-Path -LiteralPath $DispatchTemplatesSrc -PathType Container) -or
+    !(Get-ChildItem -LiteralPath $DispatchTemplatesSrc -Filter '*.md' -File -ErrorAction SilentlyContinue)) {
+    throw "Dispatch templates not found at: $DispatchTemplatesSrc"
+}
+
 # ── Check existing installation ───────────────────────────────────────────────
 $hasExisting = (Get-ChildItem "$AgentsDir\forge*.md" -ErrorAction SilentlyContinue) -or
                (Get-ChildItem "$CommandsDir\forge*.md" -ErrorAction SilentlyContinue) -or
-               (Test-Path (Join-Path $ClaudeDir 'forge-agent-prefs.md')) -or
-               (Test-Path (Join-Path $ClaudeDir 'forge-agent-prefs.jsonc'))
+               (Test-Path (Join-Path $ClaudeDir 'forge-agent-prefs.jsonc')) -or
+               (Get-ChildItem -Path $DispatchTemplatesDir -Filter '*.md' -File -ErrorAction SilentlyContinue)
 
 if ($hasExisting -and -not $Update) {
     Write-Host ""
@@ -63,11 +70,13 @@ if ($hasExisting -and $Update) {
     if (-not $DryRun) {
         New-Item -ItemType Directory "$BackupDir\agents" -Force | Out-Null
         New-Item -ItemType Directory "$BackupDir\commands" -Force | Out-Null
+        $DispatchTemplatesBackupDir = Join-Path (Join-Path $BackupDir 'templates') 'dispatch'
+        New-Item -ItemType Directory $DispatchTemplatesBackupDir -Force | Out-Null
         Get-ChildItem "$AgentsDir\forge*.md"   -ErrorAction SilentlyContinue | Copy-Item -Destination "$BackupDir\agents\"
         Get-ChildItem "$CommandsDir\forge*.md" -ErrorAction SilentlyContinue | Copy-Item -Destination "$BackupDir\commands\"
-        $legacyPrefsFile = Join-Path $ClaudeDir 'forge-agent-prefs.md'
         $prefsJsoncFile = Join-Path $ClaudeDir 'forge-agent-prefs.jsonc'
-        if (Test-Path $legacyPrefsFile) { Copy-Item $legacyPrefsFile $BackupDir }
+        Get-ChildItem -Path $DispatchTemplatesDir -Filter '*.md' -File -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $DispatchTemplatesBackupDir
         if (Test-Path $prefsJsoncFile) { Copy-Item $prefsJsoncFile $BackupDir }
         if (Test-Path "$ClaudeDir\forge-statusline.js")  { Copy-Item "$ClaudeDir\forge-statusline.js"  $BackupDir }
         if (Test-Path "$ClaudeDir\forge-hook.js")        { Copy-Item "$ClaudeDir\forge-hook.js"        $BackupDir }
@@ -119,6 +128,13 @@ Info "Instalando agentes..."
 foreach ($f in Get-ChildItem "$RepoDir\agents\forge*.md") {
     CopyFile $f.FullName "$AgentsDir\$($f.Name)"
     Info "  agents\$($f.Name)"
+}
+
+Write-Host ""
+Info "Instalando templates de dispatch..."
+Get-ChildItem -LiteralPath $DispatchTemplatesSrc -Filter '*.md' -File | ForEach-Object {
+    CopyFile $_.FullName (Join-Path $DispatchTemplatesDir $_.Name)
+    Info "  templates/dispatch/$($_.Name)"
 }
 
 # ── Opus model availability probe ─────────────────────────────────────────────

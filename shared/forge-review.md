@@ -44,6 +44,9 @@ const rv=(JSON.parse(d).prefs.review)||{};
 const low=v=>(typeof v==='string')?v.toLowerCase():undefined;
 let mode=low(rv.mode); if(!['enabled','disabled'].includes(mode))mode='enabled';
 let style=low(rv.style); if(!['dialectic','flags'].includes(style))style='dialectic';
+let trigger=low(rv.trigger); if(!['adaptive','always'].includes(trigger))trigger='adaptive';
+let adaptiveFlagsLines=Number.isInteger(rv.adaptive_flags_lines)&&rv.adaptive_flags_lines>0?rv.adaptive_flags_lines:40;
+let adaptiveDialecticLines=Number.isInteger(rv.adaptive_dialectic_lines)&&rv.adaptive_dialectic_lines>0?rv.adaptive_dialectic_lines:400;
 let rounds=rv.rounds; if(!Number.isInteger(rounds)||rounds<0||rounds>3)rounds=1;
 let askAuto=low(rv.ask_in_auto); if(!['defer','pause'].includes(askAuto))askAuto='defer';
 let fixConceded=(low(rv.fix_conceded)==='false')?false:(rv.fix_conceded===false?false:true);
@@ -52,8 +55,8 @@ let challenger=low(rv.challenger); if(!['claude','codex','gemini','auto'].includ
 let advocate=low(rv.advocate); if(!['claude','auto'].includes(advocate))advocate='claude';
 let challengerModel=(typeof rv.challenger_model==='string'&&rv.challenger_model.trim())?rv.challenger_model.trim():null;
 let advocateModel=(typeof rv.advocate_model==='string'&&rv.advocate_model)?rv.advocate_model:'claude-fable-5';
-process.stdout.write(JSON.stringify({mode,style,rounds,askAuto,fixConceded,engine,challenger,advocate,challengerModel,advocateModel}));
-}catch(e){process.stdout.write('{\"mode\":\"enabled\",\"style\":\"dialectic\",\"rounds\":1,\"askAuto\":\"defer\",\"fixConceded\":true,\"engine\":\"agents\",\"challenger\":\"claude\",\"advocate\":\"claude\",\"challengerModel\":null,\"advocateModel\":\"claude-fable-5\"}')}})")
+process.stdout.write(JSON.stringify({mode,style,trigger,adaptiveFlagsLines,adaptiveDialecticLines,rounds,askAuto,fixConceded,engine,challenger,advocate,challengerModel,advocateModel}));
+}catch(e){process.stdout.write('{\"mode\":\"enabled\",\"style\":\"dialectic\",\"trigger\":\"adaptive\",\"adaptiveFlagsLines\":40,\"adaptiveDialecticLines\":400,\"rounds\":1,\"askAuto\":\"defer\",\"fixConceded\":true,\"engine\":\"agents\",\"challenger\":\"claude\",\"advocate\":\"claude\",\"challengerModel\":null,\"advocateModel\":\"claude-fable-5\"}')}})")
 
 CHALLENGER=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challenger||'claude')}catch(e){process.stdout.write('claude')}})")
 CHALLENGER_MODEL=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challengerModel||'')}catch(e){process.stdout.write('')}})")
@@ -303,6 +306,50 @@ fi
 
 If `$DIFF_CMD` still produces no changes → write a minimal `{S##}-REVIEW.md` stating "no diff to review" and proceed. Do not dispatch agents.
 
+## Step 1.5 — Deterministic cost policy
+
+Before dispatching a reviewer, run the zero-model policy engine. The engine reads
+the resolved `review.trigger`/threshold prefs itself, computes Git/SVN diff stats
+without `eval`, and returns `skip | flags | dialectic`. This gate is deterministic:
+never spend an LLM call deciding whether to spend an LLM call.
+
+```bash
+REVIEW_CODE_DIR="${CODE_DIR:-$WORKING_DIR}"
+POLICY_ARGS=(review --cwd "$REVIEW_CODE_DIR" --risk "${SLICE_RISK:-normal}")
+[ -n "${BASE:-}" ] && POLICY_ARGS+=(--base "$BASE")
+compgen -G "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/tasks/*/*-SECURITY.md" >/dev/null && POLICY_ARGS+=(--security-present)
+grep -Eq 'substantive:[[:space:]]*(false|✗)|wired:[[:space:]]*(false|✗)' \
+  "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/{S##}-VERIFICATION.md" 2>/dev/null \
+  && POLICY_ARGS+=(--verification-drift)
+
+REVIEW_POLICY=$(node "$FORGE_SCRIPTS_DIR/forge-cost-policy.js" "${POLICY_ARGS[@]}")
+POLICY_EXIT=$?
+if [ "$POLICY_EXIT" -ne 0 ] || ! node -e 'JSON.parse(process.argv[1])' "$REVIEW_POLICY" 2>/dev/null; then
+  # Never turn a policy implementation failure into a skipped review.
+  REVIEW_POLICY='{"decision":"flags","reason":"policy-error-fail-open","changed_files":0,"changed_lines":0,"estimated_calls":1,"saved_calls_vs_dialectic":0}'
+fi
+REVIEW_DECISION=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).decision)" "$REVIEW_POLICY")
+REVIEW_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).reason)" "$REVIEW_POLICY")
+
+mkdir -p "$WORKING_DIR/.gsd/forge"
+printf '%s' "$REVIEW_POLICY" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const p=JSON.parse(d);process.stdout.write(JSON.stringify({...p,ts:process.argv[1],event:"review-policy",milestone:process.argv[2],slice:process.argv[3]})+"\n")})' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{M###}" "{S##}" \
+  >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+```
+
+The emitted `review-policy` event carries the full policy object, making cost
+savings auditable rather than theoretical. Policy failure is visible as
+`policy-error-fail-open` and conservatively spends one flags pass.
+
+- `skip` → write the minimal `{S##}-REVIEW.md` with `**Policy:** skipped —
+  {REVIEW_REASON}` and proceed without any review agent.
+- `flags` → set the effective `style = flags` for this gate and run Step 2 only.
+- `dialectic` → retain the configured dialectic and continue through Steps 2–5.
+
+`review.trigger: always` preserves the legacy behavior. An explicit configured
+`review.style: flags` is a ceiling: adaptive risk never upgrades an operator's
+one-pass choice into a dialectic.
+
 ## Step 2 — Challenge
 
 Routed by `challenger` (from Step 0). `challenger == 'claude'` (default) runs the in-context agent unchanged; `challenger == 'codex' | 'gemini'` runs the S01 adapter with `--engine $XLLM_ENGINE`.
@@ -313,6 +360,13 @@ Routed by `challenger` (from Step 0). `challenger == 'claude'` (default) runs th
 Agent({ subagent_type: 'forge-reviewer',
   prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: complete-slice/{S##}\nDIFF_CMD: {DIFF_CMD}" })
 ```
+
+Capture the completed subagent's `agent_id` as `REVIEWER_AGENT_ID`. Claude Code
+returns this id with a custom subagent result. It is used in Step 4 to resume the
+same reviewer through the native `SendMessage` tool, preserving the reviewer's
+diff reads and original reasoning instead of paying for a fresh reviewer context
+on every rebuttal round. If no id is returned, leave `REVIEWER_AGENT_ID` empty and
+use the compatibility fallback documented in Step 4.
 
 Parse the result:
 - `NO_FLAGS` → no objections. Write a clean `{S##}-REVIEW.md` ("Reviewer found nothing to challenge."), proceed. Done.
@@ -371,9 +425,36 @@ Skip if `rounds == 0`. Otherwise, for `i` in `1..rounds` (default 1), feed the d
 
 ### `challenger == 'claude'` (default agent)
 
+**Preferred native continuation (Claude Code with `SendMessage`):** when
+`REVIEWER_AGENT_ID` is non-empty and `SendMessage` is present in the
+orchestrator's own tool list, resume the completed reviewer:
+
+```
+SendMessage({ to: REVIEWER_AGENT_ID,
+  message: "REBUTTAL ROUND {i}/{rounds}. Review the DEFENSE below against the objections you already authored. Return only the maintained/withdrawn verdict contract from your agent instructions.\n\nDEFENSE:\n{DEFENSE}" })
+```
+
+Wait for that resumed subagent's completion notification before resolving the
+round. A completed custom subagent auto-resumes in the background and retains its
+full history. Claude Code currently exposes `SendMessage` only when
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`; Forge never enables that experimental
+flag itself. Reuse the same id for every round when the tool is present. This path
+avoids re-sending `DIFF_CMD` and `OBJECTIONS` and avoids re-reading the diff.
+
+**Compatibility fallback:** if `SendMessage` is absent, the send fails, or
+`REVIEWER_AGENT_ID` is empty (older Claude Code / malformed tool result), emit a
+`review-resume-fallback` event and use the legacy fresh dispatch below. Review
+remains never-blocking.
+
 ```
 Agent({ subagent_type: 'forge-reviewer',
   prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: complete-slice/{S##}\nDIFF_CMD: {DIFF_CMD}\nOBJECTIONS:\n{OBJECTIONS}\nDEFENSE:\n{DEFENSE}" })
+```
+
+Fallback event:
+
+```json
+{"ts":"<ISO-8601>","event":"review-resume-fallback","milestone":"{M###}","slice":"{S##}","round":N,"reason":"sendmessage-unavailable|missing-agent-id|sendmessage-failed"}
 ```
 
 When `DEFENSE` is present the reviewer runs in **rebuttal mode** (`agents/forge-reviewer.md § Rebuttal mode`): it only re-litigates objections the advocate `refuted` or marked `open`, returning `maintained` or `withdrawn` + a reason. Objections the advocate `conceded` are carried through as `conceded` (settled — nothing to rebut). A throw here → apply **§ Agent unavailability (review-agent-unavailable)** above: retry first (Retry Handler); if the challenger stays unavailable at this stage, emit `review-rebuttal-unavailable` and carry every non-conceded objection through with the advocate's own verdict (`refuted`/`open`) **unchanged** — `maintained` is never stamped by the orchestrator, since that label means the challenger heard the defense and held its ground, which did not happen here. If Step 3 ended in `review-advocate-unavailable`, Step 4 **does not run at all** (see **§ Agent unavailability (review-agent-unavailable)**): the objections stay `open` cruas. Only the last round's verdicts count.

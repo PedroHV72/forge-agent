@@ -23,7 +23,8 @@
  * CLI usage:
  *   node scripts/forge-xllm.js --mode challenge --diff-cmd "git diff" [--engine codex|agy] [--model <id>] [--timeout 300] [--env-policy minimal|inherit] [--cwd <dir>]
  *   node scripts/forge-xllm.js --mode rebuttal --input <file> [--engine codex|agy] [--model <id>] [--timeout 300] [--env-policy minimal|inherit] [--cwd <dir>]
- *   node scripts/forge-xllm.js --mode execute --plan <T##-PLAN.md> --result-file <path> --cwd <repo> [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit]
+ *   node scripts/forge-xllm.js --mode execute --plan <T##-PLAN.md> --result-file <path> --cwd <repo> [--dispatch-id <id>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit]
+ *   node scripts/forge-xllm.js --mode plan --plan-context <file> --result-file <path> --cwd <repo> [--dispatch-id <id>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit]
  *
  * Exit contract: 0 on success. For challenge/rebuttal the normalized JSON goes to stdout
  * (nothing else on stdout). For execute the result-file is the ONLY result channel —
@@ -70,10 +71,17 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { spawnSync, spawn, execSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
-const { captureSnapshot } = require('./forge-surgical-reset.js');
+const {
+  captureSnapshot,
+  hashObject,
+  parsePorcelainZ,
+  parseNameStatusZ,
+} = require('./forge-surgical-reset.js');
 const { classifyError, isTransient } = require('./forge-classify-error.js');
+const { countTokens } = require('./forge-tokens.js');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -87,6 +95,7 @@ const MAX_STDERR_SNIPPET = 200; // only the tail of child stderr surfaces in an 
 const SEVERITY_ENUM = ['critical', 'high', 'medium', 'low'];
 const VERDICT_ENUM = ['maintained', 'withdrawn'];
 const EXEC_STATUS_ENUM = ['done', 'partial', 'blocked'];
+const PLAN_STATUS_ENUM = ['done'];
 const MH_STATUS_ENUM = ['met', 'unmet', 'unknown'];
 const MH_SCOPE_ENUM = ['task', 'environment'];
 const ENV_REASON_ENUM = [
@@ -96,6 +105,27 @@ const ENV_REASON_ENUM = [
   'network-required',
 ];
 const ENV_POLICY_ENUM = ['minimal', 'inherit'];
+const DISPATCH_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function normalizeDispatchId(value, mode) {
+  if (value != null && value !== '') {
+    const id = String(value);
+    if (!DISPATCH_ID_RE.test(id)) throw new Error('invalid --dispatch-id');
+    return id;
+  }
+  return `xllm-${mode}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}`;
+}
+
+function readResultTelemetry(resultFile, dispatchId) {
+  let current = null;
+  try { current = JSON.parse(fs.readFileSync(path.resolve(resultFile), 'utf8')); } catch {}
+  return {
+    dispatch_id: current && typeof current.dispatch_id === 'string' ? current.dispatch_id : dispatchId,
+    input_tokens: current && Number.isInteger(current.input_tokens) ? current.input_tokens : 0,
+    output_tokens: current && Number.isInteger(current.output_tokens) ? current.output_tokens : 0,
+    token_method: 'heuristic-chars-4',
+  };
+}
 
 // Single-source review schemas — extracted to shared/schemas/*.json (M014 S04) to kill the
 // "keep in sync" duplication that lived here and in shared/forge-review.md. Loaded once from
@@ -167,7 +197,7 @@ const planSchema = {
   required: ['status', 'summary', 'slice_plan', 'task_plans'],
   additionalProperties: false,
   properties: {
-    status: { type: 'string', enum: EXEC_STATUS_ENUM },
+    status: { type: 'string', enum: PLAN_STATUS_ENUM },
     summary: { type: 'string' },
     slice_plan: {
       type: 'object',
@@ -384,7 +414,9 @@ function validateExecuteResult(obj) {
  */
 function validatePlanResult(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
-  if (!EXEC_STATUS_ENUM.includes(obj.status)) return false;
+  // Planning is all-or-nothing: partial/blocked plans must never be materialized.
+  // They fail validation and the orchestrator falls back to the Claude planner.
+  if (!PLAN_STATUS_ENUM.includes(obj.status)) return false;
   if (typeof obj.summary !== 'string' || !obj.summary.trim()) return false;
   const sp = obj.slice_plan;
   if (!sp || typeof sp !== 'object' || Array.isArray(sp)) return false;
@@ -535,11 +567,12 @@ function buildPlanPrompt(contextText) {
     'When you are done, respond with ONLY a single JSON object of this exact shape',
     '(no prose before or after the JSON):',
     '{',
-    '  "status": "done" | "partial" | "blocked",',
+    '  "status": "done",',
     '  "summary": "<one-paragraph description of the decomposition>",',
     '  "slice_plan": { "filename": "S##-PLAN.md", "content": "<full markdown of the slice plan>" },',
     '  "task_plans": [ { "id": "T##", "filename": "T##-PLAN.md", "content": "<full markdown, incl. frontmatter must_haves>" } ]',
     '}',
+    'Planning is all-or-nothing: partial or blocked output is invalid and will be discarded.',
     'Rules for the JSON: content fields hold the COMPLETE markdown of each file (frontmatter',
     'included); task_plans has one entry per task (1–7 total).',
     '',
@@ -1125,74 +1158,95 @@ function normalizeRebuttal(obj) {
 
 // ── Execute helpers (git READ-ONLY + prefs) ────────────────────────────────────
 
+function gitBuffer(cwd, args, what) {
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'buffer', maxBuffer: MAX_BUFFER });
+  if (result.error || result.status !== 0) {
+    const cause = result.error
+      ? result.error.message
+      : (result.stderr || Buffer.alloc(0)).toString('utf8').trim();
+    throw new Error(`${what} failed: ${cause.slice(0, MAX_STDERR_SNIPPET)}`);
+  }
+  return result.stdout;
+}
+
+/** Snapshot every pre-dispatch dirty path, including protected `.gsd/**` paths.
+ * The public `pre_dirty` result still comes from captureSnapshot (which intentionally
+ * excludes orchestrator state); this richer private snapshot exists solely to compute
+ * the sidecar's end-state delta and protected-path violations without false positives. */
+function captureDirtySnapshot(cwd) {
+  const entries = parsePorcelainZ(gitBuffer(cwd, ['status', '--porcelain', '-uall', '-z'], 'git status'));
+  const byPath = new Map();
+  const add = (p) => {
+    if (p && !byPath.has(p)) byPath.set(p, hashObject(cwd, p));
+  };
+  for (const entry of entries) {
+    add(entry.path);
+    if (entry.origPath) add(entry.origPath);
+  }
+  return Array.from(byPath, ([p, hash]) => ({ path: p, hash }));
+}
+
+/** Return every current change versus START_SHA, including `.gsd/**`. */
+function computeAllPostChanges(cwd, startSha) {
+  const byPath = new Map();
+  const set = (p, status) => { if (p) byPath.set(p, status); };
+
+  const diff = parseNameStatusZ(gitBuffer(
+    cwd,
+    ['diff', '--name-status', '-z', startSha],
+    'git diff',
+  ));
+  for (const entry of diff) {
+    if (entry.status === 'R') {
+      set(entry.origPath, 'D');
+      set(entry.path, 'A');
+    } else if (entry.status === 'C') {
+      set(entry.path, 'A');
+    } else if (entry.status === 'A') set(entry.path, 'A');
+    else if (entry.status === 'D') set(entry.path, 'D');
+    else set(entry.path, 'M');
+  }
+
+  const porcelain = parsePorcelainZ(gitBuffer(
+    cwd,
+    ['status', '--porcelain', '-uall', '-z'],
+    'git status',
+  ));
+  for (const entry of porcelain) {
+    if (entry.xy === '??') set(entry.path, 'A');
+  }
+
+  return Array.from(byPath, ([p, status]) => ({ status, path: p }));
+}
+
 /**
- * Derive the list of changed files from git, READ-ONLY. Never trust codex's self-
- * declared files_changed. `git diff --name-status HEAD` alone misses untracked files
- * (the most common outcome of a task), so we union it with `git status --porcelain`.
- * All git calls are read-only with fixed args — no untrusted interpolation, no writes.
+ * Derive the sidecar-owned end-state delta, READ-ONLY. A dirty path that existed
+ * before dispatch and whose content hash is unchanged is excluded. A pre-dirty path
+ * whose current hash differs is included because the sidecar overlapped it. This is
+ * authoritative; the model's declared files_changed remains advisory only.
  * @param {string} cwd
+ * @param {{path:string,hash:string|null}[]} [preDirty]
+ * @param {string} [startSha]
  * @returns {{status:'A'|'M'|'D', path:string}[]}
  */
-function deriveFilesChanged(cwd) {
-  const byPath = new Map(); // path → status ('A' | 'M' | 'D')
+function deriveFilesChanged(cwd, preDirty = [], startSha) {
+  const baseline = startSha || gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
+  const before = new Map(preDirty.map((entry) => [entry.path, entry.hash]));
+  return computeAllPostChanges(cwd, baseline)
+    .filter((entry) => !before.has(entry.path) || hashObject(cwd, entry.path) !== before.get(entry.path))
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
 
-  const setStatus = (p, s) => {
-    if (!p) return;
-    // Prefer a concrete A/M/D; don't let a later blank overwrite.
-    if (!byPath.has(p)) byPath.set(p, s);
-  };
+function isProtectedGsdPath(p) {
+  const normalized = String(p || '').replace(/\\/g, '/');
+  return normalized === '.gsd' || normalized.startsWith('.gsd/');
+}
 
-  // 1. Porcelain — catches untracked (??) and staged/unstaged working-tree changes.
-  let porcelain = '';
-  try {
-    porcelain = execSync('git status --porcelain', { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER });
-  } catch { /* not a repo / git failure — fall through, best-effort */ }
-  for (const line of porcelain.split('\n')) {
-    if (!line.trim()) continue;
-    const xy = line.slice(0, 2);
-    let rest = line.slice(3);
-    if (xy === '??') {
-      setStatus(rest, 'A');
-      continue;
-    }
-    // Renames/copies appear as "R  old -> new" (or C) — treat the new path as added.
-    if (xy[0] === 'R' || xy[0] === 'C' || xy[1] === 'R' || xy[1] === 'C') {
-      const arrow = rest.indexOf(' -> ');
-      if (arrow !== -1) rest = rest.slice(arrow + 4);
-      setStatus(rest, 'A');
-      continue;
-    }
-    const code = xy.includes('D') ? 'D' : (xy.includes('A') ? 'A' : 'M');
-    setStatus(rest, code);
+function assertNoProtectedSidecarChanges(changes) {
+  const protectedPaths = changes.filter((entry) => isProtectedGsdPath(entry.path)).map((entry) => entry.path);
+  if (protectedPaths.length) {
+    throw new Error(`codex touched protected .gsd/**: ${protectedPaths.join(', ')}`);
   }
-
-  // 2. name-status against HEAD — catches committed-vs-worktree M/D/A that porcelain
-  //    already largely covers, but keeps parity with staged diffs.
-  let nameStatus = '';
-  try {
-    nameStatus = execSync('git diff --name-status HEAD', { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER });
-  } catch { /* no HEAD yet / git failure — best-effort */ }
-  for (const line of nameStatus.split('\n')) {
-    if (!line.trim()) continue;
-    const parts = line.split('\t');
-    const code = parts[0][0];
-    // Rename/copy lines carry an extra column; the last column is the target path.
-    const p = parts[parts.length - 1];
-    if (code === 'R' || code === 'C') setStatus(p, 'A');
-    else if (code === 'D') setStatus(p, 'D');
-    else if (code === 'A') setStatus(p, 'A');
-    else setStatus(p, 'M');
-  }
-
-  const derived = Array.from(byPath.entries()).map(([p, s]) => ({ status: s, path: p }));
-
-  // Advisory warning — the orchestrator file audit is the real safety net (RISK #3).
-  const gsdTouched = derived.filter((d) => d.path.startsWith('.gsd/')).map((d) => d.path);
-  if (gsdTouched.length) {
-    process.stderr.write(`forge-xllm: WARNING codex touched .gsd/**: ${gsdTouched.join(', ')}\n`);
-  }
-
-  return derived;
 }
 
 /**
@@ -1327,13 +1381,60 @@ function runRebuttal(opts) {
 
 // ── Execute driver ──────────────────────────────────────────────────────────────
 
-/** Atomic write: tmp file in the same dir + rename (the S02 poller never reads a
- *  half-written JSON). @param {string} file @param {object} obj */
+function pathKey(value, platform = process.platform) {
+  const normalized = path.resolve(value).replace(/[\\/]+$/, '');
+  return platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+/** Canonicalize and validate the result channel before ANY write. The parent must
+ * exist and resolve outside the canonical workspace. Resolving the parent first
+ * makes symlink/junction aliases safe without rejecting valid platform aliases such
+ * as macOS `/tmp` → `/private/tmp`. Windows containment is case-insensitive. Existing targets must be plain
+ * regular files (never symlinks, junctions, directories, devices, or sockets). */
+function validateResultFileTarget(resultFile, cwd, platform = process.platform) {
+  if (typeof resultFile !== 'string' || !resultFile) {
+    throw new Error('result-file path is required');
+  }
+  const workspaceReal = fs.realpathSync.native(path.resolve(cwd));
+  const target = path.resolve(resultFile);
+  const parent = path.dirname(target);
+  const parentReal = fs.realpathSync.native(parent);
+  if (!fs.statSync(parentReal).isDirectory()) throw new Error('result-file parent must be a directory');
+
+  if (fs.existsSync(target)) {
+    const stat = fs.lstatSync(target);
+    if (stat.isSymbolicLink()) throw new Error('result-file must not be a symlink or junction');
+    if (!stat.isFile()) throw new Error('result-file must be a regular file');
+  }
+
+  const canonicalTarget = path.join(parentReal, path.basename(target));
+  const workspaceKey = pathKey(workspaceReal, platform);
+  const targetKey = pathKey(canonicalTarget, platform);
+  if (targetKey === workspaceKey || targetKey.startsWith(workspaceKey + path.sep)) {
+    throw new Error('result-file must live outside the workspace');
+  }
+  return canonicalTarget;
+}
+
+/** Atomic write: exclusive randomized tmp file in the same validated directory +
+ * rename (the poller never reads half-written JSON and an attacker cannot pre-place a
+ * predictable tmp symlink). @param {string} file @param {object} obj */
 function writeJsonAtomic(file, obj) {
   const dir = path.dirname(file);
-  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify(obj), 'utf8');
-  fs.renameSync(tmp, file);
+  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+  let fd;
+  try {
+    fd = fs.openSync(tmp, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(obj), 'utf8');
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, file);
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    try { fs.unlinkSync(tmp); } catch {}
+  }
 }
 
 /** Run one read-only git command in cwd, trimmed. Throws with a clear cause. */
@@ -1370,16 +1471,15 @@ function gitRead(gitArgs, cwd, what) {
 async function runExecute(opts) {
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
   const timeoutSecs = opts.timeoutSecs || DEFAULT_EXECUTE_TIMEOUT_SECS;
+  const dispatchId = normalizeDispatchId(opts.dispatchId, 'execute');
 
   if (!opts.planFile) throw new Error('execute mode requires --plan <file>');
   if (!opts.resultFile) throw new Error('execute mode requires --result-file <path>');
 
-  const resultFile = path.resolve(opts.resultFile);
-
-  // Guard: result-file must live OUTSIDE the workspace (never in the repo being written).
-  if (resultFile === cwd || resultFile.startsWith(cwd + path.sep)) {
-    throw new Error('result-file must live outside the workspace');
-  }
+  // Validate the result channel before the first heartbeat write. This resolves the
+  // real parent and rejects symlink/junction tricks, including case-folded Windows
+  // paths that lexically appear outside the workspace.
+  const resultFile = validateResultFileTarget(opts.resultFile, cwd);
 
   let planText;
   try {
@@ -1401,10 +1501,13 @@ async function runExecute(opts) {
   // orchestrator to cross-check. The AUTHORITATIVE snapshot that drives the post-failure
   // surgical reset lives in the orchestrator's state file (T03/T04); the adapter NEVER resets.
   const preDirty = captureSnapshot(cwd);
+  const preDirtyAll = captureDirtySnapshot(cwd);
 
   const startSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
+  const prompt = buildExecutePrompt(planText);
+  const inputTokens = countTokens(prompt);
 
   // Initial heartbeat — pid unknown until the child spawns.
   writeJsonAtomic(resultFile, {
@@ -1413,6 +1516,9 @@ async function runExecute(opts) {
     pid: null,
     adapter_pid: process.pid,
     heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+    dispatch_id: dispatchId,
+    input_tokens: inputTokens,
+    token_method: 'heuristic-chars-4',
     start_sha: startSha,
     started_at: startedAt,
     updated_at: startedAt,
@@ -1425,13 +1531,15 @@ async function runExecute(opts) {
       pid,
       adapter_pid: process.pid,
       heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+      dispatch_id: dispatchId,
+      input_tokens: inputTokens,
+      token_method: 'heuristic-chars-4',
       start_sha: startSha,
       started_at: startedAt,
       updated_at: new Date().toISOString(),
     });
   };
 
-  const prompt = buildExecutePrompt(planText);
   const rawContent = await invokeCodexDetached({
     prompt,
     schema: executeSchema,
@@ -1440,6 +1548,24 @@ async function runExecute(opts) {
     timeoutSecs,
     onHeartbeat,
     envPolicy: opts.envPolicy || 'minimal',
+  });
+  const outputTokens = countTokens(rawContent);
+
+  // Persist response telemetry before post-response gates. If JSON/schema/HEAD/.gsd
+  // validation fails, the adapter-failed marker preserves the tokens already spent.
+  writeJsonAtomic(resultFile, {
+    status: 'running',
+    protocol_version: PROTOCOL_VERSION,
+    pid: null,
+    adapter_pid: process.pid,
+    heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+    dispatch_id: dispatchId,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    token_method: 'heuristic-chars-4',
+    start_sha: startSha,
+    started_at: startedAt,
+    updated_at: new Date().toISOString(),
   });
 
   // No-commit invariant: codex must not have moved HEAD.
@@ -1452,7 +1578,10 @@ async function runExecute(opts) {
   if (parsed === null) throw new Error('no parseable JSON block found in codex output');
   if (!validateExecuteResult(parsed)) throw new Error('codex output failed execute-result validation');
 
-  const derived = deriveFilesChanged(cwd);
+  const derived = deriveFilesChanged(cwd, preDirtyAll, startSha);
+  // Protected metadata is outside the surgical reset set. A sidecar-owned `.gsd`
+  // delta is therefore a hard terminal failure, never an advisory warning/success.
+  assertNoProtectedSidecarChanges(derived);
   const finishedAt = new Date().toISOString();
 
   const result = {
@@ -1468,6 +1597,10 @@ async function runExecute(opts) {
     started_at: startedAt,
     finished_at: finishedAt,
     duration_secs: Math.round((Date.now() - startedMs) / 1000),
+    dispatch_id: dispatchId,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    token_method: 'heuristic-chars-4',
   };
 
   writeJsonAtomic(resultFile, result);
@@ -1502,16 +1635,12 @@ async function runExecute(opts) {
 async function runPlan(opts) {
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
   const timeoutSecs = opts.timeoutSecs || DEFAULT_EXECUTE_TIMEOUT_SECS;
+  const dispatchId = normalizeDispatchId(opts.dispatchId, 'plan');
 
   if (!opts.planContextFile) throw new Error('plan mode requires --plan-context <file>');
   if (!opts.resultFile) throw new Error('plan mode requires --result-file <path>');
 
-  const resultFile = path.resolve(opts.resultFile);
-
-  // Guard: result-file must live OUTSIDE the workspace (never in the repo being read).
-  if (resultFile === cwd || resultFile.startsWith(cwd + path.sep)) {
-    throw new Error('result-file must live outside the workspace');
-  }
+  const resultFile = validateResultFileTarget(opts.resultFile, cwd);
 
   let contextText;
   try {
@@ -1527,6 +1656,8 @@ async function runPlan(opts) {
 
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
+  const prompt = buildPlanPrompt(contextText);
+  const inputTokens = countTokens(prompt);
 
   // Initial heartbeat — pid unknown until the child spawns.
   writeJsonAtomic(resultFile, {
@@ -1535,6 +1666,9 @@ async function runPlan(opts) {
     pid: null,
     adapter_pid: process.pid,
     heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+    dispatch_id: dispatchId,
+    input_tokens: inputTokens,
+    token_method: 'heuristic-chars-4',
     started_at: startedAt,
     updated_at: startedAt,
   });
@@ -1546,12 +1680,14 @@ async function runPlan(opts) {
       pid,
       adapter_pid: process.pid,
       heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+      dispatch_id: dispatchId,
+      input_tokens: inputTokens,
+      token_method: 'heuristic-chars-4',
       started_at: startedAt,
       updated_at: new Date().toISOString(),
     });
   };
 
-  const prompt = buildPlanPrompt(contextText);
   const rawContent = await invokeCodexDetached({
     prompt,
     schema: planSchema,
@@ -1561,6 +1697,22 @@ async function runPlan(opts) {
     onHeartbeat,
     sandbox: 'read-only',
     envPolicy: opts.envPolicy || 'minimal',
+  });
+  const outputTokens = countTokens(rawContent);
+
+  // Preserve spent output tokens if a post-response validation gate fails.
+  writeJsonAtomic(resultFile, {
+    status: 'running',
+    protocol_version: PROTOCOL_VERSION,
+    pid: null,
+    adapter_pid: process.pid,
+    heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+    dispatch_id: dispatchId,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    token_method: 'heuristic-chars-4',
+    started_at: startedAt,
+    updated_at: new Date().toISOString(),
   });
 
   const parsed = extractLastJsonBlock(rawContent);
@@ -1592,6 +1744,10 @@ async function runPlan(opts) {
     started_at: startedAt,
     finished_at: finishedAt,
     duration_secs: Math.round((Date.now() - startedMs) / 1000),
+    dispatch_id: dispatchId,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    token_method: 'heuristic-chars-4',
   };
 
   writeJsonAtomic(resultFile, result);
@@ -1617,13 +1773,18 @@ module.exports = {
   validateExecuteResult,
   validatePlanResult,
   buildPlanPrompt,
+  captureDirtySnapshot,
   deriveFilesChanged,
+  assertNoProtectedSidecarChanges,
+  validateResultFileTarget,
+  readResultTelemetry,
   readWorkersTimeout,
   readSidecarsEnvPolicy,
   buildSidecarEnv,
   assertSafeForCmdShell,
   resolveShimJsEntry,
   classifyErrorClass,
+  normalizeDispatchId,
 };
 
 // ── Error classification for adapter-failed markers ─────────────────────────
@@ -1645,7 +1806,7 @@ if (require.main === module) {
   const mode = args.mode;
 
   if (mode !== 'challenge' && mode !== 'rebuttal' && mode !== 'execute' && mode !== 'plan') {
-    process.stderr.write('Usage: forge-xllm.js --mode challenge|rebuttal|execute|plan [--engine codex|agy] [--diff-cmd <cmd>] [--input <file>] [--plan <file>] [--plan-context <file>] [--result-file <path>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit] [--cwd <dir>]\n');
+    process.stderr.write('Usage: forge-xllm.js --mode challenge|rebuttal|execute|plan [--engine codex|agy] [--diff-cmd <cmd>] [--input <file>] [--plan <file>] [--plan-context <file>] [--result-file <path>] [--dispatch-id <id>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit] [--cwd <dir>]\n');
     process.exit(2);
   }
 
@@ -1684,16 +1845,21 @@ if (require.main === module) {
       || readWorkersTimeout(process.cwd())
       || DEFAULT_EXECUTE_TIMEOUT_SECS;
     const resultFile = typeof args['result-file'] === 'string' ? args['result-file'] : null;
+    const dispatchId = normalizeDispatchId(args['dispatch-id'], 'plan');
 
-    runPlan({ planContextFile: args['plan-context'], resultFile, cwd, model, timeoutSecs, envPolicy })
+    runPlan({ planContextFile: args['plan-context'], resultFile, cwd, model, timeoutSecs, envPolicy, dispatchId })
       .then(() => process.exit(0)) // result-file is the ONLY channel — nothing on stdout
       .catch((e) => {
-        // Best-effort adapter-failed marker in the result-file (if we have a path).
-        if (resultFile) {
+        // Best-effort marker only after the target independently passes the same
+        // canonical validation. Never write adapter-failed to an untrusted path.
+        let safeResultFile = null;
+        try { safeResultFile = resultFile && validateResultFileTarget(resultFile, cwd); } catch {}
+        if (safeResultFile) {
           try {
-            writeJsonAtomic(path.resolve(resultFile), {
+            writeJsonAtomic(safeResultFile, {
               status: 'adapter-failed',
               protocol_version: PROTOCOL_VERSION,
+              ...readResultTelemetry(safeResultFile, dispatchId),
               reason: e.message,
               error_class: classifyErrorClass(e.message),
               failed_at: new Date().toISOString(),
@@ -1715,20 +1881,23 @@ if (require.main === module) {
       || readWorkersTimeout(process.cwd())
       || DEFAULT_EXECUTE_TIMEOUT_SECS;
     const resultFile = typeof args['result-file'] === 'string' ? args['result-file'] : null;
+    const dispatchId = normalizeDispatchId(args['dispatch-id'], 'execute');
 
-    runExecute({ planFile: args.plan, resultFile, cwd, model, timeoutSecs, envPolicy })
+    runExecute({ planFile: args.plan, resultFile, cwd, model, timeoutSecs, envPolicy, dispatchId })
       .then(() => process.exit(0)) // result-file is the ONLY channel — nothing on stdout
       .catch((e) => {
-        // Best-effort adapter-failed marker in the result-file (if we have a path).
-        if (resultFile) {
+        let safeResultFile = null;
+        try { safeResultFile = resultFile && validateResultFileTarget(resultFile, cwd); } catch {}
+        if (safeResultFile) {
           try {
             let startSha;
             try {
               startSha = execSync('git rev-parse HEAD', { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER }).trim();
             } catch { /* no repo / detached — omit */ }
-            writeJsonAtomic(path.resolve(resultFile), {
+            writeJsonAtomic(safeResultFile, {
               status: 'adapter-failed',
               protocol_version: PROTOCOL_VERSION,
+              ...readResultTelemetry(safeResultFile, dispatchId),
               reason: e.message,
               error_class: classifyErrorClass(e.message),
               ...(startSha ? { start_sha: startSha } : {}),

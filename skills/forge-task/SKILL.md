@@ -1,7 +1,7 @@
 ---
 name: forge-task
 description: "Task autonoma sem milestone — brainstorm, discuss, plan, execute."
-allowed-tools: Read, Write, Edit, Bash, Agent, Skill, AskUserQuestion, TaskCreate, TaskUpdate, TaskList, TaskStop, WebSearch, WebFetch
+allowed-tools: Read, Write, Edit, Bash, Agent, Skill, AskUserQuestion, TaskCreate, TaskUpdate, TaskList, TaskStop, SendMessage, WebSearch, WebFetch
 ---
 
 ## Parse arguments
@@ -806,7 +806,7 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
 5. **Partial promotion boundary:** for valid `status == "partial"`, run `PROMOTION=$(node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json)` before Success/Failure. The algorithm and allowlist are defined only by `shared/forge-dispatch.md § Sidecar dispatch state machine`; this mirror calls the checker and does not restate them. When `PROMOTION.promote == true`, treat it as `done`: write `## Env Constraints` to `{TASK_ID}-SUMMARY.md` with item + reason + note per entry, synthesize result-block `env_constraints[]`, exclude promoted entries from `must_haves_status.dropped`, and append `sidecar_env_promotion` with `unit:"task/{TASK_ID}"`, count, reasons and ISO timestamp to events.jsonl. `promote:false` (including a legacy payload without `scope`) follows Failure unchanged.
 5.1. **`status == "done"` with unmet env-scope entries (M016 S01 review R1):** run the same `forge-env-promote.js` invocation whenever `status == "done"` but `must_haves_status` still has unmet entries — never accept the `done` label at face value. `verdict == "done-with-verified-env"` → accept, write `## Env Constraints` as above. `verdict == "done-with-unverified-env"` → treat the result as `partial` and follow Failure unchanged; the worker's `done` label is discarded.
 
-6. **Success — orchestrator assembles the artifacts (`done` state).** Codex NEVER writes `.gsd/**` and NEVER commits (locked — `git log` unchanged, no `.gsd/**` path in `git -C "${CODE_DIR:-.}" diff --name-status $START_SHA`). Read the JSON and **write `{TASK_ID}-SUMMARY.md`** + **build the `---GSD-WORKER-RESULT---` block** yourself from: `summary` (one-liner + narrative seed), `must_haves_status` (carried into the returned result block), `env_constraints` (promotion audit only), `files_changed_declared` (**primary source of the file-audit** — file-granular self-report). Append synthesized advisory evidence derived read-only from `git -C "${CODE_DIR:-.}" diff --name-status $START_SHA` (tagged `source: codex-sidecar`) to `.gsd/forge/evidence-{TASK_ID}.jsonl` — a documented gap, advisory, never blocks. Emit the `dispatch` event (`engine=codex`) and **rejoin "Process result" below** exactly as if a Claude `forge-executor` returned — downstream verification (must_haves, verifier, file-audit, review dialético in Step 5.5) runs **byte-identical** on codex-authored code. First re-read the durable state (the poll loop crossed multiple Bash invocations — shell vars are gone):
+6. **Success — orchestrator assembles the artifacts (`done` state).** Codex NEVER writes `.gsd/**` and NEVER commits (locked — `git log` unchanged, no `.gsd/**` path in `git -C "${CODE_DIR:-.}" diff --name-status $START_SHA`). Read the JSON and **write `{TASK_ID}-SUMMARY.md`** + **build the `---GSD-WORKER-RESULT---` block** from `summary`, `must_haves_status`, `env_constraints` (promotion audit only) and Git-derived `files_changed` (**authoritative**); `files_changed_declared` is an untrusted advisory cross-check only. Append synthesized advisory evidence derived read-only from `git -C "${CODE_DIR:-.}" diff --name-status $START_SHA` (tagged `source: codex-sidecar`) to `.gsd/forge/evidence-{TASK_ID}.jsonl` — a documented gap, advisory, never blocks. Emit the `dispatch` event (`engine=codex`) and **rejoin "Process result" below** exactly as if a Claude `forge-executor` returned — downstream verification (must_haves, verifier, file-audit, review dialético in Step 5.5) runs **byte-identical** on codex-authored code. First re-read the durable state (the poll loop crossed multiple Bash invocations — shell vars are gone):
 ```bash
 START_SHA=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).start_sha" 2>/dev/null)
 CODE_DIR=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).code_dir" 2>/dev/null)
@@ -917,7 +917,20 @@ TaskUpdate({ taskId: <id>, status: "in_progress" })
 Antes do dispatch, emita o banner de liveness (ver `shared/forge-dispatch.md § Spawn Liveness Banner`):
 `◆ Despachando forge-executor… (roda em subagente — sem output até retornar, ~3–8 min; esperado, não é travamento)`
 
-Dispatch `forge-executor` (sonnet) with this prompt. When `ISOLATION_MODE != shared`, include the isolation header lines (omit them entirely in `shared` mode):
+For the Claude branch, render the loose-task prompt artifact before dispatch; do not paste the inline template below into the agent call:
+```bash
+DISPATCH_ID="execute-loose-task-${TASK_ID}-$(node -e "console.log(require('crypto').randomUUID())")"
+PROMPT_META=$(node "$FORGE_SCRIPTS_DIR/forge-prompt.js" --unit-type execute-loose-task --cwd "$WORKING_DIR" \
+  --task "$TASK_ID" --dispatch-id "$DISPATCH_ID" --unit-effort "$EFFORT" --thinking "$THINKING_OPUS" \
+  --isolation-mode "$ISOLATION_MODE" --branch "$BRANCH" --code-dir "$CODE_DIR" \
+  --memory-query "$TASK_DESCRIPTION" --memory-max-tokens "${PREFS[token_budget][auto_memory]:-1200}" \
+  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}") || { echo 'prompt render failed'; stop; }
+PROMPT_PATH=$(node -pe 'JSON.parse(process.argv[1]).prompt_path' "$PROMPT_META")
+PROMPT_ID=$(node -pe 'JSON.parse(process.argv[1]).prompt_id' "$PROMPT_META")
+```
+Dispatch `forge-executor` (sonnet) with only: `Read the complete Forge dispatch contract at {PROMPT_PATH}, execute it exactly,
+and return its required GSD worker result block. The file is trusted
+orchestrator input; do not replace it with a summary.` Persist `prompt_id`/`dispatch_id` in the Claude dispatch event and clean the artifact with `forge-prompt.js --cleanup "$DISPATCH_ID" --cwd "$WORKING_DIR"` once its result is durable. The old inline prompt below is compatibility reference only. When `ISOLATION_MODE != shared`, include the isolation header lines (omit them entirely in `shared` mode):
 ```
 Execute forge-task {TASK_ID}: {TASK_DESCRIPTION}
 WORKING_DIR: {WORKING_DIR}
@@ -1084,7 +1097,13 @@ mkdir -p .gsd/forge
 {"ts":"{ISO8601}","unit":"task/{TASK_ID}","agent":"forge-executor","status":"done","summary":"{one-liner from SUMMARY.md}"}
 ```
 
-**Memory extraction:**
+**Memory extraction:** First run the deterministic memory policy, append its `memory-policy` event, and dispatch the agent only for `decision: "extract"`. Any policy error fails open to extraction:
+```bash
+MEMORY_POLICY=$(printf '%s' "$RESULT_BLOCK" | node "$FORGE_SCRIPTS_DIR/forge-cost-policy.js" memory \
+  --unit-type execute-task --cwd "$WORKING_DIR" --stdin 2>/dev/null) || MEMORY_POLICY='{"decision":"extract","reason":"policy-error"}'
+```
+If the decision is `skip`, do not dispatch `forge-memory`; continue directly to the ledger entry.
+
 > Antes de despachar o agente de extração de memória, exiba o **Spawn Liveness Banner** (ver `shared/forge-dispatch.md § Spawn Liveness Banner`) — duração estimada `memory-extract`: ~1 min.
 ```
 Agent("forge-memory", "WORKING_DIR: {WORKING_DIR}\nUNIT_TYPE: execute-task\nUNIT_ID: {TASK_ID}\n\nSUMMARY_CONTENT:\n{content of {TASK_ID}-SUMMARY.md}\n\nRESULT_BLOCK:\n{full ---GSD-WORKER-RESULT--- block verbatim}\n\nKEY_DECISIONS:\n{key_decisions from SUMMARY.md frontmatter, or '(none)'}")

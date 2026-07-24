@@ -4,17 +4,20 @@
 // Library exports:
 //   MEMORY_DIR                          → string  // relative path '.gsd/memory'
 //   memoryDir(cwd)                      → string  // absolute path to memory dir
-//   fragmentPath(cwd, unitId)           → string  // absolute path to <unit-id>.md
+//   fragmentPath(cwd, unitId, opts?)    → string  // absolute path to [<milestone>__]<unit-id>.md
 //   parseFragment(text)                 → object  // parse markdown with YAML frontmatter
 //   writeFragment(cwd, fragment, opts)  → { path, created }
-//   readFragment(cwd, unitId)           → object | null
-//   listFragments(cwd)                  → Array<{ unitId, path }>
+//   readFragment(cwd, unitId, opts?)    → object | null
+//   listFragments(cwd, opts?)           → Array<{ storageKey, unitId, milestoneId, path }>
+//   validateUnitId(unitId)              → boolean
+//   queryRelevant(query)                → bounded selector result
 //
 // CLI:
 //   node forge-memory.js --list [--cwd <dir>]
-//   node forge-memory.js --read <unit-id> [--cwd <dir>]
-//   node forge-memory.js --write [--cwd <dir>]   (reads JSON fragment from stdin)
+//   node forge-memory.js --read <unit-id> [--milestone <id>] [--cwd <dir>]
+//   node forge-memory.js --write [--milestone <id>] [--cwd <dir>]   (reads JSON fragment from stdin)
 //   node forge-memory.js --validate <unit-id> [--cwd <dir>]
+//   node forge-memory.js --query [options] [--cwd <dir>]
 //   node forge-memory.js --help
 //
 // Exit codes:
@@ -33,27 +36,215 @@ const yamlSafe = require('./forge-yaml-safe');
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MEMORY_DIR = '.gsd/memory';
+const MAX_QUERY_BYTES = 512 * 1024;
+const FRAGMENT_LOCK_TTL_MS = 120 * 1000;
+const FRAGMENT_LOCK_ATTEMPTS = 200;
 
 // Pattern for forge-ask session IDs: ask-<session-id>
 const ASK_ID_RE = /^ask-[A-Za-z0-9._-]+$/;
 
+// Milestone-internal slices/tasks use local canonical IDs in the dispatch loop.
+// They are not top-level forge-ids entities, but they are valid memory fragment
+// owners (for example S02 plan research and T03 execution summaries).
+const LOCAL_UNIT_ID_RE = /^(?:S\d+|T\d+(?:\.\d+)?)$/i;
+const QUALIFIED_KEY_RE = /^(.+)__((?:S\d+|T\d+(?:\.\d+)?))$/i;
+
+function isWithin(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (
+    relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+function assertMemoryDirectory(cwd, create) {
+  const resolvedCwd = path.resolve(cwd || process.cwd());
+  if (create) fs.mkdirSync(resolvedCwd, { recursive: true });
+  if (!fs.existsSync(resolvedCwd)) return null;
+  const realCwd = fs.realpathSync(resolvedCwd);
+  const dir = path.join(resolvedCwd, '.gsd', 'memory');
+  if (create) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) return null;
+  const realDir = fs.realpathSync(dir);
+  if (!isWithin(realCwd, realDir)) {
+    throw new Error(`Memory directory escapes cwd: ${realDir}`);
+  }
+  if (!fs.statSync(realDir).isDirectory()) {
+    throw new Error(`Memory path is not a directory: ${realDir}`);
+  }
+  return realDir;
+}
+
+function validateMilestoneId(id) {
+  return Boolean(id && isValid(id) && entityKind(id) === 'milestone');
+}
+
+function milestoneFromOptions(opts) {
+  if (!opts) return null;
+  if (typeof opts === 'string') return opts;
+  return opts.milestoneId || opts.milestone_id || null;
+}
+
+function qualifiedStorageKey(unitId, milestoneId) {
+  if (!LOCAL_UNIT_ID_RE.test(unitId) || !milestoneId) return unitId;
+  if (!validateMilestoneId(milestoneId)) {
+    throw new Error(`Invalid memory milestone ID: "${milestoneId}"`);
+  }
+  return `${milestoneId}__${unitId}`;
+}
+
+function parseStorageKey(storageKey) {
+  if (storageKey === 'legacy-orphan') {
+    return { storageKey, unitId: storageKey, milestoneId: null };
+  }
+  if (validateUnitId(storageKey)) {
+    return { storageKey, unitId: storageKey, milestoneId: null };
+  }
+  const match = String(storageKey).match(QUALIFIED_KEY_RE);
+  if (!match || !validateMilestoneId(match[1]) || !LOCAL_UNIT_ID_RE.test(match[2])) {
+    return null;
+  }
+  return { storageKey, unitId: match[2], milestoneId: match[1] };
+}
+
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (_) {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) { /* compatibility fallback */ }
+  }
+}
+
+function assertFragmentLockDirectory(cwd) {
+  const memoryRoot = assertMemoryDirectory(cwd, true);
+  const lockRoot = path.join(memoryRoot, '.locks');
+  fs.mkdirSync(lockRoot, { recursive: true });
+  const realLockRoot = fs.realpathSync(lockRoot);
+  if (!isWithin(memoryRoot, realLockRoot) || !fs.statSync(realLockRoot).isDirectory()) {
+    throw new Error(`Memory lock directory escapes fragment store: ${realLockRoot}`);
+  }
+  return realLockRoot;
+}
+
+function removeStaleFragmentLock(lockDir, ttlMs) {
+  let stat;
+  try {
+    stat = fs.lstatSync(lockDir);
+  } catch (_) {
+    return true;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`Refusing unsafe memory fragment lock: ${lockDir}`);
+  }
+  if (Date.now() - stat.mtimeMs <= ttlMs) return false;
+
+  const entries = fs.readdirSync(lockDir, { withFileTypes: true });
+  if (entries.some(entry => entry.name !== 'owner.json' || !entry.isFile())) {
+    throw new Error(`Refusing to steal malformed memory fragment lock: ${lockDir}`);
+  }
+  if (entries.length === 1) fs.unlinkSync(path.join(lockDir, 'owner.json'));
+  try {
+    fs.rmdirSync(lockDir);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return true;
+    return false;
+  }
+}
+
+// Atomic mkdir mutex used around the complete read -> merge -> write transaction.
+// The lower-level writeAtomic lock alone starts too late and permits lost updates.
+function acquireFragmentLock(cwd, fpath, opts) {
+  opts = opts || {};
+  const lockRoot = assertFragmentLockDirectory(cwd);
+  const resolvedTarget = path.resolve(fpath);
+  // NTFS is normally case-insensitive: T01.md and t01.md must share a mutex.
+  const lockIdentity = process.platform === 'win32' ? resolvedTarget.toLowerCase() : resolvedTarget;
+  const lockName = crypto.createHash('sha256').update(lockIdentity).digest('hex') + '.lock';
+  const lockDir = path.join(lockRoot, lockName);
+  const ttlMs = opts.lockTtlMs || FRAGMENT_LOCK_TTL_MS;
+  const attempts = opts.lockAttempts || FRAGMENT_LOCK_ATTEMPTS;
+  const token = crypto.randomUUID();
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({
+        token,
+        pid: process.pid,
+        acquired_at: Date.now(),
+      }), { encoding: 'utf8', flag: 'wx' });
+      return {
+        release() {
+          try {
+            const ownerPath = path.join(lockDir, 'owner.json');
+            const owner = JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
+            if (owner.token !== token) return false;
+            fs.unlinkSync(ownerPath);
+            fs.rmdirSync(lockDir);
+            return true;
+          } catch (_) {
+            return false;
+          }
+        },
+      };
+    } catch (error) {
+      if (error.code !== 'EEXIST') {
+        // If mkdir succeeded but owner creation failed, remove only our empty dir.
+        try { fs.rmdirSync(lockDir); } catch (_) {}
+        throw error;
+      }
+      if (removeStaleFragmentLock(lockDir, ttlMs)) {
+        attempt--;
+        continue;
+      }
+      if (attempt < attempts - 1) sleepSync(Math.min(50, 5 + attempt));
+    }
+  }
+  throw new Error(`memory fragment lock contention: ${fpath}`);
+}
+
+function readQueryFile(cwd, filename) {
+  const resolvedCwd = path.resolve(cwd || process.cwd());
+  const realCwd = fs.realpathSync(resolvedCwd);
+  const target = path.resolve(resolvedCwd, filename);
+  if (!isWithin(resolvedCwd, target)) {
+    throw new Error(`--query-file path must stay inside cwd: ${target}`);
+  }
+  const realTarget = fs.realpathSync(target);
+  if (!isWithin(realCwd, realTarget)) {
+    throw new Error(`--query-file path must stay inside cwd: ${realTarget}`);
+  }
+  const stat = fs.statSync(realTarget);
+  if (!stat.isFile()) throw new Error(`--query-file is not a file: ${realTarget}`);
+  if (stat.size > MAX_QUERY_BYTES) {
+    throw new Error(`--query-file exceeds ${MAX_QUERY_BYTES} bytes`);
+  }
+  return fs.readFileSync(realTarget, 'utf8');
+}
+
 // ── memoryDir ─────────────────────────────────────────────────────────────────
 // Returns the absolute path to the memory directory for a given cwd.
 function memoryDir(cwd) {
-  return path.join(cwd || process.cwd(), '.gsd', 'memory');
+  return path.join(path.resolve(cwd || process.cwd()), '.gsd', 'memory');
 }
 
 // ── validateUnitId ────────────────────────────────────────────────────────────
 // Returns true if id is a valid unit ID for a MEMORY fragment.
-// Accepts three shapes:
+// Accepts four shapes:
 //   1. Milestone IDs (via forge-ids.isValid + entityKind === 'milestone')
 //   2. Task IDs     (via forge-ids.isValid + entityKind === 'task')
-//   3. ask-<session-id> literals (^ask-[A-Za-z0-9._-]+$)
+//   3. Milestone-local slice/task IDs (S## / T## / T##.N)
+//   4. ask-<session-id> literals (^ask-[A-Za-z0-9._-]+$)
 function validateUnitId(id) {
   if (!id) return false;
-  // Shape 3: forge-ask session
+  // Shape 4: forge-ask session
   if (ASK_ID_RE.test(id)) return true;
-  // Shapes 1 & 2: delegate to forge-ids
+  // Shape 3: milestone-local unit IDs used by forge-auto/forge-next.
+  if (LOCAL_UNIT_ID_RE.test(id)) return true;
+  // Shapes 1 & 2: delegate to forge-ids.
   if (!isValid(id)) return false;
   const kind = entityKind(id);
   return kind === 'milestone' || kind === 'task';
@@ -62,15 +253,18 @@ function validateUnitId(id) {
 // ── fragmentPath ──────────────────────────────────────────────────────────────
 // Returns absolute path to the fragment file for a unit ID.
 // Throws if the ID is not a valid memory unit ID.
-function fragmentPath(cwd, unitId) {
+function fragmentPath(cwd, unitId, opts) {
   if (!validateUnitId(unitId)) {
     throw new Error(
       `Invalid memory unit ID: "${unitId}". ` +
       'Expected a milestone ID (M###, M-<ts>-<slug>), ' +
-      'task ID (TASK-###, T-<ts>-<slug>), or ask-<session-id>.'
+      'task ID (TASK-###, T-<ts>-<slug>), local S##/T##/T##.N, ' +
+      'or ask-<session-id>.'
     );
   }
-  return path.join(memoryDir(cwd), `${unitId}.md`);
+  const milestoneId = milestoneFromOptions(opts);
+  const storageKey = qualifiedStorageKey(unitId, milestoneId);
+  return path.join(memoryDir(cwd), `${storageKey}.md`);
 }
 
 // ── parseFragment ─────────────────────────────────────────────────────────────
@@ -380,7 +574,8 @@ function serializeFrontmatter(fragment) {
 // ── writeFragment ─────────────────────────────────────────────────────────────
 // Writes a MEMORY fragment to disk.
 // fragment shape: { unit_id, facts?: [...], stats?: [...], ...rest }
-// opts shape: { runId?: string, sessionId?: string } — optional, degrade to fake UUIDs if absent.
+// opts shape: { runId?, sessionId?, milestoneId? }. For local S##/T## IDs,
+// milestoneId qualifies the physical fragment and prevents cross-milestone collisions.
 // Merges with existing fragment if present.
 //   - facts: dedup by mem_id; existing fact fields NEVER mutated (append-only).
 //   - stats: dedup by SHA1(kind, mem_id, ts); append-only.
@@ -393,89 +588,127 @@ function writeFragment(cwd, fragment, opts) {
     throw new Error('fragment.unit_id is required');
   }
 
-  const fpath = fragmentPath(cwd, fragment.unit_id); // throws if invalid id
-  const dir = path.dirname(fpath);
-
-  // mkdir -p
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  const optionMilestone = milestoneFromOptions(opts);
+  const payloadMilestone = fragment.milestone_id || null;
+  if (optionMilestone && payloadMilestone && optionMilestone !== payloadMilestone) {
+    throw new Error(`Conflicting memory milestone IDs: "${optionMilestone}" and "${payloadMilestone}"`);
   }
-
-  // Merge with existing if present
-  let base;
-  if (fs.existsSync(fpath)) {
-    const existing = parseFragment(fs.readFileSync(fpath, 'utf8'));
-    const existingFacts = Array.isArray(existing.facts) ? existing.facts : [];
-    const incomingFacts = Array.isArray(fragment.facts) ? fragment.facts : [];
-    const existingStats = Array.isArray(existing.stats) ? existing.stats : [];
-    const incomingStats = Array.isArray(fragment.stats) ? fragment.stats : [];
-    const mergedFacts = mergeFacts(existingFacts, incomingFacts);
-    const mergedStats = mergeStats(existingStats, incomingStats);
-    // Incoming scalar fields override existing; facts/stats merged
-    base = { ...existing, ...fragment, facts: mergedFacts, stats: mergedStats };
-  } else {
-    // New fragment: sort for stable ordering
-    const facts = Array.isArray(fragment.facts) ? mergeFacts([], fragment.facts) : [];
-    const stats = Array.isArray(fragment.stats) ? mergeStats([], fragment.stats) : [];
-    base = { ...fragment, facts, stats };
+  const milestoneId = optionMilestone || payloadMilestone;
+  if (milestoneId && !validateMilestoneId(milestoneId)) {
+    throw new Error(`Invalid memory milestone ID: "${milestoneId}"`);
   }
+  const fpath = fragmentPath(cwd, fragment.unit_id, { milestoneId }); // throws if invalid id
 
-  // Serialize
-  const frontmatter = serializeFrontmatter(base);
-  const body = base.body ? `\n${base.body}` : '';
-  const content = `---\n${frontmatter}\n---\n${body}`;
+  // mkdir -p, then resolve the directory to prevent a .gsd/memory symlink
+  // from redirecting writes outside the workspace.
+  assertMemoryDirectory(cwd, true);
+  const transactionLock = acquireFragmentLock(cwd, fpath, opts);
+  try {
+    if (fs.existsSync(fpath)) {
+      const targetStat = fs.lstatSync(fpath);
+      if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+        throw new Error(`Refusing to merge non-regular memory fragment: ${fpath}`);
+      }
+    }
 
-  // Idempotent check — skip writeAtomic (and lock acquisition) if content unchanged
-  if (fs.existsSync(fpath)) {
-    const existingContent = fs.readFileSync(fpath, 'utf8');
-    if (existingContent === content) {
+    // Read and merge only after acquiring the transaction lock. This is what
+    // prevents two background forge-memory agents from both merging stale data.
+    let base;
+    if (fs.existsSync(fpath)) {
+      const existing = parseFragment(fs.readFileSync(fpath, 'utf8'));
+      const existingFacts = Array.isArray(existing.facts) ? existing.facts : [];
+      const incomingFacts = Array.isArray(fragment.facts) ? fragment.facts : [];
+      const existingStats = Array.isArray(existing.stats) ? existing.stats : [];
+      const incomingStats = Array.isArray(fragment.stats) ? fragment.stats : [];
+      const mergedFacts = mergeFacts(existingFacts, incomingFacts);
+      const mergedStats = mergeStats(existingStats, incomingStats);
+      base = { ...existing, ...fragment, facts: mergedFacts, stats: mergedStats };
+    } else {
+      const facts = Array.isArray(fragment.facts) ? mergeFacts([], fragment.facts) : [];
+      const stats = Array.isArray(fragment.stats) ? mergeStats([], fragment.stats) : [];
+      base = { ...fragment, facts, stats };
+    }
+    if (milestoneId) base.milestone_id = milestoneId;
+
+    const frontmatter = serializeFrontmatter(base);
+    const body = base.body ? `\n${base.body}` : '';
+    const content = `---\n${frontmatter}\n---\n${body}`;
+
+    if (fs.existsSync(fpath) && fs.readFileSync(fpath, 'utf8') === content) {
       return { path: fpath, created: false };
     }
+
+    yamlSafe.writeAtomic(fpath, content, {
+      cwd,
+      runId: opts.runId || null,
+      sessionId: opts.sessionId || null,
+    });
+    return { path: fpath, created: true };
+  } finally {
+    transactionLock.release();
   }
-
-  // Atomic write with optional runId/sessionId (D-S05-D: degrade to fake UUIDs if absent)
-  yamlSafe.writeAtomic(fpath, content, {
-    cwd,
-    runId: opts.runId || null,
-    sessionId: opts.sessionId || null,
-  });
-
-  return { path: fpath, created: true };
 }
 
 // ── readFragment ──────────────────────────────────────────────────────────────
 // Reads and parses a MEMORY fragment. Returns null if the file does not exist.
-function readFragment(cwd, unitId) {
+function readFragment(cwd, unitId, opts) {
   let fpath;
   try {
-    fpath = fragmentPath(cwd, unitId);
+    fpath = fragmentPath(cwd, unitId, opts);
   } catch (e) {
     throw e; // propagate invalid id error
   }
 
   if (!fs.existsSync(fpath)) return null;
+  assertMemoryDirectory(cwd, false);
+  const targetStat = fs.lstatSync(fpath);
+  if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+    throw new Error(`Refusing to read non-regular memory fragment: ${fpath}`);
+  }
   const text = fs.readFileSync(fpath, 'utf8');
   return parseFragment(text);
 }
 
 // ── listFragments ─────────────────────────────────────────────────────────────
 // Lists all fragment files in the memory directory.
-// Returns Array<{ unitId, path }> sorted by unitId ascending.
+// Returns Array<{ storageKey, unitId, milestoneId, path }> sorted by storageKey.
 // Returns [] if the directory does not exist.
-function listFragments(cwd) {
-  const dir = memoryDir(cwd);
-  if (!fs.existsSync(dir)) return [];
+function listFragments(cwd, opts) {
+  const dir = assertMemoryDirectory(cwd, false);
+  if (!dir) return [];
 
-  const files = fs.readdirSync(dir);
-  const fragments = files
-    .filter(f => f.endsWith('.md'))
-    .map(f => ({
-      unitId: f.slice(0, -3), // strip .md
-      path: path.join(dir, f),
+  const milestoneId = milestoneFromOptions(opts);
+  if (milestoneId && !validateMilestoneId(milestoneId)) {
+    throw new Error(`Invalid memory milestone ID: "${milestoneId}"`);
+  }
+
+  const fragments = fs.readdirSync(dir, { withFileTypes: true })
+    .filter(entry => {
+      if (!entry.isFile() || !entry.name.endsWith('.md')) return false;
+      const parsed = parseStorageKey(entry.name.slice(0, -3));
+      return parsed && (!milestoneId || parsed.milestoneId === milestoneId);
+    })
+    .map(entry => ({
+      ...parseStorageKey(entry.name.slice(0, -3)),
+      path: path.join(dir, entry.name),
     }))
-    .sort((a, b) => a.unitId.localeCompare(b.unitId));
+    .sort((a, b) => a.storageKey.localeCompare(b.storageKey));
 
   return fragments;
+}
+
+// Trusted in-process selector seam consumed by forge-prompt.js.  The lazy
+// require avoids the forge-memory <-> forge-projection module cycle.
+function queryRelevant(query) {
+  if (!query || typeof query !== 'object') throw new Error('memory query must be an object');
+  const { queryMemoryEntries } = require('./forge-projection');
+  return queryMemoryEntries(query.cwd || process.cwd(), {
+    unitType: query.unitType,
+    query: query.query,
+    limit: query.limit,
+    maxTokens: query.maxTokens,
+    nowMs: query.nowMs,
+  });
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
@@ -483,10 +716,15 @@ module.exports = {
   MEMORY_DIR,
   memoryDir,
   fragmentPath,
+  qualifiedStorageKey,
+  parseStorageKey,
   parseFragment,
   writeFragment,
   readFragment,
   listFragments,
+  validateUnitId,
+  validateMilestoneId,
+  queryRelevant,
 };
 
 // ── cliMain ───────────────────────────────────────────────────────────────────
@@ -494,19 +732,29 @@ function printUsage() {
   console.log(`Usage: node forge-memory.js <command> [options]
 
 Commands:
-  --list [--cwd <dir>]                    List all memory fragments (JSON array)
-  --read <unit-id> [--cwd <dir>]          Read and print a fragment (JSON), null if missing
-  --write [--cwd <dir>]                   Write/merge fragment from stdin (JSON fragment)
-  --validate <unit-id> [--cwd <dir>]      Validate ID and check if fragment exists
+  --list [--milestone <id>] [--cwd <dir>] List all memory fragments (JSON array)
+  --read <unit-id> [--milestone <id>]     Read and print a fragment (JSON), null if missing
+  --write [--milestone <id>]              Write/merge fragment from stdin (JSON fragment)
+  --validate <unit-id> [--milestone <id>] Validate ID and check if fragment exists
+  --query|--select [options] [--cwd <dir>]
+                                          Select relevant memories deterministically
   --help, -h                              Show this help
 
 Unit ID forms accepted:
   M###, M-<ts>-<slug>            Milestone IDs
   TASK-###, T-<ts>-<slug>        Task IDs
+  S##, T##, T##.N                Milestone-local slice/task IDs
   ask-<session-id>               forge-ask session IDs
 
 Options:
-  --cwd <dir>   Working directory (default: process.cwd())
+  --cwd <dir>                 Working directory (default: process.cwd())
+  --milestone <id>            Namespace local S##/T## fragments by milestone
+  --unit-type <type>          Query phase, e.g. execute-task or plan-slice
+  --text <query>              Query text (prefer --query-file for long plans)
+  --query-file <path>         Read query text from inside --cwd (max 512 KiB)
+  --limit <n>                 Maximum entries (default: 8, max: 50)
+  --max-tokens <n>            chars/4 output budget (default: 2000, max: 16000)
+  --format json|markdown      Output shape (default: json)
 
 Exit codes:
   0  Success
@@ -527,6 +775,21 @@ function cliMain(argv) {
     argv = argv.filter((_, i) => i !== cwdIdx && i !== cwdIdx + 1);
   }
 
+  let milestoneId = null;
+  const milestoneIdx = argv.indexOf('--milestone');
+  if (milestoneIdx !== -1) {
+    milestoneId = argv[milestoneIdx + 1];
+    if (!milestoneId || milestoneId.startsWith('--')) {
+      process.stderr.write('--milestone requires a milestone ID\n');
+      process.exit(2);
+    }
+    if (!validateMilestoneId(milestoneId)) {
+      process.stderr.write(`Invalid memory milestone ID: "${milestoneId}"\n`);
+      process.exit(1);
+    }
+    argv = argv.filter((_, i) => i !== milestoneIdx && i !== milestoneIdx + 1);
+  }
+
   const cmd = argv[0];
 
   if (!cmd || cmd === '--help' || cmd === '-h') {
@@ -535,7 +798,7 @@ function cliMain(argv) {
   }
 
   if (cmd === '--list') {
-    const result = listFragments(cwd);
+    const result = listFragments(cwd, { milestoneId });
     console.log(JSON.stringify(result));
     process.exit(0);
   }
@@ -546,8 +809,59 @@ function cliMain(argv) {
       process.stderr.write('--read requires a unit ID\n');
       process.exit(2);
     }
-    const fragment = readFragment(cwd, id);
+    const fragment = readFragment(cwd, id, { milestoneId });
     console.log(JSON.stringify(fragment));
+    process.exit(0);
+  }
+
+  if (cmd === '--query' || cmd === '--select') {
+    const allowedOptions = new Set([
+      '--unit-type', '--text', '--query-file', '--limit', '--max-tokens', '--format',
+    ]);
+    for (let i = 1; i < argv.length; i += 2) {
+      const name = argv[i];
+      const value = argv[i + 1];
+      if (!allowedOptions.has(name)) throw new Error(`Unknown query option: ${name}`);
+      if (value === undefined || value.startsWith('--')) throw new Error(`${name} requires a value`);
+    }
+    const option = (name, fallback) => {
+      const idx = argv.indexOf(name);
+      if (idx === -1) return fallback;
+      const value = argv[idx + 1];
+      if (value === undefined || value.startsWith('--')) {
+        throw new Error(`${name} requires a value`);
+      }
+      return value;
+    };
+
+    let result;
+    try {
+      const unitType = option('--unit-type', 'other');
+      const queryFile = option('--query-file', null);
+      let query = option('--text', '');
+      if (queryFile) {
+        query = readQueryFile(cwd, queryFile);
+      }
+      if (query.includes('\0')) throw new Error('query text must not contain NUL bytes');
+      if (Buffer.byteLength(query, 'utf8') > MAX_QUERY_BYTES) {
+        throw new Error(`query text exceeds ${MAX_QUERY_BYTES} bytes`);
+      }
+      const limit = option('--limit', '8');
+      const maxTokens = option('--max-tokens', '2000');
+      const format = option('--format', 'json').toLowerCase();
+      if (!['json', 'markdown'].includes(format)) {
+        throw new Error('--format must be json or markdown');
+      }
+
+      // Lazy require avoids a top-level forge-memory <-> forge-projection cycle.
+      const { queryMemoryEntries } = require('./forge-projection');
+      result = queryMemoryEntries(cwd, { unitType, query, limit, maxTokens });
+      if (format === 'markdown') process.stdout.write(result.markdown + '\n');
+      else console.log(JSON.stringify(result));
+    } catch (e) {
+      process.stderr.write(`${e.message}\n`);
+      process.exit(1);
+    }
     process.exit(0);
   }
 
@@ -566,7 +880,7 @@ function cliMain(argv) {
       }
       let result;
       try {
-        result = writeFragment(cwd, fragment);
+        result = writeFragment(cwd, fragment, { milestoneId });
       } catch (e) {
         process.stderr.write(`${e.message}\n`);
         process.exit(1);
@@ -586,7 +900,7 @@ function cliMain(argv) {
     let exists = false;
     let existsError = null;
     try {
-      const fpath = fragmentPath(cwd, id);
+      const fpath = fragmentPath(cwd, id, { milestoneId });
       exists = fs.existsSync(fpath);
     } catch (e) {
       existsError = e.message;

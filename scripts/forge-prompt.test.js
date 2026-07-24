@@ -1,0 +1,377 @@
+#!/usr/bin/env node
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const {
+  TEMPLATE_FILES,
+  resolveTemplate,
+  extractStandards,
+  renderPrompt,
+  materializePrompt,
+  cleanupPrompt,
+} = require('./forge-prompt.js');
+const { countTokens } = require('./forge-tokens.js');
+
+const SCRIPT = path.join(__dirname, 'forge-prompt.js');
+const tempRoots = [];
+let passed = 0;
+
+function tempWorkspace(label) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `forge-prompt-${label}-`));
+  tempRoots.push(root);
+  fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.gsd', 'CODING-STANDARDS.md'), [
+    '# Coding Standards',
+    '',
+    '## Lint & Format Commands',
+    'npm run lint',
+    '',
+    '## Directory Conventions',
+    'Source belongs in src/.',
+    '',
+    '## Asset Map',
+    'Reuse src/lib/api.js.',
+    '',
+    '## Pattern Catalog',
+    'Use Result objects.',
+    '',
+    '## Code Rules',
+    'Never swallow errors.',
+    '',
+  ].join('\n'));
+  return root;
+}
+
+function test(name, fn) {
+  try {
+    fn();
+    passed += 1;
+    process.stdout.write(`ok - ${name}\n`);
+  } catch (error) {
+    process.stderr.write(`not ok - ${name}\n${error.stack}\n`);
+    process.exitCode = 1;
+  }
+}
+
+function baseOptions(cwd, unitType) {
+  return {
+    cwd,
+    unitType,
+    milestoneId: 'M001',
+    sliceId: 'S01',
+    taskId: 'T01',
+    description: 'Ship deterministic dispatch prompts',
+    unitEffort: 'medium',
+    thinking: 'adaptive',
+    autoCommit: false,
+    milestoneCleanup: 'keep',
+    planCheckMode: 'advisory',
+    mustHavesCheckResults: 'pass: 4\nwarn: 0\nfail: 0',
+    memories: ['Prefer deterministic inputs', 'Keep prompts bounded'],
+  };
+}
+
+test('declares every currently dispatched unit type', () => {
+  assert.deepStrictEqual(Object.keys(TEMPLATE_FILES).sort(), [
+    'complete-milestone',
+    'complete-slice',
+    'discuss-milestone',
+    'discuss-slice',
+    'execute-loose-task',
+    'execute-task',
+    'plan-check',
+    'plan-milestone',
+    'plan-slice',
+    'research-milestone',
+    'research-slice',
+  ]);
+});
+
+test('resolves a project-local template before a global template', () => {
+  const cwd = tempWorkspace('precedence');
+  const home = path.join(cwd, 'fake-home');
+  const scriptDir = path.join(cwd, 'fake-install', 'scripts');
+  const localDir = path.join(cwd, 'shared', 'templates', 'dispatch');
+  const globalDir = path.join(home, '.claude', 'templates', 'dispatch');
+  fs.mkdirSync(localDir, { recursive: true });
+  fs.mkdirSync(globalDir, { recursive: true });
+  fs.mkdirSync(scriptDir, { recursive: true });
+  fs.writeFileSync(path.join(localDir, 'execute-task.md'), 'LOCAL {T##}\n');
+  fs.writeFileSync(path.join(globalDir, 'execute-task.md'), 'GLOBAL {T##}\n');
+  const found = resolveTemplate('execute-task', { cwd, homeDir: home, scriptDir });
+  assert.strictEqual(found.scope, 'project');
+  assert.strictEqual(found.content, 'LOCAL {T##}\n');
+});
+
+test('falls back to the installed global template when no local copy exists', () => {
+  const cwd = tempWorkspace('global');
+  const home = path.join(cwd, 'fake-home');
+  const scriptDir = path.join(cwd, 'fake-install', 'scripts');
+  const globalDir = path.join(home, '.claude', 'templates', 'dispatch');
+  fs.mkdirSync(globalDir, { recursive: true });
+  fs.mkdirSync(scriptDir, { recursive: true });
+  fs.writeFileSync(path.join(globalDir, 'plan-milestone.md'), 'GLOBAL {M###}: {description}\n');
+  const found = resolveTemplate('plan-milestone', { cwd, homeDir: home, scriptDir });
+  assert.strictEqual(found.scope, 'global');
+  assert.strictEqual(found.content, 'GLOBAL {M###}: {description}\n');
+});
+
+test('extracts only the bounded coding-standard sections', () => {
+  const standards = extractStandards([
+    '## Lint & Format Commands',
+    'npm run lint',
+    '## Directory Conventions',
+    'src/',
+    '## Asset Map',
+    'src/lib.js',
+    '## Pattern Catalog',
+    'Result<T>',
+    '## Code Rules',
+    'No ignored errors.',
+    '## Unrelated',
+    'large irrelevant context',
+  ].join('\n'));
+  assert.strictEqual(standards.CS_LINT, 'npm run lint');
+  assert.strictEqual(standards.CS_STRUCTURE, 'src/\n\nsrc/lib.js\n\nResult<T>');
+  assert.strictEqual(standards.CS_RULES, 'No ignored errors.');
+  assert.ok(!JSON.stringify(standards).includes('large irrelevant context'));
+});
+
+test('renders all unit templates with no contract placeholder left behind', () => {
+  const cwd = tempWorkspace('all-units');
+  for (const unitType of Object.keys(TEMPLATE_FILES)) {
+    const result = renderPrompt(baseOptions(cwd, unitType));
+    assert.ok(result.prompt.includes('WORKING_DIR:'));
+    assert.ok(result.prompt.endsWith('\n'));
+    assert.ok(!/\{(?:WORKING_DIR|M###|S##|T##|auto_commit|milestone_cleanup|unit_effort|THINKING_OPUS|CS_LINT|CS_STRUCTURE|CS_RULES|TOP_MEMORIES|description|PLAN_CHECK_MODE|MUST_HAVES_CHECK_RESULTS)\}/.test(result.prompt));
+    assert.strictEqual(result.input_tokens, countTokens(result.prompt));
+    assert.ok(result.input_tokens < 1500, `${unitType} prompt unexpectedly large: ${result.input_tokens}`);
+  }
+});
+
+test('injects selected memories from the future selective-provider seam', () => {
+  const cwd = tempWorkspace('memory-provider');
+  let received;
+  const options = baseOptions(cwd, 'execute-task');
+  delete options.memories;
+  options.memoryProvider = query => {
+    received = query;
+    return { facts: ['Fact one', { fact: 'Fact two' }] };
+  };
+  const result = renderPrompt(options);
+  assert.strictEqual(received.unitType, 'execute-task');
+  assert.strictEqual(received.unitId, 'T01');
+  assert.ok(result.prompt.includes('- Fact one\n- Fact two'));
+});
+
+test('does not execute a project-local JavaScript shadow of the memory API', () => {
+  const cwd = tempWorkspace('memory-shadow');
+  const scripts = path.join(cwd, 'scripts');
+  const marker = path.join(cwd, 'shadow-executed');
+  fs.mkdirSync(scripts);
+  fs.writeFileSync(path.join(scripts, 'forge-memory.js'), [
+    "'use strict';",
+    `require('fs').writeFileSync(${JSON.stringify(marker)}, 'executed');`,
+    'module.exports.queryRelevant = query => ({',
+    "  facts: ['untrusted-' + query.unitType],",
+    '});',
+    '',
+  ].join('\n'));
+  const options = baseOptions(cwd, 'plan-milestone');
+  delete options.memories;
+  options.memoryQuery = 'deterministic renderer';
+  const result = renderPrompt(options);
+  assert.strictEqual(fs.existsSync(marker), false);
+  assert.ok(!result.prompt.includes('untrusted-plan-milestone'));
+});
+
+test('bounds direct and provider memory injection by memoryMaxTokens', () => {
+  const cwd = tempWorkspace('memory-budget');
+  const direct = renderPrompt({
+    ...baseOptions(cwd, 'execute-task'),
+    memories: 'direct-memory '.repeat(100),
+    memoryMaxTokens: 12,
+  });
+  const directBlock = direct.prompt.match(/AUTO-MEMORY"[^\n]*\n([\s\S]*?)\n\[END DATA FROM "AUTO-MEMORY"\]/)[1];
+  assert(directBlock.length <= 48, `direct memory chars=${directBlock.length}`);
+
+  const options = baseOptions(cwd, 'execute-task');
+  delete options.memories;
+  options.memoryMaxTokens = 10;
+  options.memoryProvider = () => ({ markdown: 'provider-memory '.repeat(100) });
+  const provided = renderPrompt(options);
+  const providerBlock = provided.prompt.match(/AUTO-MEMORY"[^\n]*\n([\s\S]*?)\n\[END DATA FROM "AUTO-MEMORY"\]/)[1];
+  assert(providerBlock.length <= 40, `provider memory chars=${providerBlock.length}`);
+});
+
+test('shares the standards budget across only the sections used by a template', () => {
+  const cwd = tempWorkspace('standards-budget');
+  const result = renderPrompt({
+    ...baseOptions(cwd, 'plan-slice'),
+    standards: {
+      CS_LINT: 'unused-lint '.repeat(100),
+      CS_STRUCTURE: 'structure '.repeat(100),
+      CS_RULES: 'rules '.repeat(100),
+    },
+    standardsMaxTokens: 20,
+  });
+  const structure = result.prompt.match(/CODING-STANDARDS\.structure"[^\n]*\n([\s\S]*?)\n\[END DATA FROM "CODING-STANDARDS\.structure"\]/)[1];
+  const rules = result.prompt.match(/CODING-STANDARDS\.rules"[^\n]*\n([\s\S]*?)\n\[END DATA FROM "CODING-STANDARDS\.rules"\]/)[1];
+  assert(structure.length > 0 && rules.length > 0);
+  assert(structure.length + rules.length <= 80, `standards chars=${structure.length + rules.length}`);
+  assert(!result.prompt.includes('unused-lint'));
+});
+
+test('does not load optional memory or standards for templates that do not reference them', () => {
+  const cwd = tempWorkspace('unused-context');
+  let memoryCalls = 0;
+  const missingStandards = path.join(cwd, 'does-not-exist.md');
+  const result = renderPrompt({
+    ...baseOptions(cwd, 'complete-milestone'),
+    memories: undefined,
+    memoryProvider: () => {
+      memoryCalls += 1;
+      throw new Error('unused provider should not run');
+    },
+    standardsPath: missingStandards,
+  });
+  assert.strictEqual(memoryCalls, 0);
+  assert.ok(result.prompt.includes('Complete GSD milestone M001'));
+});
+
+test('renders the same prompt body for identical inputs', () => {
+  const cwd = tempWorkspace('determinism');
+  const options = baseOptions(cwd, 'plan-slice');
+  const first = renderPrompt(options);
+  const second = renderPrompt(options);
+  assert.strictEqual(first.prompt, second.prompt);
+  assert.strictEqual(first.template_sha256, second.template_sha256);
+  assert.strictEqual(first.input_tokens, second.input_tokens);
+});
+
+test('inserts the established isolation header directly after WORKING_DIR', () => {
+  const cwd = tempWorkspace('isolation');
+  const codeDir = path.join(cwd, 'worktree');
+  fs.mkdirSync(codeDir);
+  const result = renderPrompt({
+    ...baseOptions(cwd, 'execute-task'),
+    isolationMode: 'worktree',
+    branch: 'forge/M001/S01',
+    codeDir,
+  });
+  const expected = [
+    `WORKING_DIR: ${cwd}`,
+    'ISOLATION: worktree',
+    'BRANCH: forge/M001/S01',
+    `CODE_DIR: ${codeDir}`,
+  ].join('\n');
+  assert.ok(result.prompt.includes(expected));
+  assert.throws(
+    () => renderPrompt({ ...baseOptions(cwd, 'execute-task'), isolationMode: 'worktree', branch: '../bad\nbranch', codeDir }),
+    /Invalid branch/,
+  );
+});
+
+test('materializes metadata and prompt atomically below .gsd/forge/prompts', () => {
+  const cwd = tempWorkspace('materialize');
+  const result = materializePrompt({
+    ...baseOptions(cwd, 'execute-task'),
+    dispatchId: 'dispatch-S01-T01-001',
+  });
+  const expectedRoot = path.join(cwd, '.gsd', 'forge', 'prompts');
+  assert.strictEqual(path.dirname(result.prompt_path), fs.realpathSync(expectedRoot));
+  assert.ok(fs.existsSync(result.prompt_path));
+  const artifact = fs.readFileSync(result.prompt_path, 'utf8');
+  assert.ok(artifact.includes('prompt_id: "dispatch-S01-T01-001"'));
+  assert.ok(artifact.includes('dispatch_group_id: "dispatch-S01-T01-001"'));
+  assert.ok(artifact.includes('dispatch_id: "dispatch-S01-T01-001"'));
+  assert.strictEqual(result.prompt_id, 'dispatch-S01-T01-001');
+  assert.strictEqual(result.dispatch_group_id, 'dispatch-S01-T01-001');
+  assert.ok(artifact.includes(`input_tokens: ${result.input_tokens}`));
+  assert.ok(artifact.includes('Execute GSD task T01'));
+  assert.deepStrictEqual(fs.readdirSync(expectedRoot).filter(name => name.endsWith('.tmp')), []);
+});
+
+test('refuses to clobber an existing dispatch artifact', () => {
+  const cwd = tempWorkspace('no-clobber');
+  const options = { ...baseOptions(cwd, 'execute-task'), dispatchId: 'same-dispatch' };
+  const first = materializePrompt(options);
+  const before = fs.readFileSync(first.prompt_path, 'utf8');
+  assert.throws(() => materializePrompt(options), /already exists/);
+  assert.strictEqual(fs.readFileSync(first.prompt_path, 'utf8'), before);
+  assert.deepStrictEqual(
+    fs.readdirSync(path.dirname(first.prompt_path)).filter(name => name.endsWith('.tmp')),
+    [],
+  );
+});
+
+test('cleanup removes only the exact safe dispatch artifact', () => {
+  const cwd = tempWorkspace('cleanup');
+  const one = materializePrompt({ ...baseOptions(cwd, 'plan-check'), dispatchId: 'one' });
+  const two = materializePrompt({ ...baseOptions(cwd, 'plan-check'), dispatchId: 'two' });
+  assert.strictEqual(cleanupPrompt(cwd, 'one'), true);
+  assert.ok(!fs.existsSync(one.prompt_path));
+  assert.ok(fs.existsSync(two.prompt_path));
+  assert.strictEqual(cleanupPrompt(cwd, 'one'), false);
+  assert.throws(() => cleanupPrompt(cwd, '../two'), /dispatch_id/);
+});
+
+test('rejects unknown units, malformed IDs, traversal, and unknown placeholders', () => {
+  const cwd = tempWorkspace('validation');
+  assert.throws(() => renderPrompt({ ...baseOptions(cwd, 'bogus') }), /Unsupported unit type/);
+  assert.throws(() => renderPrompt({ ...baseOptions(cwd, 'execute-task'), taskId: '../T01' }), /Invalid task ID/);
+  assert.throws(() => materializePrompt({ ...baseOptions(cwd, 'execute-task'), dispatchId: '../escape' }), /dispatch_id/);
+  assert.throws(() => renderPrompt({ ...baseOptions(cwd, 'execute-task'), standardsPath: '../outside.md' }), /must stay inside cwd/);
+
+  const templateDir = path.join(cwd, 'bad-templates');
+  fs.mkdirSync(templateDir);
+  fs.writeFileSync(path.join(templateDir, 'execute-task.md'), 'Bad {UNKNOWN}\n');
+  assert.throws(
+    () => renderPrompt({ ...baseOptions(cwd, 'execute-task'), templateDir }),
+    /Unknown placeholder.*UNKNOWN/,
+  );
+});
+
+test('CLI accepts selected memories and options as stdin JSON', () => {
+  const cwd = tempWorkspace('cli');
+  const input = {
+    ...baseOptions(cwd, 'research-slice'),
+    dispatch_id: 'cli-dispatch',
+    memories: '- stdin-selected-memory',
+  };
+  const run = spawnSync(process.execPath, [SCRIPT, '--stdin-json'], {
+    input: JSON.stringify(input),
+    encoding: 'utf8',
+    cwd: __dirname,
+  });
+  assert.strictEqual(run.status, 0, run.stderr);
+  const metadata = JSON.parse(run.stdout);
+  assert.strictEqual(metadata.prompt_id, 'cli-dispatch');
+  assert.strictEqual(metadata.dispatch_group_id, 'cli-dispatch');
+  assert.strictEqual(metadata.dispatch_id, 'cli-dispatch');
+  assert.ok(metadata.input_tokens > 0);
+  assert.ok(fs.existsSync(metadata.prompt_path));
+  const artifact = fs.readFileSync(metadata.prompt_path, 'utf8');
+  assert.ok(artifact.includes('stdin-selected-memory'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(metadata, 'prompt'));
+});
+
+test('CLI rejects unknown options instead of silently drifting', () => {
+  const run = spawnSync(process.execPath, [SCRIPT, '--unit-typo', 'execute-task'], {
+    encoding: 'utf8',
+    cwd: __dirname,
+  });
+  assert.notStrictEqual(run.status, 0);
+  assert.match(run.stderr, /Unknown option: --unit-typo/);
+});
+
+process.on('exit', () => {
+  for (const root of tempRoots) {
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+  }
+  if (!process.exitCode) process.stdout.write(`1..${passed}\n`);
+});

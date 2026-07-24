@@ -4,6 +4,7 @@ description: GSD research phase agent. Scouts codebases, reads docs, identifies 
 model: "claude-opus-4-8[1m]"
 thinking: adaptive
 effort: medium
+maxTurns: 48
 tools: Read, Bash, Glob, Grep, Write, AskUserQuestion, Skill, WebSearch, WebFetch
 ---
 

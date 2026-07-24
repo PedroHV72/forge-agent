@@ -46,6 +46,7 @@ const LOCAL_IGNORE_PATHS = Object.freeze([
   '.gsd/forge/events.jsonl',
   '.gsd/forge/evidence-*.jsonl',
   '.gsd/forge/compact-signal.json',
+  '.gsd/forge/prompts/',
 ]);
 
 // ── PROJECTION_IGNORE_PATHS ───────────────────────────────────────────────────
