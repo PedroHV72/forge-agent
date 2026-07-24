@@ -3741,8 +3741,12 @@ function smokeRouting() {
   const cfgE = readPrefsCached(dirE);
   assert(cfgE.ok === false && cfgE.errors.length > 0,
     '(e) malformed JSONC routing fixture → canonical reader reports a parse error', JSON.stringify(cfgE));
-  const rE = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirE });
-  assert(rE.source === 'routing' && Array.isArray(rE.chain) && rE.chain.length > 0,
+  // Com o layer local em parse-error e sem global routing configurado, a
+  // degradação canônica é tier_models (M008 all-or-nothing) — não exigimos
+  // source:'routing' aqui, só o contrato do resolver (chain não-vazia + source string).
+  const rE = withHermeticHome(() =>
+    resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'backend', cwd: dirE }));
+  assert(Array.isArray(rE.chain) && rE.chain.length > 0 && typeof rE.source === 'string',
     '(e) malformed routing fixture still returns the resolver contract safely', JSON.stringify(rE));
   const eCli = runScript('forge-routing.js', ['--unit-type', 'execute-task', '--tier', 'standard', '--domain', 'backend', '--cwd', dirE]);
   qStatuses.push(eCli.status);
@@ -4127,13 +4131,25 @@ function smokeDomainEmission() {
   const writeRoutingPrefsDom = (dir, bodyText) => {
     fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
     const lines = bodyText.split('\n').filter(Boolean);
-    const domain = lines.find((line) => /^\s{2}\S/.test(line)).trim().replace(/:$/, '');
-    const phase = lines.find((line) => /^\s{4}\S/.test(line)).trim().replace(/:$/, '');
-    const tierLine = lines.find((line) => /^\s{6}\S/.test(line)).trim();
-    const split = tierLine.indexOf(':');
-    const tier = tierLine.slice(0, split);
-    const members = tierLine.slice(split + 1).trim().slice(1, -1).split(',').map((v) => v.trim());
-    const routing = { [domain]: { [phase]: { [tier]: members } } };
+    const routing = {};
+    let curDomain = null;
+    let curPhase = null;
+    for (const line of lines) {
+      if (/^\s{2}\S/.test(line)) {
+        curDomain = line.trim().replace(/:$/, '');
+        routing[curDomain] = routing[curDomain] || {};
+        curPhase = null;
+      } else if (/^\s{4}\S/.test(line)) {
+        curPhase = line.trim().replace(/:$/, '');
+        routing[curDomain][curPhase] = routing[curDomain][curPhase] || {};
+      } else if (/^\s{6}\S/.test(line)) {
+        const tierLine = line.trim();
+        const split = tierLine.indexOf(':');
+        const tier = tierLine.slice(0, split);
+        const members = tierLine.slice(split + 1).trim().slice(1, -1).split(',').map((v) => v.trim());
+        routing[curDomain][curPhase][tier] = members;
+      }
+    }
     fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({ routing }), 'utf8');
   };
 
@@ -6622,7 +6638,13 @@ function smokePrefsChokepoints() {
   if (bashProbe.error || bashProbe.status !== 0) {
     pass('(f) install.sh --dry-run skipped (bash unavailable)');
   } else {
-    const dry = spawnSync('bash', [path.join(REPO, 'install.sh'), '--dry-run', '--update'], { encoding: 'utf8' });
+    // install.sh guards on ~/.claude existing; provide a hermetic HOME with
+    // that directory so the dry-run runs regardless of the runner's real HOME.
+    const dryHome = mkTmp('install-dry-home');
+    fs.mkdirSync(path.join(dryHome, '.claude'), { recursive: true });
+    const dry = spawnSync('bash', [path.join(REPO, 'install.sh'), '--dry-run', '--update'],
+      { encoding: 'utf8', env: { ...process.env, HOME: dryHome } });
+    cleanup(dryHome);
     const output = `${dry.stdout || ''}${dry.stderr || ''}`;
     assert(dry.status === 0, '(f) install.sh --dry-run exits 0', output);
     assert(!/[✗]|fatal/i.test(dry.stderr || ''), '(f) install.sh --dry-run has no error/fatal stderr', dry.stderr || '');
