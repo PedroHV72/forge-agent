@@ -8,6 +8,24 @@ const fs = require('fs');
 const path = require('path');
 const { MH_SCOPE_ENUM, ENV_REASON_ENUM } = require('./forge-xllm.js');
 
+const SANDBOX_DENIAL_RE = /\bEPERM\b|\bEACCES\b|\bEROFS\b|permission denied|operation not permitted|read-only file system|not permitted by the sandbox/i;
+const RUNNER_NAMES = 'npm|npx|pnpm|yarn|bun|node|jest|vitest|mocha|playwright|pytest|python3?|tox|go|cargo|make|gradle|mvn|dotnet|bundle|rspec|rake|php|composer|cmake|ctest|tsc|eslint|ruff';
+const ATTEMPTED_COMMAND_RE = new RegExp(`(?:^|[\\s\`'"(\\\\/])(?:${RUNNER_NAMES})\\b|\`[^\`\\n]{3,}\``);
+const RUNNER_TOKEN_RE = new RegExp(`\\b(?:${RUNNER_NAMES})\\b`, 'gi');
+
+/**
+ * Extract the distinct runner tool names (npm, pytest, make, ...) mentioned in
+ * a text blob. Shared with forge-reverify.js's ambiguous-multi-command gate so
+ * both places recognize the same runner vocabulary from a single source.
+ * @param {string} text
+ * @returns {string[]} lowercased, deduplicated runner names
+ */
+function extractRunnerTokens(text) {
+  const value = typeof text === 'string' ? text : '';
+  const matches = value.match(RUNNER_TOKEN_RE) || [];
+  return [...new Set(matches.map(token => token.toLowerCase()))];
+}
+
 function textOf(entry) {
   return `${entry && entry.item || ''}\n${entry && entry.note || ''}`;
 }
@@ -43,6 +61,16 @@ function corroborates(entry, planText) {
       return /network|install|fetch|clone|download|registry/i.test(evidence)
         ? null
         : 'network-required requires network operation evidence';
+    case 'sandbox-exec-blocked': {
+      // `item` is worker-echoed plan boilerplate — it can freely contain runner
+      // names and OS-denial vocabulary for tasks *about* sandboxing, which would
+      // trivially satisfy both signals with an empty `note` (a wash). Only the
+      // `note` is an execution report, so corroborate against it in isolation.
+      const note = typeof entry.note === 'string' ? entry.note : '';
+      return SANDBOX_DENIAL_RE.test(note) && ATTEMPTED_COMMAND_RE.test(note)
+        ? null
+        : 'sandbox-exec-blocked requires the attempted command and an OS denial signal (EPERM/EACCES/permission denied) in the note';
+    }
     default:
       return 'reason is not in the environment allowlist';
   }
@@ -163,4 +191,4 @@ function runCli(args) {
 
 if (require.main === module) process.exitCode = runCli(process.argv.slice(2));
 
-module.exports = { checkEnvPromotion, corroborates, corroborateEnvEntries };
+module.exports = { checkEnvPromotion, corroborates, corroborateEnvEntries, extractRunnerTokens };

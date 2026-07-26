@@ -7771,7 +7771,7 @@ function smokeSidecarEnvPromotion() {
   const adapterModule = { exports: {} };
   const adapterWrapper = new Function('exports', 'require', 'module', '__filename', '__dirname',
     `${fs.readFileSync(path.join(SCRIPTS, 'forge-xllm.js'), 'utf8').replace(/^#![^\n]*\n/, '')}\n` +
-    'module.exports.__section57 = { executeSchema, buildExecutePrompt };');
+    'module.exports.__section57 = { executeSchema, buildExecutePrompt, planSchema, buildPlanPrompt };');
   adapterWrapper(adapterModule.exports, require, adapterModule,
     path.join(SCRIPTS, 'forge-xllm.js'), SCRIPTS);
   const internals = adapterModule.exports.__section57;
@@ -7805,10 +7805,10 @@ function smokeSidecarEnvPromotion() {
     '(a) executeSchema item properties include scope and reason');
   const prompt = internals.buildExecutePrompt('x');
   assert(prompt.includes('scope') && adapter.MH_SCOPE_ENUM.join('|') === 'task|environment'
-      && adapter.ENV_REASON_ENUM.join('|') === 'git-commit-required|gsd-write-refused|out-of-scope-test-failure|network-required',
+      && adapter.ENV_REASON_ENUM.join('|') === 'git-commit-required|gsd-write-refused|out-of-scope-test-failure|network-required|sandbox-exec-blocked',
     '(a) adapter exports the canonical scope and environment-reason enums');
-  assert(prompt.includes('"git-commit-required" | "gsd-write-refused" | "out-of-scope-test-failure" | "network-required"'),
-    '(a) execute prompt contains the four canonical environment classes');
+  assert(prompt.includes('"git-commit-required" | "gsd-write-refused" | "out-of-scope-test-failure" | "network-required" | "sandbox-exec-blocked"'),
+    '(a) execute prompt contains the five canonical environment classes');
   assert(/status reflects ONLY task-scope work/.test(prompt),
     '(a) execute prompt says status reflects task-scope-only work');
 
@@ -7859,7 +7859,7 @@ function smokeSidecarEnvPromotion() {
   // C — canonical spec, executable mirrors, and planner guidance.
   const dispatch = fs.readFileSync(path.join(REPO, 'shared', 'forge-dispatch.md'), 'utf8');
   assert(/forge-env-promote\.js/.test(dispatch)
-      && ['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required']
+      && ['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required', 'sandbox-exec-blocked']
         .every(reason => dispatch.includes(reason))
       && /env_constraints/.test(dispatch) && /sidecar_env_promotion/.test(dispatch),
     '(c) dispatch Branch C references checker, allowlist, env_constraints, and promotion event');
@@ -7870,7 +7870,7 @@ function smokeSidecarEnvPromotion() {
     const name = path.basename(path.dirname(skillPath));
     assert(/forge-env-promote\.js/.test(skill) && /env_constraints/.test(skill),
       `(c) ${name} mirror calls the promotion checker and carries env_constraints`);
-    assert(!['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required']
+    assert(!['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required', 'sandbox-exec-blocked']
       .every(reason => new RegExp(`['"]${reason}['"]`).test(skill)),
     `(c) ${name} mirror does not redefine the environment allowlist`);
   }
@@ -7932,6 +7932,119 @@ function smokeSidecarEnvPromotion() {
     reinjectEnvStr);
 
   pass('(final) Section 57: sidecar env-promotion contract regression guard — adapter, promotion matrix, and doc-presence verified');
+}
+
+// ── Section 71: sandbox-exec-blocked + deterministic re-verification ───────
+function smokeSandboxExecBlocked() {
+  process.stdout.write('\n▸ Section 71: sandbox-exec-blocked re-verification contract\n');
+  const REPO = path.dirname(SCRIPTS);
+  const { checkEnvPromotion } = require('./forge-env-promote.js');
+  const adapter = require('./forge-xllm.js');
+  const reverify = require('./forge-reverify.js');
+  const base = { status: 'partial', summary: 'fixture', files_changed: [] };
+  const env = note => ({ item: 'blocked verification', status: 'unmet', note, scope: 'environment', reason: 'sandbox-exec-blocked' });
+  const promotion = note => checkEnvPromotion({ ...base, must_haves_status: [env(note)] }, 'writes:\n - src/example.js');
+  const good = promotion('ran `npm test`; jest exited EPERM: operation not permitted');
+  const prose = promotion('the sandbox blocked me');
+  assert(good.promote === true && good.env_constraints.length === 1, '(a) denial plus attempted command promotes');
+  assert(prose.promote === false && /attempted command.*denial signal/.test(prose.rejected[0].why), '(a) prose-only sandbox claim is rejected');
+  assert(promotion('EPERM').promote === false, '(a) denial without a command is rejected');
+  assert(promotion('ran npm test, it did not work').promote === false, '(a) command without denial is rejected');
+  assert(promotion('tried `bazel test //...` — permission denied').promote === true, '(a) backtick command escape hatch promotes');
+  assert(adapter.ENV_REASON_ENUM.join('|') === 'git-commit-required|gsd-write-refused|out-of-scope-test-failure|network-required|sandbox-exec-blocked'
+    && adapter.PROTOCOL_VERSION === 2, '(a) enum appends sandbox-exec-blocked and protocol remains 2');
+
+  // Legacy outputs are exact objects, protecting the existing four cases from drift.
+  const legacy = { ...base, must_haves_status: [{ item: 'legacy', status: 'unmet', note: 'refused .gsd/STATE.md', scope: 'environment', reason: 'gsd-write-refused' }] };
+  assert(JSON.stringify(checkEnvPromotion(legacy, '')) === JSON.stringify({ promote: true, env_constraints: [{ item: 'legacy', reason: 'gsd-write-refused', note: 'refused .gsd/STATE.md' }], rejected: [] }),
+    '(b) legacy gsd-write-refused output remains byte-identical');
+
+  const fixture = mkTmp('sandbox-reverify');
+  fs.writeFileSync(path.join(fixture, 'package.json'), JSON.stringify({ scripts: { test: `${process.execPath} -e "process.exit(0)"` } }), 'utf8');
+  fs.writeFileSync(path.join(fixture, 'package-lock.json'), '{}', 'utf8');
+  const payload = { ...base, must_haves_status: [env('npm test EPERM')] };
+  const verified = reverify.reverify({ result: payload, codeDir: fixture, apply: true });
+  assert(verified.verdict === 'verified' && payload.must_haves_status[0].status === 'met'
+    && payload.must_haves_status[0].scope === 'task' && payload.must_haves_status[0].reason === '',
+  '(c) re-verification runs project command and deterministically rewrites verified entry');
+  const failedPayload = { ...base, must_haves_status: [env('npm test EPERM')] };
+  fs.writeFileSync(path.join(fixture, 'package.json'), JSON.stringify({ scripts: { test: `${process.execPath} -e "process.exit(1)"` } }), 'utf8');
+  const failed = reverify.reverify({ result: failedPayload, codeDir: fixture, apply: true });
+  assert(failed.verdict === 'failed' && failedPayload.must_haves_status[0].status === 'unmet'
+    && failedPayload.must_haves_status[0].scope === 'task' && checkEnvPromotion(failedPayload, '').promote === false,
+  '(c) failed re-verification forces the normal task failure path');
+  cleanup(fixture);
+
+  const files = ['scripts/forge-xllm.js', 'scripts/forge-env-promote.js', 'shared/forge-dispatch.md', 'scripts/forge-smoke.js', 'scripts/forge-reverify.js', 'scripts/forge-reverify.test.js'];
+  for (const file of files) assert((fs.readFileSync(path.join(REPO, file), 'utf8').match(/sandbox-exec-blocked/g) || []).length >= 1,
+    `(d) ${file} contains sandbox-exec-blocked`);
+  for (const name of ['forge-auto', 'forge-next', 'forge-task']) {
+    const skill = fs.readFileSync(path.join(REPO, 'skills', name, 'SKILL.md'), 'utf8');
+    assert(/node "\$FORGE_SCRIPTS_DIR\/forge-reverify\.js"[^\n]*--apply/.test(skill) && /orchestrator_reverification/.test(skill),
+      `(d) ${name} mirror has executable re-verification invocation and event`);
+    assert(!['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required', 'sandbox-exec-blocked']
+      .every(reason => new RegExp(`['"]${reason}['"]`).test(skill)), `(d) ${name} does not redefine five-member allowlist`);
+  }
+  const wrapper = new Function('exports', 'require', 'module', '__filename', '__dirname',
+    `${fs.readFileSync(path.join(SCRIPTS, 'forge-xllm.js'), 'utf8').replace(/^#![^\n]*\n/, '')}\nmodule.exports.__section71={planSchema,buildPlanPrompt};`);
+  const module71 = { exports: {} };
+  wrapper(module71.exports, require, module71, path.join(SCRIPTS, 'forge-xllm.js'), SCRIPTS);
+  const planPrompt = module71.exports.__section71.buildPlanPrompt('fixture');
+  assert(module71.exports.__section71.planSchema.properties.must_haves_status === undefined
+    && !adapter.ENV_REASON_ENUM.some(reason => planPrompt.includes(reason)), '(d) plan branch has no sandbox/reason schema gap');
+  const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').indexOf('async function main()'));
+  assert(/smokeSandboxExecBlocked\(\)/.test(mainBody), '(d) Section 71 is registered in main');
+
+  // R1 (TASK-015 review): the two-signal check must be washable-proof — a
+  // must-have `item` that already mentions a runner and OS-denial vocabulary
+  // must NOT satisfy corroboration on its own with an empty `note`.
+  const { corroborates: corroboratesFn } = require('./forge-env-promote.js');
+  const washedItemEntry = {
+    item: 'Add sandbox-exec-blocked reason so npm test EPERM failures are not silently rejected',
+    note: '', scope: 'environment', reason: 'sandbox-exec-blocked',
+  };
+  assert(typeof corroboratesFn(washedItemEntry, '') === 'string',
+    '(f) sandbox-exec-blocked corroboration ignores item-only evidence with an empty note (wash-proof)');
+  const honestNoteEntry = { ...washedItemEntry, note: 'ran `npm test`: EPERM: operation not permitted' };
+  assert(corroboratesFn(honestNoteEntry, '') === null,
+    '(f) sandbox-exec-blocked corroboration still promotes an honest note reporting the attempted command and denial');
+  for (const legacyReason of ['gsd-write-refused', 'git-commit-required', 'network-required']) {
+    const before = corroboratesFn({ item: '', note: 'x', scope: 'environment', reason: legacyReason }, '');
+    assert(before !== undefined, `(f) legacy reason ${legacyReason} corroboration path unchanged (still callable)`);
+  }
+
+  // R2 (TASK-015 review): 2+ entries whose notes name visibly different
+  // commands must refuse blanket promotion instead of trusting one exit code
+  // for all of them.
+  const multiFixture = mkTmp('sandbox-reverify-multi');
+  fs.writeFileSync(path.join(multiFixture, 'package.json'), JSON.stringify({ scripts: { test: `${process.execPath} -e "process.exit(0)"` } }), 'utf8');
+  fs.writeFileSync(path.join(multiFixture, 'package-lock.json'), '{}', 'utf8');
+  const divergentPayload = { ...base, must_haves_status: [
+    env('ran `npm test`: EPERM: operation not permitted'),
+    env('ran `make lint`: EACCES: permission denied'),
+  ] };
+  const divergentOutcome = reverify.reverify({ result: divergentPayload, codeDir: multiFixture, apply: true });
+  assert(divergentOutcome.verdict === 'ambiguous-multi-command' && divergentOutcome.entries === 2,
+    '(g) two entries naming different commands refuse blanket promotion', JSON.stringify(divergentOutcome));
+  assert(divergentPayload.must_haves_status[0].scope === 'environment' && divergentPayload.must_haves_status[1].scope === 'environment',
+    '(g) ambiguous-multi-command leaves the payload untouched');
+  const sameCommandPayload = { ...base, must_haves_status: [
+    env('ran `npm test`: EPERM: operation not permitted'),
+    env('ran `npm test` again: EACCES: permission denied'),
+  ] };
+  const sameCommandOutcome = reverify.reverify({ result: sameCommandPayload, codeDir: multiFixture, apply: true });
+  assert(sameCommandOutcome.verdict === 'verified',
+    '(g) two entries citing the same command still promote in bulk', JSON.stringify(sameCommandOutcome));
+  cleanup(multiFixture);
+
+  // R3 (TASK-015 review): --apply must write atomically (reuse forge-surgical-reset.js's
+  // writeJsonAtomic, not a bare fs.writeFileSync) so a kill mid-write cannot
+  // truncate the result file for the next JSON.parse consumer.
+  const reverifySource = fs.readFileSync(path.join(SCRIPTS, 'forge-reverify.js'), 'utf8');
+  assert(/require\(['"]\.\/forge-surgical-reset\.js['"]\)/.test(reverifySource) && /writeJsonAtomic\(absoluteResult, result\)/.test(reverifySource),
+    '(h) forge-reverify.js reuses writeJsonAtomic from forge-surgical-reset.js for --apply writes');
+
+  pass('(final) Section 71: sandbox execution classification and re-verification stay live');
 }
 
 // ── Section 58: cleanupForRun registry-first mode ──────────────────────────
@@ -8928,6 +9041,7 @@ async function main() {
     smokeSchemaExtraction();
     smokeRequireWorktree();
     smokeSidecarEnvPromotion();
+    smokeSandboxExecBlocked();
     smokeCleanupRegistryMode();
     smokeXllmStateSliceQualified();
     smokeXllmResultFileGuard();

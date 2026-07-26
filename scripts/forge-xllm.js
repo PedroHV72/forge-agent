@@ -115,6 +115,7 @@ const ENV_REASON_ENUM = [
   'gsd-write-refused',
   'out-of-scope-test-failure',
   'network-required',
+  'sandbox-exec-blocked',
 ];
 const ENV_POLICY_ENUM = ['minimal', 'inherit'];
 const DISPATCH_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -525,7 +526,8 @@ function buildExecutePrompt(planText, extras) {
     ' PROHIBITIONS (git/commit, .gsd/** writes, or network), or items that were already',
     ' failing before your work (pre-existing/out-of-scope), must be marked with',
     ' "scope": "environment" and exactly one "reason" from this enum:',
-    ' "git-commit-required" | "gsd-write-refused" | "out-of-scope-test-failure" | "network-required".',
+    ' "git-commit-required" | "gsd-write-refused" | "out-of-scope-test-failure" | "network-required" | "sandbox-exec-blocked".',
+    ' `sandbox-exec-blocked` — a command you needed to run (tests, lint, build) could not execute because the sandbox denied it (`EPERM`/`EACCES`/permission denied), NOT because it ran and failed. Put the literal command AND the literal OS error in the `note`.',
     ' Include evidence in the "note". These environment items MUST NOT lower the overall',
     ' status: status reflects ONLY task-scope work. "done" means all task-scope work is',
     ' complete, even when environment items are unmet.',
@@ -535,7 +537,7 @@ function buildExecutePrompt(planText, extras) {
     '{',
     '  "status": "done" | "partial" | "blocked",',
     '  "summary": "<one-paragraph description of what you did>",',
-    '  "must_haves_status": [ { "item": "<must-have text>", "status": "met"|"unmet"|"unknown", "note": "<evidence or reason>", "scope": "task"|"environment", "reason": ""|"git-commit-required"|"gsd-write-refused"|"out-of-scope-test-failure"|"network-required" } ],',
+    '  "must_haves_status": [ { "item": "<must-have text>", "status": "met"|"unmet"|"unknown", "note": "<evidence or reason>", "scope": "task"|"environment", "reason": ""|"git-commit-required"|"gsd-write-refused"|"out-of-scope-test-failure"|"network-required"|"sandbox-exec-blocked" } ],',
     '  "files_changed": [ "<relative path>", ... ]',
     '}',
     'Rules for the JSON: files_changed lists the relative paths you created or modified;',
