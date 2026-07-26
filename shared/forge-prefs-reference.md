@@ -266,6 +266,12 @@ Como múltiplos /forge-auto//forge-task simultâneos isolam suas mudanças (M004
 - **Default:** `false`
 - **Descrição:** true = remove a worktree ao completar a milestone. Mesmo com true, NUNCA remove worktree suja (mudanças não commitadas) — cleanup vira skipped (dirty). Com auto_commit: false, commite na branch forge/{id} antes.
 
+### `forge_isolation.worktree_install_deps`
+
+- **Tipo:** boolean
+- **Default:** `true`
+- **Descrição:** true = ao provisionar uma worktree (mode = worktree), instala dependências automaticamente detectando o lockfile na raiz do repo (package-lock.json → npm ci, pnpm-lock.yaml → pnpm install, yarn.lock → yarn install). Roda uma vez por run, com timeout de 10 min. Falha no install degrada e avisa — nunca aborta o isolamento. O install executa lifecycle scripts do repo (ex.: postinstall) — quem roda o forge sobre repositório de terceiro/não-confiável deve considerar false.
+
 ### `forge_isolation.file_locks`
 
 - **Tipo:** boolean

@@ -41,6 +41,8 @@ Illustrative examples in this file (e.g. `M001`, `M002`, `M042`) are prose examp
 
 When the run's `forge_isolation.mode` (resolved by the orchestrator at activation via `scripts/forge-isolation.js --setup`) is **not** `shared`, the orchestrator appends an isolation header to EVERY worker prompt, immediately after the `WORKING_DIR:` line:
 
+In `worktree` mode, setup can provision Node dependencies once per run when `forge_isolation.worktree_install_deps` is true (the default). It detects a root lockfile, reports an additive `deps` object in `--setup` JSON, and degrades rather than aborting on install failure; workers are warned in their prompt that dependencies may be absent.
+
 ```
 ISOLATION: branch | worktree
 BRANCH: forge/{run-id}                  # resolved from forge_isolation.branch_pattern
@@ -1066,7 +1068,7 @@ node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-update \
 
 **4. Dispatch detached via `run_in_background`.** The Bash tool's 600s foreground ceiling does not apply to `run_in_background: true` (MEM: sidecar dispatch via background + poll). `--model` is appended **only when `$SIDECAR_MODEL` is non-empty**: the resolver selects the chain's Codex member, then falls back to `workers.codex_model`.
 
-**Context parity (canonical).** The sidecar receives Security and the informational context core **inlined**, rather than paths: its `workspace-write -C CODE_DIR` sandbox cannot read `.gsd/**` under `WORKING_DIR`. Both flags below are unconditional; absent or empty files simply omit their prompt section. Security is a non-truncatable must-have, while the assembled bundle contains only informational data. Follow-up, intentionally out of scope: `## Slice Plan`, `## Prior Context`, and `## Checker Feedback`.
+**Context parity (canonical).** The sidecar receives Security and the informational context core **inlined**, rather than paths: on macOS/Linux its `workspace-write -C CODE_DIR` sandbox cannot read `.gsd/**` under `WORKING_DIR`. On win32 the adapter uses `--dangerously-bypass-approvals-and-sandbox`: Codex issues #15850, #5824, #17179 and #14367 show that the Windows sandbox fails legitimate writes, can corrupt ownership, and is not a reliable boundary. `assertNoProtectedSidecarChanges`, the fallback surgical reset, `buildSidecarEnv`'s allowlist, and `-C CODE_DIR` remain active independently. Both flags below are unconditional; absent or empty files simply omit their prompt section. Security is a non-truncatable must-have, while the assembled bundle contains only informational data. Follow-up, intentionally out of scope: `## Slice Plan`, `## Prior Context`, and `## Checker Feedback`.
 
 ```bash
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "$HOME/.claude/scripts")

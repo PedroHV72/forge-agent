@@ -27,6 +27,18 @@ function assert(condition, name, detail) {
   }
 }
 
+function setEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const item of a) if (!b.has(item)) return false;
+  return true;
+}
+
+function describeSetDiff(a, b) {
+  const missing = [...b].filter((x) => !a.has(x));
+  const extra = [...a].filter((x) => !b.has(x));
+  return `missing: ${JSON.stringify(missing)}, extra: ${JSON.stringify(extra)}`;
+}
+
 // ── Isolated fixtures ───────────────────────────────────────────────────────
 
 const originalHome = process.env.HOME;
@@ -42,20 +54,50 @@ try {
 
   const schema = loadSchema();
 
+  // Independent leaf/section walker over the raw schema JSON — deliberately
+  // NOT the walkSchemaLeaves function under test, so these asserts prove
+  // "the viewer doesn't drop a knob the schema declares" rather than
+  // comparing a function against itself. Adding a knob to
+  // forge-prefs.schema.json must move this count without editing this file.
+  function independentSchemaLeafKeys(node, prefix, section, acc) {
+    if (!node || typeof node !== 'object') return acc;
+    if (node.properties) {
+      for (const [key, child] of Object.entries(node.properties)) {
+        independentSchemaLeafKeys(child, prefix ? `${prefix}.${key}` : key, section || key, acc);
+      }
+      return acc;
+    }
+    acc.leafPaths.add(prefix);
+    acc.sections.add(section);
+    return acc;
+  }
+  const independentSchema = independentSchemaLeafKeys(
+    { properties: schema.properties }, '', null, { leafPaths: new Set(), sections: new Set() },
+  );
+
   // ── walkSchemaLeaves — schema-universe shape ──────────────────────────────
   const { leaves, sections } = walkSchemaLeaves(schema);
-  assert(leaves.length === 94, 'walkSchemaLeaves returns all 94 knobs', `got ${leaves.length}`);
-  assert(sections.length === 40, 'walkSchemaLeaves returns all 40 sections', `got ${sections.length}`);
   const leafPaths = new Set(leaves.map((leaf) => leaf.path));
+  assert(setEqual(leafPaths, independentSchema.leafPaths),
+    'walkSchemaLeaves knob set matches an independent schema walk',
+    describeSetDiff(leafPaths, independentSchema.leafPaths));
+  assert(setEqual(new Set(sections), independentSchema.sections),
+    'walkSchemaLeaves section set matches an independent schema walk',
+    describeSetDiff(new Set(sections), independentSchema.sections));
   assert(leafPaths.has('review.rounds'), 'includes a known nested leaf (review.rounds)');
   assert(leafPaths.has('$schema'), 'includes the $schema catalog-reference leaf');
   assert(leafPaths.has('routing'), 'includes an open-ended object leaf (routing) as a single knob');
 
   // ── buildCatalog against a virgin project (nothing set anywhere) ─────────
   const virgin = buildCatalog(projectDir);
-  assert(virgin.knobs.length === 94, 'buildCatalog(virgin) lists all 94 knobs', `got ${virgin.knobs.length}`);
+  const virginPaths = new Set(virgin.knobs.map((knob) => knob.path));
+  assert(setEqual(virginPaths, independentSchema.leafPaths),
+    'buildCatalog(virgin) lists exactly the knob set the schema declares',
+    describeSetDiff(virginPaths, independentSchema.leafPaths));
   const virginSections = new Set(virgin.knobs.map((knob) => knob.section));
-  assert(virginSections.size === 40, 'buildCatalog(virgin) covers all 40 sections', `got ${virginSections.size}`);
+  assert(setEqual(virginSections, independentSchema.sections),
+    'buildCatalog(virgin) covers exactly the section set the schema declares',
+    describeSetDiff(virginSections, independentSchema.sections));
   assert(virgin.knobs.every((knob) => knob.active === false), 'buildCatalog(virgin) — every knob is desligado');
   assert(
     virgin.knobs.every((knob) => knob.layer === '—'),
@@ -89,7 +131,10 @@ try {
   assert(setResult.status === 'set', 'setPreference activates review.rounds=2 locally', JSON.stringify(setResult));
 
   const active = buildCatalog(projectDir);
-  assert(active.knobs.length === 94, 'buildCatalog(active) still lists all 94 knobs after --set', `got ${active.knobs.length}`);
+  const activePaths = new Set(active.knobs.map((knob) => knob.path));
+  assert(setEqual(activePaths, independentSchema.leafPaths),
+    'buildCatalog(active) still lists exactly the schema knob set after --set',
+    describeSetDiff(activePaths, independentSchema.leafPaths));
   const activeRounds = active.knobs.find((knob) => knob.path === 'review.rounds');
   assert(activeRounds.active === true, 'review.rounds is ATIVO after --set');
   assert(activeRounds.value === 2, 'review.rounds resolves to the set value (2)', `got ${activeRounds.value}`);

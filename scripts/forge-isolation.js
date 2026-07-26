@@ -15,7 +15,7 @@
 // Library exports:
 //   setupForRun(cwd, runId, opts) → { mode, repos: [{path, branch?, worktree?, status, error?}] }
 //   cleanupForRun(cwd, runId, opts) → similar shape
-//   readIsolationPrefs(cwd) → { mode, branchPattern, autoPullMain, worktreeRoot, worktreeCleanupOnComplete }
+//   readIsolationPrefs(cwd) → { mode, branchPattern, autoPullMain, worktreeRoot, worktreeCleanupOnComplete, worktreeInstallDeps }
 //
 // CLI:
 //   node forge-isolation.js --setup --run M065 [--cwd <path>]
@@ -31,12 +31,15 @@ const { readPrefsCached } = require('./forge-prefs.js');
 const repos = require('./forge-repos.js');
 const runs = require('./forge-runs.js');
 
+const WORKTREE_INSTALL_TIMEOUT_MS = 600000;
+
 function readIsolationPrefs(cwd) {
   let mode = 'shared';
   let branchPattern = 'forge/{M###}';
   let autoPullMain = true;
   let worktreeRoot = '.forge-worktrees';
   let worktreeCleanupOnComplete = false;
+  let worktreeInstallDeps = true;
   let prOnComplete = false;
 
   const isolation = readPrefsCached(cwd).prefs.forge_isolation;
@@ -50,8 +53,63 @@ function readIsolationPrefs(cwd) {
   const boolValue = (value, fallback) => value === undefined ? fallback : (typeof value === 'boolean' ? value : String(value).toLowerCase() === 'true');
   autoPullMain = boolValue(isolation.auto_pull_main, autoPullMain);
   worktreeCleanupOnComplete = boolValue(isolation.worktree_cleanup_on_complete, worktreeCleanupOnComplete);
+  worktreeInstallDeps = boolValue(isolation.worktree_install_deps, worktreeInstallDeps);
   prOnComplete = boolValue(isolation.pr_on_complete, prOnComplete);
-  return { mode, branchPattern, autoPullMain, worktreeRoot, worktreeCleanupOnComplete, prOnComplete };
+  return { mode, branchPattern, autoPullMain, worktreeRoot, worktreeCleanupOnComplete, worktreeInstallDeps, prOnComplete };
+}
+
+function resolvePackageManager(repoRoot) {
+  if (!fs.existsSync(path.join(repoRoot, 'package.json'))) return null;
+  const managers = [
+    ['pnpm-lock.yaml', { manager: 'pnpm', cmd: 'pnpm', args: ['install', '--frozen-lockfile'] }],
+    ['yarn.lock', { manager: 'yarn', cmd: 'yarn', args: ['install', '--frozen-lockfile'] }],
+    ['package-lock.json', { manager: 'npm', cmd: 'npm', args: ['ci'] }],
+  ];
+  for (const [lockfile, config] of managers) {
+    if (fs.existsSync(path.join(repoRoot, lockfile))) return config;
+  }
+  return null;
+}
+
+// NOTE: first-line truncation above is a size guard, NOT a redaction mechanism —
+// a secret on the first line of stderr (the common case for npm/yarn auth
+// failures) is NOT protected by truncation. Every credential-shaped pattern
+// below must be actively redacted; do not rely on truncation to hide secrets.
+function redactInstallError(value) {
+  return String(value || '').split(/\r?\n/)[0].slice(0, 500)
+    // npm canonical per-registry token: //<host>/:_authToken=<token>
+    .replace(/(\/\/[^\s/]+\/:_authToken=)\S+/gi, '$1[REDACTED]')
+    // legacy/global npm token forms: _authToken=, _auth=, _password=
+    .replace(/(_authToken=)\S+/gi, '$1[REDACTED]')
+    .replace(/(_auth=)\S+/gi, '$1[REDACTED]')
+    .replace(/(_password=)\S+/gi, '$1[REDACTED]')
+    // yarn: npmAuthToken: <token>
+    .replace(/(npmAuthToken:\s*)\S+/gi, '$1[REDACTED]')
+    // credentials embedded in a URL: https://user:pass@host/...
+    .replace(/https:\/\/[^\s/@:]+:[^\s/@]+@/gi, 'https://[REDACTED]@');
+}
+
+// Dependency provisioning inherits process.env deliberately: private registries often
+// require proxy, registry, or NODE_AUTH_TOKEN configuration. It runs project lifecycle
+// scripts, so untrusted repositories should set worktree_install_deps: false.
+function installWorktreeDeps(repoRoot, wtPath, opts) {
+  opts = opts || {};
+  if (opts.enabled === false) return { status: 'disabled', manager: null, ms: 0 };
+  const packageManager = resolvePackageManager(repoRoot);
+  if (!packageManager) return { status: 'no-lockfile', manager: null, ms: 0 };
+  const timeoutMs = opts.timeoutMs || WORKTREE_INSTALL_TIMEOUT_MS;
+  const runner = opts.runner || ((cmd, args, runOpts) => spawnSync(cmd, args, {
+    cwd: runOpts.cwd, timeout: runOpts.timeoutMs, shell: true, stdio: 'pipe', encoding: 'utf8', env: process.env,
+  }));
+  const started = Date.now();
+  try {
+    const run = runner(packageManager.cmd, packageManager.args, { cwd: wtPath, timeoutMs });
+    const ms = Date.now() - started;
+    if (run && !run.error && run.status === 0) return { status: 'installed', manager: packageManager.manager, ms };
+    return { status: 'failed', manager: packageManager.manager, ms, error: redactInstallError(run && (run.stderr || run.error)) || 'dependency installer failed' };
+  } catch (e) {
+    return { status: 'failed', manager: packageManager.manager, ms: Date.now() - started, error: redactInstallError(e.message) || 'dependency installer failed' };
+  }
 }
 
 // ── Effective-mode elevation (require_worktree per write-engine) ────────────
@@ -259,7 +317,7 @@ function cleanupBranchOne(repoPath, branchName) {
 }
 
 // ── Worktree mode ───────────────────────────────────────────────────────────
-function setupWorktreeOne(repoPath, branchName, worktreeRoot, runId, autoPullMain) {
+function setupWorktreeOne(repoPath, branchName, worktreeRoot, runId, autoPullMain, installOpts) {
   const result = { path: repoPath, branch: branchName, worktree: null, status: 'pending' };
   try {
     const repoName = path.basename(repoPath);
@@ -271,6 +329,7 @@ function setupWorktreeOne(repoPath, branchName, worktreeRoot, runId, autoPullMai
     // Already exists?
     if (fs.existsSync(wtPath)) {
       result.status = 'already-exists';
+      result.deps = { status: 'skipped', manager: null, ms: 0, reason: 'worktree-already-exists' };
       return result;
     }
 
@@ -289,6 +348,7 @@ function setupWorktreeOne(repoPath, branchName, worktreeRoot, runId, autoPullMai
       execSync(`git worktree add "${wtPath}" -b ${branchName}`, { cwd: repoPath, encoding: 'utf8', shell: true, stdio: 'pipe' });
     }
     result.status = 'created';
+    result.deps = installWorktreeDeps(repoPath, wtPath, installOpts);
   } catch (e) {
     result.status = 'error';
     result.error = e.message.split('\n')[0];
@@ -338,7 +398,9 @@ function setupForRun(cwd, runId, opts) {
     if (mode === 'branch') {
       result.repos.push(setupBranchOne(r, branchName, prefs.autoPullMain));
     } else if (mode === 'worktree') {
-      result.repos.push(setupWorktreeOne(r, branchName, prefs.worktreeRoot, runId, prefs.autoPullMain));
+      result.repos.push(setupWorktreeOne(r, branchName, prefs.worktreeRoot, runId, prefs.autoPullMain, {
+        enabled: prefs.worktreeInstallDeps, runner: opts.runner, timeoutMs: opts.timeoutMs,
+      }));
     }
   }
   return result;
@@ -469,4 +531,5 @@ module.exports = {
   resolveEffectiveMode, detectExternalWriteEngine, resolveRequireWorktree, resolveCleanupMode,
   resolveBranchName, gitDefaultBranch, gitCurrentBranch,
   gitHasOriginRemote, fetchDefaultBranch,
+  resolvePackageManager, installWorktreeDeps, WORKTREE_INSTALL_TIMEOUT_MS,
 };

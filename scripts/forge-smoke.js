@@ -43,6 +43,45 @@ function assert(cond, name, detail) {
   else fail(name, detail || 'assertion failed');
 }
 
+// Independent leaf/section walker over the raw prefs schema — deliberately
+// NOT forge-prefs-view.js's walkSchemaLeaves, so comparisons against it
+// prove "the viewer doesn't drop a knob the schema declares" instead of a
+// function compared against itself. Adding a knob to forge-prefs.schema.json
+// moves this set without touching any hardcoded count in this file.
+function independentSchemaLeafKeys(schema) {
+  const leafPaths = new Set();
+  const sections = new Set();
+  function walk(node, prefix, section) {
+    if (!node || typeof node !== 'object') return;
+    if (node.properties) {
+      for (const [key, child] of Object.entries(node.properties)) {
+        walk(child, prefix ? `${prefix}.${key}` : key, section || key);
+      }
+      return;
+    }
+    leafPaths.add(prefix);
+    sections.add(section);
+  }
+  if (schema && schema.properties) {
+    for (const [topKey, topNode] of Object.entries(schema.properties)) {
+      walk(topNode, topKey, topKey);
+    }
+  }
+  return { leafPaths, sections };
+}
+
+function setEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const item of a) if (!b.has(item)) return false;
+  return true;
+}
+
+function describeSetDiff(a, b) {
+  const missing = [...b].filter((x) => !a.has(x));
+  const extra = [...a].filter((x) => !b.has(x));
+  return `missing: ${JSON.stringify(missing)}, extra: ${JSON.stringify(extra)}`;
+}
+
 function runScript(name, args, opts) {
   opts = opts || {};
   const r = spawnSync('node', [path.join(SCRIPTS, name), ...args], { encoding: 'utf8', ...opts });
@@ -5580,7 +5619,8 @@ function smokePrefsViewerDoctor() {
   const migrate = require('./forge-prefs-migrate.js');
   const schema = engine.loadSchema();
 
-  // (a) Viewer: 94-knob coverage, activation, and no-drift against schema.
+  // (a) Viewer: full knob-set coverage, activation, and no-drift against schema.
+  const expectedSchemaLeaves = independentSchemaLeafKeys(schema);
   const project = mkTmp('prefs-viewer');
   const home = path.join(project, 'home');
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
@@ -5592,9 +5632,14 @@ function smokePrefsViewerDoctor() {
     const setResult = migrate.setPreference(project, 'review.rounds=3', { layer: 'local', create: true });
     assert(setResult.status === 'set', '(a) setPreference activates review.rounds=3 locally for the viewer fixture', JSON.stringify(setResult));
     const catalog = view.buildCatalog(project);
-    assert(catalog.knobs.length === 94, '(a) viewer lists all 94 knobs', `got ${catalog.knobs.length}`);
+    const catalogPaths = new Set(catalog.knobs.map((knob) => knob.path));
+    assert(setEqual(catalogPaths, expectedSchemaLeaves.leafPaths),
+      '(a) viewer lists exactly the knob set the schema declares',
+      describeSetDiff(catalogPaths, expectedSchemaLeaves.leafPaths));
     const sections = new Set(catalog.knobs.map((knob) => knob.section));
-    assert(sections.size === 40, '(a) viewer covers all 40 sections', JSON.stringify([...sections]));
+    assert(setEqual(sections, expectedSchemaLeaves.sections),
+      '(a) viewer covers exactly the section set the schema declares',
+      describeSetDiff(sections, expectedSchemaLeaves.sections));
     const rounds = catalog.knobs.find((knob) => knob.path === 'review.rounds');
     assert(!!rounds && rounds.active === true && rounds.value === 3 && rounds.layer === 'local',
       '(a) activated knob is ATIVO with the right layer+value', JSON.stringify(rounds));
@@ -7659,13 +7704,17 @@ function smokeRequireWorktree() {
   const view = require('./forge-prefs-view.js');
   withHermeticHome(() => {
     const project = mkTmp('require-worktree-catalog');
+    const schema = engine.loadSchema();
+    const expectedLeaves = independentSchemaLeafKeys(schema);
     const catalog = view.buildCatalog(project);
-    assert(catalog.knobs.length === 94, '(l) viewer lists all 94 knobs', `got ${catalog.knobs.length}`);
-    assert(new Set(catalog.knobs.map((k) => k.section)).size === 40,
-      '(l) section count includes adaptive memory policy', '');
+    const catalogPaths = new Set(catalog.knobs.map((k) => k.path));
+    assert(setEqual(catalogPaths, expectedLeaves.leafPaths),
+      '(l) viewer lists exactly the knob set the schema declares',
+      describeSetDiff(catalogPaths, expectedLeaves.leafPaths));
+    assert(setEqual(new Set(catalog.knobs.map((k) => k.section)), expectedLeaves.sections),
+      '(l) section set includes adaptive memory policy', '');
     const rw = catalog.knobs.find((k) => k.path === 'workers.require_worktree');
     assert(!!rw && rw.section === 'workers', '(l) require_worktree catalogued under workers', JSON.stringify(rw));
-    const schema = engine.loadSchema();
     assert(schema.properties.workers.properties.require_worktree
         && schema.properties.workers.properties.require_worktree.default === 'auto',
       '(l) schema workers.require_worktree default auto');
@@ -8485,6 +8534,99 @@ function smokeVerifierCodeDir() {
   pass('(final) Section 67: verifier keeps artifact and code roots distinct');
 }
 
+// ── Section 70: Windows sandbox gate + worktree dependency provisioning ─────
+function smokeWindowsSandboxAndWorktreeDeps() {
+  process.stdout.write('\n▸ Section 70: Windows sandbox gate + worktree dependencies\n');
+  const { codexSandboxArgs, buildExecutePrompt } = require('./forge-xllm.js');
+  const { resolvePackageManager, installWorktreeDeps } = require('./forge-isolation.js');
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const expectedWrite = ['--sandbox', 'workspace-write'];
+  assert(same(codexSandboxArgs('workspace-write', 'darwin'), expectedWrite)
+    && same(codexSandboxArgs('workspace-write', 'linux'), expectedWrite),
+  '70a: POSIX workspace-write args are byte-identical');
+  assert(same(codexSandboxArgs('workspace-write', 'win32'), ['--dangerously-bypass-approvals-and-sandbox'])
+    && !codexSandboxArgs('workspace-write', 'win32').includes('--sandbox'),
+  '70a: win32 workspace-write is bypass-only');
+  assert(['darwin', 'linux', 'win32'].every((p) => same(codexSandboxArgs('read-only', p), ['--sandbox', 'read-only'])),
+    '70b: read-only remains sandboxed on every platform');
+
+  const xllmSource = fs.readFileSync(path.join(SCRIPTS, 'forge-xllm.js'), 'utf8');
+  const gateStart = xllmSource.indexOf('function codexSandboxArgs');
+  const gateEnd = xllmSource.indexOf('\n}', gateStart) + 2;
+  const outsideGate = xllmSource.slice(0, gateStart) + xllmSource.slice(gateEnd);
+  assert(!/['"]--sandbox['"]\s*,\s*['"](?:read-only|workspace-write)['"]/.test(outsideGate),
+    '70c: forge-xllm has no call-site sandbox literal pairs');
+  const gateComment = xllmSource.slice(Math.max(0, gateStart - 1500), gateEnd);
+  assert(['15850', '17179', '14367', '5824', 'assertNoProtectedSidecarChanges'].every((s) => gateComment.includes(s)),
+    '70d: gate comment documents Windows issues and surviving defense');
+
+  const template = fs.readFileSync(path.join(SCRIPTS, '..', 'shared', 'templates', 'dispatch', 'execute-task.md'), 'utf8');
+  const sentinel = 'dependencies may not be installed';
+  const prompt = buildExecutePrompt('# T70\n');
+  assert(template.split(sentinel).length - 1 === 1 && prompt.includes(sentinel)
+    && prompt.includes('unknown') && prompt.indexOf(sentinel) < prompt.indexOf('Must-have scope classification:'),
+  '70e: dependency warning reaches template and sidecar prompt exactly once');
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-t70-'));
+  const wt = path.join(root, 'worktree');
+  let calls = 0;
+  try {
+    fs.mkdirSync(wt);
+    fs.writeFileSync(path.join(root, 'package.json'), '{}\n');
+    fs.writeFileSync(path.join(root, 'package-lock.json'), '{}\n');
+    const installed = installWorktreeDeps(root, wt, { runner: (cmd, args, runOpts) => {
+      calls++; return { status: cmd === 'npm' && args[0] === 'ci' && runOpts.cwd === wt ? 0 : 1, stderr: '' };
+    } });
+    assert(installed.status === 'installed' && installed.manager === 'npm' && calls === 1,
+      '70f: npm lockfile provisions through injected runner with worktree cwd');
+    const failed = installWorktreeDeps(root, wt, { runner: () => ({ status: 1, stderr: 'npm ERR! failed install\nsecret ignored' }) });
+    assert(failed.status === 'failed' && !!failed.error, '70g: install failure degrades without throwing');
+    const redacted = installWorktreeDeps(root, wt, { runner: () => ({ status: 1, stderr: 'https://user:password@example.invalid/pkg' }) });
+    assert(!redacted.error.includes('user:password@'), '70g: installer error redacts credential URLs');
+    const npmToken = installWorktreeDeps(root, wt, { runner: () => ({ status: 1, stderr: '//registry.npmjs.org/:_authToken=npm_SECRET123 is invalid' }) });
+    assert(!npmToken.error.includes('npm_SECRET123'), '70g: installer error redacts canonical npm per-registry token');
+    const yarnToken = installWorktreeDeps(root, wt, { runner: () => ({ status: 1, stderr: 'npmAuthToken: yarn_SECRET456 rejected' }) });
+    assert(!yarnToken.error.includes('yarn_SECRET456'), '70g: installer error redacts yarn npmAuthToken');
+    const control = installWorktreeDeps(root, wt, { runner: () => ({ status: 1, stderr: 'plain error with no secrets at all here' }) });
+    assert(control.error === 'plain error with no secrets at all here', '70g: installer error passes through stderr with no secret unchanged');
+    const disabled = installWorktreeDeps(root, wt, { enabled: false, runner: () => { calls++; return { status: 0 }; } });
+    assert(disabled.status === 'disabled' && calls === 1, '70h: disabled provisioning does not call runner');
+    fs.unlinkSync(path.join(root, 'package-lock.json'));
+    const noLock = installWorktreeDeps(root, wt, { runner: () => { calls++; return { status: 0 }; } });
+    assert(noLock.status === 'no-lockfile' && calls === 1, '70h: no lockfile does not call runner');
+    fs.writeFileSync(path.join(root, 'package-lock.json'), '{}\n');
+    fs.writeFileSync(path.join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+    assert(resolvePackageManager(root).manager === 'pnpm', '70i: pnpm lockfile wins manager precedence');
+  } finally { cleanup(root); }
+  const source = fs.readFileSync(__filename, 'utf8');
+  const isolationSource = fs.readFileSync(path.join(SCRIPTS, 'forge-isolation.js'), 'utf8');
+  assert(/result\.status = 'created';\s*result\.deps = installWorktreeDeps/.test(isolationSource)
+    && /status: 'skipped'.+worktree-already-exists/.test(isolationSource),
+  '70j: created worktrees receive additive non-fatal deps; existing worktrees skip installs');
+  assert(/smokeWindowsSandboxAndWorktreeDeps\(\);/.test(source.slice(source.lastIndexOf('async function main()'))),
+    '(final) Section 70 is registered in main()');
+
+  // 70k: every `isolation.<key>` read by readIsolationPrefs() must be declared in
+  // forge-prefs.schema.json's forge_isolation block — closes the class of bug where
+  // code reads a knob the schema (and therefore the generated reference doc and
+  // /forge-prefs catalog) never declared, leaving the operator with no way to
+  // discover the opt-out.
+  const readKeys = new Set();
+  const readIsoBody = isolationSource.slice(
+    isolationSource.indexOf('function readIsolationPrefs'),
+    isolationSource.indexOf('function resolvePackageManager'));
+  for (const m of readIsoBody.matchAll(/isolation\.([a-zA-Z_][a-zA-Z0-9_]*)/g)) readKeys.add(m[1]);
+  const schemaJson = JSON.parse(fs.readFileSync(path.join(SCRIPTS, '..', 'forge-prefs.schema.json'), 'utf8'));
+  const isolationProps = Object.keys(
+    schemaJson.properties.forge_isolation.properties || {});
+  const missing = [...readKeys].filter((k) => k !== 'mode' && !isolationProps.includes(k));
+  assert(missing.length === 0,
+    `70k: readIsolationPrefs() keys all declared in forge_isolation schema (missing: ${missing.join(', ')})`);
+  assert(isolationProps.includes('worktree_install_deps'), '70k: worktree_install_deps is declared in the schema');
+
+  pass('(final) Section 70: platform gate and non-fatal dependency provisioning verified');
+}
+
 // ── Section 64: review agent unavailability — classifier behaviour + sanctioned path docs ──
 // Only ONE surface here is mechanically executable: scripts/forge-classify-error.js (the retry
 // decision behind § Agent unavailability). The per-mode policy itself is prose interpreted at
@@ -8797,6 +8939,7 @@ async function main() {
     smokePhasesTable();
     smokeSidecarModel();
     smokeVerifierCodeDir();
+    smokeWindowsSandboxAndWorktreeDeps();
   } catch (e) {
     fail('unhandled exception', e.stack || e.message);
   }

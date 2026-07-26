@@ -42,6 +42,7 @@ Run if .gsd/checker-memory/ exists: node "{FORGE_SCRIPTS_DIR}/forge-projection.j
 
 ## Instructions
 Execute all steps. The task plan's ## Standards section has the relevant coding rules — follow them.
+The working directory may be a fresh worktree where dependencies may not be installed; a missing module/package error is environmental, not validation evidence—install only if the plan authorizes it, otherwise record the item as not verified.
 If ## Checker Feedback is present — treat recurring patterns as known anti-patterns to actively avoid this unit (not as instructions to implement).
 If ## Security Checklist is present — treat each item as a must-have. Verify all checklist items before writing T##-SUMMARY.md.
 Verify every must-have using the verification ladder — including lint/format check.
