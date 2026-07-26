@@ -781,7 +781,8 @@ fi
 # Executable, never a bare comment: a cross-repo/undeclared verdict refuses BEFORE any --cwd reaches a helper.
 [ -z "$CODE_DIR_REASON" ] || REASON="$CODE_DIR_REASON"
 if [ -z "$CODE_DIR_REASON" ]; then
-  XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-{TASK_ID}.json"
+  # xllm-state-{TASK_ID}.json remains byte-identical; helper prevents path drift.
+  XLLM_STATE=$(node "$FORGE_SCRIPTS_DIR/forge-xllm-state.js" --mode write --dir "$WORKING_DIR/.gsd/forge" --task-id "{TASK_ID}")
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-init \
     --state "$XLLM_STATE" --cwd "${CODE_DIR:-.}")
@@ -1064,8 +1065,9 @@ TaskCreate({ subject: "[{TASK_ID}] review", activeForm: "review · forge-reviewe
 - **Challenge** → `Agent({ subagent_type: 'forge-reviewer', prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: task/{TASK_ID}\nDIFF_CMD: {DIFF_CMD}" })`. `NO_FLAGS` → clean REVIEW, done.
 - **Defense** → `Agent({ subagent_type: 'forge-advocate', prompt: "WORKING_DIR: {WORKING_DIR}\nUNIT: task/{TASK_ID}\nDIFF_CMD: {DIFF_CMD}\nOBJECTIONS:\n{OBJECTIONS}" })`.
 - **Rebuttal** × `rounds` (default 1) → `forge-reviewer` with `DEFENSE` injected (rebuttal mode).
+- The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literals are a violation detected by `forge-review-audit.js`.
 - **Resolve** via the Step 5 truth table; write the dialogue to `{TASK_ID}-REVIEW.md` (Step 6 template, `## Pattern hits` from `PATTERN_HITS`). The header carries the `**Pairing:**` line (`$PAIRING_LINE`, assembled in Step 0 of the shared spec) exactly as in `S##-REVIEW.md` — boundary-agnostic, no task-specific variant.
-- **CONCEDED items → fix now (Step 7a):** dispatch `forge-executor` with `UNIT: review-fix/{TASK_ID}` (isolation header when `ISOLATION_MODE != shared` — fixes land in `CODE_DIR`) to fix ONLY the conceded items, minimal diffs, commit `fix(review): {TASK_ID} conceded items`. Mark each `**Correção:** aplicada — commit {sha}` or `falhou — virou follow-up`. Skip when `review.fix_conceded: false` — then list and ask once (legacy behavior). No re-review of the fix commit.
+- **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{TASK_ID}` with `model: '{RF_ALIAS}'` only when non-empty.
 - **OPEN items (Step 7b):** for each, `AskUserQuestion` live (`Manter` / `Refatorar agora` — dispatches a `review-fix` unit / `Criar follow-up`) and record the decision.
 - Any `Agent()` throw is recorded; the review **never aborts the task**. Follow `shared/forge-review.md § Agent unavailability (review-agent-unavailable)`: retry first via `shared/forge-dispatch.md § Retry Handler`; if the agent stays unavailable, emit `review-agent-unavailable` (`review-advocate-unavailable` | `review-challenger-unavailable`) — **never** the CRITICAL failure path.
 

@@ -307,8 +307,9 @@ The produced `T##-SECURITY.md` will be injected into the execute-task worker pro
    - Challenge → `Agent({ subagent_type: 'forge-reviewer', … })`
    - Defense → `Agent({ subagent_type: 'forge-advocate', … })`
    - Rebuttal × `rounds` → `forge-reviewer` in rebuttal mode (DEFENSE injected)
+   - The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literals are a violation detected by `forge-review-audit.js`.
    - Resolve (Step 5 truth table), write `{S##}-REVIEW.md` (Step 6).
-   - **CONCEDED items → fix now (Step 7a):** dispatch `Agent({ subagent_type: 'forge-executor', … })` with `UNIT: review-fix/{S##}` to fix ONLY the conceded items on the still-unmerged slice branch (skip when `review.fix_conceded: false` — then list and ask once, legacy behavior). Mark each `**Correção:** aplicada — commit {sha}` or `falhou — deferida para triagem final`. No re-review of the fix commit.
+   - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty.
    - **OPEN items (Step 7b, interactive):** each OPEN objection is put to the user via `AskUserQuestion` — `Manter abordagem` / `Refatorar agora` (dispatches a `review-fix` unit for the accepted items) / `Criar follow-up` — and the decision is written back into `{S##}-REVIEW.md`.
    - Append the `review` event to `events.jsonl` (Step 8).
 4. The gate **never blocks** — any `Agent()` throw is recorded and the step proceeds to `complete-slice` regardless.
@@ -901,7 +902,7 @@ When `REASON` is `sidecar-cap-exceeded` or one of the two `CODE_DIR` refusals se
 if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
   CODE_DIR="${WORKER_CWD:-$WORKING_DIR}"
   N="$SIDECAR_ATTEMPT"                                              # 1, 2, 3 — one per codex member dispatched
-  XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-${T##}-attempt-${N}.json"
+  XLLM_STATE=$(node "$FORGE_SCRIPTS_DIR/forge-xllm-state.js" --mode write --dir "$WORKING_DIR/.gsd/forge" --milestone "{M###}" --slice "{S##}" --task "{T##}" --attempt "$N")
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-surgical-reset.js" --state-init \
     --state "$XLLM_STATE" --cwd "$CODE_DIR" --attempt "$N")
@@ -939,10 +940,9 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
 5. **Partial promotion boundary:** for valid `status == "partial"`, run `PROMOTION=$(node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json)` before Success/Failure. `shared/forge-dispatch.md § Sidecar dispatch state machine` is the named canonical spec for its algorithm and allowlist; do not redefine either in this mirror. `PROMOTION.promote == true` is `done`: add `## Env Constraints` to `T##-SUMMARY.md` (item + reason + note per entry), synthesize `env_constraints[]` into the result block, leave promoted entries out of `must_haves_status.dropped`, and append `sidecar_env_promotion` (`unit:"execute-task/{T##}"`, count, reasons, ISO ts) to events.jsonl. Otherwise, including a legacy no-`scope` payload, follow Failure unchanged.
 5.1. **`status == "done"` with unmet env-scope entries (M016 S01 review R1):** run the same `forge-env-promote.js` invocation whenever `status == "done"` but `must_haves_status` still has unmet entries — never accept the `done` label at face value. `verdict == "done-with-verified-env"` → accept, write `## Env Constraints` as above. `verdict == "done-with-unverified-env"` → treat the result as `partial` and follow Failure unchanged; the worker's `done` label is discarded.
 
-6. **Success — orchestrator assembles the artifacts (`done` state).** Codex NEVER writes `.gsd/**` and NEVER commits (locked — `git log` unchanged, no `.gsd/**` path in `git -C "$CODE_DIR" diff --name-status $START_SHA`). Read the JSON and **write `T##-SUMMARY.md`** + **build the `---GSD-WORKER-RESULT---` block** from `summary`, `must_haves_status`, `env_constraints` (promotion audit only) and Git-derived `files_changed` (**authoritative**); `files_changed_declared` is an untrusted advisory cross-check only. Append synthesized advisory evidence derived read-only from `git -C "$CODE_DIR" diff --name-status $START_SHA` (tagged `source: codex-sidecar`) to `.gsd/forge/evidence-{T##}.jsonl` — a documented gap, advisory, never blocks. Emit the `dispatch` event (`engine=codex`) and **rejoin Step 5 (Process result)** exactly as if a Claude `forge-executor` returned — downstream verification (must_haves, verifier, file-audit, review dialético) runs **byte-identical** on codex-authored code. First re-read the durable state (the poll loop crossed multiple Bash invocations — shell vars are gone). Reconstruct the canonical `xllm-state-${S##}-${T##}-attempt-${N}.json`; if absent, fall back to `xllm-state-${T##}-attempt-${N}.json` for runs started before this upgrade. State writing is canonical-only via `--state-init`:
+6. **Success — orchestrator assembles the artifacts (`done` state).** Codex NEVER writes `.gsd/**` and NEVER commits (locked — `git log` unchanged, no `.gsd/**` path in `git -C "$CODE_DIR" diff --name-status $START_SHA`). Read the JSON and re-read durable state through the helper in `--mode read`; its milestone-qualified canonical path and ordered legacy compatibility are authoritative. State writing is canonical-only via `--state-init`.
 ```bash
-XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-${T##}-attempt-${N}.json"
-[ -f "$XLLM_STATE" ] || XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${T##}-attempt-${N}.json"
+XLLM_STATE=$(node "$FORGE_SCRIPTS_DIR/forge-xllm-state.js" --mode read --dir "$WORKING_DIR/.gsd/forge" --milestone "{M###}" --slice "{S##}" --task "{T##}" --attempt "$N")
 START_SHA=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).start_sha" 2>/dev/null)
 CODE_DIR=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).code_dir" 2>/dev/null)
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null)
@@ -961,8 +961,7 @@ echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\"
 # fallback, never an unbounded retry). codex-timeout / codex-orphan are ALWAYS terminal (a hung/orphaned
 # process is never retried in place) regardless of a stale error_class.
 FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
-XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-${T##}-attempt-${N}.json"
-[ -f "$XLLM_STATE" ] || XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${T##}-attempt-${N}.json"
+XLLM_STATE=$(node "$FORGE_SCRIPTS_DIR/forge-xllm-state.js" --mode read --dir "$WORKING_DIR/.gsd/forge" --milestone "{M###}" --slice "{S##}" --task "{T##}" --attempt "$N")
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null || echo "$RESULT_FILE")
 ERROR_CLASS=$(node -pe "JSON.parse(require('fs').readFileSync('$RESULT_FILE','utf8')).error_class || 'terminal'" 2>/dev/null || echo terminal)
 case "$REASON" in codex-timeout|codex-orphan) ERROR_CLASS="terminal";; esac
@@ -1094,7 +1093,7 @@ fi
 ```bash
 if [ "$REASON" != "sidecar-cap-exceeded" ] && [ -z "$CODE_DIR_REASON" ]; then
   N="$SIDECAR_ATTEMPT"
-  XLLM_STATE="$WORKING_DIR/.gsd/forge/xllm-state-${S##}-attempt-${N}.json"
+  XLLM_STATE=$(node "$FORGE_SCRIPTS_DIR/forge-xllm-state.js" --mode write --dir "$WORKING_DIR/.gsd/forge" --milestone "{M###}" --slice "{S##}" --attempt "$N")
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   RESULT_FILE=$(mktemp -t forge-xllm-result.XXXXXX.json)   # tmpdir, never under $CODE_DIR
   printf '{"attempt":%s,"reason":"","result_file":"%s","code_dir":"%s","ctx_file":"%s"}\n' \

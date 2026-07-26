@@ -33,6 +33,10 @@ const TIER_DEFAULTS = {
   'discuss-milestone': 'standard',
   'discuss-slice': 'standard',
   'execute-task': 'standard',
+  // review-fix is a surgical, already-scoped edit. review-challenger and
+  // review-advocate deliberately stay out: review.*_model owns them (two
+  // sources would recreate audit B). plan-check remains deferred until wired.
+  'review-fix': 'standard',
   'plan-milestone': 'max',
   'plan-slice': 'heavy',
 };
@@ -45,6 +49,7 @@ const EFFORT_DEFAULTS = {
   'research-milestone': 'medium',
   'research-slice': 'medium',
   'execute-task': 'low',
+  'review-fix': 'medium',
   'complete-slice': 'low',
   'complete-milestone': 'low',
   'memory-extract': 'low',
@@ -342,7 +347,7 @@ function degradedContract(args) {
   };
 }
 
-module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, thinkingHeaderFor, TIER_DEFAULTS };
+module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, thinkingHeaderFor, TIER_DEFAULTS, EFFORT_DEFAULTS };
 
 if (require.main === module) {
   // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a

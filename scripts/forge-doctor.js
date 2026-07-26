@@ -24,6 +24,7 @@ const { execFileSync } = require('child_process');
 
 // ── Imports from forge-ignore ─────────────────────────────────────────────────
 const { PROJECTION_IGNORE_PATHS, detectVcs } = require('./forge-ignore');
+const { audit: auditReview } = require('./forge-review-audit');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const CURRENT_SCHEMA = 'fragment-store@1.0.0';
@@ -162,7 +163,7 @@ function parseArgs(argv) {
 
 function runCheck(name, cwd) {
   const checks = name === 'all'
-    ? ['schema', 'projection-versioned']
+    ? ['schema', 'projection-versioned', 'review-model-drift']
     : [name];
 
   let allOk = true;
@@ -177,6 +178,9 @@ function runCheck(name, cwd) {
       const r = checkProjectionVersioned(cwd);
       results.push({ check: 'projection-versioned', ...r });
       if (!r.ok) allOk = false;
+    } else if (c === 'review-model-drift') {
+      const report = auditReview(path.join(cwd, '.gsd', 'forge', 'events.jsonl'), cwd);
+      results.push({ check: c, ok: true, report, message: `${report.drifts.length} advisory review model drift(s) (compares history against TODAY's advocate_model preference — a past preference change can surface old, then-compliant events as drift).` });
     } else {
       process.stderr.write(`forge-doctor: unknown check "${c}". Valid: schema, projection-versioned, all\n`);
       process.exit(2);
@@ -190,7 +194,7 @@ function formatResults(results) {
   const lines = [];
   for (const r of results) {
     const icon = r.ok ? '✓' : '✗';
-    const label = r.check === 'schema' ? 'Layer 2 — Schema version' : 'Layer 3 — Projection versioned';
+    const label = r.check === 'schema' ? 'Layer 2 — Schema version' : r.check === 'review-model-drift' ? 'Advisory — Review model drift' : 'Layer 3 — Projection versioned';
     lines.push(`  ${icon} ${label}`);
     lines.push(`    ${r.message}`);
     if (!r.ok && r.tracked && r.tracked.length > 0) {

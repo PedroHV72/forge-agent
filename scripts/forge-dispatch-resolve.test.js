@@ -8,7 +8,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { resolveDispatch, degradedContract } = require('./forge-dispatch-resolve.js');
+const { resolveDispatch, degradedContract, TIER_DEFAULTS } = require('./forge-dispatch-resolve.js');
+if (TIER_DEFAULTS['review-fix'] !== 'standard' || 'review-advocate' in TIER_DEFAULTS || 'review-challenger' in TIER_DEFAULTS) throw new Error('review-fix routing defaults invalid');
+if (resolveDispatch({ unitType: 'review-fix', cwd: process.cwd() }).effort !== 'medium') throw new Error('review-fix effort invalid');
 const { readTierChain } = require('./forge-tier-chain.js');
 
 const SCRIPT = path.join(__dirname, 'forge-dispatch-resolve.js');

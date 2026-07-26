@@ -20,6 +20,7 @@ unless overridden (see [Override Precedence](#override-precedence)).
 | `discuss-milestone` | standard | Ambiguity scoring and AskUserQuestion loops; standard reasoning sufficient |
 | `discuss-slice` | standard | Scoped discussion within a slice |
 | `execute-task` | standard | Code implementation; default standard, can be overridden via frontmatter |
+| `review-fix` | standard | Surgical edit of conceded review objections on an unmerged slice branch, under an explicit "only the conceded items" constraint — more delicate than routine execute-task, doesn't need heavy reasoning |
 | `plan-milestone` | max | Full decomposition into slices and tasks; 1 unit per milestone — frontier reasoning justifies the 2x premium |
 | `plan-slice` | heavy | Task-level decomposition with dependency analysis and acceptance criteria. Escalates to `max` when the slice is tagged `risk:high` in ROADMAP (see [Override Precedence](#override-precedence)) |
 

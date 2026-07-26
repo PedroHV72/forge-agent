@@ -8138,24 +8138,19 @@ function smokeXllmStateSliceQualified() {
   const task = fs.readFileSync(path.join(repo, 'skills', 'forge-task', 'SKILL.md'), 'utf8');
   const spec = fs.readFileSync(path.join(repo, 'shared', 'forge-dispatch.md'), 'utf8');
 
-  const FALLBACK_LINE = '[ -f "$XLLM_STATE" ] || XLLM_STATE=';
-  const EXPECTED_FALLBACK_COUNT = { 'forge-auto': 3, 'forge-next': 2 };
+  const EXPECTED_HELPER_COUNT = { 'forge-auto': 5, 'forge-next': 4 };
   for (const [name, mirror] of [['forge-auto', auto], ['forge-next', next]]) {
-    assert(mirror.includes('xllm-state-${S##}-${T##}-attempt'),
-      `(a) ${name} Branch C uses slice-qualified task-level state filename`);
-    const fallbackCount = mirror.split(FALLBACK_LINE).length - 1;
-    assert(fallbackCount === EXPECTED_FALLBACK_COUNT[name],
-      `(b) ${name} has exact dual-format fallback reconstruction count (expected ${EXPECTED_FALLBACK_COUNT[name]}, got ${fallbackCount})`);
+    const count = mirror.split('forge-xllm-state.js').length - 1;
+    assert(count === EXPECTED_HELPER_COUNT[name], `(a) ${name} has exact helper count ${EXPECTED_HELPER_COUNT[name]}`);
+    assert(!mirror.includes('[ -f "$XLLM_STATE" ] || XLLM_STATE='), `(b) ${name} has no inline fallback`);
   }
   assert(task.includes('xllm-state-{TASK_ID}.json'),
     '(c) forge-task keeps its TASK_ID-only state filename');
-  assert(auto.includes('xllm-state-{S##}-attempt-$N.json')
-      && next.includes('xllm-state-${S##}-attempt-${N}.json'),
-    '(d) Branch D slice-level state filenames remain slice-qualified and unchanged');
-  assert(spec.includes('xllm-state-{S##}-{T##}-attempt-{N}.json')
+  assert(spec.includes('xllm-state-{M###}-{S##}-{T##}-attempt-{N}.json')
+      && spec.includes('xllm-state-{S##}-{T##}-attempt-{N}.json')
       && spec.includes('xllm-state-{T##}-attempt-{N}.json')
-      && /two-format read policy|política de leitura|leitura dupla/i.test(spec),
-    '(e) dispatch spec documents canonical task filename and legacy dual-read policy');
+      && /three-format read policy|política de leitura/i.test(spec),
+    '(e) dispatch spec documents milestone canonical path and three reads');
   assert(spec.includes('execute-task/{T##}') && /not reformatted|not be reformatted|não.*reformat/i.test(spec),
     '(f) event unitId remains execute-task/{T##} and is not reformatted');
 
@@ -8164,6 +8159,19 @@ function smokeXllmStateSliceQualified() {
   assert(/smokeXllmStateSliceQualified\(\);/.test(mainBody),
     '(g) Section 59 is registered in main()');
   pass('(final) Section 59: slice-qualified task-level state, dual-read compatibility, untouched boundaries, and main() registration verified');
+}
+
+// ── Section 72: review pairing visibility and declared review-fix routing ────
+function smokeReviewModelDiscipline() {
+  process.stdout.write('\n▸ Section 72: review model discipline\n');
+  const repo = path.dirname(SCRIPTS); const files = ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md', 'shared/forge-review.md'];
+  for (const rel of files) { const text = fs.readFileSync(path.join(repo, rel), 'utf8'); assert(!/forge-(advocate|reviewer).*model:\s*['"](sonnet|opus|fable|haiku)['"]/.test(text), `${rel}: no literal review model`); }
+  const review = fs.readFileSync(path.join(repo, 'shared/forge-review.md'), 'utf8');
+  assert(review.includes('review-config-inert') && review.includes('intra_family_debate') && review.includes('Adversarialidade reduzida'), 'review visibility fields wired');
+  const resolver = fs.readFileSync(path.join(repo, 'scripts/forge-dispatch-resolve.js'), 'utf8');
+  assert(resolver.includes("'review-fix': 'standard'"), 'review-fix tier declared');
+  assert((review + fs.readFileSync(path.join(repo, 'skills/forge-auto/SKILL.md'), 'utf8') + fs.readFileSync(path.join(repo, 'skills/forge-next/SKILL.md'), 'utf8') + fs.readFileSync(path.join(repo, 'skills/forge-task/SKILL.md'), 'utf8')).split('--unit-type review-fix').length - 1 === 4, 'four review-fix resolver sites');
+  assert(fs.existsSync(path.join(repo, 'scripts/forge-review-audit.js')), 'review audit exists');
 }
 
 // ── Section 60: forge-xllm --result-file guard (challenge/rebuttal) + Engine Fallback Discipline ──
@@ -9044,6 +9052,7 @@ async function main() {
     smokeSandboxExecBlocked();
     smokeCleanupRegistryMode();
     smokeXllmStateSliceQualified();
+    smokeReviewModelDiscipline();
     smokeXllmResultFileGuard();
     smokeRoutingDomains();
     smokeInitGitGuarantee();

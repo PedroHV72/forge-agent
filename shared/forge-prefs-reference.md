@@ -618,13 +618,13 @@ Review gate dialético antes de complete-slice (branch ainda não-mergeado): cha
 
 - **Tipo:** string \| null
 - **Default:** `null`
-- **Descrição:** Modelo repassado como --model ao CLI externo quando challenger != claude; null/unset usa o default do CLI. Codex aceita IDs (gpt-5.2-codex); gemini aceita labels com espaços ("Gemini 3.1 Pro (High)" — ver agy models). Ignorado com challenger claude.
+- **Descrição:** Modelo repassado ao CLI externo quando o challenger RESOLVIDO não é claude; se claude, fica inerte e emite review-config-inert. null/unset usa o default do CLI.
 
 ### `review.advocate_model`
 
 - **Tipo:** string
 - **Default:** `"claude-fable-5"`
-- **Descrição:** Modelo do defender (forge-advocate), resolvido para alias de dispatch via scripts/forge-model-alias.js. ID sem alias conhecido omite model: (o frontmatter do agente governa) com warning. Default literal — nunca null.
+- **Descrição:** Modelo do defender (forge-advocate), resolvido para alias via scripts/forge-model-alias.js e auditado por scripts/forge-review-audit.js. ID sem alias omite model:. Default literal — nunca null.
 
 ## plan_gate
 

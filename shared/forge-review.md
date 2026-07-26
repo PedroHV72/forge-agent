@@ -174,6 +174,12 @@ fi
 CHALLENGER="$RESOLVED_CHALLENGER"
 ADVOCATE_RESOLVED="$RESOLVED_ADVOCATE"
 
+# A configured external model is inert whenever the resolved challenger is claude.
+if [ -n "$CHALLENGER_MODEL" ] && [ "$RESOLVED_CHALLENGER" = claude ]; then
+  echo "⚠ review-config-inert: challenger_model ignored for resolved claude"
+  printf '{"ts":"%s","event":"review-config-inert","milestone":"%s","slice":"%s","reason":"challenger-resolved-claude"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{M###}" "{S##}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+fi
+
 # Linha **Pairing:** do header (Step 6) — montada uma vez aqui, consumida boundary-agnóstica.
 CHALLENGER_FAMILY=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --family "$RESOLVED_CHALLENGER")
 [ -z "$CHALLENGER_FAMILY" ] && CHALLENGER_FAMILY="$RESOLVED_CHALLENGER"
@@ -182,6 +188,9 @@ if [ "$PAIR_POLICY" = majority ] || [ "$PAIR_POLICY" = tie-last ] || [ "$PAIR_PO
   PAIR_SUFFIX=" (${PAIR_POLICY}: ${PAIR_COUNTS_CLAUDE} claude / ${PAIR_COUNTS_CODEX} codex → autor ${AUTHOR_ENGINE})"
 fi
 PAIRING_LINE="**Pairing:** ${PAIR_MODE} — autor ${AUTHOR_ENGINE} → challenger ${CHALLENGER_FAMILY}${PAIR_SUFFIX}"
+ADVOCATE_FAMILY=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --family "$RESOLVED_ADVOCATE")
+INTRA_FAMILY=false
+if [ "$ADVOCATE_FAMILY" = "$CHALLENGER_FAMILY" ] && [ "$ADVOCATE_FAMILY" != "$AUTHOR_ENGINE" ]; then INTRA_FAMILY=true; fi
 ```
 
 A partir daqui, **todo o gate consome os resolvidos**: Steps 2/4 e a regra workflow abaixo usam `$RESOLVED_CHALLENGER`; Steps 3/6 usam `$RESOLVED_ADVOCATE`. `AUTHOR_ENGINE`/`PAIR_MODE`/`PAIR_POLICY`/`PAIR_REASON` alimentam a linha `**Pairing:**` do header (Step 6), já pré-montada em `$PAIRING_LINE`. A resolução ocorre **uma vez por review**; `style: flags` (abaixo) usa o pairing já resolvido (decisão #31 preservada).
@@ -436,7 +445,7 @@ XLLM_EXIT=$?
 
 ## Step 3 — Defense (forge-advocate)
 
-`ADVOCATE_ALIAS` was resolved in Step 0 from `advocate_model` (default `claude-fable-5`) via `scripts/forge-model-alias.js`. Pass `model:` to the dispatch **only when the alias is non-empty** (same override-at-dispatch pattern as the S02 challenger model, mirrored for the defender):
+`ADVOCATE_ALIAS` was resolved in Step 0 from `advocate_model` (default `claude-fable-5`) via `scripts/forge-model-alias.js`. **The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literal sonnet/fable/opus/haiku is a violation detected post-hoc by `forge-review-audit.js`.** Pass `model:` only when the alias is non-empty:
 
 ```
 if [ -n "$ADVOCATE_ALIAS" ]; then
@@ -713,6 +722,7 @@ The artifact is the **dialogue**, not a flag dump. Auditable, durable with the m
 **Challenger:** {claude|codex|gemini} (<model|default>)
 **Defender:** {advocate_model|alias}
 {$PAIRING_LINE}
+{$INTRA_FAMILY == true ? '**⚠ Adversarialidade reduzida:** refutação e juízo de tradeoff são da mesma família; fase 2 deve prover defesa cross-family.' : ''}
 
 ## Abertas — requerem decisão humana
 > O reviewer e o autor não chegaram a acordo. Você decide.
@@ -731,6 +741,9 @@ The artifact is the **dialogue**, not a flag dump. Auditable, durable with the m
 ## Resolvidas no debate — sem ação
 - R{n} `path:line` — <one-liner: por que caiu>
 
+## Adversarialidade reduzida
+- Quando `INTRA_FAMILY`, liste aqui itens `refuted+withdrawn`; são fechamentos sob viés intra-família.
+
 ## Pattern hits (scan determinístico)
 - `path:line` — pattern `{p}` — <context>   ← optional; deterministic grep, same patterns as forge-completer step 4a
 ```
@@ -748,6 +761,8 @@ Omit any section with zero items — **exceto** o bloco de indisponibilidade do 
 A CONCEDED objection is a problem **both agents agree is real** — the confrontation already settled it. Recording it for a human to maybe-read later defeats the purpose of the debate. Fix it now, while the boundary diff is still intact (slice branch unmerged / task uncommitted scope).
 
 Skip if `fixConceded == false` (pref opt-out → conceded items fall through to Step 7b posture as before) or there are zero CONCEDED items.
+
+Before dispatching `review-fix`, compute `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; pass `model: '{RF_ALIAS}'` only when it is non-empty.
 
 ```
 Agent({ subagent_type: 'forge-executor',
@@ -779,10 +794,10 @@ The gate **never** returns a blocker regardless of posture.
 Append one line per agent dispatch to `{WORKING_DIR}/.gsd/forge/events.jsonl` (I/O errors propagate — no silent-fail):
 
 ```json
-{"ts":"<ISO-8601>","event":"review","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","style":"dialectic","rounds":N,"counts":{"resolved":N,"conceded":N,"open":N},"conceded_fixed":N,"engine":"agents","challenger":"claude","advocate":$([ -n "$ADVOCATE_ALIAS" ] && printf '"%s"' "$ADVOCATE_ALIAS" || printf 'null')}
+{"ts":"<ISO-8601>","event":"review","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","style":"dialectic","rounds":N,"counts":{"resolved":N,"conceded":N,"open":N},"conceded_fixed":N,"engine":"agents","challenger":"claude","advocate":$([ -n "$ADVOCATE_ALIAS" ] && printf '"%s"' "$ADVOCATE_ALIAS" || printf 'null'),"intra_family_debate":$INTRA_FAMILY,"intra_family_withdrawn":N}
 ```
 
-`conceded_fixed`, `engine`, `challenger` and `advocate` are additive fields (readers that ignore unknown fields stay compatible — same convention as `tier`/`reason` from M002). `engine` is either `"agents"` or `"workflow"` and is emitted by **both** engine paths. `conceded_fixed`: number of conceded items whose Step 7a fix landed. `challenger` is `"claude"`, `"codex"` or `"gemini"` — the challenger that actually ran the challenge (so an external→agent fallback records `"claude"`). `advocate` is the resolved `ADVOCATE_ALIAS` (e.g. `"fable"`) or JSON `null` when the id had no known alias (frontmatter governed instead) — same optional-field glue pattern as the rest of this event.
+`conceded_fixed`, `engine`, `challenger` and `advocate` are additive fields (readers that ignore unknown fields stay compatible — same convention as `tier`/`reason` from M002). `engine` is either `"agents"` or `"workflow"` and is emitted by **both** engine paths. `conceded_fixed`: number of conceded items whose Step 7a fix landed. `challenger` is `"claude"`, `"codex"` or `"gemini"` — the challenger that actually ran the challenge (so an external→agent fallback records `"claude"`). `advocate` is the resolved `ADVOCATE_ALIAS` (e.g. `"fable"`) or JSON `null` when the id had no known alias (frontmatter governed instead) — same optional-field glue pattern as the rest of this event. `intra_family_withdrawn` is the count of items listed under **§ Adversarialidade reduzida** (`refuted+withdrawn` resolutions from the Step 5 truth table, **excluding** `open+withdrawn`) — always `0` when `intra_family_debate` is `false`.
 
 **Agent unavailability (additive).** When a review `Agent()` stayed unavailable after the Retry Handler (see **§ Agent unavailability (review-agent-unavailable)**), append one extra line — it does **not** replace the `review` line above; both are emitted, and the Step 6 header is stamped honestly with what actually ran:
 

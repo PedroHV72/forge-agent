@@ -324,3 +324,4 @@ Footer:
 - dry-run: same as fix counts + `Nenhum arquivo alterado. Execute /forge-doctor --fix para aplicar.`
 
 Skipped items → list with suggested command.
+`review-model-drift` is included in `/forge-doctor --check all` as an advisory audit of recorded review advocates against resolved prefs.
