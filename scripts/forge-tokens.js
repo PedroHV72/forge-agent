@@ -164,6 +164,42 @@ function readJsonlLines(absPath) {
 }
 
 /**
+ * Classify the provenance of a token count without treating an arbitrary
+ * string as provider billing data.  Existing Forge events use the local
+ * chars/4 heuristic; future adapters or an OTel bridge can opt into the
+ * reported bucket with an explicit provider-*, otel-* or exact-* method.
+ *
+ * @param {*} value
+ * @returns {'estimated'|'reported'|'unknown'}
+ */
+function tokenMethodKind(value) {
+  if (typeof value !== 'string' || !value.trim()) return 'unknown';
+  const method = value.trim().toLowerCase();
+  if (method.startsWith('heuristic-')) return 'estimated';
+  if (method.startsWith('provider-') || method.startsWith('otel-') || method.startsWith('exact-')) return 'reported';
+  return 'unknown';
+}
+
+function emptyTokenSources() {
+  return {
+    estimated: { count: 0, input: 0, output: 0 },
+    reported: { count: 0, input: 0, output: 0 },
+    unknown: { count: 0, input: 0, output: 0 },
+  };
+}
+
+function tokenDataQuality(sources) {
+  const estimated = sources.estimated.count > 0;
+  const reported = sources.reported.count > 0;
+  const unknown = sources.unknown.count > 0;
+  if (!estimated && !reported && !unknown) return 'none';
+  if (reported && !estimated && !unknown) return 'reported';
+  if (estimated && !reported && !unknown) return 'estimated';
+  if (unknown && !estimated && !reported) return 'unknown';
+  return 'mixed';
+}
+
+/**
  * Aggregate dispatch token telemetry for a milestone.
  *
  * Modern dispatch events carry their own `milestone` discriminator, which is
@@ -183,6 +219,8 @@ function readJsonlLines(absPath) {
  *   total_output: number,
  *   dispatch_count: number,
  *   by_phase: Object<string,{count:number,input:number,output:number}>,
+ *   token_sources: Object<'estimated'|'reported'|'unknown',{count:number,input:number,output:number}>,
+ *   token_data_quality: 'none'|'estimated'|'reported'|'unknown'|'mixed',
  *   has_telemetry: boolean,
  *   has_token_data: boolean,
  *   source: 'global-milestone'|'per-milestone'|'global'|'unattributable'|'none'
@@ -198,6 +236,8 @@ function aggregate(cwd, opts) {
     total_output: 0,
     dispatch_count: 0,
     by_phase: {},
+    token_sources: emptyTokenSources(),
+    token_data_quality: 'none',
     has_telemetry: false,
     has_token_data: false,
     source: source,
@@ -287,12 +327,18 @@ function aggregate(cwd, opts) {
     let totalInput = 0;
     let totalOutput = 0;
     const byPhaseMap = {};
+    const tokenSources = emptyTokenSources();
 
     for (const line of selected) {
       const inputTokens = typeof line.input_tokens === 'number' && !isNaN(line.input_tokens) ? line.input_tokens : 0;
       const outputTokens = typeof line.output_tokens === 'number' && !isNaN(line.output_tokens) ? line.output_tokens : 0;
       totalInput += inputTokens;
       totalOutput += outputTokens;
+
+      const source = tokenSources[tokenMethodKind(line.token_method)];
+      source.count += 1;
+      source.input += inputTokens;
+      source.output += outputTokens;
 
       const phase = String(line.unit).split('/')[0];
       if (!byPhaseMap[phase]) {
@@ -322,6 +368,8 @@ function aggregate(cwd, opts) {
       total_output: totalOutput,
       dispatch_count: selected.length,
       by_phase: byPhase,
+      token_sources: tokenSources,
+      token_data_quality: tokenDataQuality(tokenSources),
       has_telemetry: selected.length > 0,
       has_token_data: (totalInput + totalOutput) > 0,
       source: source,
