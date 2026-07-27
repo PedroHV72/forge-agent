@@ -741,7 +741,7 @@ This snippet is self-contained and drop-in compatible with both `skills/forge-au
 
 #### When to apply
 
-Compute `input_tokens` after all placeholder substitution in the complete prompt artifact, before the model is called. Compute `output_tokens` from the returned text with the same heuristic unless an exact provider usage channel is explicitly available. Emit a unique `dispatch_id` on EVERY model call — success, failure, and every retry. A `retry` event records the control-flow decision and references the next call; it never replaces that call's own `dispatch` event.
+Compute `input_tokens` after all placeholder substitution in the complete prompt artifact, before the model is called. Compute `output_tokens` from the returned text with the same heuristic unless an exact provider usage channel is explicitly available. Set `token_method` honestly: `heuristic-*` for local estimates and `provider-*`, `otel-*` or `exact-*` only for an explicitly reported usage channel. `forge-tokens.aggregate()` keeps those sources separate, so an estimated field is never displayed as provider billing usage. Emit a unique `dispatch_id` on EVERY model call — success, failure, and every retry. A `retry` event records the control-flow decision and references the next call; it never replaces that call's own `dispatch` event.
 
 There are two identities on the Claude artifact path:
 

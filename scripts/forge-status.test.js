@@ -842,6 +842,36 @@ test('aggregate() all-zero-tokens case: has_telemetry true, has_token_data false
   assert(agg.dispatch_count > 0, 'dispatch_count > 0');
 });
 
+test('aggregate() separates estimated, reported and undeclared token methods', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-provenance-'));
+  tmpDirs.push(dir);
+  const milestoneId = 'M-20260101120000-alpha';
+  const base = {
+    ts: '2026-07-02T19:00:00Z',
+    event: 'dispatch',
+    milestone: milestoneId,
+    unit: 'execute-task/T01',
+  };
+  writeEventsFixture(dir, milestoneId, {
+    globalLines: [
+      { ...base, dispatch_id: 'estimate', token_method: 'heuristic-chars-4', input_tokens: 10, output_tokens: 5 },
+      { ...base, dispatch_id: 'reported', token_method: 'otel-native-usage', input_tokens: 20, output_tokens: 8 },
+      { ...base, dispatch_id: 'legacy', input_tokens: 30, output_tokens: 13 },
+    ],
+  });
+  const agg = tokens.aggregate(dir, { milestoneId });
+  assertEq(agg.token_data_quality, 'mixed', 'mixed provenance');
+  assertEq(agg.token_sources.estimated.count, 1, 'estimated count');
+  assertEq(agg.token_sources.reported.input, 20, 'reported input');
+  assertEq(agg.token_sources.unknown.output, 13, 'unknown output');
+
+  const rendered = status.renderTokensBlock(agg, { color: false });
+  assert(rendered.includes('Medição:      mista'), 'status labels mixed provenance');
+  assert(rendered.includes('estimada (chars/4): 1'), 'status labels estimate');
+  assert(rendered.includes('reportada (provedor/OTel): 1'), 'status labels report');
+  assert(rendered.includes('método não declarado: 1'), 'status labels legacy');
+});
+
 test('aggregate() does NOT sum global log when per-milestone file is missing (R2 regression)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-status-tok-fallback-'));
   tmpDirs.push(dir);

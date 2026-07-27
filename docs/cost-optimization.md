@@ -120,6 +120,14 @@ Para contar respostas extensas, `--scalar` lê `stdin` e retorna apenas o inteir
 
 A telemetria local responde “quanto contexto o Forge estima que montou e recebeu?”. Para custo real e cache, use também os sinais do Claude Code ou OpenTelemetry descritos abaixo.
 
+O agregador preserva a proveniência da medição em vez de somar tudo sob o rótulo de
+"custo". Eventos com `token_method: heuristic-*` entram como **estimados**;
+`provider-*`, `otel-*` ou `exact-*` entram como **reportados**; eventos legados
+sem método ficam como **não declarados**. O bloco de tokens do status expõe essa
+separação e marca uma execução como `mista` quando há mais de uma fonte. Assim,
+uma futura ponte OpenTelemetry pode coexistir com as estimativas atuais sem que
+uma seja apresentada como se fosse a outra.
+
 ### Reparação do contrato com `SubagentStop`
 
 O hook `SubagentStop` valida workers Forge que devem retornar `---GSD-WORKER-RESULT---`. Quando o marcador falta, o hook devolve `decision: block` com feedback, fazendo o mesmo subagente corrigir sua saída antes que o orquestrador a aceite. Isso reduz retries completos e evita interpretar uma narrativa como resultado estruturado.
@@ -234,6 +242,7 @@ Use `context: fork` primeiro em skills autocontidas, read-only ou de uma única 
 | Comandos `/usage` e `/context` no runbook | Melhora operação e diagnóstico humano | Médio | Baixo | Disponível nativamente |
 | Limites headless | Cria circuit breakers de turnos, tools e orçamento | Alto | Médio | Aplicar por adapter/cenário |
 | Correlação OpenTelemetry | Aproxima estimativas locais do consumo real | Alto | Médio/Alto | Próxima etapa operacional |
+| Proveniência da medição no status | Impede confundir estimativa com uso reportado | Médio | Baixo | Implementado |
 
 “Impacto esperado” é qualitativo. O ranking indica onde medir primeiro; não representa economia observada.
 

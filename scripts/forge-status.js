@@ -574,6 +574,25 @@ function fmtInt(n) {
   return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
 }
 
+function formatTokenMeasurement(agg) {
+  const sources = agg && agg.token_sources;
+  if (!sources || typeof sources !== 'object') return 'não declarada (eventos legados)';
+
+  const labels = {
+    estimated: 'estimada (chars/4)',
+    reported: 'reportada (provedor/OTel)',
+    unknown: 'método não declarado',
+  };
+  const parts = [];
+  for (const kind of ['estimated', 'reported', 'unknown']) {
+    const count = sources[kind] && Number.isFinite(sources[kind].count) ? sources[kind].count : 0;
+    if (count > 0) parts.push(`${labels[kind]}: ${count}`);
+  }
+  if (parts.length === 0) return 'sem dados de tokens';
+  if (parts.length === 1) return parts[0];
+  return `mista — ${parts.join(' · ')}`;
+}
+
 function renderTokensBlock(agg, opts) {
   const paint = makePaint(Boolean(opts && opts.color));
   if (!agg) {
@@ -595,6 +614,7 @@ function renderTokensBlock(agg, opts) {
   lines.push(paint.header(`### Token usage (${agg.milestone || '—'})`));
   lines.push(`- Total input:  ${fmtInt(agg.total_input)} tokens`);
   lines.push(`- Total output: ${fmtInt(agg.total_output)} tokens`);
+  lines.push(`- Medição:      ${formatTokenMeasurement(agg)}`);
 
   const phases = Object.keys(agg.by_phase || {});
   const phaseSummary = phases
@@ -880,5 +900,6 @@ module.exports = {
   collect,
   renderTree,
   renderTokensBlock,
+  formatTokenMeasurement,
   runWatch,
 };
