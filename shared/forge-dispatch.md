@@ -189,6 +189,7 @@ WORKING_DIR: {WORKING_DIR}
 effort: {unit_effort}
 thinking: {THINKING_OPUS}
 ROUTING_DOMAINS: {routing_domains}
+WORKSPACE_REPOS: {workspace_repos}
 
 ## Risk Assessment
 
@@ -1027,6 +1028,8 @@ CD_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-code-dir.js" --resolve \
 ```
 
 Verdicts: `ok` → `CODE_DIR` is the resolved worktree (**both engines** get it — strictly better than the blind pick, byte-identical in a single-repo workspace, which short-circuits without reading the plan). `cross-repo` → `REASON="sidecar-multirepo-unsupported"`. `undeclared` → `REASON="sidecar-code-dir-undeclared"`. On either refusal, **skip steps 1–4 entirely** (no `START_SHA` capture, no state or result-file allocation, no sidecar launch) and go straight to Fallback — identical control flow to `sidecar-cap-exceeded`, and refused **before** any `--cwd` reaches `forge-surgical-reset.js`. One visible warning line names the ambiguity and the repos touched.
+
+For multiple usable repos, precedence is fixed: P0 one usable repo short-circuits without reading the plan; P1 paths attributed to two or more repos refuses `cross-repo`; P2 a declared `repo:` that is unknown or ambiguous refuses; P3 a declaration conflicting with one attributed repo refuses; P4 a valid consistent declaration resolves; P5 one attributed repo resolves; P6 only a plan without `repo:` reaches the filesystem probe. The probe scores measured path depth; a shared one-component signal is discarded, while a unique signal is retained.
 
 **Where the Claude fallback stands on a refusal.** The refusal is a statement about the SIDECAR — it needs one git repo and the unit does not have exactly one. The Claude executor carries no such constraint: it reads, writes and commits across repos. So on refusal in a workspace with **2+ usable worktrees**, `CODE_DIR` becomes `multi_repo_root` — the one directory every worktree sits under (`.forge-worktrees/{RUN_ID}/`), emitted by the resolver from the literal worktree values. Standing there, the executor can reach every repo the unit touches. The previous behavior — inheriting the bootstrap `WORKTREE_DIR`, i.e. the blind `repos.find(...)` first pick — dropped the executor inside whichever repo sorted first, so a genuinely multi-repo unit either wrote to the wrong tree or forced the operator to override `CODE_DIR` by hand on every dispatch.
 

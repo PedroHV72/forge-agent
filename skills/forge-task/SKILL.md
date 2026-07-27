@@ -378,6 +378,8 @@ Derive the valid domain list for the header below (reuses `$FORGE_SCRIPTS_DIR`/`
 ```bash
 routing_domains=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" --list-domains --cwd "$WORKING_DIR" \
   | node -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(a.length?a.join(", "):"(none — omit domain:)")')
+workspace_repos=$(node "$FORGE_SCRIPTS_DIR/forge-repos.js" --list --cwd "$WORKING_DIR" \
+  | node -e 'const l=require("fs").readFileSync(0,"utf8").split("\n").map(s=>s.trim()).filter(Boolean).map(p=>p.split(/[\\/]/).pop());process.stdout.write(l.length>1?l.join(", "):"(single repo — omit repo:)")')
 ```
 
 Dispatch `forge-planner` (opus) with this prompt:
@@ -387,6 +389,7 @@ WORKING_DIR: {WORKING_DIR}
 effort: {EFFORT_OPUS}
 thinking: adaptive
 ROUTING_DOMAINS: {routing_domains}
+WORKSPACE_REPOS: {workspace_repos}
 
 ## Task Brief
 {content of {TASK_ID}-BRIEF.md}
@@ -417,7 +420,8 @@ this task will create or modify — literals or globs, `writes: []` for a docs-o
 emit it unconditionally, it is what lets a multi-repo workspace attribute this task to ONE
 repo), and — only when this task's work maps to a
 domain that is an existing key in the resolved `routing:` block of prefs — `domain:`.
-Omit `domain:` entirely when no such key applies (resolves to `default`, never an error);
+When the injected repo list has multiple names, add `repo:` using only one listed name; omit it
+when the list is single or absent. Omit `domain:` entirely when no such key applies (resolves to `default`, never an error);
 judge domain from the nature of the work, not filenames/keywords. See
 `agents/forge-planner.md § Effort & Tier Hints` / `§ Must-Haves Schema` for the canonical
 contract. After the frontmatter, include exactly these sections:

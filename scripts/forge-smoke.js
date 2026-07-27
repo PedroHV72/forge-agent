@@ -8531,6 +8531,48 @@ function smokeCodeDirMultiRepo() {
     assert(n.status === 5 && n.json.status === 'undeclared',
       `(n) tied repo-relative directory fails closed as undeclared (got ${n.status}/${n.json.status})`);
 
+    // (o) A greenfield declaration selects a repo even when its target does not exist yet.
+    const planDeclared = writePlan('plan-declared.md', [
+      '---', 'id: T07', 'repo: freyr', 'writes:', '  - "src/v2/**"', '---', '', '# plan', '',
+    ].join('\n'));
+    const o = resolve(isoMulti, planDeclared);
+    assert(o.status === 0 && o.json.status === 'ok' && o.json.code_dir === wt('freyr') && o.json.resolution === 'declared',
+      `(o) greenfield repo: declaration resolves freyr (got ${o.status}/${o.json.status}/${o.json.code_dir}/${o.json.resolution})`);
+
+    const planUnknownDeclared = writePlan('plan-unknown-declared.md', [
+      '---', 'id: T08', 'repo: nosuchrepo', 'writes:', '  - "src/v2/**"', '---', '', '# plan', '',
+    ].join('\n'));
+    const p = resolve(isoMulti, planUnknownDeclared);
+    assert(p.status === 5 && p.json.status === 'undeclared' && p.json.declared_repo_status === 'unknown' && p.json.code_dir === '',
+      `(p) unknown repo: declaration refuses loudly (got ${p.status}/${p.json.status}/${p.json.declared_repo_status})`);
+
+    const planConflictingDeclared = writePlan('plan-conflicting-declared.md', [
+      '---', 'id: T09', 'repo: freyr', 'writes:', '  - "asgard/src/b.ts"', '---', '', '# plan', '',
+    ].join('\n'));
+    const q = resolve(isoMulti, planConflictingDeclared);
+    assert(q.status === 5 && q.json.declared_repo_status === 'conflict' && q.json.code_dir === '',
+      `(q) conflicting repo: declaration refuses loudly (got ${q.status}/${q.json.declared_repo_status})`);
+
+    fs.mkdirSync(path.join(asgardDir, 'app', 'api', 'delivery'), { recursive: true });
+    const planWeighted = writePlan('plan-weighted.md', [
+      '---', 'id: T10', 'writes:', '  - "app/api/delivery/route.ts"', '  - "src/index.js"', '---', '', '# plan', '',
+    ].join('\n'));
+    const r = resolve(isoMulti, planWeighted);
+    // Flat counting gave 1×1 here; measured depth makes asgard the strict winner.
+    assert(r.status === 0 && r.json.repo === asgardDir && r.json.resolution === 'fs-probe' && r.json.probe === 'winner',
+      `(r) weighted probe resolves heterogeneous evidence to asgard (got ${r.status}/${r.json.repo}/${r.json.probe})`);
+
+    fs.mkdirSync(path.join(freyrDir, 'app', 'api', 'delivery'), { recursive: true });
+    const s = resolve(isoMulti, planWeighted);
+    assert(s.status === 5 && s.json.status === 'undeclared' && s.json.probe === 'tie',
+      `(s) equally deep evidence remains a fail-closed tie (got ${s.status}/${s.json.probe})`);
+
+    const t = resolve(isoMulti, planRepoRelative);
+    assert(t.status === 5 && t.json.status === 'undeclared' && t.json.probe === 'weak',
+      `(t) shared generic parent is weak rather than a fabricated tie (got ${t.status}/${t.json.probe})`);
+    const { FS_PROBE_FLOOR } = require(path.join(SCRIPTS, 'forge-code-dir.js'));
+    assert(FS_PROBE_FLOOR === 2, `(u) FS_PROBE_FLOOR remains 2 (got ${FS_PROBE_FLOOR})`);
+
     // (e) D4: `.gsd/**` never makes a plan cross-repo.
     const e = resolve(isoMulti, planGsdMixed);
     assert(e.status === 0 && e.json.status === 'ok' && e.json.code_dir === wt('asgard'),
@@ -8599,6 +8641,41 @@ function smokeCodeDirMultiRepo() {
     assert(usage.status === 2 && /forge-code-dir error:/.test(usage.stderr),
       `(l) no-args invocation exits 2 with a forge-code-dir error line (got ${usage.status})`);
 
+    // (v) R1 fix: a trailing inline comment on `repo:` must not defeat the declared-repo
+    // arms — the docstring on parseScalarField promises comment-stripping.
+    const planCommentedDeclared = writePlan('plan-commented-declared.md', [
+      '---', 'id: T11', 'repo: freyr   # optional — see WORKSPACE_REPOS', 'writes:',
+      '  - "src/v2/**"', '---', '', '# plan', '',
+    ].join('\n'));
+    const v = resolve(isoMulti, planCommentedDeclared);
+    assert(v.status === 0 && v.json.status === 'ok' && v.json.code_dir === wt('freyr') && v.json.resolution === 'declared',
+      `(v) trailing-comment repo: declaration still resolves freyr (got ${v.status}/${v.json.status}/${v.json.code_dir}/${v.json.resolution})`);
+
+    // (w) R3 fix: byBasename is case-insensitive, byAbsolute/byRelative untouched. A
+    // case-variant declaration must still resolve — never fall closed to unknown.
+    const planCaseDrift = writePlan('plan-case-drift.md', [
+      '---', 'id: T12', 'repo: FREYR', 'writes:', '  - "src/v2/**"', '---', '', '# plan', '',
+    ].join('\n'));
+    const w = resolve(isoMulti, planCaseDrift);
+    assert(w.status === 0 && w.json.status === 'ok' && w.json.code_dir === wt('freyr') && w.json.resolution === 'declared',
+      `(w) case-drifted repo: declaration (FREYR vs freyr) resolves freyr (got ${w.status}/${w.json.status}/${w.json.code_dir})`);
+
+    // (x) safety preserved: two case-variant repos (e.g. `Freyr` and `freyr`) both matching
+    // byBasename case-insensitively must still refuse as ambiguous — never a wrong-repo write.
+    const freyrCapDir = path.join(root, 'Freyr');
+    fs.mkdirSync(freyrCapDir, { recursive: true });
+    mkGitRepo(freyrCapDir);
+    const isoCaseAmbiguous = JSON.stringify({
+      mode: 'worktree',
+      repos: [
+        { path: freyrDir, branch: 'forge/TASK-160', worktree: wt('freyr'), status: 'created' },
+        { path: freyrCapDir, branch: 'forge/TASK-160', worktree: wt('Freyr'), status: 'created' },
+      ],
+    });
+    const x = resolve(isoCaseAmbiguous, planCaseDrift);
+    assert(x.status === 5 && x.json.status === 'undeclared' && x.json.declared_repo_status === 'ambiguous' && x.json.code_dir === '',
+      `(x) two case-variant repos both matching byBasename refuse as ambiguous (got ${x.status}/${x.json.status}/${x.json.declared_repo_status})`);
+
     const source = fs.readFileSync(__filename, 'utf8');
     const mainBody = source.slice(source.lastIndexOf('async function main()'));
     assert(/smokeCodeDirMultiRepo\(\);/.test(mainBody),
@@ -8607,6 +8684,54 @@ function smokeCodeDirMultiRepo() {
   } finally {
     cleanup(root);
   }
+}
+
+// ── Section 73: workspace repo injection anti-inertia guard ─────────────────
+function smokeWorkspaceRepos() {
+  process.stdout.write('\n▸ Section 73: workspace repo injection into planner prompts + contract\n');
+  const repoRoot = path.dirname(SCRIPTS);
+  const expected = {
+    'shared/forge-dispatch.md': 1,
+    'skills/forge-auto/SKILL.md': 1,
+    'skills/forge-next/SKILL.md': 1,
+    'skills/forge-task/SKILL.md': 1,
+    'agents/forge-planner.md': 2,
+  };
+  const contents = {};
+  for (const [file, count] of Object.entries(expected)) {
+    contents[file] = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+    const got = contents[file].split('WORKSPACE_REPOS').length - 1;
+    assert(got === count, `(a) ${file} has exact WORKSPACE_REPOS count (expected ${count}, got ${got})`);
+  }
+  assert(contents['shared/forge-dispatch.md'].includes('WORKSPACE_REPOS: {workspace_repos}'),
+    '(b) canonical plan-slice template uses the workspace repo placeholder');
+  for (const file of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+    assert(/forge-repos\.js" --list/.test(contents[file]),
+      `(c) ${file} derives the injected repo list via forge-repos.js --list`);
+  }
+  const planner = contents['agents/forge-planner.md'];
+  assert(/Omit `repo:` when the injected repo list says single repo or is absent/.test(planner),
+    '(d) planner documents omitting repo: for a single/absent list');
+
+  // (f) anti-inertia: a presence guard cannot catch a pipeline that silently no-ops.
+  // Extract the actual `node -e '...'` one-liner from each mirror and EXECUTE it against
+  // a synthetic 2-line multi-repo list — asserting it splits/derives, not just that it
+  // "mentions" forge-repos.js. This must fail against the pre-fix double-escaped split.
+  for (const file of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+    const body = contents[file];
+    const m = body.match(/\| node -e '(const l=require\("fs"\)[\s\S]*?)'\)/);
+    assert(m, `(f) ${file} has an extractable node -e workspace-repos pipeline`);
+    const script = m[1];
+    const r = spawnSync(process.execPath, ['-e', script], { input: '/ws/api\n/ws/web\n', encoding: 'utf8' });
+    assert(r.status === 0, `(f) ${file} workspace-repos pipeline runs cleanly (got exit ${r.status}, stderr: ${r.stderr})`);
+    assert(r.stdout === 'api, web',
+      `(f) ${file} workspace-repos pipeline on a 2-line input yields "api, web" (got ${JSON.stringify(r.stdout)}) — inert split("\\\\n") would yield "(single repo — omit repo:)"`);
+  }
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/smokeWorkspaceRepos\(\);/.test(mainBody), '(e) Section 73 is registered in main()');
+  pass('(final) Section 73: workspace repo prompt injection and planner contract verified');
 }
 
 // ── Section 66: sidecar_model resolver and mirrors ──────────────────────────
@@ -9138,6 +9263,7 @@ async function main() {
       () => { smokeRoutingDomains(); },
       () => { smokeInitGitGuarantee(); },
       () => { smokeCodeDirMultiRepo(); },
+      () => { smokeWorkspaceRepos(); },
       () => { smokeReviewAgentUnavailable(); },
       () => { smokeSharedGlob(); },
       () => { smokePhasesTable(); },

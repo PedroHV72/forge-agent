@@ -23,6 +23,9 @@
 //   parseFilesToChange(planText) → string[]
 //   attributeRepo(absPath, repos) → repo|null   (longest-prefix, boundary-aware)
 //   parseListField(fm, key) → string[]|null     (copied from forge-parallelism.js — see below)
+//   parseScalarField(fm, key) → string|null
+//   matchDeclaredRepo(value, usable, cwd) → { repo, status }
+//   scorePath(root, repoPath) → number
 //   normalizePath(p) → string
 //
 // CLI:
@@ -46,6 +49,7 @@ const { hasStructuredMustHaves, parseMustHaves } = require('./forge-must-haves.j
 
 const REASON_CROSS_REPO  = 'sidecar-multirepo-unsupported';
 const REASON_UNDECLARED  = 'sidecar-code-dir-undeclared';
+const FS_PROBE_FLOOR = 2;
 
 // ── path helpers (copied from forge-parallelism.js:74-76) ───────────────────
 function normalizePath(p) {
@@ -76,6 +80,17 @@ function parseListField(fm, key) {
   const emptyRe = new RegExp('^' + key + ':\\s*$', 'm');
   if (emptyRe.test(fm)) return [];
   return null;
+}
+
+// Parse a simple YAML scalar, accepting quotes and stripping an inline comment.
+// This deliberately is not a general YAML parser: plan frontmatter uses plain scalars.
+function parseScalarField(fm, key) {
+  const re = new RegExp('^' + key + ':\\s*(.*?)\\s*$', 'm');
+  const m = String(fm || '').match(re);
+  if (!m) return null;
+  let value = m[1].replace(/\s+#.*$/, '').trim();
+  value = value.replace(/^["']|["']$/g, '').trim();
+  return value || null;
 }
 
 // A glob is not a path: truncate at the first segment containing a wildcard so that
@@ -204,6 +219,35 @@ function attributeRepo(absPath, repos) {
   return best;
 }
 
+function pathSegments(p) {
+  return normalizePath(p).split('/').filter(Boolean).length;
+}
+
+// A path contributes the depth that can actually be observed in a source repo.
+function scorePath(root, repoPath) {
+  const normalizedRoot = normalizePath(root);
+  if (!normalizedRoot || !repoPath) return 0;
+  if (fs.existsSync(path.join(repoPath, normalizedRoot))) return pathSegments(normalizedRoot) + 1;
+  const parent = normalizePath(path.dirname(normalizedRoot));
+  if (parent && parent !== '.' && fs.existsSync(path.join(repoPath, parent))) return pathSegments(parent);
+  return 0;
+}
+
+function matchDeclaredRepo(value, usable, cwd) {
+  const declared = String(value || '').trim();
+  if (!declared) return { repo: null, status: 'unknown' };
+  const normalized = normalizePath(declared);
+  const byAbsolute = usable.filter(r => normalizePath(r.path) === normalized);
+  if (byAbsolute.length === 1) return { repo: byAbsolute[0], status: 'ok' };
+  const relative = normalizePath(path.resolve(cwd, declared));
+  const byRelative = usable.filter(r => normalizePath(r.path) === relative);
+  if (byRelative.length === 1) return { repo: byRelative[0], status: 'ok' };
+  const declaredLower = declared.toLowerCase();
+  const byBasename = usable.filter(r => path.basename(normalizePath(r.path)).toLowerCase() === declaredLower);
+  if (byBasename.length === 1) return { repo: byBasename[0], status: 'ok' };
+  return { repo: null, status: byBasename.length > 1 ? 'ambiguous' : 'unknown' };
+}
+
 // ── resolution ──────────────────────────────────────────────────────────────
 function emptyResult(extra) {
   return Object.assign({
@@ -218,6 +262,10 @@ function emptyResult(extra) {
     run: '',
     reason: '',
     multi_repo_root: '',
+    declared_repo: '',
+    declared_repo_status: '',
+    probe: '',
+    probe_scores: {},
   }, extra || {});
 }
 
@@ -285,6 +333,8 @@ function resolveCodeDir(opts) {
 
   // 5. Declared paths (D3).
   const { paths, source } = parseDeclaredPaths(planText);
+  const fm = frontmatterOf(planText);
+  const declaredRepo = parseScalarField(fm, 'repo') || '';
 
   // 6. Filter `.gsd/**` BEFORE attribution (D4).
   const considered = paths.filter(p => !isArtifactPath(p));
@@ -306,32 +356,58 @@ function resolveCodeDir(opts) {
   // repos; a worktree may not yet contain a newly declared file. Limitation C3: when
   // cwd itself is a repo, attribution already claims every relative path and this
   // deliberately does not reinterpret that first-pass result.
+  // P1: directly attributed paths spanning repos are always a genuine sidecar refusal.
+  if (touched.size >= 2) {
+    return emptyResult({ status: 'cross-repo', repos_touched: Array.from(touched.keys()), paths_considered: considered.length,
+      paths_unmatched: unmatched, source, run, reason: REASON_CROSS_REPO, multi_repo_root: commonWorktreeRoot(usable),
+      declared_repo: declaredRepo });
+  }
+
+  // P2–P4: a declaration is validated before it can select a worktree and never falls through.
+  if (declaredRepo) {
+    const match = matchDeclaredRepo(declaredRepo, usable, cwd);
+    if (match.status !== 'ok') {
+      return emptyResult({ status: 'undeclared', paths_considered: considered.length, paths_unmatched: unmatched, source, run,
+        reason: REASON_UNDECLARED, multi_repo_root: commonWorktreeRoot(usable), declared_repo: declaredRepo,
+        declared_repo_status: match.status });
+    }
+    if (touched.size === 1 && normalizePath(touched.keys().next().value) !== normalizePath(match.repo.path)) {
+      return emptyResult({ status: 'undeclared', paths_considered: considered.length, paths_unmatched: unmatched, source, run,
+        reason: REASON_UNDECLARED, multi_repo_root: commonWorktreeRoot(usable), declared_repo: declaredRepo,
+        declared_repo_status: 'conflict' });
+    }
+    return emptyResult({ status: 'ok', code_dir: match.repo.worktree, repo: match.repo.path || '',
+      repos_touched: [match.repo.path || ''], paths_considered: considered.length, paths_unmatched: unmatched, source,
+      resolution: 'declared', run, declared_repo: declaredRepo, declared_repo_status: 'ok' });
+  }
+
   let resolution = touched.size > 0 ? 'attribution' : '';
+  let probe = '';
+  const probeScores = {};
   if (touched.size === 0 && considered.length > 0) {
-    const matches = new Map();
-    for (const repo of usable) {
-      let count = 0;
-      for (const p of considered) {
-        const root = globRoot(p);
-        if (!root) continue;
-        if (fs.existsSync(path.join(repo.path, root))) {
-          count += 1;
-          continue;
-        }
-        const parent = path.dirname(root);
-        if (parent !== '.' && fs.existsSync(path.join(repo.path, parent))) count += 1;
-      }
-      if (count > 0) matches.set(normalizePath(repo.path), { repo, count });
+    const totals = new Map(usable.map(repo => [normalizePath(repo.path), 0]));
+    let discardedWeak = false;
+    for (const p of considered) {
+      const root = globRoot(p);
+      const scored = usable.map(repo => ({ repo, score: scorePath(root, repo.path) }));
+      const max = Math.max(0, ...scored.map(item => item.score));
+      const winners = scored.filter(item => item.score === max && max > 0);
+      if (winners.length === 1) totals.set(normalizePath(winners[0].repo.path), totals.get(normalizePath(winners[0].repo.path)) + max);
+      else if (winners.length >= 2 && max >= FS_PROBE_FLOOR) {
+        for (const winner of winners) totals.set(normalizePath(winner.repo.path), totals.get(normalizePath(winner.repo.path)) + max);
+      } else if (winners.length >= 2) discardedWeak = true;
     }
-    let best = null;
-    let tied = false;
-    for (const candidate of matches.values()) {
-      if (!best || candidate.count > best.count) { best = candidate; tied = false; }
-      else if (candidate.count === best.count) tied = true;
-    }
-    if (best && !tied) {
-      touched.set(normalizePath(best.repo.path), best.repo);
-      resolution = 'fs-probe';
+    for (const repo of usable) probeScores[normalizePath(repo.path)] = totals.get(normalizePath(repo.path));
+    const candidates = usable.filter(repo => probeScores[normalizePath(repo.path)] > 0);
+    if (!candidates.length) probe = discardedWeak ? 'weak' : 'none';
+    else {
+      const bestScore = Math.max(...candidates.map(repo => probeScores[normalizePath(repo.path)]));
+      const winners = candidates.filter(repo => probeScores[normalizePath(repo.path)] === bestScore);
+      if (winners.length === 1) {
+        touched.set(normalizePath(winners[0].path), winners[0]);
+        resolution = 'fs-probe';
+        probe = 'winner';
+      } else probe = 'tie';
     }
   }
 
@@ -352,21 +428,8 @@ function resolveCodeDir(opts) {
       source,
       resolution,
       run,
-    });
-  }
-
-  if (touched.size >= 2) {
-    return emptyResult({
-      status: 'cross-repo',
-      code_dir: '',
-      repo: '',
-      repos_touched: reposTouched,
-      paths_considered: considered.length,
-      paths_unmatched: unmatched,
-      source,
-      run,
-      reason: REASON_CROSS_REPO,
-      multi_repo_root: commonWorktreeRoot(usable),
+      probe,
+      probe_scores: probeScores,
     });
   }
 
@@ -381,6 +444,8 @@ function resolveCodeDir(opts) {
     run,
     reason: REASON_UNDECLARED,
     multi_repo_root: commonWorktreeRoot(usable),
+    probe,
+    probe_scores: probeScores,
   });
 }
 
@@ -469,10 +534,14 @@ module.exports = {
   parseFilesToChange,
   attributeRepo,
   parseListField,
+  parseScalarField,
+  matchDeclaredRepo,
   normalizePath,
   globRoot,
+  scorePath,
   isArtifactPath,
   exitCodeFor,
   REASON_CROSS_REPO,
   REASON_UNDECLARED,
+  FS_PROBE_FLOOR,
 };

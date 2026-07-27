@@ -117,6 +117,7 @@ writes:                           # files/globs this task will create or modify
   - "src/auth/jwt.ts"
   - "src/auth/__tests__/**"
 domain: backend                  # optional — see domain: contract below
+repo: api                        # optional — see WORKSPACE_REPOS
 must_haves:
   truths:
     - "Observable outcome (used for verification)"
@@ -144,6 +145,7 @@ expected_output:
 - `expected_output` is a **top-level sibling** of `must_haves` (not nested inside it) — a flat array of path strings.
 - **Unconditional** — emit the block on every net-new T##-PLAN, even when artifacts are minor. The executor's verification gate (`scripts/forge-must-haves.js`) parses and validates this shape; a missing or malformed block causes the gate to fail.
 - `domain` is **optional** (unlike the fields above). The prompt header carries the list of valid keys as `ROUTING_DOMAINS: <comma-separated list>` (or `(none — omit domain:)`) — judge the domain from the actual nature of the task's work and emit **only** a key from that list (open-set — you do not invent new keys, you only reference ones already present in that list). If that list is absent or `(none)`, or the task doesn't clearly belong to one of its keys, **omit the field** — it resolves to `default` downstream with no error, never a failure. **No keyword auto-detection**: judge the domain from the actual nature of the task's work, don't pattern-match on filenames/strings. Additive: T##-PLANs without `domain:` remain fully valid — `forge-must-haves.js` accepts its absence.
+- `repo` is optional and additive. When the injected `WORKSPACE_REPOS` list names multiple repos, emit only one of those names; never invent a repo. Omit `repo:` when the injected repo list says single repo or is absent. Plans without it remain valid and use legacy attribution/probing.
 
 **Domain metadata precedence (fixed by S02, documented here for the emitting side):** frontmatter `domain:` on the T##-PLAN > the slice's `` `domain:<name>` `` tag on its ROADMAP line (§ For milestone planning above) > `default`. `domain:` is an axis **independent of `tier:`/`effort:`** below — set it (or leave it unset) purely on the task's subject matter, not on its complexity.
 
