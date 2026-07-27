@@ -8686,9 +8686,9 @@ function smokeCodeDirMultiRepo() {
   }
 }
 
-// ── Section 73: workspace repo injection anti-inertia guard ─────────────────
+// ── Section 74: workspace repo injection anti-inertia guard ─────────────────
 function smokeWorkspaceRepos() {
-  process.stdout.write('\n▸ Section 73: workspace repo injection into planner prompts + contract\n');
+  process.stdout.write('\n▸ Section 74: workspace repo injection into planner prompts + contract\n');
   const repoRoot = path.dirname(SCRIPTS);
   const expected = {
     'shared/forge-dispatch.md': 1,
@@ -8730,8 +8730,8 @@ function smokeWorkspaceRepos() {
 
   const source = fs.readFileSync(__filename, 'utf8');
   const mainBody = source.slice(source.lastIndexOf('async function main()'));
-  assert(/smokeWorkspaceRepos\(\);/.test(mainBody), '(e) Section 73 is registered in main()');
-  pass('(final) Section 73: workspace repo prompt injection and planner contract verified');
+  assert(/smokeWorkspaceRepos\(\);/.test(mainBody), '(e) Section 74 is registered in main()');
+  pass('(final) Section 74: workspace repo prompt injection and planner contract verified');
 }
 
 // ── Section 66: sidecar_model resolver and mirrors ──────────────────────────
@@ -9134,6 +9134,83 @@ async function runSection(body) {
   }
 }
 
+// ── Section 75: refusal explains itself + doctor lists the affected plans ───
+// Every assertion here EXECUTES the pipeline (resolver CLI, doctor CLI, and the actual
+// one-liner extracted from each mirror). A presence-only grep is exactly how a dead
+// pipeline shipped green before (Section 74 (f) carries the same lesson).
+function smokeDoctorPlanRepo() {
+  process.stdout.write('\n▸ Section 75: plan repo declaration hint + doctor advisory layer\n');
+  const repoRoot = path.dirname(SCRIPTS);
+  const root = mkTmp('s75');
+  try {
+    const apiDir = path.join(root, 'api');
+    const webDir = path.join(root, 'web');
+    fs.mkdirSync(apiDir, { recursive: true });
+    fs.mkdirSync(webDir, { recursive: true });
+    mkGitRepo(apiDir);
+    mkGitRepo(webDir);
+    const wt = (name) => path.join(root, '.forge-worktrees', 'TASK-018', name);
+    const iso = JSON.stringify({
+      mode: 'worktree',
+      repos: [
+        { path: apiDir, branch: 'forge/TASK-018', worktree: wt('api'), status: 'created' },
+        { path: webDir, branch: 'forge/TASK-018', worktree: wt('web'), status: 'created' },
+      ],
+    });
+
+    const slice = path.join(root, '.gsd', 'milestones', 'M001', 'slices', 'S01', 'tasks');
+    const writePlan = (file, lines) => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, lines.join('\n') + '\n', 'utf8');
+      return file;
+    };
+    const pending = writePlan(path.join(slice, 'T01', 'T01-PLAN.md'),
+      ['---', 'id: T01', 'writes:', '  - "does/not/exist/a.ts"', '---', '', '# plan']);
+    writePlan(path.join(root, '.gsd', 'archive', 'M000', 'slices', 'S01', 'tasks', 'T09', 'T09-PLAN.md'),
+      ['---', 'id: T09', '---', '', '# plan']);
+
+    // (a) the refusal is unchanged (exit 5) and now carries actionable prose.
+    const r = runScript('forge-code-dir.js',
+      ['--resolve', '--iso-result', iso, '--plan', pending, '--cwd', root, '--run', 'TASK-018']);
+    let json = {}; try { json = JSON.parse(r.stdout); } catch { json = {}; }
+    assert(r.status === 5 && json.status === 'undeclared',
+      `(a) plan without repo: still refuses with exit 5 (got ${r.status}/${json.status})`);
+    assert(typeof json.hint === 'string' && json.hint.length > 0 && json.hint.includes('repo:'),
+      `(a) the refusal JSON carries a non-empty hint naming repo: (got ${JSON.stringify(json.hint)})`);
+
+    // (b) the doctor names the pending plan and stays advisory (exit 0), never reading archive/.
+    const d = runScript('forge-doctor.js', ['--check', 'plan-repo-declared', '--cwd', root]);
+    assert(d.status === 0, `(b) plan-repo-declared is advisory — exit 0 (got ${d.status}, stderr: ${d.stderr})`);
+    assert(d.stdout.includes('T01/T01-PLAN.md'),
+      `(b) doctor names the pending plan without repo: (stdout: ${d.stdout})`);
+    assert(!d.stdout.includes('T09'), '(b) doctor never reports a plan under .gsd/archive/');
+  } finally { cleanup(root); }
+
+  // (c) anti-inertia: extract the real one-liner from each mirror and RUN it. A mirror that
+  // copied the pipeline wrong prints nothing and fails here, not silently in production.
+  for (const file of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+    const body = fs.readFileSync(path.join(repoRoot, file), 'utf8');
+    const m = body.match(/CODE_DIR_HINT=\$\(node -e "([^"]+)" "\$CD_JSON"\)/);
+    assert(m, `(c) ${file} has an extractable CODE_DIR_HINT one-liner`);
+    if (!m) continue; // a missing pipeline is already a failure; never crash the section
+    const out = spawnSync(process.execPath, ['-e', m[1], '{"hint":"X"}'], { encoding: 'utf8' });
+    assert(out.status === 0 && out.stdout === 'X',
+      `(c) ${file} hint one-liner prints the hint (got exit ${out.status}, stdout ${JSON.stringify(out.stdout)})`);
+    assert(/\$\{CODE_DIR_HINT:\+ — \$CODE_DIR_HINT\}/.test(body),
+      `(c) ${file} appends the hint to the refusal warning line`);
+  }
+  // (d) F2: the loose-task mirror keeps its own run id — removing it to "match" the others
+  // would be a regression in the forge-task path.
+  const taskMirror = fs.readFileSync(path.join(repoRoot, 'skills/forge-task/SKILL.md'), 'utf8');
+  assert(/forge-code-dir\.js[\s\S]{0,400}--run "\$TASK_ID"/.test(taskMirror),
+    '(d) forge-task still passes --run "$TASK_ID" to forge-code-dir.js');
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  assert(/smokeDoctorPlanRepo\(\);/.test(source.slice(source.lastIndexOf('async function main()'))),
+    '(e) Section 75 is registered in main()');
+  pass('(final) Section 75: the refusal explains itself and the doctor lists every affected plan');
+}
+
 // ── Section 73: the harness protects its own coverage ──────────────────────
 async function smokeSectionIsolation() {
   process.stdout.write('\n▸ Section 73: section isolation\n');
@@ -9264,6 +9341,7 @@ async function main() {
       () => { smokeInitGitGuarantee(); },
       () => { smokeCodeDirMultiRepo(); },
       () => { smokeWorkspaceRepos(); },
+      () => { smokeDoctorPlanRepo(); },
       () => { smokeReviewAgentUnavailable(); },
       () => { smokeSharedGlob(); },
       () => { smokePhasesTable(); },

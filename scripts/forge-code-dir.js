@@ -18,7 +18,9 @@
 //   resolveCodeDir({ isoResult, planPath, cwd, run }) → { status, code_dir, repo, repos_touched,
 //                                                         paths_considered, paths_unmatched,
 //                                                         source, resolution, run, reason,
-//                                                         multi_repo_root }
+//                                                         multi_repo_root, hint }
+//   hintFor({ status, declared_repo, declared_repo_status, repos_touched }) → string (pt-BR)
+//   frontmatterOf(text) → string
 //   parseDeclaredPaths(planText) → { paths: string[], source: 'writes+expected_output'|'files-to-change'|'none' }
 //   parseFilesToChange(planText) → string[]
 //   attributeRepo(absPath, repos) → repo|null   (longest-prefix, boundary-aware)
@@ -36,6 +38,11 @@
 //   4  status cross-repo   → reason sidecar-multirepo-unsupported
 //   5  status undeclared   → reason sidecar-code-dir-undeclared
 //   2  usage / parse error
+//
+// `hint` is PURELY informational (TASK-018): actionable pt-BR prose in a single source that
+// the three orchestrator mirrors print next to the refusal warning. It NEVER changes a
+// verdict, a status or an exit code — same refusal, better explanation. Additive: it is on
+// every result with default '' and nothing reads it to decide anything.
 //
 // NOTE: `parseListField` / `normalizePath` are COPIED from scripts/forge-parallelism.js
 // rather than required: that module calls main() at top level with no `require.main`
@@ -248,6 +255,54 @@ function matchDeclaredRepo(value, usable, cwd) {
   return { repo: null, status: byBasename.length > 1 ? 'ambiguous' : 'unknown' };
 }
 
+// ── actionable prose (TASK-018) ─────────────────────────────────────────────
+//
+// Pure: given the fields of a refusal, return ONE pt-BR sentence naming the cause and the
+// exact fix. It lives here (and not in the three mirrors) because prose duplicated across
+// three files is prose that drifts. The reason codes (`sidecar-code-dir-undeclared`) point
+// at the resolver; the cause is usually in the PLAN, and that is what the operator needs
+// to read. Nothing here writes anything: `repo:` is never filled automatically (D3) — the
+// declaration is TRUSTED by the resolver, so a guessed value would be worse than none.
+function hintFor(info) {
+  const o = info || {};
+  const status = String(o.status || '');
+  const declared = String(o.declared_repo || '');
+  const declaredStatus = String(o.declared_repo_status || '');
+  const touched = (Array.isArray(o.repos_touched) ? o.repos_touched : []).join(', ');
+
+  if (status === 'cross-repo') {
+    return `Os paths declarados no plano cruzam mais de um repo (${touched || 'vários'}). `
+      + 'O sidecar exige um único repo por unidade: divida a unidade em uma task por repo '
+      + '(cada uma com seu `repo:` e seus `writes:`).';
+  }
+
+  if (status !== 'undeclared') return '';
+
+  if (declaredStatus === 'unknown') {
+    return `\`repo: ${declared}\` não casa com nenhum repo do workspace. `
+      + 'Corrija para o nome do diretório (ou o caminho) de um repo existente — '
+      + '`/forge-doctor` lista os planos afetados.';
+  }
+  if (declaredStatus === 'ambiguous') {
+    return `\`repo: ${declared}\` casa com mais de um repo do workspace. `
+      + 'Declare o caminho completo do repo pretendido em vez do nome curto.';
+  }
+  if (declaredStatus === 'conflict') {
+    return `\`repo: ${declared}\` contradiz os paths declarados (atribuídos a ${touched || 'outro repo'}). `
+      + 'Corrija `repo:` **ou** `writes:`/`expected_output:` para que apontem ao mesmo repo.';
+  }
+
+  if (!declared) {
+    return 'O plano não declara `repo:` e os paths declarados não bastam para atribuir um único repo. '
+      + 'Declare `repo: <nome-do-repo>` no frontmatter do `T##-PLAN.md` (o nome do diretório do repo '
+      + 'dentro do workspace). Rode `/forge-doctor` para listar todos os planos afetados. '
+      + 'Nada preenche esse campo automaticamente — a declaração é confiada pelo resolvedor, '
+      + 'então um valor adivinhado seria pior que ausente.';
+  }
+
+  return '';
+}
+
 // ── resolution ──────────────────────────────────────────────────────────────
 function emptyResult(extra) {
   return Object.assign({
@@ -266,6 +321,7 @@ function emptyResult(extra) {
     declared_repo_status: '',
     probe: '',
     probe_scores: {},
+    hint: '',
   }, extra || {});
 }
 
@@ -360,7 +416,8 @@ function resolveCodeDir(opts) {
   if (touched.size >= 2) {
     return emptyResult({ status: 'cross-repo', repos_touched: Array.from(touched.keys()), paths_considered: considered.length,
       paths_unmatched: unmatched, source, run, reason: REASON_CROSS_REPO, multi_repo_root: commonWorktreeRoot(usable),
-      declared_repo: declaredRepo });
+      declared_repo: declaredRepo,
+      hint: hintFor({ status: 'cross-repo', declared_repo: declaredRepo, repos_touched: Array.from(touched.keys()) }) });
   }
 
   // P2–P4: a declaration is validated before it can select a worktree and never falls through.
@@ -369,12 +426,15 @@ function resolveCodeDir(opts) {
     if (match.status !== 'ok') {
       return emptyResult({ status: 'undeclared', paths_considered: considered.length, paths_unmatched: unmatched, source, run,
         reason: REASON_UNDECLARED, multi_repo_root: commonWorktreeRoot(usable), declared_repo: declaredRepo,
-        declared_repo_status: match.status });
+        declared_repo_status: match.status,
+        hint: hintFor({ status: 'undeclared', declared_repo: declaredRepo, declared_repo_status: match.status }) });
     }
     if (touched.size === 1 && normalizePath(touched.keys().next().value) !== normalizePath(match.repo.path)) {
       return emptyResult({ status: 'undeclared', paths_considered: considered.length, paths_unmatched: unmatched, source, run,
         reason: REASON_UNDECLARED, multi_repo_root: commonWorktreeRoot(usable), declared_repo: declaredRepo,
-        declared_repo_status: 'conflict' });
+        declared_repo_status: 'conflict',
+        hint: hintFor({ status: 'undeclared', declared_repo: declaredRepo, declared_repo_status: 'conflict',
+          repos_touched: Array.from(touched.keys()) }) });
     }
     return emptyResult({ status: 'ok', code_dir: match.repo.worktree, repo: match.repo.path || '',
       repos_touched: [match.repo.path || ''], paths_considered: considered.length, paths_unmatched: unmatched, source,
@@ -446,6 +506,7 @@ function resolveCodeDir(opts) {
     multi_repo_root: commonWorktreeRoot(usable),
     probe,
     probe_scores: probeScores,
+    hint: hintFor({ status: 'undeclared', declared_repo: '', declared_repo_status: '' }),
   });
 }
 
@@ -536,6 +597,8 @@ module.exports = {
   parseListField,
   parseScalarField,
   matchDeclaredRepo,
+  hintFor,
+  frontmatterOf,
   normalizePath,
   globRoot,
   scorePath,

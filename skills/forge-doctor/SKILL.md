@@ -309,6 +309,21 @@ Missing → append `.gsd/prefs.local.md` to `.gitignore`.
 
 ---
 
+## C9: Declaração de repo em planos ativos
+
+```bash
+node scripts/forge-doctor.js --check plan-repo-declared
+```
+Ecoe as linhas retornadas. Advisory: **nunca bloqueia** e **nunca escreve**.
+
+- Workspace com menos de 2 repos → `skipped: single-repo` (o campo `repo:` só existe para desambiguar multi-repo).
+- Planos pendentes sem `repo:` no frontmatter → `⚠` + a lista. Cada um desses vai ser recusado pelo sidecar com `sidecar-code-dir-undeclared` e cair no executor Claude.
+- Planos já executados (com `*-SUMMARY.md` irmão ou `status: DONE`/`DECOMPOSED`) e tudo sob `.gsd/archive/` são ignorados de propósito.
+
+**`--fix` NÃO preenche `repo:`** — em nenhum caminho. O resolvedor *confia* na declaração (uma declaração válida resolve antes do probe de filesystem), então um `repo:` adivinhado é pior que ausente. A correção é manual: adicionar `repo: <nome-do-diretório-do-repo>` no frontmatter do `T##-PLAN.md`.
+
+---
+
 ## Report
 
 Header line:
@@ -324,4 +339,5 @@ Footer:
 - dry-run: same as fix counts + `Nenhum arquivo alterado. Execute /forge-doctor --fix para aplicar.`
 
 Skipped items → list with suggested command.
+`plan-repo-declared` (C9) is advisory: entra no `--check all` sem nunca mudar o exit code.
 `review-model-drift` is included in `/forge-doctor --check all` as an advisory audit of recorded review advocates against resolved prefs.
