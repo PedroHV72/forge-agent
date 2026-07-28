@@ -51,6 +51,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Embedded terminals are CHILD PROCESSES: quitting the app kills every
+    /// session with it, unlike an external Terminal window. Forge itself is
+    /// resumable from disk, so no work is lost — but a unit can be cut off
+    /// mid-dispatch, so this must never happen silently.
+    @MainActor
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let live = AppState.shared.sessions.filter(\.isRunning)
+        guard !live.isEmpty else { return .terminateNow }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = live.count == 1
+            ? "1 sessão ainda está rodando"
+            : "\(live.count) sessões ainda estão rodando"
+        alert.informativeText = """
+        Sair encerra \(live.count == 1 ? "essa sessão" : "essas sessões") — \
+        \(live.map(\.tabLabel).joined(separator: ", ")).
+
+        O trabalho não se perde: o Forge guarda o estado em disco e você retoma \
+        com "Continuar milestone". Mas a unidade em andamento é interrompida.
+        """
+        alert.addButton(withTitle: "Sair mesmo assim")
+        alert.addButton(withTitle: "Cancelar")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
     /// Clicking the Dock icon after closing the window should bring it back.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {

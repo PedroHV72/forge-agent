@@ -189,17 +189,27 @@ final class AppState: ObservableObject {
     /// Open a terminal inside the app. The account is selected with
     /// `claude --account <name>`, the flag the shell-init hook understands —
     /// never by exporting a token, which would leak it into the environment.
-    func newSession(cwd: String, mode: LauncherSheet.Mode, text: String, account: String) {
+    ///
+    /// `runId` matters for real: Forge refuses a bare `/forge-auto` once two or
+    /// more runs are active in a workspace (multi_run.refused_when_active_count),
+    /// which is exactly the case when several milestones share a project.
+    func newSession(cwd: String, mode: LauncherSheet.Mode, text: String,
+                    account: String, runId: String = "") {
         let desc = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        var claudeArgs = ""
-        if !account.isEmpty { claudeArgs = " --account \(shq(account))" }
+        let claudeArgs = account.isEmpty ? "" : " --account \(shq(account))"
 
         var boot: String?
+        var attachedRun: String?
+
         switch mode {
         case .shell:
             boot = nil
+        case .chat:
+            boot = "claude\(claudeArgs)"
         case .auto:
-            boot = "claude\(claudeArgs) \(shq("/forge-auto"))"
+            let slash = runId.isEmpty ? "/forge-auto" : "/forge-auto \(runId)"
+            attachedRun = runId.isEmpty ? nil : runId
+            boot = "claude\(claudeArgs) \(shq(slash))"
         case .newMilestone:
             let slash = desc.isEmpty ? "/forge-new-milestone" : "/forge-new-milestone \(desc)"
             boot = "claude\(claudeArgs) \(shq(slash))"
@@ -208,9 +218,11 @@ final class AppState: ObservableObject {
             boot = "claude\(claudeArgs) \(shq("/forge-task \(desc)"))"
         }
 
-        let title = URL(fileURLWithPath: cwd).lastPathComponent
-            + (mode == .shell ? "" : " · \(mode.shortLabel)")
-        sessions.append(TerminalSession(cwd: cwd, title: title, bootstrap: boot))
+        let project = URL(fileURLWithPath: cwd).lastPathComponent
+        let title = mode == .shell ? project : "\(project) · \(mode.shortLabel)"
+        sessions.append(TerminalSession(
+            cwd: cwd, title: title, bootstrap: boot,
+            runId: attachedRun, account: account.isEmpty ? nil : account))
     }
 
     func closeSession(_ s: TerminalSession) {
@@ -222,7 +234,7 @@ final class AppState: ObservableObject {
     /// Open a terminal on another account, in-app.
     func launch(account: String) {
         let cwd = workspaces.first ?? FileManager.default.homeDirectoryForCurrentUser.path
-        newSession(cwd: cwd, mode: .shell, text: "", account: account)
+        newSession(cwd: cwd, mode: .chat, text: "", account: account)
         sessions.last.map { _ in show("Sessão aberta na conta \(account)") }
     }
 
@@ -234,10 +246,10 @@ final class AppState: ObservableObject {
     /// Resume an existing run in an in-app terminal. /forge-auto takes the run
     /// id and picks up from disk state.
     func resume(_ run: Run) {
-        let title = "\(run.projectName) · \(run.id)"
         sessions.append(TerminalSession(
-            cwd: run.cwd, title: title,
-            bootstrap: "claude \(shq("/forge-auto \(run.id)"))"))
+            cwd: run.cwd, title: "\(run.projectName) · auto",
+            bootstrap: "claude \(shq("/forge-auto \(run.id)"))",
+            runId: run.id, account: run.account))
         show("Sessão aberta — veja em Terminal")
     }
 

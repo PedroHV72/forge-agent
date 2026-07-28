@@ -27,15 +27,30 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// than as argv so it lands in shell history and stays visible/editable.
     let bootstrap: String?
 
+    /// Which run this session drives, when it drives one. With several
+    /// milestones in the same project the project name alone cannot tell two
+    /// tabs apart — the run id is the only thing that can.
+    let runId: String?
+    let account: String?
+
     @Published var isRunning = true
     @Published var exitLabel: String?
 
     var projectName: String { URL(fileURLWithPath: cwd).lastPathComponent }
 
-    init(cwd: String, title: String, bootstrap: String? = nil) {
+    /// Short, unambiguous tab label.
+    var tabLabel: String {
+        if let runId { return runId }
+        return title
+    }
+
+    init(cwd: String, title: String, bootstrap: String? = nil,
+         runId: String? = nil, account: String? = nil) {
         self.cwd = cwd
         self.title = title
         self.bootstrap = bootstrap
+        self.runId = runId
+        self.account = account
     }
 }
 
@@ -181,7 +196,16 @@ struct TerminalsView: View {
                         Circle()
                             .fill(s.isRunning ? Color.green : Color.secondary)
                             .frame(width: 6, height: 6)
-                        Text(s.title).font(.caption)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(s.tabLabel).font(.caption)
+                            HStack(spacing: 4) {
+                                Text(s.projectName).font(.system(size: 9))
+                                if let a = s.account, !a.isEmpty {
+                                    Text("· \(a)").font(.system(size: 9))
+                                }
+                            }
+                            .foregroundStyle(.tertiary)
+                        }
                         Button {
                             state.closeSession(s)
                             if selection == s.id { selection = state.sessions.first?.id }
@@ -231,11 +255,13 @@ struct LauncherSheet: View {
     @State private var mode: Mode = .auto
     @State private var text = ""
     @State private var account = ""
+    @State private var runId = ""
 
     enum Mode: String, CaseIterable, Identifiable {
         case auto = "Continuar milestone"
         case newMilestone = "Novo milestone"
         case task = "Task avulsa"
+        case chat = "Conversar"
         case shell = "Só o shell"
         var id: String { rawValue }
 
@@ -244,6 +270,7 @@ struct LauncherSheet: View {
             case .auto:         return "/forge-auto — retoma de onde parou"
             case .newMilestone: return "/forge-new-milestone — brainstorm, discuss e plano"
             case .task:         return "/forge-task — trabalho pontual, sem milestone"
+            case .chat:         return "abre o claude sem comando — conversa livre"
             case .shell:        return "abre o shell sem rodar nada"
             }
         }
@@ -255,9 +282,17 @@ struct LauncherSheet: View {
             case .auto:         return "auto"
             case .newMilestone: return "milestone"
             case .task:         return "task"
+            case .chat:         return "chat"
             case .shell:        return "shell"
             }
         }
+    }
+
+    /// Runs already alive in the selected project. Forge refuses a bare
+    /// /forge-auto once two or more are active (multi_run.refused_when_active_count),
+    /// so the id is not a nicety here — without it the command is rejected.
+    private var runsHere: [Run] {
+        state.liveRuns.filter { $0.cwd == resolvedWorkspace }
     }
 
     var body: some View {
@@ -284,6 +319,8 @@ struct LauncherSheet: View {
 
             Text(mode.hint).font(.caption).foregroundStyle(.secondary)
 
+            if mode == .auto { autoSection }
+
             if mode.needsText {
                 TextField(mode == .task ? "O que precisa ser feito?"
                                         : "Descreva o milestone (opcional)",
@@ -301,10 +338,35 @@ struct LauncherSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(width: 480)
         .onAppear {
             if workspace.isEmpty { workspace = state.workspaces.first ?? "" }
             state.loadAccounts()
+            state.reloadCheap()
+            if runId.isEmpty { runId = runsHere.first?.id ?? "" }
+        }
+        // Single-argument form: the two-argument onChange is macOS 14+, and the
+        // deployment target is 13.
+        .onChange(of: workspace) { _ in runId = runsHere.first?.id ?? "" }
+    }
+
+    @ViewBuilder private var autoSection: some View {
+        if runsHere.isEmpty {
+            Text("Nenhuma run ativa neste projeto — /forge-auto vai pegar a milestone atual do STATE.")
+                .font(.caption2).foregroundStyle(.tertiary)
+        } else {
+            Picker("Run", selection: $runId) {
+                ForEach(runsHere) { r in
+                    Text("\(r.id)\(r.worker.map { " · \($0)" } ?? "")").tag(r.id)
+                }
+            }
+            if runsHere.count >= 2 {
+                // Explains why the picker is not optional, rather than silently
+                // producing a command the orchestrator will reject.
+                Label("Com 2+ runs ativas o Forge exige o ID — por isso ele vai junto.",
+                      systemImage: "info.circle")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -313,7 +375,8 @@ struct LauncherSheet: View {
     }
 
     private func open() {
-        state.newSession(cwd: resolvedWorkspace, mode: mode, text: text, account: account)
+        state.newSession(cwd: resolvedWorkspace, mode: mode, text: text,
+                         account: account, runId: runId)
         isPresented = false
     }
 }
