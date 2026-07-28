@@ -115,6 +115,7 @@ final class AppState: ObservableObject {
         }
         gates = g
         runs = r
+        Notifier.shared.sync(pending: pending)
         NotificationCenter.default.post(name: Self.didChange, object: nil)
     }
 
@@ -161,11 +162,20 @@ final class AppState: ObservableObject {
 
     func answer(_ gate: Gate, choice: String) {
         guard let cwd = gate.cwd else { return show("gate sem cwd", error: true) }
+        answer(gateID: gate.id, cwd: cwd, choice: choice)
+    }
+
+    /// Answering by id, so a notification action can resolve a gate without the
+    /// decoded object in hand.
+    func answer(gateID: String, cwd: String, choice: String) {
         let r = ForgeCore.run("forge-gate.js",
-                              ["--answer", gate.id, "--choice", choice, "--cwd", cwd])
+                              ["--answer", gateID, "--choice", choice, "--cwd", cwd])
         // The common failure here is benign: the gate expired or was answered
         // elsewhere between render and click.
-        if !r.ok { show(r.stderr.isEmpty ? "não foi possível responder" : r.stderr, error: true) }
+        if !r.ok {
+            show(r.stderr.isEmpty ? "não foi possível responder" : r.stderr, error: true)
+        }
+        Notifier.shared.forget(gateID)
         reloadCheap()
     }
 

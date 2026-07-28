@@ -137,6 +137,28 @@ enum Examples {
                 }),
 
             Example(
+                id: "notify",
+                title: "Responder sem abrir o app",
+                what: "Cria a pergunta depois de 6 segundos — tempo de você trocar de janela. A notificação traz as opções como botões: clique num e o run é respondido.",
+                why: "É por isso que o app existe: um run autônomo pode perguntar e continuar sem você largar o que está fazendo.",
+                action: "Notificar em 6s",
+                run: { s in
+                    guard Sandbox.ensure() else { return s.show("não consegui criar o sandbox", error: true) }
+                    s.registerSandbox()
+                    s.show("Troque de janela — a notificação chega em 6s")
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 6_000_000_000)
+                        open(s, args: [
+                            "--run", "DEMO", "--unit", "S05", "--origin", "demo-notificacao",
+                            "--question", "Clique num botão desta notificação — a resposta chega no run.",
+                            "--option", "sim:Pode seguir:Escolha registrada como humana",
+                            "--option", "nao:Prefiro revisar:Também é escolha humana",
+                            "--default", "nao", "--timeout", "600000",
+                        ], toast: nil)
+                    }
+                }),
+
+            Example(
                 id: "terminal",
                 title: "Um terminal de verdade",
                 what: "Abre uma sessão no sandbox. É um shell completo, com sua conta e suas skills.",
@@ -156,6 +178,10 @@ enum Examples {
             return state.show("não consegui criar o sandbox", error: true)
         }
         state.registerSandbox()
+        // Notifications are NOT suppressed here: seeing the banner is half the
+        // point of the examples. The engine's own osascript banner is skipped
+        // (--no-notify) because the app posts a richer one, with the gate's
+        // options as buttons, from Notifier.
         let r = ForgeCore.run("forge-gate.js",
                               ["--open", "--cwd", Sandbox.path, "--no-notify"] + args)
         if !r.ok {

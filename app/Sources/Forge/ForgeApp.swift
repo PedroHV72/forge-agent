@@ -44,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         installStatusItem()
         refreshBadge()
+        Notifier.shared.start()
         observer = NotificationCenter.default.addObserver(
             forName: AppState.didChange, object: nil, queue: .main
         ) { [weak self] _ in
