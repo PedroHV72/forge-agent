@@ -1,0 +1,230 @@
+// Stores — observable state backing the UI.
+//
+// Refresh costs differ by an order of magnitude, so the cadences do too:
+//   gates/runs → local JSON reads, polled every 2s
+//   accounts   → one CLI call, refreshed on demand
+//   usage      → a real API request per account (~9 tokens each), so it is
+//                manual/cached only. Polling it on a timer would quietly spend
+//                the user's quota just to keep a progress bar warm.
+
+import SwiftUI
+import Foundation
+
+// MARK: - Workspaces
+
+/// Which projects to watch. A plain JSON array of paths, editable by hand.
+enum Workspaces {
+    static var file: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.claude/forge-gate-workspaces.json"
+    }
+
+    static func load() -> [String] {
+        guard let data = FileManager.default.contents(atPath: file),
+              let list = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return list.filter { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    static func save(_ list: [String]) {
+        let unique = Array(Set(list)).sorted()
+        guard let data = try? JSONEncoder().encode(unique) else { return }
+        try? FileManager.default.createDirectory(
+            atPath: (file as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: file), options: .atomic)
+    }
+
+    static func add(_ p: String)    { save(load() + [p]) }
+    static func remove(_ p: String) { save(load().filter { $0 != p }) }
+}
+
+// MARK: - App state
+
+@MainActor
+final class AppState: ObservableObject {
+    static let shared = AppState()
+
+    /// Posted after every cheap reload so the Dock badge can follow along
+    /// without running a second timer of its own.
+    static let didChange = Notification.Name("ForgeAppStateDidChange")
+
+    @Published private(set) var gates: [Gate] = []
+    @Published private(set) var runs: [Run] = []
+    @Published private(set) var accounts: [Account] = []
+    @Published private(set) var activeAccount: String?
+    @Published private(set) var usage: [String: AccountUsage] = [:]
+    @Published private(set) var workspaces: [String] = []
+
+    @Published var usageLoading = false
+    @Published var usageCheckedAt: Date?
+    @Published var toast: Toast?
+
+    private var timer: Timer?
+
+    struct Toast: Identifiable, Equatable {
+        let id = UUID()
+        let text: String
+        let isError: Bool
+    }
+
+    var pending: [Gate] { gates.filter(\.isPending).sorted { $0.created_at < $1.created_at } }
+
+    var recent: [Gate] {
+        gates.filter { !$0.isPending }
+            .sorted { $0.created_at > $1.created_at }
+            .prefix(20).map { $0 }
+    }
+
+    var liveRuns: [Run] { runs.filter { $0.active }.sorted { $0.started_at > $1.started_at } }
+
+    /// Accounts ordered by real weekly headroom when known, so the one to use
+    /// next is simply the one on top. Falls back to name order.
+    var accountsByHeadroom: [Account] {
+        accounts.sorted { a, b in
+            let ua = usage[a.name]?.headroom
+            let ub = usage[b.name]?.headroom
+            if let ua, let ub, ua != ub { return ua > ub }
+            if ua != nil, ub == nil { return true }
+            if ua == nil, ub != nil { return false }
+            return a.name < b.name
+        }
+    }
+
+    init() {
+        reloadCheap()
+        loadAccounts()
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.reloadCheap() }
+        }
+    }
+
+    deinit { timer?.invalidate() }
+
+    // MARK: Cheap reload (files only)
+
+    func reloadCheap() {
+        workspaces = Workspaces.load()
+        var g: [Gate] = [], r: [Run] = []
+        for ws in workspaces {
+            g += Self.decodeDir("\(ws)/.gsd/forge/gates", as: Gate.self)
+            r += Self.decodeDir("\(ws)/.gsd/forge/runs", as: Run.self)
+        }
+        gates = g
+        runs = r
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
+    }
+
+    /// Decode every *.json in a directory, skipping anything unreadable —
+    /// a half-written or corrupt file must never take the whole list down.
+    private static func decodeDir<T: Decodable>(_ dir: String, as: T.Type) -> [T] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir)
+        else { return [] }
+        let dec = JSONDecoder()
+        return names.filter { $0.hasSuffix(".json") }.compactMap { n in
+            guard let d = FileManager.default.contents(atPath: "\(dir)/\(n)") else { return nil }
+            return try? dec.decode(T.self, from: d)
+        }
+    }
+
+    // MARK: Accounts
+
+    func loadAccounts() {
+        guard let payload = ForgeCore.runJSON(
+            AccountsPayload.self, "forge-accounts.js", ["--list", "--json"])
+        else { return }
+        accounts = payload.accounts
+        activeAccount = payload.env_active ?? payload.active
+    }
+
+    /// Costs a real API call per account — only ever on explicit request.
+    func refreshUsage() {
+        guard !usageLoading else { return }
+        usageLoading = true
+        Task.detached(priority: .userInitiated) {
+            let rows = ForgeCore.runJSON([AccountUsage].self, "forge-usage.js", ["--json"]) ?? []
+            await MainActor.run {
+                for row in rows { self.usage[row.name] = row }
+                self.usageLoading = false
+                self.usageCheckedAt = Date()
+                if rows.isEmpty {
+                    self.show("Não consegui ler o uso das contas", error: true)
+                }
+            }
+        }
+    }
+
+    // MARK: Actions
+
+    func answer(_ gate: Gate, choice: String) {
+        guard let cwd = gate.cwd else { return show("gate sem cwd", error: true) }
+        let r = ForgeCore.run("forge-gate.js",
+                              ["--answer", gate.id, "--choice", choice, "--cwd", cwd])
+        // The common failure here is benign: the gate expired or was answered
+        // elsewhere between render and click.
+        if !r.ok { show(r.stderr.isEmpty ? "não foi possível responder" : r.stderr, error: true) }
+        reloadCheap()
+    }
+
+    func togglePause(_ run: Run) {
+        let paused = ForgeCore.isPaused(cwd: run.cwd, runId: run.id)
+        if let err = ForgeCore.setPaused(!paused, cwd: run.cwd, runId: run.id) {
+            show(err, error: true)
+        } else {
+            show(paused ? "Retomado — segue na próxima unidade"
+                        : "Pausa pedida — para ao fim da unidade atual")
+        }
+        reloadCheap()
+    }
+
+    func isPaused(_ run: Run) -> Bool {
+        ForgeCore.isPaused(cwd: run.cwd, runId: run.id)
+    }
+
+    func launch(account: String) {
+        let cwd = workspaces.first ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let r = ForgeCore.run("forge-accounts.js",
+                              ["--launch", account, "--new-window"], cwd: cwd)
+        if r.ok { show("Abrindo terminal na conta \(account)") }
+        else { show(r.stderr.isEmpty ? "falha ao lançar" : r.stderr, error: true) }
+    }
+
+    func openTerminal(at cwd: String, command: String, title: String) {
+        let r = ForgeCore.openTerminal(cwd: cwd, command: command, title: title)
+        if r.ok { show(title) } else { show(r.stderr, error: true) }
+    }
+
+    /// Resume an existing run in a fresh terminal. /forge-auto takes the run id
+    /// and picks up from disk state.
+    func resume(_ run: Run) {
+        openTerminal(at: run.cwd,
+                     command: "claude \(ForgeCore.shellQuote("/forge-auto \(run.id)"))",
+                     title: "Retomando \(run.id)")
+    }
+
+    func startMilestone(in cwd: String, description: String) {
+        let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let slash = desc.isEmpty ? "/forge-new-milestone" : "/forge-new-milestone \(desc)"
+        openTerminal(at: cwd, command: "claude \(ForgeCore.shellQuote(slash))",
+                     title: "Novo milestone")
+    }
+
+    func startTask(in cwd: String, description: String) {
+        let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !desc.isEmpty else { return show("descreva a task", error: true) }
+        openTerminal(at: cwd, command: "claude \(ForgeCore.shellQuote("/forge-task \(desc)"))",
+                     title: "Nova task")
+    }
+
+    func addWorkspace(_ p: String)    { Workspaces.add(p); reloadCheap() }
+    func removeWorkspace(_ p: String) { Workspaces.remove(p); reloadCheap() }
+
+    func show(_ text: String, error: Bool = false) {
+        toast = Toast(text: text, isError: error)
+        let shown = toast
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            if self.toast == shown { self.toast = nil }
+        }
+    }
+}
