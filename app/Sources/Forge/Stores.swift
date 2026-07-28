@@ -270,6 +270,28 @@ final class AppState: ObservableObject {
         show("Sessão aberta — veja em Terminal")
     }
 
+    /// The sandbox is registered like any other project so examples show up
+    /// everywhere real work does — same screens, same code paths.
+    func registerSandbox() {
+        guard !workspaces.contains(Sandbox.path) else { return }
+        Workspaces.add(Sandbox.path)
+        reloadCheap()
+    }
+
+    func destroySandbox() {
+        Workspaces.remove(Sandbox.path)
+        // Close any session living in the sandbox first — removing the folder
+        // under a running shell leaves it in a directory that no longer exists.
+        for s in sessions where s.cwd == Sandbox.path { closeSession(s) }
+        do {
+            try Sandbox.destroy()
+            show("Sandbox removido")
+        } catch {
+            show("não consegui remover: \(error.localizedDescription)", error: true)
+        }
+        reloadCheap()
+    }
+
     func addWorkspace(_ p: String)    { Workspaces.add(p); reloadCheap() }
     func removeWorkspace(_ p: String) { Workspaces.remove(p); reloadCheap() }
 

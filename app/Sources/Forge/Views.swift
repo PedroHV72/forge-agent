@@ -22,6 +22,7 @@ enum Section: String, CaseIterable, Identifiable {
     case accounts = "Contas"
     case prefs = "Preferências"
     case history = "Histórico"
+    case examples = "Exemplos"
 
     var id: String { rawValue }
 
@@ -34,6 +35,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .accounts: return "person.2"
         case .prefs:    return "slider.horizontal.3"
         case .history:  return "clock.arrow.circlepath"
+        case .examples: return "sparkles"
         }
     }
 }
@@ -80,6 +82,7 @@ struct RootView: View {
                 case .accounts: AccountsView(state: state)
                 case .prefs:    PrefsView(state: state)
                 case .history:  HistoryView(state: state)
+                case .examples: ExamplesView(state: state)
                 }
             }
             .frame(minWidth: 460, minHeight: 380)
