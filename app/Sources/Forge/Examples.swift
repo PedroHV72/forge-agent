@@ -203,6 +203,7 @@ struct ExamplesView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 intro
+                NotificationStatusBar()
 
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 320, maximum: 480), spacing: 14)],
@@ -289,5 +290,47 @@ struct ExampleCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// Says out loud whether notifications will actually be delivered, and offers
+/// the only fix when they will not. Without this the failure is invisible: you
+/// click an example, nothing happens, and there is nothing to look at.
+struct NotificationStatusBar: View {
+    @ObservedObject private var notifier = Notifier.shared
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: notifier.canAlert ? "bell.badge" : "bell.slash")
+                .foregroundStyle(notifier.canAlert ? Color.accentOrange : .secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Notificações: \(notifier.statusText)").font(.caption)
+                if let e = notifier.lastError {
+                    Text(e).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                } else if notifier.canAlert {
+                    Text("As perguntas chegam com as opções como botões.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                } else {
+                    Text("O aviso chega, mas sem botões — abra o app para responder. Botões exigem assinar o app com um Developer ID.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            Spacer()
+            Button("Testar agora") { notifier.testNow() }
+                .controlSize(.small)
+            if notifier.needsSystemSettings {
+                Button("Abrir Ajustes") { notifier.openSystemSettings() }
+                    .controlSize(.small)
+            }
+            Button {
+                notifier.refreshSettings()
+            } label: {
+                Image(systemName: "arrow.clockwise").font(.caption2)
+            }
+            .buttonStyle(.plain).foregroundStyle(.tertiary)
+            .help("Reverificar")
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
     }
 }

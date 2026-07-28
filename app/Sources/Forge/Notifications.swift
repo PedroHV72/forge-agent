@@ -12,6 +12,18 @@
 //
 // One category is registered per gate, because the buttons ARE that gate's
 // options and no fixed category could describe them ahead of time.
+//
+// AD-HOC SIGNING BLOCKS THE NATIVE PATH. Verified on macOS 26.4 with no signing
+// identity available: requestAuthorization fails with "Notifications are not
+// allowed for this application", and the bundle never appears among the apps
+// registered in com.apple.ncprefs — the system simply refuses an ad-hoc signed
+// bundle as a notifier. A Developer ID signature is what unlocks it.
+//
+// So there is a fallback: `osascript display notification`, which does work
+// (verified: banner shown, sound played). It cannot carry action buttons and
+// shows a generic icon, so it announces rather than resolves — you still have
+// to open the app to answer. Announcing is the part that cannot be missed;
+// buttons are the upgrade that arrives with a real signature.
 
 import Foundation
 import UserNotifications
@@ -21,8 +33,15 @@ import AppKit
 final class Notifier: NSObject, ObservableObject {
     static let shared = Notifier()
 
-    @Published private(set) var authorized = false
-    @Published private(set) var denied = false
+    /// What the system will actually do, which is NOT the same as
+    /// authorizationStatus. Verified on this machine: a bundle can report
+    /// status .denied while alertSetting/soundSetting are .enabled, and
+    /// delivering still works. Gating on authorizationStatus alone silently
+    /// disables every notification — that was the original bug.
+    @Published private(set) var canAlert = false
+    @Published private(set) var statusText = "verificando…"
+    @Published private(set) var needsSystemSettings = false
+    @Published private(set) var lastError: String?
 
     /// Gates already announced. Without this the 2s poll would re-notify the
     /// same question every tick.
@@ -30,36 +49,89 @@ final class Notifier: NSObject, ObservableObject {
 
     private let center = UNUserNotificationCenter.current()
 
+    /// Diagnostic trail. Notification failures are invisible by nature — the
+    /// banner simply never appears — so the decisions get written down.
+    private static let logPath = NSTemporaryDirectory() + "forge-notify.log"
+
+    static func trace(_ line: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let entry = "[\(stamp)] \(line)\n"
+        if let h = FileHandle(forWritingAtPath: logPath) {
+            h.seekToEndOfFile(); h.write(entry.data(using: .utf8)!); try? h.close()
+        } else {
+            try? entry.data(using: .utf8)!.write(to: URL(fileURLWithPath: logPath))
+        }
+    }
+
     func start() {
         center.delegate = self
+        refreshSettings()
+    }
+
+    /// Re-read the real settings. Called on launch and whenever the user might
+    /// have changed something in System Settings.
+    func refreshSettings() {
         center.getNotificationSettings { [weak self] settings in
+            let status = settings.authorizationStatus
             Task { @MainActor in
                 guard let self else { return }
-                switch settings.authorizationStatus {
+
+                switch status {
                 case .authorized, .provisional:
-                    self.authorized = true
+                    Self.trace("settings: authorized")
+                    self.canAlert = true
+                    self.needsSystemSettings = false
+                    self.statusText = "ativas"
                 case .denied:
-                    self.denied = true
-                default:
+                    // alertSetting/soundSetting read as .enabled even for a
+                    // bundle the system never registered as a notifier, and the
+                    // native delivery then fails with no error at all. Only
+                    // .authorized/.provisional may take the native path;
+                    // everything else uses the fallback, which demonstrably works.
+                    Self.trace("settings: denied, alert=\(settings.alertSetting.rawValue) sound=\(settings.soundSetting.rawValue) → fallback")
+                    self.canAlert = false
+                    self.needsSystemSettings = false
+                    self.statusText = "modo alternativo (sem botões — app sem assinatura Developer ID)"
+                case .notDetermined:
+                    Self.trace("settings: notDetermined — pedindo permissão")
+                    self.statusText = "pedindo permissão…"
                     self.request()
+                default:
+                    Self.trace("settings: status=\(status.rawValue) → fallback")
+                    self.canAlert = false
+                    self.statusText = "modo alternativo (sem botões — app sem assinatura Developer ID)"
                 }
             }
         }
     }
 
     func request() {
-        center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, err in
             Task { @MainActor in
-                self?.authorized = granted
-                self?.denied = !granted
+                guard let self else { return }
+                Self.trace("requestAuthorization granted=\(granted) err=\(err?.localizedDescription ?? "nil")")
+                if let err, !granted {
+                    // Happens once a bundle has been denied: the prompt never
+                    // reappears and only System Settings can undo it.
+                    self.lastError = err.localizedDescription
+                }
+                self.refreshSettings()
             }
         }
     }
 
+    /// Deep-link to the notification pane; the prompt does not come back.
+    func openSystemSettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!
+        NSWorkspace.shared.open(url)
+    }
+
+    /// True when banners come from osascript rather than the app itself, i.e.
+    /// without action buttons.
+    var usingFallback: Bool { !canAlert }
+
     /// Announce any gate not yet announced, and withdraw the ones that are gone.
     func sync(pending: [Gate]) {
-        guard authorized else { return }
-
         let ids = Set(pending.map(\.id))
         let stale = announced.subtracting(ids)
         if !stale.isEmpty {
@@ -71,8 +143,54 @@ final class Notifier: NSObject, ObservableObject {
 
         for gate in pending where !announced.contains(gate.id) {
             announced.insert(gate.id)
-            post(gate)
+            Self.trace("anunciando \(gate.id) via \(canAlert ? "nativa" : "osascript")")
+            if canAlert { post(gate) } else { postFallback(gate) }
         }
+    }
+
+    /// Banner via osascript. Works where the native path is refused, at the
+    /// cost of buttons and the app icon.
+    private func postFallback(_ gate: Gate) {
+        let sub = [gate.projectName, gate.subtitle]
+            .filter { !$0.isEmpty }.joined(separator: " · ")
+        let body = gate.question.replacingOccurrences(of: "\n", with: " ")
+        func esc(_ v: String) -> String {
+            v.replacingOccurrences(of: "\\", with: "\\\\")
+             .replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let script = "display notification \"\(esc(body))\" " +
+                     "with title \"Forge precisa de você\" " +
+                     "subtitle \"\(esc(sub))\" sound name \"Submarine\""
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        let err = Pipe()
+        p.standardError = err
+        do {
+            try p.run()
+            p.waitUntilExit()
+            let e = String(data: err.fileHandleForReading.readDataToEndOfFile(),
+                           encoding: .utf8) ?? ""
+            Self.trace("osascript exit=\(p.terminationStatus) err=\(e.trimmingCharacters(in: .whitespacesAndNewlines))")
+            if p.terminationStatus != 0 { lastError = e }
+        } catch {
+            Self.trace("osascript falhou: \(error.localizedDescription)")
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Fire a banner right now, through whichever path is active. Without this
+    /// the only way to test is to wait for a real gate.
+    func testNow() {
+        Self.trace("teste manual — canAlert=\(canAlert) status=\(statusText)")
+        let probe = Gate(
+            id: "test-\(Int(Date().timeIntervalSince1970))", run_id: "TESTE",
+            unit_id: nil, origin: nil, cwd: nil,
+            question: "Notificação de teste do Forge.", context: nil,
+            options: [GateOption(key: "ok", label: "OK", description: "")],
+            default: "ok", status: "pending", answer: nil,
+            created_at: Date.nowMs, expires_at: nil)
+        if canAlert { post(probe) } else { postFallback(probe) }
     }
 
     private func post(_ gate: Gate) {
@@ -107,7 +225,15 @@ final class Notifier: NSObject, ObservableObject {
 
             let request = UNNotificationRequest(
                 identifier: gate.id, content: content, trigger: nil)
-            self.center.add(request)
+            self.center.add(request) { error in
+                guard let error else { return }
+                Task { @MainActor in
+                    self.lastError = error.localizedDescription
+                    // Allow a retry on the next poll rather than pretending it
+                    // was announced.
+                    self.announced.remove(gate.id)
+                }
+            }
         }
     }
 
