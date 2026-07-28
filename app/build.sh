@@ -43,6 +43,15 @@ swiftc -O -parse-as-library \
   -o "${BUNDLE}/Contents/MacOS/Forge" \
   "${APP_DIR}/Sources/"*.swift
 
+ICON="${APP_DIR}/Forge.icns"
+if [ ! -f "$ICON" ]; then
+  echo "▸ Gerando ícone"
+  swift "${APP_DIR}/make-icon.swift" "$ICON" || echo "  aviso: ícone não gerado — o app usa o genérico"
+fi
+if [ -f "$ICON" ]; then
+  cp "$ICON" "${BUNDLE}/Contents/Resources/Forge.icns"
+fi
+
 cp "${APP_DIR}/Info.plist" "${BUNDLE}/Contents/Info.plist"
 
 echo "▸ Assinando (ad-hoc)"

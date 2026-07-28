@@ -144,6 +144,14 @@ enum Workspaces {
 
 @MainActor
 final class GateStore: ObservableObject {
+    /// Shared because two surfaces read it: the SwiftUI window and the
+    /// AppDelegate that keeps the Dock badge in sync.
+    static let shared = GateStore()
+
+    /// Posted after every reload so the Dock badge can follow without the
+    /// delegate having to poll on its own timer.
+    static let didChange = Notification.Name("GateStoreDidChange")
+
     @Published private(set) var pending: [Gate] = []
     @Published private(set) var recent: [Gate] = []
     @Published private(set) var workspaces: [String] = []
@@ -172,6 +180,7 @@ final class GateStore: ObservableObject {
         recent = all.filter { !$0.isPending }
             .sorted { $0.created_at > $1.created_at }
             .prefix(5).map { $0 }
+        NotificationCenter.default.post(name: Self.didChange, object: nil)
     }
 
     private static func readGates(in workspace: String) -> [Gate] {

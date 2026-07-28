@@ -1,58 +1,117 @@
-// ForgeApp — menu bar app for answering Forge gates.
+// ForgeApp — desktop app for answering Forge gates.
 //
 // This is the "house" around the gate protocol: a headless run parks on a
-// question, this shows it in the menu bar, and one click answers it. It is a
-// SECOND front-end over the same files — the terminal stays first-class, and
-// nothing here is required for the protocol to work.
+// question, this shows it, and one click answers it. It is a SECOND front-end
+// over the same files — the terminal stays first-class, and nothing here is
+// required for the protocol to work.
 //
-// LSUIElement is set in Info.plist so there is no Dock icon: the app lives in
-// the menu bar only.
+// WHY A REGULAR WINDOWED APP AND NOT MENU-BAR-ONLY
+// ------------------------------------------------
+// The first cut was MenuBarExtra with LSUIElement. It worked — the NSStatusItem
+// was created, visible, alpha 1.0 — and was still invisible on the author's
+// machine, because macOS stacks status items right-to-left and this one landed
+// at x=634 on a 1512pt display whose safeAreaInsets.top is 32: dead behind the
+// MacBook Pro notch. No API lets an app choose its slot in the menu bar, so a
+// menu-bar-only design is at the mercy of how full the user's bar happens to be.
+//
+// A Dock icon with a badge cannot be hidden by a notch, and "open the app" is
+// what was actually asked for. The status item is still installed as a bonus
+// when there is room for it.
 
 import SwiftUI
 import AppKit
 
 @main
 struct ForgeApp: App {
-    @StateObject private var store = GateStore()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var store = GateStore.shared
 
     var body: some Scene {
-        MenuBarExtra {
-            GatePanel(store: store)
-                // .window style gives a real SwiftUI surface instead of a plain
-                // NSMenu, which is what lets each gate render its question,
-                // context and one button per option.
-                .frame(width: 420)
-        } label: {
-            MenuBarLabel(count: store.pending.count)
+        WindowGroup("Forge") {
+            ContentView(store: store)
+                .frame(minWidth: 420, minHeight: 320)
         }
-        .menuBarExtraStyle(.window)
-    }
-}
-
-/// Bolt plus a count. The count is the whole point — it answers "does Forge
-/// need me right now?" without opening anything.
-struct MenuBarLabel: View {
-    let count: Int
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: count > 0 ? "bolt.fill" : "bolt")
-            if count > 0 { Text("\(count)") }
+        .defaultSize(width: 480, height: 600)
+        .commands {
+            CommandGroup(after: .newItem) {
+                Button("Atualizar") { store.reload() }
+                    .keyboardShortcut("r", modifiers: .command)
+            }
         }
     }
 }
 
-struct GatePanel: View {
+// MARK: - Delegate: Dock badge + optional status item
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem?
+    private var observer: NSObjectProtocol?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        installStatusItem()
+        refreshBadge()
+        observer = NotificationCenter.default.addObserver(
+            forName: GateStore.didChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshBadge() }
+        }
+    }
+
+    /// Reopening from the Dock with no window left (user closed it) should bring
+    /// the list back rather than doing nothing.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            for w in sender.windows where w.canBecomeMain {
+                w.makeKeyAndOrderFront(nil)
+                return true
+            }
+        }
+        return true
+    }
+
+    /// The badge is the notch-proof signal: a number on the Dock icon that says
+    /// "Forge is waiting on you" without needing any menu bar real estate.
+    @MainActor
+    private func refreshBadge() {
+        let n = GateStore.shared.pending.count
+        NSApp.dockTile.badgeLabel = n > 0 ? "\(n)" : nil
+        statusItem?.button?.title = n > 0 ? " \(n)" : ""
+    }
+
+    /// Best-effort. On a crowded menu bar (especially with a notch) this may
+    /// never be drawn — which is exactly why it is not the primary surface.
+    private func installStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(
+            systemSymbolName: "bolt.fill", accessibilityDescription: "Forge")
+        item.button?.imagePosition = .imageLeading
+        item.button?.target = self
+        item.button?.action = #selector(openWindow)
+        statusItem = item
+    }
+
+    @objc private func openWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        for w in NSApp.windows where w.canBecomeMain {
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+    }
+}
+
+// MARK: - Main view
+
+struct ContentView: View {
     @ObservedObject var store: GateStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-
             Divider()
 
             if store.pending.isEmpty {
                 EmptyState(store: store)
+                Spacer()
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
@@ -62,16 +121,13 @@ struct GatePanel: View {
                         }
                     }
                 }
-                .frame(maxHeight: 460)
             }
 
             if let err = store.lastError, !err.isEmpty {
                 Divider()
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(10)
-                    .textSelection(.enabled)
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+                    .padding(10).textSelection(.enabled)
             }
 
             Divider()
@@ -80,33 +136,35 @@ struct GatePanel: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 8) {
             Image(systemName: "bolt.fill").foregroundStyle(.orange)
             Text("Forge").font(.headline)
             Spacer()
             if store.pending.isEmpty {
-                Text("tudo em dia").font(.caption).foregroundStyle(.secondary)
+                Label("tudo em dia", systemImage: "checkmark.circle.fill")
+                    .font(.caption).foregroundStyle(.green)
             } else {
-                Text("^[\(store.pending.count) pergunta](inflect: true)")
-                    .font(.caption).foregroundStyle(.orange)
+                Text(store.pending.count == 1 ? "1 pergunta" : "\(store.pending.count) perguntas")
+                    .font(.caption).bold().foregroundStyle(.orange)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14).padding(.vertical, 10)
     }
 
     private var footer: some View {
         HStack(spacing: 12) {
             Button("Adicionar projeto…") { pickWorkspace() }
-                .buttonStyle(.link)
             Spacer()
             Text("\(store.workspaces.count) projeto(s)")
                 .font(.caption2).foregroundStyle(.secondary)
-            Button("Sair") { NSApplication.shared.terminate(nil) }
-                .buttonStyle(.link)
+            Button {
+                store.reload()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .help("Atualizar (⌘R)")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 14).padding(.vertical, 10)
     }
 
     private func pickWorkspace() {
@@ -116,7 +174,6 @@ struct GatePanel: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Observar"
         panel.message = "Escolha a pasta de um projeto que usa o Forge (.gsd/)"
-        // Bring the picker forward — a menu bar app has no window to own it.
         NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url {
             store.addWorkspace(url.path)
@@ -130,7 +187,7 @@ struct GateCard: View {
     @ObservedObject var store: GateStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 Text(gate.projectName)
                     .font(.caption).bold()
@@ -141,8 +198,8 @@ struct GateCard: View {
                 }
                 Spacer()
                 if let left = gate.timeLeft {
-                    // Surfacing the fallback is the honest thing to do: if the
-                    // human ignores this, the run WILL proceed with `default`.
+                    // Surfacing the fallback is the honest thing to do: ignoring
+                    // the gate is a real outcome — the run WILL take `default`.
                     Text("⏳ \(left) → \(gate.defaultLabel)")
                         .font(.caption2).foregroundStyle(.secondary)
                         .help("Sem resposta, o Forge segue com \"\(gate.defaultLabel)\"")
@@ -153,15 +210,13 @@ struct GateCard: View {
 
             if let ctx = gate.context, !ctx.isEmpty {
                 Text(ctx)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(8).frame(maxWidth: .infinity, alignment: .leading)
                     .background(.quaternary.opacity(0.4),
                                 in: RoundedRectangle(cornerRadius: 6))
             }
 
-            VStack(spacing: 4) {
+            VStack(spacing: 5) {
                 ForEach(gate.options) { opt in
                     Button {
                         store.answer(gate, choice: opt.key)
@@ -174,15 +229,20 @@ struct GateCard: View {
                                     .lineLimit(2)
                             }
                             Spacer()
+                            if opt.key == gate.default {
+                                Text("padrão").font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         .contentShape(Rectangle())
+                        .padding(.vertical, 2)
                     }
                     .buttonStyle(.bordered)
                     .frame(maxWidth: .infinity)
                 }
             }
         }
-        .padding(12)
+        .padding(14)
     }
 }
 
@@ -199,29 +259,25 @@ struct EmptyState: View {
             } else {
                 Label("Nenhuma pergunta pendente", systemImage: "checkmark.circle")
                     .font(.callout).foregroundStyle(.secondary)
-                Text("Quando um run precisar de você, aparece aqui e o Mac notifica.")
+                Text("Quando um run precisar de você, aparece aqui, o Dock mostra o número e o Mac notifica.")
                     .font(.caption).foregroundStyle(.secondary)
 
                 if !store.recent.isEmpty {
-                    Divider().padding(.vertical, 2)
+                    Divider().padding(.vertical, 4)
                     Text("Recentes").font(.caption).bold().foregroundStyle(.secondary)
                     ForEach(store.recent) { g in
                         HStack(spacing: 6) {
                             Image(systemName: icon(for: g.effectiveStatus))
-                                .foregroundStyle(color(for: g.effectiveStatus))
-                                .font(.caption2)
-                            Text(g.answer?.label ?? g.effectiveStatus)
-                                .font(.caption2)
-                            Text(g.question)
-                                .font(.caption2).foregroundStyle(.secondary)
-                                .lineLimit(1)
+                                .foregroundStyle(color(for: g.effectiveStatus)).font(.caption2)
+                            Text(g.answer?.label ?? g.effectiveStatus).font(.caption2)
+                            Text(g.question).font(.caption2)
+                                .foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
                 }
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14).frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func icon(for status: String) -> String {
