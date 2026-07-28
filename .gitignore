@@ -17,3 +17,6 @@ do-not-commit/
 
 # macOS app build output
 app/build/
+
+# SPM build artefacts
+app/.build/

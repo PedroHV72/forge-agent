@@ -36,12 +36,16 @@ echo "▸ Limpando build anterior"
 rm -rf "$BUNDLE"
 mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources"
 
-echo "▸ Compilando (swiftc $(swiftc --version 2>/dev/null | head -1 | sed 's/.*version //;s/ .*//'))"
-# -parse-as-library is required for the @main entry point.
-swiftc -O -parse-as-library \
-  -target arm64-apple-macosx13.0 \
-  -o "${BUNDLE}/Contents/MacOS/Forge" \
-  "${APP_DIR}/Sources/"*.swift
+echo "▸ Compilando (swift build, SwiftTerm)"
+# SPM rather than a bare swiftc invocation: the terminal needs SwiftTerm's VT
+# emulator as a dependency. First build downloads it; later builds are cached.
+( cd "$APP_DIR" && swift build -c release --arch arm64 ) || exit 1
+BIN="$(cd "$APP_DIR" && swift build -c release --arch arm64 --show-bin-path)/Forge"
+if [ ! -f "$BIN" ]; then
+  echo "build.sh: binário não encontrado em $BIN" >&2
+  exit 1
+fi
+cp "$BIN" "${BUNDLE}/Contents/MacOS/Forge"
 
 ICON="${APP_DIR}/Forge.icns"
 if [ ! -f "$ICON" ]; then

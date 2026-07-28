@@ -1,0 +1,319 @@
+// TerminalView — a real terminal inside the app.
+//
+// Backed by SwiftTerm's LocalProcessTerminalView, which owns the PTY and the
+// VT emulation. Claude Code repaints continuously (alternate screen, cursor
+// addressing, 256 colours), so nothing less than a real emulator renders it
+// correctly — a partial ANSI parser yields a garbled screen, not a plain one.
+//
+// The shell is started as a LOGIN shell so the user's rc runs. That matters
+// here specifically: install.sh wires `eval "$(forge-accounts shell-init)"`
+// into the rc, and that hook is what attaches the right Claude account to a
+// bare `claude`. Skipping the login shell would silently run every session on
+// the wrong account.
+
+import SwiftUI
+import AppKit
+import SwiftTerm
+
+// MARK: - Session model
+
+@MainActor
+final class TerminalSession: ObservableObject, Identifiable {
+    let id = UUID()
+    let cwd: String
+    let title: String
+
+    /// Command queued to run once the shell is ready. Sent as keystrokes rather
+    /// than as argv so it lands in shell history and stays visible/editable.
+    let bootstrap: String?
+
+    @Published var isRunning = true
+    @Published var exitLabel: String?
+
+    var projectName: String { URL(fileURLWithPath: cwd).lastPathComponent }
+
+    init(cwd: String, title: String, bootstrap: String? = nil) {
+        self.cwd = cwd
+        self.title = title
+        self.bootstrap = bootstrap
+    }
+}
+
+// MARK: - NSViewRepresentable bridge
+
+struct TerminalHost: NSViewRepresentable {
+    @ObservedObject var session: TerminalSession
+
+    func makeCoordinator() -> Coordinator { Coordinator(session: session) }
+
+    func makeNSView(context: Context) -> LocalProcessTerminalView {
+        let view = LocalProcessTerminalView(frame: .zero)
+        view.processDelegate = context.coordinator
+
+        let term = view.getTerminal()
+        term.setCursorStyle(.blinkBlock)
+        applyTheme(view)
+
+        // A login shell so ~/.zshrc runs — see the note at the top of the file.
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        var env = Terminal.getEnvironmentVariables(termName: "xterm-256color")
+        env.append("LANG=en_US.UTF-8")
+        // Marks the session so Forge tooling (and the user) can tell where it runs.
+        env.append("FORGE_APP=1")
+
+        // SwiftTerm inherits the parent's cwd, so it has to be set around the
+        // spawn — and restored immediately. Leaving it changed would silently
+        // reroute every relative path in the app, and each new session would
+        // inherit the previous one's directory.
+        let previousCwd = FileManager.default.currentDirectoryPath
+        FileManager.default.changeCurrentDirectoryPath(session.cwd)
+        view.startProcess(
+            executable: shell,
+            args: ["-l"],
+            environment: env,
+            execName: "-\(URL(fileURLWithPath: shell).lastPathComponent)")
+        FileManager.default.changeCurrentDirectoryPath(previousCwd)
+
+        if let boot = session.bootstrap {
+            context.coordinator.scheduleBootstrap(boot, on: view)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
+        applyTheme(nsView)
+    }
+
+    /// Colours tuned to sit next to the app's own surfaces rather than to
+    /// imitate Terminal.app.
+    private func applyTheme(_ view: LocalProcessTerminalView) {
+        view.nativeBackgroundColor = NSColor(calibratedRed: 0.07, green: 0.07,
+                                             blue: 0.085, alpha: 1)
+        view.nativeForegroundColor = NSColor(calibratedWhite: 0.88, alpha: 1)
+        view.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
+        let session: TerminalSession
+        private var didBootstrap = false
+
+        init(session: TerminalSession) { self.session = session }
+
+        /// Give the login shell a beat to finish sourcing rc files before typing
+        /// into it, otherwise the keystrokes race the prompt and get eaten.
+        func scheduleBootstrap(_ command: String, on view: LocalProcessTerminalView) {
+            guard !didBootstrap else { return }
+            didBootstrap = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak view] in
+                guard let view else { return }
+                view.send(txt: command + "\n")
+            }
+        }
+
+        func processTerminated(source: TerminalView, exitCode: Int32?) {
+            session.isRunning = false
+            session.exitLabel = exitCode.map { $0 == 0 ? "encerrado" : "saiu com código \($0)" }
+                ?? "encerrado"
+        }
+
+        func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
+        func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+    }
+}
+
+// MARK: - Terminal screen
+
+struct TerminalsView: View {
+    @ObservedObject var state: AppState
+    @State private var selection: UUID?
+    @State private var showLauncher = false
+
+    var body: some View {
+        Group {
+            if state.sessions.isEmpty {
+                launcherPane
+            } else {
+                VStack(spacing: 0) {
+                    tabBar
+                    Divider()
+                    ZStack {
+                        // Every session stays mounted; hiding rather than
+                        // unmounting keeps the PTY and scrollback alive when
+                        // you switch tabs.
+                        ForEach(state.sessions) { s in
+                            TerminalHost(session: s)
+                                .opacity(s.id == currentID ? 1 : 0)
+                                .allowsHitTesting(s.id == currentID)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Terminal")
+        .sheet(isPresented: $showLauncher) {
+            LauncherSheet(state: state, isPresented: $showLauncher)
+        }
+        .toolbar {
+            ToolbarItem {
+                Button { showLauncher = true } label: {
+                    Label("Nova sessão", systemImage: "plus")
+                }
+            }
+        }
+        .onAppear { if selection == nil { selection = state.sessions.first?.id } }
+    }
+
+    private var currentID: UUID? {
+        if let selection, state.sessions.contains(where: { $0.id == selection }) {
+            return selection
+        }
+        return state.sessions.first?.id
+    }
+
+    private var tabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(state.sessions) { s in
+                    let active = s.id == currentID
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(s.isRunning ? Color.green : Color.secondary)
+                            .frame(width: 6, height: 6)
+                        Text(s.title).font(.caption)
+                        Button {
+                            state.closeSession(s)
+                            if selection == s.id { selection = state.sessions.first?.id }
+                        } label: {
+                            Image(systemName: "xmark").font(.system(size: 8))
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(active ? AnyShapeStyle(.quaternary)
+                                       : AnyShapeStyle(.clear),
+                                in: RoundedRectangle(cornerRadius: 7))
+                    .contentShape(Rectangle())
+                    .onTapGesture { selection = s.id }
+                }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 7)
+        }
+    }
+
+    private var launcherPane: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            VStack(spacing: 14) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 34)).foregroundStyle(.tertiary)
+                Text("Nenhuma sessão aberta").font(.headline)
+                Text("Rode o Forge aqui dentro — o terminal é real, com sua conta e suas skills.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 320)
+                Button("Nova sessão…") { showLauncher = true }
+                    .controlSize(.large)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: - Launcher
+
+struct LauncherSheet: View {
+    @ObservedObject var state: AppState
+    @Binding var isPresented: Bool
+
+    @State private var workspace = ""
+    @State private var mode: Mode = .auto
+    @State private var text = ""
+    @State private var account = ""
+
+    enum Mode: String, CaseIterable, Identifiable {
+        case auto = "Continuar milestone"
+        case newMilestone = "Novo milestone"
+        case task = "Task avulsa"
+        case shell = "Só o shell"
+        var id: String { rawValue }
+
+        var hint: String {
+            switch self {
+            case .auto:         return "/forge-auto — retoma de onde parou"
+            case .newMilestone: return "/forge-new-milestone — brainstorm, discuss e plano"
+            case .task:         return "/forge-task — trabalho pontual, sem milestone"
+            case .shell:        return "abre o shell sem rodar nada"
+            }
+        }
+
+        var needsText: Bool { self == .newMilestone || self == .task }
+
+        var shortLabel: String {
+            switch self {
+            case .auto:         return "auto"
+            case .newMilestone: return "milestone"
+            case .task:         return "task"
+            case .shell:        return "shell"
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Nova sessão").font(.headline)
+
+            Picker("Projeto", selection: $workspace) {
+                ForEach(state.workspaces, id: \.self) { ws in
+                    Text(URL(fileURLWithPath: ws).lastPathComponent).tag(ws)
+                }
+            }
+
+            Picker("Conta", selection: $account) {
+                Text("padrão").tag("")
+                ForEach(state.accounts.filter(\.has_token)) { a in
+                    Text(a.name).tag(a.name)
+                }
+            }
+
+            Picker("O que fazer", selection: $mode) {
+                ForEach(Mode.allCases) { m in Text(m.rawValue).tag(m) }
+            }
+            .pickerStyle(.radioGroup)
+
+            Text(mode.hint).font(.caption).foregroundStyle(.secondary)
+
+            if mode.needsText {
+                TextField(mode == .task ? "O que precisa ser feito?"
+                                        : "Descreva o milestone (opcional)",
+                          text: $text, axis: .vertical)
+                    .textFieldStyle(.roundedBorder).lineLimit(2...5)
+            }
+
+            HStack {
+                Button("Cancelar") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Abrir") { open() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(resolvedWorkspace.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onAppear {
+            if workspace.isEmpty { workspace = state.workspaces.first ?? "" }
+            state.loadAccounts()
+        }
+    }
+
+    private var resolvedWorkspace: String {
+        workspace.isEmpty ? (state.workspaces.first ?? "") : workspace
+    }
+
+    private func open() {
+        state.newSession(cwd: resolvedWorkspace, mode: mode, text: text, account: account)
+        isPresented = false
+    }
+}

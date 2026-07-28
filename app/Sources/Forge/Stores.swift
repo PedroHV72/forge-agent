@@ -60,6 +60,9 @@ final class AppState: ObservableObject {
     @Published var usageCheckedAt: Date?
     @Published var toast: Toast?
 
+    /// Live terminal sessions hosted inside the app.
+    @Published private(set) var sessions: [TerminalSession] = []
+
     private var timer: Timer?
 
     struct Toast: Identifiable, Equatable {
@@ -181,12 +184,46 @@ final class AppState: ObservableObject {
         ForgeCore.isPaused(cwd: run.cwd, runId: run.id)
     }
 
+    // MARK: Terminal sessions
+
+    /// Open a terminal inside the app. The account is selected with
+    /// `claude --account <name>`, the flag the shell-init hook understands —
+    /// never by exporting a token, which would leak it into the environment.
+    func newSession(cwd: String, mode: LauncherSheet.Mode, text: String, account: String) {
+        let desc = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var claudeArgs = ""
+        if !account.isEmpty { claudeArgs = " --account \(shq(account))" }
+
+        var boot: String?
+        switch mode {
+        case .shell:
+            boot = nil
+        case .auto:
+            boot = "claude\(claudeArgs) \(shq("/forge-auto"))"
+        case .newMilestone:
+            let slash = desc.isEmpty ? "/forge-new-milestone" : "/forge-new-milestone \(desc)"
+            boot = "claude\(claudeArgs) \(shq(slash))"
+        case .task:
+            guard !desc.isEmpty else { return show("descreva a task", error: true) }
+            boot = "claude\(claudeArgs) \(shq("/forge-task \(desc)"))"
+        }
+
+        let title = URL(fileURLWithPath: cwd).lastPathComponent
+            + (mode == .shell ? "" : " · \(mode.shortLabel)")
+        sessions.append(TerminalSession(cwd: cwd, title: title, bootstrap: boot))
+    }
+
+    func closeSession(_ s: TerminalSession) {
+        sessions.removeAll { $0.id == s.id }
+    }
+
+    private func shq(_ s: String) -> String { ForgeCore.shellQuote(s) }
+
+    /// Open a terminal on another account, in-app.
     func launch(account: String) {
         let cwd = workspaces.first ?? FileManager.default.homeDirectoryForCurrentUser.path
-        let r = ForgeCore.run("forge-accounts.js",
-                              ["--launch", account, "--new-window"], cwd: cwd)
-        if r.ok { show("Abrindo terminal na conta \(account)") }
-        else { show(r.stderr.isEmpty ? "falha ao lançar" : r.stderr, error: true) }
+        newSession(cwd: cwd, mode: .shell, text: "", account: account)
+        sessions.last.map { _ in show("Sessão aberta na conta \(account)") }
     }
 
     func openTerminal(at cwd: String, command: String, title: String) {
@@ -194,26 +231,14 @@ final class AppState: ObservableObject {
         if r.ok { show(title) } else { show(r.stderr, error: true) }
     }
 
-    /// Resume an existing run in a fresh terminal. /forge-auto takes the run id
-    /// and picks up from disk state.
+    /// Resume an existing run in an in-app terminal. /forge-auto takes the run
+    /// id and picks up from disk state.
     func resume(_ run: Run) {
-        openTerminal(at: run.cwd,
-                     command: "claude \(ForgeCore.shellQuote("/forge-auto \(run.id)"))",
-                     title: "Retomando \(run.id)")
-    }
-
-    func startMilestone(in cwd: String, description: String) {
-        let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
-        let slash = desc.isEmpty ? "/forge-new-milestone" : "/forge-new-milestone \(desc)"
-        openTerminal(at: cwd, command: "claude \(ForgeCore.shellQuote(slash))",
-                     title: "Novo milestone")
-    }
-
-    func startTask(in cwd: String, description: String) {
-        let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !desc.isEmpty else { return show("descreva a task", error: true) }
-        openTerminal(at: cwd, command: "claude \(ForgeCore.shellQuote("/forge-task \(desc)"))",
-                     title: "Nova task")
+        let title = "\(run.projectName) · \(run.id)"
+        sessions.append(TerminalSession(
+            cwd: run.cwd, title: title,
+            bootstrap: "claude \(shq("/forge-auto \(run.id)"))"))
+        show("Sessão aberta — veja em Terminal")
     }
 
     func addWorkspace(_ p: String)    { Workspaces.add(p); reloadCheap() }

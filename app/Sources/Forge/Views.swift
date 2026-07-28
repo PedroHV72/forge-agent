@@ -16,8 +16,10 @@ import AppKit
 
 enum Section: String, CaseIterable, Identifiable {
     case now = "Agora"
+    case terminal = "Terminal"
     case runs = "Runs"
     case accounts = "Contas"
+    case prefs = "Preferências"
     case history = "Histórico"
 
     var id: String { rawValue }
@@ -25,8 +27,10 @@ enum Section: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .now:      return "bolt.fill"
+        case .terminal: return "terminal"
         case .runs:     return "play.circle"
         case .accounts: return "person.2"
+        case .prefs:    return "slider.horizontal.3"
         case .history:  return "clock.arrow.circlepath"
         }
     }
@@ -68,8 +72,10 @@ struct RootView: View {
             Group {
                 switch section ?? .now {
                 case .now:      NowView(state: state)
+                case .terminal: TerminalsView(state: state)
                 case .runs:     RunsView(state: state)
                 case .accounts: AccountsView(state: state)
+                case .prefs:    PrefsView(state: state)
                 case .history:  HistoryView(state: state)
                 }
             }
@@ -81,9 +87,10 @@ struct RootView: View {
 
     private func badge(for s: Section) -> Int? {
         switch s {
-        case .now:  return state.pending.isEmpty ? nil : state.pending.count
-        case .runs: return state.liveRuns.isEmpty ? nil : state.liveRuns.count
-        default:    return nil
+        case .now:      return state.pending.isEmpty ? nil : state.pending.count
+        case .runs:     return state.liveRuns.isEmpty ? nil : state.liveRuns.count
+        case .terminal: return state.sessions.isEmpty ? nil : state.sessions.count
+        default:        return nil
         }
     }
 
@@ -253,68 +260,40 @@ struct GateCard: View {
 
 struct RunsView: View {
     @ObservedObject var state: AppState
-    @State private var newDesc = ""
-    @State private var target: String = ""
+    @State private var showLauncher = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if state.liveRuns.isEmpty {
-                    Text("Nenhum run ativo.")
-                        .font(.callout).foregroundStyle(.secondary)
-                        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.quaternary.opacity(0.3),
-                                    in: RoundedRectangle(cornerRadius: 12))
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Nenhum run ativo.")
+                            .font(.callout).foregroundStyle(.secondary)
+                        Text("Um run aparece aqui assim que o /forge-auto começa — no terminal do app ou fora dele.")
+                            .font(.caption).foregroundStyle(.tertiary)
+                        Button("Abrir sessão…") { showLauncher = true }
+                            .controlSize(.small)
+                    }
+                    .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary.opacity(0.3),
+                                in: RoundedRectangle(cornerRadius: 12))
                 } else {
                     ForEach(state.liveRuns) { r in RunCard(run: r, state: state) }
                 }
-
-                SectionTitle("Iniciar")
-                launcher
             }
             .padding(18)
         }
         .navigationTitle("Runs")
-    }
-
-    private var launcher: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Picker("Projeto", selection: $target) {
-                ForEach(state.workspaces, id: \.self) { ws in
-                    Text(URL(fileURLWithPath: ws).lastPathComponent).tag(ws)
-                }
-            }
-            .labelsHidden()
-            .disabled(state.workspaces.isEmpty)
-
-            TextField("O que fazer? (milestone ou task)", text: $newDesc, axis: .vertical)
-                .textFieldStyle(.roundedBorder).lineLimit(1...3)
-
-            HStack(spacing: 8) {
-                Button("Novo milestone") {
-                    state.startMilestone(in: resolvedTarget, description: newDesc)
-                    newDesc = ""
-                }
-                Button("Task avulsa") {
-                    state.startTask(in: resolvedTarget, description: newDesc)
-                    newDesc = ""
-                }
-                Spacer()
-            }
-            .disabled(state.workspaces.isEmpty)
-
-            // The app opens a Terminal instead of adopting the process: an
-            // interactive claude needs a TTY, and the run must outlive the app.
-            Text("Abre um terminal no projeto — o run continua mesmo se você fechar o app.")
-                .font(.caption2).foregroundStyle(.tertiary)
+        .sheet(isPresented: $showLauncher) {
+            LauncherSheet(state: state, isPresented: $showLauncher)
         }
-        .padding(16)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
-        .onAppear { if target.isEmpty { target = state.workspaces.first ?? "" } }
-    }
-
-    private var resolvedTarget: String {
-        target.isEmpty ? (state.workspaces.first ?? "") : target
+        .toolbar {
+            ToolbarItem {
+                Button { showLauncher = true } label: {
+                    Label("Nova sessão", systemImage: "plus")
+                }
+            }
+        }
     }
 }
 
