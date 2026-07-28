@@ -20,6 +20,7 @@
 // CLI:
 //   node forge-isolation.js --setup --run M065 [--cwd <path>]
 //   node forge-isolation.js --cleanup --run M065 [--cwd <path>]
+//   node forge-isolation.js --attach M065 --run T123 [--cwd <path>]
 
 'use strict';
 
@@ -381,6 +382,46 @@ function cleanupWorktreeOne(repoPath, worktreePath) {
   return result;
 }
 
+// Validates a lender's registered worktree(s) without provisioning anything.
+// A fallback setup here would silently put the borrower on an unrelated branch.
+function attachForRun(cwd, runId, lenderRunId) {
+  if (!lenderRunId || typeof lenderRunId !== 'string') {
+    return { ok: false, attached: false, reason: 'missing-run-id', error: 'Informe o id do run que emprestará o worktree.' };
+  }
+
+  const lender = runs.get(cwd, lenderRunId);
+  if (!lender) {
+    return { ok: false, attached: false, reason: 'unknown-run', error: `Run emprestador não encontrado: ${lenderRunId}.` };
+  }
+  if (!Array.isArray(lender.worktrees) || lender.worktrees.length === 0) {
+    return {
+      ok: false,
+      attached: false,
+      reason: 'no-worktree-registered',
+      error: `O run ${lenderRunId} não tem worktree registrado; ele precisa ter rodado em modo worktree com esta versão.`,
+    };
+  }
+
+  for (const entry of lender.worktrees) {
+    if (!entry || typeof entry.path !== 'string' || !fs.existsSync(entry.path) || !fs.statSync(entry.path).isDirectory()) {
+      const missingPath = entry && entry.path ? entry.path : '(caminho ausente no registro)';
+      return { ok: false, attached: false, reason: 'worktree-path-missing', error: `Worktree registrado não existe ou não é diretório: ${missingPath}.` };
+    }
+  }
+
+  const first = lender.worktrees[0];
+  const codeDir = lender.worktrees.length === 1 ? first.path : path.dirname(first.path);
+  return {
+    ok: true,
+    mode: 'worktree',
+    attached: true,
+    attached_to: lenderRunId,
+    code_dir: codeDir,
+    branch: gitCurrentBranch(first.path),
+    repos: lender.worktrees.map(entry => ({ path: entry.repo, worktree: entry.path, status: 'attached' })),
+  };
+}
+
 // ── Public top-level ────────────────────────────────────────────────────────
 function setupForRun(cwd, runId, opts) {
   opts = opts || {};
@@ -436,6 +477,44 @@ function resolveCleanupMode(cwd, runId) {
 }
 
 function cleanupForRun(cwd, runId, opts) {
+  let rec = null;
+  try { rec = runs.get(cwd, runId); } catch { rec = null; }
+  if (rec && rec.attached_to) {
+    // Borrowed worktrees belong to another (possibly still active) run. A clean
+    // status does not make them disposable: cleanupWorktreeOne only protects
+    // uncommitted changes and would otherwise destroy valid in-flight work.
+    return {
+      mode: 'worktree',
+      mode_source: 'borrowed',
+      borrowed_from: rec.attached_to,
+      user_mode: null,
+      elevated: null,
+      elevation_reason: null,
+      repos: (rec.worktrees || []).map(e => ({
+        path: e.repo,
+        worktree: e.path,
+        status: 'skipped (borrowed)',
+        reason: 'worktree emprestado de ' + rec.attached_to + ' — nunca removido',
+      })),
+    };
+  }
+  // Lender-side guard (TASK-019 R1): the borrower-side `rec.attached_to`
+  // check above protects a path that path-derivation-by-convention never
+  // actually hits (a borrower's own runId never maps to the lender's
+  // worktree dir), so it guards nothing in practice today — it is kept
+  // because it is cheap, keeps borrowed status auditable in the JSON, and
+  // becomes load-bearing the moment path derivation ever switches from
+  // convention to the registry's `worktrees` field. The check that is
+  // actually load-bearing right now is this one: cleaning up the LENDER
+  // removes its tree by convention regardless of who has an active
+  // attach to it, so we must scan the registry for active borrowers of
+  // THIS runId before touching anything. Mirrors the 2026-06-10 worktree
+  // cleanup data-loss incident, newly reachable because borrowing exists.
+  let activeBorrowers = [];
+  try {
+    activeBorrowers = runs.listActive(cwd).filter(r => r.id !== runId && r.attached_to === runId);
+  } catch { activeBorrowers = []; }
+
   opts = opts || {};
   const prefs = readIsolationPrefs(cwd);
   const cm = resolveCleanupMode(cwd, runId);
@@ -448,6 +527,20 @@ function cleanupForRun(cwd, runId, opts) {
     elevation_reason: cm.elevation_reason === undefined ? null : cm.elevation_reason,
     repos: [],
   };
+
+  if (activeBorrowers.length > 0) {
+    const borrowerIds = activeBorrowers.map(r => r.id);
+    result.lent_to = borrowerIds;
+    const repoList = repos.discoverRepos(cwd);
+    for (const r of repoList) {
+      result.repos.push({
+        path: r,
+        status: `skipped (lent to ${borrowerIds.join(', ')})`,
+        reason: 'worktree emprestado a ' + borrowerIds.join(', ') + ' — nunca removido enquanto emprestimo ativo',
+      });
+    }
+    return result;
+  }
 
   if (mode === 'shared') return result;
 
@@ -490,12 +583,13 @@ function cliMain() {
   const args = parseArgs(process.argv.slice(2));
   const cwd  = args.cwd || process.cwd();
 
-  if (args.help || (!args.setup && !args.cleanup && !args.prefs && !args['effective-mode'])) {
+  if (args.help || (!args.setup && !args.cleanup && !args.attach && !args.prefs && !args['effective-mode'])) {
     process.stdout.write(`forge-isolation — setup/cleanup branch + worktree modes
 
 Flags:
   --setup --run <id>     setup branch or worktree per repo (idempotent)
   --cleanup --run <id>   cleanup (checkout main / remove worktree)
+  --attach <lender> --run <id>  validate and borrow a registered worktree (never creates one)
   --prefs                print resolved forge_isolation prefs
   --effective-mode       print resolveEffectiveMode JSON (git-free; shows require_worktree elevation)
   --cwd <path>           override working directory
@@ -517,6 +611,14 @@ Reads prefs from forge_isolation: + workers.require_worktree (cascade user → r
     } else if (args.cleanup) {
       const r = cleanupForRun(cwd, args.run);
       process.stdout.write(JSON.stringify(r, null, 2) + '\n');
+    } else if (args.attach) {
+      const lenderRunId = typeof args.attach === 'string' ? args.attach : '';
+      const r = attachForRun(cwd, args.run, lenderRunId);
+      process.stdout.write(JSON.stringify(r, null, 2) + '\n');
+      if (!r.ok) {
+        process.stderr.write(`forge-isolation attach: ${r.error}\n`);
+        process.exit(2);
+      }
     }
   } catch (e) {
     process.stderr.write(`forge-isolation error: ${e.message}\n`);
@@ -527,7 +629,7 @@ Reads prefs from forge_isolation: + workers.require_worktree (cascade user → r
 if (require.main === module) cliMain();
 
 module.exports = {
-  setupForRun, cleanupForRun, readIsolationPrefs,
+  setupForRun, cleanupForRun, attachForRun, readIsolationPrefs,
   resolveEffectiveMode, detectExternalWriteEngine, resolveRequireWorktree, resolveCleanupMode,
   resolveBranchName, gitDefaultBranch, gitCurrentBranch,
   gitHasOriginRemote, fetchDefaultBranch,

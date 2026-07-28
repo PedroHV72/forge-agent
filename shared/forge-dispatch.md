@@ -53,6 +53,7 @@ Isolation rule: all source-code reads, writes, builds and git commits happen ins
 Semantics for workers:
 - **`branch`** — `CODE_DIR == WORKING_DIR`. The orchestrator already checked out `BRANCH`; commit on it and never switch back to the default branch mid-unit.
 - **`worktree`** — `CODE_DIR` is a physical worktree (e.g. `.forge-worktrees/{run-id}/{repo}/`). Use `CODE_DIR` for every source file path and run git with `git -C "{CODE_DIR}" …`. `.gsd/**` reads/writes (plans, summaries, events) keep using `WORKING_DIR` paths — the GSD state never moves into the worktree.
+- **Borrowed `worktree`** (`/forge-task --attach`) — `CODE_DIR` belongs to the lender run and `BRANCH` is the lender's branch. Workers commit there normally; the borrower cleanup never removes the borrowed tree.
 - Header absent → `shared` mode; nothing changes.
 - When the header is present with `ISOLATION: worktree`, commands in the templates that take `--cwd "{WORKING_DIR}"` for **code verification/build** (e.g. `forge-verify.js`) run with `--cwd "{CODE_DIR}"` instead; `--plan`/artifact paths under `.gsd/**` keep `{WORKING_DIR}`. `forge-verifier.js` is the exception: it needs both `--cwd {WORKING_DIR}` for plans and artifacts and `--code-dir {CODE_DIR}` for code/import verification.
 

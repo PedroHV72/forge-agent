@@ -8,6 +8,7 @@ allowed-tools: Read, Write, Edit, Bash, Agent, Skill, AskUserQuestion, TaskCreat
 
 From `$ARGUMENTS`:
 - If contains `--resume <id>` (aceita `T-<ts>-<slug>` ou o legado `TASK-###`) → **RESUME MODE**: set `TASK_ID` to that ID, skip init
+- `--attach <run-id>` → `ATTACH_RUN = <run-id>`. A task passa a operar dentro do worktree desse run, na branch dele.
 - `--skip-brainstorm` or `-skip-brainstorm` → `SKIP_BRAINSTORM = true`
 - `--skip-research` or `-skip-research` → `SKIP_RESEARCH = true`
 - Remaining text after all flags → `TASK_DESCRIPTION`
@@ -15,6 +16,9 @@ From `$ARGUMENTS`:
 If `TASK_DESCRIPTION` is empty AND not resume mode → stop and tell the user:
 > Descreva a task: `/forge-task <descrição>`
 > Para pular brainstorm: `/forge-task --skip-brainstorm <descrição>`
+
+If `--attach` has no value, stop and tell the user:
+> Informe o run a anexar: `/forge-task --attach <run-id> <descrição>`
 
 ---
 
@@ -116,8 +120,35 @@ TASK_ID=$(node "$FORGE_SCRIPTS_DIR/forge-ids.js" --new-task "$TASK_DESCRIPTION")
 - Resume mode: `TASK_ID` already set — skip to Dispatch loop
 - Formato do `TASK_ID` segue a pref `ids.format` (resolvida pelo próprio forge-ids.js): `timestamp` (default) → `T-<YYYYMMDDHHMMSS>-<slug>` (slug omitido se a descrição for vaga); `sequential` → legado `TASK-00N` (max existente + 1 em `.gsd/tasks/`)
 
-**Isolation setup (branch/worktree)** — apply `forge_isolation` from prefs BEFORE registering the run. Idempotent — safe on resume (`already-on-branch` / `already-exists`):
+**Isolation setup (branch/worktree)** — apply `forge_isolation` from prefs BEFORE registering the run. An explicit attach validates a registered lender and never creates a worktree; setup remains idempotent (`already-on-branch` / `already-exists`):
+
+On resume, `--attach` is never re-supplied on the command line (the skill's own resume hint is `/forge-task --resume {TASK_ID}` with no `--attach`). If `ATTACH_RUN` were left empty here, resume would silently fall into the `--setup` branch below and provision a brand-new worktree off the default branch — losing the lender's branch and the work already on it. So before branching on `$ATTACH_RUN`, recover an existing attach from the registry when resuming:
 ```bash
+if [ -n "$RESUME_MODE" ] && [ -z "$ATTACH_RUN" ]; then
+  EXISTING_ATTACH=$(node -e "
+    const runs=require('$FORGE_SCRIPTS_DIR/forge-runs.js');
+    const rec=runs.get(process.cwd(), process.argv[1]);
+    process.stdout.write((rec && rec.attached_to) ? rec.attached_to : '');
+  " "$TASK_ID")
+  [ -n "$EXISTING_ATTACH" ] && ATTACH_RUN="$EXISTING_ATTACH" && echo "⛓ Isolation: resumindo attach registrado a $ATTACH_RUN"
+fi
+
+if [ -n "$ATTACH_RUN" ]; then
+  ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --attach "$ATTACH_RUN" --run "$TASK_ID" --cwd "$(pwd)")
+  ATTACH_RC=$?
+  ISOLATION_MODE="worktree"
+  WORKTREE_DIR=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).code_dir)||'')" "$ISO_RESULT")
+  ATTACH_BRANCH=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).branch)||'')" "$ISO_RESULT")
+  ATTACH_REASON=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).reason)||'')" "$ISO_RESULT")
+  ATTACH_ERROR=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).error)||'')" "$ISO_RESULT")
+  if [ "$ATTACH_RC" -ne 0 ]; then
+    echo "✗ Não foi possível anexar ao run $ATTACH_RUN: $ATTACH_REASON — $ATTACH_ERROR" >&2
+    exit "$ATTACH_RC"
+  fi
+  CODE_DIR="$WORKTREE_DIR"
+  BRANCH="$ATTACH_BRANCH"
+  echo "⛓ Isolation: worktree emprestado de $ATTACH_RUN → $WORKTREE_DIR (branch $ATTACH_BRANCH)"
+else
 ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$TASK_ID" --cwd "$(pwd)")
 ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
 WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
@@ -126,6 +157,7 @@ ELEVATED=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).elev
 ELEV_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).elevation_reason||'')" "$ISO_RESULT")
 echo "ISOLATION_MODE=$ISOLATION_MODE  WORKTREE_DIR=${WORKTREE_DIR:-—}  ISO_ERRORS=${ISO_ERRORS:-none}"
 [ "$ELEVATED" = "true" ] && echo "⚠ require_worktree: elevado a worktree ($ELEV_REASON) → CODE_DIR=${WORKTREE_DIR:-?}"
+fi
 ```
 
 Isolation rules (CRITICAL — the operator configured this; honor it):
@@ -135,12 +167,16 @@ Isolation rules (CRITICAL — the operator configured this; honor it):
 - `ISO_ERRORS` non-empty AND no repo succeeded → STOP and surface the errors. Running un-isolated when the operator configured isolation is NOT an acceptable fallback.
 - When mode != shared, emit one line: `⛓ Isolation: {mode} → {branch name or worktree path}`.
 - `workers.require_worktree` elevation is static-at-activation (never mid-run); `auto` (default) elevates `shared→worktree` only when `execute-task` resolves to an external write engine (codex/gpt/gemini); `true` always elevates; `false` never elevates. Read-only paths (Branch D plan-slice, review challenger) are exempt. Warn-and-proceed — never blocks; false-positive acceptable, false-negative not. Keep `shared`: `workers.require_worktree: false`.
+- `ATTACH_RC != 0` → **STOP loud** with the JSON `reason` and `error`. Never fall back to setup: the operator requested milestone code, not a new tree based on the default branch.
+- Attached worktrees set `CODE_DIR = $WORKTREE_DIR` and `BRANCH = $ATTACH_BRANCH`; the branch is the lender's branch, never `forge/{TASK_ID}`.
+- A borrowed worktree is never removed during task cleanup. This is guaranteed by the borrower registry field `attached_to`, not by the skill's good will.
 
 **Register in multi-run registry** (M004+) — only when initializing fresh (not on resume):
 ```bash
 if [ -z "$RESUME_MODE" ]; then
-  SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
+  SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}" 
+  WORKTREES_JSON=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write(JSON.stringify((r.repos||[]).filter(x=>x.worktree&&x.status!=='error').map(x=>({repo:x.path,path:x.worktree}))))" "$ISO_RESULT")
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --attached-to "${ATTACH_RUN:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
   # Regenerate dashboard
   node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
 fi

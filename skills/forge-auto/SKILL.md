@@ -169,6 +169,7 @@ WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]
 ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
 ELEVATED=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).elevated||false))" "$ISO_RESULT")
 ELEV_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).elevation_reason||'')" "$ISO_RESULT")
+WORKTREES_JSON=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write(JSON.stringify((r.repos||[]).filter(x=>x.worktree&&x.status!=='error').map(x=>({repo:x.path,path:x.worktree}))))" "$ISO_RESULT")
 echo "ISOLATION_MODE=$ISOLATION_MODE"
 echo "WORKTREE_DIR=${WORKTREE_DIR:-—}"
 echo "ISO_ERRORS=${ISO_ERRORS:-none}"
@@ -192,14 +193,14 @@ Branch on `$STATUS`:
 - **`activate-new`** — register the new run:
   ```bash
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$RUN_ID" --kind "$RUN_KIND" --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --cwd "$WORKING_DIR" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$RUN_ID" --kind "$RUN_KIND" --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --cwd "$WORKING_DIR" > /dev/null
   echo "$MSG"
   ```
   Then continue to legacy activation (which writes auto-mode-started.txt + alias).
 - **`resume`** — emit `$MSG`, set `RUN_ID` (already set). Update the existing registry entry with the new session_id (the previous orchestrator process exited; this is a fresh session that needs to own heartbeat updates) and the freshly-resolved isolation mode:
   ```bash
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"session_id\":\"$SESSION_ID\",\"active\":true,\"isolation_mode\":\"$ISOLATION_MODE\"}" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"session_id\":\"$SESSION_ID\",\"active\":true,\"isolation_mode\":\"$ISOLATION_MODE\",\"worktrees\":$WORKTREES_JSON}" > /dev/null
   ```
   Without this, `forge-hook.resolveBySessionId` won't match — heartbeats fall back to legacy `auto-mode.json` and `runs/{id}.json` becomes stale.
 

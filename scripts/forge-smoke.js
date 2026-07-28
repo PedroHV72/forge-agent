@@ -447,6 +447,13 @@ function smokeIsolation() {
     return spawnSync('git', args, { cwd, encoding: 'utf8', env });
   }
 
+  // Defensive JSON.parse: against pre-change binaries, stdout may be empty,
+  // malformed, or missing fields the newer asserts expect. Never throw here —
+  // return {} so downstream optional-chained accesses fail cleanly instead.
+  function parseJSON(s) {
+    try { return JSON.parse(s); } catch (e) { return {}; }
+  }
+
   // Sandbox git repo
   const repo = path.join(dir, 'repo');
   fs.mkdirSync(path.join(repo, '.gsd'), { recursive: true });
@@ -546,6 +553,133 @@ function smokeIsolation() {
   assert(res.repos[0].base === 'origin/main', 'worktree base is origin/main, not local main', r.stdout);
   assert(wtF && fs.existsSync(path.join(wtF, 'fresh.txt')),
     'worktree branches from fresh origin/main (contains commit local main lacked)', r.stdout);
+  assert(res.attached !== true, 'ordinary --setup has no attach marker (opt-in remains pure)', r.stdout);
+
+  // Borrow/attach contract: records persist the additive fields, attach only
+  // reads a lender tree, and cleanup returns a borrowed tree unconditionally.
+  r = runScript('forge-runs.js', [
+    '--add', '--id', 'R-ATTACHED', '--kind', 'task', '--session', 's-attached',
+    '--worktrees', '[{"repo":"/r","path":"/w"}]', '--attached-to', 'M-X', '--cwd', repo,
+  ], { env });
+  res = parseJSON(r.stdout);
+  assert(Array.isArray(res.worktrees) && res.worktrees.length === 1 && res.attached_to === 'M-X',
+    'run add persists worktrees and attached_to', r.stdout);
+  r = runScript('forge-runs.js', ['--get', 'R-ATTACHED', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(Array.isArray(res.worktrees) && res.worktrees[0] && res.worktrees[0].path === '/w' && res.attached_to === 'M-X',
+    'run get returns persisted attach fields', r.stdout);
+  r = runScript('forge-runs.js', ['--add', '--id', 'R-LEGACY', '--kind', 'task', '--session', 's-legacy', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(Array.isArray(res.worktrees) && res.worktrees.length === 0 && res.attached_to === null,
+    'run add defaults additive attach fields for callers without flags', r.stdout);
+  r = runScript('forge-runs.js', ['--list', '--cwd', repo], { env });
+  const allRuns = parseJSON(r.stdout);
+  r = runScript('forge-runs.js', ['--list-active', '--cwd', repo], { env });
+  const activeRuns = parseJSON(r.stdout);
+  assert(Array.isArray(allRuns) && allRuns.some(x => x.id === 'R-LEGACY') &&
+    Array.isArray(activeRuns) && activeRuns.some(x => x.id === 'R-LEGACY'),
+    'records without attach flags remain readable through list and list-active', r.stdout);
+  r = runScript('forge-runs.js', ['--add', '--id', 'R-BAD-JSON', '--kind', 'task', '--session', 's-bad', '--worktrees', '{oops', '--cwd', repo], { env });
+  assert(r.status !== 0 && /invalid --worktrees JSON/.test(r.stderr),
+    'invalid --worktrees JSON fails loudly instead of defaulting', r.stderr);
+
+  fs.writeFileSync(path.join(repo, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"worktree","auto_pull_main":false,"worktree_cleanup_on_complete":true}}');
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-LENDER', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  const lenderWt = res.repos && res.repos[0] && res.repos[0].worktree;
+  assert(lenderWt && fs.existsSync(lenderWt), 'lender setup creates its registered worktree', r.stdout);
+  const lenderTrees = JSON.stringify([{ repo, path: lenderWt }]);
+  r = runScript('forge-runs.js', ['--add', '--id', 'M-LENDER', '--kind', 'milestone', '--session', 's-lender', '--isolation-mode', 'worktree', '--worktrees', lenderTrees, '--cwd', repo], { env });
+  assert(r.status === 0, 'lender run records its physical worktree', r.stderr);
+  const wtCount = () => git(['worktree', 'list'], repo).stdout.trim().split(/\r?\n/).filter(Boolean).length;
+  const beforeAttach = wtCount();
+  r = runScript('forge-isolation.js', ['--attach', 'M-LENDER', '--run', 'T-BORROW', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(r.status === 0 && res.ok === true && res.code_dir === lenderWt && res.branch === 'forge/M-LENDER',
+    'attach returns lender tree and lender branch', r.stdout);
+  assert(wtCount() === beforeAttach && !fs.existsSync(path.join(repo, '..', '.forge-worktrees', 'T-BORROW', path.basename(repo))),
+    'attach creates neither a worktree nor a borrower directory', r.stdout);
+
+  const refusalCount = wtCount();
+  r = runScript('forge-isolation.js', ['--attach', 'M-UNKNOWN', '--run', 'T-REFUSE', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(r.status !== 0 && res.ok === false && res.reason === 'unknown-run' && wtCount() === refusalCount,
+    'attach rejects an unknown run without creating a worktree', r.stdout + r.stderr);
+  r = runScript('forge-runs.js', ['--add', '--id', 'M-NOWT', '--kind', 'milestone', '--session', 's-nowt', '--cwd', repo], { env });
+  r = runScript('forge-isolation.js', ['--attach', 'M-NOWT', '--run', 'T-REFUSE', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(r.status !== 0 && res.ok === false && res.reason === 'no-worktree-registered' && wtCount() === refusalCount,
+    'attach rejects a lender without registered worktrees', r.stdout + r.stderr);
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-MISSING', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  const missingWt = res.repos && res.repos[0] && res.repos[0].worktree;
+  r = runScript('forge-runs.js', ['--add', '--id', 'M-MISSING', '--kind', 'milestone', '--session', 's-missing', '--worktrees', JSON.stringify([{ repo, path: missingWt }]), '--cwd', repo], { env });
+  if (missingWt) fs.rmSync(missingWt, { recursive: true, force: true });
+  const missingCount = wtCount();
+  r = runScript('forge-isolation.js', ['--attach', 'M-MISSING', '--run', 'T-REFUSE', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(r.status !== 0 && res.ok === false && res.reason === 'worktree-path-missing' && wtCount() === missingCount,
+    'attach rejects a missing registered directory without creating a worktree', r.stdout + r.stderr);
+
+  r = runScript('forge-runs.js', [
+    '--add', '--id', 'T-BORROW', '--kind', 'task', '--session', 's-borrow', '--isolation-mode', 'worktree',
+    '--worktrees', lenderTrees, '--attached-to', 'M-LENDER', '--cwd', repo,
+  ], { env });
+  const lenderClean = git(['status', '--porcelain'], lenderWt).stdout;
+  assert(lenderClean === '', 'borrowed lender worktree is clean before cleanup', lenderClean);
+
+  // Borrower-side guard: cleaning up the BORROWER's own run must never
+  // touch the lender's tree (protects the `rec.attached_to` early return,
+  // kept even though path-derivation-by-convention never targets the
+  // lender's path from the borrower's runId).
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'T-BORROW', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(fs.existsSync(lenderWt) && git(['worktree', 'list'], repo).stdout.includes(lenderWt),
+    'borrowed worktree survives its own borrower cleanup and remains registered with git', r.stdout);
+  assert(res.mode_source === 'borrowed' && res.borrowed_from === 'M-LENDER' &&
+    Array.isArray(res.repos) && res.repos.every(x => x && /borrowed/.test(x.status)),
+    'borrower-side cleanup reports its unconditional protection', r.stdout);
+
+  // TASK-019 R1 — real hazard: cleaning up the LENDER while T-BORROW is
+  // still active must remove nothing (path is derived by convention on the
+  // lender's own runId, so this is the guard that is actually load-bearing).
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-LENDER', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(fs.existsSync(lenderWt) && git(['worktree', 'list'], repo).stdout.includes(lenderWt),
+    'lender cleanup with an active borrower removes nothing; tree survives on disk and in git worktree list', r.stdout);
+  assert(Array.isArray(res.lent_to) && res.lent_to.includes('T-BORROW') &&
+    Array.isArray(res.repos) && res.repos.every(x => x && /lent to T-BORROW/.test(x.status)),
+    'lender cleanup names the active borrower in its status', r.stdout);
+
+  // Inactive borrower must not pin the tree forever.
+  r = runScript('forge-runs.js', ['--update', 'T-BORROW', '--json', '{"active":false}', '--cwd', repo], { env });
+  assert(r.status === 0, 'borrower can be marked inactive', r.stderr);
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-LENDER', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(res.repos && res.repos[0] && res.repos[0].status === 'removed' && !fs.existsSync(lenderWt),
+    'lender cleanup proceeds once its only borrower is inactive (positive control)', r.stdout);
+
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-CONTROL', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  const controlWt = res.repos && res.repos[0] && res.repos[0].worktree;
+  r = runScript('forge-runs.js', ['--add', '--id', 'M-CONTROL', '--kind', 'milestone', '--session', 's-control', '--isolation-mode', 'worktree', '--worktrees', JSON.stringify([{ repo, path: controlWt }]), '--cwd', repo], { env });
+  assert(controlWt && git(['status', '--porcelain'], controlWt).stdout === '', 'positive cleanup control worktree is clean', controlWt);
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-CONTROL', '--cwd', repo], { env });
+  res = parseJSON(r.stdout);
+  assert(res.repos && res.repos[0] && res.repos[0].status === 'removed' && !fs.existsSync(controlWt || path.join(dir, '__missing__')),
+    'non-borrowed clean worktree is removed under the same cleanup preference', r.stdout);
+
+  // TASK-019 R2 — resuming an attached task must never create a new
+  // worktree at the resumer's own runId; it must fail loud instead when the
+  // lender tree is unreadable, never silently fall back to --setup.
+  const noNewCount = wtCount();
+  const resumeWtDir = path.join(path.dirname(controlWt || repo), 'T-RESUME-ATTACHED', path.basename(repo));
+  assert(!fs.existsSync(resumeWtDir), 'sanity: resume worktree path does not pre-exist', resumeWtDir);
+  r = runScript('forge-isolation.js', ['--attach', 'M-CONTROL', '--run', 'T-RESUME-ATTACHED', '--cwd', repo], { env });
+  assert(r.status !== 0, 'attach to an already-cleaned-up lender fails loud instead of falling back to setup', r.stdout + r.stderr);
+  assert(!fs.existsSync(resumeWtDir) && wtCount() === noNewCount,
+    'resume of an attached task creates no new worktree even on lender failure', r.stdout);
 
   cleanup(dir);
 }
