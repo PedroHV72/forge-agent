@@ -87,6 +87,112 @@ enum ProjectDiscovery {
     }
 }
 
+// MARK: - Git
+
+/// A checkout belonging to a project. Forge can isolate a milestone in its own
+/// worktree (forge_isolation.mode = worktree), so one "project" on disk is
+/// often several working trees — and the runs, gates and branches live in the
+/// worktree, not the folder you added.
+struct Checkout: Identifiable, Hashable {
+    let path: String
+    let branch: String?
+    let isPrimary: Bool
+
+    var id: String { path }
+    var name: String { URL(fileURLWithPath: path).lastPathComponent }
+}
+
+enum Git {
+    /// `git worktree list --porcelain` emits stanzas separated by blank lines:
+    ///   worktree <path>
+    ///   HEAD <sha>
+    ///   branch refs/heads/<name>   (absent when detached)
+    static func checkouts(at path: String) -> [Checkout] {
+        guard let out = run(["worktree", "list", "--porcelain"], at: path) else { return [] }
+        var result: [Checkout] = []
+        var current: String?
+        var branch: String?
+
+        func flush() {
+            guard let c = current else { return }
+            result.append(Checkout(path: c, branch: branch, isPrimary: result.isEmpty))
+            current = nil; branch = nil
+        }
+
+        for line in out.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("worktree ") {
+                flush()
+                current = String(line.dropFirst("worktree ".count))
+            } else if line.hasPrefix("branch ") {
+                branch = String(line.dropFirst("branch ".count))
+                    .replacingOccurrences(of: "refs/heads/", with: "")
+            }
+        }
+        flush()
+        return result
+    }
+
+    static func currentBranch(at path: String) -> String? {
+        run(["rev-parse", "--abbrev-ref", "HEAD"], at: path)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func isDirty(at path: String) -> Bool {
+        guard let out = run(["status", "--porcelain"], at: path) else { return false }
+        return !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private static func run(_ args: [String], at path: String) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = ["-C", path] + args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        do {
+            try p.run()
+            let d = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            guard p.terminationStatus == 0 else { return nil }
+            return String(data: d, encoding: .utf8)
+        } catch { return nil }
+    }
+}
+
+// MARK: - Folder appearance
+
+/// Uses the folder's real Finder icon and colour tags, so a project looks in
+/// the app exactly as it does in Finder — including custom icons and tags the
+/// user set themselves.
+enum FolderLook {
+    static func icon(for path: String) -> NSImage {
+        let img = NSWorkspace.shared.icon(forFile: path)
+        img.size = NSSize(width: 32, height: 32)
+        return img
+    }
+
+    /// Finder tag names, mapped to their standard colours.
+    static func tagColors(for path: String) -> [Color] {
+        let url = URL(fileURLWithPath: path)
+        guard let values = try? url.resourceValues(forKeys: [.tagNamesKey]),
+              let names = values.tagNames else { return [] }
+        return names.compactMap { color(named: $0) }
+    }
+
+    private static func color(named raw: String) -> Color? {
+        switch raw.lowercased() {
+        case "red", "vermelho":       return .red
+        case "orange", "laranja":     return .orange
+        case "yellow", "amarelo":     return .yellow
+        case "green", "verde":        return .green
+        case "blue", "azul":          return .blue
+        case "purple", "roxo":        return .purple
+        case "gray", "grey", "cinza": return .gray
+        default:                      return nil
+        }
+    }
+}
+
 // MARK: - View
 
 struct ProjectsView: View {
@@ -263,9 +369,12 @@ struct ProjectCard: View {
     @ObservedObject var state: AppState
 
     @State private var status: ProjectStatus?
+    @State private var checkouts: [Checkout] = []
     @State private var loading = false
     @State private var showLauncher = false
+    @State private var launchTarget: String?
     @State private var hovering = false
+    @State private var expanded = false
 
     private var name: String { URL(fileURLWithPath: path).lastPathComponent }
 
@@ -273,12 +382,20 @@ struct ProjectCard: View {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
-    private var runsHere: [Run] { state.liveRuns.filter { $0.cwd == path } }
-    private var gatesHere: [Gate] { state.pending.filter { $0.cwd == path } }
-    private var sessionsHere: [TerminalSession] { state.sessions.filter { $0.cwd == path } }
 
-    /// A project without .gsd/ is almost always a wrong folder pick, and saying
-    /// so beats rendering an empty card that looks broken.
+    /// Runs and gates are attributed by cwd, and with worktree isolation that
+    /// cwd is the WORKTREE, not the folder in the list. Matching only the
+    /// project path would show zero activity while a milestone is running.
+    private var ownedPaths: Set<String> {
+        Set([path] + checkouts.map(\.path))
+    }
+
+    private var runsHere: [Run] { state.liveRuns.filter { ownedPaths.contains($0.cwd) } }
+    private var gatesHere: [Gate] { state.pending.filter { $0.cwd.map(ownedPaths.contains) ?? false } }
+    private var sessionsHere: [TerminalSession] { state.sessions.filter { ownedPaths.contains($0.cwd) } }
+
+    private var extraCheckouts: [Checkout] { checkouts.filter { !$0.isPrimary } }
+
     private var hasGsd: Bool {
         FileManager.default.fileExists(atPath: "\(path)/.gsd")
     }
@@ -301,7 +418,7 @@ struct ProjectCard: View {
                     HStack(spacing: 6) {
                         Text(id).font(.caption2).foregroundStyle(.tertiary)
                         if let p = m.phase { Text("· \(p)").font(.caption2).foregroundStyle(.tertiary) }
-                        if let s = m.slice { Text("· \(s)").font(.caption2).foregroundStyle(.tertiary) }
+                        if let sl = m.slice { Text("· \(sl)").font(.caption2).foregroundStyle(.tertiary) }
                     }
                 }
             }
@@ -313,6 +430,8 @@ struct ProjectCard: View {
                 }
             }
 
+            if !extraCheckouts.isEmpty { worktreeSection }
+
             Divider().padding(.vertical, 1)
             actions
         }
@@ -323,24 +442,33 @@ struct ProjectCard: View {
                                             : Color.accentOrange.opacity(0.35), lineWidth: 1))
         .onHover { hovering = $0 }
         .sheet(isPresented: $showLauncher) {
-            LauncherSheet(state: state, isPresented: $showLauncher, initialWorkspace: path)
+            LauncherSheet(state: state, isPresented: $showLauncher,
+                          initialWorkspace: launchTarget ?? path)
         }
         .task(id: path) { await refresh() }
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "folder.fill")
-                .font(.caption).foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(name).font(.headline).lineLimit(1)
+        HStack(spacing: 10) {
+            // The real Finder icon, so a folder with a custom icon looks the
+            // same here as it does in Finder.
+            Image(nsImage: FolderLook.icon(for: path))
+                .resizable().frame(width: 30, height: 30)
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(name).font(.headline).lineLimit(1)
+                    ForEach(Array(FolderLook.tagColors(for: path).enumerated()), id: \.offset) { _, c in
+                        Circle().fill(c).frame(width: 7, height: 7)
+                    }
+                }
                 Text(abbreviatedPath).font(.system(size: 9))
                     .foregroundStyle(.tertiary).lineLimit(1).truncationMode(.head)
             }
             Spacer()
             if loading { ProgressView().controlSize(.small).scaleEffect(0.7) }
-            if hovering {
-                Button { Task { await refresh(force: true) } } label: {
+            if hovering && !loading {
+                Button { Task { await refresh() } } label: {
                     Image(systemName: "arrow.clockwise").font(.caption2)
                 }
                 .buttonStyle(.plain).foregroundStyle(.tertiary)
@@ -349,7 +477,6 @@ struct ProjectCard: View {
         }
     }
 
-    /// Counts first: they answer "does this project need me?" before any detail.
     private var stats: some View {
         HStack(spacing: 14) {
             Stat(value: gatesHere.count, label: "pergunta", accent: !gatesHere.isEmpty)
@@ -358,9 +485,64 @@ struct ProjectCard: View {
         }
     }
 
+    /// Worktrees are where isolated milestones actually run, so they are
+    /// navigable: open a session directly in one, or reveal it.
+    private var worktreeSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8))
+                    Image(systemName: "arrow.triangle.branch").font(.caption2)
+                    Text(extraCheckouts.count == 1 ? "1 worktree"
+                                                   : "\(extraCheckouts.count) worktrees")
+                        .font(.caption)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+
+            if expanded {
+                ForEach(extraCheckouts) { c in
+                    HStack(spacing: 7) {
+                        Image(nsImage: FolderLook.icon(for: c.path))
+                            .resizable().frame(width: 15, height: 15)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(c.name).font(.caption2).lineLimit(1)
+                            if let b = c.branch {
+                                Text(b).font(.system(size: 9))
+                                    .foregroundStyle(.tertiary).lineLimit(1)
+                            }
+                        }
+                        Spacer()
+                        if state.liveRuns.contains(where: { $0.cwd == c.path }) {
+                            Circle().fill(Color.green).frame(width: 5, height: 5)
+                        }
+                        Button {
+                            launchTarget = c.path
+                            state.addWorkspaceQuietly(c.path)
+                            showLauncher = true
+                        } label: {
+                            Image(systemName: "terminal").font(.system(size: 9))
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
+                        .help("Abrir sessão nesta worktree")
+                        Button { ForgeCore.reveal(c.path) } label: {
+                            Image(systemName: "folder").font(.system(size: 9))
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
+                        .help("Ver no Finder")
+                    }
+                    .padding(.leading, 12)
+                }
+            }
+        }
+    }
+
     private var actions: some View {
-        // ViewThatFits keeps the buttons on one row while there is room and
-        // wraps them instead of clipping when the card is narrow.
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 6) { buttons }
             VStack(alignment: .leading, spacing: 6) { buttons }
@@ -368,7 +550,7 @@ struct ProjectCard: View {
     }
 
     @ViewBuilder private var buttons: some View {
-        Button("Abrir sessão") { showLauncher = true }
+        Button("Abrir sessão") { launchTarget = path; showLauncher = true }
             .controlSize(.small)
         Button("Ver pasta") { ForgeCore.reveal(path) }
             .controlSize(.small)
@@ -389,15 +571,20 @@ struct ProjectCard: View {
         .help(path)
     }
 
-    private func refresh(force: Bool = false) async {
-        guard hasGsd, !loading else { return }
+    private func refresh() async {
+        guard !loading else { return }
         loading = true
         defer { loading = false }
         let p = path
-        let result: ProjectStatus? = await Task.detached(priority: .utility) {
+
+        // git is cheap; forge-status spawns node, so both go off the main actor.
+        let trees = await Task.detached(priority: .utility) { Git.checkouts(at: p) }.value
+        checkouts = trees
+
+        guard hasGsd else { return }
+        status = await Task.detached(priority: .utility) {
             ForgeCore.runJSON(ProjectStatus.self, "forge-status.js", ["--json", "--cwd", p])
         }.value
-        status = result
     }
 }
 

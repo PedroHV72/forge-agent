@@ -293,6 +293,15 @@ final class AppState: ObservableObject {
     }
 
     func addWorkspace(_ p: String)    { Workspaces.add(p); reloadCheap() }
+
+    /// Register a path without surfacing it as a project card — used for
+    /// worktrees, which belong to a project already in the list and should not
+    /// appear as separate entries.
+    func addWorkspaceQuietly(_ p: String) {
+        guard !workspaces.contains(p) else { return }
+        Workspaces.add(p)
+        reloadCheap()
+    }
     func removeWorkspace(_ p: String) { Workspaces.remove(p); reloadCheap() }
 
     func show(_ text: String, error: Bool = false) {

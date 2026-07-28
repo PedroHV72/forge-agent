@@ -31,13 +31,31 @@ enum ForgeCore {
         return nil
     }
 
+    /// Where the Forge repo lives, used to resolve engines before an install.
+    ///
+    /// Prefs moved from `forge-agent-prefs.md` (YAML-ish) to
+    /// `forge-agent-prefs.jsonc`, so both are read, newest format first. Two
+    /// traps in the JSONC file, both hit in practice:
+    ///   - `repo_path` appears twice: once commented out in the scaffold header
+    ///     and once for real further down. Commented lines must be skipped.
+    ///   - the value is a JSON string, so the quotes have to come off.
     static var repoPath: String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        guard let text = try? String(contentsOfFile: "\(home)/.claude/forge-agent-prefs.md",
-                                     encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n") where line.contains("repo_path:") {
-            let v = line.split(separator: ":", maxSplits: 1)[1].trimmingCharacters(in: .whitespaces)
-            if !v.isEmpty { return v }
+        for file in ["\(home)/.claude/forge-agent-prefs.jsonc",
+                     "\(home)/.claude/forge-agent-prefs.json",
+                     "\(home)/.claude/forge-agent-prefs.md"] {
+            guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { continue }
+            for raw in text.split(separator: "\n") {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("//") || line.hasPrefix("#") { continue }
+                guard line.contains("repo_path") else { continue }
+                guard let colon = line.firstIndex(of: ":") else { continue }
+                var v = String(line[line.index(after: colon)...])
+                    .trimmingCharacters(in: .whitespaces)
+                if let comment = v.range(of: "//") { v = String(v[..<comment.lowerBound]) }
+                v = v.trimmingCharacters(in: CharacterSet(charactersIn: " ,\"'"))
+                if !v.isEmpty, FileManager.default.fileExists(atPath: v) { return v }
+            }
         }
         return nil
     }
@@ -60,8 +78,12 @@ enum ForgeCore {
     @discardableResult
     static func run(_ engineName: String, _ args: [String], cwd: String? = nil) -> Result {
         guard let enginePath = engine(engineName) else {
+            // Say which paths were tried: "run install.sh" is useless when the
+            // real cause is a repo_path that no longer resolves.
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let repoNote = repoPath.map { "repo: \($0)/scripts/" } ?? "repo_path não resolvido nas prefs"
             return Result(ok: false, stdout: "",
-                          stderr: "engine \(engineName) não encontrado — rode ./install.sh")
+                          stderr: "\(engineName) não encontrado — procurei em \(home)/.claude/scripts/ e \(repoNote). Rode ./install.sh no repo do Forge.")
         }
 
         let proc = Process()
