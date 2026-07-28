@@ -17,6 +17,7 @@ import AppKit
 enum Section: String, CaseIterable, Identifiable {
     case now = "Agora"
     case terminal = "Terminal"
+    case projects = "Projetos"
     case runs = "Runs"
     case accounts = "Contas"
     case prefs = "Preferências"
@@ -28,6 +29,7 @@ enum Section: String, CaseIterable, Identifiable {
         switch self {
         case .now:      return "bolt.fill"
         case .terminal: return "terminal"
+        case .projects: return "folder"
         case .runs:     return "play.circle"
         case .accounts: return "person.2"
         case .prefs:    return "slider.horizontal.3"
@@ -73,6 +75,7 @@ struct RootView: View {
                 switch section ?? .now {
                 case .now:      NowView(state: state)
                 case .terminal: TerminalsView(state: state)
+                case .projects: ProjectsView(state: state)
                 case .runs:     RunsView(state: state)
                 case .accounts: AccountsView(state: state)
                 case .prefs:    PrefsView(state: state)
@@ -90,6 +93,7 @@ struct RootView: View {
         case .now:      return state.pending.isEmpty ? nil : state.pending.count
         case .runs:     return state.liveRuns.isEmpty ? nil : state.liveRuns.count
         case .terminal: return state.sessions.isEmpty ? nil : state.sessions.count
+        case .projects: return state.workspaces.isEmpty ? nil : state.workspaces.count
         default:        return nil
         }
     }
@@ -101,13 +105,11 @@ struct RootView: View {
                 Button {
                     pickWorkspace(state)
                 } label: {
-                    Label("Projeto", systemImage: "plus")
+                    Label("Adicionar projeto", systemImage: "plus")
                         .font(.caption)
                 }
                 .buttonStyle(.plain)
                 Spacer()
-                Text("\(state.workspaces.count)")
-                    .font(.caption2).foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
         }
@@ -229,7 +231,21 @@ struct GateCard: View {
                                 in: RoundedRectangle(cornerRadius: 8))
             }
 
-            VStack(spacing: 6) {
+            // Options sit side by side while there is room and stack when the
+            // window narrows, instead of squeezing labels into ellipses.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) { optionButtons }
+                VStack(spacing: 6) { optionButtons }
+            }
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(Color.accentOrange.opacity(0.35), lineWidth: 1))
+    }
+
+    @ViewBuilder private var optionButtons: some View {
+        Group {
                 ForEach(gate.options) { opt in
                     Button { state.answer(gate, choice: opt.key) } label: {
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -247,12 +263,7 @@ struct GateCard: View {
                     }
                     .buttonStyle(.bordered).frame(maxWidth: .infinity)
                 }
-            }
         }
-        .padding(16)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(Color.accentOrange.opacity(0.35), lineWidth: 1))
     }
 }
 
@@ -403,8 +414,13 @@ struct AccountsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
-                ForEach(state.accountsByHeadroom) { a in
-                    AccountCard(account: a, usage: state.usage[a.name], state: state)
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 300, maximum: 460), spacing: 14)],
+                    alignment: .leading, spacing: 14
+                ) {
+                    ForEach(state.accountsByHeadroom) { a in
+                        AccountCard(account: a, usage: state.usage[a.name], state: state)
+                    }
                 }
             }
             .padding(18)

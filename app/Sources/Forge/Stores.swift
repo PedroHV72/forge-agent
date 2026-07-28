@@ -225,8 +225,25 @@ final class AppState: ObservableObject {
             runId: attachedRun, account: account.isEmpty ? nil : account))
     }
 
-    func closeSession(_ s: TerminalSession) {
+    /// Closing kills the child process, so a session that is still running gets
+    /// a confirmation — the same reasoning as quitting the app: Forge resumes
+    /// from disk, but the in-flight unit is cut off. Returns whether it closed.
+    @discardableResult
+    func closeSession(_ s: TerminalSession, confirm: Bool = false) -> Bool {
+        if confirm && s.isRunning {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Encerrar \(s.tabLabel)?"
+            alert.informativeText = s.runId != nil
+                ? "A run continua salva em disco — você retoma com “Continuar milestone”. A unidade em andamento é interrompida."
+                : "A sessão será encerrada."
+            alert.addButton(withTitle: "Encerrar")
+            alert.addButton(withTitle: "Cancelar")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        }
         sessions.removeAll { $0.id == s.id }
+        return true
     }
 
     private func shq(_ s: String) -> String { ForgeCore.shellQuote(s) }

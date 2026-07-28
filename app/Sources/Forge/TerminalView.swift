@@ -151,7 +151,15 @@ struct TerminalsView: View {
                 launcherPane
             } else {
                 VStack(spacing: 0) {
-                    tabBar
+                    // One session needs no tab strip — a slim header with a
+                    // real "Encerrar" button reads better than a lone tab with
+                    // a tiny x. Several sessions need to be comparable at a
+                    // glance, so they become tabs.
+                    if state.sessions.count == 1, let only = state.sessions.first {
+                        SingleSessionHeader(session: only, state: state)
+                    } else {
+                        tabStrip
+                    }
                     Divider()
                     ZStack {
                         // Every session stays mounted; hiding rather than
@@ -175,6 +183,7 @@ struct TerminalsView: View {
                 Button { showLauncher = true } label: {
                     Label("Nova sessão", systemImage: "plus")
                 }
+                .help("Nova sessão (⌘T)")
             }
         }
         .onAppear { if selection == nil { selection = state.sessions.first?.id } }
@@ -187,42 +196,30 @@ struct TerminalsView: View {
         return state.sessions.first?.id
     }
 
-    private var tabBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+    /// Up to four tabs share the width evenly; beyond that they keep a readable
+    /// minimum and the strip scrolls, so tabs never shrink into unreadable slivers.
+    private var tabStrip: some View {
+        let evenly = state.sessions.count <= 4
+        return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(state.sessions) { s in
-                    let active = s.id == currentID
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(s.isRunning ? Color.green : Color.secondary)
-                            .frame(width: 6, height: 6)
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(s.tabLabel).font(.caption)
-                            HStack(spacing: 4) {
-                                Text(s.projectName).font(.system(size: 9))
-                                if let a = s.account, !a.isEmpty {
-                                    Text("· \(a)").font(.system(size: 9))
-                                }
-                            }
-                            .foregroundStyle(.tertiary)
-                        }
-                        Button {
-                            state.closeSession(s)
-                            if selection == s.id { selection = state.sessions.first?.id }
-                        } label: {
-                            Image(systemName: "xmark").font(.system(size: 8))
-                        }
-                        .buttonStyle(.plain).foregroundStyle(.tertiary)
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(active ? AnyShapeStyle(.quaternary)
-                                       : AnyShapeStyle(.clear),
-                                in: RoundedRectangle(cornerRadius: 7))
-                    .contentShape(Rectangle())
-                    .onTapGesture { selection = s.id }
+                    TerminalTab(
+                        session: s,
+                        isActive: s.id == currentID,
+                        onSelect: { selection = s.id },
+                        onClose: { close(s) })
+                    .frame(minWidth: 150, maxWidth: evenly ? .infinity : 230)
                 }
             }
             .padding(.horizontal, 10).padding(.vertical, 7)
+            .frame(maxWidth: evenly ? .infinity : nil, alignment: .leading)
+        }
+        .scrollDisabled(evenly)
+    }
+
+    private func close(_ s: TerminalSession) {
+        if state.closeSession(s, confirm: true), selection == s.id {
+            selection = state.sessions.first?.id
         }
     }
 
@@ -245,11 +242,90 @@ struct TerminalsView: View {
     }
 }
 
+/// Header shown when exactly one session is open.
+struct SingleSessionHeader: View {
+    @ObservedObject var session: TerminalSession
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Circle().fill(session.isRunning ? Color.green : Color.secondary)
+                .frame(width: 7, height: 7)
+            Text(session.tabLabel).font(.callout).bold()
+            Text(session.projectName).font(.caption).foregroundStyle(.secondary)
+            if let a = session.account, !a.isEmpty {
+                Text("· \(a)").font(.caption).foregroundStyle(.tertiary)
+            }
+            if let e = session.exitLabel {
+                Text(e).font(.caption2).foregroundStyle(.tertiary)
+            }
+            Spacer()
+            Button(session.isRunning ? "Encerrar" : "Fechar") {
+                _ = state.closeSession(session, confirm: true)
+            }
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 9)
+    }
+}
+
+/// One tab. The close control is a real 18pt hit target that appears on hover
+/// (or whenever the tab is active), instead of a permanent 8pt glyph that is
+/// both hard to hit and visually noisy across many tabs.
+struct TerminalTab: View {
+    @ObservedObject var session: TerminalSession
+    let isActive: Bool
+    let onSelect: () -> Void
+    let onClose: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle().fill(session.isRunning ? Color.green : Color.secondary)
+                .frame(width: 6, height: 6)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.tabLabel)
+                    .font(.caption).lineLimit(1).truncationMode(.middle)
+                HStack(spacing: 4) {
+                    Text(session.projectName)
+                    if let a = session.account, !a.isEmpty { Text("· \(a)") }
+                }
+                .font(.system(size: 9)).foregroundStyle(.tertiary).lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if hovering || isActive {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(hovering ? .primary : .tertiary)
+                .help("Fechar sessão")
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(isActive ? AnyShapeStyle(.quaternary)
+                             : AnyShapeStyle(hovering ? AnyShapeStyle(.quaternary.opacity(0.5))
+                                                      : AnyShapeStyle(.clear)),
+                    in: RoundedRectangle(cornerRadius: 7))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .onHover { hovering = $0 }
+    }
+}
+
 // MARK: - Launcher
 
 struct LauncherSheet: View {
     @ObservedObject var state: AppState
     @Binding var isPresented: Bool
+    /// Pre-selected project when opened from a project card.
+    var initialWorkspace: String? = nil
 
     @State private var workspace = ""
     @State private var mode: Mode = .auto
@@ -340,7 +416,7 @@ struct LauncherSheet: View {
         .padding(20)
         .frame(width: 480)
         .onAppear {
-            if workspace.isEmpty { workspace = state.workspaces.first ?? "" }
+            if workspace.isEmpty { workspace = initialWorkspace ?? state.workspaces.first ?? "" }
             state.loadAccounts()
             state.reloadCheap()
             if runId.isEmpty { runId = runsHere.first?.id ?? "" }
