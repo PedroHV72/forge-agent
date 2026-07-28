@@ -11,6 +11,7 @@
 
 import SwiftUI
 import AppKit
+import ForgeKit
 
 // MARK: - Status payload
 
@@ -87,78 +88,10 @@ enum ProjectDiscovery {
     }
 }
 
-// MARK: - Git
-
 /// A checkout belonging to a project. Forge can isolate a milestone in its own
 /// worktree (forge_isolation.mode = worktree), so one "project" on disk is
 /// often several working trees — and the runs, gates and branches live in the
 /// worktree, not the folder you added.
-struct Checkout: Identifiable, Hashable {
-    let path: String
-    let branch: String?
-    let isPrimary: Bool
-
-    var id: String { path }
-    var name: String { URL(fileURLWithPath: path).lastPathComponent }
-}
-
-enum Git {
-    /// `git worktree list --porcelain` emits stanzas separated by blank lines:
-    ///   worktree <path>
-    ///   HEAD <sha>
-    ///   branch refs/heads/<name>   (absent when detached)
-    static func checkouts(at path: String) -> [Checkout] {
-        guard let out = run(["worktree", "list", "--porcelain"], at: path) else { return [] }
-        var result: [Checkout] = []
-        var current: String?
-        var branch: String?
-
-        func flush() {
-            guard let c = current else { return }
-            result.append(Checkout(path: c, branch: branch, isPrimary: result.isEmpty))
-            current = nil; branch = nil
-        }
-
-        for line in out.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line.hasPrefix("worktree ") {
-                flush()
-                current = String(line.dropFirst("worktree ".count))
-            } else if line.hasPrefix("branch ") {
-                branch = String(line.dropFirst("branch ".count))
-                    .replacingOccurrences(of: "refs/heads/", with: "")
-            }
-        }
-        flush()
-        return result
-    }
-
-    static func currentBranch(at path: String) -> String? {
-        run(["rev-parse", "--abbrev-ref", "HEAD"], at: path)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    static func isDirty(at path: String) -> Bool {
-        guard let out = run(["status", "--porcelain"], at: path) else { return false }
-        return !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private static func run(_ args: [String], at path: String) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        p.arguments = ["-C", path] + args
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = Pipe()
-        do {
-            try p.run()
-            let d = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            guard p.terminationStatus == 0 else { return nil }
-            return String(data: d, encoding: .utf8)
-        } catch { return nil }
-    }
-}
-
 // MARK: - Folder appearance
 
 /// Uses the folder's real Finder icon and colour tags, so a project looks in

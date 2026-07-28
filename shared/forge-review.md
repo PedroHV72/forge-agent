@@ -48,15 +48,16 @@ let trigger=low(rv.trigger); if(!['adaptive','always'].includes(trigger))trigger
 let adaptiveFlagsLines=Number.isInteger(rv.adaptive_flags_lines)&&rv.adaptive_flags_lines>0?rv.adaptive_flags_lines:40;
 let adaptiveDialecticLines=Number.isInteger(rv.adaptive_dialectic_lines)&&rv.adaptive_dialectic_lines>0?rv.adaptive_dialectic_lines:400;
 let rounds=rv.rounds; if(!Number.isInteger(rounds)||rounds<0||rounds>3)rounds=1;
-let askAuto=low(rv.ask_in_auto); if(!['defer','pause'].includes(askAuto))askAuto='defer';
+let askAuto=low(rv.ask_in_auto); if(!['defer','pause','gate'].includes(askAuto))askAuto='defer';
+let gateTimeoutMs=Number.isInteger(rv.gate_timeout_ms)&&rv.gate_timeout_ms>0?rv.gate_timeout_ms:1800000;
 let fixConceded=(low(rv.fix_conceded)==='false')?false:(rv.fix_conceded===false?false:true);
 let engine=low(rv.engine); if(!['agents','workflow'].includes(engine))engine='agents';
 let challenger=low(rv.challenger); if(!['claude','codex','gemini','auto'].includes(challenger))challenger='claude';
 let advocate=low(rv.advocate); if(!['claude','auto'].includes(advocate))advocate='claude';
 let challengerModel=(typeof rv.challenger_model==='string'&&rv.challenger_model.trim())?rv.challenger_model.trim():null;
 let advocateModel=(typeof rv.advocate_model==='string'&&rv.advocate_model)?rv.advocate_model:'claude-fable-5';
-process.stdout.write(JSON.stringify({mode,style,trigger,adaptiveFlagsLines,adaptiveDialecticLines,rounds,askAuto,fixConceded,engine,challenger,advocate,challengerModel,advocateModel}));
-}catch(e){process.stdout.write('{\"mode\":\"enabled\",\"style\":\"dialectic\",\"trigger\":\"adaptive\",\"adaptiveFlagsLines\":40,\"adaptiveDialecticLines\":400,\"rounds\":1,\"askAuto\":\"defer\",\"fixConceded\":true,\"engine\":\"agents\",\"challenger\":\"claude\",\"advocate\":\"claude\",\"challengerModel\":null,\"advocateModel\":\"claude-fable-5\"}')}})")
+process.stdout.write(JSON.stringify({mode,style,trigger,adaptiveFlagsLines,adaptiveDialecticLines,rounds,askAuto,gateTimeoutMs,fixConceded,engine,challenger,advocate,challengerModel,advocateModel}));
+}catch(e){process.stdout.write('{\"mode\":\"enabled\",\"style\":\"dialectic\",\"trigger\":\"adaptive\",\"adaptiveFlagsLines\":40,\"adaptiveDialecticLines\":400,\"rounds\":1,\"askAuto\":\"defer\",\"gateTimeoutMs\":1800000,\"fixConceded\":true,\"engine\":\"agents\",\"challenger\":\"claude\",\"advocate\":\"claude\",\"challengerModel\":null,\"advocateModel\":\"claude-fable-5\"}')}})")
 
 CHALLENGER=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challenger||'claude')}catch(e){process.stdout.write('claude')}})")
 CHALLENGER_MODEL=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challengerModel||'')}catch(e){process.stdout.write('')}})")
@@ -786,6 +787,31 @@ Agent({ subagent_type: 'forge-executor',
 **`MODE == auto` (forge-auto):**
 - `askAuto == defer` (default) — **do NOT pause mid-loop.** Mark each OPEN item in `{S##}-REVIEW.md` with `**Decisão:** deferido → triagem no fim da milestone`. Echo one line to the user: `⚖ Review S##: {Y} concedida(s) corrigidas · {Z} aberta(s) → triagem final`. Continue the loop. Deferred items are **guaranteed to surface**: the milestone-final triage (Step 9) puts every one of them to the operator before `complete-milestone` runs. Defer means *postponed to end-of-milestone*, never *swallowed*.
 - `askAuto == pause` (opt-in) — run the same `AskUserQuestion` flow as interactive mode, accepting the pause.
+- `askAuto == gate` (opt-in) — **ask without pausing.** `AskUserQuestion` does not exist in a headless session (verified: absent from the `system/init` tool list), which is why `defer` exists at all. The gate mailbox (`scripts/forge-gate.js`) works around that: the question goes to a file, any responder answers it, and — decisively — **it always resolves**, taking the declared default when nobody replies in time. So the loop keeps its autonomy while the human gets a real chance to steer.
+
+  For each OPEN item, run one gate and act on the resolution:
+
+  ```bash
+  RES=$(node "${FORGE_SCRIPTS}/forge-gate.js" --open --wait --json \
+    --cwd "$WORKING_DIR" --run "${RUN_ID:-{M###}}" --unit "{S##}" --origin review-open \
+    --question "$OBJECTION_SUMMARY" \
+    --context "$OBJECTION_DETAIL" \
+    --option "keep:Manter abordagem atual:Objeção registrada, sem ação" \
+    --option "fix:Refatorar agora:Despacha um review-fix para este item" \
+    --option "followup:Criar follow-up:Registra em KNOWLEDGE.md e segue" \
+    --default followup \
+    --timeout "${GATE_TIMEOUT_MS:-1800000}")
+  CHOICE=$(printf '%s' "$RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).choice||'')}catch{console.log('')}})")
+  SOURCE=$(printf '%s' "$RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).source||'')}catch{console.log('')}})")
+  ```
+
+  - `fix` → dispatch a `review-fix` unit for that item (same shape as Step 7a).
+  - `keep` / `followup` → write the decision into the `**Decisão:**` line.
+  - `source == timeout-default` → treat exactly as `defer`: mark `**Decisão:** deferido → triagem no fim da milestone` so Step 9 still surfaces it. **Nobody answering must never silently close an item.**
+
+  Record the provenance on the `**Decisão:**` line (`via gate — humano` vs `via gate — expirou`), so the artefact never claims a human made a call the clock made.
+
+  `GATE_TIMEOUT_MS` defaults to 30min and is read from `review.gate_timeout_ms` when set. A run left alone overnight therefore behaves exactly like `defer` — the safe default is the one that happens when nobody is watching.
 
 The gate **never** returns a blocker regardless of posture.
 

@@ -34,7 +34,11 @@
     },
     "merge_strategy": {
       "type": "string",
-      "enum": ["squash", "merge", "rebase"],
+      "enum": [
+        "squash",
+        "merge",
+        "rebase"
+      ],
       "default": "squash",
       "description": "Estratégia de merge do branch do slice na main ao completar. Ignorado quando auto_commit: false."
     },
@@ -50,24 +54,38 @@
     },
     "milestone_cleanup": {
       "type": "string",
-      "enum": ["keep", "archive", "delete"],
+      "enum": [
+        "keep",
+        "archive",
+        "delete"
+      ],
       "default": "keep",
       "description": "Destino dos artefatos .gsd/milestones/{id}/ após o milestone completar (o LEDGER.md compacto é sempre gravado antes). keep = mantém tudo; archive = move para .gsd/archive/; delete = remove inteiramente. Arquivos duráveis (AUTO-MEMORY, DECISIONS, LEDGER, STATE, CODING-STANDARDS) nunca são tocados."
     },
     "task_cleanup": {
       "type": "string",
-      "enum": ["keep", "archive", "delete"],
+      "enum": [
+        "keep",
+        "archive",
+        "delete"
+      ],
       "default": "keep",
       "description": "Destino dos artefatos .gsd/tasks/{id}/ após uma task solta (/forge-task) completar. keep = mantém; archive = move para .gsd/archive/tasks/; delete = remove."
     },
     "compact_after": {
-      "type": ["integer", "string"],
+      "type": [
+        "integer",
+        "string"
+      ],
       "default": "unlimited",
       "description": "Unidades por sessão do forge-auto antes de um checkpoint manual (reseta contadores e continua — não para o loop). Número inteiro ou \"unlimited\". Ausente/\"unlimited\" = sem checkpoint (o Compaction Resilience Protocol cobre o auto-compact sozinho)."
     },
     "notifications": {
       "type": "string",
-      "enum": ["on", "off"],
+      "enum": [
+        "on",
+        "off"
+      ],
       "default": "on",
       "description": "on = forge-auto dispara PushNotification nos 3 pontos de espera humana (blocker não-recuperável, triagem final de review, Final Report). off = loop idêntico, sem push. Tool ausente no harness = silent-skip. Valor inválido cai em on."
     },
@@ -82,61 +100,121 @@
       "properties": {
         "plan-milestone": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "medium",
           "description": "Effort da fase plan-milestone (decomposição arquitetural em slices)."
         },
         "plan-slice": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "medium",
           "description": "Effort da fase plan-slice (planejamento de tasks). Risk escalation: slice risk:high sobe automaticamente para max."
         },
         "discuss-milestone": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "medium",
           "description": "Effort da fase discuss-milestone (decisões de arquitetura com o usuário)."
         },
         "discuss-slice": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "medium",
           "description": "Effort da fase discuss-slice (decisões de escopo do slice)."
         },
         "research-milestone": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "medium",
           "description": "Effort da fase research-milestone (exploração de codebase)."
         },
         "research-slice": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "medium",
           "description": "Effort da fase research-slice (pesquisa focada no slice)."
         },
         "execute-task": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "low",
           "description": "Effort da fase execute-task (implementação). Override por task via effort: no frontmatter do T##-PLAN.md; clamp em medium quando o modelo resolvido é haiku/sonnet."
         },
         "complete-slice": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "low",
           "description": "Effort da fase complete-slice (summaries, UAT, merge)."
         },
         "complete-milestone": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "low",
           "description": "Effort da fase complete-milestone (fechamento, LEDGER, cleanup)."
         },
         "memory-extract": {
           "type": "string",
-          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "default": "low",
           "description": "Effort da extração de memórias pós-unidade (haiku — leve por design)."
         }
@@ -148,13 +226,19 @@
       "properties": {
         "opus_phases": {
           "type": "string",
-          "enum": ["adaptive", "disabled"],
+          "enum": [
+            "adaptive",
+            "disabled"
+          ],
           "default": "adaptive",
           "description": "Thinking das fases que rodam em Opus (discuss/research/plan)."
         },
         "sonnet_phases": {
           "type": "string",
-          "enum": ["adaptive", "disabled"],
+          "enum": [
+            "adaptive",
+            "disabled"
+          ],
           "default": "disabled",
           "description": "Thinking das fases que rodam em Sonnet (execute/complete). Sonnet não suporta extended thinking — manter disabled."
         }
@@ -166,7 +250,10 @@
       "properties": {
         "format": {
           "type": "string",
-          "enum": ["timestamp", "sequential"],
+          "enum": [
+            "timestamp",
+            "sequential"
+          ],
           "default": "timestamp",
           "description": "timestamp = M-<YYYYMMDDHHMMSS>-<slug> / T-<ts>-<slug> (sem colisão entre branches paralelos). sequential = legado M001/TASK-001 (max+1 varrendo .gsd/milestones/ + .gsd/archive/ e .gsd/tasks/ — risco de colisão entre devs). Valor inválido cai silenciosamente em timestamp."
         }
@@ -178,7 +265,11 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["shared", "branch", "worktree"],
+          "enum": [
+            "shared",
+            "branch",
+            "worktree"
+          ],
           "default": "shared",
           "description": "shared = single working tree, concorrência protegida por file-locks; branch = cria forge/{M###} em cada repo afetado e commita ali; worktree = worktree física por milestone, isolamento total de FS."
         },
@@ -233,7 +324,15 @@
             },
             "exclude": {
               "type": "array",
-              "default": ["node_modules/**", "vendor/**", ".forge-worktrees/**", ".gsd/**", "dist/**", "build/**", ".next/**"],
+              "default": [
+                "node_modules/**",
+                "vendor/**",
+                ".forge-worktrees/**",
+                ".gsd/**",
+                "dist/**",
+                "build/**",
+                ".next/**"
+              ],
               "description": "Globs a excluir do auto-detect. Default real do reader (forge-repos.js DEFAULT_EXCLUDE) — mais amplo que o exemplo do template."
             }
           }
@@ -266,7 +365,11 @@
         },
         "dashboard_refresh_on": {
           "type": "array",
-          "default": ["boot", "exit", "phase_change"],
+          "default": [
+            "boot",
+            "exit",
+            "phase_change"
+          ],
           "description": "Eventos do ciclo que disparam regen do dashboard .gsd/STATE.md via scripts/forge-dashboard.js. Valores válidos: boot, exit, phase_change, tick (tick = regen periódico, custoso — não recomendado)."
         },
         "legacy_alias": {
@@ -287,7 +390,10 @@
         },
         "cross_run_overlap": {
           "type": "string",
-          "enum": ["defer", "block"],
+          "enum": [
+            "defer",
+            "block"
+          ],
           "default": "defer",
           "description": "Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff)."
         }
@@ -319,22 +425,34 @@
       "description": "Qual model ID concreto cada alias de tier resolve no dispatch. Aceita escalar ou lista [primário, ...fallbacks] — a lista forma a escada intra-tier consumida pela Failure Taxonomy (model_refusal/429/400). O ID é traduzido para alias de Agent() por scripts/forge-model-alias.js; ID não mapeado é pulado com warning.",
       "properties": {
         "light": {
-          "type": ["string", "array"],
+          "type": [
+            "string",
+            "array"
+          ],
           "default": "claude-haiku-4-5-20251001",
           "description": "Tier leve — memory-extract, complete-slice, tasks tag: docs. Escalar ou lista de fallback intra-tier."
         },
         "standard": {
-          "type": ["string", "array"],
+          "type": [
+            "string",
+            "array"
+          ],
           "default": "claude-sonnet-5",
           "description": "Tier padrão — execute-task default, research, discuss. Escalar ou lista de fallback intra-tier."
         },
         "heavy": {
-          "type": ["string", "array"],
+          "type": [
+            "string",
+            "array"
+          ],
           "default": "claude-opus-5",
           "description": "Tier de raciocínio profundo — plan-slice default. claude-opus-5 tem 1M de contexto por default (sem sufixo [1m]); fonte: forge-tier-chain.js DEFAULT_TIER_MODEL. Escalar ou lista."
         },
         "max": {
-          "type": ["string", "array"],
+          "type": [
+            "string",
+            "array"
+          ],
           "default": "claude-fable-5",
           "description": "Tier de fronteira — plan-milestone, plan-slice risk:high, escalação de context_overflow. ~2x o custo do opus. Escalar ou lista."
         }
@@ -346,13 +464,19 @@
       "properties": {
         "execute-task": {
           "type": "string",
-          "enum": ["claude", "codex"],
+          "enum": [
+            "claude",
+            "codex"
+          ],
           "default": "claude",
           "description": "Engine das unidades execute-task. codex roteia ao sidecar (--mode execute); falha do sidecar reseta ao START_SHA e cai uma única vez no worker Claude (evento worker-engine-fallback). Valor inválido cai em claude."
         },
         "plan-slice": {
           "type": "string",
-          "enum": ["claude", "codex"],
+          "enum": [
+            "claude",
+            "codex"
+          ],
           "default": "claude",
           "description": "Engine das unidades plan-slice. codex roteia ao sidecar --mode plan (read-only — o orquestrador materializa o retorno). Valor inválido cai em claude."
         },
@@ -362,19 +486,35 @@
           "description": "Segundos — teto do sidecar codex antes do SIGKILL. Só se aplica quando o engine resolvido é codex; inválido/não-positivo cai em 1800."
         },
         "codex_model": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null,
           "description": "Repassado como -m <valor> ao codex-cli quando definido; null/unset usa o modelo default do CLI instalado (ex.: gpt-5.6-sol). Ignorado quando o engine é claude."
         },
         "sidecar_on_failure": {
           "type": "string",
-          "enum": ["retry-then-fallback", "fallback", "pause-ask"],
+          "enum": [
+            "retry-then-fallback",
+            "fallback",
+            "pause-ask"
+          ],
           "default": "retry-then-fallback",
           "description": "Política ao falhar o sidecar codex. retry-then-fallback (default): Layer-1 retenta o mesmo codex em erro transiente (S02) e só então cai no fallback Claude. fallback: pula o Layer-1 (comportamento pré-S02). pause-ask: retenta transiente e, SÓ na exaustão, pausa + AskUserQuestion (interativo) ou degrada a fallback + evento sidecar-pause-degraded (headless). Valor inválido cai em retry-then-fallback."
         },
         "require_worktree": {
-          "type": ["string", "boolean"],
-          "enum": ["auto", "true", "false", true, false],
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "auto",
+            "true",
+            "false",
+            true,
+            false
+          ],
           "default": "auto",
           "description": "Elevação estática de isolamento por engine de escrita, resolvida na ativação por scripts/forge-isolation.js resolveEffectiveMode. auto (default): eleva forge_isolation.mode shared→worktree quando um engine externo de escrita (codex via workers.execute-task, ou família gpt/gemini em routing.<domain>.executor) é resolvido p/ execute-task; branch sob auto NÃO eleva. true: sempre exige worktree (eleva shared/branch→worktree). false: nunca eleva — byte-idêntico ao comportamento atual. Paths read-only (plan-slice Branch D, review challenger) não disparam elevação. Falso-positivo aceitável, falso-negativo não."
         }
@@ -386,7 +526,10 @@
       "properties": {
         "env_policy": {
           "type": "string",
-          "enum": ["minimal", "inherit"],
+          "enum": [
+            "minimal",
+            "inherit"
+          ],
           "default": "minimal",
           "description": "Política de ambiente dos sidecars. minimal repassa apenas allowlist e remove prefixos de credenciais; inherit preserva todo o ambiente como escape hatch inseguro."
         }
@@ -420,7 +563,11 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["lenient", "strict", "disabled"],
+          "enum": [
+            "lenient",
+            "strict",
+            "disabled"
+          ],
           "default": "lenient",
           "description": "lenient = escreve o log; mismatches viram seção advisory '## Evidence Flags' no S##-SUMMARY (não bloqueia). strict = reservado M004+ (mismatches bloqueiam complete-slice). disabled = hook pula a escrita — zero log. Valor inválido cai em lenient."
         }
@@ -432,7 +579,15 @@
       "properties": {
         "ignore_list": {
           "type": "array",
-          "default": ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "dist/**", "build/**", ".next/**", ".gsd/**"],
+          "default": [
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "dist/**",
+            "build/**",
+            ".next/**",
+            ".gsd/**"
+          ],
           "description": "Globs excluídos de ambos os lados do diff (evita ruído de lockfiles e build). Suporta prefix exato, ** (qualquer profundidade) e * dentro de segmento. Bloco ausente/vazio = este default hardcoded, sem erro."
         }
       }
@@ -443,7 +598,11 @@
       "properties": {
         "extraction": {
           "type": "string",
-          "enum": ["adaptive", "always", "disabled"],
+          "enum": [
+            "adaptive",
+            "always",
+            "disabled"
+          ],
           "default": "adaptive",
           "description": "adaptive = extrai em summaries de boundary e em execute-task com sinal durável (decisão, gotcha, padrão); planos/research/discuss já persistem o conhecimento em artefatos próprios e não disparam outro modelo. always = comportamento legado após toda unidade. disabled = nunca despacha forge-memory."
         }
@@ -455,7 +614,10 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["enabled", "disabled"],
+          "enum": [
+            "enabled",
+            "disabled"
+          ],
           "default": "enabled",
           "description": "enabled = forge-completer extrai após cada complete-slice. disabled = pula completamente — nenhum CHECKER-MEMORY.md é gerado/atualizado."
         }
@@ -467,7 +629,11 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["advisory", "blocking", "disabled"],
+          "enum": [
+            "advisory",
+            "blocking",
+            "disabled"
+          ],
           "default": "advisory",
           "description": "advisory = pontua e prossegue independente do veredicto (flags viram documentação). blocking = revision-loop (max 3 rodadas, fails em decremento monotônico; senão pausa e notifica). disabled = pula o gate — nenhum artefato gerado."
         }
@@ -479,25 +645,37 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["enabled", "disabled"],
+          "enum": [
+            "enabled",
+            "disabled"
+          ],
           "default": "enabled",
           "description": "enabled = o gate roda por slice. disabled = pula inteiramente — nenhum S##-REVIEW.md é gerado."
         },
         "engine": {
           "type": "string",
-          "enum": ["agents", "workflow"],
+          "enum": [
+            "agents",
+            "workflow"
+          ],
           "default": "agents",
           "description": "Quem roda o debate (Steps 2–5). agents = dispatch via Agent() no orquestrador (default). workflow = uma única invocação da tool Workflow (Claude Code >= 2.1.154; requer bypassPermissions para não pausar o forge-auto); tool ausente/erro → fallback automático para agents. Ignorado quando style: flags."
         },
         "style": {
           "type": "string",
-          "enum": ["dialectic", "flags"],
+          "enum": [
+            "dialectic",
+            "flags"
+          ],
           "default": "dialectic",
           "description": "dialectic = debate completo (challenge → defense → rebuttal → resolução). flags = single-pass legado — só o challenger, sem defesa nem perguntas."
         },
         "trigger": {
           "type": "string",
-          "enum": ["adaptive", "always"],
+          "enum": [
+            "adaptive",
+            "always"
+          ],
           "default": "adaptive",
           "description": "adaptive = docs-only pula; código comum usa flags (1 chamada); risk:high, checklist de segurança, drift, paths sensíveis ou diff grande usam dialectic. always = preserva o style configurado em todo diff não-vazio. A decisão determinística vem de scripts/forge-cost-policy.js."
         },
@@ -515,15 +693,24 @@
         },
         "rounds": {
           "type": "integer",
-          "enum": [0, 1, 2, 3],
+          "enum": [
+            0,
+            1,
+            2,
+            3
+          ],
           "default": 1,
           "description": "Rodadas de réplica do reviewer sobre a defesa (0–3). 0 = sem réplica (toda objeção contestada vira aberta)."
         },
         "ask_in_auto": {
           "type": "string",
-          "enum": ["defer", "pause"],
+          "enum": [
+            "defer",
+            "pause",
+            "gate"
+          ],
           "default": "defer",
-          "description": "defer = no forge-auto, objeções abertas NÃO pausam o loop — vão para a triagem final da milestone (honra a AUTONOMY RULE). pause = pergunta ao humano por slice mesmo em modo autônomo (opt-in)."
+          "description": "defer = no forge-auto, objeções abertas NÃO pausam o loop — vão para a triagem final da milestone (honra a AUTONOMY RULE). pause = pergunta ao humano por slice mesmo em modo autônomo (opt-in). | gate = abre uma pergunta no mailbox (scripts/forge-gate.js) e espera com timeout — o app/CLI responde; sem resposta cai no default declarado, equivalente a defer. Não pausa o loop."
         },
         "fix_conceded": {
           "type": "boolean",
@@ -532,18 +719,29 @@
         },
         "challenger": {
           "type": "string",
-          "enum": ["claude", "codex", "gemini", "auto"],
+          "enum": [
+            "claude",
+            "codex",
+            "gemini",
+            "auto"
+          ],
           "default": "claude",
           "description": "Quem desafia (challenge + rebuttal). codex = GPT via codex exec; gemini = Antigravity CLI agy — ambos via scripts/forge-xllm.js, com fallback automático ao forge-reviewer Claude em qualquer falha. auto = família OPOSTA ao autor do código (reduz viés de auto-preferência). Valor inválido cai em claude."
         },
         "advocate": {
           "type": "string",
-          "enum": ["claude", "auto"],
+          "enum": [
+            "claude",
+            "auto"
+          ],
           "default": "claude",
           "description": "Quem defende. auto = MESMA família do autor; enquanto --mode defend externo não existe, autor GPT/Gemini degrada para advocate Claude (evento review-pairing-fallback) — nunca bloqueia."
         },
         "challenger_model": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null,
           "description": "Modelo repassado ao CLI externo quando o challenger RESOLVIDO não é claude; se claude, fica inerte e emite review-config-inert. null/unset usa o default do CLI."
         },
@@ -551,6 +749,11 @@
           "type": "string",
           "default": "claude-fable-5",
           "description": "Modelo do defender (forge-advocate), resolvido para alias via scripts/forge-model-alias.js e auditado por scripts/forge-review-audit.js. ID sem alias omite model:. Default literal — nunca null."
+        },
+        "gate_timeout_ms": {
+          "type": "integer",
+          "default": 1800000,
+          "description": "Timeout (ms) da pergunta quando review.ask_in_auto: gate. Sem resposta dentro do prazo, o item é deferido para a triagem final (Step 9) — nunca fechado em silêncio. Default 30min."
         }
       }
     },
@@ -560,13 +763,20 @@
       "properties": {
         "interactive": {
           "type": "string",
-          "enum": ["always", "auto", "off"],
+          "enum": [
+            "always",
+            "auto",
+            "off"
+          ],
           "default": "always",
           "description": "always = conduz o handshake sempre que existe um plano, mesmo all-pass. auto = só quando há warn/fail do plan-checker. off = batch advisory mesmo em modo interativo."
         },
         "ask_in_auto": {
           "type": "string",
-          "enum": ["defer", "off"],
+          "enum": [
+            "defer",
+            "off"
+          ],
           "default": "defer",
           "description": "forge-auto NUNCA conduz o handshake, incondicionalmente (AUTONOMY RULE). defer e off são semanticamente idênticos para o forge-auto — off existe como sinalizador explícito de intenção."
         }
@@ -603,7 +813,11 @@
       "properties": {
         "test_quality": {
           "type": "string",
-          "enum": ["advisory", "blocking", "disabled"],
+          "enum": [
+            "advisory",
+            "blocking",
+            "disabled"
+          ],
           "default": "advisory",
           "description": "advisory = detecta disabled-test/weak-assertion/no-assertion/circular-assertion e registra flags no S##-VERIFICATION.md sem bloquear. blocking = reservado M004+ (flags bloqueiam complete-slice). disabled = pula o nível 4."
         }
@@ -615,7 +829,10 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["advisory", "disabled"],
+          "enum": [
+            "advisory",
+            "disabled"
+          ],
           "default": "advisory",
           "description": "advisory = resolve cada símbolo (ripgrep/grep) e emite VERIFIED|MISSING|AMBIGUOUS|UNCHECKABLE em S##-SYMBOL-CHECK.md, sem bloquear. Greenfield (artefatos ainda não criados) não flagga MISSING. disabled = pula o gate."
         }
@@ -659,7 +876,10 @@
       "properties": {
         "reinject": {
           "type": "string",
-          "enum": ["auto", "off"],
+          "enum": [
+            "auto",
+            "off"
+          ],
           "default": "auto",
           "description": "auto = must_haves dropados viram seção 'Requisitos pendentes re-injetados' no prompt da próxima unidade (cap de 10 itens). off = opt-out da re-injeção; o PRUNE ainda registra em S##-CONTEXT § Decisions (nunca some em silêncio)."
         }
@@ -671,7 +891,10 @@
       "properties": {
         "handoff_in_auto": {
           "type": "string",
-          "enum": ["on", "off"],
+          "enum": [
+            "on",
+            "off"
+          ],
           "default": "on",
           "description": "on = ao cruzar o threshold na fronteira de unidade, o loop faz checkpoint (continue.md), pausa e indica a troca de conta. off = sem pausa automática (a statusline ainda mostra o alerta de uso)."
         },

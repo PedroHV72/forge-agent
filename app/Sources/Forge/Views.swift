@@ -11,6 +11,7 @@
 
 import SwiftUI
 import AppKit
+import ForgeKit
 
 // MARK: - Shell
 

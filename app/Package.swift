@@ -16,10 +16,17 @@ let package = Package(
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.15.0"),
     ],
     targets: [
+        // Pure logic lives here so it can be tested: an executable target cannot
+        // be imported by a test target, and the parts most worth pinning down
+        // (JSONC editing, git parsing, engine resolution) carry no UI anyway.
+        .target(name: "ForgeKit", path: "Sources/ForgeKit"),
         .executableTarget(
             name: "Forge",
-            dependencies: ["SwiftTerm"],
+            dependencies: ["SwiftTerm", "ForgeKit"],
             path: "Sources/Forge"
         ),
+        // Executable, not a testTarget: XCTest requires full Xcode and this
+        // repo builds against the Command Line Tools.
+        .executableTarget(name: "ForgeKitTests", dependencies: ["ForgeKit"], path: "Sources/ForgeKitTests"),
     ]
 )

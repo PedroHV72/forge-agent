@@ -14,6 +14,7 @@
 import SwiftUI
 import AppKit
 import SwiftTerm
+import ForgeKit
 
 // MARK: - Session model
 

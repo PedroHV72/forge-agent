@@ -28,6 +28,7 @@
 import Foundation
 import UserNotifications
 import AppKit
+import ForgeKit
 
 @MainActor
 final class Notifier: NSObject, ObservableObject {

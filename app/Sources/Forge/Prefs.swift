@@ -12,6 +12,7 @@
 
 import SwiftUI
 import Foundation
+import ForgeKit
 
 // MARK: - Schema model
 
@@ -29,50 +30,6 @@ struct PrefField: Identifiable, Hashable {
     var isToggle: Bool { type == "boolean" }
     var isPicker: Bool { !enumValues.isEmpty }
     var isNumber: Bool { type == "integer" || type == "number" }
-}
-
-/// Minimal JSON value — the schema mixes types freely and Swift needs one box.
-enum JSONValue: Codable, Hashable {
-    case string(String), number(Double), bool(Bool), null
-    case array([JSONValue]), object([String: JSONValue])
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { self = .null }
-        else if let b = try? c.decode(Bool.self) { self = .bool(b) }
-        else if let d = try? c.decode(Double.self) { self = .number(d) }
-        else if let s = try? c.decode(String.self) { self = .string(s) }
-        else if let a = try? c.decode([JSONValue].self) { self = .array(a) }
-        else if let o = try? c.decode([String: JSONValue].self) { self = .object(o) }
-        else { self = .null }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        switch self {
-        case .string(let s): try c.encode(s)
-        case .number(let d): try c.encode(d)
-        case .bool(let b):   try c.encode(b)
-        case .null:          try c.encodeNil()
-        case .array(let a):  try c.encode(a)
-        case .object(let o): try c.encode(o)
-        }
-    }
-
-    var display: String {
-        switch self {
-        case .string(let s): return s
-        case .number(let d): return d == d.rounded() ? String(Int(d)) : String(d)
-        case .bool(let b):   return b ? "sim" : "não"
-        case .null:          return "—"
-        case .array(let a):  return a.map(\.display).joined(separator: ", ")
-        case .object:        return "{…}"
-        }
-    }
-
-    var asBool: Bool? { if case .bool(let b) = self { return b }; return nil }
-    var asString: String? { if case .string(let s) = self { return s }; return nil }
-    var asDouble: Double? { if case .number(let d) = self { return d }; return nil }
 }
 
 // MARK: - Store
@@ -185,7 +142,7 @@ final class PrefsStore: ObservableObject {
             // structures are left to the file itself (the app links to it).
             let parts = key.split(separator: ".").map(String.init)
             guard parts.count <= 2 else { continue }
-            text = Self.upsert(text, path: parts, value: value)
+            text = PrefsEdit.upsert(text, path: parts, value: value)
         }
 
         do {
@@ -196,80 +153,6 @@ final class PrefsStore: ObservableObject {
             return nil
         } catch {
             return error.localizedDescription
-        }
-    }
-
-    /// Insert or replace `path` in a JSONC document, preserving comments.
-    /// `.null` removes the key (falling back to the schema default).
-    static func upsert(_ source: String, path: [String], value: JSONValue) -> String {
-        var lines = source.components(separatedBy: "\n")
-        let leaf = path.last!
-        let indent = path.count > 1 ? "    " : "  "
-        let literal = encode(value)
-
-        // Find an existing assignment for the leaf key, scoped to its parent
-        // block when nested.
-        var searchFrom = 0
-        var searchTo = lines.count
-
-        if path.count == 2 {
-            guard let parentIdx = lines.firstIndex(where: {
-                $0.trimmingCharacters(in: .whitespaces).hasPrefix("\"\(path[0])\"")
-            }) else {
-                // Parent block absent — add the whole object.
-                return insertTopLevel(lines: lines, key: path[0],
-                                      raw: "{\n    \"\(leaf)\": \(literal)\n  }")
-            }
-            searchFrom = parentIdx
-            searchTo = lines[parentIdx...].firstIndex(where: {
-                $0.trimmingCharacters(in: .whitespaces).hasPrefix("}")
-            }) ?? lines.count
-        }
-
-        let existing = lines[searchFrom..<searchTo].firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespaces).hasPrefix("\"\(leaf)\"")
-        })
-
-        if case .null = value {
-            if let existing { lines.remove(at: existing) }
-            return lines.joined(separator: "\n")
-        }
-
-        if let existing {
-            // Preserve a trailing comma and any trailing comment on the line.
-            let old = lines[existing]
-            let hasComma = old.trimmingCharacters(in: .whitespaces).hasSuffix(",")
-            lines[existing] = "\(indent)\"\(leaf)\": \(literal)\(hasComma ? "," : "")"
-            return lines.joined(separator: "\n")
-        }
-
-        if path.count == 2 {
-            lines.insert("\(indent)\"\(leaf)\": \(literal),", at: searchFrom + 1)
-            return lines.joined(separator: "\n")
-        }
-        return insertTopLevel(lines: lines, key: leaf, raw: literal)
-    }
-
-    private static func insertTopLevel(lines: [String], key: String, raw: String) -> String {
-        var lines = lines
-        guard let open = lines.firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespaces).hasPrefix("{")
-        }) else {
-            return (["{", "  \"\(key)\": \(raw)", "}"]).joined(separator: "\n")
-        }
-        lines.insert("  \"\(key)\": \(raw),", at: open + 1)
-        return lines.joined(separator: "\n")
-    }
-
-    static func encode(_ v: JSONValue) -> String {
-        switch v {
-        case .string(let s): return "\"\(s.replacingOccurrences(of: "\"", with: "\\\""))\""
-        case .number(let d): return d == d.rounded() ? String(Int(d)) : String(d)
-        case .bool(let b):   return b ? "true" : "false"
-        case .null:          return "null"
-        case .array(let a):  return "[" + a.map(encode).joined(separator: ", ") + "]"
-        case .object(let o): return "{" + o.map { "\"\($0.key)\": \(encode($0.value))" }
-                                            .joined(separator: ", ") + "}"
         }
     }
 

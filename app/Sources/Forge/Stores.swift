@@ -9,6 +9,7 @@
 
 import SwiftUI
 import Foundation
+import ForgeKit
 
 // MARK: - Workspaces
 
@@ -64,6 +65,7 @@ final class AppState: ObservableObject {
     @Published private(set) var sessions: [TerminalSession] = []
 
     private var timer: Timer?
+    private var watcher: Watcher?
 
     struct Toast: Identifiable, Equatable {
         let id = UUID()
@@ -97,7 +99,16 @@ final class AppState: ObservableObject {
     init() {
         reloadCheap()
         loadAccounts()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+
+        // FSEvents drives updates; the timer is only a safety net. It also
+        // covers the one change no filesystem can report: a gate reaching its
+        // expiry, which is a clock event, not a write.
+        watcher = Watcher { [weak self] in
+            Task { @MainActor in self?.reloadCheap() }
+        }
+        watcher?.watch(workspaces)
+
+        timer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reloadCheap() }
         }
     }
@@ -115,6 +126,8 @@ final class AppState: ObservableObject {
         }
         gates = g
         runs = r
+        // Follow projects being added or removed.
+        watcher?.watch(workspaces)
         Notifier.shared.sync(pending: pending)
         NotificationCenter.default.post(name: Self.didChange, object: nil)
     }

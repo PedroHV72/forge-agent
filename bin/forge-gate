@@ -24,8 +24,18 @@ set -euo pipefail
 
 ENGINE="$HOME/.claude/scripts/forge-gate.js"
 if [ ! -f "$ENGINE" ]; then
-  REPO="$(grep 'repo_path:' "$HOME/.claude/forge-agent-prefs.md" 2>/dev/null | cut -d: -f2 | tr -d ' ' || true)"
-  [ -n "${REPO:-}" ] && ENGINE="$REPO/scripts/forge-gate.js"
+  # Read repo_path from the current prefs format (JSONC). Two traps, both real:
+  # the scaffold ships a COMMENTED repo_path hundreds of lines above the live
+  # one, and the value is a JSON string. So: drop comment lines, keep the LAST
+  # live assignment, strip quotes/commas.
+  PREFS="$HOME/.claude/forge-agent-prefs.jsonc"
+  [ -f "$PREFS" ] || PREFS="$HOME/.claude/forge-agent-prefs.json"
+  if [ -f "$PREFS" ]; then
+    REPO="$(sed 's/[[:space:]]*\/\/.*$//' "$PREFS" 2>/dev/null \
+      | grep -E '^[[:space:]]*"repo_path"[[:space:]]*:' \
+      | tail -1 | cut -d: -f2- | tr -d ' ",' || true)"
+    [ -n "${REPO:-}" ] && [ -f "$REPO/scripts/forge-gate.js" ] && ENGINE="$REPO/scripts/forge-gate.js"
+  fi
 fi
 if [ ! -f "$ENGINE" ]; then
   echo "forge-gate: engine não encontrado. Rode /forge-update." >&2
