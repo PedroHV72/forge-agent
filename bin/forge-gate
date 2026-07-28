@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# forge-gate — CLI wrapper over scripts/forge-gate.js
+#
+# Translates human subcommands into the engine's flags, the same way
+# bin/forge-accounts does (bin/forge-status is a pure pass-through because its
+# engine already takes flags directly; this one does not).
+#
+#   forge-gate list [--all] [--json]      → --list
+#   forge-gate show <id>                  → --show <id>
+#   forge-gate answer <id> <key> [--notes "..."]
+#                                         → --answer <id> --choice <key>
+#   forge-gate cancel <id>                → --cancel <id>
+#   forge-gate wait <id>                  → --wait <id>
+#   forge-gate cleanup                    → --cleanup
+#   forge-gate demo                       → --demo
+#   forge-gate open --question "..." --option "k:Label:Desc" ...
+#
+# Long flags are passed straight through, so `forge-gate --list` also works.
+#
+# Installed to a bin dir on PATH by install.sh. Resolves the engine in
+# ~/.claude first, then falls back to the repo (repo_path in prefs) for
+# dev/dogfood.
+set -euo pipefail
+
+ENGINE="$HOME/.claude/scripts/forge-gate.js"
+if [ ! -f "$ENGINE" ]; then
+  REPO="$(grep 'repo_path:' "$HOME/.claude/forge-agent-prefs.md" 2>/dev/null | cut -d: -f2 | tr -d ' ' || true)"
+  [ -n "${REPO:-}" ] && ENGINE="$REPO/scripts/forge-gate.js"
+fi
+if [ ! -f "$ENGINE" ]; then
+  echo "forge-gate: engine não encontrado. Rode /forge-update." >&2
+  exit 1
+fi
+
+if [ $# -eq 0 ]; then
+  exec node "$ENGINE" --help
+fi
+
+sub="$1"
+case "$sub" in
+  # Subcommands taking a single positional <id>
+  show|cancel|wait)
+    shift
+    if [ $# -eq 0 ]; then
+      echo "forge-gate: '$sub' requer <id>" >&2
+      exit 2
+    fi
+    id="$1"; shift
+    exec node "$ENGINE" "--$sub" "$id" "$@"
+    ;;
+
+  # answer <id> <key> — the one a human actually types
+  answer)
+    shift
+    if [ $# -lt 2 ]; then
+      echo "forge-gate: 'answer' requer <id> <key>" >&2
+      echo "  ex: forge-gate answer G-20260728143022-a1b2 treat" >&2
+      exit 2
+    fi
+    id="$1"; key="$2"; shift 2
+    exec node "$ENGINE" --answer "$id" --choice "$key" "$@"
+    ;;
+
+  # Subcommands with no positional argument
+  list|cleanup|demo|open)
+    shift
+    exec node "$ENGINE" "--$sub" "$@"
+    ;;
+
+  -h|--help|help)
+    exec node "$ENGINE" --help
+    ;;
+
+  # Already flag form (--list, --open, ...) — pass through untouched
+  --*)
+    exec node "$ENGINE" "$@"
+    ;;
+
+  *)
+    echo "forge-gate: subcomando desconhecido: $sub" >&2
+    echo "  use: list | show | answer | cancel | wait | open | cleanup | demo" >&2
+    exit 2
+    ;;
+esac
