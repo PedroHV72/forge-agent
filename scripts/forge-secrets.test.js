@@ -81,12 +81,29 @@ test('o segredo volta pelo cofre', () => {
   assertEq(secrets.get(SERVICE, 'a'), 'sk-super-secreto-12345');
 });
 
-test('list() não expõe segredo, só se existe', () => {
+test('list() não expõe segredo, e por padrão nem toca no cofre', () => {
+  // Reading to check presence means one Keychain access per entry, which on an
+  // unsigned bundle is one authorisation dialog per entry.
   const rows = secrets.list().filter(c => c.service === SERVICE);
   assertEq(rows.length, 1);
-  assertEq(rows[0].has_secret, true);
+  assertEq(rows[0].has_secret, null, 'sem --verify não se afirma nada sobre o valor');
   assert(!('secret' in rows[0]), 'list() não pode carregar o segredo');
   assert(!JSON.stringify(rows).includes('sk-super-secreto'), 'segredo em list()');
+});
+
+test('list({verify:true}) confirma presença sem revelar', () => {
+  const rows = secrets.list({ verify: true }).filter(c => c.service === SERVICE);
+  assertEq(rows[0].has_secret, true);
+  assert(!JSON.stringify(rows).includes('sk-super-secreto'));
+});
+
+test('não verificado é diferente de ausente', () => {
+  // null and false are distinct claims: "we did not look" must never render as
+  // "it is missing", which would send the user re-adding a healthy secret.
+  const unverified = secrets.list().find(c => c.service === SERVICE);
+  const verified = secrets.list({ verify: true }).find(c => c.service === SERVICE);
+  assertEq(unverified.has_secret, null);
+  assertEq(verified.has_secret, true);
 });
 
 test('readicionar substitui em vez de duplicar', () => {

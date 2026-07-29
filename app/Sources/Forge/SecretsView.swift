@@ -27,7 +27,10 @@ struct StoredSecret: Codable, Identifiable, Hashable {
 
     var id: String { "\(service)/\(name)" }
     var isDefault: Bool { is_default ?? false }
-    var hasSecret: Bool { has_secret ?? false }
+    /// nil means "not checked", which is the default: verifying costs one
+    /// Keychain access per entry, and an ad-hoc signed bundle gets an
+    /// authorisation dialog for each. Only `false` means actually missing.
+    var secretMissing: Bool { has_secret == false }
 }
 
 // MARK: - Keychain (write path)
@@ -75,9 +78,11 @@ final class SecretsStore: ObservableObject {
         Dictionary(grouping: secrets, by: \.service)
     }
 
-    func load() {
-        secrets = ForgeCore.runJSON([StoredSecret].self,
-                                    "forge-secrets.js", ["--list", "--json"]) ?? []
+    /// Listing never verifies. `verifyAll()` exists for when the user asks.
+    func load(verify: Bool = false) {
+        var args = ["--list", "--json"]
+        if verify { args.append("--verify") }
+        secrets = ForgeCore.runJSON([StoredSecret].self, "forge-secrets.js", args) ?? []
         if let rows = ForgeCore.runJSON([ServiceRow].self,
                                         "forge-secrets.js", ["--services", "--json"]) {
             services = rows.map(\.service).sorted()
@@ -119,6 +124,10 @@ final class SecretsStore: ObservableObject {
         load()
         return true
     }
+
+    /// One round of Keychain prompts, on request — the price of an answer the
+    /// user asked for, rather than one they got for opening a screen.
+    func verifyAll() { load(verify: true) }
 
     func remove(_ s: StoredSecret) {
         let r = ForgeCore.run("forge-secrets.js", ["--remove", s.service, s.name])
@@ -171,6 +180,12 @@ struct SecretsView: View {
         }
         .toolbar {
             ToolbarItem {
+                Button { store.verifyAll() } label: {
+                    Label("Verificar", systemImage: "checkmark.shield")
+                }
+                .help("Confere se cada valor está no cofre — o macOS vai pedir autorização")
+            }
+            ToolbarItem {
                 Button { adding = true } label: {
                     Label("Adicionar", systemImage: "plus")
                 }
@@ -184,7 +199,7 @@ struct SecretsView: View {
                 .font(.system(size: 16)).foregroundStyle(Color.accentOrange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Guardados no Keychain").font(.callout).bold()
-                Text("O valor nunca é exibido nem copiável. Para usar, rode o comando com forge-secrets exec — o segredo entra só no processo que precisa dele.")
+                Text("O valor nunca é exibido nem copiável. Listar não abre o Keychain — só \"Verificar\" faz isso, e por isso o macOS pede autorização ali.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -242,11 +257,14 @@ struct SecretRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: secret.hasSecret ? "key.fill" : "key.slash")
+            Image(systemName: secret.secretMissing ? "key.slash" : "key.fill")
                 .font(.caption)
-                .foregroundStyle(secret.hasSecret ? AnyShapeStyle(Color.green)
-                                                  : AnyShapeStyle(Color.orange))
+                .foregroundStyle(secret.secretMissing ? AnyShapeStyle(Color.orange)
+                                 : (secret.has_secret == true ? AnyShapeStyle(Color.green)
+                                                              : AnyShapeStyle(.secondary)))
                 .frame(width: 16)
+                .help(secret.has_secret == nil ? "Valor não verificado"
+                      : (secret.secretMissing ? "Sem valor no cofre" : "Valor presente"))
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
@@ -262,7 +280,7 @@ struct SecretRow: View {
                 if let n = secret.note, !n.isEmpty {
                     Text(n).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
-                if !secret.hasSecret {
+                if secret.secretMissing {
                     Text("registrado sem valor no cofre — readicione")
                         .font(.caption2).foregroundStyle(.orange)
                 }

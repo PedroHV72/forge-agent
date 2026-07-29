@@ -210,9 +210,22 @@ function remove(service, name) {
   return true;
 }
 
-/// Entries with a `has_secret` flag and never the secret itself.
-function list() {
-  return load().map(c => ({ ...c, has_secret: !!get(c.service, c.name) }));
+/// Registry entries, never the secrets.
+///
+/// `verify` is OFF by default, and that is the whole point: checking whether a
+/// value is present means reading it, and every read is a Keychain access. On a
+/// bundle without a stable signature — an ad-hoc signed app, which is any build
+/// without a Developer ID — macOS re-prompts for authorisation on each one, so
+/// simply listing five secrets produced five dialogs.
+///
+/// Verification is still available for a health check, where one round of
+/// prompts is a reasonable price for the answer.
+function list(opts) {
+  const verify = !!(opts && opts.verify);
+  return load().map(c => ({
+    ...c,
+    has_secret: verify ? !!get(c.service, c.name) : null,
+  }));
 }
 
 function find(service, name) {
@@ -268,7 +281,7 @@ function usage() {
     '',
     'Uso:',
     '  --add <serviço> <nome> [--env VAR] [--note "..."]   segredo vem do stdin',
-    '  --list [serviço] [--json]',
+    '  --list [serviço] [--verify] [--json]   --verify lê o cofre (abre o Keychain)',
     '  --exec <serviço> [nome] -- <comando> [args...]',
     '  --default <serviço> <nome>                          padrão do serviço',
     '  --remove <serviço> <nome>',
@@ -328,7 +341,7 @@ function main(argv) {
   if (iList >= 0) {
     const filter = argv[iList + 1] && !argv[iList + 1].startsWith('--')
       ? argv[iList + 1].toLowerCase() : null;
-    let rows = list();
+    let rows = list({ verify: argv.includes('--verify') });
     if (filter) rows = rows.filter(c => c.service === filter);
     if (json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
     if (!rows.length) {
@@ -343,15 +356,20 @@ function main(argv) {
       const known = SERVICES[svc];
       console.log(`\n  ${svc}${known ? `  (${known.env})` : ''}`);
       for (const c of group) {
-        const mark = c.has_secret ? '●' : '○';
+        // Unverified is a dot, not a cross: "we did not look" and "it is
+        // missing" are different claims and the list must not conflate them.
+        const mark = c.has_secret === null ? '·' : (c.has_secret ? '●' : '○');
         const def = c.is_default ? ' ★' : '  ';
         console.log(`    ${mark}${def} ${c.name.padEnd(18)} ${c.note || ''}`);
       }
     }
     console.log('');
     if (rows.some(c => c.is_default)) console.log('  ★ = padrão do serviço');
-    if (rows.some(c => !c.has_secret)) {
-      console.log('  ○ = registrado sem segredo no cofre — readicione.');
+    if (rows.some(c => c.has_secret === false)) {
+      console.log('  ○ = registrado sem valor no cofre — readicione.');
+    }
+    if (rows.some(c => c.has_secret === null)) {
+      console.log('  · = valor não verificado (use --verify; abre o Keychain)');
     }
     return 0;
   }
