@@ -284,8 +284,10 @@ test("parseRepoPath tira comentário de fim de linha") {
     assertEqual(PrefsLocator.parseRepoPath(doc), "/x")
 }
 
-test("parseRepoPath aceita o formato .md legado") {
-    assertEqual(PrefsLocator.parseRepoPath("repo_path: /legado/forge"), "/legado/forge")
+test("parseRepoPath aceita a forma sem aspas") {
+    // Tolerated by the parser, but only the JSONC/JSON files are ever read —
+    // the legacy markdown format is deliberately not consulted.
+    assertEqual(PrefsLocator.parseRepoPath("repo_path: /sem/aspas"), "/sem/aspas")
 }
 
 test("parseRepoPath usa a ÚLTIMA atribuição viva") {
@@ -373,6 +375,39 @@ test("Duration formata as faixas") {
     assertEqual(Duration.short(ms: 120_000), "2min")
     assertEqual(Duration.short(ms: 5_400_000), "1.5h")
     assertEqual(Duration.short(ms: -1), "agora")
+}
+
+print("\nProjectDiscovery (a cópia local sombreava esta — código testado ≠ código rodado)")
+
+test("scan acha projeto e continua descendo para aninhados") {
+    let tmp = NSTemporaryDirectory() + "forge-disc-\(UUID().uuidString.prefix(6))"
+    let fm = FileManager.default
+    defer { try? fm.removeItem(atPath: tmp) }
+
+    // ~/Development/repo/.gsd  and  ~/Development/repo/services/.gsd (monorepo)
+    for p in ["Development/repo/.gsd", "Development/repo/services/.gsd",
+              "Development/plain/src", "Development/repo/node_modules/pkg/.gsd"] {
+        try? fm.createDirectory(atPath: "\(tmp)/\(p)", withIntermediateDirectories: true)
+    }
+
+    // Compare by suffix: macOS canonicalises /var to /private/var, so the
+    // returned paths never string-match the ones built here.
+    let found = ProjectDiscovery.scan(home: tmp)
+    func has(_ suffix: String) -> Bool { found.contains { $0.hasSuffix(suffix) } }
+
+    assertTrue(has("/Development/repo"), "projeto raiz não encontrado")
+    assertTrue(has("/Development/repo/services"),
+               "projeto aninhado perdido — parar no primeiro acerto seria errado")
+    assertFalse(has("/Development/plain"), "pasta sem .gsd não é projeto")
+    assertFalse(found.contains { $0.contains("node_modules") },
+                "node_modules deve ser pulado")
+}
+
+test("scan ignora raiz inexistente sem falhar") {
+    let tmp = NSTemporaryDirectory() + "forge-disc-empty-\(UUID().uuidString.prefix(6))"
+    try? FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    assertEqual(ProjectDiscovery.scan(home: tmp).count, 0)
 }
 
 

@@ -41,57 +41,6 @@ struct ProjectStatus: Codable {
     }
 }
 
-// MARK: - Discovery
-
-/// Finds Forge projects on disk instead of making the user navigate to each one.
-/// A project is any directory containing .gsd/ — the same marker every engine uses.
-enum ProjectDiscovery {
-    /// Where people actually keep code. Scanned shallowly on purpose: a deep
-    /// walk of $HOME would take seconds and wander into node_modules.
-    static let roots = ["Development", "Documents", "Projects", "Code", "src", "repos", "Desktop"]
-    static let maxDepth = 3
-
-    static func scan() -> [String] {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        var found: Set<String> = []
-        for root in roots {
-            let base = home.appendingPathComponent(root)
-            guard FileManager.default.fileExists(atPath: base.path) else { continue }
-            walk(base, depth: 0, into: &found)
-        }
-        return found.sorted()
-    }
-
-    private static func walk(_ dir: URL, depth: Int, into found: inout Set<String>) {
-        guard depth <= maxDepth else { return }
-        let fm = FileManager.default
-
-        if fm.fileExists(atPath: dir.appendingPathComponent(".gsd").path) {
-            found.insert(dir.path)
-            // Keep descending: a monorepo can hold nested Forge projects
-            // (lookchina/services is one), so stopping here would miss them.
-        }
-
-        guard let entries = try? fm.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return }
-
-        for e in entries {
-            guard (try? e.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-            else { continue }
-            let name = e.lastPathComponent
-            // Directories that never contain a project but are huge to traverse.
-            if ["node_modules", "vendor", "Library", ".git", "dist", "build",
-                ".build", "target", "Pods"].contains(name) { continue }
-            walk(e, depth: depth + 1, into: &found)
-        }
-    }
-}
-
-/// A checkout belonging to a project. Forge can isolate a milestone in its own
-/// worktree (forge_isolation.mode = worktree), so one "project" on disk is
-/// often several working trees — and the runs, gates and branches live in the
-/// worktree, not the folder you added.
 // MARK: - Folder appearance
 
 /// Uses the folder's real Finder icon and colour tags, so a project looks in
