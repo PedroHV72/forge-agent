@@ -52,6 +52,12 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const IS_DARWIN = process.platform === 'darwin';
+
+// Every `security` call is bounded. A locked keychain makes the tool prompt for
+// a password, and with no TTY — a CI runner, a hook, a headless agent — it waits
+// forever instead of failing. Discovered when the macOS CI job went from 70s to
+// hanging past ten minutes on this exact call.
+const KEYCHAIN_TIMEOUT_MS = Number(process.env.FORGE_KEYCHAIN_TIMEOUT_MS || 5000);
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const REGISTRY_FILE = process.env.FORGE_SECRETS_REGISTRY
   || path.join(CLAUDE_DIR, 'forge-secrets.json');
@@ -115,7 +121,7 @@ function storeSecret(service, name, secret) {
         '-a', KEYCHAIN_ACCT,
         '-s', keychainService(service, name),
         '-w', secret,
-      ], { stdio: ['ignore', 'ignore', 'pipe'] });
+      ], { stdio: ['ignore', 'ignore', 'pipe'], timeout: KEYCHAIN_TIMEOUT_MS });
       return 'keychain';
     } catch {
       // The Keychain can be unreachable: it is resolved through HOME, so a
@@ -145,7 +151,8 @@ function get(service, name) {
         '-a', KEYCHAIN_ACCT,
         '-s', keychainService(service, name),
         '-w',
-      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).replace(/\n$/, '');
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+           timeout: KEYCHAIN_TIMEOUT_MS }).replace(/\n$/, '');
       if (v) return v;
     } catch { /* fall through to the file store */ }
   }
@@ -164,7 +171,7 @@ function deleteSecret(service, name) {
         'delete-generic-password',
         '-a', KEYCHAIN_ACCT,
         '-s', keychainService(service, name),
-      ], { stdio: 'ignore' });
+      ], { stdio: 'ignore', timeout: KEYCHAIN_TIMEOUT_MS });
     } catch {}
     // No early return: a copy may also exist in the file store from a moment
     // when the Keychain was unavailable, and leaving it behind would mean

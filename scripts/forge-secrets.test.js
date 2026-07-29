@@ -267,6 +267,30 @@ test('--list filtra por serviço', () => {
   assert(rows.every(c => c.service === SERVICE), 'filtro deixou passar outro serviço');
 });
 
+console.log('\nrobustez do cofre');
+
+test('Keychain travado não pendura — degrada para arquivo', () => {
+  // A locked keychain makes `security` prompt for a password; with no TTY it
+  // waits forever. This is what hung the macOS CI job past ten minutes.
+  const prev = process.env.FORGE_KEYCHAIN_TIMEOUT_MS;
+  process.env.FORGE_KEYCHAIN_TIMEOUT_MS = '1';
+  delete require.cache[require.resolve('./forge-secrets.js')];
+  const iso = require('./forge-secrets.js');
+
+  const t0 = Date.now();
+  iso.add({ service: SERVICE + 'to', name: 'x', secret: 'valor' });
+  const took = Date.now() - t0;
+
+  assert(took < 3000, `add demorou ${took}ms — deveria desistir do Keychain rápido`);
+  assertEq(iso.find(SERVICE + 'to', 'x').store, 'file', 'deve registrar que caiu no arquivo');
+  assertEq(iso.get(SERVICE + 'to', 'x'), 'valor', 'o valor tem que continuar acessível');
+
+  iso.remove(SERVICE + 'to', 'x');
+  if (prev === undefined) delete process.env.FORGE_KEYCHAIN_TIMEOUT_MS;
+  else process.env.FORGE_KEYCHAIN_TIMEOUT_MS = prev;
+  delete require.cache[require.resolve('./forge-secrets.js')];
+});
+
 console.log('\nremoção');
 
 test('remove apaga registro e segredo', () => {
