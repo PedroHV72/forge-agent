@@ -29,6 +29,12 @@
 //   0 — success
 //   1 — runtime error (invalid id, parse error, etc.)
 //   2 — unknown/missing arguments
+//
+// Boundary with .gsd/memory/ (forge-memory): items are PENDING ACTIONS — work
+// that still needs to happen. Facts about the project — things that BECAME TRUE —
+// belong to .gsd/memory/ instead. The two stores never compete for the same
+// capture: forge-memory's quality gate explicitly rejects pendência candidates
+// and never calls into this module to create an item.
 
 'use strict';
 

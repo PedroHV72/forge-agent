@@ -41,13 +41,23 @@ Parse the returned JSON object to get `facts` (existing extracted memories) and 
 
 ## Step 2 — Extract candidates
 
-Analyze SUMMARY_CONTENT + RESULT_BLOCK + KEY_DECISIONS. For each potential memory, apply the **quality gate** — all three questions must be YES to proceed:
+Analyze SUMMARY_CONTENT + RESULT_BLOCK + KEY_DECISIONS. For each potential memory, apply the **quality gate** — all four questions must be YES to proceed:
 
 1. **Project-specific?** — Is this specific to THIS codebase/project, not generic best practice?
 2. **Non-obvious?** — Would a competent dev reading the code NOT know this without real debugging effort?
 3. **Durable?** — Will this still be true in future tasks, not just a one-off fix?
+4. **Fact, not pending action?** — Is this something that BECAME TRUE about the project, not work someone still needs to do? Pendência é item (`.gsd/items/`), nunca memória.
 
 If any answer is NO → discard the candidate. Do not save it.
+
+**Worked examples (question 4):**
+- PASSES: "resolveItemId short-circuits exact matches before prefix scan" → this is a fact about how the code now behaves → `architecture` memory, save it.
+- REJECTED: "the S05 board still needs keyboard navigation" → this is NOT a memory, it is pending work → discard the candidate. Do NOT call `forge-items.js` from this agent to create the item — item creation belongs elsewhere in the pipeline; this Haiku agent has no business writing work items from summaries it may misread.
+
+Note: this guard is prompt-level, enforced entirely by Haiku's own judgement when
+reading each candidate — there is no runtime code path that checks it. Verifying
+this guard means verifying the TEXT above is present in this file, not exercising
+any behavior.
 
 Good extraction candidates from a summary:
 - `patterns_established` entries → often become `pattern` or `convention` memories
@@ -72,6 +82,7 @@ Good extraction candidates from a summary:
 - Temporary state or in-progress notes
 - Anything with secrets, tokens, or credentials
 - Generic best practices not specific to THIS codebase
+- Pending actions, follow-ups, TODOs — trabalho ainda por fazer é item (`.gsd/items/`), não memória. forge-memory NUNCA cria itens; apenas descarta o candidato.
 
 <!-- pre-S04: Step 3 mutated AUTO-MEMORY.md in-place with Write/Edit: incremented hits/confidence directly on stored entries, removed/rewrote entries for supersede/prune/decay, and rewrote the file header extraction_count on every run. -->
 ## Step 3 — Build fragment payload and emit via forge-memory.js
