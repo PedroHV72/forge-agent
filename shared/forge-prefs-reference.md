@@ -753,3 +753,19 @@ Handoff de conta por esgotamento de janela de uso (5h/semanal) no /forge-auto �
 - **Tipo:** integer
 - **Default:** `90`
 - **Descrição:** % de uso da janela mais apertada (5h OU semanal) que dispara o handoff.
+
+## app
+
+Knobs consumidos exclusivamente pelo app macOS (Forge.app) — não pelo CLI. Resolvidos via forge-prefs.js --resolved sem cwd, ou seja, sempre da camada global (~/.claude/forge-agent-prefs.jsonc); "qual projeto o app preseleciona" é uma preferência por operador, não por projeto.
+
+### `app.default_workspace`
+
+- **Tipo:** string
+- **Default:** `""`
+- **Descrição:** Caminho absoluto do projeto que o app preseleciona no composer e na folha de nova sessão. Vazio = sem default: o app usa o último projeto usado ou pede — ele NUNCA escolhe um por conta própria.
+
+### `app.session_root_dir`
+
+- **Tipo:** string
+- **Default:** `""`
+- **Descrição:** Diretório onde uma sessão shell/chat iniciada sem projeto abre. Vazio = $HOME. Um `~/` no início é expandido.

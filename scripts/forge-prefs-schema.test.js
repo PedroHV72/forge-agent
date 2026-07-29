@@ -169,6 +169,9 @@ const INVENTORY = [
   // — accounts —
   { key: 'accounts.handoff_in_auto', type: 'string', default: 'on', source: 'skills/forge-auto/SKILL.md:1574 "accounts.handoff_in_auto, default on"' },
   { key: 'accounts.handoff_threshold', type: 'integer', default: 90, source: 'skills/forge-auto/SKILL.md:1574 "accounts.handoff_threshold, default 90"' },
+  // — app (macOS app only, resolved via forge-prefs.js --resolved with no cwd) —
+  { key: 'app.default_workspace', type: 'string', default: '', source: 'app/Sources/Forge/Stores.swift § appDefaults (empty ⇒ WorkspaceDefaults.preselect falls to last-used, never to a workspace)' },
+  { key: 'app.session_root_dir', type: 'string', default: '', source: 'app/Sources/ForgeKit/WorkspaceDefaults.swift § sessionRoot (empty ⇒ home)' },
 ];
 
 // legacyReadFile flattens exactly 2 levels (section.key) — nested level-3 keys
