@@ -166,6 +166,7 @@ struct NowView: View {
 
                 if state.workspaces.isEmpty { emptyWorkspaces }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
         }
         .navigationTitle("Agora")
@@ -183,6 +184,7 @@ struct NowView: View {
             Spacer()
         }
         .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
     }
 
@@ -243,6 +245,7 @@ struct GateCard: View {
             }
         }
         .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12)
             .strokeBorder(Color.accentOrange.opacity(0.35), lineWidth: 1))
@@ -383,6 +386,7 @@ struct RunCard: View {
             }
         }
         .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 }
@@ -405,6 +409,7 @@ struct RunStrip: View {
             Text(run.elapsed).font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
     }
 }
@@ -435,7 +440,7 @@ struct AccountsView: View {
                 summary
                 if state.accounts.isEmpty { empty }
                 LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 340, maximum: 520), spacing: 14)],
+                    columns: [GridItem(.adaptive(minimum: 330), spacing: 14)],
                     alignment: .leading, spacing: 14
                 ) {
                     ForEach(state.accountsByHeadroom) { a in
@@ -444,6 +449,7 @@ struct AccountsView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
         }
         .navigationTitle("Contas")
@@ -504,6 +510,7 @@ struct AccountsView: View {
             }
         }
         .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 14))
     }
 
@@ -599,6 +606,7 @@ struct AccountCard: View {
             }
         }
         .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14)
             .strokeBorder(isRecommended ? Color.accentOrange.opacity(0.45) : .clear, lineWidth: 1.5))
@@ -843,6 +851,7 @@ struct HistoryView: View {
                             Spacer()
                         }
                         .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .background(.quaternary.opacity(0.25),
                                     in: RoundedRectangle(cornerRadius: 10))
                     }

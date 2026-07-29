@@ -104,13 +104,14 @@ struct ProjectsView: View {
             // Adaptive grid: one column in a narrow window, more as it widens,
             // instead of a single stretched column that wastes the space.
             LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 320, maximum: 460), spacing: 14)],
+                columns: [GridItem(.adaptive(minimum: 300), spacing: 14)],
                 alignment: .leading, spacing: 14
             ) {
                 ForEach(ordered, id: \.self) { ws in
                     ProjectCard(path: ws, state: state)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
 
             if state.workspaces.isEmpty { empty }
@@ -318,6 +319,7 @@ struct ProjectCard: View {
             actions
         }
         .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12)
             .strokeBorder(gatesHere.isEmpty ? Color.clear

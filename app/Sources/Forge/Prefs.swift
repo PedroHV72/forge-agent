@@ -452,6 +452,7 @@ struct PrefRow: View {
             }
         }
         .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(store.isOverridden(field) ? AnyShapeStyle(.quaternary.opacity(0.42))
                                               : AnyShapeStyle(.quaternary.opacity(0.2)),
                     in: RoundedRectangle(cornerRadius: 9))

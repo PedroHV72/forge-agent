@@ -206,7 +206,7 @@ struct ExamplesView: View {
                 NotificationStatusBar()
 
                 LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 320, maximum: 480), spacing: 14)],
+                    columns: [GridItem(.adaptive(minimum: 300), spacing: 14)],
                     alignment: .leading, spacing: 14
                 ) {
                     ForEach(Examples.all()) { ex in
@@ -216,6 +216,7 @@ struct ExamplesView: View {
 
                 if Sandbox.exists { footer }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
         }
         .navigationTitle("Exemplos")
@@ -250,6 +251,7 @@ struct ExamplesView: View {
                 .controlSize(.small)
         }
         .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
         .confirmationDialog("Apagar o sandbox de exemplos?",
                             isPresented: $confirmingReset, titleVisibility: .visible) {
@@ -331,6 +333,7 @@ struct NotificationStatusBar: View {
             .help("Reverificar")
         }
         .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
     }
 }
