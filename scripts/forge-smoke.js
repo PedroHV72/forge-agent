@@ -1216,8 +1216,13 @@ function smokeStopHook() {
     'emit compact signal');
   assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', 'status: blocked',
     'deactivate run NOW');
+  // Anchor on the section HEADER (newline-delimited), not the bare title: the title also
+  // appears earlier as an inline cross-reference inside the `status: partial` bullet, and
+  // indexOf finds that one first. The window from there covers the `status: blocked` bullet
+  // instead of the section, so v3.1.0's item-capture block pushed the deactivation command
+  // out of it and this assert went red on a prose insertion, not a lost behaviour.
   assertExitAnchor(autoSkillPath, 'forge-auto/SKILL.md', '## Deactivate auto-mode indicator',
-    '## Deactivate auto-mode indicator');
+    '\n## Deactivate auto-mode indicator\n');
 
   // forge-task exits to audit
   assertExitAnchor(taskSkillPath, 'forge-task/SKILL.md', 'status: done',
