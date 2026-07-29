@@ -174,17 +174,12 @@ struct NowView: View {
     @State private var project = ""
     @State private var account = ""
     @State private var highlighted = 0
-    @State private var keyMonitor: Any?
     @FocusState private var focused: Bool
 
     /// Rows currently offered, as a flat list — the menu shows either commands
     /// or projects, never both, so one index addresses whichever is up.
     private var menuCount: Int { max(matchingCommands.count, matchingProjects.count) }
 
-    /// NSTextView's own text-container padding, which a sibling Text does not
-    /// have. Measured against the rendered caret, not guessed.
-    private static let editorInsetX: CGFloat = 5
-    private static let editorInsetY: CGFloat = 1
 
     private var completion: CompletionContext {
         ComposerParser.context(in: text, caret: text.endIndex)
@@ -225,10 +220,6 @@ struct NowView: View {
         .onAppear {
             if commands.isEmpty { commands = CommandCatalog.load() }
             focused = true
-            installKeyMonitor()
-        }
-        .onDisappear {
-            if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         }
     }
 
@@ -236,12 +227,11 @@ struct NowView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Alignment note: TextEditor wraps an NSTextView whose text
-            // container adds ~5pt of lineFragmentPadding on the leading edge
-            // and ~1pt on top. The prompt glyph and the placeholder are plain
-            // Text views with no such inset, so without compensating they sit
-            // visibly off the typed line. The constants below cancel it.
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            // PromptEditor zeroes the text container insets, so the first
+            // glyph sits at the view origin and a plain Text beside it lands on
+            // the same line — no baseline guessing, and it holds at any font
+            // size. See PromptEditor.swift for why TextEditor could not.
+            HStack(alignment: .top, spacing: 9) {
                 Text(">")
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Color.accentOrange)
@@ -252,21 +242,15 @@ struct NowView: View {
                             .font(.system(size: 15))
                             .foregroundStyle(.tertiary)
                             .allowsHitTesting(false)
-                            .padding(.leading, Self.editorInsetX)
-                            .padding(.top, Self.editorInsetY)
                     }
-                    TextEditor(text: $text)
-                        .font(.system(size: 15))
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 24, maxHeight: 150)
-                        .focused($focused)
-                        // Reset the highlight whenever the query changes, so
-                        // Enter never fires a stale row.
-                        .onChange(of: text) { _ in highlighted = 0 }
+                    PromptEditor(
+                        text: $text,
+                        onKey: { handleKey($0) },
+                        onSubmit: { submit() })
+                    .frame(minHeight: 20, maxHeight: 150)
+                    .onChange(of: text) { _ in highlighted = 0 }
                 }
-                // Pull the editor back by its own inset so the caret lines up
-                // with the prompt glyph rather than sitting 5pt to its right.
-                .padding(.leading, -Self.editorInsetX)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
 
                 Button { submit() } label: {
                     Image(systemName: "arrow.up.circle.fill").font(.system(size: 22))
@@ -277,9 +261,9 @@ struct NowView: View {
                 .keyboardShortcut(.return, modifiers: .command)
                 .help(canSubmit ? "⌘↩ para enviar"
                                 : "Escolha um projeto com @ antes de enviar")
-                // The button is an icon, not text, so baseline alignment would
-                // hang it below the line; align it to the first line's centre.
-                .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 6 }
+                // Nudge the icon onto the text line: a symbol is taller than
+                // the glyphs it sits beside.
+                .offset(y: -3)
             }
             .padding(.horizontal, 16).padding(.vertical, 14)
 
@@ -409,34 +393,25 @@ struct NowView: View {
 
     // MARK: Keyboard
 
-    /// SwiftUI's TextEditor consumes arrows and tab, and .onKeyPress is macOS
-    /// 14+ while this targets 13. A local monitor sees the event before the
-    /// text view and swallows it only while the menu is open, so normal typing
-    /// and caret movement are untouched.
-    private func installKeyMonitor() {
-        guard keyMonitor == nil else { return }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard showingMenu else { return event }
-            switch event.keyCode {
-            case 126: // ↑
-                highlighted = max(0, highlighted - 1)
-                return nil
-            case 125: // ↓
-                highlighted = min(menuCount - 1, highlighted + 1)
-                return nil
-            case 48:  // tab
-                acceptHighlighted()
-                return nil
-            case 36:  // return — accept the suggestion, not a newline
-                acceptHighlighted()
-                return nil
-            case 53:  // esc — close the menu by ending the token
-                text += " "
-                return nil
-            default:
-                return event
-            }
+    /// Called by the editor before it treats a key as editing. Returning true
+    /// consumes it. Scoped to the menu being open, so ordinary typing, caret
+    /// movement and newlines behave normally the rest of the time — which a
+    /// global event monitor could not promise.
+    private func handleKey(_ action: PromptEditor.KeyAction) -> Bool {
+        guard showingMenu else { return false }
+        switch action {
+        case .up:
+            highlighted = max(0, highlighted - 1)
+        case .down:
+            highlighted = min(menuCount - 1, highlighted + 1)
+        case .tab, .enter:
+            acceptHighlighted()
+        case .escape:
+            // End the token rather than clearing the line: the text typed so
+            // far is still what the user meant.
+            text += " "
         }
+        return true
     }
 
     private func acceptHighlighted() {
