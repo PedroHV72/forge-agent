@@ -53,11 +53,13 @@ enum Section: String, CaseIterable, Identifiable {
 
 struct RootView: View {
     @ObservedObject var state: AppState
-    @State private var section: Section? = .now
 
+    // Section selection lives in AppState, not in `@State`: opening a session
+    // from the composer has to move the operator to the terminal, and only
+    // shared state can be driven from there.
     var body: some View {
         NavigationSplitView {
-            List(selection: $section) {
+            List(selection: $state.section) {
                 ForEach(Section.allCases) { s in
                     Label {
                         HStack {
@@ -85,7 +87,7 @@ struct RootView: View {
             .safeAreaInset(edge: .bottom) { sidebarFooter }
         } detail: {
             Group {
-                switch section ?? .now {
+                switch state.section ?? .now {
                 case .now:      NowView(state: state)
                 case .terminal: TerminalsView(state: state)
                 case .projects: ProjectsView(state: state)
@@ -485,7 +487,9 @@ struct NowView: View {
         // it as the last-used default — the second-choice tier in `preselection`.
         state.rememberWorkspace(resolvedProject)
         text = ""
-        state.show("Sessão aberta — veja em Terminal")
+        // newSessionRaw already focused the new session; nothing further to do
+        // here. Creating a terminal and leaving the operator on this screen —
+        // with only a toast to explain it — was the original complaint.
     }
 
     // MARK: Gate banner

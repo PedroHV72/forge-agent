@@ -69,6 +69,22 @@ final class AppState: ObservableObject {
     /// Live terminal sessions hosted inside the app.
     @Published private(set) var sessions: [TerminalSession] = []
 
+    /// Which sidebar section is showing. Owned here rather than as RootView
+    /// `@State` because opening a session has to be able to take the operator
+    /// to the terminal — the composer that creates it lives on another screen.
+    @Published var section: Section? = .now
+
+    /// Which session the terminal screen shows. Same reason: the creating code
+    /// path needs to name it, and the terminal screen may not be on screen yet.
+    @Published var focusedSession: UUID?
+
+    /// Show a session: select it and go to the terminal. Every creation path
+    /// ends here, so "created but nothing visibly happened" cannot come back.
+    func focus(_ s: TerminalSession?) {
+        if let s { focusedSession = s.id }
+        section = .terminal
+    }
+
     /// Rich per-project status from forge-status.js, keyed by cwd. Spawns node,
     /// so it is refreshed on a slow cadence — unlike the gate/run files, which
     /// are plain reads driven by FSEvents.
@@ -350,6 +366,7 @@ final class AppState: ObservableObject {
         sessions.append(TerminalSession(
             cwd: cwd, title: title, bootstrap: boot,
             runId: attachedRun, account: account.isEmpty ? nil : account))
+        focus(sessions.last)
     }
 
     /// Open a session from a free-form line. A leading slash command is passed
@@ -365,6 +382,7 @@ final class AppState: ObservableObject {
         sessions.append(TerminalSession(
             cwd: cwd, title: title, bootstrap: boot,
             runId: nil, account: account.isEmpty ? nil : account))
+        focus(sessions.last)
     }
 
     @discardableResult
@@ -382,6 +400,12 @@ final class AppState: ObservableObject {
             guard alert.runModal() == .alertFirstButtonReturn else { return false }
         }
         sessions.removeAll { $0.id == s.id }
+        // The only place a PTY is allowed to die. The view layer keeps it
+        // alive across navigation, so nothing else reclaims it — and skipping
+        // this would leak one shell per closed session.
+        TerminalViewStore.shared.closeSession(s.id)
+        focusedSession = TerminalFocus.afterClosing(
+            s.id, selection: focusedSession, remaining: sessions.map(\.id))
         return true
     }
 
@@ -469,7 +493,7 @@ final class AppState: ObservableObject {
             cwd: run.cwd, title: "\(run.projectName) · auto",
             bootstrap: "claude \(shq("/forge-auto \(run.id)"))",
             runId: run.id, account: run.account))
-        show("Sessão aberta — veja em Terminal")
+        focus(sessions.last)
     }
 
     /// The sandbox is registered like any other project so examples show up

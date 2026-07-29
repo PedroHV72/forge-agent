@@ -55,20 +55,63 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 }
 
-// MARK: - NSViewRepresentable bridge
+// MARK: - Live terminal ownership
 
-struct TerminalHost: NSViewRepresentable {
-    @ObservedObject var session: TerminalSession
+/// One live emulator plus the delegate that keeps reporting on it. Boxed
+/// together because the delegate is referenced weakly by SwiftTerm: held only
+/// by a SwiftUI coordinator it would die with the view, and the session would
+/// stop learning that its shell exited.
+final class TerminalInstance {
+    let view: LocalProcessTerminalView
+    let coordinator: TerminalHost.Coordinator
 
-    func makeCoordinator() -> Coordinator { Coordinator(session: session) }
+    init(view: LocalProcessTerminalView, coordinator: TerminalHost.Coordinator) {
+        self.view = view
+        self.coordinator = coordinator
+    }
+}
 
-    func makeNSView(context: Context) -> LocalProcessTerminalView {
+/// Owns every live terminal, keyed by `TerminalSession.id`, outside the
+/// SwiftUI view lifecycle.
+///
+/// Before this existed, `makeNSView` built a terminal every time it ran — and
+/// it runs again on every navigation back to the screen. That is why sessions
+/// died when you left, and why coming back replayed the first message: the
+/// "already bootstrapped" flag lived on a coordinator that was itself
+/// recreated. The policy half is `ForgeKit.TerminalRegistry`/`TerminalLifecycle`
+/// so it can be tested without AppKit; this is the thin AppKit shell.
+@MainActor
+final class TerminalViewStore {
+    static let shared = TerminalViewStore()
+
+    private let registry = TerminalRegistry<TerminalInstance>()
+
+    /// The terminal for this session, created (and its shell started) only on
+    /// the first request. Every later call — every rebuild of the view — gets
+    /// the same live instance back.
+    func instance(for session: TerminalSession) -> TerminalInstance {
+        registry.adopt(session.id) { TerminalViewStore.make(for: session) }.entry
+    }
+
+    /// True at most once per session id, ever. Keyed on the session rather
+    /// than on a view coordinator, which is the entire point.
+    func claimBootstrap(for id: UUID) -> Bool { registry.claimBootstrap(for: id) }
+
+    /// Genuine session close: terminate the PTY and drop the entry. Nothing
+    /// else in the app may call this — view teardown explicitly must not, see
+    /// `TerminalLifecycle`.
+    func closeSession(_ id: UUID) {
+        guard TerminalLifecycle.action(for: .sessionClosed) == .terminateAndDiscard else { return }
+        registry.discard(id)?.view.terminate()
+    }
+
+    private static func make(for session: TerminalSession) -> TerminalInstance {
         let view = LocalProcessTerminalView(frame: .zero)
-        view.processDelegate = context.coordinator
+        let coordinator = TerminalHost.Coordinator(session: session)
+        view.processDelegate = coordinator
 
-        let term = view.getTerminal()
-        term.setCursorStyle(.blinkBlock)
-        applyTheme(view)
+        view.getTerminal().setCursorStyle(.blinkBlock)
+        TerminalHost.applyTheme(view)
 
         // A login shell so ~/.zshrc runs — see the note at the top of the file.
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
@@ -90,19 +133,65 @@ struct TerminalHost: NSViewRepresentable {
             execName: "-\(URL(fileURLWithPath: shell).lastPathComponent)")
         FileManager.default.changeCurrentDirectoryPath(previousCwd)
 
-        if let boot = session.bootstrap {
-            context.coordinator.scheduleBootstrap(boot, on: view)
+        return TerminalInstance(view: view, coordinator: coordinator)
+    }
+
+    /// Send the queued command once the login shell has had a beat to finish
+    /// sourcing rc files — typing sooner races the prompt and the keystrokes
+    /// get eaten. Sent as keystrokes rather than argv so it lands in shell
+    /// history and stays visible/editable.
+    func sendBootstrap(_ command: String, to view: LocalProcessTerminalView) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak view] in
+            guard let view else { return }
+            view.send(txt: command + "\n")
+        }
+    }
+}
+
+// MARK: - NSViewRepresentable bridge
+
+struct TerminalHost: NSViewRepresentable {
+    @ObservedObject var session: TerminalSession
+
+    func makeCoordinator() -> Coordinator {
+        TerminalViewStore.shared.instance(for: session).coordinator
+    }
+
+    func makeNSView(context: Context) -> LocalProcessTerminalView {
+        let store = TerminalViewStore.shared
+        // Never `LocalProcessTerminalView(frame:)` here: the session may
+        // already own a live one, and rebuilding it is what killed sessions on
+        // navigation. The registry decides; this only displays.
+        let instance = store.instance(for: session)
+        let view = instance.view
+
+        // The same NSView can be handed to a second host (navigating back
+        // builds a new one before the old is gone). AppKit would otherwise
+        // move it while it is still installed in the previous hierarchy.
+        view.removeFromSuperview()
+
+        TerminalHost.applyTheme(view)
+
+        if let boot = session.bootstrap, store.claimBootstrap(for: session.id) {
+            store.sendBootstrap(boot, to: view)
         }
         return view
     }
 
     func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
-        applyTheme(nsView)
+        TerminalHost.applyTheme(nsView)
+    }
+
+    /// Deliberately empty. Losing the view is not losing the session — only
+    /// `AppState.closeSession` ends a process. Terminating here is exactly the
+    /// bug this file was rewritten to remove.
+    static func dismantleNSView(_ nsView: LocalProcessTerminalView, coordinator: Coordinator) {
+        _ = TerminalLifecycle.action(for: .viewDismantled)   // .keepAlive
     }
 
     /// Colours tuned to sit next to the app's own surfaces rather than to
     /// imitate Terminal.app.
-    private func applyTheme(_ view: LocalProcessTerminalView) {
+    static func applyTheme(_ view: LocalProcessTerminalView) {
         view.nativeBackgroundColor = NSColor(calibratedRed: 0.07, green: 0.07,
                                              blue: 0.085, alpha: 1)
         view.nativeForegroundColor = NSColor(calibratedWhite: 0.88, alpha: 1)
@@ -112,20 +201,13 @@ struct TerminalHost: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
         let session: TerminalSession
-        private var didBootstrap = false
 
         init(session: TerminalSession) { self.session = session }
 
-        /// Give the login shell a beat to finish sourcing rc files before typing
-        /// into it, otherwise the keystrokes race the prompt and get eaten.
-        func scheduleBootstrap(_ command: String, on view: LocalProcessTerminalView) {
-            guard !didBootstrap else { return }
-            didBootstrap = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak view] in
-                guard let view else { return }
-                view.send(txt: command + "\n")
-            }
-        }
+        // The bootstrap guard used to live here, as a per-instance flag. That
+        // was the replay bug: coordinators are per-view, so a fresh one on
+        // navigation re-armed it. It now lives in TerminalViewStore, keyed by
+        // session id — do not bring it back here.
 
         func processTerminated(source: TerminalView, exitCode: Int32?) {
             session.isRunning = false
@@ -143,7 +225,6 @@ struct TerminalHost: NSViewRepresentable {
 
 struct TerminalsView: View {
     @ObservedObject var state: AppState
-    @State private var selection: UUID?
     @State private var showLauncher = false
 
     var body: some View {
@@ -187,14 +268,14 @@ struct TerminalsView: View {
                 .help("Nova sessão (⌘T)")
             }
         }
-        .onAppear { if selection == nil { selection = state.sessions.first?.id } }
+        .onAppear { if state.focusedSession == nil { state.focusedSession = state.sessions.first?.id } }
     }
 
+    /// Selection lives in AppState, not in `@State`: creating a session has to
+    /// be able to point the operator at it, and this view may not even be on
+    /// screen at that moment.
     private var currentID: UUID? {
-        if let selection, state.sessions.contains(where: { $0.id == selection }) {
-            return selection
-        }
-        return state.sessions.first?.id
+        TerminalFocus.resolve(selection: state.focusedSession, among: state.sessions.map(\.id))
     }
 
     /// Up to four tabs share the width evenly; beyond that they keep a readable
@@ -207,7 +288,7 @@ struct TerminalsView: View {
                     TerminalTab(
                         session: s,
                         isActive: s.id == currentID,
-                        onSelect: { selection = s.id },
+                        onSelect: { state.focusedSession = s.id },
                         onClose: { close(s) })
                     .frame(minWidth: 150, maxWidth: evenly ? .infinity : 230)
                 }
@@ -219,9 +300,7 @@ struct TerminalsView: View {
     }
 
     private func close(_ s: TerminalSession) {
-        if state.closeSession(s, confirm: true), selection == s.id {
-            selection = state.sessions.first?.id
-        }
+        _ = state.closeSession(s, confirm: true)
     }
 
     private var launcherPane: some View {
