@@ -1174,6 +1174,71 @@ test("root dir existente é honrado sem aviso") {
 // down mechanically, so a future edit that reintroduces `known.first`
 // breaks the build, not just the behaviour.
 
+print("\nItems (board)")
+
+test("colunas saem na ordem canônica") {
+    let cols = ItemBoard.columns([])
+    assertEqual(cols.map(\.status), [.inbox, .triaged, .doing, .done, .dropped])
+    assertTrue(cols.allSatisfy { $0.items.isEmpty }, "colunas vazias devem existir mesmo sem itens")
+}
+
+test("rótulos pt-BR de cada status") {
+    assertEqual(ItemStatus.inbox.label, "Entrada")
+    assertEqual(ItemStatus.triaged.label, "Triado")
+    assertEqual(ItemStatus.doing.label, "Fazendo")
+    assertEqual(ItemStatus.done.label, "Feito")
+    assertEqual(ItemStatus.dropped.label, "Descartado")
+}
+
+test("openCount ignora done e dropped") {
+    let items = [
+        Item(id: "I-1", status: "inbox"),
+        Item(id: "I-2", status: "triaged"),
+        Item(id: "I-3", status: "doing"),
+        Item(id: "I-4", status: "done"),
+        Item(id: "I-5", status: "dropped"),
+    ]
+    assertEqual(ItemBoard.openCount(items), 3)
+}
+
+test("status desconhecido não entra em coluna nenhuma e aparece em unknown") {
+    let items = [
+        Item(id: "I-1", status: "inbox"),
+        Item(id: "I-2", status: "arquivado"),
+        Item(id: "I-3", status: nil),
+    ]
+    let cols = ItemBoard.columns(items)
+    assertEqual(cols.flatMap(\.items).count, 1, "só o item conhecido entra em alguma coluna")
+    let unk = ItemBoard.unknown(items)
+    assertEqual(unk.count, 2)
+    assertTrue(unk.contains { $0.id == "I-2" })
+    assertTrue(unk.contains { $0.id == "I-3" })
+}
+
+test("decodifica um item real da saída do engine") {
+    // Copiado verbatim de `node scripts/forge-items.js --list --json`.
+    let json = """
+    {"id":"I-20260729145851-test-title","title":"Test title","status":"inbox",
+     "origin":"human","created":"2026-07-29T14:58:51.237Z",
+     "updated":"2026-07-29T14:58:51.237Z","body":"Some body text"}
+    """
+    let item = try! JSONDecoder().decode(Item.self, from: Data(json.utf8))
+    assertEqual(item.id, "I-20260729145851-test-title")
+    assertEqual(item.title, "Test title")
+    assertEqual(item.status, "inbox")
+    assertEqual(item.parsedStatus, .inbox)
+    assertEqual(item.origin, "human")
+    assertEqual(item.body, "Some body text")
+}
+
+test("item sem campos opcionais decodifica") {
+    let json = "{\"id\":\"I-20260729000000-bare\"}"
+    let item = try! JSONDecoder().decode(Item.self, from: Data(json.utf8))
+    assertEqual(item.id, "I-20260729000000-bare")
+    assertTrue(item.title == nil)
+    assertTrue(item.parsedStatus == nil)
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {
