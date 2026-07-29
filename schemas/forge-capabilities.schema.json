@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge-agent.dev/schemas/forge-capabilities.schema.json",
+  "title": "Forge capability catalog",
+  "description": "A runtime-neutral catalog. schema_version versions this catalog only; product releases derive from Git tags.",
+  "type": "object",
+  "required": ["$schema", "schema_version", "release", "capabilities"],
+  "properties": {
+    "$schema": { "const": "schemas/forge-capabilities.schema.json" },
+    "schema_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "release": { "$ref": "#/$defs/release" },
+    "capabilities": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/capability" } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "host": { "type": "string", "enum": ["claude", "codex"] },
+    "availability": { "type": "string", "enum": ["implemented", "planned", "conditional", "unavailable"] },
+    "kind": { "type": "string", "enum": ["skill", "agent", "command", "hook", "headless", "mcp", "statusline", "accounts", "app"] },
+    "probe": {
+      "type": "object",
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": { "const": "filesystem" },
+        "path": { "type": "string", "minLength": 1, "pattern": "^[^\\\\]+$" }
+      },
+      "additionalProperties": false
+    },
+    "hosts": {
+      "type": "object",
+      "required": ["claude", "codex"],
+      "properties": {
+        "claude": { "$ref": "#/$defs/availability" },
+        "codex": { "$ref": "#/$defs/availability" }
+      },
+      "additionalProperties": false
+    },
+    "capability": {
+      "type": "object",
+      "required": ["capability_id", "kind", "owner", "required", "hosts", "probe"],
+      "properties": {
+        "capability_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "kind": { "$ref": "#/$defs/kind" },
+        "owner": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "required": { "type": "boolean" },
+        "hosts": { "$ref": "#/$defs/hosts" },
+        "probe": { "$ref": "#/$defs/probe" }
+      },
+      "additionalProperties": false
+    },
+    "release": {
+      "type": "object",
+      "required": ["product_version_source", "adapters"],
+      "properties": {
+        "product_version_source": { "const": "git-tag-release-workflow" },
+        "adapters": {
+          "type": "object",
+          "required": ["claude", "codex"],
+          "properties": {
+            "claude": { "$ref": "#/$defs/adapter" },
+            "codex": { "$ref": "#/$defs/adapter" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "adapter": {
+      "type": "object",
+      "required": ["optional", "host"],
+      "properties": {
+        "optional": { "const": true },
+        "host": { "$ref": "#/$defs/host" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
