@@ -52,6 +52,7 @@ const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const keychainDiag = require('./forge-keychain-diagnostics');
 
 const CLAUDE_DIR     = path.join(os.homedir(), '.claude');
 // FORGE_ACCOUNTS_REGISTRY overrides the non-secret registry path (used for tests
@@ -105,13 +106,27 @@ function storeToken(name, token) {
     // -U updates if the item already exists. Args passed as an array (no shell),
     // so the token is not subject to shell history/quoting. It is briefly visible
     // in `ps` — acceptable for a local single-user macOS Keychain write.
-    execFileSync('security', [
-      'add-generic-password', '-U',
-      '-a', KEYCHAIN_ACCT,
-      '-s', keychainService(name),
-      '-w', token,
-    ], { stdio: ['ignore', 'ignore', 'pipe'] });
-    return 'keychain';
+    try {
+      execFileSync('security', [
+        'add-generic-password', '-U',
+        '-a', KEYCHAIN_ACCT,
+        '-s', keychainService(name),
+        '-w', token,
+      ], { stdio: ['ignore', 'ignore', 'pipe'] });
+      return 'keychain';
+    } catch (err) {
+      // Record evidence, then re-throw UNCHANGED — this path has no silent
+      // fallback (unlike forge-secrets), so the caller must still see the
+      // original failure.
+      keychainDiag.recordFailure({
+        engine: 'forge-accounts.storeToken',
+        service: keychainService(name),
+        account: KEYCHAIN_ACCT,
+        err,
+        fallback: false,
+      });
+      throw err;
+    }
   }
   // Fallback: 0600 file. Create with restrictive mode from the start.
   let map = {};

@@ -52,6 +52,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
+const keychainDiag = require('./forge-keychain-diagnostics');
 
 const IS_DARWIN = process.platform === 'darwin';
 
@@ -125,12 +126,20 @@ function storeSecret(service, name, secret) {
         '-w', secret,
       ], { stdio: ['ignore', 'ignore', 'pipe'], timeout: KEYCHAIN_TIMEOUT_MS });
       return 'keychain';
-    } catch {
+    } catch (err) {
       // The Keychain can be unreachable: it is resolved through HOME, so a
       // sandboxed or altered environment has none, and a locked keychain also
       // refuses writes. Falling through to the 0600 file keeps the credential
       // usable instead of silently vanishing — `store` records which was used
-      // so `--list` can say so.
+      // so `--list` can say so. Record the failure BEFORE falling back, so
+      // the next occurrence leaves evidence instead of only a `store: file`.
+      keychainDiag.recordFailure({
+        engine: 'forge-secrets.storeSecret',
+        service: keychainService(service, name),
+        account: KEYCHAIN_ACCT,
+        err,
+        fallback: true,
+      });
     }
   }
   // No Keychain: a 0600 file, created before anything is written to it.
@@ -375,6 +384,7 @@ function usage() {
     '  --default <serviço> <nome>                          padrão do serviço',
     '  --remove <serviço> <nome>',
     '  --services                                          serviços conhecidos',
+    '  --diagnostics [--json]   falhas de escrita no Keychain (sem segredos)',
     '',
     'Vários do mesmo serviço convivem — o nome é seu:',
     '  printf %s "$TOKEN" | forge-secrets add railway lookchina',
@@ -398,6 +408,13 @@ function main(argv) {
     else for (const r of rows) {
       console.log(`  ${r.service.padEnd(12)} ${r.env.padEnd(24)} ${r.cli || ''}`);
     }
+    return 0;
+  }
+
+  if (argv.includes('--diagnostics')) {
+    const entries = keychainDiag.readEntries();
+    if (json) { console.log(JSON.stringify(entries, null, 2)); return 0; }
+    console.log(keychainDiag.formatEntries(entries));
     return 0;
   }
 
