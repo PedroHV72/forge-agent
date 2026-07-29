@@ -354,6 +354,16 @@ struct LauncherSheet: View {
 
         var needsText: Bool { self == .newMilestone || self == .task }
 
+        /// `/forge-*` commands are meaningless outside a project, while a
+        /// shell and a free conversation are not — those two are the only
+        /// modes allowed to launch into the session root dir.
+        var needsProject: Bool {
+            switch self {
+            case .auto, .newMilestone, .task: return true
+            case .chat, .shell: return false
+            }
+        }
+
         var shortLabel: String {
             switch self {
             case .auto:         return "auto"
@@ -377,6 +387,9 @@ struct LauncherSheet: View {
             Text("Nova sessão").font(.headline)
 
             Picker("Projeto", selection: $workspace) {
+                // A choice, not a default — never preselected — so shell/chat
+                // can be launched without a project without hiding the option.
+                Text("nenhum (root dir)").tag("")
                 ForEach(state.workspaces, id: \.self) { ws in
                     Text(URL(fileURLWithPath: ws).lastPathComponent).tag(ws)
                 }
@@ -396,6 +409,14 @@ struct LauncherSheet: View {
 
             Text(mode.hint).font(.caption).foregroundStyle(.secondary)
 
+            // Destination is on screen before Abrir is reachable — never an
+            // implicit landing spot the operator only discovers after launch.
+            if mode.needsProject && resolvedWorkspace.isEmpty {
+                Text("escolha um projeto para este modo").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("abre em \(launchDirectory)").font(.caption).foregroundStyle(.secondary)
+            }
+
             if mode == .auto { autoSection }
 
             if mode.needsText {
@@ -411,13 +432,13 @@ struct LauncherSheet: View {
                 Spacer()
                 Button("Abrir") { open() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(resolvedWorkspace.isEmpty)
+                    .disabled(mode.needsProject && resolvedWorkspace.isEmpty)
             }
         }
         .padding(20)
         .frame(width: 480)
         .onAppear {
-            if workspace.isEmpty { workspace = initialWorkspace ?? state.workspaces.first ?? "" }
+            if workspace.isEmpty { workspace = initialWorkspace ?? state.preselection.workspace ?? "" }
             state.loadAccounts()
             state.reloadCheap()
             if runId.isEmpty { runId = runsHere.first?.id ?? "" }
@@ -447,13 +468,25 @@ struct LauncherSheet: View {
         }
     }
 
+    /// No implicit fallback here, ever — see `b992edf`. Empty is a legal
+    /// value; `mode.needsProject` and the button guard are what keep an
+    /// empty workspace from reaching a mode that requires one.
     private var resolvedWorkspace: String {
-        workspace.isEmpty ? (state.workspaces.first ?? "") : workspace
+        workspace
+    }
+
+    /// Where `open()` actually launches: the picked project, or the
+    /// configured session root dir when none is picked. Only ever read for
+    /// `!mode.needsProject || !resolvedWorkspace.isEmpty` — the button guard
+    /// enforces that combination before this value can be used.
+    private var launchDirectory: String {
+        resolvedWorkspace.isEmpty ? state.resolvedSessionRoot : resolvedWorkspace
     }
 
     private func open() {
-        state.newSession(cwd: resolvedWorkspace, mode: mode, text: text,
+        state.newSession(cwd: launchDirectory, mode: mode, text: text,
                          account: account, runId: runId)
+        if !resolvedWorkspace.isEmpty { state.rememberWorkspace(resolvedWorkspace) }
         isPresented = false
     }
 }
