@@ -53,8 +53,11 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 const keychainDiag = require('./forge-keychain-diagnostics');
-
-const IS_DARWIN = process.platform === 'darwin';
+// Every Keychain branch below asks this first. See forge-keychain-switch.js for
+// why: with an isolated HOME `security` raises a modal dialog and blocks, so the
+// test suite must be unable to reach the real binary. Unset variable ⇒ the
+// predicate is exactly the old `process.platform === 'darwin'` test.
+const { keychainEnabled } = require('./forge-keychain-switch');
 
 // Every `security` call is bounded. A locked keychain makes the tool prompt for
 // a password, and with no TTY — a CI runner, a hook, a headless agent — it waits
@@ -115,7 +118,7 @@ function keychainService(service, name) {
 
 // ── Secret storage ───────────────────────────────────────────────────────────
 function storeSecret(service, name, secret) {
-  if (IS_DARWIN) {
+  if (keychainEnabled()) {
     try {
       // See the header note: the secret must go in argv because `security`
       // stores an empty value when given one on stdin.
@@ -176,6 +179,11 @@ function storeSecret(service, name, secret) {
 const KEYCHAIN_NOT_FOUND = 44;
 
 function keychainProbe(service, name) {
+  // Guarded here as well as at the `probeSecret` call site: this function is the
+  // one that actually spawns `security`, so a future caller that forgets the
+  // outer check still cannot reach the binary. `unknown` (not `absent`) is the
+  // honest answer — we did not look, so we cannot claim there is nothing there.
+  if (!keychainEnabled()) return { state: 'unknown', value: null };
   try {
     const v = execFileSync('security', [
       'find-generic-password',
@@ -221,7 +229,7 @@ function fileProbe(service, name) {
 /// layer to have said so.
 function probeSecret(service, name) {
   let sawUnknown = false;
-  if (IS_DARWIN) {
+  if (keychainEnabled()) {
     const k = keychainProbe(service, name);
     if (k.state === 'present') return k;
     if (k.state === 'unknown') sawUnknown = true;
@@ -245,7 +253,7 @@ function get(service, name) {
 }
 
 function deleteSecret(service, name) {
-  if (IS_DARWIN) {
+  if (keychainEnabled()) {
     try {
       execFileSync('security', [
         'delete-generic-password',

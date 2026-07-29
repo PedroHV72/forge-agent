@@ -68,6 +68,25 @@ function discoverTests(matches) {
     .sort((a, b) => a.localeCompare(b, 'en'));
 }
 
+// The suite may never reach the real macOS `security` binary. HOME is isolated
+// below, and `security` resolves the login keychain THROUGH HOME — with a temp
+// HOME there is no login.keychain-db to write into, so instead of failing it
+// raises a modal dialog and blocks until a human answers it. The call's timeout
+// then kills it and leaves the window orphaned on the operator's screen: 249 of
+// them in 3 hours, one per assertion that touched the vault. Every Keychain
+// branch in forge-secrets.js / forge-accounts.js consults this variable and
+// takes the 0600-file fallback instead. See scripts/forge-keychain-switch.js.
+//
+// Set for EVERY child, including --inherit-home: inheriting the real HOME would
+// make the calls succeed rather than hang, but a test suite still has no
+// business writing into the operator's real keychain.
+const KEYCHAIN_DISABLED_ENV = { FORGE_KEYCHAIN_DISABLED: '1' };
+
+function childEnv(root, filename) {
+  const base = root ? isolatedEnv(root, filename) : { ...process.env };
+  return { ...base, ...KEYCHAIN_DISABLED_ENV };
+}
+
 function isolatedEnv(root, filename) {
   const stem = filename.replace(/\.test\.js$/, '').replace(/[^A-Za-z0-9._-]/g, '_');
   const home = path.join(root, stem);
@@ -132,7 +151,7 @@ function main(argv) {
       const suiteStarted = Date.now();
       const result = spawnSync(process.execPath, [path.join(scriptsDir, filename)], {
         cwd: repoRoot,
-        env: isolatedRoot ? isolatedEnv(isolatedRoot, filename) : process.env,
+        env: childEnv(isolatedRoot, filename),
         encoding: 'utf8',
         maxBuffer: 64 * 1024 * 1024,
       });
@@ -167,4 +186,7 @@ function main(argv) {
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
 
-module.exports = { discoverTests, isolatedEnv, main, parseArgs };
+// childEnv is exported so forge-keychain-switch.test.js can assert the Keychain
+// kill-switch behaviourally — by calling it — rather than by grepping for a
+// string that a refactor could move without meaning to change anything.
+module.exports = { childEnv, discoverTests, isolatedEnv, main, parseArgs };
