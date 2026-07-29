@@ -34,10 +34,21 @@ enum ForgeCore {
 
     static var repoPath: String? { PrefsLocator.repoPath() }
 
-    static var nodePath: String {
-        for p in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
-        where FileManager.default.fileExists(atPath: p) { return p }
-        return "/usr/bin/env"
+    /// Resolved once. The search can spawn a login shell (see NodeLocator), so
+    /// re-probing on every engine call — which is what a computed `var` did —
+    /// is both slow and pointless: node does not move mid-session.
+    static let nodeOutcome: NodeLocator.Outcome =
+        NodeLocator.resolve(NodeLocator.systemProbe())
+
+    /// Absolute path to node, or nil when nothing resolved. Deliberately NOT
+    /// falling back to `/usr/bin/env`: under launchd's minimal PATH that turns
+    /// into `env: node: No such file or directory` at exec time, which tells the
+    /// operator nothing. See NodeLocator.
+    static var nodePath: String? { nodeOutcome.path }
+
+    static var nodeError: String {
+        if case .notFound(let tried) = nodeOutcome { return NodeLocator.notFoundMessage(tried: tried) }
+        return ""
     }
 
     // MARK: - Running engines
@@ -60,13 +71,13 @@ enum ForgeCore {
                           stderr: "\(engineName) não encontrado — procurei em \(home)/.claude/scripts/ e \(repoNote). Rode ./install.sh no repo do Forge.")
         }
 
+        guard let node = nodePath else {
+            return Result(ok: false, stdout: "", stderr: nodeError)
+        }
+
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: nodePath)
-        var argv: [String] = []
-        if nodePath.hasSuffix("/env") { argv.append("node") }
-        argv.append(enginePath)
-        argv += args
-        proc.arguments = argv
+        proc.executableURL = URL(fileURLWithPath: node)
+        proc.arguments = [enginePath] + args
         if let cwd { proc.currentDirectoryURL = URL(fileURLWithPath: cwd) }
 
         let out = Pipe(), err = Pipe()
@@ -99,13 +110,12 @@ enum ForgeCore {
         guard let enginePath = engine(engineName) else {
             return Result(ok: false, stdout: "", stderr: "\(engineName) não encontrado")
         }
+        guard let node = nodePath else {
+            return Result(ok: false, stdout: "", stderr: nodeError)
+        }
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: nodePath)
-        var argv: [String] = []
-        if nodePath.hasSuffix("/env") { argv.append("node") }
-        argv.append(enginePath)
-        argv += args
-        proc.arguments = argv
+        proc.executableURL = URL(fileURLWithPath: node)
+        proc.arguments = [enginePath] + args
         if let cwd { proc.currentDirectoryURL = URL(fileURLWithPath: cwd) }
 
         let stdin = Pipe(), out = Pipe(), err = Pipe()
