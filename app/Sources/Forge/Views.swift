@@ -19,6 +19,7 @@ enum Section: String, CaseIterable, Identifiable {
     case now = "Início"
     case terminal = "Terminal"
     case projects = "Projetos"
+    case items = "Itens"
     case runs = "Runs"
     case accounts = "Contas"
     case metrics = "Métricas"
@@ -36,6 +37,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .now:      return "bolt.fill"
         case .terminal: return "terminal"
         case .projects: return "folder"
+        case .items:    return "tray.full"
         case .runs:     return "play.circle"
         case .accounts: return "person.2"
         case .metrics:  return "chart.bar.xaxis"
@@ -87,6 +89,7 @@ struct RootView: View {
                 case .now:      NowView(state: state)
                 case .terminal: TerminalsView(state: state)
                 case .projects: ProjectsView(state: state)
+                case .items:    ItemsView(state: state)
                 case .runs:     RunsView(state: state)
                 case .accounts: AccountsView(state: state)
                 case .metrics:  MetricsView(state: state)
