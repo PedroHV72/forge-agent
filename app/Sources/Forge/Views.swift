@@ -174,7 +174,17 @@ struct NowView: View {
     @State private var project = ""
     @State private var account = ""
     @State private var highlighted = 0
+    @State private var keyMonitor: Any?
     @FocusState private var focused: Bool
+
+    /// Rows currently offered, as a flat list — the menu shows either commands
+    /// or projects, never both, so one index addresses whichever is up.
+    private var menuCount: Int { max(matchingCommands.count, matchingProjects.count) }
+
+    /// NSTextView's own text-container padding, which a sibling Text does not
+    /// have. Measured against the rendered caret, not guessed.
+    private static let editorInsetX: CGFloat = 5
+    private static let editorInsetY: CGFloat = 1
 
     private var completion: CompletionContext {
         ComposerParser.context(in: text, caret: text.endIndex)
@@ -192,9 +202,10 @@ struct NowView: View {
 
     private var showingMenu: Bool { !matchingCommands.isEmpty || !matchingProjects.isEmpty }
 
-    private var resolvedProject: String {
-        project.isEmpty ? (state.workspaces.first ?? "") : project
-    }
+    /// No implicit fallback. Defaulting to the first workspace meant a line
+    /// typed without a project silently ran in whichever one sorted first —
+    /// a wrong-repo dispatch that looks exactly like a right one.
+    private var resolvedProject: String { project }
 
     var body: some View {
         ScrollView {
@@ -212,9 +223,12 @@ struct NowView: View {
         }
         .navigationTitle("Início")
         .onAppear {
-            if project.isEmpty { project = state.workspaces.first ?? "" }
             if commands.isEmpty { commands = CommandCatalog.load() }
             focused = true
+            installKeyMonitor()
+        }
+        .onDisappear {
+            if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         }
     }
 
@@ -222,40 +236,52 @@ struct NowView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 8) {
+            // Alignment note: TextEditor wraps an NSTextView whose text
+            // container adds ~5pt of lineFragmentPadding on the leading edge
+            // and ~1pt on top. The prompt glyph and the placeholder are plain
+            // Text views with no such inset, so without compensating they sit
+            // visibly off the typed line. The constants below cancel it.
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(">")
-                    .font(.system(size: 15, weight: .medium, design: .monospaced))
+                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Color.accentOrange)
-                    .padding(.top, 2)
 
                 ZStack(alignment: .topLeading) {
                     if text.isEmpty {
                         Text("Pergunte algo, ou digite / para um comando e @ para um projeto")
-                            .font(.system(size: 13))
+                            .font(.system(size: 15))
                             .foregroundStyle(.tertiary)
                             .allowsHitTesting(false)
-                            .padding(.top, 2)
+                            .padding(.leading, Self.editorInsetX)
+                            .padding(.top, Self.editorInsetY)
                     }
                     TextEditor(text: $text)
-                        .font(.system(size: 13))
+                        .font(.system(size: 15))
                         .scrollContentBackground(.hidden)
-                        .frame(minHeight: 22, maxHeight: 120)
+                        .frame(minHeight: 24, maxHeight: 150)
                         .focused($focused)
                         // Reset the highlight whenever the query changes, so
                         // Enter never fires a stale row.
                         .onChange(of: text) { _ in highlighted = 0 }
                 }
+                // Pull the editor back by its own inset so the caret lines up
+                // with the prompt glyph rather than sitting 5pt to its right.
+                .padding(.leading, -Self.editorInsetX)
 
                 Button { submit() } label: {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 18))
+                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 22))
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(canSubmit ? Color.accentOrange : Color.secondary.opacity(0.4))
+                .foregroundStyle(canSubmit ? Color.accentOrange : Color.secondary.opacity(0.35))
                 .disabled(!canSubmit)
                 .keyboardShortcut(.return, modifiers: .command)
-                .help("⌘↩ para enviar")
+                .help(canSubmit ? "⌘↩ para enviar"
+                                : "Escolha um projeto com @ antes de enviar")
+                // The button is an icon, not text, so baseline alignment would
+                // hang it below the line; align it to the first line's centre.
+                .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 6 }
             }
-            .padding(12)
+            .padding(.horizontal, 16).padding(.vertical, 14)
 
             if showingMenu {
                 Divider()
@@ -302,18 +328,29 @@ struct NowView: View {
     private func completionRow(icon: String, title: String, subtitle: String,
                                selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack(spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Image(systemName: icon)
-                    .font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 14)
+                    .font(.system(size: 12))
+                    .foregroundStyle(selected ? Color.accentOrange : .secondary)
+                    .frame(width: 18, alignment: .center)
+                    // An SF Symbol has no text baseline of its own; nudge it
+                    // onto the one the labels share.
+                    .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 4 }
                 Text(title)
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(.primary)
                 Text(subtitle)
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 0)
+                if selected {
+                    Text("⇥").font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
             }
-            .padding(.horizontal, 12).padding(.vertical, 5)
-            .background(selected ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear))
+            .padding(.horizontal, 16).padding(.vertical, 9)
+            .background(selected ? AnyShapeStyle(Color.accentOrange.opacity(0.13))
+                                 : AnyShapeStyle(.clear))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -323,15 +360,29 @@ struct NowView: View {
     /// rather than dropdowns — @ sets the project, and the account is a rare
     /// override that does not deserve a permanent control.
     private var footerBar: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "folder").font(.system(size: 9)).foregroundStyle(.tertiary)
-            Text(resolvedProject.isEmpty ? "nenhum projeto"
-                                         : ProjectOrganiser.name(resolvedProject))
-                .font(.caption2).foregroundStyle(.secondary)
-                .help(resolvedProject)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: resolvedProject.isEmpty ? "folder.badge.questionmark" : "folder")
+                .font(.system(size: 11))
+                .foregroundStyle(resolvedProject.isEmpty ? AnyShapeStyle(Color.accentOrange)
+                                                         : AnyShapeStyle(.tertiary))
+            if resolvedProject.isEmpty {
+                Text("escolha um projeto com @")
+                    .font(.caption).foregroundStyle(Color.accentOrange)
+            } else {
+                Text(ProjectOrganiser.name(resolvedProject))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .help(resolvedProject)
+                Button {
+                    project = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 9))
+                }
+                .buttonStyle(.plain).foregroundStyle(.tertiary)
+                .help("Limpar o projeto")
+            }
 
-            if let (cmd, _) = Optional(ComposerParser.split(text)), let c = cmd {
-                Text("· /\(c)").font(.caption2).foregroundStyle(Color.accentOrange)
+            if let c = ComposerParser.split(text).command {
+                Text("· /\(c)").font(.caption).foregroundStyle(Color.accentOrange)
             }
 
             Spacer()
@@ -342,18 +393,60 @@ struct NowView: View {
                     Button(a.name) { account = a.name }
                 }
             } label: {
-                HStack(spacing: 3) {
-                    Image(systemName: "person.crop.circle").font(.system(size: 9))
-                    Text(account.isEmpty ? "conta padrão" : account).font(.caption2)
+                HStack(spacing: 4) {
+                    Image(systemName: "person.crop.circle").font(.system(size: 11))
+                    Text(account.isEmpty ? "conta padrão" : account).font(.caption)
                 }
                 .foregroundStyle(.secondary)
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
 
-            Text("⌘↩").font(.system(size: 9, design: .monospaced))
+            Text("⌘↩").font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
         }
-        .padding(.horizontal, 12).padding(.vertical, 7)
+        .padding(.horizontal, 16).padding(.vertical, 10)
+    }
+
+    // MARK: Keyboard
+
+    /// SwiftUI's TextEditor consumes arrows and tab, and .onKeyPress is macOS
+    /// 14+ while this targets 13. A local monitor sees the event before the
+    /// text view and swallows it only while the menu is open, so normal typing
+    /// and caret movement are untouched.
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard showingMenu else { return event }
+            switch event.keyCode {
+            case 126: // ↑
+                highlighted = max(0, highlighted - 1)
+                return nil
+            case 125: // ↓
+                highlighted = min(menuCount - 1, highlighted + 1)
+                return nil
+            case 48:  // tab
+                acceptHighlighted()
+                return nil
+            case 36:  // return — accept the suggestion, not a newline
+                acceptHighlighted()
+                return nil
+            case 53:  // esc — close the menu by ending the token
+                text += " "
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func acceptHighlighted() {
+        if !matchingCommands.isEmpty, highlighted < matchingCommands.count {
+            accept(matchingCommands[highlighted].slash)
+        } else if !matchingProjects.isEmpty, highlighted < matchingProjects.count {
+            let path = matchingProjects[highlighted]
+            project = path
+            acceptProject(path)
+        }
     }
 
     // MARK: Actions
