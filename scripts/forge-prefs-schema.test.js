@@ -67,6 +67,7 @@ const INVENTORY = [
   { key: 'compact_after', type: ['integer', 'string'], default: 'unlimited', source: 'skills/forge-auto/SKILL.md:63 "if set and not unlimited, else unlimited"' },
   { key: 'notifications', type: 'string', default: 'on', source: 'skills/forge-auto/SKILL.md:58 "if absent or not on/off, default on"' },
   { key: 'repo_path', type: 'string', default: '', source: 'scripts/forge-statusline.js:339 (written by install.sh; absent → update check skipped)' },
+  { key: 'node_path', type: 'string', default: '', source: 'app/Sources/ForgeKit/NodeLocatorSystem.swift systemProbe (PrefsLocator.stringPref("node_path"); ausente → descoberta automática)' },
   // — effort (template-extracted too; defaults = EFFORT_DEFAULTS) —
   { key: 'effort.plan-milestone', type: 'string', default: 'medium', source: 'shared/forge-dispatch.md:1594 EFFORT_DEFAULTS' },
   { key: 'effort.plan-slice', type: 'string', default: 'medium', source: 'shared/forge-dispatch.md:1594 EFFORT_DEFAULTS' },

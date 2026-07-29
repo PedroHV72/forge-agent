@@ -122,6 +122,14 @@
 - **Default:** `""`
 - **Descrição:** Caminho do repositório forge-agent na máquina — preenchido pelo install.sh; usado pela statusline para o update check. Não editar manualmente em condições normais.
 
+## node_path
+
+### `node_path`
+
+- **Tipo:** string
+- **Default:** `""`
+- **Descrição:** Caminho absoluto do binário node usado pelo Forge.app para rodar os engines. Vazio → descoberta automática (caminhos fixos, gerenciadores de versão, $PATH, shell de login). Preencha quando o app não achar seu node — a variável de ambiente FORGE_NODE_PATH tem precedência sobre esta chave.
+
 ## effort
 
 Default de effort (intensidade de raciocínio) por fase (unit_type). Eixo ortogonal ao tier: o tier escolhe QUAL modelo, o effort escolhe o quão fundo ele pensa. Escala ordenada: low < medium < high < xhigh < max. Sobreposto por effort: no frontmatter do T##-PLAN.md e clampado pela capacidade do modelo resolvido (haiku/sonnet limitam em medium).

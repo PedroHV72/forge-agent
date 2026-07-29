@@ -1253,6 +1253,199 @@ test("item sem campos opcionais decodifica") {
     assertTrue(item.parsedStatus == nil)
 }
 
+print("\nNodeLocator (descoberta de node fora dos três caminhos fixos)")
+
+// Fake probe: the filesystem is a set of executable paths and a directory map,
+// so the search order is exercised without depending on what this machine has
+// installed. `pathVar` defaults to launchd's minimal PATH — the exact
+// environment a GUI app inherits from Finder, where the old `/usr/bin/env node`
+// fallback died with "env: node: No such file or directory".
+let launchdPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+func fakeProbe(home: String = "/Users/tester",
+               executables: Set<String> = [],
+               dirs: [String: [String]] = [:],
+               files: [String: String] = [:],
+               envOverride: String? = nil,
+               prefValue: String? = nil,
+               pathVar: String = launchdPath,
+               shell: @escaping () -> String? = { nil }) -> NodeLocator.Probe {
+    NodeLocator.Probe(
+        home: home,
+        envOverride: envOverride,
+        prefValue: prefValue,
+        pathVar: pathVar,
+        isExecutable: { executables.contains($0) },
+        listDir: { dirs[$0] ?? [] },
+        readFile: { files[$0] },
+        loginShell: shell)
+}
+
+test("encontra node do nvm sem versão hardcoded (árvore sintética)") {
+    let home = "/Users/tester"
+    let root = "\(home)/.nvm/versions/node"
+    let probe = fakeProbe(
+        home: home,
+        executables: ["\(root)/v20.9.0/bin/node", "\(root)/v24.11.1/bin/node"],
+        dirs: [root: ["v20.9.0", "v24.11.1"]])
+    assertEqual(NodeLocator.resolve(probe).path, "\(root)/v24.11.1/bin/node",
+                "deve escolher a maior versão instalada")
+    assertEqual(NodeLocator.resolve(probe).source, NodeLocator.Source.versionManager)
+}
+
+test("nvm: alias/default vence a maior versão") {
+    let home = "/Users/tester"
+    let root = "\(home)/.nvm/versions/node"
+    let probe = fakeProbe(
+        home: home,
+        executables: ["\(root)/v20.9.0/bin/node", "\(root)/v24.11.1/bin/node"],
+        dirs: [root: ["v20.9.0", "v24.11.1"]],
+        files: ["\(home)/.nvm/alias/default": "v20.9.0\n"])
+    assertEqual(NodeLocator.resolve(probe).path, "\(root)/v20.9.0/bin/node")
+}
+
+test("nvm: alias parcial (\"20\") resolve para a maior v20.x") {
+    let home = "/Users/tester"
+    let root = "\(home)/.nvm/versions/node"
+    let probe = fakeProbe(
+        home: home,
+        executables: ["\(root)/v20.9.0/bin/node", "\(root)/v20.11.0/bin/node",
+                      "\(root)/v24.11.1/bin/node"],
+        dirs: [root: ["v20.9.0", "v20.11.0", "v24.11.1"]],
+        files: ["\(home)/.nvm/alias/default": "20"])
+    assertEqual(NodeLocator.resolve(probe).path, "\(root)/v20.11.0/bin/node")
+}
+
+test("ordenação de versões é numérica, não lexicográfica") {
+    assertEqual(NodeLocator.highestVersion(["v9.11.2", "v10.0.0"]), "v10.0.0")
+}
+
+test("fnm, asdf, mise e volta também são encontrados") {
+    let home = "/Users/tester"
+    let cases: [(String, [String: [String]])] = [
+        ("\(home)/.local/share/fnm/aliases/default/bin/node", [:]),
+        ("\(home)/.asdf/shims/node", [:]),
+        ("\(home)/.local/share/mise/shims/node", [:]),
+        ("\(home)/.volta/bin/node", [:]),
+        ("\(home)/.asdf/installs/nodejs/24.11.1/bin/node",
+         ["\(home)/.asdf/installs/nodejs": ["24.11.1"]]),
+    ]
+    for (path, dirs) in cases {
+        let r = NodeLocator.resolve(fakeProbe(home: home, executables: [path], dirs: dirs))
+        assertEqual(r.path, path, "não encontrou \(path)")
+    }
+}
+
+test("PATH mínimo do launchd NÃO produz /usr/bin/env silenciosamente") {
+    // O bug original: sem nenhum node instalado nos caminhos fixos, o app
+    // devolvia "/usr/bin/env" e a falha só aparecia no exec, como
+    // `env: node: No such file or directory`.
+    let outcome = NodeLocator.resolve(fakeProbe())
+    switch outcome {
+    case .found(let r):
+        assertTrue(false, "não deveria resolver nada, obteve \(r.path)")
+    case .notFound(let tried):
+        assertFalse(tried.isEmpty, "o diagnóstico deve listar onde procurou")
+        let msg = NodeLocator.notFoundMessage(tried: tried)
+        assertTrue(msg.contains("FORGE_NODE_PATH"), "a mensagem deve nomear o override")
+        assertTrue(msg.contains("node_path"), "a mensagem deve nomear a pref")
+        assertFalse(msg.contains("No such file or directory"), "não é a mensagem do env")
+    }
+    assertTrue(outcome.path == nil, "nenhum caminho deve ser reportado")
+    assertFalse("\(outcome)".contains("/usr/bin/env"), "/usr/bin/env nunca é resposta")
+}
+
+test("override do operador vence tudo") {
+    let home = "/Users/tester"
+    let probe = fakeProbe(home: home,
+                          executables: ["/opt/homebrew/bin/node", "/custom/node"],
+                          envOverride: "/custom/node")
+    assertEqual(NodeLocator.resolve(probe).path, "/custom/node")
+    assertEqual(NodeLocator.resolve(probe).source, NodeLocator.Source.envOverride)
+
+    let prefProbe = fakeProbe(home: home,
+                              executables: ["/opt/homebrew/bin/node", "/pref/node"],
+                              prefValue: "/pref/node")
+    assertEqual(NodeLocator.resolve(prefProbe).source, NodeLocator.Source.pref)
+}
+
+test("override quebrado é reportado, não contornado em silêncio") {
+    // Contornar deixaria o operador sem sinal de que a config dele foi ignorada.
+    let probe = fakeProbe(executables: ["/opt/homebrew/bin/node"], envOverride: "/nao/existe/node")
+    let outcome = NodeLocator.resolve(probe)
+    assertTrue(outcome.path == nil, "override inválido não deve cair no caminho fixo")
+    if case .notFound(let tried) = outcome {
+        assertTrue(tried.contains(where: { $0.contains("/nao/existe/node") }),
+                   "o diagnóstico deve citar o valor inválido")
+    }
+}
+
+test("caminhos fixos continuam valendo e vêm antes de gerenciadores") {
+    let home = "/Users/tester"
+    let nvm = "\(home)/.nvm/versions/node/v24.11.1/bin/node"
+    let probe = fakeProbe(home: home,
+                          executables: ["/opt/homebrew/bin/node", nvm],
+                          dirs: ["\(home)/.nvm/versions/node": ["v24.11.1"]])
+    assertEqual(NodeLocator.resolve(probe).path, "/opt/homebrew/bin/node")
+    assertEqual(NodeLocator.resolve(probe).source, NodeLocator.Source.fixed)
+}
+
+test("$PATH e shell de login servem de rede de segurança") {
+    let onPath = NodeLocator.resolve(fakeProbe(executables: ["/opt/tools/bin/node"],
+                                               pathVar: "/opt/tools/bin:/usr/bin"))
+    assertEqual(onPath.path, "/opt/tools/bin/node")
+    assertEqual(onPath.source, NodeLocator.Source.pathScan)
+
+    let viaShell = NodeLocator.resolve(fakeProbe(executables: ["/from/shell/node"],
+                                                 shell: { "/from/shell/node\n" }))
+    assertEqual(viaShell.path, "/from/shell/node")
+    assertEqual(viaShell.source, NodeLocator.Source.loginShell)
+
+    // Resposta do shell apontando para nada não é aceita.
+    let bogus = NodeLocator.resolve(fakeProbe(shell: { "/nao/existe/node" }))
+    assertTrue(bogus.path == nil)
+}
+
+test("systemProbe encontra nvm numa árvore real em disco (não a desta máquina)") {
+    // O teste acima usa um filesystem falso; este exercita os closures reais
+    // (contentsOfDirectory / isExecutableFile) contra um $HOME sintético, que é
+    // onde um erro de layout apareceria.
+    let fm = FileManager.default
+    let home = NSTemporaryDirectory() + "forge-node-\(UUID().uuidString.prefix(8))"
+    defer { try? fm.removeItem(atPath: home) }
+    for v in ["v18.20.4", "v24.11.1"] {
+        let bin = "\(home)/.nvm/versions/node/\(v)/bin"
+        try fm.createDirectory(atPath: bin, withIntermediateDirectories: true)
+        try "#!/bin/sh\necho \(v)\n".write(toFile: "\(bin)/node", atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: "\(bin)/node")
+    }
+    // PATH mínimo do launchd + $SHELL ausente: só o nvm pode responder.
+    let probe = NodeLocator.systemProbe(environment: ["PATH": launchdPath],
+                                        home: home, prefValue: nil, shellTimeout: 1)
+    let outcome = NodeLocator.resolve(probe)
+    assertEqual(outcome.path, "\(home)/.nvm/versions/node/v24.11.1/bin/node")
+    assertEqual(outcome.source, NodeLocator.Source.versionManager)
+}
+
+test("systemProbe lê node_path das prefs e FORGE_NODE_PATH do ambiente") {
+    let probe = NodeLocator.systemProbe(
+        environment: ["FORGE_NODE_PATH": "/env/node", "PATH": launchdPath],
+        home: "/Users/tester", prefValue: "/pref/node")
+    assertEqual(probe.envOverride, "/env/node")
+    assertEqual(probe.prefValue, "/pref/node")
+    assertEqual(probe.pathVar, launchdPath)
+}
+
+test("node_path é lido do JSONC ignorando a linha comentada") {
+    let jsonc = """
+    {
+      // "node_path": "/comentado/node",
+      "node_path": "/real/node"
+    }
+    """
+    assertEqual(PrefsLocator.parseString(jsonc, key: "node_path"), "/real/node")
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {
