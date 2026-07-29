@@ -28,7 +28,7 @@ struct ForgeApp: App {
         .defaultSize(width: 820, height: 620)
         .commands {
             CommandGroup(after: .newItem) {
-                Button("Atualizar") { state.reloadCheap(); state.loadAccounts() }
+                Button("Atualizar") { state.reloadCheap(); state.loadAccounts(); state.loadAppDefaults() }
                     .keyboardShortcut("r", modifiers: .command)
                 Button("Adicionar projeto…") { pickWorkspace(state) }
                     .keyboardShortcut("o", modifiers: .command)

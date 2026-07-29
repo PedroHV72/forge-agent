@@ -70,16 +70,62 @@ public enum WorkspaceDefaults {
         return Preselection(workspace: nil, reason: .none, warning: nil)
     }
 
+    /// Result of resolving the session root: the directory to actually use,
+    /// plus an operator-facing warning when the configured value had to be
+    /// overridden. Mirrors `Preselection`'s warning field — a misconfigured
+    /// default must be visible, not silently dropped.
+    public struct SessionRootResolution: Equatable {
+        public let path: String
+        public let warning: String?
+
+        public init(path: String, warning: String?) {
+            self.path = path
+            self.warning = warning
+        }
+    }
+
     /// The directory to use for project-less sessions (`shell`/`chat`),
     /// which carry no project semantics and so are the only sanctioned
     /// non-project cwd.
-    public static func sessionRoot(configured: String?, home: String) -> String {
-        guard let configured = trimmed(configured) else { return home }
-        if configured == "~" { return home }
-        if configured.hasPrefix("~/") {
-            return home + "/" + configured.dropFirst(2)
+    ///
+    /// A configured value that expands to a path which is not an existing
+    /// directory (mistyped, deleted, moved) is never handed to the terminal
+    /// host silently: `TerminalHost`'s chdir failure is ignored, so the
+    /// session would open somewhere the "abre em …" caption does not
+    /// describe. Falling back to `home` here, with a warning the caller can
+    /// surface, keeps that caption honest.
+    ///
+    /// `isDirectory` is injected (defaulting to a real filesystem check) so
+    /// this stays testable without touching disk.
+    public static func sessionRoot(
+        configured: String?,
+        home: String,
+        isDirectory: (String) -> Bool = defaultIsDirectory
+    ) -> SessionRootResolution {
+        guard let configured = trimmed(configured) else {
+            return SessionRootResolution(path: home, warning: nil)
         }
-        return configured
+        let expanded: String
+        if configured == "~" {
+            expanded = home
+        } else if configured.hasPrefix("~/") {
+            expanded = home + "/" + configured.dropFirst(2)
+        } else {
+            expanded = configured
+        }
+
+        if isDirectory(expanded) {
+            return SessionRootResolution(path: expanded, warning: nil)
+        }
+        return SessionRootResolution(
+            path: home,
+            warning: "O diretório configurado para sessões (\(expanded)) não existe — usando \(home).")
+    }
+
+    public static func defaultIsDirectory(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+        return exists && isDir.boolValue
     }
 
     private static func trimmed(_ s: String?) -> String? {

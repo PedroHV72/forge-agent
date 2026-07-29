@@ -187,7 +187,14 @@ final class AppState: ObservableObject {
     /// hand, so polling them on a timer would spawn node every couple of
     /// seconds for nothing.
     func loadAppDefaults() {
-        let resolved = ForgeCore.runJSON(ModelsStore.ResolvedPrefs.self, "forge-prefs.js", ["--resolved"])
+        // `--global-only` (R3 fix, S04 review): `app.*` is a per-operator
+        // setting, never per-project. Without this flag, ForgeCore.runJSON
+        // inherits the app process's cwd — which can carry a project-local
+        // .gsd/forge-prefs.jsonc (e.g. `swift run` inside this very repo) —
+        // and that local layer would silently override the operator's
+        // global default. This must always resolve the global layer alone.
+        let resolved = ForgeCore.runJSON(
+            ModelsStore.ResolvedPrefs.self, "forge-prefs.js", ["--resolved", "--global-only"])
         if case .object(let app)? = resolved?.prefs?["app"] {
             defaultWorkspacePref = app["default_workspace"]?.asString ?? ""
             sessionRootDir = app["session_root_dir"]?.asString ?? ""
@@ -197,6 +204,9 @@ final class AppState: ObservableObject {
         }
         // A misconfigured default must be visible, not silently dropped.
         if let warning = preselection.warning {
+            show(warning, error: true)
+        }
+        if let warning = sessionRootResolution.warning {
             show(warning, error: true)
         }
     }
@@ -224,13 +234,19 @@ final class AppState: ObservableObject {
             known: workspaces)
     }
 
-    /// Where project-less `shell`/`chat` sessions open — the only sanctioned
-    /// non-project cwd.
-    var resolvedSessionRoot: String {
+    /// Full resolution (path + optional warning) for the session root —
+    /// computed once so `resolvedSessionRoot` and the `loadAppDefaults()`
+    /// toast agree on the exact same check.
+    private var sessionRootResolution: WorkspaceDefaults.SessionRootResolution {
         WorkspaceDefaults.sessionRoot(
             configured: sessionRootDir,
             home: FileManager.default.homeDirectoryForCurrentUser.path)
     }
+
+    /// Where project-less `shell`/`chat` sessions open — the only sanctioned
+    /// non-project cwd. Falls back to `$HOME` (with a toast, see
+    /// `loadAppDefaults()`) when the configured directory does not exist.
+    var resolvedSessionRoot: String { sessionRootResolution.path }
 
     // MARK: Accounts
 

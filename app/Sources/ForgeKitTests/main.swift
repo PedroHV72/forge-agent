@@ -1141,11 +1141,32 @@ test("pref fora da lista de projetos resolve com aviso") {
 }
 
 test("root dir expande ~ e cai no home quando vazio") {
-    assertEqual(WorkspaceDefaults.sessionRoot(configured: nil, home: "/Users/x"), "/Users/x")
-    assertEqual(WorkspaceDefaults.sessionRoot(configured: "  ", home: "/Users/x"), "/Users/x")
-    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~", home: "/Users/x"), "/Users/x")
-    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~/code", home: "/Users/x"), "/Users/x/code")
-    assertEqual(WorkspaceDefaults.sessionRoot(configured: "/abs/path", home: "/Users/x"), "/abs/path")
+    let alwaysExists: (String) -> Bool = { _ in true }
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: nil, home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "  ", home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~", home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~/code", home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x/code")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "/abs/path", home: "/Users/x", isDirectory: alwaysExists).path, "/abs/path")
+
+    let nilCase = WorkspaceDefaults.sessionRoot(configured: nil, home: "/Users/x", isDirectory: alwaysExists)
+    assertTrue(nilCase.warning == nil, "sem valor configurado não deve haver aviso")
+}
+
+// R1 fix (S04 review): a configured session root that does not resolve to an
+// existing directory must fall back to $HOME with a visible warning, never
+// silently open somewhere the "abre em …" caption does not describe.
+test("root dir inexistente cai no home com aviso") {
+    let neverExists: (String) -> Bool = { _ in false }
+    let r = WorkspaceDefaults.sessionRoot(configured: "/repo/removido", home: "/Users/x", isDirectory: neverExists)
+    assertEqual(r.path, "/Users/x")
+    assertTrue(r.warning != nil, "diretório inexistente deve carregar aviso")
+}
+
+test("root dir existente é honrado sem aviso") {
+    let alwaysExists: (String) -> Bool = { _ in true }
+    let r = WorkspaceDefaults.sessionRoot(configured: "/repo/valido", home: "/Users/x", isDirectory: alwaysExists)
+    assertEqual(r.path, "/repo/valido")
+    assertTrue(r.warning == nil, "diretório existente não deve carregar aviso")
 }
 
 // Both preselect() and sessionRoot() are pure and Foundation-free at the

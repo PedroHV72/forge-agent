@@ -27,8 +27,9 @@
 // Zero deps, standalone runner (repo convention): exit != 0 on any failure.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { loadSchema } = require('./forge-prefs.js');
+const { loadSchema, readPrefs } = require('./forge-prefs.js');
 
 const repoRoot = path.resolve(__dirname, '..');
 const appSourcesDir = path.join(repoRoot, 'app', 'Sources');
@@ -163,6 +164,52 @@ check('Stores.swift references WorkspaceDefaults', () => {
   assert(fs.existsSync(storesPath), `not found: ${path.relative(repoRoot, storesPath)}`);
   const src = fs.readFileSync(storesPath, 'utf8');
   assert(src.includes('WorkspaceDefaults'), 'Stores.swift does not reference WorkspaceDefaults — resolver may be unwired');
+});
+
+// R3 fix (S04 review): `app.*` prefs (default_workspace, session_root_dir) are
+// per-operator, never per-project — `readPrefs(cwd, { globalOnly: true })`
+// must resolve strictly from the global layer even when a project-local
+// .gsd/ carries a CONFLICTING value for the same key.
+check('Stores.swift resolves app.* prefs with --global-only', () => {
+  const storesPath = path.join(appSourcesDir, 'Forge', 'Stores.swift');
+  const src = fs.readFileSync(storesPath, 'utf8');
+  assert(src.includes('--global-only'),
+    'Stores.swift loadAppDefaults() does not pass --global-only — a project-local .gsd/ ' +
+    'could silently override the operator-wide default_workspace/session_root_dir');
+});
+
+check('readPrefs({ globalOnly: true }) ignores a conflicting local layer', () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-global-only-'));
+  const globalDir = path.join(scratch, 'claude');
+  const projectDir = path.join(scratch, 'project');
+  const localDir = path.join(projectDir, '.gsd');
+  fs.mkdirSync(globalDir, { recursive: true });
+  fs.mkdirSync(localDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(globalDir, 'forge-agent-prefs.jsonc'),
+    JSON.stringify({ app: { default_workspace: '/global/repo', session_root_dir: '/global/root' } })
+  );
+  fs.writeFileSync(
+    path.join(localDir, 'forge-prefs.jsonc'),
+    JSON.stringify({ app: { default_workspace: '/local/repo', session_root_dir: '/local/root' } })
+  );
+
+  const opts = { globalDir, localDir };
+
+  const merged = readPrefs(projectDir, opts);
+  assert(merged.prefs.app.default_workspace === '/local/repo',
+    'sanity check failed: without globalOnly the local layer should still win');
+
+  const globalOnly = readPrefs(projectDir, { ...opts, globalOnly: true });
+  assert(globalOnly.prefs.app.default_workspace === '/global/repo',
+    `globalOnly must resolve app.default_workspace from the global layer alone, got ${JSON.stringify(globalOnly.prefs.app)}`);
+  assert(globalOnly.prefs.app.session_root_dir === '/global/root',
+    `globalOnly must resolve app.session_root_dir from the global layer alone, got ${JSON.stringify(globalOnly.prefs.app)}`);
+  assert(globalOnly.layers.local.source === 'absent',
+    `globalOnly must report the local layer as absent, got ${JSON.stringify(globalOnly.layers.local)}`);
+
+  fs.rmSync(scratch, { recursive: true, force: true });
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
