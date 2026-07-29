@@ -455,7 +455,7 @@ test("lista sobrevive ao round-trip como array, não como string") {
 print("\nPrefLabels (nome de máquina → texto humano)")
 
 test("humanise converte snake_case") {
-    assertEqual(PrefLabels.humanise("ask_in_auto"), "Ask in automático")
+    assertEqual(PrefLabels.humanise("ask_in_auto"), "Ask in auto")
     assertEqual(PrefLabels.humanise("adaptive_flags_lines"), "Adaptive flags lines")
     assertEqual(PrefLabels.humanise("mode"), "Mode")
 }
@@ -489,6 +489,27 @@ test("humanValue usa o sufixo da chave como unidade") {
 test("humanValue não inventa unidade onde não há") {
     assertTrue(PrefLabels.humanValue(key: "mode", value: .string("advisory")) == nil)
     assertTrue(PrefLabels.humanValue(key: "rounds", value: .number(1)) == nil)
+}
+
+test("união escalar não vira número") {
+    // compact_after is integer OR "unlimited"; treating it as a number showed 0
+    // on screen and would have destroyed the sentinel on save.
+    assertEqual(PrefKind.from(types: ["integer", "string"], hasEnum: false, itemsAreStrings: false),
+                .scalarUnion)
+}
+
+test("scalar preserva sentinela e número") {
+    assertEqual(PrefsEdit.scalar(from: "unlimited", allowsNumber: true), .string("unlimited"))
+    assertEqual(PrefsEdit.scalar(from: "12", allowsNumber: true), .number(12))
+    assertEqual(PrefsEdit.scalar(from: " 8 ", allowsNumber: true), .number(8))
+    // Not a bare number → stays a string rather than becoming a lossy 5.
+    assertEqual(PrefsEdit.scalar(from: "5x", allowsNumber: true), .string("5x"))
+}
+
+test("humanise não inverte a ordem das palavras") {
+    // The Portuguese translation of single words produced "Automático commit".
+    assertEqual(PrefLabels.humanise("auto_commit"), "Auto commit")
+    assertEqual(PrefLabels.humanise("compact_after"), "Compact after")
 }
 
 

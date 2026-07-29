@@ -538,6 +538,41 @@ struct AccountsView: View {
     }
 }
 
+
+/// An icon-only menu button.
+///
+/// SwiftUI's Menu draws a disclosure chevron beside its label by default, which
+/// on an icon label reads as a glyph with something stuck to it. Hiding the
+/// indicator and giving the button a real hit area (rather than the width of
+/// the glyph) is what makes it look intentional.
+struct IconMenu<Content: View>: View {
+    var icon: String = "ellipsis"
+    var help: String = "Mais opções"
+    @ViewBuilder var content: () -> Content
+
+    @State private var hovering = false
+
+    var body: some View {
+        Menu {
+            content()
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 26, height: 22)
+                .background(hovering ? AnyShapeStyle(.quaternary)
+                                     : AnyShapeStyle(.clear),
+                            in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .foregroundStyle(hovering ? .primary : .secondary)
+        .onHover { hovering = $0 }
+        .help(help)
+    }
+}
+
 // MARK: - Meter primitives
 
 enum Meter {
@@ -661,7 +696,7 @@ struct AccountCard: View {
                     .help("\(sessionCount) sessão(ões) do app nesta conta")
             }
             Spacer()
-            Menu {
+            IconMenu(help: "Opções da conta") {
                 if !isDefault && account.has_token {
                     Button("Tornar padrão") { state.setDefaultAccount(account.name) }
                 }
@@ -679,10 +714,7 @@ struct AccountCard: View {
                 }
                 Divider()
                 Button("Remover…", role: .destructive) { confirmingRemove = true }
-            } label: {
-                Image(systemName: "ellipsis")
             }
-            .menuStyle(.borderlessButton).frame(width: 22)
         }
     }
 

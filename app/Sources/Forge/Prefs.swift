@@ -499,6 +499,15 @@ struct PrefRow: View {
             Text("\(currentList.count) item(ns)")
                 .font(.caption2).foregroundStyle(.secondary)
 
+        case .scalarUnion:
+            // A number OR a sentinel word (compact_after: 5 | "unlimited").
+            // Typed text is parsed back into whichever shape it actually is, so
+            // the sentinel survives a round-trip.
+            TextField("", text: Binding(
+                get: { store.value(for: field)?.display ?? "" },
+                set: { store.set(field, PrefsEdit.scalar(from: $0, allowsNumber: true)) }))
+            .textFieldStyle(.roundedBorder).frame(width: 140)
+
         case .opaque:
             // Editing a nested object (or a string|array union) as text would
             // rewrite it in the wrong shape. Show it and point at the file.

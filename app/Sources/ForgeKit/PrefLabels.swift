@@ -85,22 +85,21 @@ public enum PrefLabels {
         groups[key] ?? GroupLabel(humanise(key), "slider.horizontal.3", "")
     }
 
-    /// snake_case → "Snake case". Deliberately mechanical: it can never drift
-    /// from a schema that keeps growing, and it only has to be good enough for
-    /// a title sitting directly above the exact machine name.
+    /// snake_case → "Snake case". Deliberately mechanical, and deliberately NOT
+    /// translated word by word: Portuguese word order is not English word order,
+    /// so mapping auto→automático turned `auto_commit` into "Automático commit".
+    /// The schema's own pt-BR description does the explaining; this only has to
+    /// be readable above the exact machine name.
     public static func humanise(_ key: String) -> String {
         let words = key.split(whereSeparator: { $0 == "_" || $0 == "-" }).map(String.init)
         guard let first = words.first else { return key }
-        let rest = words.dropFirst().map { abbreviations[$0] ?? $0 }
-        let head = abbreviations[first] ?? first
+        let rest = words.dropFirst().map { units[$0] ?? $0 }
+        let head = units[first] ?? first
         return ([head.prefix(1).uppercased() + head.dropFirst()] + rest).joined(separator: " ")
     }
 
-    /// Fragments whose expansion is not obvious from the word itself.
-    private static let abbreviations: [String: String] = [
-        "ms": "(ms)", "pct": "(%)", "auto": "automático", "max": "máximo",
-        "min": "mínimo", "dir": "diretório", "cmd": "comando",
-    ]
+    /// Only unit suffixes are expanded — they are noise as bare letters.
+    private static let units: [String: String] = ["ms": "(ms)", "pct": "(%)"]
 
     // MARK: - Values
 

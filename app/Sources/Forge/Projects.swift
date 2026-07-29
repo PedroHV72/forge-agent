@@ -438,21 +438,17 @@ struct ProjectCard: View {
             .controlSize(.small)
         Button("Ver pasta") { ForgeCore.reveal(path) }
             .controlSize(.small)
-        Menu {
+        IconMenu(help: path) {
             Button("Copiar caminho") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(path, forType: .string)
             }
+            Button("Abrir no Finder") { ForgeCore.reveal(path) }
             Divider()
             Button("Remover da lista", role: .destructive) {
                 state.removeWorkspace(path)
             }
-        } label: {
-            Image(systemName: "ellipsis")
         }
-        .menuStyle(.borderlessButton)
-        .frame(width: 26)
-        .help(path)
     }
 
     private func refresh() async {

@@ -73,12 +73,13 @@ public enum JSONValue: Codable, Hashable {
 /// guessed from the current value, because a list that happens to be empty is
 /// still a list.
 public enum PrefKind: String, Sendable {
-    case toggle      // boolean
-    case choice      // enum
-    case number      // integer | number
-    case text        // string
-    case stringList  // array of strings
-    case opaque      // object, or a shape the app must not rewrite
+    case toggle       // boolean
+    case choice       // enum
+    case number       // integer | number
+    case text         // string
+    case stringList   // array of strings
+    case scalarUnion  // integer|string — e.g. compact_after: 5 or "unlimited"
+    case opaque       // object, or a shape the app must not rewrite
 
     /// `types` is the schema's `type` (possibly a union), `hasEnum` whether it
     /// constrains values, `itemsAreStrings` whether an array holds strings.
@@ -92,13 +93,31 @@ public enum PrefKind: String, Sendable {
             return itemsAreStrings ? .stringList : .opaque
         }
         if types.contains("boolean") { return .toggle }
-        if types.contains("integer") || types.contains("number") { return .number }
+        // A scalar union such as compact_after (integer OR "unlimited") must not
+        // be forced into a numeric field: reading it as a number shows 0 for
+        // "unlimited", and writing it back would destroy the sentinel.
+        let numeric = types.contains("integer") || types.contains("number")
+        if numeric && types.contains("string") { return .scalarUnion }
+        if numeric { return .number }
         if types.contains("string") { return .text }
         return .opaque
     }
 }
 
 public enum PrefsEdit {
+
+    /// Parse text typed for a scalar-union knob, keeping the shape the value
+    /// actually has: digits become a number, anything else stays a string.
+    /// This is what preserves sentinels like "unlimited".
+    public static func scalar(from text: String, allowsNumber: Bool) -> JSONValue {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        if t.isEmpty { return .string("") }
+        if allowsNumber, let d = Double(t), t.allSatisfy({ $0.isNumber || $0 == "." || $0 == "-" }) {
+            return .number(d)
+        }
+        return .string(t)
+    }
+
 
     /// Insert or replace `path` in a JSONC document, preserving comments.
     /// `.null` removes the key, falling back to the schema default.
