@@ -1557,6 +1557,161 @@ test("fechar a aba visível cai na primeira restante") {
     assertTrue(TerminalFocus.afterClosing(a, selection: a, remaining: []) == nil)
 }
 
+// UpdateCore — the installer's output, and when a relaunch is allowed.
+
+print("\nAtualização — saída do instalador")
+
+/// Classify one line with a fresh tracker.
+func classify(_ line: String) -> InstallerLine {
+    var t = InstallerPhaseTracker()
+    return t.consume(line)
+}
+
+test("linha com marcador ▸ do build.sh é fase (a fase mais longa da atualização)") {
+    assertEqual(classify("▸ Compilando (swift build, SwiftTerm)"),
+                .phase("Compilando (swift build, SwiftTerm)"),
+                "sem isso a barra fica travada durante minutos de swift build")
+    assertEqual(InstallerLabels.label(for: "Compilando (swift build, SwiftTerm)"),
+                "compilando o app")
+}
+
+test("linha com 2 espaços é fase; com 4 é detalhe") {
+    assertEqual(classify("  Installing skills..."), .phase("Installing skills..."))
+    assertEqual(classify("    forge-auto"), .detail("    forge-auto"))
+}
+
+test("saída crua do SwiftPM (sem indentação) é detalhe") {
+    assertEqual(classify("[14/16] Compiling Forge Stores.swift"),
+                .detail("[14/16] Compiling Forge Stores.swift"))
+    assertEqual(classify("Build complete! (6.06s)"), .detail("Build complete! (6.06s)"))
+}
+
+test("o marcador vence a indentação — ✓ com sub-item ainda é fase") {
+    assertEqual(classify("✓   hooks sincronizados em settings.json"),
+                .phase("hooks sincronizados em settings.json"))
+}
+
+test("⚠ é fase, não detalhe") {
+    assertEqual(classify("⚠ swift não encontrado"), .phase("swift não encontrado"))
+}
+
+test("linha vazia é detalhe vazio") {
+    assertEqual(classify(""), .detail(""))
+    assertEqual(classify("\n"), .detail(""))
+}
+
+test("\\r é removido antes de classificar") {
+    assertEqual(classify("  Installing scripts...\r\n"), .phase("Installing scripts..."))
+}
+
+test("a linha de sucesso encerra e vira 'concluído'") {
+    var t = InstallerPhaseTracker()
+    assertEqual(t.consume("✓ Forge Agent instalado com sucesso!"), .finished("concluído"))
+}
+
+test("Próximos passos DEPOIS do sucesso é detalhe, não a última fase") {
+    var t = InstallerPhaseTracker()
+    _ = t.consume("✓ Forge Agent instalado com sucesso!")
+    assertEqual(t.consume("  Próximos passos:"), .detail("  Próximos passos:"))
+    assertEqual(t.consume("  Ajuda a qualquer momento:   /forge-help"),
+                .detail("  Ajuda a qualquer momento:   /forge-help"),
+                "o último rótulo não pode ser uma instrução de onboarding")
+}
+
+test("✓ Forge.app instalado em /Applications é fase legítima, antes do marco final") {
+    var t = InstallerPhaseTracker()
+    assertEqual(t.consume("✓ Forge.app instalado em /Applications"),
+                .phase("Forge.app instalado em /Applications"))
+    assertEqual(InstallerLabels.label(for: "Forge.app instalado em /Applications"),
+                "app instalado")
+}
+
+print("\nAtualização — rótulos em PT")
+
+test("as fases conhecidas ganham rótulo em português") {
+    assertEqual(InstallerLabels.label(for: "Backup saved to ~/.claude.bak"), "fazendo backup")
+    assertEqual(InstallerLabels.label(for: "Installing agents..."), "copiando agentes")
+    assertEqual(InstallerLabels.label(for: "Installing dispatch templates..."),
+                "copiando templates de dispatch")
+    assertEqual(InstallerLabels.label(for: "Verificando disponibilidade de claude-opus-5..."),
+                "verificando modelos")
+    assertEqual(InstallerLabels.label(for: "Installing preferences..."), "instalando preferências")
+    assertEqual(InstallerLabels.label(for: "MCPs globais (Tier 1 — zero-config)"),
+                "configurando MCPs")
+    assertEqual(InstallerLabels.label(for: "Building the macOS app..."), "compilando o app")
+    assertEqual(InstallerLabels.label(for: "Instalando em /Applications"),
+                "instalando em /Applications")
+}
+
+test("rótulo desconhecido degrada para a frase crua, sem parar a barra") {
+    assertEqual(InstallerLabels.label(for: "Doing something brand new..."),
+                "Doing something brand new...")
+}
+
+print("\nAtualização — relaunch e bundle")
+
+test("só o exit 0 autoriza o relaunch") {
+    assertTrue(UpdateOutcome.canRelaunch(exitCode: 0))
+    assertFalse(UpdateOutcome.canRelaunch(exitCode: 1))
+    assertFalse(UpdateOutcome.canRelaunch(exitCode: 128))
+}
+
+test("a mensagem de falha carrega o código e a cauda do log") {
+    let msg = UpdateOutcome.failureMessage(
+        exitCode: 1, lastLines: ["a", "", "b", "c", "d"])
+    assertTrue(msg.contains("código 1"), "sem o código: \(msg)")
+    assertTrue(msg.contains("d"), "sem a última linha: \(msg)")
+    assertFalse(msg.contains("\na\n"), "levou mais de três linhas: \(msg)")
+}
+
+test("bundle canônico não gera aviso; um build de dev gera") {
+    assertTrue(RelaunchTarget.divergenceNote(for: "/Applications/Forge.app") == nil)
+    assertTrue(RelaunchTarget.divergenceNote(for: "/Applications/Forge.app/") == nil,
+               "barra final não deveria contar como divergência")
+    let note = RelaunchTarget.divergenceNote(for: "/Users/dev/forge-agent/app/build/Forge.app")
+    assertTrue(note != nil, "um bundle fora de /Applications tem que avisar")
+    assertTrue(note?.contains("/Users/dev/forge-agent/app/build/Forge.app") ?? false,
+               "o aviso tem que dizer QUAL bundle vai reabrir")
+}
+
+print("\nAtualização — restauração de seção e pré-checagem do git")
+
+test("SectionRestore devolve o raw válido e cai no fallback no resto") {
+    let valid = ["Início", "Atualizações", "Terminal"]
+    assertEqual(SectionRestore.resolve(rawValue: "Atualizações", valid: valid, fallback: "Início"),
+                "Atualizações")
+    assertEqual(SectionRestore.resolve(rawValue: nil, valid: valid, fallback: "Início"), "Início")
+    assertEqual(SectionRestore.resolve(rawValue: "", valid: valid, fallback: "Início"), "Início")
+    assertEqual(SectionRestore.resolve(rawValue: "Seção Renomeada", valid: valid, fallback: "Início"),
+                "Início",
+                "um label renomeado invalida a preferência gravada")
+}
+
+test("a pré-checagem distingue árvore suja de branch divergente") {
+    assertTrue(UpdatePrecheck.evaluate(dirty: false, ahead: 0) == nil)
+    assertEqual(UpdatePrecheck.evaluate(dirty: true, ahead: 0), .dirtyTree)
+    assertEqual(UpdatePrecheck.evaluate(dirty: false, ahead: 2), .diverged)
+    assertEqual(UpdatePrecheck.evaluate(dirty: true, ahead: 2), .dirtyTree,
+                "sujo vence: é o caso mais perigoso de 'resolver' sozinho")
+}
+
+test("o comando manual só inspeciona — nunca stash, reset ou rebase") {
+    let cmd = UpdatePrecheck.manualCommand(repo: "/Users/dev/forge-agent")
+    assertTrue(cmd.contains("/Users/dev/forge-agent"), "sem o repo: \(cmd)")
+    assertTrue(cmd.contains("git status"), "sem git status: \(cmd)")
+    for forbidden in ["stash", "reset", "rebase", "checkout"] {
+        assertFalse(cmd.contains(forbidden), "o comando sugere \(forbidden): \(cmd)")
+    }
+}
+
+test("a mensagem de bloqueio explica que a recusa é proteção") {
+    for blocker in [UpdatePrecheck.Blocker.dirtyTree, .diverged] {
+        let m = UpdatePrecheck.message(for: blocker)
+        assertGreater(m.count, 40, "mensagem curta demais para explicar: \(m)")
+        assertFalse(m.contains("stash"), "a mensagem sugere stash: \(m)")
+    }
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

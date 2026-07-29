@@ -62,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let live = AppState.shared.sessions.filter(\.isRunning)
-        guard !live.isEmpty else { return .terminateNow }
+        guard !live.isEmpty else { return terminateNow() }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -79,7 +79,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Sair mesmo assim")
         alert.addButton(withTitle: "Cancelar")
         NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+        return alert.runModal() == .alertFirstButtonReturn ? terminateNow() : .terminateCancel
+    }
+
+    /// The last thing that happens before the process goes away, and the only
+    /// place the replacement instance is started: doing it in `relaunch()` meant
+    /// that cancelling this alert left the new copy already running alongside
+    /// the old one.
+    @MainActor
+    private func terminateNow() -> NSApplication.TerminateReply {
+        if UpdateStore.shared.relaunchPending { UpdateStore.shared.launchNewInstance() }
+        return .terminateNow
     }
 
     /// Clicking the Dock icon after closing the window should bring it back.

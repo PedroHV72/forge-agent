@@ -34,6 +34,7 @@ const path = require('path');
 
 const repoRoot = path.resolve(__dirname, '..');
 const updatesSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Updates.swift');
+const forgeAppSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'ForgeApp.swift');
 const installSh = path.join(repoRoot, 'install.sh');
 
 let passed = 0;
@@ -71,10 +72,60 @@ function stripLineComments(source) {
     .join('\n');
 }
 
+/// Extract a function body by COUNTING BRACES, not by regex.
+///
+/// The previous version matched `/func runUpdate\(\)\s*\{[\s\S]*?\n    \}/` — non
+/// greedy up to the first line that is four spaces and a closing brace. Once
+/// `runUpdate()` gained closures (`onLine:`/`onExit:`, whose closing lines are
+/// `    }, onExit: { code in` and `    })`), that regex truncated the body at the
+/// first nested closure — and a guard asserting something is ABSENT from the body
+/// would then pass because of the truncation rather than the code. See the
+/// bite-proof case at the bottom.
+function bodyOf(source, signature) {
+  const at = source.indexOf(signature);
+  assert(at !== -1, `assinatura não encontrada: ${signature}`);
+  const open = source.indexOf('{', at);
+  assert(open !== -1, `sem abertura de bloco após ${signature}`);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}') {
+      depth--;
+      if (depth === 0) return source.slice(open, i + 1);
+    }
+  }
+  throw new Error(`bloco não fechado em ${signature}`);
+}
+
+/// The text preceding the `{` that opens the block containing `index` — i.e. the
+/// condition an assignment sits under. Used to prove WHERE `needsRelaunch = true`
+/// happens, instead of hoping it is near the right line.
+function enclosingBlockHeader(source, index) {
+  let depth = 0;
+  for (let i = index; i >= 0; i--) {
+    const c = source[i];
+    if (c === '}') depth++;
+    else if (c === '{') {
+      if (depth === 0) return source.slice(source.lastIndexOf('\n', i) + 1, i);
+      depth--;
+    }
+  }
+  return null;
+}
+
+function indexesOf(source, re) {
+  const out = [];
+  const rx = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+  let m;
+  while ((m = rx.exec(source)) !== null) out.push(m.index);
+  return out;
+}
+
 console.log('\n=== forge app · self-update ===\n');
 
 const updatesSource = read(updatesSwift);
 const updatesCode = stripLineComments(updatesSource);
+const appCode = stripLineComments(read(forgeAppSwift));
 const installSource = read(installSh);
 
 check('install.sh ainda gateia o build do app atrás de --with-app', () => {
@@ -90,29 +141,56 @@ check('install.sh ainda gateia o build do app atrás de --with-app', () => {
   );
 });
 
+const runUpdateBody = bodyOf(updatesCode, 'func runUpdate()');
+
 check('runUpdate() invoca install.sh com --update E --with-app', () => {
-  const m = updatesCode.match(/func runUpdate\(\)\s*\{[\s\S]*?\n    \}/);
-  assert(m, 'não encontrei o corpo de runUpdate()');
-  const body = m[0];
   assert(
-    body.includes('--update'),
+    runUpdateBody.includes('--update'),
     'runUpdate() não passa --update'
   );
   assert(
-    body.includes('--with-app'),
+    runUpdateBody.includes('--with-app'),
     'runUpdate() não passa --with-app — o app atualizaria tudo menos ele mesmo ' +
       '(install.sh gateia o build do app em WITH_APP)'
   );
 });
 
-check('runUpdate() marca que a janela em execução ficou obsoleta', () => {
-  const m = updatesCode.match(/func runUpdate\(\)\s*\{[\s\S]*?\n    \}/);
-  assert(m, 'não encontrei o corpo de runUpdate()');
+check('runUpdate() roda o instalador headless, não num Terminal', () => {
   assert(
-    /needsRelaunch\s*=\s*true/.test(m[0]),
-    'runUpdate() não seta needsRelaunch — o processo em execução continua no ' +
-      'binário antigo e a janela pareceria atualizada'
+    !/openTerminal/.test(runUpdateBody),
+    'runUpdate() ainda abre um Terminal — o progresso tem que ser exibido pelo app'
   );
+  // A ausência sozinha passaria num corpo vazio: exigir a prova positiva.
+  assert(
+    /ForgeCore\.stream\(/.test(runUpdateBody),
+    'runUpdate() não chama ForgeCore.stream — sem streaming a barra fica parada ' +
+      'durante os minutos de swift build'
+  );
+});
+
+check('needsRelaunch só é setado depois do exit 0 do instalador', () => {
+  // Invertido de propósito: até a v3.1.4 este guard exigia a atribuição DENTRO
+  // de runUpdate(), que é justamente o bug — o botão aparecia enquanto o
+  // instalador ainda compilava, e clicar nele matava o build.
+  assert(
+    !/needsRelaunch\s*=\s*true/.test(runUpdateBody),
+    'runUpdate() seta needsRelaunch — o botão apareceria com o instalador ainda ' +
+      'rodando, e clicar nele mata o build'
+  );
+  const sites = indexesOf(updatesCode, /needsRelaunch\s*=\s*true/);
+  assert(
+    sites.length > 0,
+    'ninguém seta needsRelaunch — a janela ficaria no binário antigo sem afordance'
+  );
+  for (const at of sites) {
+    const header = enclosingBlockHeader(updatesCode, at);
+    assert(header !== null, 'atribuição fora de qualquer bloco');
+    assert(
+      /canRelaunch|==\s*0/.test(header),
+      'needsRelaunch = true não está sob uma condição de exit code zero: ' +
+        `\`${header.trim()}\``
+    );
+  }
 });
 
 check('existe o afordance de reabrir (needsRelaunch + relaunch())', () => {
@@ -124,15 +202,35 @@ check('existe o afordance de reabrir (needsRelaunch + relaunch())', () => {
     /func relaunch\(\)/.test(updatesCode),
     'relaunch() não existe'
   );
-  const m = updatesCode.match(/func relaunch\(\)\s*\{[\s\S]*?\n    \}/);
-  assert(m, 'não encontrei o corpo de relaunch()');
+  const relaunchBody = bodyOf(updatesCode, 'func relaunch()');
   assert(
-    m[0].includes('"-n"'),
-    'relaunch() não usa `open -n` — sem isso a nova cópia não sobe antes desta sair'
+    /terminate/.test(relaunchBody),
+    'relaunch() não encerra a instância antiga'
+  );
+  // `open -n` mudou de lugar: dispará-lo antes da confirmação de término deixava
+  // duas instâncias quando o alerta de sessões vivas era cancelado.
+  assert(
+    !relaunchBody.includes('"-n"'),
+    'relaunch() ainda sobe a nova cópia antes da confirmação de término'
+  );
+  const launchBody = bodyOf(updatesCode, 'func launchNewInstance()');
+  assert(
+    launchBody.includes('"-n"'),
+    'launchNewInstance() não usa `open -n` — sem isso a nova cópia não sobe antes desta sair'
+  );
+});
+
+check('a nova instância só sobe depois de o término ser confirmado', () => {
+  const body = bodyOf(appCode, 'func applicationShouldTerminate(');
+  assert(
+    /relaunchPending/.test(appCode),
+    'ForgeApp não consulta relaunchPending'
   );
   assert(
-    /terminate/.test(m[0]),
-    'relaunch() não encerra a instância antiga'
+    /launchNewInstance\(\)/.test(body) ||
+      /launchNewInstance\(\)/.test(bodyOf(appCode, 'func terminateNow()')),
+    'applicationShouldTerminate não dispara launchNewInstance() — a ordenação ' +
+      'corrigida (terminar → relançar) não está garantida'
   );
 });
 
@@ -158,6 +256,58 @@ check('o matcher ignora menções em comentário (bite-proof)', () => {
   assert(
     !/needsRelaunch\s*=\s*true/.test(stripped),
     'stripLineComments deixou passar uma atribuição comentada'
+  );
+});
+
+// Bite-proof II: a mention in a comment must not SATISFY the "someone sets it
+// under exit 0" half of the guard either. Absence proofs and presence proofs
+// need the same matcher.
+check('atribuição só em comentário não satisfaz a prova positiva (bite-proof)', () => {
+  const fake = [
+    'func finishUpdate(exitCode: Int32) {',
+    '    if UpdateOutcome.canRelaunch(exitCode: exitCode) {',
+    '        // needsRelaunch = true',
+    '    }',
+    '}',
+  ].join('\n');
+  assert(
+    indexesOf(stripLineComments(fake), /needsRelaunch\s*=\s*true/).length === 0,
+    'um fonte que só menciona a atribuição em comentário contaria como prova'
+  );
+});
+
+// Bite-proof III: the reason the regex had to go. This is the shape runUpdate()
+// actually has now — closures whose closing lines start with four spaces.
+check('bodyOf não trunca em closure aninhada (bite-proof)', () => {
+  const fake = [
+    'func runUpdate() {',
+    '    ForgeCore.stream(cwd: r, command: c, onLine: { line in',
+    '        keep(line)',
+    '    }, onExit: { code in',
+    '        needsRelaunch = true',
+    '    })',
+    '}',
+  ].join('\n');
+
+  const body = bodyOf(fake, 'func runUpdate()');
+  assert(
+    /needsRelaunch\s*=\s*true/.test(body),
+    'bodyOf perdeu a atribuição dentro da closure — o guard de ausência passaria ' +
+      'por truncamento, não por mérito'
+  );
+
+  // And the matcher that used to be here would have missed it, silently.
+  const old = fake.match(/func runUpdate\(\)\s*\{[\s\S]*?\n    \}/);
+  assert(
+    old && !/needsRelaunch\s*=\s*true/.test(old[0]),
+    'o regex antigo deveria truncar aqui — se não trunca, este caso não prova nada'
+  );
+
+  // The header walk must find the closure's condition, not the function's.
+  const at = indexesOf(fake, /needsRelaunch\s*=\s*true/)[0];
+  assert(
+    /onExit/.test(enclosingBlockHeader(fake, at) || ''),
+    'enclosingBlockHeader não achou o bloco imediato da atribuição'
   );
 });
 

@@ -148,6 +148,119 @@ enum ForgeCore {
         return try? JSONDecoder().decode(T.self, from: data)
     }
 
+    // MARK: - Streaming a shell command
+
+    /// Accumulates chunks and hands back only the COMPLETE lines in them.
+    ///
+    /// `availableData` delivers arbitrary chunks, not lines — and a chunk can end
+    /// in the middle of a multi-byte character, which the installer emits
+    /// constantly (`✓`, `⚠`, `▸`, `…`, `é`). Decoding a chunk directly returns
+    /// nil for those and the text disappears without a trace, so the split
+    /// happens on bytes and only whole lines are decoded.
+    ///
+    /// Locked because the two pipes' readability handlers run on different
+    /// threads.
+    private final class LineAccumulator {
+        private let lock = NSLock()
+        private var buffer = Data()
+
+        func take(_ chunk: Data) -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            buffer.append(chunk)
+            var lines: [String] = []
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let raw = buffer[buffer.startIndex..<nl]
+                buffer.removeSubrange(buffer.startIndex...nl)
+                lines.append(Self.decode(raw))
+            }
+            return lines
+        }
+
+        /// Whatever is left without a trailing newline — the last line of a
+        /// process that did not end its output with one.
+        func flush() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !buffer.isEmpty else { return nil }
+            let rest = Self.decode(buffer)
+            buffer.removeAll()
+            return rest
+        }
+
+        /// Invalid bytes are replaced rather than dropped: a mangled line is
+        /// still readable, a missing one is a silent hole in the log.
+        private static func decode(_ data: Data) -> String {
+            String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        }
+    }
+
+    /// Run `command` under bash and report it line by line while it runs.
+    ///
+    /// The blocking helpers above (`run`, `runWithInput`) cannot be used for the
+    /// self-update: the installer's longest step is a `swift build` that takes
+    /// minutes, and whole-output capture means the UI has nothing to show until
+    /// it is over. That is indistinguishable from a hang.
+    ///
+    /// `onLine` and `onExit` are always delivered on the main queue, in order.
+    /// `waitUntilExit()` is never called — a full pipe plus a main-thread wait
+    /// deadlocks the app.
+    ///
+    /// Not routed through `engine(_:)`/`nodePath`: this is bash, not node.
+    @discardableResult
+    static func stream(cwd: String, command: String,
+                       onLine: @escaping (String) -> Void,
+                       onExit: @escaping (Int32) -> Void) -> Process? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = ["-lc", command]
+        proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
+
+        let out = Pipe(), err = Pipe()
+        proc.standardOutput = out
+        proc.standardError = err
+
+        let accOut = LineAccumulator(), accErr = LineAccumulator()
+        let emit: ([String]) -> Void = { lines in
+            guard !lines.isEmpty else { return }
+            DispatchQueue.main.async { for l in lines { onLine(l) } }
+        }
+
+        for (handle, acc) in [(out.fileHandleForReading, accOut),
+                              (err.fileHandleForReading, accErr)] {
+            handle.readabilityHandler = { fh in
+                let chunk = fh.availableData
+                // Empty data is the EOF signal, not a line.
+                guard !chunk.isEmpty else { return }
+                emit(acc.take(chunk))
+            }
+        }
+
+        proc.terminationHandler = { p in
+            // Drain first: a readability handler is not guaranteed to fire for
+            // the final chunk (SR-12080), and the last lines are exactly where
+            // the reason for a failure lives. Safe here — the process is gone.
+            let restOut = out.fileHandleForReading.readDataToEndOfFile()
+            let restErr = err.fileHandleForReading.readDataToEndOfFile()
+            var tail = accOut.take(restOut) + accErr.take(restErr)
+            if let l = accOut.flush() { tail.append(l) }
+            if let l = accErr.flush() { tail.append(l) }
+            emit(tail)
+
+            // Only now: leaving a handler set keeps the FileHandle alive.
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.async { onExit(p.terminationStatus) }
+        }
+
+        do {
+            try proc.run()
+            return proc
+        } catch {
+            return nil
+        }
+    }
+
     // MARK: - Launching terminals
 
     /// Open a Terminal window running `command` in `cwd`.
