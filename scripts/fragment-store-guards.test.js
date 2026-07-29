@@ -235,6 +235,55 @@ function seedSvnTree(cwd) {
   fs.mkdirSync(path.join(cwd, '.gsd', 'forge'), { recursive: true }); // .gsd versioned, .gsd/forge ignored wholesale
 }
 
+test('detectVcs recognizes an SVN working-copy subdirectory via wc-root probe', () => {
+  const tmp = mkTmp();
+  const sub = path.join(tmp, 'sub');
+  const calls = [];
+  fs.mkdirSync(sub, { recursive: true });
+  fs.mkdirSync(path.join(tmp, '.svn'), { recursive: true }); // ancestor .svn — required to reach the probe
+  const restore = ignore.__setExecFileSync((file, args, options) => {
+    calls.push({ file, args, options });
+    assert(file === 'svn', `unexpected exec: ${file}`);
+    assert(args.slice(0, 3).join('|') === 'info|--show-item|wc-root', `unexpected args: ${args.join(' ')}`);
+    return tmp + '\n';
+  });
+  try {
+    assert(ignore.detectVcs(sub) === 'svn', 'subdirectory should resolve to svn');
+    assert(calls.length === 1, `expected one probe, got ${calls.length}`);
+    assert(calls[0].args.join('|') === ['info', '--show-item', 'wc-root', '--non-interactive', sub].join('|'),
+      `probe args mismatch: ${calls[0].args.join(' ')}`);
+  } finally { ignore.__setExecFileSync(restore); rmrf(tmp); }
+});
+
+test('detectVcs fails closed when the SVN wc-root probe throws', () => {
+  const tmp = mkTmp();
+  const restore = ignore.__setExecFileSync(() => { throw new Error('svn unavailable'); });
+  try {
+    assert(ignore.detectVcs(tmp) === 'none', 'failed probe should return none');
+  } finally { ignore.__setExecFileSync(restore); rmrf(tmp); }
+});
+
+test('detectVcs makes zero execFileSync calls in a no-VCS directory (hot-path perf guard)', () => {
+  const tmp = mkTmp();
+  let calls = 0;
+  const restore = ignore.__setExecFileSync(() => { calls++; throw new Error('must not spawn'); });
+  try {
+    assert(ignore.detectVcs(tmp) === 'none', 'no-VCS dir should resolve to none');
+    assert(calls === 0, `expected zero SVN probes in the no-VCS hot path, got ${calls}`);
+  } finally { ignore.__setExecFileSync(restore); rmrf(tmp); }
+});
+
+test('detectVcs keeps the git fast-path without probing SVN', () => {
+  const tmp = mkTmp();
+  fs.mkdirSync(path.join(tmp, '.git'), { recursive: true });
+  let calls = 0;
+  const restore = ignore.__setExecFileSync(() => { calls++; throw new Error('must not probe'); });
+  try {
+    assert(ignore.detectVcs(tmp) === 'git', 'git directory should resolve to git');
+    assert(calls === 0, `expected no SVN probe, got ${calls}`);
+  } finally { ignore.__setExecFileSync(restore); rmrf(tmp); }
+});
+
 test('applyIgnore does NOT throw when .gsd/forge is ignored wholesale (no E155010)', () => {
   const tmp = mkTmp();
   const propsetCalls = [];

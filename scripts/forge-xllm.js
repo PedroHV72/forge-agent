@@ -76,10 +76,9 @@ const { spawnSync, spawn, execSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
 const {
   captureSnapshot,
-  hashObject,
-  parsePorcelainZ,
-  parseNameStatusZ,
+  parseSvnBaseline,
 } = require('./forge-surgical-reset.js');
+const vcs = require('./forge-vcs.js');
 const { classifyError, isTransient } = require('./forge-classify-error.js');
 const { countTokens, truncateAtSectionBoundary } = require('./forge-tokens.js');
 
@@ -850,6 +849,12 @@ function invokeCodexDetached(opts) {
       const args = [
         'exec',
         ...codexSandboxArgs(sandbox || 'workspace-write'),
+        // Allow running outside a Git repository (e.g. SVN working copies). Codex
+        // otherwise aborts with "Not inside a trusted directory and --skip-git-repo-check
+        // was not specified", and a non-git dir can never become a "trusted directory"
+        // (no config/trust bypasses it — only this flag). The sandbox already bounds
+        // the blast radius, so this does not weaken isolation. See docs/xllm-review-svn-gap.md.
+        '--skip-git-repo-check',
         '-C', cwd,
         '-o', lastMsgFile,
         '--output-schema', schemaFile,
@@ -1240,54 +1245,27 @@ function gitBuffer(cwd, args, what) {
   return result.stdout;
 }
 
+// sem `exclude` — .gsd/** É incluído de propósito. copyOriginDeleted:false preserves the
+// original computeAllPostChanges semantics: a detected copy (C) leaves its source
+// untouched, never reported as 'D' (R4 — this is a report-only path, unlike the reset
+// engine where marking the copy origin 'D' is inert).
+const VCS_OPTS = { env: buildSidecarEnv(), maxBuffer: MAX_BUFFER, copyOriginDeleted: false };
+
 /** Snapshot every pre-dispatch dirty path, including protected `.gsd/**` paths.
  * The public `pre_dirty` result still comes from captureSnapshot (which intentionally
  * excludes orchestrator state); this richer private snapshot exists solely to compute
  * the sidecar's end-state delta and protected-path violations without false positives. */
-function captureDirtySnapshot(cwd) {
-  const entries = parsePorcelainZ(gitBuffer(cwd, ['status', '--porcelain', '-uall', '-z'], 'git status'));
-  const byPath = new Map();
-  const add = (p) => {
-    if (p && !byPath.has(p)) byPath.set(p, hashObject(cwd, p));
-  };
-  for (const entry of entries) {
-    add(entry.path);
-    if (entry.origPath) add(entry.origPath);
-  }
-  return Array.from(byPath, ([p, hash]) => ({ path: p, hash }));
+function captureDirtySnapshot(cwd, vcsName = 'git') {
+  const result = vcs.captureDirty(cwd, { ...VCS_OPTS, vcs: vcsName });
+  if (!result.ok) throw new Error(`git status failed: ${result.error}`);
+  return result.entries;
 }
 
 /** Return every current change versus START_SHA, including `.gsd/**`. */
-function computeAllPostChanges(cwd, startSha) {
-  const byPath = new Map();
-  const set = (p, status) => { if (p) byPath.set(p, status); };
-
-  const diff = parseNameStatusZ(gitBuffer(
-    cwd,
-    ['diff', '--name-status', '-z', startSha],
-    'git diff',
-  ));
-  for (const entry of diff) {
-    if (entry.status === 'R') {
-      set(entry.origPath, 'D');
-      set(entry.path, 'A');
-    } else if (entry.status === 'C') {
-      set(entry.path, 'A');
-    } else if (entry.status === 'A') set(entry.path, 'A');
-    else if (entry.status === 'D') set(entry.path, 'D');
-    else set(entry.path, 'M');
-  }
-
-  const porcelain = parsePorcelainZ(gitBuffer(
-    cwd,
-    ['status', '--porcelain', '-uall', '-z'],
-    'git status',
-  ));
-  for (const entry of porcelain) {
-    if (entry.xy === '??') set(entry.path, 'A');
-  }
-
-  return Array.from(byPath, ([p, status]) => ({ status, path: p }));
+function computeAllPostChanges(cwd, startSha, vcsName = 'git') {
+  const result = vcs.postChanges(cwd, startSha, { ...VCS_OPTS, vcs: vcsName });
+  if (!result.ok) throw new Error(`git diff failed: ${result.error}`);
+  return result.entries.map((entry) => ({ status: entry.status, path: entry.path }));
 }
 
 /**
@@ -1300,11 +1278,22 @@ function computeAllPostChanges(cwd, startSha) {
  * @param {string} [startSha]
  * @returns {{status:'A'|'M'|'D', path:string}[]}
  */
-function deriveFilesChanged(cwd, preDirty = [], startSha) {
-  const baseline = startSha || gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
+function deriveFilesChanged(cwd, preDirty = [], startSha, vcsName = 'git') {
+  const baseline = startSha || (vcsName === 'git' ? gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD') : startSha);
   const before = new Map(preDirty.map((entry) => [entry.path, entry.hash]));
-  return computeAllPostChanges(cwd, baseline)
-    .filter((entry) => !before.has(entry.path) || hashObject(cwd, entry.path) !== before.get(entry.path))
+  return computeAllPostChanges(cwd, baseline, vcsName)
+    .filter((entry) => {
+      if (!before.has(entry.path)) return true;
+      const current = vcs.hashPath(cwd, entry.path, { ...VCS_OPTS, vcs: vcsName });
+      // Conservative degrade, not throw: this is a read-only reporting path (feeds
+      // files_changed for the sidecar report). The pre-seam hashObject() never threw —
+      // a failed hash-object here degraded to null, comparing !== before → "changed".
+      // Throwing here would abort the entire dispatch from a report-only path (R3).
+      // The destructive reset engine (forge-surgical-reset.js) is where a hard failure
+      // is appropriate — this path is not that.
+      if (!current.ok) return true;
+      return current.hash !== before.get(entry.path);
+    })
     .sort((a, b) => a.path.localeCompare(b.path));
 }
 
@@ -1541,6 +1530,7 @@ function gitRead(gitArgs, cwd, what) {
  */
 async function runExecute(opts) {
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
+  const vcsName = vcs.detectVcs(cwd) === 'svn' ? 'svn' : 'git';
   const timeoutSecs = opts.timeoutSecs || DEFAULT_EXECUTE_TIMEOUT_SECS;
   const dispatchId = normalizeDispatchId(opts.dispatchId, 'execute');
 
@@ -1561,8 +1551,10 @@ async function runExecute(opts) {
   if (!planText.trim()) throw new Error('--plan file is empty');
 
   // Guard: cwd must be a git work tree.
-  const insideRepo = gitRead('rev-parse --is-inside-work-tree', cwd, 'git repo check');
-  if (insideRepo !== 'true') throw new Error(`--cwd is not inside a git work tree: ${cwd}`);
+  if (vcsName !== 'svn') {
+    const insideRepo = gitRead('rev-parse --is-inside-work-tree', cwd, 'git repo check');
+    if (insideRepo !== 'true') throw new Error(`--cwd is not inside a git work tree: ${cwd}`);
+  }
 
   // Pre-dispatch dirty SNAPSHOT (refuse→snapshot, M013 S01): the adapter no longer
   // refuses on a pre-existing dirty tree (auto_commit:false leaves prior work uncommitted).
@@ -1571,8 +1563,8 @@ async function runExecute(opts) {
   // This snapshot is AUDIT ONLY — exposed as `pre_dirty` in the result JSON for the
   // orchestrator to cross-check. The AUTHORITATIVE snapshot that drives the post-failure
   // surgical reset lives in the orchestrator's state file (T03/T04); the adapter NEVER resets.
-  const preDirty = captureSnapshot(cwd);
-  const preDirtyAll = captureDirtySnapshot(cwd);
+  const preDirty = captureSnapshot(cwd, vcsName);
+  const preDirtyAll = captureDirtySnapshot(cwd, vcsName);
 
   let securityText = '';
   let contextText = '';
@@ -1583,7 +1575,16 @@ async function runExecute(opts) {
   if (contextText.trim()) contextText = truncateAtSectionBoundary(contextText, CONTEXT_BUDGET_CHARS);
   else contextText = '';
 
-  const startSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
+  let startSha;
+  if (vcsName === 'svn') {
+    const baseline = vcs.baselineId(cwd, { ...VCS_OPTS, vcs: 'svn' });
+    if (!baseline.ok) throw new Error(baseline.error);
+    const parsedBaseline = parseSvnBaseline(baseline.id);
+    if (!parsedBaseline.ok) throw new Error(parsedBaseline.error);
+    startSha = parsedBaseline.range;
+  } else {
+    startSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
+  }
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const prompt = buildExecutePrompt(planText, { securityText, contextText });
@@ -1649,16 +1650,28 @@ async function runExecute(opts) {
   });
 
   // No-commit invariant: codex must not have moved HEAD.
-  const headSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD (post-run)');
-  if (headSha !== startSha) {
-    throw new Error('codex moved HEAD (committed) — no-commit invariant violated');
+  let headSha;
+  if (vcsName === 'svn') {
+    const baseline = vcs.baselineId(cwd, { ...VCS_OPTS, vcs: 'svn' });
+    if (!baseline.ok) throw new Error(baseline.error);
+    const parsedBaseline = parseSvnBaseline(baseline.id);
+    if (!parsedBaseline.ok) throw new Error(parsedBaseline.error);
+    headSha = parsedBaseline.range;
+    if (headSha !== startSha) {
+      throw new Error('svn-revision-moved: working copy revision moved during dispatch (' + startSha + ' -> ' + headSha + ') — no-commit/no-update invariant violated');
+    }
+  } else {
+    headSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD (post-run)');
+    if (headSha !== startSha) {
+      throw new Error('codex moved HEAD (committed) — no-commit invariant violated');
+    }
   }
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error('no parseable JSON block found in codex output');
   if (!validateExecuteResult(parsed)) throw new Error('codex output failed execute-result validation');
 
-  const derived = deriveFilesChanged(cwd, preDirtyAll, startSha);
+  const derived = deriveFilesChanged(cwd, preDirtyAll, startSha, vcsName);
   // Protected metadata is outside the surgical reset set. A sidecar-owned `.gsd`
   // delta is therefore a hard terminal failure, never an advisory warning/success.
   assertNoProtectedSidecarChanges(derived);
@@ -1674,6 +1687,7 @@ async function runExecute(opts) {
     pre_dirty: preDirty,
     start_sha: startSha,
     head_sha: headSha,
+    ...(vcsName === 'svn' ? { vcs: 'svn' } : {}),
     started_at: startedAt,
     finished_at: finishedAt,
     duration_secs: Math.round((Date.now() - startedMs) / 1000),
@@ -1714,6 +1728,7 @@ async function runExecute(opts) {
  */
 async function runPlan(opts) {
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
+  const vcsName = vcs.detectVcs(cwd) === 'svn' ? 'svn' : 'git';
   const timeoutSecs = opts.timeoutSecs || DEFAULT_EXECUTE_TIMEOUT_SECS;
   const dispatchId = normalizeDispatchId(opts.dispatchId, 'plan');
 
@@ -1731,8 +1746,10 @@ async function runPlan(opts) {
   if (!contextText.trim()) throw new Error('--plan-context file is empty');
 
   // Guard: cwd must be a git work tree (read-only check).
-  const insideRepo = gitRead('rev-parse --is-inside-work-tree', cwd, 'git repo check');
-  if (insideRepo !== 'true') throw new Error(`--cwd is not inside a git work tree: ${cwd}`);
+  if (vcsName !== 'svn') {
+    const insideRepo = gitRead('rev-parse --is-inside-work-tree', cwd, 'git repo check');
+    if (insideRepo !== 'true') throw new Error(`--cwd is not inside a git work tree: ${cwd}`);
+  }
 
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
@@ -1974,7 +1991,13 @@ if (require.main === module) {
           try {
             let startSha;
             try {
-              startSha = execSync('git rev-parse HEAD', { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER }).trim();
+              if (vcs.detectVcs(cwd) === 'svn') {
+                const baseline = vcs.baselineId(cwd, { vcs: 'svn' });
+                const parsedBaseline = baseline.ok ? parseSvnBaseline(baseline.id) : null;
+                if (parsedBaseline && parsedBaseline.ok) startSha = parsedBaseline.range;
+              } else {
+                startSha = execSync('git rev-parse HEAD', { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER }).trim();
+              }
             } catch { /* no repo / detached — omit */ }
             writeJsonAtomic(safeResultFile, {
               status: 'adapter-failed',

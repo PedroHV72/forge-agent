@@ -68,12 +68,44 @@ function allIgnorePaths() {
 }
 
 // ── detectVcs ─────────────────────────────────────────────────────────────────
-// Checks cwd only — does NOT walk up to parent dirs.
-// Layer-1 operates at the repo root where .gsd/ lives.
+// Checks cwd first, then asks SVN for the working-copy root when cwd is below it.
+// Layer-1 normally operates at the repo root where .gsd/ lives.
+// Root-anchored probe: since SVN 1.7 only the WC ROOT carries .svn, so a
+// CODE_DIR pointing at a subdirectory reads as 'none' without this.
+function svnWcRoot(dir) {
+  try {
+    const out = _execFileSync('svn',
+      ['info', '--show-item', 'wc-root', '--non-interactive', dir],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const root = String(out || '').trim();
+    return root || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Pure filesystem walk-up: does any ancestor directory contain a .svn dir?
+// Since SVN 1.7, .svn only exists at the WC root, so "inside a WC" is
+// exactly "some ancestor has .svn". Zero-cost compared to spawning svn,
+// and lets us skip the spawn entirely in the common (no-VCS) hot path.
+function hasAncestorSvn(dir) {
+  let p = path.resolve(dir);
+  for (;;) {
+    if (fs.existsSync(path.join(p, '.svn'))) return true;
+    const parent = path.dirname(p);
+    if (parent === p) return false;
+    p = parent;
+  }
+}
+
 function detectVcs(cwd) {
   const dir = cwd || process.cwd();
   if (fs.existsSync(path.join(dir, '.git'))) return 'git';
   if (fs.existsSync(path.join(dir, '.svn'))) return 'svn';
+  // Keep both fast-paths: root behavior stays byte-identical and git avoids svn spawn.
+  // Only probe svn (spawn) when a pure filesystem walk-up finds a candidate
+  // ancestor .svn — avoids spawning svn for the common no-VCS case.
+  if (hasAncestorSvn(dir) && svnWcRoot(dir)) return 'svn';
   return 'none';
 }
 

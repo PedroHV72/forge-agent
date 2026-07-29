@@ -54,6 +54,7 @@ Semantics for workers:
 - **`branch`** — `CODE_DIR == WORKING_DIR`. The orchestrator already checked out `BRANCH`; commit on it and never switch back to the default branch mid-unit.
 - **`worktree`** — `CODE_DIR` is a physical worktree (e.g. `.forge-worktrees/{run-id}/{repo}/`). Use `CODE_DIR` for every source file path and run git with `git -C "{CODE_DIR}" …`. `.gsd/**` reads/writes (plans, summaries, events) keep using `WORKING_DIR` paths — the GSD state never moves into the worktree.
 - **Borrowed `worktree`** (`/forge-task --attach`) — `CODE_DIR` belongs to the lender run and `BRANCH` is the lender's branch. Workers commit there normally; the borrower cleanup never removes the borrowed tree.
+- **SVN working copy (Phase 1)** — activation detects `svn` before `require_worktree` elevation. It does not attempt branch/worktree setup and does not STOP on an all-repositories setup failure; it runs `shared` with an `elevation_reason` naming SVN. SVN isolation is Phase 2 and out of scope.
 - Header absent → `shared` mode; nothing changes.
 - When the header is present with `ISOLATION: worktree`, commands in the templates that take `--cwd "{WORKING_DIR}"` for **code verification/build** (e.g. `forge-verify.js`) run with `--cwd "{CODE_DIR}"` instead; `--plan`/artifact paths under `.gsd/**` keep `{WORKING_DIR}`. `forge-verifier.js` is the exception: it needs both `--cwd {WORKING_DIR}` for plans and artifacts and `--code-dir {CODE_DIR}` for code/import verification.
 
@@ -790,11 +791,12 @@ Each dispatch event is a single newline-terminated JSON object appended to `.gsd
 | `status` | `"done" \| "error"` | call outcome; absent means legacy success | `"done"` |
 | `unit` | string | `${unitType}/${unitId}` | `"execute-task/T03"` |
 | `model` | string | PREFS routing | `"claude-sonnet-5"` |
+| `vcs` | string | `detectVcs(CODE_DIR)` | `"git"` |
 | `input_tokens` | integer | `countTokens(finalPrompt)` | `12345` |
 | `output_tokens` | integer | SDK usage or `countTokens(text)` | `3421` |
 | `token_method` | string | counting method; currently `heuristic-chars-4` | `"heuristic-chars-4"` |
 
-Routing adds `tier`, `reason`, `engine`, `domain`, `route_source`, `chain_len`, `effort`, and `effort_reason` fields additively. Implementors must treat the schema as open for extension.
+Routing adds `tier`, `reason`, `engine`, `domain`, `route_source`, `chain_len`, `effort`, and `effort_reason` fields additively; `vcs` is likewise additive. Implementors must treat the schema as open for extension: old readers ignore unknown fields and no existing field is renamed, retyped, or removed.
 
 Do NOT include: raw prompt text, worker output, file paths, exception messages, or any PII.
 
@@ -819,7 +821,7 @@ Worker returns approximately 1 200 characters of output. Token estimate: `countT
 Event appended to `.gsd/forge/events.jsonl`:
 
 ```json
-{"ts":"2026-04-16T10:00:05Z","event":"dispatch","dispatch_id":"execute-task-T03-a91c4e-a1","prompt_id":"execute-task-T03-a91c4e","attempt":1,"status":"done","unit":"execute-task/T03","model":"claude-sonnet-5","input_tokens":2000,"output_tokens":300,"token_method":"heuristic-chars-4"}
+{"ts":"2026-04-16T10:00:05Z","event":"dispatch","dispatch_id":"execute-task-T03-a91c4e-a1","prompt_id":"execute-task-T03-a91c4e","attempt":1,"status":"done","unit":"execute-task/T03","model":"claude-sonnet-5","input_tokens":2000,"output_tokens":300,"token_method":"heuristic-chars-4","vcs":"git"}
 ```
 
 #### Budgeted Section Injection
@@ -1019,7 +1021,7 @@ When the dispatched chain member resolves to `engine == codex` **and** the unit 
 
 **0. Increment the sidecar attempt counter (`SIDECAR_ATTEMPT`).** Before dispatching *any* sidecar for this unit, increment a per-unit counter `SIDECAR_ATTEMPT` (starts at 1 for the first sidecar dispatch of the unit). It is hard-capped by the number of `engine == codex` members in the resolved chain (≤3, S01 cap). Exceeding the cap → abort the chain to the Claude fallback (`reason: sidecar-cap-exceeded`). The counter is persisted in the per-attempt state file (below) so it survives an auto-compact mid-unit.
 
-**0.5. Resolve the ONE `CODE_DIR` (multi-repo precondition).** **The sidecar assumes ONE `CODE_DIR` that is a git repository** — `--state-init`, the `START_SHA` capture, the post-run diff and the surgical reset all take a single `--cwd`. A workspace with N repos therefore resolves to the single repo the unit's **declared** paths touch, or the sidecar **refuses**; it never picks `repos[0]` blindly, and never points a helper at the non-git `.forge-worktrees/{RUN_ID}/` root. Resolution is delegated to `scripts/forge-code-dir.js --resolve`, fed with the isolation result the orchestrator already holds (`$ISO_RESULT`) plus the unit's plan — a pure function, no git calls:
+**0.5. Resolve the ONE `CODE_DIR` (multi-repo precondition).** **The sidecar assumes ONE `CODE_DIR` that is a working copy of ONE supported VCS (git or svn)** — `--state-init`, the `START_SHA` capture, the post-run diff and the surgical reset all take a single `--cwd`. A workspace with N repos therefore resolves to the single repo the unit's **declared** paths touch, or the sidecar **refuses**; it never picks `repos[0]` blindly, and never points a helper at the non-git `.forge-worktrees/{RUN_ID}/` root. Resolution is delegated to `scripts/forge-code-dir.js --resolve`, fed with the isolation result the orchestrator already holds (`$ISO_RESULT`) plus the unit's plan — a pure function, no git calls:
 
 ```bash
 # Per-unit CODE_DIR resolution — runs where $PLAN_PATH is already known, before the engine branch.
@@ -1175,7 +1177,28 @@ Before the success/failure boundary, a valid result with `status:"partial"` runs
 
 **`status:"done"` with unmet environment-scope entries (M016 S01 review R1).** The same checker ALSO runs when `status:"done"` and `must_haves_status` still carries unmet entries — a worker is instructed to return `done` once only `scope:"environment"` items remain, and that label is never trusted at face value. Run the identical `forge-env-promote.js` invocation; the checker returns `verdict:"done-with-verified-env"` (every unmet entry corroborates) or `verdict:"done-with-unverified-env"` (at least one `rejected` entry). Only `done-with-verified-env` is accepted as success — write `## Env Constraints` exactly as above. `done-with-unverified-env` is **never** a silent accept: the orchestrator treats the result as `partial` and follows the existing failure path (classifier → repair strategy), discarding the worker's `done` label.
 
-On `status: done` with exit 0 (including that promoted `partial`), the orchestrator reads the JSON and **builds** both `T##-SUMMARY.md` and the `---GSD-WORKER-RESULT---` block itself. **Codex NEVER touches `.gsd/**` and NEVER commits** (locked) — `git log` is unchanged and no `.gsd/**` path appears in `git -C "$CODE_DIR" diff --name-status $START_SHA`. JSON fields consumed:
+#### DISPATCH_VCS prelude (canonical — VCS-agnostic)
+
+This one-liner lives here and nowhere else; mirrors reference this section by name and never replicate the command. Every `dispatch` event emitter resolves the `vcs` field for its telemetry line with:
+
+```bash
+DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
+```
+
+`--field vcs` makes `forge-vcs.js --detect` print the raw value instead of the JSON envelope, so the mirror line is a single command with no inline JSON parsing. On any failure (missing script, non-zero exit, empty stdout) the `|| echo "git"` fallback keeps the telemetry field populated with the safe git default rather than emitting nothing.
+
+#### Post-run change set + baseline (canonical — VCS-agnostic)
+
+This command lives here and nowhere else; mirrors reference this section by name and never replicate the command. Capture the VCS baseline before the run and derive post-run synthesized evidence with:
+
+```bash
+START_SHA=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --baseline --cwd "$CODE_DIR")
+node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --changes --cwd "$CODE_DIR" --since "$START_SHA"
+```
+
+`CODE_DIR` can be a SVN working copy (M017), where a raw git-only delta aborts. The helper prints ordered `X\tpath` entries (`A`, `M`, or `D`); exit 0 with empty stdout means no change, while non-zero means a real failure. It is the source only of synthesized **advisory** evidence and the invariant that no `.gsd/**` path appears in that delta. It is never the source of `files_changed`: that field remains authoritative from the adapter result JSON (S05), so truncated or missing advisory output cannot mean “nothing changed”. The helper keeps explicit `maxBuffer` limits and accepts cwd/revision only as argv, never shell text.
+
+On `status: done` with exit 0 (including that promoted `partial`), the orchestrator reads the JSON and **builds** both `T##-SUMMARY.md` and the `---GSD-WORKER-RESULT---` block itself. **Codex NEVER touches `.gsd/**` and NEVER commits** (locked) — `git log` is unchanged and no `.gsd/**` path appears in the canonical post-run change set above. JSON fields consumed:
 
 | JSON field | Use |
 |------------|-----|
@@ -1183,7 +1206,7 @@ On `status: done` with exit 0 (including that promoted `partial`), the orchestra
 | `summary` | one-liner + narrative seed for `T##-SUMMARY.md` |
 | `must_haves_status` | carried into the returned `---GSD-WORKER-RESULT---` (`must_haves_status`) |
 | `env_constraints` | orchestrator-synthesized audit field for promoted environment-only partials; never re-injected as dropped work |
-| `files_changed` | **primary source of the file-audit** — git-derived (`git diff --name-status $START_SHA` in `$CODE_DIR`), so it can never under-report (codex omitting a self-reported path) nor carry a path-traversal payload (it only ever lists paths git itself touched) |
+| `files_changed` | **primary source of the file-audit** — VCS-derived in the adapter result JSON, so it can never under-report (codex omitting a self-reported path) nor carry a path-traversal payload (it only ever lists paths the VCS itself touched) |
 | `files_changed_declared` | **advisory cross-check only** (M013 S01 T03) — file-granular codex self-report, logged alongside `files_changed`; a divergence between the two is a `warning`, never a reset target and never grounds to trust the declared list over git's own diff |
 | `start_sha` / `head_sha` | audit trail; the orchestrator's own `$START_SHA` is authoritative for the reset |
 | `dispatch_id` | globally unique model-call ID, identical to the heartbeat/state value |
@@ -1191,7 +1214,7 @@ On `status: done` with exit 0 (including that promoted `partial`), the orchestra
 
 After assembling the SUMMARY + result block, control **rejoins the normal Process-result path** exactly as if a Claude `forge-executor` had returned — downstream verification (must_haves, verifier, file-audit, review dialético) runs **byte-identical** on codex-authored code. Nothing downstream changes.
 
-**7. Synthesized evidence (advisory).** Because the PostToolUse hook only logs the orchestrator's own tool calls — not the detached codex process — append synthesized evidence lines to `.gsd/forge/evidence-{unitId}.jsonl` derived read-only from `git -C "$CODE_DIR" diff --name-status $START_SHA`, tagged `source: codex-sidecar`. This is a **documented gap**, advisory only — it never blocks.
+**7. Synthesized evidence (advisory).** Because the PostToolUse hook only logs the orchestrator's own tool calls — not the detached codex process — append synthesized evidence lines to `.gsd/forge/evidence-{unitId}.jsonl` from the named canonical post-run change set above, tagged `source: codex-sidecar`. This is a **documented gap**, advisory only — it never blocks.
 
 #### Sidecar dispatch state machine — Branch D (`dispatch_engine == codex && UNIT_TYPE == plan-slice`)
 
@@ -1347,7 +1370,7 @@ Triggers (`reason` value):
 | `codex-orphan` | heartbeat `updated_at` stale beyond the dynamic threshold (`max(heartbeat_interval_ms × 4, 30s)`, per Branch C step 5's canonical orphan detection) **and** the liveness probe/grace expired (probe → dead, or a second consecutive `stale-alive`) → killed. **Always terminal** (an orphaned/hung process is never retried in place) → skips § Layer-1, fires this trigger directly. | both |
 | `surgical-reset-overlap` | `forge-surgical-reset.js --reset` exit 3 — a pre-dirty path's current hash diverged from its snapshot hash (the sidecar ALSO wrote a pre-existing dirty file); **NOTHING was reset**, not even the non-overlapped paths | execute-task only (Branch C) |
 | `verified-reset-failed` | `forge-surgical-reset.js --reset` exit 2 — post-reset verification found a leftover change that isn't an intact pre-dirty path | execute-task only (Branch C) |
-| `sidecar-state-init-failed` | `forge-surgical-reset.js --state-init` precondition failure (e.g. not a git repo, permission denied) — no reset needed, nothing was captured | both |
+| `sidecar-state-init-failed` | `forge-surgical-reset.js --state-init` precondition failure (e.g. no supported VCS at `--cwd`, permission denied) — no reset needed, nothing was captured; a SVN working copy is **not** a cause since M017 because `--state-init` works there | both |
 | `sidecar-multirepo-unsupported` | the unit's declared paths span >= 2 repos in a multi-repo workspace — the sidecar has no single valid `CODE_DIR`/`START_SHA`/reset scope. A **declared precondition**, refused before any `--cwd` is handed to a helper — not an accidental failure | both |
 | `sidecar-code-dir-undeclared` | multi-repo workspace and the plan declares zero attributable paths (`writes:`/`expected_output:`/`## Files to Change` all empty or unmatched) — a planner gap, correctable, deliberately a distinct signal from the row above | both |
 | `codex-exit-nonzero` (`.gsd/**` variant) | a **new** delta under `.gsd/**` in the sidecar's post-run diff — `assertNoProtectedSidecarChanges` throws `"codex touched protected .gsd/**: <paths>"` (adapter exit 2). This is **terminal, never advisory**: Materialization is orchestrator-only (`codex never touches .gsd/**`, see Branch D result schema note below) and the sidecar is not exempt on Branch C either. A path that was already dirty under `.gsd/**` **before** dispatch is exempt (pre-dirty snapshot, Branch C step 1) — only new sidecar-owned `.gsd/**` writes trip this. The violated paths are named in `reason` for human triage. | execute-task only (Branch C) |

@@ -28,6 +28,7 @@ const fs   = require('fs');
 const path = require('path');
 const { execSync, spawnSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
+const { detectVcs } = require('./forge-vcs.js');
 
 const repos = require('./forge-repos.js');
 const runs = require('./forge-runs.js');
@@ -179,7 +180,7 @@ function detectExternalWriteEngine(cwd) {
 
 // Resolves the EFFECTIVE isolation mode for a run, applying require_worktree
 // elevation once at activation. Returns
-//   { mode, user_mode, require_worktree, elevated, elevation_reason, write_engine }
+//   { mode, user_mode, require_worktree, elevated, elevation_reason, write_engine, vcs }
 // Invariants: `false` never elevates (byte-identical); a `worktree` user mode is
 // a no-op; `true` always yields `worktree` from shared/branch; `auto` elevates
 // only from `shared` when a write-engine is detected.
@@ -187,7 +188,23 @@ function resolveEffectiveMode(cwd) {
   const iso = readIsolationPrefs(cwd);
   const userMode = iso.mode;
   const req = resolveRequireWorktree(cwd);
-  const base = { mode: userMode, user_mode: userMode, require_worktree: req, elevated: false, elevation_reason: null, write_engine: null };
+  // VCS detection is advisory here: an error or an unrecognised location keeps
+  // the historical git-oriented path rather than weakening isolation broadly.
+  let vcs = 'none';
+  try { vcs = detectVcs(cwd); } catch { vcs = 'none'; }
+  const base = { mode: userMode, user_mode: userMode, require_worktree: req, elevated: false, elevation_reason: null, write_engine: null, vcs };
+
+  // SVN has no worktree or branch equivalent in Phase 1. This must precede
+  // every elevation branch, including an explicit worktree user preference:
+  // a named shared degradation is safer than attempting git setup and STOPing.
+  if (vcs === 'svn') {
+    return {
+      ...base,
+      mode: 'shared',
+      elevated: false,
+      elevation_reason: 'vcs:svn — worktree/branch isolation unsupported in SVN (M017 Fase 1 runs shared)',
+    };
+  }
 
   if (req === 'false') return base;            // never elevate — invariant
   if (userMode === 'worktree') return base;    // already isolated — no-op
@@ -428,7 +445,7 @@ function setupForRun(cwd, runId, opts) {
   const prefs = readIsolationPrefs(cwd);
   const eff = resolveEffectiveMode(cwd);   // may elevate shared→worktree at activation
   const mode = eff.mode;
-  const result = { mode, user_mode: eff.user_mode, elevated: eff.elevated, elevation_reason: eff.elevation_reason, repos: [] };
+  const result = { mode, user_mode: eff.user_mode, elevated: eff.elevated, elevation_reason: eff.elevation_reason, vcs: eff.vcs, repos: [] };
 
   if (mode === 'shared') return result;  // no-op
 
@@ -473,6 +490,7 @@ function resolveCleanupMode(cwd, runId) {
     user_mode: eff.user_mode,
     elevated: eff.elevated,
     elevation_reason: eff.elevation_reason,
+    vcs: eff.vcs,
   };
 }
 
@@ -490,6 +508,7 @@ function cleanupForRun(cwd, runId, opts) {
       user_mode: null,
       elevated: null,
       elevation_reason: null,
+      vcs: (() => { try { return detectVcs(cwd); } catch { return 'none'; } })(),
       repos: (rec.worktrees || []).map(e => ({
         path: e.repo,
         worktree: e.path,
@@ -525,6 +544,7 @@ function cleanupForRun(cwd, runId, opts) {
     user_mode: cm.user_mode === undefined ? null : cm.user_mode,
     elevated: cm.elevated === undefined ? null : cm.elevated,
     elevation_reason: cm.elevation_reason === undefined ? null : cm.elevation_reason,
+    vcs: cm.vcs === undefined ? (() => { try { return detectVcs(cwd); } catch { return 'none'; } })() : cm.vcs,
     repos: [],
   };
 
@@ -591,11 +611,11 @@ Flags:
   --cleanup --run <id>   cleanup (checkout main / remove worktree)
   --attach <lender> --run <id>  validate and borrow a registered worktree (never creates one)
   --prefs                print resolved forge_isolation prefs
-  --effective-mode       print resolveEffectiveMode JSON (git-free; shows require_worktree elevation)
+  --effective-mode       print resolveEffectiveMode JSON (shows require_worktree elevation and SVN shared short-circuit)
   --cwd <path>           override working directory
 
 Reads prefs from forge_isolation: + workers.require_worktree (cascade user → repo → local).
---setup/--cleanup JSON carry elevated/elevation_reason/user_mode.
+--setup/--cleanup JSON carry elevated/elevation_reason/user_mode/vcs.
 `);
     return;
   }

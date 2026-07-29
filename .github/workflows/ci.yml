@@ -28,6 +28,10 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Subversion (smoke fixture gate)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y subversion
+
       - name: Run test suites
         run: node scripts/run-tests.js
 

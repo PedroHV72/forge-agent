@@ -22,7 +22,9 @@
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
+const crypto = require('crypto');
 const { spawnSync, execFileSync } = require('child_process');
+const forgeIgnore = require('./forge-ignore');
 
 const SCRIPTS = __dirname;
 const KEEP = process.argv.includes('--keep');
@@ -39,13 +41,20 @@ function readRepoText(p) {
 
 let passes = 0;
 let fails = 0;
+let skips = 0;
 const failures = [];
+const skipped = [];
 
 function pass(name) { passes++; process.stdout.write(`  ✓ ${name}\n`); }
 function fail(name, detail) {
   fails++;
   failures.push({ name, detail });
   process.stdout.write(`  ✗ ${name}\n    ${detail}\n`);
+}
+function skip(name, reason) {
+  skips++;
+  skipped.push({ name, reason });
+  process.stdout.write(`  ⊘ ${name} — ${reason}\n`);
 }
 
 function assert(cond, name, detail) {
@@ -116,6 +125,55 @@ function cleanup(dir) {
     return;
   }
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+}
+
+function hasSvn() {
+  try {
+    const r = spawnSync('svn', ['--version', '--quiet'], { encoding: 'utf8' });
+    return r.status === 0 && (r.stdout || '').trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function hasSvnversion() {
+  try {
+    const r = spawnSync('svnversion', ['--version'], { encoding: 'utf8' });
+    return r.status === 0 && ((r.stdout || '') + (r.stderr || '')).trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function svnGateDecision(env, platform, present) {
+  if (present) return 'run';
+  return env.CI && platform === 'linux' ? 'fail' : 'skip';
+}
+
+// Shared by Sections 76 and 78.  Keep every client invocation argv-based and
+// fixture-configured so a developer's global ignores cannot change a proof.
+function svnq(cwd, args, configDir) {
+  const r = spawnSync('svn', ['--non-interactive', '--config-dir', configDir, ...args],
+    { cwd, encoding: 'utf8' });
+  return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+}
+
+function initSvnRepo(label) {
+  const dir = mkTmp(label);
+  const repo = path.join(dir, 'repo');
+  const wc = path.join(dir, 'wc');
+  const configDir = path.join(dir, 'svnconfig');
+  fs.mkdirSync(configDir, { recursive: true });
+  // svnadmin has no --non-interactive option; it is non-interactive by design.
+  const created = spawnSync('svnadmin',
+    ['--config-dir', configDir, 'create', repo], { encoding: 'utf8' });
+  assert(created.status === 0, '(a) svnadmin creates a repository',
+    JSON.stringify({ status: created.status, stderr: created.stderr || '' }));
+  const checkedOut = svnq(dir, ['checkout', require('url').pathToFileURL(repo).href, wc], configDir);
+  assert(checkedOut.status === 0, '(a) svn checkout creates the working copy',
+    JSON.stringify(checkedOut));
+  if (created.status !== 0 || checkedOut.status !== 0) { cleanup(dir); return null; }
+  return { dir, repo, wc, configDir };
 }
 
 // ── Hermetic HOME override (MEM032) ─────────────────────────────────────────
@@ -1671,6 +1729,7 @@ function writeMockCodex(dir, opts) {
     '# forge-smoke mock codex — writes payload to the -o file, honors exit code / sleep',
     'OUT=""',
     'CODEXCWD=""',
+    'HAS_SKIP_GIT_REPO_CHECK=0',
     // FORGE_PROMPTLEN_FILE is intentionally NOT initialized here — it comes from the
     // environment (set by the large-prompt smoke scenario) so the mock can record
     // the stdin-received prompt length. Clobbering it to "" would disable the assert.
@@ -1678,8 +1737,15 @@ function writeMockCodex(dir, opts) {
     'for arg in "$@"; do',
     '  if [ "$prev" = "-o" ]; then OUT="$arg"; fi',
     '  if [ "$prev" = "-C" ]; then CODEXCWD="$arg"; fi',
+    '  if [ "$arg" = "--skip-git-repo-check" ]; then HAS_SKIP_GIT_REPO_CHECK=1; fi',
     '  prev="$arg"',
     'done',
+    // The SVN adapter must explicitly opt out of Codex's Git-repository trust
+    // check.  Keep this opt-in so the default mock script is byte-identical for
+    // its established callers.
+    opts.checkContract
+      ? 'if [ "$HAS_SKIP_GIT_REPO_CHECK" -ne 1 ]; then echo "mock: no --skip-git-repo-check" >&2; exit 1; fi'
+      : '',
     // New transport: the prompt arrives on stdin (`codex exec -`), NOT argv. Drain
     // it fully — this both exercises the stdin pipe/EOF contract and lets callers
     // that set FORGE_PROMPTLEN_FILE assert the received byte length (large-prompt test).
@@ -3369,6 +3435,160 @@ async function smokeXllmPlan() {
     cleanup(resultDir);
     cleanup(mockDir);
   }
+}
+
+// ── Section 80: forge-xllm SVN execute/plan — behavioral wall proof ────────
+// A real file:// SVN repository proves the adapter's non-Git branch.  The git
+// shim is intentionally executable: source scans cannot prove that a future
+// helper will not accidentally route an SVN dispatch through git.
+function smokeXllmSvn() {
+  process.stdout.write('\n▸ Section 80: forge-xllm SVN execute/plan + absence guard\n');
+  const decision = svnGateDecision(process.env, process.platform, hasSvn() && hasSvnversion());
+  if (decision === 'fail') {
+    fail('Section 80: svn, svnadmin ou svnversion ausente no runner que deve gatear',
+      'ci.yml instala subversion no runner Linux — ausência aqui é falso-verde, não skip');
+    return;
+  }
+  if (decision === 'skip') {
+    skip('Section 80: forge-xllm SVN', 'svn, svnadmin e svnversion devem estar no PATH');
+    return;
+  }
+
+  const executePayload = JSON.stringify({
+    status: 'done', summary: 'SVN execute completed',
+    must_haves_status: [{ item: 'SVN fixture', status: 'met', note: 'ok', scope: 'task', reason: '' }],
+    files_changed: ['sidecar-file.txt'],
+  });
+  const taskPlan = [
+    '---', 'id: T01', 'slice: S99', 'milestone: M999', 'must_haves:',
+    '  truths:', '    - "the thing works"', '  artifacts:', '    - path: "src/thing.js"',
+    '      provides: "the thing"', '      min_lines: 5', '  key_links:',
+    '    - from: "src/thing.js"', '      to: "src/other.js"', '      via: "import"',
+    'expected_output:', '  - src/thing.js', '---', '', '# T01: fixture', '', '## Steps', '1. do it.', '',
+  ].join('\n');
+  const planPayload = JSON.stringify({
+    status: 'done', summary: 'SVN plan completed',
+    slice_plan: { filename: 'S99-PLAN.md', content: '# S99\n' },
+    task_plans: [{ id: 'T01', filename: 'T01-PLAN.md', content: taskPlan }],
+  });
+  const readJson = (file) => {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+  };
+  const svnRange = (cwd) => {
+    const r = spawnSync('svnversion', [], { cwd, encoding: 'utf8' });
+    return r.status === 0 ? (r.stdout || '').trim() : '';
+  };
+
+  // Anti-inert pair: the mock itself rejects a missing contract flag before it
+  // writes -o, then accepts the real flag.  This makes its use in (a)-(e)
+  // meaningful instead of a decorative option.
+  {
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-svn-contract-'));
+    const output = path.join(mockDir, 'out.json');
+    try {
+      writeMockCodex(mockDir, { checkContract: true, payload: executePayload });
+      const absent = spawnSync(path.join(mockDir, 'codex'), ['exec', '-o', output, '-'], { encoding: 'utf8', input: '' });
+      assert(absent.status !== 0 && !fs.existsSync(output),
+        '(a) checkContract rejects missing --skip-git-repo-check before -o write',
+        JSON.stringify({ status: absent.status, stderr: absent.stderr || '', exists: fs.existsSync(output) }));
+      const present = spawnSync(path.join(mockDir, 'codex'), ['exec', '--skip-git-repo-check', '-o', output, '-'], { encoding: 'utf8', input: '' });
+      assert(present.status === 0 && fs.existsSync(output),
+        '(a) checkContract accepts --skip-git-repo-check',
+        JSON.stringify({ status: present.status, stderr: present.stderr || '', exists: fs.existsSync(output) }));
+    } finally { cleanup(mockDir); }
+  }
+
+  const fixture = initSvnRepo('xllm-svn');
+  if (!fixture) return;
+  try {
+    fs.writeFileSync(path.join(fixture.wc, 'seed.txt'), 'seed\n', 'utf8');
+    const added = svnq(fixture.wc, ['add', 'seed.txt'], fixture.configDir);
+    const committed = added.status === 0 && svnq(fixture.wc, ['commit', '-m', 'seed'], fixture.configDir);
+    const updated = committed && committed.status === 0 && svnq(fixture.wc, ['update'], fixture.configDir);
+    assert(added.status === 0 && committed && committed.status === 0 && updated && updated.status === 0,
+      '(a) SVN fixture is seeded and updated beyond r0', JSON.stringify({ added, committed, updated }));
+    if (added.status !== 0 || !committed || committed.status !== 0 || !updated || updated.status !== 0) return;
+
+    const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-svn-plan-'));
+    const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-svn-result-'));
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-svn-mock-'));
+    try {
+      const planFile = path.join(planDir, 'plan.md');
+      const contextFile = path.join(planDir, 'plan-context.md');
+      const executeResult = path.join(resultDir, 'execute.json');
+      const planResult = path.join(resultDir, 'plan.json');
+      const gitLog = path.join(resultDir, 'git.log');
+      fs.writeFileSync(planFile, '# T01\nexecute fixture\n', 'utf8');
+      fs.writeFileSync(contextFile, '# SVN context\nplan fixture\n', 'utf8');
+      writeMockCodex(mockDir, {
+        checkContract: true, payload: executePayload,
+        extraScript: `printf 'sidecar\\n' > "$CODEXCWD/sidecar-file.txt"`,
+      });
+      fs.writeFileSync(path.join(mockDir, 'git'), '#!/bin/sh\necho "$@" >> "$LOGFILE"\nexit 1\n', 'utf8');
+      fs.chmodSync(path.join(mockDir, 'git'), 0o755);
+
+      const startRange = svnRange(fixture.wc);
+      const execute = runXllm(['--mode', 'execute', '--plan', planFile, '--result-file', executeResult, '--cwd', fixture.wc],
+        mockDir, fixture.wc, { LOGFILE: gitLog });
+      const executeJson = readJson(executeResult);
+      assert(execute.status === 0 && executeJson && executeJson.status === 'done',
+        '(a) SVN execute completes exit 0 with the valid payload', JSON.stringify({ execute, executeJson }));
+      assert(executeJson && JSON.stringify(executeJson.files_changed) === JSON.stringify([{ status: 'A', path: 'sidecar-file.txt' }]),
+        '(a) SVN files_changed is exactly the real sidecar file', JSON.stringify(executeJson && executeJson.files_changed));
+      assert(executeJson && executeJson.start_sha === startRange && executeJson.head_sha === startRange
+        && executeJson.vcs === 'svn' && !/^[0-9a-f]{40}$/i.test(executeJson.start_sha),
+      '(a) SVN result carries the svnversion range and vcs=svn', JSON.stringify(executeJson));
+      assert(!fs.existsSync(gitLog) || fs.readFileSync(gitLog, 'utf8').trim() === '',
+        '(b) execute on SVN never invokes the PATH git shim', fs.existsSync(gitLog) ? fs.readFileSync(gitLog, 'utf8') : 'no log');
+
+      writeMockCodex(mockDir, { checkContract: true, payload: planPayload });
+      const plan = runXllm(['--mode', 'plan', '--plan-context', contextFile, '--result-file', planResult, '--cwd', fixture.wc],
+        mockDir, fixture.wc, { LOGFILE: gitLog });
+      const planJson = readJson(planResult);
+      assert(plan.status === 0 && planJson && planJson.status === 'done',
+        '(e) SVN plan completes exit 0 with the valid payload', JSON.stringify({ plan, planJson }));
+      assert(!fs.existsSync(gitLog) || fs.readFileSync(gitLog, 'utf8').trim() === '',
+        '(b) plan on SVN never invokes the PATH git shim', fs.existsSync(gitLog) ? fs.readFileSync(gitLog, 'utf8') : 'no log');
+
+      const movedResult = path.join(resultDir, 'moved.json');
+      writeMockCodex(mockDir, {
+        checkContract: true, payload: 'not-needed-after-revision-move',
+        extraScript: `printf 'changed\\n' > "$CODEXCWD/seed.txt"\nsvn --non-interactive --config-dir ${shQuote(fixture.configDir)} commit -m x "$CODEXCWD/seed.txt"`,
+      });
+      const moved = runXllm(['--mode', 'execute', '--plan', planFile, '--result-file', movedResult, '--cwd', fixture.wc], mockDir, fixture.wc);
+      const movedJson = readJson(movedResult);
+      assert(moved.status === 2 && movedJson && movedJson.status === 'adapter-failed'
+        && /svn-revision-moved/.test(movedJson.reason || ''),
+      '(c) SVN commit during dispatch trips svn-revision-moved', JSON.stringify({ moved, movedJson }));
+    } finally {
+      cleanup(planDir); cleanup(resultDir); cleanup(mockDir);
+    }
+  } finally { cleanup(fixture.dir); }
+
+  // A just-checked-out WC is r0.  The baseline wall must refuse it before the
+  // child is spawned, so the mock's extra-script marker remains absent.
+  const r0 = initSvnRepo('xllm-svn-r0');
+  if (!r0) return;
+  try {
+    const planDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-svn-r0-plan-'));
+    const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-svn-r0-result-'));
+    const mockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-xllm-svn-r0-mock-'));
+    const marker = path.join(resultDir, 'spawned.marker');
+    try {
+      const planFile = path.join(planDir, 'plan.md');
+      const resultFile = path.join(resultDir, 'result.json');
+      fs.writeFileSync(planFile, '# T01\nr0 fixture\n', 'utf8');
+      writeMockCodex(mockDir, { checkContract: true, payload: executePayload, extraScript: ': > "$FORGE_R0_MARKER"' });
+      const refused = runXllm(['--mode', 'execute', '--plan', planFile, '--result-file', resultFile, '--cwd', r0.wc],
+        mockDir, r0.wc, { FORGE_R0_MARKER: marker });
+      const refusedJson = readJson(resultFile);
+      assert(refused.status === 2 && /svn-baseline-zero-revision/.test(refused.stderr)
+        && refusedJson && /svn-baseline-zero-revision/.test(refusedJson.reason || '') && !fs.existsSync(marker),
+      '(d) r0 SVN WC refuses before spawning codex', JSON.stringify({ refused, refusedJson, markerExists: fs.existsSync(marker) }));
+    } finally { cleanup(planDir); cleanup(resultDir); cleanup(mockDir); }
+  } finally { cleanup(r0.dir); }
+
+  pass('(final) Section 80: SVN execute/plan, git absence, revision trip and r0 refusal verified');
 }
 
 // ── Section 24: forge-status CLI packaging ──────────────────────────────────
@@ -8821,7 +9041,7 @@ function smokeCodeDirMultiRepo() {
 
     // (h) contract note authored ONCE in the canonical spec (D13 formula-once).
     const spec = read('shared/forge-dispatch.md');
-    const note = 'The sidecar assumes ONE `CODE_DIR` that is a git repository';
+    const note = 'The sidecar assumes ONE `CODE_DIR` that is a working copy of ONE supported VCS (git or svn)';
     const noteCount = spec.split(note).length - 1;
     assert(noteCount === 1, `(h) shared/forge-dispatch.md carries the contract note exactly once (got ${noteCount})`);
 
@@ -9428,6 +9648,861 @@ function smokeDoctorPlanRepo() {
   pass('(final) Section 75: the refusal explains itself and the doctor lists every affected plan');
 }
 
+// ── Section 76: real SVN fixture + counted skip ────────────────────────────
+// This section intentionally exercises the VCS detector through the same
+// fixture that proves SVN 1.7's root-only metadata layout.  The checkout root
+// has .svn, while the committed child directory does not.  Keeping both calls
+// next to the filesystem assertions makes the boundary visible: root detection
+// is the compatibility fast-path and child detection is the wc-root probe.
+// The corresponding test suite stubs the probe so this behavioral contract is
+// also covered on hosts where the svn executable is unavailable (notably CI on
+// Windows).  The real fixture remains gated by hasSvn(), preserving the smoke
+// runner's counted-skip contract instead of silently dropping coverage.
+//
+// T02 counterfactual record: commenting out the single `svnWcRoot(dir)` branch
+// makes the child assertion below fail with `none`; restoring that branch makes
+// the assertion pass with `svn`.  This is stronger than checking only source
+// text because the fixture is a real repository and the child is versioned.
+// The git and no-VCS calls are deliberately included in the same cleanup scope
+// to guard the unchanged return values and the git fast-path's no-spawn rule.
+// No KEEP-dependent state is used by these detector assertions: every temporary
+// directory belongs to this invocation and is removed in the local finally
+// blocks.  The SVN config directory is likewise fixture-local and hermetic.
+// Keeping the assertions behavioral also protects consumers of detectVcs:
+// applyIgnore and validateIgnore inherit the same root-aware classification.
+// A failed svn info probe is intentionally not surfaced as an exception here:
+// missing binaries, permissions, and non-working-copy paths all mean `none`.
+// The probe output is treated as a path, never as a localized diagnostic.
+// These notes document why the fixture uses `--show-item wc-root` explicitly.
+// They are part of the Section 76 acceptance record and should remain with it.
+// The workflow assertion deliberately reads the checked-in file used by CI.
+// This keeps the smoke contract coupled to the runner setup that guarantees svn.
+// The exact occurrence count prevents a prose-only mention from satisfying it.
+// The ordering check models the executable sequence, not merely document presence.
+// The Linux condition protects local macOS and Windows development environments.
+// The extracted decision test makes the enforced branch independently replayable.
+// Its collaborators are plain values, so no platform mutation is required.
+// A CI Linux runner with no binary is therefore a counted failure.
+// A local machine with no binary remains a counted skip for developer ergonomics.
+// A present binary takes the fixture path and exercises the real detector.
+// These three outcomes are intentionally mutually exclusive.
+// Keeping the gate before fixture setup also makes missing-tool behavior immediate.
+// The workflow installation remains the source of truth for Linux availability.
+// The smoke assertion protects that source of truth from accidental removal.
+// Changes to the workflow must preserve both the install step and its position.
+// This section does not infer availability from runner labels alone.
+// It probes the executable and then applies the environment-specific policy.
+// The result is binary for enforcement while retaining local skip accounting.
+// Section 76's real fixture assertions remain unchanged after the gate.
+// The acceptance record is intentionally kept beside the guarded fixture.
+function smokeSvnFixture() {
+  process.stdout.write('\n▸ Section 76: fixture SVN real + skip contado\n');
+  const source = fs.readFileSync(__filename, 'utf8');
+  const repoRoot = path.dirname(SCRIPTS);
+  const ci = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
+  // Case-insensitive count of the installation ACTION only (the `run:` line),
+  // excluding the `- name:` step label — a step's display name ("Install
+  // Subversion") is not itself an installation reference, and counting it
+  // would double-count the same single step. Case-insensitive so a
+  // `Subversion`/`SUBVERSION` variant in the install command itself is never
+  // silently missed by a literal-lowercase match.
+  const installLines = ci.split('\n').filter((l) => !/^\s*-\s*name\s*:/i.test(l));
+  const svnCount = installLines.join('\n').toLowerCase().split('subversion').length - 1;
+  const installIndex = ci.indexOf('Install Subversion');
+  const smokeIndex = ci.indexOf('Smoke suite');
+  const installStep = ci.slice(installIndex, smokeIndex);
+  assert(svnCount === 1, '(h) ci.yml contains exactly one subversion installation reference', `count=${svnCount}`);
+  assert(installIndex >= 0 && smokeIndex >= 0 && installIndex < smokeIndex,
+    '(h) Subversion installation precedes the smoke suite', JSON.stringify({ installIndex, smokeIndex }));
+  assert(/if:\s*runner\.os\s*==\s*'Linux'/.test(installStep),
+    '(h) Subversion installation is Linux-only', installStep);
+
+  const decisionMatch = source.match(/function svnGateDecision\(env, platform, present\) \{[\s\S]*?\n\}/);
+  assert(!!decisionMatch, '(h) svn gate decision can be extracted from source');
+  if (decisionMatch) {
+    const decision = new Function(`${decisionMatch[0]}; return svnGateDecision;`)();
+    assert(decision({ CI: '1' }, 'linux', false) === 'fail',
+      '(h) Linux CI without svn selects fail');
+    assert(decision({}, 'darwin', false) === 'skip',
+      '(h) non-Linux/non-CI without svn selects skip');
+    assert(decision({}, 'linux', false) === 'skip',
+      '(h) Linux without CI and without svn selects skip');
+    assert(decision({ CI: '1' }, 'darwin', false) === 'skip',
+      '(h) CI on non-Linux without svn selects skip');
+  }
+
+  const svnDecision = svnGateDecision(process.env, process.platform, hasSvn());
+  if (svnDecision === 'fail') {
+    fail('Section 76: svn ausente no runner que deve gatear',
+      'ci.yml instala subversion no runner Linux — ausência aqui é falso-verde, não skip');
+    return;
+  }
+  if (svnDecision === 'skip') {
+    skip('Section 76: fixture SVN', 'svn não está no PATH');
+    return;
+  }
+
+  const fixture = initSvnRepo('svn-fixture');
+  if (!fixture) return;
+  try {
+    assert(fs.existsSync(path.join(fixture.wc, '.svn')), '(a) checkout produces wc/.svn');
+
+    fs.writeFileSync(path.join(fixture.wc, 'a.txt'), 'initial\n', 'utf8');
+    fs.mkdirSync(path.join(fixture.wc, 'sub'));
+    fs.writeFileSync(path.join(fixture.wc, 'sub', 'nested.txt'), 'nested\n', 'utf8');
+    const added = svnq(fixture.wc, ['add', 'a.txt', 'sub'], fixture.configDir);
+    const committed = svnq(fixture.wc, ['commit', '-m', 'init'], fixture.configDir);
+    assert(added.status === 0 && committed.status === 0,
+      '(b) svn add + commit return status 0', JSON.stringify({ added, committed }));
+    const info = svnq(fixture.wc, ['info', '--show-item', 'revision', 'a.txt'], fixture.configDir);
+    assert(info.status === 0 && info.stdout.trim() === '1',
+      '(b) initial commit has revision 1', JSON.stringify(info));
+
+    fs.writeFileSync(path.join(fixture.wc, 'a.txt'), 'modified\n', 'utf8');
+    const status = svnq(fixture.wc, ['status', '--xml'], fixture.configDir);
+    assert(status.status === 0 && /<status(?:\s|>)/.test(status.stdout)
+      && /<entry\s+path="a\.txt"/.test(status.stdout),
+    '(c) dirty svn status --xml is parseable and contains a.txt', status.stdout);
+    assert(fs.existsSync(path.join(fixture.wc, 'sub'))
+      && !fs.existsSync(path.join(fixture.wc, 'sub', '.svn')),
+    '(d) versioned subdirectory has no nested .svn');
+    assert(forgeIgnore.detectVcs(fixture.wc) === 'svn',
+      '(f) detectVcs recognizes the SVN working-copy root');
+    assert(forgeIgnore.detectVcs(path.join(fixture.wc, 'sub')) === 'svn',
+      '(f) detectVcs recognizes an SVN working-copy subdirectory');
+    const gitDir = mkTmp('svn-git-detection');
+    const noneDir = mkTmp('svn-none-detection');
+    try {
+      fs.mkdirSync(path.join(gitDir, '.git'), { recursive: true });
+      assert(forgeIgnore.detectVcs(gitDir) === 'git', '(f) detectVcs keeps git detection');
+      assert(forgeIgnore.detectVcs(noneDir) === 'none', '(f) detectVcs keeps none detection');
+    } finally {
+      cleanup(gitDir);
+      cleanup(noneDir);
+    }
+
+    const skipMatch = source.match(/function skip\(name, reason\) \{[\s\S]*?\n\}/);
+    assert(!!skipMatch, '(e) skip implementation can be extracted from source');
+    if (skipMatch) {
+      const output = [];
+      const extracted = new Function('write',
+        `const process = { stdout: { write } }; let skips = 0; const skipped = [];\n${skipMatch[0]}\nreturn { skip, count: () => skips, items: skipped };`)(
+          (line) => output.push(line));
+      extracted.skip('fixture gate', 'stub reason');
+      assert(extracted.count() === 1 && extracted.items.length === 1
+        && output.length === 1 && /fixture gate/.test(output[0]),
+      '(e) extracted skip increments and prints via stubbed collaborators', JSON.stringify({ output, items: extracted.items }));
+    }
+    assert(/smokeSvnFixture\(\);/.test(source.slice(source.lastIndexOf('async function main()'))),
+      '(g) Section 76 is registered in main()');
+    pass('(final) Section 76: fixture SVN real + skip contado verificada');
+  } finally {
+    cleanup(fixture.dir);
+  }
+}
+
+// ── Section 77: VCS seam — behavioral parity and executable absence guards ──
+// This section proves the seam against these counterfactuals: reintroducing a
+// literal git call into the reset engine, weakening restore/remove/preserve
+// semantics in the wrapper, or collapsing the .gsd-inclusive and .gsd-exclusive
+// consumer views into one. It uses real fixtures and executes the relevant CLIs.
+function smokeVcsSeam() {
+  process.stdout.write('\n▸ Section 77: VCS seam — paridade git + absence-guard\n');
+  const SR = path.join(SCRIPTS, 'forge-surgical-reset.js');
+  const VCS = path.join(SCRIPTS, 'forge-vcs.js');
+  const xllm = require(path.join(SCRIPTS, 'forge-xllm.js'));
+  const sr = require(SR);
+  const W = (dir, rel, content) => {
+    const abs = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content, 'utf8');
+  };
+  const R = (dir, rel) => fs.readFileSync(path.join(dir, rel), 'utf8');
+  const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const gitq = (cwd, args) => spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  const commit = (dir, message) => gitq(dir, ['add', '-A']) && gitq(dir, ['-c', 'user.email=smoke@forge', '-c', 'user.name=smoke', 'commit', '-qm', message]);
+  const runReset = (stateFile, args) => runScript('forge-surgical-reset.js', args || ['--reset', '--state', stateFile]);
+
+  // (a) Executable source guard: exact counts prevent a doc-only occurrence
+  // from masking a reintroduced literal git argv in the reset engine.
+  const source = fs.readFileSync(SR, 'utf8');
+  const spawnGitCount = source.split("spawnSync('git'").length - 1;
+  const revParseCount = source.split("'rev-parse'").length - 1;
+  const hashObjectCount = source.split("'hash-object'").length - 1;
+  const checkoutCount = source.split("'checkout'").length - 1;
+  const seamRequireCount = source.split("require('./forge-vcs.js')").length - 1;
+  assert(spawnGitCount === 0, `(a) reset source has zero spawnSync('git') argv literals (measured ${spawnGitCount})`);
+  assert(revParseCount === 0, `(a) reset source has zero 'rev-parse' argv literals (measured ${revParseCount})`);
+  assert(hashObjectCount === 0, `(a) reset source has zero 'hash-object' argv literals (measured ${hashObjectCount})`);
+  assert(checkoutCount === 0, `(a) reset source has zero 'checkout' argv literals (measured ${checkoutCount})`);
+  assert(seamRequireCount === 1, `(a) reset source requires forge-vcs.js exactly once (measured ${seamRequireCount})`);
+
+  // (b)+(c) A real git fixture covers restore/remove/preserve behavior and
+  // deliberately keeps the two .gsd consumer views observably asymmetric.
+  const dir = mkTmp('vcs-seam');
+  try {
+    gitq(dir, ['init', '-q', '-b', 'main']);
+    gitq(dir, ['config', 'user.email', 'smoke@forge']);
+    gitq(dir, ['config', 'user.name', 'smoke@forge']);
+    W(dir, 'a.txt', 'a baseline\n');
+    W(dir, 'sub/s.txt', 'sub baseline\n');
+    W(dir, 'b.txt', 'b baseline\n');
+    commit(dir, 'seed');
+    W(dir, 'b.txt', 'operator pre-existing work\n');
+    const bPath = path.join(dir, 'b.txt');
+    const beforeB = digest(bPath);
+    const stateFile = path.join(dir, '.gsd', 'forge', 'vcs-seam-state.json');
+    const init = runScript('forge-surgical-reset.js', ['--state-init', '--state', stateFile, '--cwd', dir]);
+    assert(init.status === 0 && /^[0-9a-f]{40}\n?$/.test(init.stdout), '(b) --state-init exits 0 and prints START_SHA', JSON.stringify(init));
+
+    W(dir, 'a.txt', 'sidecar changed a\n');
+    W(dir, 'novo/lixo.txt', 'sidecar-only file\n');
+    W(dir, '.gsd/x.json', '{"dirty":true}\n');
+    const derived = xllm.deriveFilesChanged(dir, [], JSON.parse(fs.readFileSync(stateFile, 'utf8')).start_sha);
+    const captured = sr.captureSnapshot(dir);
+    const post = sr.computePostChanges(dir, JSON.parse(fs.readFileSync(stateFile, 'utf8')).start_sha);
+    assert(derived.some((entry) => entry.path === '.gsd/x.json'), '(c) deriveFilesChanged includes .gsd/x.json while captureSnapshot/computePostChanges exclude it', JSON.stringify(derived));
+    assert(!captured.some((entry) => entry.path === '.gsd/x.json'), '(c) captureSnapshot preserves the .gsd-exclusive view (not collapsed with deriveFilesChanged)', JSON.stringify(captured));
+    assert(!post.some((entry) => entry.path === '.gsd/x.json'), '(c) computePostChanges preserves the .gsd-exclusive view (not collapsed with deriveFilesChanged)', JSON.stringify(post));
+
+    const reset = runReset(stateFile);
+    let resetOut = null;
+    try { resetOut = JSON.parse(reset.stdout); } catch {}
+    assert(reset.status === 0 && resetOut && resetOut.verified === true, '(b) --reset exits 0 and verifies the sidecar reset', reset.stdout + reset.stderr);
+    assert(resetOut && resetOut.restored.includes('a.txt') && resetOut.removed.includes('novo/lixo.txt'), '(b) reset reports restored a.txt and removed novo/lixo.txt', JSON.stringify(resetOut));
+    const afterB = digest(bPath);
+    assert(afterB === beforeB, `(b) pre-existing b.txt SHA-256 is byte-identical before/after (${beforeB} !== ${afterB})`);
+    assert(!fs.existsSync(path.join(dir, 'novo/lixo.txt')), '(b) sidecar-only file is removed from disk');
+  } finally {
+    cleanup(dir);
+  }
+
+  const overlapDir = mkTmp('vcs-seam-overlap');
+  try {
+    gitq(overlapDir, ['init', '-q', '-b', 'main']);
+    gitq(overlapDir, ['config', 'user.email', 'smoke@forge']);
+    gitq(overlapDir, ['config', 'user.name', 'smoke@forge']);
+    W(overlapDir, 'a.txt', 'a baseline\n');
+    W(overlapDir, 'b.txt', 'b baseline\n');
+    commit(overlapDir, 'seed');
+    W(overlapDir, 'b.txt', 'operator pre-existing work\n');
+    const stateFile = path.join(overlapDir, '.gsd', 'forge', 'vcs-seam-overlap-state.json');
+    const init = runScript('forge-surgical-reset.js', ['--state-init', '--state', stateFile, '--cwd', overlapDir]);
+    assert(init.status === 0, '(b) overlap fixture state-init exits 0', init.stdout + init.stderr);
+    W(overlapDir, 'a.txt', 'sidecar changed a\n');
+    W(overlapDir, 'b.txt', 'sidecar overwrote overlap\n');
+    W(overlapDir, 'novo/lixo.txt', 'must remain after overlap abort\n');
+    const reset = runReset(stateFile);
+    let overlapOut = null;
+    try { overlapOut = JSON.parse(reset.stdout); } catch {}
+    assert(reset.status === 3, '(b) overlap reset exits 3', reset.stdout + reset.stderr);
+    assert(overlapOut && Array.isArray(overlapOut.overlap) && overlapOut.overlap.length > 0, '(b) overlap result is non-empty', JSON.stringify(overlapOut));
+    assert(R(overlapDir, 'a.txt') === 'sidecar changed a\n' && R(overlapDir, 'b.txt') === 'sidecar overwrote overlap\n' && fs.existsSync(path.join(overlapDir, 'novo/lixo.txt')), '(b) overlap abort performs zero resets');
+  } finally {
+    cleanup(overlapDir);
+  }
+
+  // (d) The seam CLI has an explicit detect mode and an explicit usage error.
+  const cliDir = mkTmp('vcs-seam-cli');
+  try {
+    gitq(cliDir, ['init', '-q', '-b', 'main']);
+    gitq(cliDir, ['config', 'user.email', 'smoke@forge']);
+    gitq(cliDir, ['config', 'user.name', 'smoke@forge']);
+    const detected = runScript('forge-vcs.js', ['--detect', '--cwd', cliDir]);
+    let detectedOut = null;
+    try { detectedOut = JSON.parse(detected.stdout); } catch {}
+    assert(detected.status === 0 && detectedOut && detectedOut.vcs === 'git', '(d) forge-vcs --detect reports git and exits 0', detected.stdout + detected.stderr);
+    const missing = runScript('forge-vcs.js', []);
+    assert(missing.status !== 0 && missing.stderr.startsWith('forge-vcs:'), '(d) forge-vcs without --detect exits non-zero with forge-vcs: usage error', missing.stderr);
+  } finally {
+    cleanup(cliDir);
+  }
+
+  const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeVcsSeam\(\); \}/.test(mainBody), '(g) Section 77 is registered through a closure in main()');
+  pass('(final) Section 77: VCS seam — paridade git, assimetria .gsd, CLI e absence-guard verificadas');
+}
+
+// ── Section 78: real SVN primitives — surgical-reset safety proof ──────────
+function smokeSvnPrimitives() {
+  process.stdout.write('\n▸ Section 78: primitivas SVN — prova de segurança real\n');
+  const decision = svnGateDecision(process.env, process.platform, hasSvn());
+  if (decision === 'fail') {
+    fail('Section 78: svn ausente no runner que deve gatear',
+      'ci.yml instala subversion no runner Linux — ausência aqui é falso-verde, não skip');
+    return;
+  }
+  if (decision === 'skip') {
+    skip('Section 78: primitivas SVN', 'svn não está no PATH');
+    return;
+  }
+
+  const vcs = require('./forge-vcs.js');
+  const { computeResetTarget } = require('./forge-surgical-reset.js');
+  const OPTS = { vcs: 'svn' };
+  const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const write = (wc, rel, content) => {
+    const file = path.join(wc, rel);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content, 'utf8');
+  };
+  const seed = (label, files) => {
+    const fixture = initSvnRepo(label);
+    if (!fixture) return null;
+    for (const [rel, content] of Object.entries(files)) write(fixture.wc, rel, content);
+    const added = svnq(fixture.wc, ['add', '--parents', ...Object.keys(files)], fixture.configDir);
+    const committed = svnq(fixture.wc, ['commit', '-m', 'r1'], fixture.configDir);
+    // A checkout made before r1 reports 0:1 until it is updated.  Normalize it
+    // to an r1 root so baselineId has the documented clean value of exactly 1.
+    const updated = committed.status === 0 && svnq(fixture.wc, ['update'], fixture.configDir);
+    assert(added.status === 0 && committed.status === 0 && updated && updated.status === 0, `(a) ${label} commits r1`,
+      JSON.stringify({ added, committed, updated }));
+    return fixture;
+  };
+  const entriesHave = (entries, rel) => entries.some((entry) => entry.path === rel);
+  const tree = (root) => {
+    const out = new Map();
+    const visit = (dir, prefix) => {
+      for (const name of fs.readdirSync(dir)) {
+        if (name === '.svn') continue;
+        const rel = prefix ? `${prefix}/${name}` : name;
+        const abs = path.join(dir, name);
+        const stat = fs.lstatSync(abs);
+        if (stat.isDirectory()) { out.set(`${rel}/`, 'dir'); visit(abs, rel); }
+        else out.set(rel, sha256(abs));
+      }
+    };
+    visit(root, '');
+    return [...out.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  };
+
+  // The central ROADMAP demo: this hash oracle deliberately uses local crypto,
+  // never vcs.hashPath, so a broken seam cannot attest to its own correctness.
+  const central = seed('svn-primitives', { 'a.txt': 'alpha\n', 'b.txt': 'bravo\n', 'sub/s.txt': 'sierra\n' });
+  if (central) try {
+    const centralOpts = { ...OPTS, configDir: central.configDir };
+    const cleanBase = vcs.baselineId(central.wc, centralOpts);
+    assert(cleanBase.ok && cleanBase.id === '1', '(a) SVN baselineId is r1 while clean', JSON.stringify(cleanBase));
+    write(central.wc, 'b.txt', 'bravo LOCAL EDIT\n');
+    const shaBBefore = sha256(path.join(central.wc, 'b.txt'));
+    const pre = vcs.captureDirty(central.wc, centralOpts);
+    assert(pre.ok && entriesHave(pre.entries, 'b.txt') && pre.entries.find((e) => e.path === 'b.txt').hash !== null,
+      '(b) pre-dispatch snapshot protects b.txt with a hash', JSON.stringify(pre));
+    write(central.wc, 'a.txt', 'alpha SIDECAR\n');
+    write(central.wc, 'sub/s.txt', 'sierra SIDECAR\n');
+    write(central.wc, 'junk.txt', 'junk\n');
+    write(central.wc, 'junkdir/inner/deep.txt', 'deep junk\n');
+    const post = vcs.postChanges(central.wc, null, centralOpts);
+    const target = computeResetTarget(post.entries, pre.entries, (p) => vcs.hashPath(central.wc, p, centralOpts).hash);
+    assert(post.ok && target.overlap.length === 0 && target.preserved.includes('b.txt'),
+      '(d) central target preserves b.txt and has no overlap', JSON.stringify({ post, target }));
+    const done = vcs.restoreAndRemove(central.wc, null, target, centralOpts);
+    assert(done.ok, '(d) central restore/remove succeeds', JSON.stringify(done));
+    assert(fs.readFileSync(path.join(central.wc, 'a.txt'), 'utf8') === 'alpha\n'
+      && fs.readFileSync(path.join(central.wc, 'sub/s.txt'), 'utf8') === 'sierra\n',
+    '(e) tracked sidecar edits return to committed content');
+    assert(!fs.existsSync(path.join(central.wc, 'junk.txt')) && !fs.existsSync(path.join(central.wc, 'junkdir')),
+      '(e) sidecar file and recursive unversioned directory are absent');
+    assert(sha256(path.join(central.wc, 'b.txt')) === shaBBefore,
+      '(e) independent sha256(b.txt) before dispatch equals after reset');
+    const after = vcs.postChanges(central.wc, null, centralOpts);
+    assert(after.ok && after.entries.length === 1 && after.entries[0].path === 'b.txt',
+      '(e) only the operator edit remains after central reset', JSON.stringify(after));
+    const dirtyBase = vcs.baselineId(central.wc, centralOpts);
+    assert(dirtyBase.ok && /^1M?$/.test(dirtyBase.id), '(i) dirty SVN baseline is raw r1 marker', JSON.stringify(dirtyBase));
+
+    // Newlines must travel as one argv value; --targets would split this into
+    // invented paths and leave the file behind while svn still exits zero.
+    write(central.wc, 'nl\nfile.txt', 'newline sidecar junk\n');
+    const newlinePost = vcs.postChanges(central.wc, null, centralOpts);
+    const newlineTarget = computeResetTarget(newlinePost.entries, pre.entries,
+      (p) => vcs.hashPath(central.wc, p, centralOpts).hash);
+    const newlineDone = vcs.restoreAndRemove(central.wc, null, newlineTarget, centralOpts);
+    assert(newlineDone.ok && !fs.existsSync(path.join(central.wc, 'nl\nfile.txt')),
+      '(i) newline path is removed through argv routing', JSON.stringify(newlineDone));
+    const anchored = vcs.captureDirty(path.join(central.wc, 'sub'), centralOpts);
+    assert(!anchored.ok && /svn-wcroot-mismatch/.test(anchored.error) && JSON.stringify(anchored.entries) === '[]',
+      '(j) SVN primitives refuse a non-root working-copy path', JSON.stringify(anchored));
+  } finally { cleanup(central.dir); }
+
+  // This is the exit-3 semantic proof. CLI/state-file wiring is deliberately S04.
+  const overlap = seed('svn-overlap', { 'a.txt': 'alpha\n', 'b.txt': 'bravo\n', 'sub/s.txt': 'sierra\n' });
+  if (overlap) try {
+    const overlapOpts = { ...OPTS, configDir: overlap.configDir };
+    write(overlap.wc, 'b.txt', 'operator edit\n');
+    const pre = vcs.captureDirty(overlap.wc, overlapOpts);
+    write(overlap.wc, 'b.txt', 'sidecar overwrote operator\n');
+    write(overlap.wc, 'extra.txt', 'sidecar extra\n');
+    const post = vcs.postChanges(overlap.wc, null, overlapOpts);
+    const target = computeResetTarget(post.entries, pre.entries, (p) => vcs.hashPath(overlap.wc, p, overlapOpts).hash);
+    assert(target.overlap.includes('b.txt'), '(f) overlap detects sidecar rewrite of operator path', JSON.stringify(target));
+    const beforeThrow = tree(overlap.wc);
+    let thrown = null;
+    try { vcs.restoreAndRemove(overlap.wc, null, target, overlapOpts); } catch (error) { thrown = error; }
+    assert(thrown && /overlap is non-empty/.test(thrown.message), '(f) overlap hard guard throws its semantic error', String(thrown && thrown.message));
+    assert(JSON.stringify(tree(overlap.wc)) === JSON.stringify(beforeThrow),
+      '(f) overlap hard guard leaves every non-.svn tree file byte-identical');
+  } finally { cleanup(overlap.dir); }
+
+  const props = seed('svn-props', { 'a.txt': 'alpha\n', 'b2.txt': 'bravo two\n' });
+  if (props) try {
+    const propsOpts = { ...OPTS, configDir: props.configDir };
+    const setProp = svnq(props.wc, ['propset', 'svn:mime-type', 'text/plain', 'b2.txt'], props.configDir);
+    assert(setProp.status === 0, '(g) operator sets a prop-only change before snapshot', JSON.stringify(setProp));
+    const pre = vcs.captureDirty(props.wc, propsOpts);
+    assert(pre.ok && entriesHave(pre.entries, 'b2.txt'), '(g) normal+props=modified enters dirty snapshot', JSON.stringify(pre));
+    write(props.wc, 'a.txt', 'sidecar change\n');
+    const safePost = vcs.postChanges(props.wc, null, propsOpts);
+    const safeTarget = computeResetTarget(safePost.entries, pre.entries, (p) => vcs.hashPath(props.wc, p, propsOpts).hash);
+    const safeDone = vcs.restoreAndRemove(props.wc, null, safeTarget, propsOpts);
+    const safeStatus = svnq(props.wc, ['status', '--xml'], props.configDir);
+    assert(safeDone.ok && /path="b2\.txt"[\s\S]*?props="modified"/.test(safeStatus.stdout),
+      '(g) reset of another sidecar edit preserves operator prop-only work', JSON.stringify({ safeDone, status: safeStatus.stdout }));
+    const aggressivePre = vcs.captureDirty(props.wc, propsOpts);
+    write(props.wc, 'b2.txt', 'sidecar changed b2 content\n');
+    const aggressivePost = vcs.postChanges(props.wc, null, propsOpts);
+    const aggressiveTarget = computeResetTarget(aggressivePost.entries, aggressivePre.entries,
+      (p) => vcs.hashPath(props.wc, p, propsOpts).hash);
+    let thrown = null;
+    try { vcs.restoreAndRemove(props.wc, null, aggressiveTarget, propsOpts); } catch (error) { thrown = error; }
+    const aggressiveStatus = svnq(props.wc, ['status', '--xml'], props.configDir);
+    assert(aggressiveTarget.overlap.includes('b2.txt') && thrown && /overlap is non-empty/.test(thrown.message)
+      && /path="b2\.txt"[\s\S]*?props="modified"/.test(aggressiveStatus.stdout),
+    '(g) aggressive prop scenario aborts instead of reverting the operator property', JSON.stringify({ aggressiveTarget, message: thrown && thrown.message, status: aggressiveStatus.stdout }));
+  } finally { cleanup(props.dir); }
+
+  // Directory-level prop change (svn:ignore) must not blanket-recurse and
+  // destroy a preserved sibling nested under that directory. This is the
+  // R1-conceded review finding, reproduced against real svn as a contra-
+  // factual: it fails against the pre-fix code (unconditional --depth
+  // infinity on the whole batch) and must pass against the fix (directory
+  // targets with a preserved descendant revert at --depth empty).
+  const dirProp = seed('svn-dirprop', { 'dirA/keep.txt': 'keep original\n', 'other.txt': 'other\n' });
+  if (dirProp) try {
+    const dirPropOpts = { ...OPTS, configDir: dirProp.configDir };
+    write(dirProp.wc, 'dirA/keep.txt', 'OPERATOR PRECIOUS WORK\n');
+    const pre = vcs.captureDirty(dirProp.wc, dirPropOpts);
+    assert(pre.ok && entriesHave(pre.entries, 'dirA/keep.txt'),
+      '(k) operator edit under dirA enters the pre-dispatch dirty snapshot', JSON.stringify(pre));
+    const setIgnore = svnq(dirProp.wc, ['propset', 'svn:ignore', '*.log', 'dirA'], dirProp.configDir);
+    assert(setIgnore.status === 0, '(k) sidecar sets a directory-level prop after snapshot', JSON.stringify(setIgnore));
+    const post = vcs.postChanges(dirProp.wc, null, dirPropOpts);
+    const target = computeResetTarget(post.entries, pre.entries, (p) => vcs.hashPath(dirProp.wc, p, dirPropOpts).hash);
+    assert(target.overlap.length === 0 && target.restore.includes('dirA') && target.preserved.includes('dirA/keep.txt'),
+      '(k) target restores the dir-prop change and preserves the sibling operator file', JSON.stringify(target));
+    const done = vcs.restoreAndRemove(dirProp.wc, null, target, dirPropOpts);
+    assert(done.ok, '(k) restore/remove of the dir-prop target succeeds', JSON.stringify(done));
+    // This is the R1 contrafactual: pre-fix, --depth infinity on the whole
+    // batch recurses into dirA and reverts keep.txt to its committed content,
+    // silently destroying the operator's precious work even though target
+    // .preserved says it should have survived. Post-fix it must read back
+    // byte-identical.
+    assert(fs.readFileSync(path.join(dirProp.wc, 'dirA/keep.txt'), 'utf8') === 'OPERATOR PRECIOUS WORK\n',
+      '(k) R1: preserved sibling under a reverted directory survives byte-identical');
+    const dirStatus = svnq(dirProp.wc, ['status', '--xml'], dirProp.configDir);
+    assert(!/svn:ignore/.test(dirStatus.stdout) || !/path="dirA"[\s\S]*?props="modified"/.test(dirStatus.stdout),
+      '(k) the directory-level prop itself was reverted', dirStatus.stdout);
+  } finally { cleanup(dirProp.dir); }
+
+  const external = seed('svn-external-main', { 'a.txt': 'alpha\n' });
+  const externalSource = seed('svn-external-src', { 'inside.txt': 'external base\n' });
+  if (external && externalSource) try {
+    const externalOpts = { ...OPTS, configDir: external.configDir };
+    const externalUrl = require('url').pathToFileURL(externalSource.repo).href;
+    const configured = svnq(external.wc, ['propset', 'svn:externals', `ext ${externalUrl}`, '.'], external.configDir);
+    const committed = configured.status === 0 && svnq(external.wc, ['commit', '-m', 'external'], external.configDir);
+    const updated = committed && committed.status === 0 && svnq(external.wc, ['update'], external.configDir);
+    if (configured.status !== 0 || !committed || !updated || updated.status !== 0 || !fs.existsSync(path.join(external.wc, 'ext', 'inside.txt'))) {
+      skip('Section 78: external SVN', 'fixture external setup falhou neste svn; sub-cenário não foi degradado a assert vacuo');
+    } else {
+      write(external.wc, 'ext/inside.txt', 'external operator dirty\n');
+      const captured = vcs.captureDirty(external.wc, externalOpts);
+      const posted = vcs.postChanges(external.wc, null, externalOpts);
+      write(external.wc, 'a.txt', 'sidecar main change\n');
+      const target = computeResetTarget(vcs.postChanges(external.wc, null, externalOpts).entries, captured.entries,
+        (p) => vcs.hashPath(external.wc, p, externalOpts).hash);
+      const done = vcs.restoreAndRemove(external.wc, null, target, externalOpts);
+      assert(captured.ok && posted.ok && !captured.entries.some((e) => e.path.startsWith('ext/'))
+        && !posted.entries.some((e) => e.path.startsWith('ext/')) && done.ok
+        && fs.readFileSync(path.join(external.wc, 'ext', 'inside.txt'), 'utf8') === 'external operator dirty\n',
+      '(h) external is absent from snapshots and survives reset untouched', JSON.stringify({ captured, posted, done }));
+    }
+  } finally { if (external) cleanup(external.dir); if (externalSource) cleanup(externalSource.dir); }
+
+  const conflict = seed('svn-conflict', { 'a.txt': 'alpha\n' });
+  if (conflict) try {
+    const conflictOpts = { ...OPTS, configDir: conflict.configDir };
+    const wc2 = path.join(conflict.dir, 'wc2');
+    const checkedOut = svnq(conflict.dir, ['checkout', require('url').pathToFileURL(conflict.repo).href, wc2], conflict.configDir);
+    if (checkedOut.status !== 0) {
+      skip('Section 78: conflito SVN', 'segundo checkout da fixture falhou; fallback é a cobertura mapSvnItem de T01');
+    } else {
+      write(conflict.wc, 'a.txt', 'local conflicting change\n');
+      write(wc2, 'a.txt', 'remote conflicting change\n');
+      const remoteCommit = svnq(wc2, ['commit', '-m', 'remote'], conflict.configDir);
+      const updated = remoteCommit.status === 0 && svnq(conflict.wc, ['update'], conflict.configDir);
+      const captured = vcs.captureDirty(conflict.wc, conflictOpts);
+      assert(updated && !captured.ok && /svn-status-unhandled:conflicted/.test(captured.error),
+        '(h) real SVN conflict fails closed in captureDirty', JSON.stringify({ remoteCommit, updated, captured }));
+    }
+  } finally { cleanup(conflict.dir); }
+
+  pass('(final) Section 78: prova SVN real — preservação, overlap, props, external, conflito e paths especiais verificados');
+}
+
+// ── Section 79: real SVN revision guard — partial-update safety proof ──────
+function smokeSvnRevisionGuard() {
+  process.stdout.write('\n▸ Section 79: guarda de revisão SVN — update parcial real\n');
+  const { parseSvnBaseline } = require('./forge-surgical-reset.js');
+  const decision = svnGateDecision(process.env, process.platform, hasSvn() && hasSvnversion());
+  if (decision === 'fail') {
+    fail('Section 79: svn ou svnversion ausente no runner que deve gatear',
+      'ci.yml instala subversion no runner Linux — ausência aqui é falso-verde, não skip');
+    return;
+  }
+  if (decision === 'skip') {
+    skip('Section 79: guarda de revisão SVN', 'svn e svnversion devem estar no PATH');
+    return;
+  }
+
+  // This is intentionally a local oracle, never forge-vcs.hashPath: otherwise
+  // the seam under test could attest to its own preservation claim.
+  const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const write = (wc, rel, content) => {
+    const file = path.join(wc, rel);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content, 'utf8');
+  };
+  const tree = (root) => {
+    const entries = [];
+    const visit = (dir, prefix) => {
+      for (const name of fs.readdirSync(dir)) {
+        if (name === '.svn') continue;
+        const abs = path.join(dir, name);
+        const rel = prefix ? `${prefix}/${name}` : name;
+        if (fs.lstatSync(abs).isDirectory()) visit(abs, rel);
+        else entries.push([rel, sha256(abs)]);
+      }
+    };
+    visit(root, '');
+    return entries.sort((a, b) => a[0].localeCompare(b[0]));
+  };
+  const cli = (args, fixture) => {
+    // The reset CLI has no config-dir flag.  Pin its default config home to
+    // this fixture while direct svn calls remain explicitly argv/config-dir.
+    const home = path.join(fixture.dir, 'svn-home');
+    fs.mkdirSync(home, { recursive: true });
+    const configLink = path.join(home, '.subversion');
+    if (!fs.existsSync(configLink)) fs.symlinkSync(fixture.configDir, configLink, 'dir');
+    return runScript('forge-surgical-reset.js', args, {
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+    });
+  };
+  const json = (result) => {
+    try { return JSON.parse(result.stdout); } catch { return null; }
+  };
+  const seed = (label, files) => {
+    const fixture = initSvnRepo(label);
+    if (!fixture) return null;
+    for (const [rel, content] of Object.entries(files)) write(fixture.wc, rel, content);
+    const added = svnq(fixture.wc, ['add', '--parents', ...Object.keys(files)], fixture.configDir);
+    const committed = svnq(fixture.wc, ['commit', '-m', 'r1'], fixture.configDir);
+    const updated = committed.status === 0 && svnq(fixture.wc, ['update'], fixture.configDir);
+    assert(added.status === 0 && committed.status === 0 && updated && updated.status === 0,
+      `(a) ${label} commits and updates r1`, JSON.stringify({ added, committed, updated }));
+    return fixture;
+  };
+  const teammateCommit = (fixture, rel, content) => {
+    const wc2 = path.join(fixture.dir, 'wc-teammate');
+    const checkout = svnq(fixture.dir, ['checkout', require('url').pathToFileURL(fixture.repo).href, wc2], fixture.configDir);
+    if (checkout.status !== 0) return { checkout, commit: null, wc2 };
+    write(wc2, rel, content);
+    return { checkout, commit: svnq(wc2, ['commit', '-m', 'r2'], fixture.configDir), wc2 };
+  };
+
+  // (a) Establish the premise directly in svn: partial update + raw revert
+  // really can replace the operator's sidecar content with a teammate's r2.
+  const premise = seed('svn-revision-premise', { 'sub/c.txt': 'c-v1\n' });
+  if (premise) try {
+    write(premise.wc, 'sub/c.txt', 'c-SIDECAR\n');
+    const teammate = teammateCommit(premise, 'sub/c.txt', 'c-TEAMMATE\n');
+    const updated = teammate.commit && teammate.commit.status === 0
+      && svnq(premise.wc, ['update', '--accept', 'theirs-full', 'sub'], premise.configDir);
+    const reverted = updated && updated.status === 0
+      && svnq(premise.wc, ['revert', 'sub/c.txt'], premise.configDir);
+    assert(teammate.checkout.status === 0 && teammate.commit && teammate.commit.status === 0
+      && updated && updated.status === 0 && reverted && reverted.status === 0
+      && fs.readFileSync(path.join(premise.wc, 'sub/c.txt'), 'utf8') === 'c-TEAMMATE\n',
+    '(a) raw svn revert after partial update restores teammate r2 (the measured danger)',
+    JSON.stringify({ teammate, updated, reverted }));
+  } finally { cleanup(premise.dir); }
+
+  // (b) Primary E2: only sub moves to r2.  Root svn info remains 1, proving a
+  // root-only sensor is blind, while svnversion correctly returns the 1:2 range.
+  const partial = seed('svn-revision-partial', { 'b.txt': 'b-v1\n', 'sub/c.txt': 'c-v1\n' });
+  if (partial) try {
+    const stateFile = path.join(partial.dir, 'state.json');
+    const initialized = cli(['--state-init', '--state', stateFile, '--cwd', partial.wc], partial);
+    const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : null;
+    assert(initialized.status === 0 && initialized.stdout.trim() === '1' && state
+      && state.vcs === 'svn' && state.start_sha === '1',
+    '(b) state-init persists svn baseline 1 and emits non-empty stdout', JSON.stringify({ initialized, state }));
+    write(partial.wc, 'sub/c.txt', 'c-SIDECAR\n');
+    write(partial.wc, 'junk.txt', 'sidecar junk\n');
+    const teammate = teammateCommit(partial, 'sub/c.txt', 'c-TEAMMATE\n');
+    const updated = teammate.commit && teammate.commit.status === 0
+      && svnq(partial.wc, ['update', '--accept', 'mine-full', 'sub'], partial.configDir);
+    const rootRevision = svnq(partial.wc, ['info', '--show-item', 'revision'], partial.configDir);
+    assert(updated && updated.status === 0 && rootRevision.status === 0 && rootRevision.stdout.trim() === '1',
+      '(b) partial update leaves root svn info at r1 (blind-sensor premise)', JSON.stringify({ updated, rootRevision }));
+    const before = tree(partial.wc);
+    const reset = cli(['--reset', '--state', stateFile], partial);
+    const result = json(reset);
+    assert(reset.status === 3 && result && result.abort === 'svn-revision-moved'
+      && result.baseline === '1' && result.current === '1:2' && JSON.stringify(result.overlap) === '[]',
+    '(b) partial update aborts with the discriminated svn revision result', JSON.stringify({ reset, result }));
+    assert(JSON.stringify(tree(partial.wc)) === JSON.stringify(before) && fs.existsSync(path.join(partial.wc, 'junk.txt')),
+      '(b) abort leaves every working-copy file byte-identical, including sidecar junk');
+  } finally { cleanup(partial.dir); }
+
+  // (c) B3 is the anti-inert counterexample: dirty r1 is still r1, not a move.
+  const dirty = seed('svn-revision-dirty', { 'b.txt': 'b-v1\n', 'sub/c.txt': 'c-v1\n' });
+  if (dirty) try {
+    write(dirty.wc, 'b.txt', 'b-OPERATOR\n');
+    const bBefore = sha256(path.join(dirty.wc, 'b.txt'));
+    const stateFile = path.join(dirty.dir, 'state.json');
+    const initialized = cli(['--state-init', '--state', stateFile, '--cwd', dirty.wc], dirty);
+    write(dirty.wc, 'sub/c.txt', 'c-SIDECAR\n');
+    write(dirty.wc, 'junk.txt', 'sidecar junk\n');
+    const reset = cli(['--reset', '--state', stateFile], dirty);
+    const result = json(reset);
+    assert(initialized.status === 0 && reset.status === 0 && result && result.ok === true
+      && !fs.existsSync(path.join(dirty.wc, 'junk.txt'))
+      && fs.readFileSync(path.join(dirty.wc, 'sub/c.txt'), 'utf8') === 'c-v1\n'
+      && sha256(path.join(dirty.wc, 'b.txt')) === bBefore && result.preserved.includes('b.txt'),
+    '(c) dirty-only r1 resets sidecar changes and preserves the operator file', JSON.stringify({ initialized, reset, result }));
+  } finally { cleanup(dirty.dir); }
+
+  // (d) A whole-WC update is secondary coverage; it must still be refused.
+  const complete = seed('svn-revision-complete', { 'sub/c.txt': 'c-v1\n' });
+  if (complete) try {
+    const stateFile = path.join(complete.dir, 'state.json');
+    const initialized = cli(['--state-init', '--state', stateFile, '--cwd', complete.wc], complete);
+    const teammate = teammateCommit(complete, 'sub/c.txt', 'c-TEAMMATE\n');
+    const updated = teammate.commit && teammate.commit.status === 0
+      && svnq(complete.wc, ['update', '--accept', 'theirs-full'], complete.configDir);
+    const reset = cli(['--reset', '--state', stateFile], complete);
+    const result = json(reset);
+    assert(initialized.status === 0 && updated && updated.status === 0 && reset.status === 3 && result
+      && result.abort === 'svn-revision-moved' && result.current === '2',
+    '(d) complete update is also refused with current r2', JSON.stringify({ initialized, teammate, updated, reset, result }));
+  } finally { cleanup(complete.dir); }
+
+  // (e) A pre-update checkout after its first commit has svnversion 0:1 and
+  // cannot become a durable baseline.  stdout must be literally empty.
+  const zero = initSvnRepo('svn-revision-zero');
+  if (zero) try {
+    write(zero.wc, 'a.txt', 'a-r1\n');
+    const added = svnq(zero.wc, ['add', 'a.txt'], zero.configDir);
+    const committed = added.status === 0 && svnq(zero.wc, ['commit', '-m', 'r1'], zero.configDir);
+    const version = spawnSync('svnversion', [], { cwd: zero.wc, encoding: 'utf8' });
+    const parsed = parseSvnBaseline(version.stdout);
+    const initialized = cli(['--state-init', '--state', path.join(zero.dir, 'state.json'), '--cwd', zero.wc], zero);
+    assert(committed && committed.status === 0 && version.status === 0 && version.stdout.trim() === '0:1',
+      '(e) post-commit pre-update checkout reports svnversion 0:1', JSON.stringify({ added, committed, version }));
+    assert(parsed.ok === false && parsed.error === 'svn-baseline-zero-revision'
+      && initialized.status !== 0 && initialized.stdout.trim() === ''
+      && initialized.stderr.includes('svn-baseline-zero-revision'),
+    '(e) zero revision parser and state-init reject with empty stdout', JSON.stringify({ parsed, initialized }));
+  } finally { cleanup(zero.dir); }
+
+  // (f) This fixture intentionally uses the real CLI contract.  It remains
+  // inside the SVN gate so an SVN-less runner has one named, counted skip.
+  const gitDir = mkTmp('svn-revision-vcs-mismatch');
+  try {
+    const gitq = (args) => spawnSync('git', ['-C', gitDir, ...args], { encoding: 'utf8' });
+    const created = gitq(['init', '-q', '-b', 'main']);
+    const email = created.status === 0 && gitq(['config', 'user.email', 'smoke@forge']);
+    const name = email && email.status === 0 && gitq(['config', 'user.name', 'smoke']);
+    write(gitDir, 'tracked.txt', 'baseline\n');
+    const added = name && name.status === 0 && gitq(['add', 'tracked.txt']);
+    const committed = added && added.status === 0 && gitq(['commit', '-qm', 'r1']);
+    const stateFile = path.join(gitDir, 'state.json');
+    const initialized = committed && committed.status === 0 && runScript('forge-surgical-reset.js', ['--state-init', '--state', stateFile, '--cwd', gitDir]);
+    write(gitDir, 'junk-git.txt', 'sidecar junk\n');
+    const svnState = fs.existsSync(stateFile) ? { ...JSON.parse(fs.readFileSync(stateFile, 'utf8')), vcs: 'svn' } : null;
+    if (svnState) fs.writeFileSync(stateFile, JSON.stringify(svnState), 'utf8');
+    const mismatch = runScript('forge-surgical-reset.js', ['--reset', '--state', stateFile]);
+    const mismatchResult = json(mismatch);
+    assert(initialized && initialized.status === 0 && mismatch.status === 3 && mismatchResult
+      && mismatchResult.abort === 'vcs-state-mismatch' && fs.existsSync(path.join(gitDir, 'junk-git.txt')),
+    '(f) svn state on a git WC aborts and leaves its tree intact', JSON.stringify({ initialized, mismatch, mismatchResult }));
+    const legacy = svnState && { ...svnState };
+    if (legacy) { delete legacy.vcs; fs.writeFileSync(stateFile, JSON.stringify(legacy), 'utf8'); }
+    const legacyReset = runScript('forge-surgical-reset.js', ['--reset', '--state', stateFile]);
+    assert(legacyReset.status === 0 && !fs.existsSync(path.join(gitDir, 'junk-git.txt')),
+      '(f) legacy state without vcs retains the git reset path', JSON.stringify(legacyReset));
+  } finally { cleanup(gitDir); }
+
+  const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeSvnRevisionGuard\(\); \}/.test(mainBody),
+    '(g) Section 79 is registered through a closure in main()');
+  pass('(final) Section 79: revisão SVN — premissa, update parcial, B3, zero e compatibilidade verificados');
+}
+
+// ── Section 81: canonical post-run change set — mirrors + VCS proof ───────
+function smokeSidecarDiffCanonical() {
+  process.stdout.write('\n▸ Section 81: canonical post-run change set — mirrors, git parity, SVN state-init\n');
+  const repoRoot = path.dirname(SCRIPTS);
+  const VCS = path.join(SCRIPTS, 'forge-vcs.js');
+  const SR = path.join(SCRIPTS, 'forge-surgical-reset.js');
+  const title = '#### Post-run change set + baseline (canonical — VCS-agnostic)';
+  const canonicalReference = 'shared/forge-dispatch.md § Post-run change set + baseline (canonical — VCS-agnostic)';
+  const mirrors = [
+    'skills/forge-auto/SKILL.md',
+    'skills/forge-next/SKILL.md',
+    'skills/forge-task/SKILL.md',
+  ];
+  const read = (rel) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+
+  // (a)+(b) Documentation is intentionally a text guard: the executable
+  // assertions below own behavior; these prevent mirrors from re-copying the
+  // formula that the canonical spec owns exactly once.
+  for (const mirror of mirrors) {
+    const text = read(mirror);
+    assert(text.includes(canonicalReference),
+      `(a) ${mirror} names the canonical post-run change-set block`);
+    const copied = text.split('diff --name-status').length - 1;
+    assert(copied === 0,
+      `(b) ${mirror} has zero copied diff --name-status literals (got ${copied})`);
+  }
+  const spec = read('shared/forge-dispatch.md');
+  const titleCount = spec.split(title).length - 1;
+  assert(titleCount === 1,
+    `(a) shared/forge-dispatch.md carries the canonical post-run block exactly once (got ${titleCount})`);
+  assert(spec.includes('forge-vcs.js" --changes'),
+    '(a) canonical post-run block invokes forge-vcs.js --changes');
+
+  // (c) The git CLI must be byte-for-byte compatible with git's own
+  // name-status presentation, except for the terminal newline contract.
+  const gitDir = mkTmp('section81-git');
+  try {
+    const gitq = (args) => spawnSync('git', ['-C', gitDir, ...args], { encoding: 'utf8' });
+    const write = (rel, value) => {
+      const file = path.join(gitDir, rel);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, value, 'utf8');
+    };
+    gitq(['init', '-q', '-b', 'main']);
+    gitq(['config', 'user.email', 'smoke@forge']);
+    gitq(['config', 'user.name', 'smoke']);
+    write('modified.txt', 'before\n');
+    write('deleted.txt', 'before\n');
+    const seeded = gitq(['add', '-A']);
+    const committed = seeded.status === 0 && gitq(['commit', '-qm', 'seed']);
+    const base = committed && committed.status === 0 ? gitq(['rev-parse', 'HEAD']).stdout.trim() : '';
+    assert(!!base, '(c) git fixture has a committed baseline', JSON.stringify({ seeded, committed, base }));
+    if (base) {
+      write('added.txt', 'added\n');
+      gitq(['add', 'added.txt']); // git diff <BASE> now includes the new path too.
+      write('modified.txt', 'after\n');
+      fs.rmSync(path.join(gitDir, 'deleted.txt'));
+      const actual = spawnSync('node', [VCS, '--changes', '--cwd', gitDir, '--since', base], { encoding: 'utf8' });
+      const expected = gitq(['diff', '--name-status', base]);
+      assert(actual.status === 0 && expected.status === 0
+        && actual.stdout.replace(/\n$/, '') === expected.stdout.replace(/\n$/, ''),
+      '(c) forge-vcs --changes is string-identical to git diff --name-status',
+      JSON.stringify({ actual, expected }));
+      // Restore the fixture before proving the empty-delta contract.
+      gitq(['checkout', '--', 'modified.txt', 'deleted.txt']);
+      gitq(['reset', '--', 'added.txt']);
+      fs.rmSync(path.join(gitDir, 'added.txt'));
+      const empty = spawnSync('node', [VCS, '--changes', '--cwd', gitDir, '--since', base], { encoding: 'utf8' });
+      assert(empty.status === 0 && empty.stdout === '',
+        '(c) forge-vcs --changes has exit 0 and empty stdout for an empty git delta', JSON.stringify(empty));
+    }
+  } finally { cleanup(gitDir); }
+
+  const noVcs = mkTmp('section81-no-vcs');
+  try {
+    const none = spawnSync('node', [VCS, '--changes', '--cwd', noVcs, '--since', 'baseline'], { encoding: 'utf8' });
+    assert(none.status !== 0 && none.stdout === '',
+      '(c) forge-vcs --changes outside VCS fails with empty stdout', JSON.stringify(none));
+    // R2 (review): --baseline must fail symmetrically with --changes outside
+    // any VCS, not just silently return an empty/undefined id.
+    const noneBaseline = spawnSync('node', [VCS, '--baseline', '--cwd', noVcs], { encoding: 'utf8' });
+    assert(noneBaseline.status !== 0 && noneBaseline.stdout === '',
+      '(c) forge-vcs --baseline outside VCS fails with empty stdout', JSON.stringify(noneBaseline));
+  } finally { cleanup(noVcs); }
+
+  // (d)+(e) SVN is gated exactly like the other real-SVN sections: Linux CI
+  // cannot turn a missing prerequisite into a false-green skip, while other
+  // runners retain an explicit, counted skip.
+  const decision = svnGateDecision(process.env, process.platform, hasSvn() && hasSvnversion());
+  if (decision === 'fail') {
+    fail('Section 81: svn, svnadmin ou svnversion ausente no runner que deve gatear',
+      'ci.yml instala subversion no runner Linux — ausência aqui é falso-verde, não skip');
+    return;
+  }
+  if (decision === 'skip') {
+    skip('Section 81: SVN change/state-init fixture', 'svn, svnadmin e svnversion devem estar no PATH');
+    return;
+  }
+
+  const fixture = initSvnRepo('section81-svn');
+  if (!fixture) return;
+  try {
+    const write = (rel, value) => fs.writeFileSync(path.join(fixture.wc, rel), value, 'utf8');
+    write('tracked.txt', 'baseline\n');
+    const added = svnq(fixture.wc, ['add', 'tracked.txt'], fixture.configDir);
+    const committed = added.status === 0 && svnq(fixture.wc, ['commit', '-m', 'seed'], fixture.configDir);
+    const updated = committed && committed.status === 0 && svnq(fixture.wc, ['update'], fixture.configDir);
+    assert(added.status === 0 && committed && committed.status === 0 && updated && updated.status === 0,
+      '(d) SVN fixture commits and updates revision 1', JSON.stringify({ added, committed, updated }));
+    const baseline = spawnSync('node', [VCS, '--baseline', '--cwd', fixture.wc], { encoding: 'utf8' });
+    assert(baseline.status === 0 && baseline.stdout.trim() === '1',
+      '(d) forge-vcs --baseline emits SVN revision 1', JSON.stringify(baseline));
+    if (baseline.status !== 0 || !baseline.stdout.trim()) return;
+    write('added.txt', 'added\n');
+    write('tracked.txt', 'changed\n');
+    const changed = spawnSync('node', [VCS, '--changes', '--cwd', fixture.wc, '--since', baseline.stdout.trim()], { encoding: 'utf8' });
+    const expectedSvn = 'A\tadded.txt\nM\ttracked.txt\n';
+    assert(changed.status === 0 && changed.stdout === expectedSvn,
+      '(d) forge-vcs --changes lists exactly the SVN-written paths and statuses', JSON.stringify(changed));
+
+    const state = path.join(fixture.dir, 'state.json');
+    const initialized = spawnSync('node', [SR, '--state-init', '--state', state, '--cwd', fixture.wc], { encoding: 'utf8' });
+    assert(initialized.status === 0 && initialized.stdout.trim() !== '',
+      '(e) SVN state-init exits 0 and prints a non-empty START_SHA', JSON.stringify(initialized));
+    const events = path.join(fixture.dir, 'events.jsonl');
+    const guard = spawnSync('bash', ['-c',
+      'START_SHA="$1"; REASON=""; [ -n "$START_SHA" ] || REASON="sidecar-state-init-failed"; [ -n "$REASON" ] && echo "{\\"event\\":\\"worker-engine-fallback\\",\\"reason\\":\\"$REASON\\"}" >> "$2"; echo "REASON=$REASON"',
+      'section81-guard', initialized.stdout.trim(), events], { encoding: 'utf8' });
+    const eventText = fs.existsSync(events) ? fs.readFileSync(events, 'utf8') : '';
+    assert(guard.status === 0 && guard.stdout.trim() === 'REASON=' && !eventText.includes('sidecar-state-init-failed'),
+      '(e) literal mirror guard leaves REASON empty and emits no SVN state-init failure event', JSON.stringify({ guard, eventText }));
+
+    const invalid = mkTmp('section81-invalid-vcs');
+    try {
+      const invalidState = path.join(invalid, 'state.json');
+      const invalidInit = spawnSync('node', [SR, '--state-init', '--state', invalidState, '--cwd', invalid], { encoding: 'utf8' });
+      const invalidEvents = path.join(invalid, 'events.jsonl');
+      const invalidGuard = spawnSync('bash', ['-c',
+        'START_SHA="$1"; REASON=""; [ -n "$START_SHA" ] || REASON="sidecar-state-init-failed"; [ -n "$REASON" ] && echo "{\\"event\\":\\"worker-engine-fallback\\",\\"reason\\":\\"$REASON\\"}" >> "$2"; echo "REASON=$REASON"',
+        'section81-guard', invalidInit.stdout.trim(), invalidEvents], { encoding: 'utf8' });
+      const invalidText = fs.existsSync(invalidEvents) ? fs.readFileSync(invalidEvents, 'utf8') : '';
+      assert(invalidInit.status !== 0 && invalidInit.stdout === '' && invalidGuard.stdout.trim() === 'REASON=sidecar-state-init-failed'
+        && invalidText.includes('sidecar-state-init-failed'),
+      '(e) literal mirror guard distinguishes a no-VCS state-init failure', JSON.stringify({ invalidInit, invalidGuard, invalidText }));
+    } finally { cleanup(invalid); }
+  } finally { cleanup(fixture.dir); }
+
+  const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeSidecarDiffCanonical\(\); \}/.test(mainBody),
+    '(final) Section 81 is registered through a closure in main()');
+  pass('(final) Section 81: canonical mirrors, git parity, SVN changes, and state-init fallback guard verified');
+}
+
 // ── Section 73: the harness protects its own coverage ──────────────────────
 async function smokeSectionIsolation() {
   process.stdout.write('\n▸ Section 73: section isolation\n');
@@ -9473,6 +10548,135 @@ async function smokeSectionIsolation() {
 // Deliberately throws — the fixture body for the isolation guard above.
 function smokeBoomFixture() {
   throw new TypeError("Cannot read properties of undefined (reading '0')");
+}
+
+// ── Section 82: isolation in SVN + vcs dispatch telemetry ─────────────────
+function smokeIsolationSvnAndVcsTelemetry() {
+  process.stdout.write('\n▸ Section 82: isolation in SVN + vcs dispatch telemetry\n');
+  const isolation = path.join(SCRIPTS, 'forge-isolation.js');
+  const prefs = {
+    forge_isolation: { mode: 'worktree' },
+    workers: { require_worktree: true },
+  };
+  const writePrefs = (dir) => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify(prefs), 'utf8');
+  };
+  const jsonRun = (args, opts) => {
+    const r = spawnSync('node', [isolation, ...args], { encoding: 'utf8', ...opts });
+    let value = null;
+    try { value = JSON.parse(r.stdout); } catch {}
+    return { status: r.status, value, stderr: r.stderr || '', stdout: r.stdout || '' };
+  };
+
+  // (a)+(c): the SVN setup must return a named shared no-op rather than
+  // entering git worktree setup and producing the all-repositories STOP shape.
+  const decision = svnGateDecision(process.env, process.platform, hasSvn());
+  if (decision === 'fail') {
+    fail('Section 82: svn e svnadmin ausentes no runner que deve gatear',
+      'ci.yml instala subversion no runner Linux — ausência aqui é falso-verde, não skip');
+  } else if (decision === 'skip') {
+    skip('Section 82: SVN effective-mode/setup fixture', 'svn e svnadmin devem estar no PATH');
+  } else {
+    const fixture = initSvnRepo('section82-svn');
+    if (fixture) {
+      try {
+        writePrefs(fixture.wc);
+        const effective = jsonRun(['--effective-mode', '--cwd', fixture.wc], {
+          env: { ...process.env, SVN_CONFIG_DIR: fixture.configDir },
+        });
+        assert(effective.status === 0 && effective.value
+          && effective.value.mode === 'shared' && effective.value.elevated === false
+          && effective.value.vcs === 'svn' && effective.value.user_mode === 'worktree'
+          && /svn/i.test(effective.value.elevation_reason || ''),
+        '(a) SVN worktree request resolves to named shared mode and preserves user_mode', JSON.stringify(effective));
+
+        const setup = jsonRun(['--setup', '--run', 'S82-SVN', '--cwd', fixture.wc], {
+          env: { ...process.env, SVN_CONFIG_DIR: fixture.configDir },
+        });
+        assert(setup.status === 0 && setup.value && setup.value.mode === 'shared'
+          && setup.value.vcs === 'svn' && Array.isArray(setup.value.repos)
+          && setup.value.repos.length === 0,
+        '(c) SVN setup is a shared no-op, never the all-repositories-failed STOP shape', JSON.stringify(setup));
+
+        const cleanupResult = jsonRun(['--cleanup', '--run', 'S82-SVN', '--cwd', fixture.wc], {
+          env: { ...process.env, SVN_CONFIG_DIR: fixture.configDir },
+        });
+        assert(cleanupResult.status === 0 && cleanupResult.value && cleanupResult.value.vcs === 'svn',
+          '(c) cleanup JSON propagates additive vcs for SVN', JSON.stringify(cleanupResult));
+      } finally { cleanup(fixture.dir); }
+    }
+  }
+
+  // (b): same prefs, different VCS. This is intentionally a real git repo so
+  // it proves the SVN guard is positively scoped and leaves git elevation intact.
+  const gitDir = mkTmp('section82-git');
+  try {
+    const init = spawnSync('git', ['init', '-q', '-b', 'main', gitDir], { encoding: 'utf8' });
+    if (init.status !== 0) {
+      fail('Section 82: git fixture initializes', JSON.stringify(init));
+    } else {
+      writePrefs(gitDir);
+      const effective = jsonRun(['--effective-mode', '--cwd', gitDir]);
+      assert(effective.status === 0 && effective.value
+        && effective.value.mode === 'worktree' && effective.value.elevated === false
+        && effective.value.vcs === 'git' && effective.value.user_mode === 'worktree',
+      '(b) identical worktree prefs retain git worktree mode and report vcs:git', JSON.stringify(effective));
+    }
+  } finally { cleanup(gitDir); }
+
+  // (d): count each mirror's dispatch emitters. Presence must be per emitter,
+  // so a forgotten line cannot be masked by another correctly updated line.
+  const skills = [
+    ['forge-auto', 'forge-auto/SKILL.md', 4],
+    ['forge-next', 'forge-next/SKILL.md', 3],
+    ['forge-task', 'forge-task/SKILL.md', 2],
+  ];
+  for (const [name, rel, expected] of skills) {
+    const source = fs.readFileSync(path.join(path.dirname(SCRIPTS), 'skills', rel), 'utf8');
+    const lines = source.split(/\r?\n/).filter(line => line.includes('\\"event\\":\\"dispatch\\"'));
+    assert(lines.length === expected && lines.every(line => line.includes('\\"vcs\\":')),
+      `(d) ${name} has vcs on all ${expected} dispatch event emitters`, JSON.stringify(lines));
+  }
+  const dispatchSpec = fs.readFileSync(path.join(path.dirname(SCRIPTS), 'shared', 'forge-dispatch.md'), 'utf8');
+  assert(/\| `vcs` \| string \| `detectVcs\(CODE_DIR\)` \| `"git"` \|/.test(dispatchSpec)
+    && /`vcs` is likewise additive/.test(dispatchSpec),
+  '(d) dispatch spec documents additive vcs field and git example');
+
+  // (e) DISPATCH_VCS prelude: 9 emitters across 3 files must carry a
+  // byte-identical extraction line, named-reference the canonical block in
+  // shared/forge-dispatch.md, and the canonical title must appear exactly
+  // once. Reviewer R1: a single site edited in isolation must turn this red.
+  const dispatchVcsTitle = '#### DISPATCH_VCS prelude (canonical — VCS-agnostic)';
+  const dispatchVcsReference = 'shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)';
+  const dispatchVcsMirrors = [
+    ['forge-auto', 'forge-auto/SKILL.md', 4],
+    ['forge-next', 'forge-next/SKILL.md', 3],
+    ['forge-task', 'forge-task/SKILL.md', 2],
+  ];
+  const dispatchVcsLine = 'DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")';
+  for (const [name, rel, expected] of dispatchVcsMirrors) {
+    const source = fs.readFileSync(path.join(path.dirname(SCRIPTS), 'skills', rel), 'utf8');
+    const referenceCount = source.split(dispatchVcsReference).length - 1;
+    const extractionLines = source.split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line.startsWith('DISPATCH_VCS='));
+    assert(referenceCount === expected,
+      `(e) ${name} names the DISPATCH_VCS prelude exactly ${expected}x (got ${referenceCount})`);
+    assert(extractionLines.length === expected && extractionLines.every(line => line === dispatchVcsLine),
+      `(e) ${name} has ${expected} byte-identical DISPATCH_VCS extraction lines`, JSON.stringify(extractionLines));
+  }
+  const dispatchVcsTitleCount = dispatchSpec.split(dispatchVcsTitle).length - 1;
+  assert(dispatchVcsTitleCount === 1,
+    `(e) shared/forge-dispatch.md carries the DISPATCH_VCS prelude block exactly once (got ${dispatchVcsTitleCount})`);
+  assert(dispatchSpec.includes('forge-vcs.js" --detect --field vcs'),
+    '(e) DISPATCH_VCS prelude block invokes forge-vcs.js --detect --field vcs');
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeIsolationSvnAndVcsTelemetry\(\); \}/.test(mainBody),
+    '(final) Section 82 is registered through a closure in main()');
+  pass('(final) Section 82: SVN shared isolation, git preservation, setup/cleanup vcs, DISPATCH_VCS prelude, and nine telemetry emitters verified');
 }
 
 async function main() {
@@ -9565,6 +10769,13 @@ async function main() {
       () => { smokeSidecarModel(); },
       () => { smokeVerifierCodeDir(); },
       () => { smokeWindowsSandboxAndWorktreeDeps(); },
+      () => { smokeSvnFixture(); },
+      () => { smokeVcsSeam(); },
+      () => { smokeSvnPrimitives(); },
+      () => { smokeSvnRevisionGuard(); },
+      () => { smokeSidecarDiffCanonical(); },
+      () => { smokeXllmSvn(); },
+      () => { smokeIsolationSvnAndVcsTelemetry(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
@@ -9578,7 +10789,11 @@ async function main() {
   if (crashedSections.length > 0) {
     process.stdout.write(`⚠ ${crashedSections.length} section(s) crashed and did not finish: ${crashedSections.join(', ')}\n`);
   }
-  process.stdout.write(`Results: ${passes} passed, ${fails} failed (${ms}ms)\n`);
+  process.stdout.write(`Results: ${passes} passed, ${fails} failed, ${skips} skipped (${ms}ms)\n`);
+  if (skips > 0) {
+    process.stdout.write('\nSkipped:\n');
+    for (const s of skipped) process.stdout.write(`  ⊘ ${s.name}: ${s.reason}\n`);
+  }
   if (failures.length > 0) {
     process.stdout.write('\nFailures:\n');
     for (const f of failures) process.stdout.write(`  ✗ ${f.name}: ${f.detail}\n`);

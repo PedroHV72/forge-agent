@@ -2,7 +2,7 @@
 'use strict';
 
 /*
- * forge-surgical-reset.js — git-derived surgical reset engine + CLI (M013 S01).
+ * forge-surgical-reset.js — surgical reset engine + CLI (M013 S01).
  *
  * SAFETY-CRITICAL. This module RESETS a git working tree. A bug here can destroy
  * a user's uncommitted work. Every design decision below is load-bearing; do not
@@ -27,122 +27,26 @@
  *      every pre_dirty path: if any diverged, the sidecar ALSO wrote a pre-dirty
  *      file → abort, reset NOTHING (not even the non-overlapped files), exit 3.
  *
- * All git calls use spawnSync('git', [args...]) with array args — never shell,
- * never string interpolation. All parsing is NUL-delimited (-z) so paths with
- * spaces/quotes/newlines are safe.
+ * VCS I/O is delegated to forge-vcs.js, which uses argv arrays and NUL-delimited
+ * parsing so paths with spaces/quotes/newlines remain safe.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const vcs = require('./forge-vcs.js');
 
-const MAX_BUFFER = 32 * 1024 * 1024; // 32MB — large diffs on big worktrees
-
-// ── .gsd exclusion — ONE predicate, used in all three operations ────────────────
-// The orchestrator writes .gsd/** during the flow (state files, events). It must
-// be excluded consistently from snapshot, post-run diff AND reset — an inclusion
-// mismatch across the three corrupts the set-diff (explicit S01-RISK warning).
-function isGsdPath(p) {
-  return p === '.gsd' || p.startsWith('.gsd/');
-}
-
-// ── git primitives (array args, never shell) ────────────────────────────────────
-
-function git(cwd, args, opts) {
-  return spawnSync('git', ['-C', cwd, ...args], {
-    encoding: 'buffer',
-    maxBuffer: MAX_BUFFER,
-    ...opts,
-  });
-}
-
-function gitText(cwd, args) {
-  const r = git(cwd, args);
-  if (r.status !== 0) {
-    const err = r.stderr ? r.stderr.toString('utf8').trim() : `git ${args.join(' ')} failed`;
-    throw new Error(`git ${args[0]} failed: ${err}`);
-  }
-  return r.stdout.toString('utf8');
-}
+const OPTS = { exclude: vcs.isGsdPath, maxBuffer: 32 * 1024 * 1024 };
+const { isGsdPath, parsePorcelainZ, parseNameStatusZ, pruneEmptyParents } = vcs;
 
 /**
  * git hash-object of the CURRENT content of <relPath> in <cwd>. Returns the SHA-1
  * string, or null when the file does not exist (a pre-existing/current deletion).
  * @returns {string|null}
  */
-function hashObject(cwd, relPath) {
-  const abs = path.join(cwd, relPath);
-  if (!fs.existsSync(abs)) return null;
-  const r = git(cwd, ['hash-object', '--', relPath]);
-  if (r.status !== 0) return null;
-  return r.stdout.toString('utf8').trim() || null;
+function hashObject(cwd, relPath, vcsName = 'git') {
+  const result = vcs.hashPath(cwd, relPath, { ...OPTS, vcs: vcsName });
+  return result.ok ? result.hash : null;
 }
-
-// ── porcelain / diff parsers (NUL-delimited) ────────────────────────────────────
-
-/**
- * Parse `git status --porcelain -uall -z` (NUL-delimited). Each record is
- * "XY<space>path\0"; a rename/copy record (X or Y is R/C) is immediately
- * followed by an extra "origPath\0" field. Returns [{xy, path, origPath?}].
- * @param {Buffer|string} buf
- */
-function parsePorcelainZ(buf) {
-  const s = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf);
-  // Split on NUL; drop the trailing empty produced by the final terminator.
-  const tokens = s.split('\0');
-  if (tokens.length && tokens[tokens.length - 1] === '') tokens.pop();
-
-  const out = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const tok = tokens[i];
-    if (tok.length < 3) continue; // malformed / stray token
-    const xy = tok.slice(0, 2);
-    const p = tok.slice(3); // skip the single space after XY
-    const isRenameCopy = xy[0] === 'R' || xy[0] === 'C' || xy[1] === 'R' || xy[1] === 'C';
-    if (isRenameCopy) {
-      // The NEXT token is the original path (rename source).
-      const origPath = tokens[i + 1];
-      i += 1;
-      out.push({ xy, path: p, origPath });
-    } else {
-      out.push({ xy, path: p });
-    }
-  }
-  return out;
-}
-
-/**
- * Parse `git diff --name-status -z <sha>` (NUL-delimited). Records are a status
- * token followed by NUL-separated path field(s). A rename/copy status (R###/C###)
- * carries TWO path fields (old, new); everything else carries one.
- * Returns [{status, path, origPath?}] with status as the raw first char.
- * @param {Buffer|string} buf
- */
-function parseNameStatusZ(buf) {
-  const s = Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf);
-  const tokens = s.split('\0');
-  if (tokens.length && tokens[tokens.length - 1] === '') tokens.pop();
-
-  const out = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const statusTok = tokens[i];
-    if (!statusTok) continue;
-    const code = statusTok[0];
-    if (code === 'R' || code === 'C') {
-      const oldPath = tokens[i + 1];
-      const newPath = tokens[i + 2];
-      i += 2;
-      out.push({ status: code, path: newPath, origPath: oldPath });
-    } else {
-      const p = tokens[i + 1];
-      i += 1;
-      out.push({ status: code, path: p });
-    }
-  }
-  return out;
-}
-
-// ── snapshot / post-run change computation ──────────────────────────────────────
 
 /**
  * Snapshot the pre-existing dirty set as {path, hash} pairs. .gsd/** excluded.
@@ -151,21 +55,12 @@ function parseNameStatusZ(buf) {
  * (now-missing → hash:null), so an overlap on either side is detected.
  * @returns {{path:string, hash:string|null}[]}
  */
-function captureSnapshot(cwd) {
-  const porcelain = git(cwd, ['status', '--porcelain', '-uall', '-z']).stdout;
-  const entries = parsePorcelainZ(porcelain);
-  const seen = new Set();
-  const snapshot = [];
-  const add = (p) => {
-    if (!p || isGsdPath(p) || seen.has(p)) return;
-    seen.add(p);
-    snapshot.push({ path: p, hash: hashObject(cwd, p) });
-  };
-  for (const e of entries) {
-    add(e.path);
-    if (e.origPath) add(e.origPath);
-  }
-  return snapshot;
+function captureSnapshot(cwd, vcsName = 'git') {
+  const result = vcs.captureDirty(cwd, { ...OPTS, vcs: vcsName });
+  // Never trust `.entries` without checking `.ok` on a SAFETY-CRITICAL path: a silent
+  // `[]` here would make the engine believe there was no pre-existing dirty work (R1).
+  if (!result.ok) throw new Error(`git status failed: ${result.error}`);
+  return result.entries;
 }
 
 /**
@@ -175,37 +70,8 @@ function captureSnapshot(cwd) {
  *   - untracked files from `git status --porcelain -uall -z` (?? → A).
  * @returns {{path:string, status:'A'|'M'|'D'}[]}
  */
-function computePostChanges(cwd, startSha) {
-  const byPath = new Map(); // path → 'A' | 'M' | 'D'
-  const set = (p, st) => {
-    if (!p || isGsdPath(p)) return;
-    byPath.set(p, st);
-  };
-
-  const diffBuf = git(cwd, ['diff', '--name-status', '-z', startSha]).stdout;
-  for (const e of parseNameStatusZ(diffBuf)) {
-    if (e.status === 'R' || e.status === 'C') {
-      // old path removed (D), new path created (A). For a copy the old side is
-      // unchanged, but marking it D is harmless: it is restored from START_SHA
-      // where it already exists (checkout is a no-op on identical content).
-      set(e.origPath, 'D');
-      set(e.path, 'A');
-    } else if (e.status === 'A') {
-      set(e.path, 'A');
-    } else if (e.status === 'D') {
-      set(e.path, 'D');
-    } else {
-      set(e.path, 'M'); // M, T (type change), etc. → restore from START_SHA
-    }
-  }
-
-  // Untracked files (not in the diff vs a commit) → treat as created (A).
-  const porcelain = git(cwd, ['status', '--porcelain', '-uall', '-z']).stdout;
-  for (const e of parsePorcelainZ(porcelain)) {
-    if (e.xy === '??') set(e.path, 'A');
-  }
-
-  return Array.from(byPath.entries()).map(([p, st]) => ({ path: p, status: st }));
+function computePostChanges(cwd, startSha, vcsName = 'git') {
+  return vcs.postChanges(cwd, startSha, { ...OPTS, vcs: vcsName }).entries;
 }
 
 // ── the pure decision function (the heart of the engine) ────────────────────────
@@ -248,20 +114,6 @@ function computeResetTarget(postChanges, preDirty, hashNow) {
 
 // ── reset execution + verification ──────────────────────────────────────────────
 
-/** Remove empty parent directories of <relPath>, upward, stopping at the repo
- *  root or the first non-empty dir. Best-effort — never throws. */
-function pruneEmptyParents(cwd, relPath) {
-  let dir = path.dirname(relPath);
-  while (dir && dir !== '.' && dir !== path.sep) {
-    const abs = path.join(cwd, dir);
-    try {
-      if (fs.readdirSync(abs).length !== 0) break;
-      fs.rmdirSync(abs);
-    } catch { break; }
-    dir = path.dirname(dir);
-  }
-}
-
 /**
  * Execute the reset. HARD GUARD: refuses to run when target.overlap is non-empty.
  * - restore: `git checkout START_SHA -- <paths...>` in one batched, shell-free call.
@@ -269,33 +121,32 @@ function pruneEmptyParents(cwd, relPath) {
  * Never touches preserved paths, never touches .gsd/**.
  * @returns {{restored:string[], removed:string[]}}
  */
-function executeReset(cwd, startSha, target) {
-  if (target.overlap.length !== 0) {
-    throw new Error('executeReset refused: overlap is non-empty (caller must abort)');
-  }
-  const restored = [];
-  const removed = [];
+function executeReset(cwd, startSha, target, vcsName = 'git') {
+  const result = vcs.restoreAndRemove(cwd, startSha, target, { ...OPTS, vcs: vcsName });
+  if (!result.ok) throw new Error(`surgical reset checkout failed: ${result.error}`);
+  return { restored: result.restored, removed: result.removed };
+}
 
-  if (target.restore.length) {
-    const r = git(cwd, ['checkout', startSha, '--', ...target.restore]);
-    if (r.status !== 0) {
-      const err = r.stderr ? r.stderr.toString('utf8').trim() : 'git checkout failed';
-      throw new Error(`surgical reset checkout failed: ${err}`);
-    }
-    restored.push(...target.restore);
+/**
+ * Recompute which paths, among the post-run changes vs START_SHA, are NOT
+ * accounted for by the pre-dirty snapshot (i.e. still diverge from the
+ * untouched pre-existing content). Shared by verifyReset (code:2 path) and by
+ * the throw-path diagnostic in resetFromState (R1) — same derivation, same
+ * shape, so both failure surfaces give the operator identical visibility.
+ * Re-queries live state (postChanges/hashObject) rather than trusting any
+ * `restored`/`removed` array, per the S03/R2 contract: those arrays are not
+ * an audit trail when `ok:false`.
+ * @returns {string[]}
+ */
+function computeLeftover(cwd, startSha, preDirty, vcsName = 'git') {
+  const preByPath = new Map(preDirty.map((d) => [d.path, d.hash]));
+  const post = computePostChanges(cwd, startSha, vcsName);
+  const leftover = [];
+  for (const { path: p } of post) {
+    if (!preByPath.has(p)) { leftover.push(p); continue; }
+    if (hashObject(cwd, p, vcsName) !== preByPath.get(p)) leftover.push(p);
   }
-
-  for (const rel of target.remove) {
-    if (isGsdPath(rel)) continue; // defensive — never remove .gsd/**
-    const abs = path.join(cwd, rel);
-    try {
-      fs.rmSync(abs, { force: true });
-      removed.push(rel);
-      pruneEmptyParents(cwd, rel);
-    } catch { /* best-effort — leftover surfaces in verifyReset */ }
-  }
-
-  return { restored, removed };
+  return leftover;
 }
 
 /**
@@ -305,14 +156,8 @@ function executeReset(cwd, startSha, target) {
  * leftover → verification fails.
  * @returns {{verified:boolean, leftover:string[]}}
  */
-function verifyReset(cwd, startSha, preDirty) {
-  const preByPath = new Map(preDirty.map((d) => [d.path, d.hash]));
-  const post = computePostChanges(cwd, startSha);
-  const leftover = [];
-  for (const { path: p } of post) {
-    if (!preByPath.has(p)) { leftover.push(p); continue; }
-    if (hashObject(cwd, p) !== preByPath.get(p)) leftover.push(p);
-  }
+function verifyReset(cwd, startSha, preDirty, vcsName = 'git') {
+  const leftover = computeLeftover(cwd, startSha, preDirty, vcsName);
   return { verified: leftover.length === 0, leftover };
 }
 
@@ -330,12 +175,37 @@ function readState(stateFile) {
 }
 
 /**
+ * Parse the raw `svnversion` result into a durable, comparison-safe revision
+ * range. This is deliberately pure: `svnversion` itself is invoked only by the
+ * VCS seam, so policy can be tested without an SVN executable or working copy.
+ *
+ * `M`, `S`, and `P` describe working-copy shape, not an obsolete baseline. They
+ * are discarded before persistence/comparison. Revision zero is never a valid
+ * dispatch baseline (it means the working copy has not been updated yet).
+ * @returns {{ok:true,range:string}|{ok:false,error:string}}
+ */
+function parseSvnBaseline(raw) {
+  const match = /^(\d+)(?::(\d+))?[MSP]*$/.exec(String(raw == null ? '' : raw).trim());
+  if (!match) return { ok: false, error: 'svn-baseline-unparseable' };
+  const lo = Number(match[1]);
+  const hi = match[2] === undefined ? null : Number(match[2]);
+  if (lo === 0 || hi === 0) return { ok: false, error: 'svn-baseline-zero-revision' };
+  return { ok: true, range: hi === null ? String(lo) : `${lo}:${hi}` };
+}
+
+/**
  * Capture START_SHA + the pre-dirty snapshot and write BOTH in ONE atomic write.
  * @returns {object} the written state
  */
 function initState(stateFile, { cwd, attempt }) {
-  const startSha = gitText(cwd, ['rev-parse', 'HEAD']).trim();
-  const preDirty = captureSnapshot(cwd);
+  const detected = vcs.detectVcs(cwd);
+  const vcsName = detected === 'svn' ? 'svn' : 'git';
+  const b = vcs.baselineId(cwd, { ...OPTS, vcs: vcsName });
+  if (!b.ok) throw new Error(vcsName === 'svn' ? b.error : `git rev-parse failed: ${b.error}`);
+  const parsed = vcsName === 'svn' ? parseSvnBaseline(b.id) : null;
+  if (parsed && !parsed.ok) throw new Error(parsed.error);
+  const startSha = parsed ? parsed.range : b.id;
+  const preDirty = captureSnapshot(cwd, vcsName);
   const state = {
     attempt: attempt == null ? 1 : attempt,
     start_sha: startSha,
@@ -344,6 +214,7 @@ function initState(stateFile, { cwd, attempt }) {
     result_file: '',
     code_dir: cwd,
     transient_retry_count: 0,
+    vcs: vcsName,
   };
   writeJsonAtomic(stateFile, state);
   return state;
@@ -384,16 +255,75 @@ function resetFromState(stateFile) {
   const cwd = state.code_dir;
   const startSha = state.start_sha;
   const preDirty = Array.isArray(state.pre_dirty) ? state.pre_dirty : [];
+  const stateVcs = state.vcs;
 
-  const post = computePostChanges(cwd, startSha);
-  const target = computeResetTarget(post, preDirty, (p) => hashObject(cwd, p));
+  // A legacy state predates VCS discrimination. It is intentionally git-only
+  // and must not probe: probing would change the existing git path and could
+  // reinterpret a durable legacy state under a different VCS.
+  let vcsName = 'git';
+  if (stateVcs !== undefined) {
+    const detectedRaw = vcs.detectVcs(cwd);
+    const detected = detectedRaw === 'svn' ? 'svn' : 'git';
+    if (stateVcs !== detected) {
+      return {
+        code: 3,
+        result: {
+          ok: false,
+          abort: 'vcs-state-mismatch',
+          expected: stateVcs,
+          detected,
+          overlap: [],
+          preserved: [],
+        },
+      };
+    }
+    vcsName = stateVcs;
+  }
+
+  if (vcsName === 'svn') {
+    const baseline = vcs.baselineId(cwd, { ...OPTS, vcs: 'svn' });
+    if (!baseline.ok) throw new Error(baseline.error);
+    const parsed = parseSvnBaseline(baseline.id);
+    if (!parsed.ok) throw new Error(parsed.error);
+    if (parsed.range !== startSha) {
+      return {
+        code: 3,
+        result: {
+          ok: false,
+          abort: 'svn-revision-moved',
+          baseline: startSha,
+          current: parsed.range,
+          overlap: [],
+          preserved: [],
+        },
+      };
+    }
+  }
+
+  const post = computePostChanges(cwd, startSha, vcsName);
+  const target = computeResetTarget(post, preDirty, (p) => hashObject(cwd, p, vcsName));
 
   if (target.overlap.length !== 0) {
     return { code: 3, result: { ok: false, overlap: target.overlap, preserved: target.preserved } };
   }
 
-  const done = executeReset(cwd, startSha, target);
-  const check = verifyReset(cwd, startSha, preDirty);
+  let done;
+  try {
+    done = executeReset(cwd, startSha, target, vcsName);
+  } catch (e) {
+    // Best-effort diagnostic (R1): the tree is in an UNKNOWN state per the
+    // S03/R2 contract, so this MUST re-query live state, never trust `result`
+    // fields off the throw. If the re-query itself fails, the ORIGINAL error
+    // must survive untouched — a diagnostic that swallows the real cause
+    // would be worse than no diagnostic at all.
+    try {
+      e.leftover = computeLeftover(cwd, startSha, preDirty, vcsName);
+    } catch (_diagErr) {
+      // swallow: original error below is what matters
+    }
+    throw e;
+  }
+  const check = verifyReset(cwd, startSha, preDirty, vcsName);
   if (!check.verified) {
     return {
       code: 2,
@@ -416,10 +346,12 @@ module.exports = {
   isGsdPath,
   parsePorcelainZ,
   parseNameStatusZ,
+  parseSvnBaseline,
   hashObject,
   captureSnapshot,
   computePostChanges,
   computeResetTarget,
+  computeLeftover,
   executeReset,
   verifyReset,
   pruneEmptyParents,
@@ -505,9 +437,22 @@ function main() {
 
     if (args.reset) {
       if (!args.state) usageError('--reset requires --state <file>');
-      const { code, result } = resetFromState(args.state);
-      process.stdout.write(JSON.stringify(result) + '\n');
-      process.exit(code);
+      try {
+        const { code, result } = resetFromState(args.state);
+        process.stdout.write(JSON.stringify(result) + '\n');
+        process.exit(code);
+      } catch (e) {
+        // R1: same leftover shape as the code:2 (verify-failed) path, so the
+        // operator has identical visibility on both failure surfaces. Exit
+        // code stays 1 (unchanged) — this only adds a diagnostic, it never
+        // reclassifies the failure as a different exit path.
+        const leftover = Array.isArray(e.leftover) ? e.leftover : null;
+        if (leftover) {
+          process.stdout.write(JSON.stringify({ ok: false, error: e.message, leftover }) + '\n');
+        }
+        process.stderr.write(`forge-surgical-reset: ${e.message}\n`);
+        process.exit(1);
+      }
     }
 
     usageError('one of --state-init | --state-init-read-only | --state-update | --reset is required');
