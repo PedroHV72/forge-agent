@@ -45,6 +45,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installStatusItem()
         refreshBadge()
         Notifier.shared.start()
+        // One network check per launch — a release does not land twice in an
+        // afternoon, and a timer here would be pure noise.
+        UpdateStore.shared.checkOnLaunch()
         observer = NotificationCenter.default.addObserver(
             forName: AppState.didChange, object: nil, queue: .main
         ) { [weak self] _ in

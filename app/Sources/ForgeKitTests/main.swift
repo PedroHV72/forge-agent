@@ -750,6 +750,86 @@ test("contagem de tasks por slice") {
     assertEqual(sl.totalTasks, 3)
 }
 
+print("\nChangelogParser + Version")
+
+test("parseia versões, seções e bullets") {
+    let md = """
+    ## Unreleased — Cost-aware dispatch
+
+    ### Added
+
+    - Prompts determinísticos com budget.
+    - Telemetria por chamada.
+
+    ### Fixed
+
+    - **Perda silenciosa de dados.** `forge-state.js` truncava a seção
+      até a primeira linha, apagando o histórico.
+
+    ---
+
+    ## v2.10.0 — Roteamento
+
+    ### Changed
+
+    - Modelo resolvido por tier.
+    """
+    let r = ChangelogParser.parse(md)
+    assertEqual(r.count, 2)
+    assertEqual(r[0].version, "Unreleased")
+    assertEqual(r[0].headline, "Cost-aware dispatch")
+    assertTrue(r[0].isUnreleased)
+    assertEqual(r[0].sections.count, 2)
+    assertEqual(r[0].sections[0].kind, .added)
+    assertEqual(r[0].sections[0].entries.count, 2)
+    assertEqual(r[1].version, "v2.10.0")
+}
+
+test("bullet quebrado em várias linhas vira uma entrada") {
+    let md = """
+    ## v1.0.0 — x
+
+    ### Fixed
+
+    - Primeira linha
+      continuação da mesma entrada.
+    - Outra entrada.
+    """
+    let sec = ChangelogParser.parse(md)[0].sections[0]
+    assertEqual(sec.entries.count, 2)
+    assertTrue(sec.entries[0].contains("continuação"), "linhas juntadas: \(sec.entries[0])")
+}
+
+test("markdown inline é limpo") {
+    assertEqual(ChangelogParser.clean("**Bold.** roda `forge-state.js` agora"),
+                "Bold. roda forge-state.js agora")
+}
+
+test("seção desconhecida cai em Outros") {
+    assertEqual(ReleaseSection.Kind.from("Deprecated"), .other)
+    assertEqual(ReleaseSection.Kind.from("Fixed"), .fixed)
+}
+
+test("changelog vazio não quebra") {
+    assertEqual(ChangelogParser.parse("").count, 0)
+    assertEqual(ChangelogParser.parse("texto solto sem cabeçalho").count, 0)
+}
+
+test("comparação de versão é semântica, não alfabética") {
+    // The case that matters as a project ages: a string compare puts v2.9.0
+    // above v2.11.0 and would tell you to downgrade.
+    assertTrue(Version.isNewer("v2.11.0", than: "v2.9.0"))
+    assertFalse(Version.isNewer("v2.9.0", than: "v2.11.0"))
+    assertTrue(Version.isNewer("2.11.1", than: "v2.11.0"))
+    assertFalse(Version.isNewer("v2.11.0", than: "v2.11.0"))
+    assertTrue(Version.isNewer("v3.0.0", than: "v2.99.99"))
+}
+
+test("sufixo de pré-release é ignorado na comparação") {
+    assertEqual(Version.components("v2.1.0-beta.1"), [2, 1, 0])
+    assertFalse(Version.isNewer("v2.1.0-beta.1", than: "v2.1.0"))
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")

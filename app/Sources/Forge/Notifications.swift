@@ -154,14 +154,19 @@ final class Notifier: NSObject, ObservableObject {
     private func postFallback(_ gate: Gate) {
         let sub = [gate.projectName, gate.subtitle]
             .filter { !$0.isEmpty }.joined(separator: " · ")
-        let body = gate.question.replacingOccurrences(of: "\n", with: " ")
+        postBanner(title: "Forge precisa de você", subtitle: sub,
+                   body: gate.question.replacingOccurrences(of: "\n", with: " "))
+    }
+
+    /// osascript banner. Shared by gates and update announcements.
+    private func postBanner(title: String, subtitle: String, body: String) {
         func esc(_ v: String) -> String {
             v.replacingOccurrences(of: "\\", with: "\\\\")
              .replacingOccurrences(of: "\"", with: "\\\"")
         }
         let script = "display notification \"\(esc(body))\" " +
-                     "with title \"Forge precisa de você\" " +
-                     "subtitle \"\(esc(sub))\" sound name \"Submarine\""
+                     "with title \"\(esc(title))\" " +
+                     "subtitle \"\(esc(subtitle))\" sound name \"Submarine\""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
@@ -235,6 +240,23 @@ final class Notifier: NSObject, ObservableObject {
                     self.announced.remove(gate.id)
                 }
             }
+        }
+    }
+
+    /// Announce a Forge release. Not a gate — no options to answer — so it goes
+    /// out as a plain banner on whichever path is working.
+    func announceUpdate(version: String, headline: String?) {
+        let body = headline.map { "\(version) — \($0)" } ?? "Versão \(version) disponível"
+        Self.trace("update \(version) via \(canAlert ? "nativa" : "osascript")")
+        if canAlert {
+            let content = UNMutableNotificationContent()
+            content.title = "Forge atualizado disponível"
+            content.body = body
+            content.sound = .default
+            center.add(UNNotificationRequest(identifier: "update-\(version)",
+                                             content: content, trigger: nil))
+        } else {
+            postBanner(title: "Forge — atualização disponível", subtitle: "", body: body)
         }
     }
 

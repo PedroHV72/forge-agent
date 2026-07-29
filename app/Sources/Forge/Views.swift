@@ -21,8 +21,10 @@ enum Section: String, CaseIterable, Identifiable {
     case projects = "Projetos"
     case runs = "Runs"
     case accounts = "Contas"
+    case models = "Modelos"
     case prefs = "Preferências"
     case history = "Histórico"
+    case updates = "Atualizações"
     case examples = "Exemplos"
 
     var id: String { rawValue }
@@ -34,8 +36,10 @@ enum Section: String, CaseIterable, Identifiable {
         case .projects: return "folder"
         case .runs:     return "play.circle"
         case .accounts: return "person.2"
+        case .models:   return "cpu"
         case .prefs:    return "slider.horizontal.3"
         case .history:  return "clock.arrow.circlepath"
+        case .updates:  return "arrow.down.circle"
         case .examples: return "sparkles"
         }
     }
@@ -81,8 +85,10 @@ struct RootView: View {
                 case .projects: ProjectsView(state: state)
                 case .runs:     RunsView(state: state)
                 case .accounts: AccountsView(state: state)
+                case .models:   ModelsView(state: state)
                 case .prefs:    PrefsView(state: state)
                 case .history:  HistoryView(state: state)
+                case .updates:  UpdatesView(state: state)
                 case .examples: ExamplesView(state: state)
                 }
             }
@@ -98,6 +104,7 @@ struct RootView: View {
         case .runs:     return state.liveRuns.isEmpty ? nil : state.liveRuns.count
         case .terminal: return state.sessions.isEmpty ? nil : state.sessions.count
         case .projects: return state.workspaces.isEmpty ? nil : state.workspaces.count
+        case .updates:  return UpdateStore.shared.updateAvailable ? 1 : nil
         default:        return nil
         }
     }
