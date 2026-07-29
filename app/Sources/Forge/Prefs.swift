@@ -276,8 +276,11 @@ struct PrefsView: View {
             HSplitView {
                 List(selection: $group) {
                     ForEach(store.groups, id: \.self) { g in
-                        HStack {
-                            Text(g == "geral" ? "Geral" : g)
+                        HStack(spacing: 7) {
+                            Image(systemName: PrefLabels.group(g).icon)
+                                .font(.caption).foregroundStyle(.secondary)
+                                .frame(width: 16)
+                            Text(PrefLabels.group(g).title)
                             Spacer()
                             // A count per group answers "where did I change
                             // things?" without opening all 22 of them.
@@ -295,6 +298,9 @@ struct PrefsView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
+                        if search.isEmpty, let g = group ?? store.groups.first {
+                            groupHeader(g)
+                        }
                         ForEach(visibleFields) { f in
                             PrefRow(field: f, store: store)
                         }
@@ -323,12 +329,33 @@ struct PrefsView: View {
         }
     }
 
+    @ViewBuilder private func groupHeader(_ g: String) -> some View {
+        let label = PrefLabels.group(g)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Image(systemName: label.icon).foregroundStyle(Color.accentOrange)
+                Text(label.title).font(.title3).bold()
+                Text(g).font(.caption2).foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .help("Nome da seção no arquivo de preferências")
+            }
+            if !label.blurb.isEmpty {
+                Text(label.blurb)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
     private var visibleFields: [PrefField] {
         var base = search.isEmpty
             ? store.fields(in: group ?? store.groups.first ?? "geral")
             : store.fields.filter {
                 $0.key.localizedCaseInsensitiveContains(search) ||
-                $0.description.localizedCaseInsensitiveContains(search)
+                $0.description.localizedCaseInsensitiveContains(search) ||
+                PrefLabels.humanise($0.leaf).localizedCaseInsensitiveContains(search) ||
+                PrefLabels.group($0.group).title.localizedCaseInsensitiveContains(search)
             }.sorted { $0.key < $1.key }
         if onlyChanged { base = base.filter { store.isOverridden($0) } }
         return base
@@ -369,7 +396,16 @@ struct PrefRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text(field.leaf).font(.callout).bold()
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(PrefLabels.humanise(field.leaf)).font(.callout).bold()
+                    // The machine name stays visible: it is what lands in the
+                    // file, what the docs use, and what you type when editing
+                    // by hand. Replacing it would give the app and the file two
+                    // names for the same knob.
+                    Text(field.leaf)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary).textSelection(.enabled)
+                }
                 if let origin = store.origin(of: field) {
                     Text(origin)
                         .font(.caption2)
@@ -401,9 +437,18 @@ struct PrefRow: View {
 
             if field.kind == .stringList { listEditor }
 
-            if let d = field.defaultValue {
-                Text("padrão: \(d.display)")
-                    .font(.caption2).foregroundStyle(.tertiary)
+            HStack(spacing: 10) {
+                if let v = store.value(for: field),
+                   let human = PrefLabels.humanValue(key: field.leaf, value: v) {
+                    // 1800000 is correct on disk and unreadable on screen.
+                    Label(human, systemImage: "equal.circle")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if let d = field.defaultValue {
+                    let humanDefault = PrefLabels.humanValue(key: field.leaf, value: d)
+                    Text("padrão: \(humanDefault ?? d.display)")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
             }
         }
         .padding(12)
@@ -529,13 +574,21 @@ struct PrefsDiffSheet: View {
                     ForEach(store.pendingEdits.keys.sorted(), id: \.self) { key in
                         let newValue = store.pendingEdits[key]!
                         HStack(alignment: .top, spacing: 8) {
-                            Text(key).font(.caption).bold().frame(width: 190, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(PrefLabels.humanise(key.components(separatedBy: ".").last ?? key))
+                                    .font(.caption).bold()
+                                Text(key).font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .frame(width: 190, alignment: .leading)
                             VStack(alignment: .leading, spacing: 1) {
                                 if case .null = newValue {
                                     Text("removido — volta ao padrão")
                                         .font(.caption).foregroundStyle(.orange)
                                 } else {
-                                    Text(newValue.display).font(.caption)
+                                    let leaf = key.components(separatedBy: ".").last ?? key
+                                    Text(PrefLabels.humanValue(key: leaf, value: newValue)
+                                         ?? newValue.display).font(.caption)
                                 }
                                 if let old = store.values[key] {
                                     Text("antes: \(old.display)")

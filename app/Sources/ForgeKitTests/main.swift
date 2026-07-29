@@ -452,6 +452,45 @@ test("lista sobrevive ao round-trip como array, não como string") {
     assertFalse(doc.contains("\"dist/**, build/**\""), "não pode virar string única")
 }
 
+print("\nPrefLabels (nome de máquina → texto humano)")
+
+test("humanise converte snake_case") {
+    assertEqual(PrefLabels.humanise("ask_in_auto"), "Ask in automático")
+    assertEqual(PrefLabels.humanise("adaptive_flags_lines"), "Adaptive flags lines")
+    assertEqual(PrefLabels.humanise("mode"), "Mode")
+}
+
+test("grupos conhecidos têm rótulo curado") {
+    assertEqual(PrefLabels.group("review").title, "Revisão de código")
+    assertEqual(PrefLabels.group("tier_models").title, "Modelos por tier")
+    assertFalse(PrefLabels.group("review").blurb.isEmpty, "grupo curado deve explicar-se")
+}
+
+test("grupo desconhecido cai na humanização, não quebra") {
+    // The schema keeps growing; a new group must render sanely with no edit here.
+    assertEqual(PrefLabels.group("nova_secao_qualquer").title, "Nova secao qualquer")
+}
+
+test("duração vira legível") {
+    assertEqual(PrefLabels.duration(ms: 1_800_000), "30 min")
+    assertEqual(PrefLabels.duration(ms: 2000), "2s")
+    assertEqual(PrefLabels.duration(ms: 3_600_000), "1h")
+    assertEqual(PrefLabels.duration(ms: 500), "500 ms")
+}
+
+test("humanValue usa o sufixo da chave como unidade") {
+    assertEqual(PrefLabels.humanValue(key: "gate_timeout_ms", value: .number(1_800_000)), "30 min")
+    assertEqual(PrefLabels.humanValue(key: "adaptive_flags_lines", value: .number(40)), "40 linhas")
+    // Thresholds appear both as fraction and percentage in this schema.
+    assertEqual(PrefLabels.humanValue(key: "warning_threshold", value: .number(0.35)), "35%")
+    assertEqual(PrefLabels.humanValue(key: "handoff_threshold", value: .number(90)), "90%")
+}
+
+test("humanValue não inventa unidade onde não há") {
+    assertTrue(PrefLabels.humanValue(key: "mode", value: .string("advisory")) == nil)
+    assertTrue(PrefLabels.humanValue(key: "rounds", value: .number(1)) == nil)
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
