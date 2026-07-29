@@ -17,6 +17,7 @@ so it stops asking where you are before every line.
 ### Fixed
 
 - **The app no longer has any implicit workspace fallback.** `b992edf` removed `workspaces.first` from the composer because it dispatched into whichever repo sorted first — a wrong-repo `/forge-auto` that looks exactly like a correct one. Two more copies survived in `LauncherSheet` and one in `launch(account:)`. All three are gone, and `scripts/forge-app-workspace.test.js` is a standing, platform-independent guard that fails if any of them returns.
+- **The app could not update itself.** `UpdateStore.runUpdate()` shelled out to `install.sh --update`, but the Swift build is gated behind `--with-app` — so the button refreshed every agent, skill, script and hook, reported success, and left the one binary the operator was looking at on the old version. It now passes `--with-app`, and because replacing a bundle does not replace the running process, the card offers "Reabrir na nova versão" instead of letting a stale window look current. `scripts/forge-app-update.test.js` guards both, and asserts the `--with-app` gate in `install.sh` still exists so the first assertion cannot quietly become vacuous.
 - **`install.sh` was not executable in the repository** (mode `100644`), so `./install.sh` — the command the README gives — failed on a fresh clone.
 
 ### Notes
