@@ -290,6 +290,38 @@ final class AppState: ObservableObject {
         else { show(r.stderr.isEmpty ? "não consegui registrar" : r.stderr, error: true) }
     }
 
+    func renameAccount(_ old: String, to new: String) {
+        let clean = new.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean != old else { return }
+        let r = ForgeCore.run("forge-accounts.js", ["--rename", old, "--to", clean])
+        if r.ok {
+            show("\(old) → \(clean)")
+            loadAccounts()
+            // Usage is keyed by name; the old entry would linger as a ghost row.
+            if let u = usage.removeValue(forKey: old) { usage[clean] = u }
+        } else {
+            show(r.stderr.isEmpty ? "falha ao renomear" : r.stderr, error: true)
+        }
+    }
+
+    /// The relaunch command, for pasting into a terminal the app did not open.
+    func copyLaunchCommand(_ name: String) {
+        let r = ForgeCore.run("forge-accounts.js", ["--launch-cmd", name])
+        let cmd = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard r.ok, !cmd.isEmpty else {
+            return show(r.stderr.isEmpty ? "não consegui gerar o comando" : r.stderr, error: true)
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(cmd, forType: .string)
+        show("Comando copiado")
+    }
+
+    func copyToPasteboard(_ text: String, label: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        show("\(label) copiado")
+    }
+
     func removeAccount(_ name: String) {
         let r = ForgeCore.run("forge-accounts.js", ["--remove", name])
         if r.ok { show("\(name) removida"); loadAccounts() }

@@ -148,8 +148,16 @@ public struct Account: Codable, Identifiable, Hashable {
     public let days_left: Int?
     public let has_token: Bool
     public let is_active: Bool
+    /// Recorded identity, present only once `--set-email` has run for this
+    /// account. Without it the status line cannot name a plain Keychain login.
+    public let email: String?
+    public let account_uuid: String?
 
     public var id: String { name }
+
+    /// Token validity is the one thing here that expires silently and breaks
+    /// every launch on this account when it does.
+    public var tokenExpiringSoon: Bool { (days_left ?? 999) < 30 }
 }
 
 public struct AccountsPayload: Codable {

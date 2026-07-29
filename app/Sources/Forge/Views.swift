@@ -414,16 +414,26 @@ struct RunStrip: View {
 struct AccountsView: View {
     @ObservedObject var state: AppState
 
+    /// The account to reach for next: most weekly headroom among those with a
+    /// token. Only meaningful once usage has actually been polled — guessing
+    /// from last_used would recommend confidently while knowing nothing.
+    private var recommended: String? {
+        guard state.usage.count > 1 else { return nil }
+        return state.accountsByHeadroom.first { $0.has_token && state.usage[$0.name] != nil }?.name
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 header
+                if state.accounts.isEmpty { empty }
                 LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 300, maximum: 460), spacing: 14)],
+                    columns: [GridItem(.adaptive(minimum: 330, maximum: 480), spacing: 14)],
                     alignment: .leading, spacing: 14
                 ) {
                     ForEach(state.accountsByHeadroom) { a in
-                        AccountCard(account: a, usage: state.usage[a.name], state: state)
+                        AccountCard(account: a, usage: state.usage[a.name],
+                                    isRecommended: a.name == recommended, state: state)
                     }
                 }
             }
@@ -431,84 +441,120 @@ struct AccountsView: View {
         }
         .navigationTitle("Contas")
         .onAppear { state.loadAccounts() }
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    state.refreshUsage()
+                } label: {
+                    if state.usageLoading { ProgressView().controlSize(.small) }
+                    else { Label("Consultar uso", systemImage: "arrow.clockwise") }
+                }
+                .disabled(state.usageLoading)
+                .help("Consulta a API de cada conta — gasta ~9 tokens por conta")
+            }
+        }
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                if let at = state.usageCheckedAt {
-                    Text("Uso verificado \(at.formatted(date: .omitted, time: .shortened))")
-                        .font(.caption).foregroundStyle(.secondary)
+                if let r = recommended {
+                    Label("Use \(r) agora", systemImage: "sparkles")
+                        .font(.callout).bold().foregroundStyle(Color.accentOrange)
+                    Text("Maior folga semanal entre as contas consultadas.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else if state.usageCheckedAt == nil {
+                    Text("Uso não consultado").font(.callout)
+                    Text("Sem isso a ordem é só alfabética — a folga real vem da API.")
+                        .font(.caption2).foregroundStyle(.secondary)
                 } else {
-                    Text("Uso não verificado")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text("\(state.accounts.count) conta(s)").font(.callout)
                 }
-                // Honesty about cost: this button spends quota, so say so.
-                Text("Consultar gasta ~9 tokens por conta.")
-                    .font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer()
-            Button {
-                state.refreshUsage()
-            } label: {
-                if state.usageLoading {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Label("Consultar uso", systemImage: "arrow.clockwise")
-                }
+            if let at = state.usageCheckedAt {
+                Text(at.formatted(date: .omitted, time: .shortened))
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .help("Última consulta de uso")
             }
-            .disabled(state.usageLoading)
-            .controlSize(.small)
         }
+        .padding(14)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var empty: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Nenhuma conta registrada", systemImage: "person.crop.circle.badge.questionmark")
+                .font(.callout)
+            // Registration needs a real TTY: `claude setup-token` opens a browser
+            // login and the app cannot host that.
+            Text("Registrar exige um terminal de verdade — o login abre o navegador. Rode:")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Text("forge-accounts add <nome>")
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                Button {
+                    state.copyToPasteboard("forge-accounts add ", label: "Comando")
+                } label: { Image(systemName: "doc.on.doc").font(.caption2) }
+                .buttonStyle(.plain).foregroundStyle(.tertiary)
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+        }
+        .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
 struct AccountCard: View {
     let account: Account
     let usage: AccountUsage?
+    let isRecommended: Bool
     @ObservedObject var state: AppState
-    @State private var confirmingRemove = false
 
-    /// Two different notions of "current", and conflating them is how you end
-    /// up thinking a terminal is on an account it is not:
-    ///   default  — what a bare `claude` will attach (persisted in the registry)
-    ///   sessão   — what THIS app's launches are using (FORGE_ACCOUNT)
+    @State private var confirmingRemove = false
+    @State private var renaming = false
+    @State private var draftName = ""
+
+    /// Two different notions of "current", and conflating them is how you end up
+    /// believing a terminal is on an account it is not:
+    ///   padrão — what a bare `claude` attaches to (persisted in the registry)
+    ///   em uso — what THIS app's sessions were launched with
     private var isDefault: Bool { state.activeAccount == account.name }
-    private var inSessions: Bool { state.sessions.contains { $0.account == account.name } }
+    private var sessionCount: Int { state.sessions.filter { $0.account == account.name }.count }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 11) {
             header
-
-            if let u = usage {
-                UsageBar(label: "5h", window: u.five_hour)
-                UsageBar(label: "7d", window: u.seven_day)
-            } else {
-                Text("uso desconhecido — use “Consultar uso”")
-                    .font(.caption2).foregroundStyle(.tertiary)
-            }
-
+            identity
+            usageSection
             meta
-
-            if account.has_token { actions }
-            else {
-                Label("sem token — registre pelo terminal: forge-accounts add \(account.name)",
-                      systemImage: "key.slash")
-                    .font(.caption2).foregroundStyle(.orange)
-                    .textSelection(.enabled)
-            }
+            Divider().padding(.vertical, 1)
+            actions
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(isDefault ? Color.accentOrange.opacity(0.35) : .clear, lineWidth: 1))
+            .strokeBorder(borderColor, lineWidth: 1))
         .confirmationDialog("Remover \(account.name)?",
                             isPresented: $confirmingRemove, titleVisibility: .visible) {
             Button("Remover", role: .destructive) { state.removeAccount(account.name) }
             Button("Cancelar", role: .cancel) {}
         } message: {
-            Text("Apaga a conta do registro e o token do Keychain. Não afeta a conta na Anthropic.")
+            Text("Apaga a conta do registro e o token do Keychain. A conta na Anthropic não é afetada.")
         }
+        .sheet(isPresented: $renaming) {
+            RenameSheet(current: account.name, draft: $draftName, isPresented: $renaming) { new in
+                state.renameAccount(account.name, to: new)
+            }
+        }
+    }
+
+    private var borderColor: Color {
+        if isRecommended { return Color.accentOrange.opacity(0.5) }
+        if isDefault { return Color.accentOrange.opacity(0.22) }
+        return .clear
     }
 
     private var header: some View {
@@ -516,32 +562,69 @@ struct AccountCard: View {
             Image(systemName: isDefault ? "largecircle.fill.circle" : "circle")
                 .font(.caption)
                 .foregroundStyle(isDefault ? Color.accentOrange : Color.secondary)
-            Text(account.name).font(.headline)
+            Text(account.name).font(.headline).lineLimit(1)
             Spacer()
+            if isRecommended { Tag("use esta", accent: true) }
             if isDefault {
-                Tag("padrão", accent: true)
+                Tag("padrão", accent: false)
                     .help("Um `claude` sem argumentos entra nesta conta")
             }
-            if inSessions {
-                Tag("em uso", accent: false)
-                    .help("Há sessão aberta no app usando esta conta")
+            if sessionCount > 0 {
+                Tag(sessionCount == 1 ? "1 sessão" : "\(sessionCount) sessões", accent: false)
+                    .help("Sessões abertas no app usando esta conta")
+            }
+        }
+    }
+
+    @ViewBuilder private var identity: some View {
+        if let email = account.email, !email.isEmpty {
+            HStack(spacing: 5) {
+                Image(systemName: "envelope").font(.caption2).foregroundStyle(.tertiary)
+                Text(email).font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+            }
+        } else {
+            HStack(spacing: 5) {
+                Image(systemName: "questionmark.circle").font(.caption2).foregroundStyle(.tertiary)
+                Text("identidade não registrada")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .help("Sem isso a statusline não consegue nomear um login direto do Keychain")
+            }
+        }
+    }
+
+    @ViewBuilder private var usageSection: some View {
+        if let u = usage {
+            VStack(spacing: 5) {
+                UsageBar(label: "5h", window: u.five_hour)
+                UsageBar(label: "7d", window: u.seven_day)
+            }
+        } else {
+            HStack(spacing: 5) {
+                Image(systemName: "chart.bar").font(.caption2).foregroundStyle(.tertiary)
+                Text("uso desconhecido — use “Consultar uso”")
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
         }
     }
 
     private var meta: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             if let d = account.days_left {
-                Label("\(d)d", systemImage: "key")
+                Label("\(d)d", systemImage: account.tokenExpiringSoon ? "key.slash" : "key")
                     .font(.caption2)
-                    .foregroundStyle(d < 30 ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
-                    .help("Token do setup-token expira em \(d) dias")
+                    .foregroundStyle(account.tokenExpiringSoon
+                                     ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
+                    .help(account.tokenExpiringSoon
+                          ? "Token expira em \(d) dias — renove com forge-accounts add \(account.name)"
+                          : "Token válido por \(d) dias")
+            }
+            if !account.has_token {
+                Label("sem token", systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.orange)
             }
             if let used = account.last_used, let when = Self.relative(used) {
                 Text("usada \(when)").font(.caption2).foregroundStyle(.tertiary)
-            }
-            if let note = account.note, !note.isEmpty {
-                Text(note).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
         }
@@ -549,20 +632,44 @@ struct AccountCard: View {
 
     private var actions: some View {
         HStack(spacing: 6) {
-            Button("Abrir sessão") { state.launch(account: account.name) }
-                .controlSize(.small)
-                .help("Abre um terminal nesta conta sem mudar o padrão")
-            if !isDefault {
+            // Opening in a specific project matters: a session's cwd decides
+            // which .gsd/ it drives.
+            Menu {
+                ForEach(state.workspaces, id: \.self) { ws in
+                    Button(URL(fileURLWithPath: ws).lastPathComponent) {
+                        state.newSession(cwd: ws, mode: .chat, text: "", account: account.name)
+                        state.show("Sessão aberta em \(URL(fileURLWithPath: ws).lastPathComponent)")
+                    }
+                }
+                if state.workspaces.isEmpty {
+                    Text("nenhum projeto observado").font(.caption)
+                }
+            } label: {
+                Label("Abrir sessão", systemImage: "terminal")
+            }
+            .menuStyle(.borderlessButton)
+            .frame(width: 120)
+            .disabled(!account.has_token || state.workspaces.isEmpty)
+            .help("Abre um terminal nesta conta, sem mudar o padrão")
+
+            if !isDefault && account.has_token {
                 Button("Tornar padrão") { state.setDefaultAccount(account.name) }
                     .controlSize(.small)
-                    .help("Um `claude` sem argumentos passa a entrar nesta conta")
             }
             Spacer()
             Menu {
+                Button("Renomear…") { draftName = account.name; renaming = true }
                 Button("Registrar identidade desta sessão") {
                     state.captureAccountIdentity(account.name)
                 }
-                .help("Grava o e-mail da sessão atual do Claude nesta conta")
+                Divider()
+                Button("Copiar comando de launch") { state.copyLaunchCommand(account.name) }
+                if let email = account.email, !email.isEmpty {
+                    Button("Copiar e-mail") { state.copyToPasteboard(email, label: "E-mail") }
+                }
+                if let uuid = account.account_uuid, !uuid.isEmpty {
+                    Button("Copiar UUID") { state.copyToPasteboard(uuid, label: "UUID") }
+                }
                 Divider()
                 Button("Remover…", role: .destructive) { confirmingRemove = true }
             } label: {
@@ -581,6 +688,40 @@ struct AccountCard: View {
         f.locale = Locale(identifier: "pt_BR")
         f.unitsStyle = .abbreviated
         return f.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+struct RenameSheet: View {
+    let current: String
+    @Binding var draft: String
+    @Binding var isPresented: Bool
+    let onRename: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Renomear conta").font(.headline)
+            Text("O token continua o mesmo — só muda o nome no registro.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextField("nome", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { commit() }
+            HStack {
+                Button("Cancelar") { isPresented = false }.keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Renomear") { commit() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty
+                              || draft == current)
+            }
+        }
+        .padding(20).frame(width: 360)
+    }
+
+    private func commit() {
+        let clean = draft.trimmingCharacters(in: .whitespaces)
+        guard !clean.isEmpty, clean != current else { return }
+        onRename(clean)
+        isPresented = false
     }
 }
 
@@ -603,36 +744,43 @@ struct UsageBar: View {
     let window: UsageWindow?
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 9) {
             Text(label).font(.caption2).monospaced()
-                .foregroundStyle(.tertiary).frame(width: 20, alignment: .leading)
+                .foregroundStyle(.tertiary).frame(width: 18, alignment: .leading)
 
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary).frame(height: 6)
+                    Capsule().fill(.quaternary).frame(height: 7)
                     Capsule().fill(color)
-                        .frame(width: max(2, geo.size.width * pct / 100), height: 6)
+                        .frame(width: max(2, geo.size.width * pct / 100), height: 7)
                 }
                 .frame(maxHeight: .infinity, alignment: .center)
             }
             .frame(height: 10)
 
-            Text("\(Int(pct))%").font(.caption2).monospacedDigit()
-                .frame(width: 34, alignment: .trailing)
+            // Headroom, not consumption: "42% livre" is the number you act on
+            // when choosing where to run next.
+            Text("\(Int(100 - pct))% livre")
+                .font(.caption2).monospacedDigit()
+                .foregroundStyle(pct >= 90 ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
+                .frame(width: 62, alignment: .trailing)
 
             if let r = window?.resetsIn {
                 Text(r).font(.caption2).foregroundStyle(.tertiary)
-                    .frame(width: 46, alignment: .trailing)
+                    .frame(width: 44, alignment: .trailing)
+                    .help("Tempo até a janela zerar")
+            } else {
+                Spacer().frame(width: 44)
             }
         }
     }
 
-    private var pct: Double { window?.pct ?? 0 }
+    private var pct: Double { min(100, max(0, window?.pct ?? 0)) }
 
-    /// Grey until it actually matters; orange only near the handoff threshold,
-    /// so the one colour in the app keeps meaning "act".
+    /// Grey until it matters; orange at the handoff threshold, red when nearly
+    /// spent — so the one accent colour keeps meaning "act".
     private var color: Color {
-        pct >= 90 ? .red : (pct >= 70 ? Color.accentOrange : Color.secondary.opacity(0.7))
+        pct >= 90 ? .red : (pct >= 70 ? Color.accentOrange : Color.secondary.opacity(0.65))
     }
 }
 
