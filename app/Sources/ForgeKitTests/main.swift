@@ -1446,6 +1446,117 @@ test("node_path é lido do JSONC ignorando a linha comentada") {
     assertEqual(PrefsLocator.parseString(jsonc, key: "node_path"), "/real/node")
 }
 
+// TerminalRegistry / TerminalLifecycle / TerminalFocus —
+// terminals survive navigation and never replay the bootstrap.
+
+print("\nTerminalRegistry (uma sessão, um terminal vivo)")
+
+/// Stand-in for the AppKit terminal: counts how often it would have been
+/// spawned, which is the whole thing under test.
+final class FakeTerminal {
+    let tag: String
+    static var made = 0
+    init(tag: String) { self.tag = tag; FakeTerminal.made += 1 }
+}
+
+test("adopt cria uma vez e devolve a mesma instância nas rebuilds seguintes") {
+    FakeTerminal.made = 0
+    let registry = TerminalRegistry<FakeTerminal>()
+    let id = UUID()
+
+    let first = registry.adopt(id) { FakeTerminal(tag: "a") }
+    // Three more rebuilds: navegar pra fora e voltar, duas vezes.
+    let second = registry.adopt(id) { FakeTerminal(tag: "b") }
+    let third = registry.adopt(id) { FakeTerminal(tag: "c") }
+
+    assertEqual(FakeTerminal.made, 1, "o processo foi criado mais de uma vez")
+    assertTrue(first.isNew, "a primeira adoção deveria ser nova")
+    assertFalse(second.isNew, "a segunda adoção não é nova")
+    assertTrue(second.entry === first.entry, "devolveu outro terminal na volta")
+    assertTrue(third.entry === first.entry, "devolveu outro terminal na volta")
+    assertEqual(registry.count, 1)
+}
+
+test("sessões diferentes têm terminais diferentes, chaveados pelo id") {
+    FakeTerminal.made = 0
+    let registry = TerminalRegistry<FakeTerminal>()
+    let a = UUID(), b = UUID()
+    let ta = registry.adopt(a) { FakeTerminal(tag: "a") }.entry
+    let tb = registry.adopt(b) { FakeTerminal(tag: "b") }.entry
+    assertFalse(ta === tb, "duas sessões compartilharam um terminal")
+    assertEqual(registry.count, 2)
+    assertEqual(registry.entry(for: a)?.tag, "a")
+    assertEqual(registry.entry(for: b)?.tag, "b")
+}
+
+test("claimBootstrap só concede uma vez — a primeira mensagem não é reenviada") {
+    let registry = TerminalRegistry<FakeTerminal>()
+    let id = UUID()
+    registry.adopt(id) { FakeTerminal(tag: "a") }
+
+    assertTrue(registry.claimBootstrap(for: id), "o primeiro envio deveria ser permitido")
+    assertFalse(registry.claimBootstrap(for: id), "a volta reenviaria a primeira mensagem")
+    assertFalse(registry.claimBootstrap(for: id))
+    assertTrue(registry.hasBootstrapped(id))
+}
+
+test("claimBootstrap sobre id desconhecido é negado, não cria slot") {
+    let registry = TerminalRegistry<FakeTerminal>()
+    assertFalse(registry.claimBootstrap(for: UUID()))
+    assertEqual(registry.count, 0)
+}
+
+test("discard devolve o terminal para o chamador encerrar e libera a chave") {
+    let registry = TerminalRegistry<FakeTerminal>()
+    let id = UUID()
+    let made = registry.adopt(id) { FakeTerminal(tag: "a") }.entry
+    let dropped = registry.discard(id)
+    assertTrue(dropped === made, "discard devolveu outro objeto")
+    assertEqual(registry.count, 0)
+    assertTrue(registry.discard(id) == nil, "discard duplo deveria ser nil")
+}
+
+test("uma sessão reaberta depois do discard bootstrapa de novo") {
+    let registry = TerminalRegistry<FakeTerminal>()
+    let id = UUID()
+    registry.adopt(id) { FakeTerminal(tag: "a") }
+    assertTrue(registry.claimBootstrap(for: id))
+    registry.discard(id)
+    registry.adopt(id) { FakeTerminal(tag: "a2") }
+    assertTrue(registry.claimBootstrap(for: id), "sessão nova não conseguiu bootstrapar")
+}
+
+print("\nTerminalLifecycle (sair da tela não é fechar a sessão)")
+
+test("view desmontada mantém o processo vivo") {
+    assertEqual(TerminalLifecycle.action(for: .viewDismantled), .keepAlive)
+}
+
+test("fechar a sessão encerra e descarta") {
+    assertEqual(TerminalLifecycle.action(for: .sessionClosed), .terminateAndDiscard)
+}
+
+print("\nTerminalFocus (qual sessão a tela mostra)")
+
+test("a seleção vale enquanto a sessão existir") {
+    let a = UUID(), b = UUID()
+    assertEqual(TerminalFocus.resolve(selection: b, among: [a, b]), b)
+    assertEqual(TerminalFocus.resolve(selection: nil, among: [a, b]), a)
+    assertEqual(TerminalFocus.resolve(selection: UUID(), among: [a, b]), a)
+    assertTrue(TerminalFocus.resolve(selection: a, among: []) == nil)
+}
+
+test("fechar uma aba em segundo plano não move o foco") {
+    let a = UUID(), b = UUID()
+    assertEqual(TerminalFocus.afterClosing(b, selection: a, remaining: [a]), a)
+}
+
+test("fechar a aba visível cai na primeira restante") {
+    let a = UUID(), b = UUID()
+    assertEqual(TerminalFocus.afterClosing(a, selection: a, remaining: [b]), b)
+    assertTrue(TerminalFocus.afterClosing(a, selection: a, remaining: []) == nil)
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {
