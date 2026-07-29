@@ -893,6 +893,94 @@ test("label cai no id quando não catalogado") {
     assertEqual(ModelCatalog.label(for: "modelo-novo"), "modelo-novo")
 }
 
+print("\nMetricsEngine (events.jsonl já acumulava isso — ninguém lia)")
+
+let sampleEvents = """
+{"ts":"2026-07-29T02:16:45Z","event":"dispatch","unit":"execute-task/T02","model":"gpt-5.6-luna","engine":"codex","domain":"backend","slice":"S14","input_tokens":4988,"output_tokens":1869}
+{"ts":"2026-07-29T02:20:00Z","event":"dispatch","unit":"execute-task/T03","model":"claude-opus-5","engine":"claude","domain":"frontend","slice":"S14","input_tokens":1000000,"output_tokens":100000}
+{"ts":"2026-07-29T02:22:00Z","event":"review","slice":"S14"}
+{"ts":"2026-07-29T02:23:00Z","event":"retry","attempts":2}
+linha quebrada sem json
+{"ts":"2026-07-29T02:24:00Z","event":"dispatch","unit":"plan-slice/S15","model":"claude-opus-5","engine":"claude","input_tokens":2000,"output_tokens":500}
+"""
+
+test("parseia dispatches e ignora linha corrompida") {
+    // The file is appended to by a live process, so the last line can be torn.
+    let (d, e) = MetricsEngine.parse(sampleEvents)
+    assertEqual(d.count, 3)
+    assertEqual(e["review"], 1)
+    assertEqual(e["retry"], 1)
+    assertEqual(d[0].engine, "codex")
+    assertEqual(d[0].totalTokens, 6857)
+}
+
+test("unitType descarta o id da unidade") {
+    let (d, _) = MetricsEngine.parse(sampleEvents)
+    assertEqual(d[0].unitType, "execute-task")
+    assertEqual(d[2].unitType, "plan-slice")
+}
+
+test("custo usa a tabela por família") {
+    // Opus 5: $5/MTok in, $25/MTok out → 1M in + 100k out = 5 + 2.5
+    let c = Pricing.cost(model: "claude-opus-5", input: 1_000_000, output: 100_000)
+    assertEqual(c ?? 0, 7.5)
+}
+
+test("modelo sem preço não inventa custo") {
+    // Inventing a number for an externally-billed engine would make the total
+    // look authoritative when it is not.
+    assertTrue(Pricing.cost(model: "gpt-5.6-luna", input: 1000, output: 1000) == nil)
+}
+
+test("resumo marca custo incompleto quando há modelo sem preço") {
+    let (d, e) = MetricsEngine.parse(sampleEvents)
+    let s = MetricsEngine.summarise(d, events: e)
+    assertEqual(s.dispatches, 3)
+    assertTrue(s.costIncomplete, "codex não tem preço na tabela")
+    // Only the two Claude dispatches contribute to cost.
+    assertTrue(s.cost > 7.5 && s.cost < 7.6, "custo: \(s.cost)")
+}
+
+test("agrupa por modelo, engine, unidade e domínio") {
+    let (d, e) = MetricsEngine.parse(sampleEvents)
+    let s = MetricsEngine.summarise(d, events: e)
+    assertEqual(s.byEngine.count, 2)
+    assertEqual(s.byUnit.count, 2)
+    assertEqual(s.byDomain.count, 2)
+    // Sorted by spend: the Claude bucket outranks the unpriced codex one.
+    assertEqual(s.byEngine[0].key, "claude")
+}
+
+test("filtro por data corta o histórico") {
+    let (d, e) = MetricsEngine.parse(sampleEvents)
+    let iso = ISO8601DateFormatter()
+    let cut = iso.date(from: "2026-07-29T02:21:00Z")!
+    let s = MetricsEngine.summarise(d, events: e, since: cut)
+    assertEqual(s.dispatches, 1, "só o dispatch das 02:24")
+}
+
+test("share de output explica a conta melhor que o total") {
+    // Output costs 5x input across the table.
+    let (d, e) = MetricsEngine.parse(sampleEvents)
+    let s = MetricsEngine.summarise(d, events: e)
+    assertTrue(s.outputShare > 0 && s.outputShare < 1)
+}
+
+test("formatação de tokens e dinheiro") {
+    assertEqual(MetricsEngine.tokens(999), "999")
+    assertEqual(MetricsEngine.tokens(4988), "5.0k")
+    assertEqual(MetricsEngine.tokens(1_250_000), "1.25M")
+    assertEqual(MetricsEngine.money(0.004), "<$0,01")
+    assertEqual(MetricsEngine.money(7.5), "$7.50")
+}
+
+test("arquivo vazio não quebra") {
+    let (d, e) = MetricsEngine.parse("")
+    assertEqual(d.count, 0)
+    assertEqual(e.count, 0)
+    assertEqual(MetricsEngine.summarise(d).dispatches, 0)
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")

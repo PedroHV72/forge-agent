@@ -16,11 +16,12 @@ import ForgeKit
 // MARK: - Shell
 
 enum Section: String, CaseIterable, Identifiable {
-    case now = "Agora"
+    case now = "Início"
     case terminal = "Terminal"
     case projects = "Projetos"
     case runs = "Runs"
     case accounts = "Contas"
+    case metrics = "Métricas"
     case models = "Modelos"
     case prefs = "Preferências"
     case history = "Histórico"
@@ -36,6 +37,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .projects: return "folder"
         case .runs:     return "play.circle"
         case .accounts: return "person.2"
+        case .metrics:  return "chart.bar.xaxis"
         case .models:   return "cpu"
         case .prefs:    return "slider.horizontal.3"
         case .history:  return "clock.arrow.circlepath"
@@ -85,6 +87,7 @@ struct RootView: View {
                 case .projects: ProjectsView(state: state)
                 case .runs:     RunsView(state: state)
                 case .accounts: AccountsView(state: state)
+                case .metrics:  MetricsView(state: state)
                 case .models:   ModelsView(state: state)
                 case .prefs:    PrefsView(state: state)
                 case .history:  HistoryView(state: state)
@@ -154,17 +157,34 @@ func pickWorkspace(_ state: AppState) {
 
 // MARK: - Agora
 
+/// The home screen. A place to START work, not an inbox.
+///
+/// It used to lead with the pending-question queue, which framed the app as
+/// somewhere you go to answer things — but questions are the exception and
+/// starting work is the rule. Pending gates are still surfaced, as a banner
+/// that cannot be missed, above the thing you actually came to do.
 struct NowView: View {
     @ObservedObject var state: AppState
+    @State private var prompt = ""
+    @State private var project = ""
+    @State private var mode: LauncherSheet.Mode = .chat
+    @State private var account = ""
+    @FocusState private var promptFocused: Bool
+
+    private var resolvedProject: String {
+        project.isEmpty ? (state.workspaces.first ?? "") : project
+    }
+
+    private var canStart: Bool {
+        !resolvedProject.isEmpty && (!mode.needsText || !prompt.trimmingCharacters(in: .whitespaces).isEmpty)
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if state.pending.isEmpty {
-                    calmHeader
-                } else {
-                    ForEach(state.pending) { g in GateCard(gate: g, state: state) }
-                }
+                if !state.pending.isEmpty { gateBanner }
+
+                composer
 
                 if !state.liveRuns.isEmpty {
                     SectionTitle("Rodando")
@@ -176,30 +196,147 @@ struct NowView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
         }
-        .navigationTitle("Agora")
+        .navigationTitle("Início")
+        .onAppear {
+            if project.isEmpty { project = state.workspaces.first ?? "" }
+            promptFocused = true
+        }
     }
 
-    private var calmHeader: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.title2).foregroundStyle(.green)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Tudo em dia").font(.headline)
-                Text("Nenhuma pergunta pendente.")
-                    .font(.caption).foregroundStyle(.secondary)
+    // MARK: Composer
+
+    private var composer: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 8) {
+                Image(systemName: "bolt.fill").foregroundStyle(Color.accentOrange)
+                Text("O que vamos fazer?").font(.headline)
+                Spacer()
             }
-            Spacer()
+
+            TextEditor(text: $prompt)
+                .font(.body)
+                .frame(minHeight: 76, maxHeight: 150)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 9))
+                .overlay(alignment: .topLeading) {
+                    if prompt.isEmpty {
+                        Text(placeholder)
+                            .font(.body).foregroundStyle(.tertiary)
+                            .padding(.horizontal, 13).padding(.vertical, 16)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .focused($promptFocused)
+
+            // Mode decides which slash command the session opens with. Chat is
+            // the default because most starts are a conversation, not a formal
+            // milestone.
+            //
+            // ViewThatFits keeps the controls on one line while there is room
+            // and wraps to two when there is not — three fixed-width pickers
+            // plus a button do not fit a narrow window, and the button was the
+            // thing getting clipped.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    pickers
+                    Spacer(minLength: 8)
+                    startButton
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) { pickers; Spacer(minLength: 0) }
+                    HStack { Spacer(); startButton }
+                }
+            }
+
+            Text(mode.hint).font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    @ViewBuilder private var pickers: some View {
+        Picker("", selection: $mode) {
+            ForEach(LauncherSheet.Mode.allCases) { m in Text(m.rawValue).tag(m) }
+        }
+        .labelsHidden().frame(width: 165)
+
+        Picker("", selection: $project) {
+            ForEach(state.workspaces, id: \.self) { ws in
+                Text(ProjectOrganiser.name(ws)).tag(ws)
+            }
+        }
+        .labelsHidden().frame(width: 145)
+        .disabled(state.workspaces.isEmpty)
+
+        Picker("", selection: $account) {
+            Text("conta padrão").tag("")
+            ForEach(state.accounts.filter(\.has_token)) { a in Text(a.name).tag(a.name) }
+        }
+        .labelsHidden().frame(width: 130)
+    }
+
+    private var startButton: some View {
+        Button { start() } label: {
+            Label("Começar", systemImage: "arrow.up.circle.fill")
+                .fixedSize()
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(!canStart)
+        .keyboardShortcut(.return, modifiers: .command)
+        .help("⌘↩ — abre uma sessão no Terminal com isto")
+    }
+
+    private var placeholder: String {
+        switch mode {
+        case .chat:         return "Pergunte, investigue, peça uma ideia…"
+        case .task:         return "Descreva a task — ex: corrigir o retry do handoff"
+        case .newMilestone: return "Descreva o milestone — ex: gate protocol no forge-auto"
+        case .auto:         return "Retoma o run selecionado; nada a escrever aqui"
+        case .shell:        return "Abre só o shell; nada a escrever aqui"
+        }
+    }
+
+    private func start() {
+        state.newSession(cwd: resolvedProject, mode: mode,
+                         text: prompt, account: account)
+        // The session carries the prompt; clearing it here keeps the composer
+        // ready for the next thing instead of re-sending on a second click.
+        prompt = ""
+        state.show("Sessão aberta — veja em Terminal")
+    }
+
+    // MARK: Gate banner
+
+    /// Questions are the exception, so they get a banner rather than the page.
+    /// It is impossible to miss and impossible to confuse with the composer.
+    private var gateBanner: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "bolt.fill").foregroundStyle(Color.accentOrange)
+                Text(state.pending.count == 1
+                     ? "1 run está esperando você"
+                     : "\(state.pending.count) runs estão esperando você")
+                    .font(.callout).bold()
+                Spacer()
+            }
+            ForEach(state.pending) { gate in
+                GateCard(gate: gate, state: state)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentOrange.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14)
+            .strokeBorder(Color.accentOrange.opacity(0.3)))
     }
 
     private var emptyWorkspaces: some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Nenhum projeto observado", systemImage: "folder.badge.questionmark")
                 .font(.callout)
-            Text("Adicione a pasta de um projeto que usa o Forge para acompanhar aqui.")
+            Text("Adicione a pasta de um projeto que usa o Forge para começar.")
                 .font(.caption).foregroundStyle(.secondary)
             Button("Adicionar projeto…") { pickWorkspace(state) }
                 .controlSize(.small)
