@@ -512,6 +512,93 @@ test("humanise não inverte a ordem das palavras") {
     assertEqual(PrefLabels.humanise("compact_after"), "Compact after")
 }
 
+print("\nModelChain (escalar OU cadeia — as duas formas são válidas no arquivo)")
+
+test("lê as duas formas do disco") {
+    assertEqual(ModelChain.from(.string("claude-opus-5")), .single("claude-opus-5"))
+    assertEqual(ModelChain.from(.array([.string("a"), .string("b")])), .chain(["a", "b"]))
+    assertTrue(ModelChain.from(.number(1)) == nil, "forma desconhecida não vira cadeia")
+}
+
+test("um item volta como escalar, vários como lista") {
+    // Round-tripping a scalar into a one-item array would rewrite a file the
+    // user authored by hand, for no gain.
+    assertEqual(ModelChain.single("x").toValue(), .string("x"))
+    assertEqual(ModelChain.chain(["x"]).toValue(), .string("x"))
+    assertEqual(ModelChain.chain(["x", "y"]).toValue(), .array([.string("x"), .string("y")]))
+}
+
+test("entradas vazias são descartadas ao gravar") {
+    assertEqual(ModelChain.chain(["x", "  ", "y"]).toValue(),
+                .array([.string("x"), .string("y")]))
+}
+
+test("editar a cadeia") {
+    let c = ModelChain.chain(["a", "b", "c"])
+    assertEqual(c.replacing(at: 1, with: "z").ids, ["a", "z", "c"])
+    assertEqual(c.removing(at: 0).ids, ["b", "c"])
+    assertEqual(c.moved(from: 2, to: 0).ids, ["c", "a", "b"])
+    assertEqual(c.appending("d").ids, ["a", "b", "c", "d"])
+}
+
+test("nunca remove o último modelo") {
+    // An empty tier has no meaning — the engine would have nothing to dispatch.
+    assertEqual(ModelChain.single("a").removing(at: 0).ids, ["a"])
+}
+
+test("índice inválido não corrompe a cadeia") {
+    let c = ModelChain.chain(["a", "b"])
+    assertEqual(c.replacing(at: 9, with: "z").ids, ["a", "b"])
+    assertEqual(c.moved(from: 0, to: 9).ids, ["a", "b"])
+}
+
+print("\nRoutingReader (achata domain → phase → tier → cadeia)")
+
+test("achata a estrutura aninhada") {
+    let routing = JSONValue.object([
+        "backend": .object([
+            "executor": .object([
+                "standard": .array([.string("gpt-5"), .string("claude-sonnet-5")]),
+            ]),
+        ]),
+    ])
+    let rows = RoutingReader.rows(from: routing)
+    assertEqual(rows.count, 1)
+    assertEqual(rows[0].domain, "backend")
+    assertEqual(rows[0].phase, "executor")
+    assertEqual(rows[0].tier, "standard")
+    assertEqual(rows[0].chain, ["gpt-5", "claude-sonnet-5"])
+}
+
+test("aceita cadeia escalar e ignora o que não entende") {
+    let routing = JSONValue.object([
+        "default": .object([
+            "planner": .object([
+                "heavy": .string("claude-opus-5"),
+                "vazio": .array([]),
+            ]),
+        ]),
+        "lixo": .string("não é objeto"),
+    ])
+    let rows = RoutingReader.rows(from: routing)
+    assertEqual(rows.count, 1)
+    assertEqual(rows[0].chain, ["claude-opus-5"])
+}
+
+test("routing ausente devolve vazio") {
+    assertEqual(RoutingReader.rows(from: nil).count, 0)
+    assertEqual(RoutingReader.rows(from: .object([:])).count, 0)
+}
+
+print("\nClosedSets")
+
+test("dashboard_refresh_on tem vocabulário fechado") {
+    assertEqual(ClosedSets.options(forLeaf: "dashboard_refresh_on") ?? [],
+                ["boot", "exit", "phase_change"])
+    assertTrue(ClosedSets.options(forLeaf: "ignore_list") == nil,
+               "lista aberta não pode virar checkbox")
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")

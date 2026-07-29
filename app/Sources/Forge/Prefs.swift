@@ -239,8 +239,8 @@ final class PrefsStore: ObservableObject {
             enumValues: enums,
             defaultValue: node.default,
             description: node.description ?? "",
-            kind: PrefKind.from(types: types, hasEnum: !enums.isEmpty,
-                                itemsAreStrings: itemsAreStrings))
+            kind: PrefKind.from(group: group, leaf: leaf, types: types,
+                                hasEnum: !enums.isEmpty, itemsAreStrings: itemsAreStrings))
     }
 
     private static func flattenValues(_ prefs: [String: JSONValue]?) -> [String: JSONValue] {
@@ -435,7 +435,13 @@ struct PrefRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if field.kind == .stringList { listEditor }
+            switch field.kind {
+            case .stringList: listEditor
+            case .modelChain: chainEditor
+            case .closedSet:  closedSetEditor
+            case .routing:    routingView
+            default:          EmptyView()
+            }
 
             HStack(spacing: 10) {
                 if let v = store.value(for: field),
@@ -508,9 +514,24 @@ struct PrefRow: View {
                 set: { store.set(field, PrefsEdit.scalar(from: $0, allowsNumber: true)) }))
             .textFieldStyle(.roundedBorder).frame(width: 140)
 
+        case .modelChain:
+            if let chain = ModelChain.from(store.value(for: field)) {
+                Text(chain.ids.count == 1 ? ModelCatalog.label(for: chain.ids[0])
+                                          : "\(chain.ids.count) na cadeia")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+        case .closedSet:
+            Text("\(currentList.count) de \(ClosedSets.options(forLeaf: field.leaf)?.count ?? 0)")
+                .font(.caption2).foregroundStyle(.secondary)
+
+        case .routing:
+            Text("\(RoutingReader.rows(from: store.value(for: field)).count) regra(s)")
+                .font(.caption2).foregroundStyle(.secondary)
+
         case .opaque:
-            // Editing a nested object (or a string|array union) as text would
-            // rewrite it in the wrong shape. Show it and point at the file.
+            // Editing a nested object as text would rewrite it in the wrong
+            // shape. Show it and point at the file.
             HStack(spacing: 6) {
                 Text(store.value(for: field)?.display ?? "—")
                     .font(.caption).foregroundStyle(.secondary)
@@ -518,6 +539,117 @@ struct PrefRow: View {
                 Image(systemName: "lock").font(.caption2).foregroundStyle(.tertiary)
                     .help("Estrutura aninhada — edite no arquivo para não corromper o formato")
             }
+        }
+    }
+
+    // MARK: Model chain
+
+    /// A tier is either one model or an ordered fallback chain, and both shapes
+    /// are valid on disk. The editor keeps whichever is there: adding a second
+    /// entry turns it into a chain, deleting back to one collapses to a scalar.
+    private var chainEditor: some View {
+        let chain = ModelChain.from(store.value(for: field)) ?? .single("")
+        return VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(chain.ids.enumerated()), id: \.offset) { idx, id in
+                HStack(spacing: 6) {
+                    if chain.ids.count > 1 {
+                        Text("\(idx + 1)")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.tertiary).frame(width: 12)
+                            .help(idx == 0 ? "Primeira escolha" : "Usado se o anterior falhar")
+                    }
+                    ModelField(id: id) { newID in
+                        store.set(field, chain.replacing(at: idx, with: newID).toValue())
+                    }
+                    if chain.ids.count > 1 {
+                        Button {
+                            store.set(field, chain.removing(at: idx).toValue())
+                        } label: { Image(systemName: "minus.circle").font(.caption) }
+                        .buttonStyle(.plain).foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            HStack(spacing: 10) {
+                Button {
+                    store.set(field, chain.appending("").toValue())
+                } label: {
+                    Label("Adicionar fallback", systemImage: "plus").font(.caption2)
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help("Modelo usado quando o anterior falha")
+
+                if let d = ModelCatalog.defaultFor(tier: field.leaf),
+                   chain.ids != [d] {
+                    Button {
+                        store.set(field, .string(d))
+                    } label: {
+                        Label("Usar \(ModelCatalog.label(for: d))", systemImage: "arrow.uturn.backward")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    // MARK: Closed set
+
+    /// Members come from a fixed vocabulary, so checkboxes beat a free list:
+    /// a typo in free text is a value the engine silently ignores.
+    private var closedSetEditor: some View {
+        let options = ClosedSets.options(forLeaf: field.leaf) ?? []
+        let selected = Set(currentList)
+        return VStack(alignment: .leading, spacing: 2) {
+            ForEach(options, id: \.self) { opt in
+                Toggle(isOn: Binding(
+                    get: { selected.contains(opt) },
+                    set: { on in
+                        // Preserve the vocabulary's order rather than click order,
+                        // so the file stays stable across edits.
+                        var next = selected
+                        if on { next.insert(opt) } else { next.remove(opt) }
+                        let ordered = options.filter { next.contains($0) }
+                        store.set(field, .array(ordered.map { .string($0) }))
+                    })) {
+                    Text(opt).font(.caption)
+                }
+                .toggleStyle(.checkbox)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    // MARK: Routing
+
+    /// Rendered, not edited: routing nests domain → phase → tier with open keys,
+    /// and a wrong write reroutes real work. Reading it is the valuable part.
+    @ViewBuilder private var routingView: some View {
+        let rows = RoutingReader.rows(from: store.value(for: field))
+        if rows.isEmpty {
+            Text("Nenhuma regra — todo trabalho resolve por tier_models.")
+                .font(.caption2).foregroundStyle(.tertiary)
+        } else {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(rows) { r in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(r.domain)
+                            .font(.system(size: 10, design: .monospaced)).bold()
+                            .frame(width: 74, alignment: .leading)
+                        Text("\(r.phase) · \(r.tier)")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .frame(width: 108, alignment: .leading)
+                        Text(r.chain.map { ModelCatalog.label(for: $0) }.joined(separator: " → "))
+                            .font(.system(size: 10)).foregroundStyle(.primary)
+                            .lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                    }
+                }
+                Text("Edite no arquivo — a estrutura é aninhada e aberta demais para um editor genérico.")
+                    .font(.system(size: 9)).foregroundStyle(.tertiary).padding(.top, 2)
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 6))
         }
     }
 
@@ -622,5 +754,47 @@ struct PrefsDiffSheet: View {
             }
         }
         .padding(20).frame(width: 520)
+    }
+}
+
+/// A model id: pick a known one or type anything. Closed pickers would block a
+/// model released after this build — which is a certainty, not a risk.
+struct ModelField: View {
+    let id: String
+    let onChange: (String) -> Void
+    @State private var text: String = ""
+
+    var body: some View {
+        HStack(spacing: 5) {
+            TextField("id do modelo", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+                .onSubmit { onChange(text) }
+                .onChange(of: text) { new in onChange(new) }
+
+            Menu {
+                ForEach(ModelCatalog.known) { m in
+                    Button {
+                        text = m.id
+                        onChange(m.id)
+                    } label: {
+                        Text("\(m.label)  ·  \(m.tier)")
+                    }
+                }
+            } label: {
+                Image(systemName: "chevron.down").font(.system(size: 8))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Modelos conhecidos")
+
+            if !id.isEmpty && !ModelCatalog.isKnown(id) {
+                Image(systemName: "questionmark.circle")
+                    .font(.caption2).foregroundStyle(.orange)
+                    .help("Id não reconhecido — pode ser um modelo novo, ou um erro de digitação")
+            }
+        }
+        .onAppear { text = id }
     }
 }

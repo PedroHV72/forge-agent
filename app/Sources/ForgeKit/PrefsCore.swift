@@ -79,10 +79,24 @@ public enum PrefKind: String, Sendable {
     case text         // string
     case stringList   // array of strings
     case scalarUnion  // integer|string — e.g. compact_after: 5 or "unlimited"
+    case modelChain   // a model id, or an ordered fallback chain
+    case closedSet    // array drawn from a fixed vocabulary
+    case routing      // the nested routing map — rendered, not edited
     case opaque       // object, or a shape the app must not rewrite
 
     /// `types` is the schema's `type` (possibly a union), `hasEnum` whether it
     /// constrains values, `itemsAreStrings` whether an array holds strings.
+    /// Some knobs are better identified by WHO they are than by their JSON type:
+    /// tier_models.heavy is `string|array` like any other union, but it is a
+    /// model chain and deserves a picker over the known ids.
+    public static func from(group: String, leaf: String, types: [String],
+                            hasEnum: Bool, itemsAreStrings: Bool) -> PrefKind {
+        if group == "tier_models" { return .modelChain }
+        if leaf == "routing" { return .routing }
+        if ClosedSets.options(forLeaf: leaf) != nil { return .closedSet }
+        return from(types: types, hasEnum: hasEnum, itemsAreStrings: itemsAreStrings)
+    }
+
     public static func from(types: [String], hasEnum: Bool, itemsAreStrings: Bool) -> PrefKind {
         if hasEnum { return .choice }
         if types.contains("object") { return .opaque }
