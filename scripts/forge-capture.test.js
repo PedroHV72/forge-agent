@@ -114,7 +114,7 @@ test('(a) forge-review.md has § Item capture section with the --add invocation 
     'review/{TASK_ID}/{R#}',
     'plan-gate/{S##}',
     'plan-gate/{TASK_ID}',
-    'blocked/{unit_id}',
+    'blocked/{unit_type}/{unit_id}',
   ];
   for (const fmt of sourceFormats) {
     assert(forgeReview.includes(fmt), `missing source format "${fmt}" in forge-review.md`);

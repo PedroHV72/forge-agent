@@ -837,13 +837,13 @@ ITEM_ID=$(printf '%s' "$RESULT" | node -e "let s='';process.stdin.on('data',d=>s
 - `review/{TASK_ID}/{R#}` — review follow-up at a standalone-task boundary (`forge-task`).
 - `plan-gate/{S##}` — plan-gate deferral for `forge-next`.
 - `plan-gate/{TASK_ID}` — plan-gate deferral for `forge-task`.
-- `blocked/{unit_id}` — a terminal blocked stop. The failure class goes in the title, not the source: `[{classe}] {unit_type}/{unit_id} bloqueado — {resumo}`.
+- `blocked/{unit_type}/{unit_id}` — a terminal blocked stop (a bare `unit_id`, e.g. `T01`, is ambiguous across slices — the type qualifies it). The failure class goes in the title, not the source: `[{classe}] {unit_type}/{unit_id} bloqueado — {resumo}`.
 
 **Pointer-line format.** `- {I-id} — {title}` — exactly one line: the item ID and its title, never the full body/content. This is the only thing written into `KNOWLEDGE.md § Review follow-ups`, a `**Decisão:**` line, or a plan-gate approval marker.
 
-**Dedup guard (blocked-unit reuse only).** Before `--add` on a `blocked/{unit_id}` source, run `--list --json` and check for an existing item with the same `source` and a status that is not `done`/`dropped`; skip creation if one is found (a resumed unit that blocks again must not spawn a duplicate item).
+**Dedup guard (blocked-unit reuse only).** Before `--add` on a `blocked/{unit_type}/{unit_id}` source, run `--list --json` and check for an existing item with the same `source` and a status that is not `done`/`dropped`; skip creation if one is found (a resumed unit that blocks again must not spawn a duplicate item).
 
-**Advisory failure rule.** If `--add` exits non-zero, log a warning and fall back to the legacy one-line note at the old destination (e.g. append directly to `KNOWLEDGE.md § Review follow-ups` without an item ID) so the deferral is not lost; then continue. Item capture never blocks a gate, a review, or the loop — same posture as every other advisory mechanism in this spec.
+**Advisory failure rule.** If `--add` exits non-zero, log a warning and fall back to a **universal durable note**: append the one-line note (no item ID) to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing) — for **every** junction, regardless of which destination the junction normally writes its pointer line to. `KNOWLEDGE.md` survives `milestone_cleanup`; a junction's own marker (e.g. a plan-gate approval marker) does not, so the `KNOWLEDGE.md` note is what actually keeps the deferral from being lost. **Additionally** (not instead), still record the same one-line note in the junction's own destination (`**Decisão:**` line, plan-gate marker, etc.) for in-context visibility — but that copy is best-effort, not the durable one. Then continue. Item capture never blocks a gate, a review, or the loop — same posture as every other advisory mechanism in this spec.
 
 **Headless rule.** Capture fires when the deferral is *recorded*, not when a human answers. A timeout-default resolution (Step 7b `followup` via the gate mailbox) and a headless Step 9 triage (no `AskUserQuestion` available) both still create the item — the absence of a human in the loop is not a reason to lose the deferral.
 

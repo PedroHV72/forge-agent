@@ -125,7 +125,7 @@ For `forge-task`:
 **Resolution per option:**
 - `Manter` — accept the finding as-is, no change. Record in the marker.
 - `Corrigir no ato` — operator corrects the plan now. Proceed to Step 3 (free-file edit).
-- `Deferir` — create an item via `shared/forge-review.md § Item capture` (source `plan-gate/{S##}` for `forge-next`, `plan-gate/{TASK_ID}` for `forge-task`; `origin: auto`, `status: inbox`; no `file` — this junction has none). Record in the marker: `{dimensão}: deferido → {I-id} — {title}`.
+- `Deferir` — create an item via `shared/forge-review.md § Item capture` (source `plan-gate/{S##}` for `forge-next`, `plan-gate/{TASK_ID}` for `forge-task`; `origin: auto`, `status: inbox`; no `file` — this junction has none). Record in the marker: `{dimensão}: deferido → {I-id} — {title}`. If `--add` fails, `§ Item capture`'s advisory-failure rule applies: the durable fallback is always `.gsd/KNOWLEDGE.md § Review follow-ups` (never the marker alone — the marker is cleaned by `milestone_cleanup`, so a marker-only note would silently vanish).
 
 Batch up to 4 findings per `AskUserQuestion` call when findings are low-severity (all `warn`) and related. Keep `fail`-severity findings as individual questions.
 
