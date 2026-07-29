@@ -281,6 +281,22 @@ final class AppState: ObservableObject {
     /// a confirmation — the same reasoning as quitting the app: Forge resumes
     /// from disk, but the in-flight unit is cut off. Returns whether it closed.
     @discardableResult
+    /// Open a session from a free-form line. A leading slash command is passed
+    /// through verbatim — whatever Forge gains tomorrow works here with no code
+    /// change — and plain text becomes a conversation.
+    func newSessionRaw(cwd: String, prompt: String, account: String) {
+        let claudeArgs = account.isEmpty ? "" : " --account \(shq(account))"
+        let boot = "claude\(claudeArgs) \(shq(prompt))"
+        let (cmd, _) = ComposerParser.split(prompt)
+        let project = URL(fileURLWithPath: cwd).lastPathComponent
+        let title = cmd.map { "\(project) · \($0.replacingOccurrences(of: "forge-", with: ""))" }
+            ?? "\(project) · chat"
+        sessions.append(TerminalSession(
+            cwd: cwd, title: title, bootstrap: boot,
+            runId: nil, account: account.isEmpty ? nil : account))
+    }
+
+    @discardableResult
     func closeSession(_ s: TerminalSession, confirm: Bool = false) -> Bool {
         if confirm && s.isRunning {
             let alert = NSAlert()

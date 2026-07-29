@@ -981,6 +981,101 @@ test("arquivo vazio não quebra") {
     assertEqual(MetricsEngine.summarise(d).dispatches, 0)
 }
 
+print("\nComposerParser (autocomplete estilo Claude Code)")
+
+func ctx(_ text: String, caretAtEnd: Bool = true) -> CompletionContext {
+    ComposerParser.context(in: text, caret: text.endIndex)
+}
+
+test("/ no início abre comandos") {
+    let c = ctx("/forge-au")
+    assertEqual(c, .command(query: "forge-au",
+                            range: "/forge-au".startIndex..<"/forge-au".endIndex))
+}
+
+test("@ abre projetos") {
+    if case .project(let q, _) = ctx("@mess") { assertEqual(q, "mess") }
+    else { assertTrue(false, "esperava contexto de projeto") }
+}
+
+test("gatilho depois de espaço também vale") {
+    if case .command(let q, _) = ctx("olha /forge-st") { assertEqual(q, "forge-st") }
+    else { assertTrue(false, "esperava comando após espaço") }
+}
+
+test("barra no meio de uma palavra NÃO abre menu") {
+    // Otherwise every path and URL would pop a menu mid-sentence.
+    assertEqual(ctx("veja src/main"), .none)
+    assertEqual(ctx("email a@b"), .none)
+}
+
+test("espaço encerra o token") {
+    assertEqual(ctx("/forge-task corrigir"), .none)
+}
+
+test("filtro põe prefixo antes de substring") {
+    let cmds = [
+        SlashCommand(name: "forge-accounts", description: "", source: .skill),
+        SlashCommand(name: "forge-auto", description: "", source: .skill),
+        SlashCommand(name: "auto-outro", description: "", source: .skill),
+    ]
+    let r = ComposerParser.filter(cmds, query: "forge-au")
+    assertEqual(r.first?.name, "forge-auto")
+}
+
+test("completar substitui o token e devolve o caret") {
+    let text = "/forge-au"
+    guard case .command(_, let range) = ctx(text) else {
+        assertTrue(false, "sem contexto"); return
+    }
+    let (out, caret) = ComposerParser.complete(text, range: range, with: "/forge-auto")
+    assertEqual(out, "/forge-auto ")
+    assertEqual(caret, 12)
+}
+
+test("split separa comando do resto") {
+    let a = ComposerParser.split("/forge-task corrigir o retry")
+    assertEqual(a.command, "forge-task")
+    assertEqual(a.rest, "corrigir o retry")
+
+    let b = ComposerParser.split("apenas uma conversa")
+    assertTrue(b.command == nil)
+    assertEqual(b.rest, "apenas uma conversa")
+
+    let c = ComposerParser.split("/forge-status")
+    assertEqual(c.command, "forge-status")
+    assertEqual(c.rest, "")
+}
+
+print("\nCommandCatalog")
+
+test("lê name e description do frontmatter") {
+    let md = """
+    ---
+    name: forge-auto
+    description: "Executa o milestone inteiro."
+    allowed-tools: Read, Write
+    ---
+
+    # corpo
+    description: isto não deve ser lido
+    """
+    assertEqual(CommandCatalog.frontmatter(md, key: "name"), "forge-auto")
+    assertEqual(CommandCatalog.frontmatter(md, key: "description"),
+                "Executa o milestone inteiro.")
+}
+
+test("sem frontmatter devolve nil em vez de ler o corpo") {
+    assertTrue(CommandCatalog.frontmatter("# só markdown\nname: x", key: "name") == nil)
+}
+
+test("catálogo real da máquina tem comandos do forge") {
+    // Reads what is installed, not a list baked into the app.
+    let all = CommandCatalog.load()
+    assertTrue(all.contains { $0.name.hasPrefix("forge") },
+               "esperava comandos forge instalados; achei \(all.count)")
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
