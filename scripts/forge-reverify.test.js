@@ -43,9 +43,11 @@ function write(dir, file, text) {
 function testTrigger() {
   assert(needsReverification(result([entry()])), 'trigger accepts unmet environment sandbox-exec-blocked');
   assert(needsReverification(result([entry({ status: 'unknown' })])), 'trigger accepts unknown environment sandbox-exec-blocked');
-  for (const reason of ['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required']) {
-    assert(!needsReverification(result([entry({ reason })])), `trigger ignores legacy reason ${reason}`);
+  for (const reason of ['git-commit-required', 'out-of-scope-test-failure', 'network-required']) {
+    assert(needsReverification(result([entry({ reason })])), `trigger accepts environment reason ${reason}`);
   }
+  assert(!needsReverification(result([entry({ reason: 'gsd-write-refused' })])),
+    'trigger excludes gsd-write-refused (not provable by command exit code)');
   assert(!needsReverification(result([entry({ status: 'met' })])), 'trigger ignores met entry');
   assert(!needsReverification(result([entry({ scope: 'task' })])), 'trigger ignores task-scope entry');
 }
@@ -64,6 +66,32 @@ function testResolution() {
     assert(JSON.stringify(resolveVerifyCommand(dir)) === JSON.stringify(expected), `resolves ${name} verification command`);
   }
   assert(resolveVerifyCommand(fixture()) === null, 'returns null when no project verification command exists');
+
+  const fallbackDir = fixture();
+  const gsdDir = path.join(fallbackDir, 'external-gsd');
+  fs.mkdirSync(gsdDir, { recursive: true });
+  fs.writeFileSync(path.join(gsdDir, 'CODING-STANDARDS.md'), '## Lint & Format Commands\n\n- **Test:** `node scripts/forge-smoke.js` + `node scripts/*.test.js`\n', 'utf8');
+  assert(JSON.stringify(resolveVerifyCommand(fallbackDir, gsdDir)) === JSON.stringify(['node', 'scripts/forge-smoke.js']),
+    'CODING-STANDARDS fallback selects the first shell-safe test command');
+  fs.writeFileSync(path.join(gsdDir, 'CODING-STANDARDS.md'), '## Lint & Format Commands\n\n- **Test:** (none detected)\n', 'utf8');
+  assert(resolveVerifyCommand(fallbackDir, gsdDir) === null, 'none-detected CODING-STANDARDS fallback returns null');
+  assert(resolveVerifyCommand(fallbackDir, path.join(fallbackDir, 'missing-gsd')) === null,
+    'missing CODING-STANDARDS fallback returns null');
+
+  const quotedDir = fixture();
+  const quotedGsd = path.join(quotedDir, 'external-gsd');
+  fs.mkdirSync(quotedGsd, { recursive: true });
+  fs.writeFileSync(path.join(quotedGsd, 'CODING-STANDARDS.md'), '## Lint & Format Commands\n\n- **Test:** `pytest -k "test one"`\n', 'utf8');
+  assert(resolveVerifyCommand(quotedDir, quotedGsd) === null,
+    'quoted command that would lose meaning under space-split resolves to null instead of a broken argv');
+
+  const priorityDir = fixture();
+  write(priorityDir, 'package.json', '{"scripts":{"test":"node -e \\"0\\""}}');
+  const priorityGsd = path.join(priorityDir, 'external-gsd');
+  fs.mkdirSync(priorityGsd, { recursive: true });
+  fs.writeFileSync(path.join(priorityGsd, 'CODING-STANDARDS.md'), '## Lint & Format Commands\n- **Test:** `make test`\n', 'utf8');
+  assert(JSON.stringify(resolveVerifyCommand(priorityDir, priorityGsd)) === JSON.stringify(['npm', 'test']),
+    'stack detection precedes the CODING-STANDARDS fallback');
 }
 
 function testRunAndApply() {
@@ -104,6 +132,20 @@ function testModeAndCli() {
   assert(run.status === 0 && output && output.verdict === 'verified' && rewritten.must_haves_status[0].status === 'met'
     && rewritten.must_haves_status[0].scope === 'task' && rewritten.must_haves_status[0].reason === '',
   'CLI --apply writes a parseable verified result deterministically', run.stderr);
+
+  const gitRequired = result([entry({ reason: 'git-commit-required', note: 'requires `git commit` to prove' })]);
+  const green = reverify({ result: gitRequired, codeDir: dir, apply: true });
+  assert(green.verdict === 'verified' && gitRequired.must_haves_status[0].status === 'met'
+    && gitRequired.must_haves_status[0].scope === 'task' && gitRequired.must_haves_status[0].reason === ''
+    && /re-verified by orchestrator: npm test exit 0/.test(gitRequired.must_haves_status[0].note),
+  'git-commit-required re-verifies green end-to-end');
+
+  write(dir, 'package.json', '{"scripts":{"test":"node -e \\"process.exit(1)\\""}}');
+  const redPayload = result([entry({ reason: 'git-commit-required', note: 'requires `git commit` to prove' })]);
+  const red = reverify({ result: redPayload, codeDir: dir, apply: true });
+  const { checkEnvPromotion } = require('./forge-env-promote.js');
+  assert(red.verdict === 'failed' && checkEnvPromotion(redPayload, '').promote === false,
+    'git-commit-required re-verifies red end-to-end and cannot promote');
 }
 
 function testAmbiguousMultiCommand() {
@@ -132,6 +174,41 @@ function testAmbiguousMultiCommand() {
   const sameCommandOutcome = reverify({ result: sameCommand, codeDir: dir, apply: true });
   assert(sameCommandOutcome.verdict === 'verified',
     'entries naming the same command still promote in bulk', JSON.stringify(sameCommandOutcome));
+}
+
+// TASK-020 review R1: gsd-write-refused alleges a .gsd/** write was refused —
+// only fs.existsSync + content can prove that, never a project suite's exit
+// code. These guards prove the trigger/promotion gate is seletive: it must
+// still fire for the other environment reasons, must never fire or promote
+// for gsd-write-refused alone, and must not let one reversible entry drag an
+// unrelated gsd-write-refused entry along with it.
+function testGsdWriteRefusedSeparation() {
+  const dir = fixture();
+  write(dir, 'package.json', '{"scripts":{"test":"node -e \\\"process.exit(0)\\\""}}');
+  write(dir, 'package-lock.json', '{}');
+
+  const fires = result([entry({ reason: 'sandbox-exec-blocked' })]);
+  const firesOutcome = reverify({ result: fires, codeDir: dir, apply: true });
+  assert(firesOutcome.verdict === 'verified' && fires.must_haves_status[0].status === 'met',
+    'sandbox-exec-blocked still fires and promotes on a green suite', JSON.stringify(firesOutcome));
+
+  const doesNotFire = result([entry({ reason: 'gsd-write-refused' })]);
+  assert(!needsReverification(doesNotFire), 'gsd-write-refused alone does not trigger needsReverification');
+  const notApplicable = reverify({ result: doesNotFire, codeDir: dir, apply: true });
+  assert(notApplicable.verdict === 'not-applicable'
+    && doesNotFire.must_haves_status[0].status !== 'met' && doesNotFire.must_haves_status[0].scope === 'environment',
+  'gsd-write-refused alone is not promoted and stays environment-scoped', JSON.stringify(notApplicable));
+
+  const mixed = result([
+    entry({ reason: 'gsd-write-refused' }),
+    entry({ reason: 'sandbox-exec-blocked' }),
+  ]);
+  const mixedOutcome = reverify({ result: mixed, codeDir: dir, apply: true });
+  assert(mixedOutcome.verdict === 'verified' && mixed.must_haves_status[1].status === 'met',
+    'mixed payload still fires for the reverifiable entry', JSON.stringify(mixedOutcome));
+  assert(mixed.must_haves_status[0].status !== 'met' && mixed.must_haves_status[0].scope === 'environment'
+    && mixed.must_haves_status[0].reason === 'gsd-write-refused',
+  'mixed payload leaves the gsd-write-refused entry untouched — selective, not a blanket disable');
 }
 
 // Regression guard: npm/pnpm/yarn are `.cmd` shims on Windows, which
@@ -189,6 +266,7 @@ try {
   testRunAndApply();
   testModeAndCli();
   testAmbiguousMultiCommand();
+  testGsdWriteRefusedSeparation();
   testPlatformRouting();
 } finally {
   for (const dir of fixtures) {

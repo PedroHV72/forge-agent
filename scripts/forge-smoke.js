@@ -3527,6 +3527,12 @@ function smokeXllmSvn() {
       fs.writeFileSync(path.join(mockDir, 'git'), '#!/bin/sh\necho "$@" >> "$LOGFILE"\nexit 1\n', 'utf8');
       fs.chmodSync(path.join(mockDir, 'git'), 0o755);
 
+      // Dogfood found that the real codex CLI itself probes
+      // `git -c core.hooksPath=/dev/null -c core.fsmonitor=false remote -v`.
+      // Forge never emits that pattern (checked in forge-xllm.js, forge-vcs.js,
+      // and forge-surgical-reset.js); its shim's exit 42 was non-fatal. The
+      // mocked codex used here does not probe git, so this guard measures Forge
+      // code only, never an arbitrary child process.
       const startRange = svnRange(fixture.wc);
       const execute = runXllm(['--mode', 'execute', '--plan', planFile, '--result-file', executeResult, '--cwd', fixture.wc],
         mockDir, fixture.wc, { LOGFILE: gitLog });
@@ -3539,7 +3545,7 @@ function smokeXllmSvn() {
         && executeJson.vcs === 'svn' && !/^[0-9a-f]{40}$/i.test(executeJson.start_sha),
       '(a) SVN result carries the svnversion range and vcs=svn', JSON.stringify(executeJson));
       assert(!fs.existsSync(gitLog) || fs.readFileSync(gitLog, 'utf8').trim() === '',
-        '(b) execute on SVN never invokes the PATH git shim', fs.existsSync(gitLog) ? fs.readFileSync(gitLog, 'utf8') : 'no log');
+        "(b) forge's own SVN execute path issues no git command (mocked codex; the real CLI does)", fs.existsSync(gitLog) ? fs.readFileSync(gitLog, 'utf8') : 'no log');
 
       writeMockCodex(mockDir, { checkContract: true, payload: planPayload });
       const plan = runXllm(['--mode', 'plan', '--plan-context', contextFile, '--result-file', planResult, '--cwd', fixture.wc],
@@ -3548,7 +3554,7 @@ function smokeXllmSvn() {
       assert(plan.status === 0 && planJson && planJson.status === 'done',
         '(e) SVN plan completes exit 0 with the valid payload', JSON.stringify({ plan, planJson }));
       assert(!fs.existsSync(gitLog) || fs.readFileSync(gitLog, 'utf8').trim() === '',
-        '(b) plan on SVN never invokes the PATH git shim', fs.existsSync(gitLog) ? fs.readFileSync(gitLog, 'utf8') : 'no log');
+        "(b) forge's own SVN plan path issues no git command (mocked codex; the real CLI does)", fs.existsSync(gitLog) ? fs.readFileSync(gitLog, 'utf8') : 'no log');
 
       const movedResult = path.join(resultDir, 'moved.json');
       writeMockCodex(mockDir, {
@@ -8421,6 +8427,18 @@ function smokeSandboxExecBlocked() {
   '(c) failed re-verification forces the normal task failure path');
   cleanup(fixture);
 
+  for (const reason of ['git-commit-required', 'out-of-scope-test-failure', 'network-required', 'sandbox-exec-blocked']) {
+    assert(reverify.needsReverification({ ...base, must_haves_status: [{ ...env('npm test EPERM'), reason }] }),
+      `(c) re-verification trigger accepts environment reason ${reason}`);
+  }
+  // TASK-020 review R1: gsd-write-refused alleges a .gsd/** write was
+  // refused — a project test suite's exit code proves nothing about that,
+  // so it is excluded from the trigger (contra-case, not a fifth accepted reason).
+  assert(!reverify.needsReverification({ ...base, must_haves_status: [{ ...env('npm test EPERM'), reason: 'gsd-write-refused' }] }),
+    '(c) re-verification trigger excludes gsd-write-refused (not provable by command exit code)');
+  assert(!reverify.needsReverification({ ...base, must_haves_status: [{ ...env('npm test EPERM'), scope: 'task' }] }),
+    '(c) re-verification trigger rejects task-scoped entries');
+
   const files = ['scripts/forge-xllm.js', 'scripts/forge-env-promote.js', 'shared/forge-dispatch.md', 'scripts/forge-smoke.js', 'scripts/forge-reverify.js', 'scripts/forge-reverify.test.js'];
   for (const file of files) assert((readRepoText(path.join(REPO, file)).match(/sandbox-exec-blocked/g) || []).length >= 1,
     `(d) ${file} contains sandbox-exec-blocked`);
@@ -8430,6 +8448,16 @@ function smokeSandboxExecBlocked() {
       `(d) ${name} mirror has executable re-verification invocation and event`);
     assert(!['git-commit-required', 'gsd-write-refused', 'out-of-scope-test-failure', 'network-required', 'sandbox-exec-blocked']
       .every(reason => new RegExp(`['"]${reason}['"]`).test(skill)), `(d) ${name} does not redefine five-member allowlist`);
+  }
+  const gsdFlagDocs = [
+    ['shared/forge-dispatch.md', '--gsd-dir "$WORKING_DIR/.gsd"'],
+    ['skills/forge-auto/SKILL.md', '--gsd-dir "$WORKING_DIR/.gsd"'],
+    ['skills/forge-next/SKILL.md', '--gsd-dir "$WORKING_DIR/.gsd"'],
+    ['skills/forge-task/SKILL.md', '--gsd-dir "${WORKING_DIR:-.}/.gsd"'],
+  ];
+  for (const [file, flag] of gsdFlagDocs) {
+    const count = fs.readFileSync(path.join(REPO, file), 'utf8').split(flag).length - 1;
+    assert(count === 1, `(d) ${file} carries exactly one executable --gsd-dir flag`, String(count));
   }
   const wrapper = new Function('exports', 'require', 'module', '__filename', '__dirname',
     `${fs.readFileSync(path.join(SCRIPTS, 'forge-xllm.js'), 'utf8').replace(/^#![^\n]*\n/, '')}\nmodule.exports.__section71={planSchema,buildPlanPrompt};`);
@@ -8490,7 +8518,7 @@ function smokeSandboxExecBlocked() {
   assert(/require\(['"]\.\/forge-surgical-reset\.js['"]\)/.test(reverifySource) && /writeJsonAtomic\(absoluteResult, result\)/.test(reverifySource),
     '(h) forge-reverify.js reuses writeJsonAtomic from forge-surgical-reset.js for --apply writes');
 
-  pass('(final) Section 71: sandbox execution classification and re-verification stay live');
+  pass('(final) Section 71: environment classification and re-verification stay live');
 }
 
 // ── Section 58: cleanupForRun registry-first mode ──────────────────────────

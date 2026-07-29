@@ -12,6 +12,7 @@ const SANDBOX_DENIAL_RE = /\bEPERM\b|\bEACCES\b|\bEROFS\b|permission denied|oper
 const RUNNER_NAMES = 'npm|npx|pnpm|yarn|bun|node|jest|vitest|mocha|playwright|pytest|python3?|tox|go|cargo|make|gradle|mvn|dotnet|bundle|rspec|rake|php|composer|cmake|ctest|tsc|eslint|ruff';
 const ATTEMPTED_COMMAND_RE = new RegExp(`(?:^|[\\s\`'"(\\\\/])(?:${RUNNER_NAMES})\\b|\`[^\`\\n]{3,}\``);
 const RUNNER_TOKEN_RE = new RegExp(`\\b(?:${RUNNER_NAMES})\\b`, 'gi');
+const GIT_WRITE_RE = /\bgit[ \t]+(?:commit|push|tag|merge|rebase|cherry-pick|revert|stash|add|am|apply|checkout[ \t]+-b)\b/i;
 
 /**
  * Extract the distinct runner tool names (npm, pytest, make, ...) mentioned in
@@ -53,10 +54,15 @@ function corroborates(entry, planText) {
       const inPlan = testPaths.some(testPath => planText.includes(normalizedPath(testPath)));
       return inPlan ? 'cited test path appears in planText' : null;
     }
-    case 'git-commit-required':
-      return /\bgit\b|commit|push/i.test(evidence)
+    // TASK-020: this means proving the item requires committing, not that a
+    // test happens to use git fixtures. `item` is self-reported boilerplate,
+    // so only the execution-report `note` is evidence.
+    case 'git-commit-required': {
+      const note = typeof entry.note === 'string' ? entry.note : '';
+      return GIT_WRITE_RE.test(note)
         ? null
-        : 'git-commit-required requires git operation evidence';
+        : 'git-commit-required requires a git write operation (commit/push/tag/merge) in the note; a note that merely mentions git is not evidence';
+    }
     case 'network-required':
       return /network|install|fetch|clone|download|registry/i.test(evidence)
         ? null

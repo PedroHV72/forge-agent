@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 'use strict';
 
-// forge-reverify.js — deterministic orchestrator-side sandbox re-verification.
+// forge-reverify.js — deterministic orchestrator-side environment re-verification.
 // Formula-once rule: this helper alone owns the trigger and command-resolution
-// rules; see shared/forge-dispatch.md § Sidecar dispatch state machine (TASK-015).
+// rules. Since TASK-020 every unmet environment reason is covered: an
+// unverified must-have remains unverified regardless of its stated excuse.
+// This supersedes the former sandbox-exec-blocked-only trigger.
 
 const fs = require('fs');
 const path = require('path');
@@ -14,17 +16,29 @@ const { extractRunnerTokens } = require('./forge-env-promote.js');
 
 const DEFAULT_TIMEOUT_MS = 600000;
 
+function isEnvironmentUnmet(entry) {
+  return Boolean(entry && entry.status !== 'met' && entry.scope === 'environment');
+}
+
+// gsd-write-refused alleges that a .gsd/** artifact write was refused — only
+// the orchestrator writes .gsd/**, and the only evidence for that claim is
+// fs.existsSync + content, never a project test suite's exit code. Running
+// the project's verify command proves nothing about a .gsd/** write, so this
+// reason is excluded from the reverifiable set (TASK-020 review R1).
+function isReverifiable(entry) {
+  return isEnvironmentUnmet(entry) && entry.reason !== 'gsd-write-refused';
+}
+
 function needsReverification(result) {
   return Boolean(result && Array.isArray(result.must_haves_status)
-    && result.must_haves_status.some(entry => entry && entry.status !== 'met'
-      && entry.scope === 'environment' && entry.reason === 'sandbox-exec-blocked'));
+    && result.must_haves_status.some(isReverifiable));
 }
 
 function readText(filename) {
   try { return fs.readFileSync(filename, 'utf8'); } catch { return null; }
 }
 
-function resolveVerifyCommand(codeDir) {
+function resolveVerifyCommand(codeDir, gsdDir = path.join(codeDir, '.gsd')) {
   const packageText = readText(path.join(codeDir, 'package.json'));
   if (packageText) {
     try {
@@ -45,7 +59,19 @@ function resolveVerifyCommand(codeDir) {
   }
   const makefile = readText(path.join(codeDir, 'Makefile'));
   if (makefile && /^test:/m.test(makefile)) return ['make', 'test'];
-  return null;
+  const standards = readText(path.join(gsdDir, 'CODING-STANDARDS.md'));
+  if (!standards) return null;
+  const header = standards.match(/^## Lint & Format Commands[ \t]*$/m);
+  if (!header || typeof header.index !== 'number') return null;
+  const section = standards.slice(header.index + header[0].length).split(/^## /m)[0];
+  const testLine = section.match(/^- \*\*Test:\*\*[ \t]*(.+)$/m);
+  if (!testLine || testLine[1].trim() === '(none detected)') return null;
+  const commands = [...testLine[1].matchAll(/`([^`]+)`/g)].map(match => match[1]);
+  // spawn runs with shell:false, so only commands tokenizable by a lossless
+  // space-split may pass; anything needing shell parsing (quotes, escapes,
+  // metacharacters) falls to null (no-command) — the pre-existing safe default.
+  const safe = commands.find(command => !/["'\\*?|&;><$(]/.test(command));
+  return safe ? safe.trim().split(/[ \t]+/).filter(Boolean) : null;
 }
 
 function commandText(argv) {
@@ -134,10 +160,10 @@ function runVerification({ argv, codeDir, timeoutMs }) {
 
 // Keep this selector separate from applyVerdict: it is evaluated before any
 // mutation so an entry is never selected merely because a prior mutation made
-// it task-scoped. That ordering is what lets a failed re-run enter repair.
+// it task-scoped. Since TASK-020 it covers every environment reason: an
+// unverified must-have is unverified regardless of its stated excuse.
 function affectedEntries(result) {
-  return Array.isArray(result && result.must_haves_status) ? result.must_haves_status.filter(entry => entry
-    && entry.status !== 'met' && entry.scope === 'environment' && entry.reason === 'sandbox-exec-blocked') : [];
+  return Array.isArray(result && result.must_haves_status) ? result.must_haves_status.filter(isReverifiable) : [];
 }
 
 // Refusal gate only — NEVER used to pick which command to run, nor to map an
@@ -177,7 +203,7 @@ function applyVerdict(result, outcome) {
  * Produce one deterministic verdict and, only when requested, amend the
  * temporary result payload. The worker-owned result is otherwise untouched.
  */
-function reverify({ result, codeDir, mode = 'auto', timeoutMs = DEFAULT_TIMEOUT_MS, apply = false }) {
+function reverify({ result, codeDir, gsdDir, mode = 'auto', timeoutMs = DEFAULT_TIMEOUT_MS, apply = false }) {
   if (mode === 'off') return { verdict: 'disabled', command: '', exit_code: null, entries: 0 };
   if (!needsReverification(result)) return { verdict: 'not-applicable', command: '', exit_code: null, entries: 0 };
   const pending = affectedEntries(result);
@@ -187,7 +213,7 @@ function reverify({ result, codeDir, mode = 'auto', timeoutMs = DEFAULT_TIMEOUT_
     // bulk and surface for a human instead of guessing which entry to trust.
     return { verdict: 'ambiguous-multi-command', command: '', exit_code: null, entries: pending.length };
   }
-  const argv = resolveVerifyCommand(codeDir);
+  const argv = resolveVerifyCommand(codeDir, gsdDir);
   const outcome = argv
     ? runVerification({ argv, codeDir, timeoutMs })
     : { verdict: 'no-command', command: '', exit_code: null };
@@ -197,18 +223,20 @@ function reverify({ result, codeDir, mode = 'auto', timeoutMs = DEFAULT_TIMEOUT_
 }
 
 function usage() {
-  return 'Usage: node scripts/forge-reverify.js --result <file> --code-dir <dir> [--apply] [--mode auto|off] [--timeout-ms N] [--json]\n';
+  return 'Usage: node scripts/forge-reverify.js --result <file> --code-dir <dir> [--gsd-dir <dir>] [--apply] [--mode auto|off] [--timeout-ms N] [--json]\n';
 }
 
 function runCli(args) {
   let resultPath = null;
   let codeDir = null;
+  let gsdDir = null;
   let apply = false;
   let mode = 'auto';
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === '--result' && args[i + 1]) resultPath = args[++i];
     else if (args[i] === '--code-dir' && args[i + 1]) codeDir = args[++i];
+    else if (args[i] === '--gsd-dir' && args[i + 1]) gsdDir = args[++i];
     else if (args[i] === '--mode' && args[i + 1]) mode = args[++i];
     else if (args[i] === '--timeout-ms' && args[i + 1]) timeoutMs = Number(args[++i]);
     else if (args[i] === '--apply') apply = true;
@@ -223,7 +251,7 @@ function runCli(args) {
   try {
     const absoluteResult = path.resolve(resultPath);
     const result = JSON.parse(fs.readFileSync(absoluteResult, 'utf8'));
-    const outcome = reverify({ result, codeDir: path.resolve(codeDir), mode, timeoutMs, apply });
+    const outcome = reverify({ result, codeDir: path.resolve(codeDir), gsdDir: gsdDir ? path.resolve(gsdDir) : undefined, mode, timeoutMs, apply });
     if (apply && ['verified', 'failed'].includes(outcome.verdict)) {
       // Atomic (temp + rename) so a kill mid-write never leaves the result
       // file truncated for the next JSON.parse consumer.
@@ -240,7 +268,7 @@ function runCli(args) {
 if (require.main === module) process.exitCode = runCli(process.argv.slice(2));
 
 module.exports = {
-  needsReverification, resolveVerifyCommand, runVerification, applyVerdict, reverify, runCli,
+  isEnvironmentUnmet, isReverifiable, needsReverification, resolveVerifyCommand, runVerification, applyVerdict, reverify, runCli,
   // Exported for the platform-routing regression guard only.
   spawnPlan, resolveExecutable,
 };
