@@ -1,16 +1,26 @@
 // SecretsView — the vault, in the app.
 //
-// Adding a secret here is SAFER than the CLI: the app talks to the Keychain
-// through the Security framework (SecItemAdd), so the value never appears in
-// any process's argv. `security add-generic-password` has no such option —
-// verified: passing the secret on stdin stores an empty string — so the CLI
-// necessarily exposes it to `ps` for the duration of one exec.
+// Adding a secret goes through scripts/forge-secrets.js and nothing else, so
+// the registry format, the env-var table and the resolution rules have one
+// implementation — and the value is written exactly once.
 //
-// Everything else still goes through scripts/forge-secrets.js, so the registry
-// format, the env-var table and the resolution rules have one implementation.
+// This file used to ALSO write the value itself through the Security framework
+// (SecItemAdd), on the theory that doing so kept it out of argv. That theory
+// was wrong, and the mistake is worth recording because it reads as an
+// improvement: the engine call happened immediately afterwards regardless, and
+// the engine's `security add-generic-password` requires the value in argv
+// (`-w` — verified, and documented at scripts/forge-secrets.js:25-31, since
+// passing it on stdin stores an empty string). The value was therefore exposed
+// to `ps` either way; the framework write avoided no exposure at all.
+//
+// What it did add was a cost. An item created by SecItemAdd carries an ACL
+// trusting the creating binary's code signature, and this app is ad-hoc signed
+// — its cdhash changes on every rebuild. So each later read by `security(1)`
+// came from an "unknown" binary and macOS prompted for authorisation, over and
+// over. Removing the write removes the prompt; the item the engine creates is
+// plain and readable by the CLI without a dialog.
 
 import SwiftUI
-import Security
 import ForgeKit
 
 // MARK: - Model
@@ -24,6 +34,9 @@ struct StoredSecret: Codable, Identifiable, Hashable {
     let added_at: String?
     let has_secret: Bool?
     let is_default: Bool?
+    /// Set by the engine only when verification was asked for AND the vault
+    /// could not be read. It splits the two reasons `has_secret` is nil.
+    let verify_failed: Bool?
 
     var id: String { "\(service)/\(name)" }
     var isDefault: Bool { is_default ?? false }
@@ -31,39 +44,9 @@ struct StoredSecret: Codable, Identifiable, Hashable {
     /// Keychain access per entry, and an ad-hoc signed bundle gets an
     /// authorisation dialog for each. Only `false` means actually missing.
     var secretMissing: Bool { has_secret == false }
-}
-
-// MARK: - Keychain (write path)
-
-enum VaultKeychain {
-    /// Same item shape scripts/forge-secrets.js uses, so a secret written here
-    /// is readable by the CLI and vice versa: generic password, account = the
-    /// OS user, service = forge-secret-<service>-<name>.
-    static func serviceName(_ service: String, _ name: String) -> String {
-        "forge-secret-\(service)-\(name)"
-    }
-
-    @discardableResult
-    static func set(_ secret: String, service: String, name: String) -> OSStatus {
-        let account = NSUserName()
-        let svc = serviceName(service, name)
-        let data = Data(secret.utf8)
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: account,
-            kSecAttrService as String: svc,
-        ]
-        // Update in place when it already exists, so re-adding replaces rather
-        // than failing with duplicate-item.
-        let update: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if status == errSecSuccess { return status }
-
-        var insert = query
-        insert[kSecValueData as String] = data
-        return SecItemAdd(insert as CFDictionary, nil)
-    }
+    /// We looked and could not tell. Distinct from "we did not look", and it
+    /// must never be shown as absence — the value is probably there.
+    var vaultUnreadable: Bool { verify_failed == true }
 }
 
 // MARK: - Store
@@ -91,9 +74,9 @@ final class SecretsStore: ObservableObject {
 
     struct ServiceRow: Codable { let service: String; let env: String }
 
-    /// Write the secret via the Security framework, then register the metadata
-    /// through the engine. Two steps because only the second one knows the
-    /// registry format — and only the first can avoid argv.
+    /// Hand the value and its metadata to the engine in a single call: it
+    /// writes the secret and registers the entry together. One writer, so the
+    /// registry and the vault cannot disagree about what exists.
     func add(service: String, name: String, secret: String, note: String) -> Bool {
         let svc = service.trimmingCharacters(in: .whitespaces).lowercased()
         let nm = name.trimmingCharacters(in: .whitespaces)
@@ -102,15 +85,9 @@ final class SecretsStore: ObservableObject {
             return false
         }
 
-        let status = VaultKeychain.set(secret, service: svc, name: nm)
-        guard status == errSecSuccess else {
-            error = "Keychain recusou (status \(status))"
-            return false
-        }
-
-        // Register with a placeholder the engine will overwrite in the Keychain
-        // with the same value — cheap, and it keeps the registry writer in one
-        // place instead of duplicating its format here.
+        // The engine is the only writer, of both the value and the registry
+        // entry. Its failure is the only failure mode there is, which is why
+        // the guard below must keep reporting it instead of returning quietly.
         var args = ["--add", svc, nm]
         if !note.trimmingCharacters(in: .whitespaces).isEmpty {
             args += ["--note", note]
@@ -263,8 +240,10 @@ struct SecretRow: View {
                                  : (secret.has_secret == true ? AnyShapeStyle(Color.green)
                                                               : AnyShapeStyle(.secondary)))
                 .frame(width: 16)
-                .help(secret.has_secret == nil ? "Valor não verificado"
-                      : (secret.secretMissing ? "Sem valor no cofre" : "Valor presente"))
+                .help(secret.vaultUnreadable
+                      ? "Não foi possível ler o cofre — o valor pode estar lá"
+                      : (secret.has_secret == nil ? "Valor não verificado"
+                         : (secret.secretMissing ? "Sem valor no cofre" : "Valor presente")))
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
@@ -343,15 +322,15 @@ struct AddSecretSheet: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            // SecureField: the value is never rendered, and the app writes it to
-            // the Keychain directly rather than through a command line.
+            // SecureField: the value is never rendered on screen, and it goes
+            // to the engine on stdin rather than being typed into a shell.
             SecureField("segredo", text: $secret)
                 .textFieldStyle(.roundedBorder)
 
             TextField("nota (opcional)", text: $note)
                 .textFieldStyle(.roundedBorder)
 
-            Text("Vários nomes do mesmo serviço convivem. O valor vai direto para o Keychain — não passa por linha de comando.")
+            Text("Vários nomes do mesmo serviço convivem. O valor é gravado direto no cofre — não fica no histórico do shell.")
                 .font(.caption2).foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
 

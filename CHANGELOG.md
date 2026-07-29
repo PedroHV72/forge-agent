@@ -1,3 +1,21 @@
+## v3.1.1 — The vault stops crying wolf, and starts keeping receipts
+
+### Fixed
+
+- **The app was the reason the Keychain kept asking.** `SecretsView.add()` wrote the secret itself with `SecItemAdd` before calling the engine, on the theory that this kept the value out of argv. It did not: the engine's `security add-generic-password` needs the value in `-w` and ran immediately afterwards regardless. So the framework write avoided *zero* exposure while creating an item whose ACL trusts the ad-hoc bundle's cdhash — which changes on every rebuild, so every later read by `security(1)` came from an "unknown" binary and prompted. `VaultKeychain`, the call, the guard and `import Security` are gone; the engine is the only writer. **Existing secrets keep the old ACL** — purging it needs `forge-secrets remove <svc> <name>` *then* `add`, because `--add` alone uses `-U`, which updates the item and preserves the ACL.
+- **"Registrado sem valor no cofre — readicione", for a secret that was fine.** `list()` computed `has_secret` as `!!get(...)`, and `get()` returned `null` for *every* failure — a denied prompt, a locked keychain, the 5-second timeout. A healthy credential listed as missing and the UI told the operator to redo work. `get()` now sits on a three-state probe (`present|absent|unknown`) with an **allowlist**: only exit 44 (Keychain) and `ENOENT`/missing key (file) mean absent; everything else is unknown. A blocklist would have re-introduced the same defect through any error nobody thought to enumerate. `get()` keeps its `string|null` signature, so the seven existing assertions were untouched.
+- Two texts that were also false: the claim that a secret added in the app "não passa por linha de comando", and the `·` footnote telling an operator who had just run `--verify` to run `--verify`.
+
+### Added
+
+- **Keychain write-failure diagnostics** (`scripts/forge-keychain-diagnostics.js`). `storeSecret` used to swallow a `security` failure and fall back to the 0600 file silently, so a failed write left no trace beyond a `store` field. Both write paths now record the exit code, signal, trimmed stderr, whether the fallback was used, and enough process context to settle whether a sandbox is involved — to `~/.claude/forge-keychain-diagnostics.jsonl`, capped at 256 KB, readable via `forge-secrets --diagnostics`. The secret value is never recorded, and a test asserts a sentinel value never reaches the file.
+
+### Known, not fixed
+
+- A separate macOS dialog — **"Chaves Não Encontradas: não foi possível encontrar as chaves para armazenar «\<user\>»"** — is a *store* failure, not the authorization prompt above, and its cause is still open. Two hypotheses were investigated and both failed verification, so nothing was changed on a guess. The diagnostics added in this release exist precisely so the next occurrence produces evidence.
+
+---
+
 ## v3.1.0 — A backlog for the work Forge already defers
 
 Forge has always produced work items it then had nowhere to put. A conceded review

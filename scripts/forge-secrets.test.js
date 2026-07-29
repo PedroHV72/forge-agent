@@ -291,6 +291,97 @@ test('Keychain travado não pendura — degrada para arquivo', () => {
   delete require.cache[require.resolve('./forge-secrets.js')];
 });
 
+test('cofre ilegível é INDETERMINADO, nunca "sem valor"', () => {
+  // The defect this pins: `list()` computed presence as `!!get(...)`, and
+  // `get()` returned null for every failure — a corrupt fallback file, a
+  // permission error, a Keychain timeout. So a credential that was perfectly
+  // fine listed as missing, and the fix the UI suggested was to re-add it.
+  //
+  // The scenario is built from the file store rather than the real Keychain on
+  // purpose: run-tests.js isolates HOME but not the Keychain, so a test that
+  // needed a broken Keychain would either hang or not run off macOS.
+  const svc = SERVICE + 'corrupt';
+  const FALLBACK = `${REGISTRY}.secrets`;
+
+  // A registry entry with no value anywhere: written straight through save(),
+  // so nothing is ever put in the Keychain and `security` answers 44 (absent)
+  // on darwin, while other platforms simply have no keychain layer.
+  const creds = secrets.load();
+  creds.push({
+    service: svc, name: 'x', env_var: 'X_TOKEN', note: '',
+    store: 'file', added_at: new Date().toISOString(),
+  });
+  secrets.save(creds);
+
+  const existed = fs.existsSync(FALLBACK);
+  const previous = existed ? fs.readFileSync(FALLBACK, 'utf8') : null;
+  try {
+    fs.writeFileSync(FALLBACK, '{ this is not json', { mode: 0o600 });
+    fs.chmodSync(FALLBACK, 0o600);
+
+    const row = secrets.list({ verify: true }).find(c => c.service === svc);
+    assert(row, 'a entrada de teste deveria estar no registro');
+    assert(row.has_secret !== false,
+      'REGRESSÃO: cofre ilegível reportado como "sem valor" — é exatamente o defeito ' +
+      'que manda o usuário readicionar um segredo saudável');
+    assertEq(row.has_secret, null, 'leitura falha não afirma nada sobre o valor');
+    assertEq(row.verify_failed, true, 'o motivo do null precisa ser distinguível');
+    assertEq(secrets.secretState(svc, 'x'), 'unknown');
+
+    // The bite: `get()` is null here, so the old `has_secret: !!get(...)`
+    // would have produced `false`. Anyone reverting list() to that form fails
+    // the assertion above because of this exact condition.
+    assertEq(secrets.get(svc, 'x'), null,
+      'get() devolve null no cenário — é por isso que !!get() produziria false');
+  } finally {
+    if (previous === null) { try { fs.rmSync(FALLBACK, { force: true }); } catch {} }
+    else {
+      fs.writeFileSync(FALLBACK, previous, { mode: 0o600 });
+      fs.chmodSync(FALLBACK, 0o600);
+    }
+    secrets.save(secrets.load().filter(c => c.service !== svc));
+  }
+});
+
+test('raiz JSON válida mas não-objeto no arquivo fallback é INDETERMINADO, nunca "sem valor"', () => {
+  // R1 review fix: JSON.parse succeeds on `null`, `[]`, a bare string or a
+  // number just as well as on an object — but storeSecret always serializes a
+  // plain object, so any other root is corruption, not an empty vault. Each
+  // case below must report `unknown`/`has_secret: null`, never `absent`/`false`.
+  const svc = SERVICE + 'nonobj';
+  const FALLBACK = `${REGISTRY}.secrets`;
+
+  const creds = secrets.load();
+  creds.push({
+    service: svc, name: 'x', env_var: 'X_TOKEN', note: '',
+    store: 'file', added_at: new Date().toISOString(),
+  });
+  secrets.save(creds);
+
+  const existed = fs.existsSync(FALLBACK);
+  const previous = existed ? fs.readFileSync(FALLBACK, 'utf8') : null;
+  try {
+    for (const root of ['null', '[]', '"a string"', '42']) {
+      fs.writeFileSync(FALLBACK, root, { mode: 0o600 });
+      fs.chmodSync(FALLBACK, 0o600);
+
+      const row = secrets.list({ verify: true }).find(c => c.service === svc);
+      assert(row, `a entrada de teste deveria estar no registro (root=${root})`);
+      assert(row.has_secret !== false,
+        `REGRESSÃO (root=${root}): raiz JSON não-objeto reportada como "sem valor"`);
+      assertEq(row.has_secret, null, `has_secret precisa ser null (root=${root})`);
+      assertEq(secrets.secretState(svc, 'x'), 'unknown', `secretState precisa ser unknown (root=${root})`);
+    }
+  } finally {
+    if (previous === null) { try { fs.rmSync(FALLBACK, { force: true }); } catch {} }
+    else {
+      fs.writeFileSync(FALLBACK, previous, { mode: 0o600 });
+      fs.chmodSync(FALLBACK, 0o600);
+    }
+    secrets.save(secrets.load().filter(c => c.service !== svc));
+  }
+});
+
 console.log('\nremoção');
 
 test('remove apaga registro e segredo', () => {
