@@ -79,7 +79,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Sair mesmo assim")
         alert.addButton(withTitle: "Cancelar")
         NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn ? terminateNow() : .terminateCancel
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            UpdateStore.shared.cancelRelaunch()
+            return .terminateCancel
+        }
+        return terminateNow()
     }
 
     /// The last thing that happens before the process goes away, and the only

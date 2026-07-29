@@ -127,7 +127,7 @@ final class UpdateStore: ObservableObject {
             + "bash \(ForgeCore.shellQuote("\(repo)/install.sh")) --update --with-app"
         var tracker = InstallerPhaseTracker()
 
-        ForgeCore.stream(cwd: repo, command: cmd, onLine: { line in
+        let process = ForgeCore.stream(cwd: repo, command: cmd, onLine: { line in
             MainActor.assumeIsolated {
                 let store = UpdateStore.shared
                 switch tracker.consume(line) {
@@ -140,6 +140,17 @@ final class UpdateStore: ObservableObject {
         }, onExit: { code in
             MainActor.assumeIsolated { UpdateStore.shared.finishUpdate(exitCode: code) }
         })
+
+        // `Process.run()` can throw before `onExit` ever fires — e.g. the
+        // stored repo directory has vanished, so `currentDirectoryURL` is
+        // invalid. Without this, `updating` stays true forever: a permanent
+        // spinner and a disabled "Atualizar" button with no way out.
+        guard process != nil else {
+            updating = false
+            phase = nil
+            lastError = "não consegui iniciar o instalador (o diretório do repo existe?)"
+            return
+        }
     }
 
     /// The installer is gone; the exit code decides everything.
@@ -177,6 +188,14 @@ final class UpdateStore: ObservableObject {
     func relaunch() {
         relaunchPending = true
         NSApplication.shared.terminate(nil)
+    }
+
+    /// Called when the live-session alert is cancelled: the user explicitly
+    /// declined to quit, so a later ordinary Quit must not relaunch on their
+    /// behalf. Without this, `relaunchPending` stayed true forever after a
+    /// single cancel.
+    func cancelRelaunch() {
+        relaunchPending = false
     }
 
     /// Start the replacement instance. Called by `applicationShouldTerminate`

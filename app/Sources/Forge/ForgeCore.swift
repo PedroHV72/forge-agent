@@ -226,31 +226,47 @@ enum ForgeCore {
             DispatchQueue.main.async { for l in lines { onLine(l) } }
         }
 
+        // Every readability handler body, the termination drain and the
+        // onExit enqueue run serialized on this ONE queue. That is the only
+        // way to guarantee `onExit` is enqueued after every already-read
+        // line callback: two FileHandle-private GCD queues plus a third for
+        // `terminationHandler` give no ordering on their own, only mutual
+        // exclusion inside `LineAccumulator`.
+        let pipeQueue = DispatchQueue(label: "forge.stream.pipe")
+
         for (handle, acc) in [(out.fileHandleForReading, accOut),
                               (err.fileHandleForReading, accErr)] {
             handle.readabilityHandler = { fh in
                 let chunk = fh.availableData
                 // Empty data is the EOF signal, not a line.
                 guard !chunk.isEmpty else { return }
-                emit(acc.take(chunk))
+                pipeQueue.async { emit(acc.take(chunk)) }
             }
         }
 
         proc.terminationHandler = { p in
-            // Drain first: a readability handler is not guaranteed to fire for
-            // the final chunk (SR-12080), and the last lines are exactly where
-            // the reason for a failure lives. Safe here — the process is gone.
-            let restOut = out.fileHandleForReading.readDataToEndOfFile()
-            let restErr = err.fileHandleForReading.readDataToEndOfFile()
-            var tail = accOut.take(restOut) + accErr.take(restErr)
-            if let l = accOut.flush() { tail.append(l) }
-            if let l = accErr.flush() { tail.append(l) }
-            emit(tail)
+            pipeQueue.async {
+                // Detach the handlers BEFORE the final drain, on this same
+                // queue, so there is never more than one reader on an fd —
+                // a readability handler still installed while
+                // `readDataToEndOfFile()` runs is a second concurrent
+                // reader on the same pipe.
+                out.fileHandleForReading.readabilityHandler = nil
+                err.fileHandleForReading.readabilityHandler = nil
 
-            // Only now: leaving a handler set keeps the FileHandle alive.
-            out.fileHandleForReading.readabilityHandler = nil
-            err.fileHandleForReading.readabilityHandler = nil
-            DispatchQueue.main.async { onExit(p.terminationStatus) }
+                // Drain: a readability handler is not guaranteed to fire for
+                // the final chunk (SR-12080), and the last lines are exactly
+                // where the reason for a failure lives. Safe here — the
+                // process is gone and no other reader remains.
+                let restOut = out.fileHandleForReading.readDataToEndOfFile()
+                let restErr = err.fileHandleForReading.readDataToEndOfFile()
+                var tail = accOut.take(restOut) + accErr.take(restErr)
+                if let l = accOut.flush() { tail.append(l) }
+                if let l = accErr.flush() { tail.append(l) }
+                emit(tail)
+
+                DispatchQueue.main.async { onExit(p.terminationStatus) }
+            }
         }
 
         do {

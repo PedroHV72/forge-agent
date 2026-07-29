@@ -1704,6 +1704,18 @@ test("o comando manual só inspeciona — nunca stash, reset ou rebase") {
     }
 }
 
+test("o comando manual escapa um repo com espaço no caminho") {
+    let cmd = UpdatePrecheck.manualCommand(repo: "/Users/dev/My Projects/forge-agent")
+    assertTrue(cmd.contains("'/Users/dev/My Projects/forge-agent'"),
+               "o caminho com espaço não foi quotado: \(cmd)")
+}
+
+test("ShellQuote.posix escapa aspas simples embutidas") {
+    assertEqual(ShellQuote.posix("simple"), "'simple'")
+    assertEqual(ShellQuote.posix("has space"), "'has space'")
+    assertEqual(ShellQuote.posix("it's"), "'it'\\''s'")
+}
+
 test("a mensagem de bloqueio explica que a recusa é proteção") {
     for blocker in [UpdatePrecheck.Blocker.dirtyTree, .diverged] {
         let m = UpdatePrecheck.message(for: blocker)

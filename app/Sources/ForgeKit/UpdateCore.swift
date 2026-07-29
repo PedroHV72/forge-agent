@@ -232,6 +232,21 @@ public enum UpdatePrecheck {
 
     /// A command that only INSPECTS — deliberately nothing that rewrites state.
     public static func manualCommand(repo: String) -> String {
-        "cd \(repo) && git status && git log --oneline origin/HEAD..HEAD"
+        "cd \(ShellQuote.posix(repo)) && git status && git log --oneline origin/HEAD..HEAD"
+    }
+}
+
+// MARK: - Quoting a path for a shell command
+
+/// A single-quote shell-escaping helper local to ForgeKit. ForgeKit cannot
+/// import ForgeCore (the app target), so this cannot reuse `ForgeCore.shellQuote`
+/// even though the two must behave identically — the same repo path is quoted
+/// by both the command this file only DISPLAYS and the command `runUpdate()`
+/// actually executes.
+public enum ShellQuote {
+    /// Wraps `s` in single quotes, escaping any embedded single quote as
+    /// `'\''` — the standard POSIX-shell technique.
+    public static func posix(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
