@@ -594,8 +594,13 @@ Body:   "O plano está no formato free-text legado (## Steps / ## Must-Haves / #
 Options: ["Manter — plano está bom", "Corrigir no ato — editar o plano", "Deferir — prosseguir assim"]
 ```
 
-- `Manter` / `Deferir` → ir para Gate Step 3 (edição livre opcional).
+- `Manter` → ir para Gate Step 3 (edição livre opcional).
 - `Corrigir no ato` → ir para Gate Step 3 (edição livre, com intenção de editar).
+- `Deferir` → criar um item via `shared/forge-review.md § Item capture`:
+  - `source: plan-gate/{TASK_ID}`, `origin: auto`, `status: inbox`, título = resumo do finding do plano legado.
+  - Sem `file`/`sha` — este junction não tem nenhum (o payload simplesmente omite essas chaves, nunca um placeholder).
+  - Registrar no marker do `{TASK_ID}-PLAN-GATE.md`: `formato legado: deferido → {I-id} — {title}`.
+  - Depois, ir para Gate Step 3 (edição livre opcional).
 
 ---
 
@@ -1110,6 +1115,10 @@ TaskCreate({ subject: "[{TASK_ID}] review", activeForm: "review · forge-reviewe
 - **Resolve** via the Step 5 truth table; write the dialogue to `{TASK_ID}-REVIEW.md` (Step 6 template, `## Pattern hits` from `PATTERN_HITS`). The header carries the `**Pairing:**` line (`$PAIRING_LINE`, assembled in Step 0 of the shared spec) exactly as in `S##-REVIEW.md` — boundary-agnostic, no task-specific variant.
 - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{TASK_ID}` with `model: '{RF_ALIAS}'` only when non-empty.
 - **OPEN items (Step 7b):** for each, `AskUserQuestion` live (`Manter` / `Refatorar agora` — dispatches a `review-fix` unit / `Criar follow-up`) and record the decision.
+  - `Criar follow-up` → create an item per `shared/forge-review.md § Item capture`: `source: review/{TASK_ID}/{R#}`, `origin: auto`, `status: inbox`, `file`/`sha` from the objection's `path:line` + HEAD sha.
+  - **Omit** `milestone` — a loose task has none, and inventing one is a RISK violation.
+  - Append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing).
+  - Write the item ID into the R#'s `**Decisão:**` line: `**Decisão:** follow-up → {I-id} — {title}`.
 - Any `Agent()` throw is recorded; the review **never aborts the task**. Follow `shared/forge-review.md § Agent unavailability (review-agent-unavailable)`: retry first via `shared/forge-dispatch.md § Retry Handler`; if the agent stays unavailable, emit `review-agent-unavailable` (`review-advocate-unavailable` | `review-challenger-unavailable`) — **never** the CRITICAL failure path.
 
   > **REGRA CRÍTICA:** o orquestrador NUNCA produz veredito de review no lugar de um agente indisponível — nem defesa, nem réplica, nem julgamento de objeção alheia. A única ação permitida é registrar a indisponibilidade e escalar ao humano (interativo) ou deferir à triagem final (auto).
