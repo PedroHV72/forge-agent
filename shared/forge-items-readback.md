@@ -12,7 +12,7 @@ Both MUST reference `shared/forge-items-readback.md § <section>` rather than co
 
 ## Detecção de referência
 
-A consumer decides an argument **is** an item reference only when the **whole** remaining argument matches the item-ID shape and nothing else: `I-` followed by a 14-digit timestamp, optionally followed by `-` and a slug (`^I-\d{14}(-[a-z0-9-]*)?$`). This is the compact form only — there is no dashed alternate (`I-20260729-120000` is **not** a valid item shape; it classifies as `legacy` under `forge-ids.classify`, never as a timestamp-form item ID).
+A consumer decides an argument **is** an item reference only when the **whole** remaining argument matches the item-ID shape and nothing else: `I-` followed by 1 to 14 digits (a full timestamp or a genuinely unique prefix of one), optionally followed by `-` and a slug (`^I-\d{1,14}(-[a-z0-9-]*)?$`). A whole-string match cannot collide with ordinary free text (sentences contain spaces), so a short prefix like `I-2026072912` is always routed to `--resolve` rather than silently degrading into a free-text task title. This is the compact form only — there is no dashed alternate (`I-20260729-120000` is **not** a valid item shape; it classifies as `legacy` under `forge-ids.classify`, never as a timestamp-form item ID).
 
 Anything that does not match this shape — free text, a partial word, a sentence — is ordinary input and is left untouched. The shape check happens **before** calling `--resolve`; do not call `--resolve` speculatively on arbitrary text and treat a resolver error as "not an item" — that would turn a real typo (e.g. a dropped character in a real item ID) into silent free-text fallthrough, masking a mistake instead of stopping loud.
 

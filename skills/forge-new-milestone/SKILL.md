@@ -139,13 +139,24 @@ AskUserQuestion({
 })
 ```
 
-Guarde as escolhas (excluindo "Nenhum") como `SELECTED_ITEMS` (lista de `{id, title, source, body}`, derivada do `OPEN_ITEMS` original).
+Guarde as escolhas (excluindo "Nenhum") como `SELECTED_ITEMS` (lista de `{id, title, source, body}`, derivada do `OPEN_ITEMS` original). Derive `PICKED_IDS` (lista de IDs) diretamente de `SELECTED_ITEMS` no mesmo passo — nunca deixe a variável iterada abaixo implícita:
+```bash
+PICKED_IDS=$(echo "$SELECTED_ITEMS" | node -e '
+  let d = "";
+  process.stdin.on("data", c => d += c).on("end", () => {
+    const items = JSON.parse(d);
+    console.log(items.map(i => i.id).join(" "));
+  });
+')
+```
 
-**Promover cada escolha** (uma por uma; falha é advisory — uma linha `⚠` nomeando o item, segue com o resto):
+**Promover cada escolha e transicionar para `doing`** (uma por uma; falha é advisory — uma linha `⚠` nomeando o item, segue com o resto):
 ```bash
 for id in $PICKED_IDS; do
   node "$FORGE_SCRIPTS_DIR/forge-items.js" --promote "$id" "$MILESTONE_ID" --cwd "$(pwd)" \
     || echo "⚠ Falha ao promover item $id — seguindo sem bloquear a criação do milestone."
+  node "$FORGE_SCRIPTS_DIR/forge-items.js" --set-status "$id" doing --cwd "$(pwd)" \
+    || echo "⚠ Falha ao marcar item $id como doing — seguindo sem bloquear a criação do milestone."
 done
 ```
 

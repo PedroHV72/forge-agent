@@ -138,8 +138,20 @@ test('(a) forge-items-readback.md contains the inbox/triaged open-items filter',
 test('(b) forge-task/SKILL.md detects an item reference in Parse arguments', () => {
   const parseSection = forgeTaskSkill.split('## Parse arguments')[1] || '';
   const upToNextHeading = parseSection.split(/\n## /)[0];
-  assert(/\^I-\\d\{14\}/.test(upToNextHeading), 'Parse arguments must contain the item-ID shape regex');
+  assert(/\^I-\\d\{1,14\}/.test(upToNextHeading), 'Parse arguments must contain the widened item-ID shape regex (\\d{1,14})');
   assert(upToNextHeading.includes('ITEM_REF'), 'Parse arguments must set ITEM_REF');
+});
+
+// R1 (review fix) — the prefix guard must be widened to \d{1,14} in BOTH the
+// consumer (forge-task/SKILL.md) and the canonical spec (forge-items-readback.md)
+// so a genuinely unique short prefix (e.g. "I-2026072912") is always routed to
+// --resolve instead of silently degrading into a free-text task.
+test('(R1) forge-task/SKILL.md pins the widened \\d{1,14} prefix guard', () => {
+  assert(/\^I-\\d\{1,14\}\(-\[a-z0-9-\]\*\)\?\$/.test(forgeTaskSkill), 'forge-task/SKILL.md must contain the exact widened regex ^I-\\d{1,14}(-[a-z0-9-]*)?$');
+});
+
+test('(R1) forge-items-readback.md pins the widened \\d{1,14} prefix guard', () => {
+  assert(/\^I-\\d\{1,14\}\(-\[a-z0-9-\]\*\)\?\$/.test(readbackSpec), 'forge-items-readback.md must contain the exact widened regex ^I-\\d{1,14}(-[a-z0-9-]*)?$');
 });
 
 test('(b) forge-task/SKILL.md references forge-items-readback.md', () => {
@@ -177,6 +189,25 @@ test('(c) forge-new-milestone/SKILL.md references the shared read-back spec', ()
 
 test('(c) forge-new-milestone/SKILL.md invokes --promote with $MILESTONE_ID', () => {
   assert(/--promote\s+"?\$id"?\s+"?\$MILESTONE_ID"?/.test(forgeNewMilestoneSkill), 'missing --promote "$id" "$MILESTONE_ID" invocation');
+});
+
+// R2 (review fix) — selected items must be transitioned to `doing` after
+// promotion, per shared/forge-items-readback.md § Transição para doing.
+test('(R2) forge-new-milestone/SKILL.md transitions picked items to doing after promotion', () => {
+  assert(/--set-status\s+"?\$id"?\s+doing/.test(forgeNewMilestoneSkill), 'missing --set-status "$id" doing invocation in the promotion loop');
+});
+
+// R3 (review fix) — the promotion loop's iterated variable ($PICKED_IDS) must
+// be visibly assigned in the same block as SELECTED_ITEMS, otherwise the loop
+// is inert (precedent: the ISOLATION_MODE orphan-variable incident).
+test('(R3) forge-new-milestone/SKILL.md assigns PICKED_IDS in the same block it is derived and consumed', () => {
+  const step15 = forgeNewMilestoneSkill.split('## Step 1.5 —')[1] || '';
+  const upToNextHeading = step15.split(/\n## /)[0];
+  assert(/PICKED_IDS=/.test(upToNextHeading), 'PICKED_IDS must be assigned (PICKED_IDS=...) within the Step 1.5 block');
+  const assignIdx = upToNextHeading.indexOf('PICKED_IDS=');
+  const loopIdx = upToNextHeading.indexOf('for id in $PICKED_IDS');
+  assert(loopIdx !== -1, 'promotion loop iterating $PICKED_IDS must be present in Step 1.5');
+  assert(assignIdx !== -1 && assignIdx < loopIdx, 'PICKED_IDS assignment must appear before the loop that consumes it');
 });
 
 // (d) both consumers reference the canonical spec rather than restating the

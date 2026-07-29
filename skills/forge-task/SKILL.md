@@ -11,7 +11,7 @@ From `$ARGUMENTS`:
 - `--attach <run-id>` → `ATTACH_RUN = <run-id>`. A task passa a operar dentro do worktree desse run, na branch dele.
 - `--skip-brainstorm` or `-skip-brainstorm` → `SKIP_BRAINSTORM = true`
 - `--skip-research` or `-skip-research` → `SKIP_RESEARCH = true`
-- Remaining text after all flags → if it matches the item-ID shape and nothing else (`^I-\d{14}(-[a-z0-9-]*)?$`, per `shared/forge-items-readback.md § Detecção de referência`) → `ITEM_REF = <that text>` (`TASK_DESCRIPTION` stays unset for now — it is derived from the item's title in `## Item intake`). Otherwise → `TASK_DESCRIPTION = <that text>` exactly as today.
+- Remaining text after all flags → if it matches the item-ID shape and nothing else (`^I-\d{1,14}(-[a-z0-9-]*)?$`, per `shared/forge-items-readback.md § Detecção de referência`) → `ITEM_REF = <that text>` (`TASK_DESCRIPTION` stays unset for now — it is derived from the item's title in `## Item intake`). Otherwise → `TASK_DESCRIPTION = <that text>` exactly as today.
 
 If both `TASK_DESCRIPTION` and `ITEM_REF` are empty AND not resume mode → stop and tell the user:
 > Descreva a task: `/forge-task <descrição>`
