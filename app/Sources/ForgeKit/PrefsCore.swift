@@ -50,6 +50,52 @@ public enum JSONValue: Codable, Hashable {
     public var asBool: Bool? { if case .bool(let b) = self { return b }; return nil }
     public var asString: String? { if case .string(let s) = self { return s }; return nil }
     public var asDouble: Double? { if case .number(let d) = self { return d }; return nil }
+
+    /// A list of strings, when that is what this value is. Used by the list
+    /// editor so array preferences are never round-tripped through a text
+    /// field — doing that rewrites `["dist/**"]` as the STRING "dist/**",
+    /// which every engine then misreads.
+    public var asStringArray: [String]? {
+        guard case .array(let items) = self else { return nil }
+        let strings = items.compactMap(\.asString)
+        return strings.count == items.count ? strings : nil
+    }
+
+    public var isContainer: Bool {
+        switch self {
+        case .array, .object: return true
+        default: return false
+        }
+    }
+}
+
+/// How a preference should be edited. Derived from the schema rather than
+/// guessed from the current value, because a list that happens to be empty is
+/// still a list.
+public enum PrefKind: String, Sendable {
+    case toggle      // boolean
+    case choice      // enum
+    case number      // integer | number
+    case text        // string
+    case stringList  // array of strings
+    case opaque      // object, or a shape the app must not rewrite
+
+    /// `types` is the schema's `type` (possibly a union), `hasEnum` whether it
+    /// constrains values, `itemsAreStrings` whether an array holds strings.
+    public static func from(types: [String], hasEnum: Bool, itemsAreStrings: Bool) -> PrefKind {
+        if hasEnum { return .choice }
+        if types.contains("object") { return .opaque }
+        if types.contains("array") {
+            // A union like string|array (tier_models) stays opaque: writing it
+            // as either shape could silently change meaning.
+            if types.count > 1 { return .opaque }
+            return itemsAreStrings ? .stringList : .opaque
+        }
+        if types.contains("boolean") { return .toggle }
+        if types.contains("integer") || types.contains("number") { return .number }
+        if types.contains("string") { return .text }
+        return .opaque
+    }
 }
 
 public enum PrefsEdit {

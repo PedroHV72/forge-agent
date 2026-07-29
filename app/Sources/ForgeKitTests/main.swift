@@ -410,6 +410,48 @@ test("scan ignora raiz inexistente sem falhar") {
     assertEqual(ProjectDiscovery.scan(home: tmp).count, 0)
 }
 
+print("\nPrefKind (evita reescrever lista como string)")
+
+test("array de strings vira editor de lista") {
+    assertEqual(PrefKind.from(types: ["array"], hasEnum: false, itemsAreStrings: true), .stringList)
+}
+
+test("união string|array fica opaca") {
+    // tier_models.heavy aceita as duas formas; escrever numa delas poderia
+    // mudar o significado em silêncio.
+    assertEqual(PrefKind.from(types: ["string", "array"], hasEnum: false, itemsAreStrings: true), .opaque)
+}
+
+test("object fica opaco") {
+    assertEqual(PrefKind.from(types: ["object"], hasEnum: false, itemsAreStrings: false), .opaque)
+}
+
+test("enum vence o tipo base") {
+    assertEqual(PrefKind.from(types: ["string"], hasEnum: true, itemsAreStrings: false), .choice)
+}
+
+test("tipos escalares") {
+    assertEqual(PrefKind.from(types: ["boolean"], hasEnum: false, itemsAreStrings: false), .toggle)
+    assertEqual(PrefKind.from(types: ["integer"], hasEnum: false, itemsAreStrings: false), .number)
+    assertEqual(PrefKind.from(types: ["string"], hasEnum: false, itemsAreStrings: false), .text)
+}
+
+test("asStringArray só aceita array homogêneo de strings") {
+    assertEqual(JSONValue.array([.string("a"), .string("b")]).asStringArray ?? [], ["a", "b"])
+    assertTrue(JSONValue.array([.string("a"), .number(1)]).asStringArray == nil,
+               "array misto não pode virar lista de strings")
+    assertTrue(JSONValue.string("a").asStringArray == nil)
+}
+
+test("lista sobrevive ao round-trip como array, não como string") {
+    // The regression this guards: editing a list used to write it back as one
+    // comma-joined string.
+    let list = JSONValue.array([.string("dist/**"), .string("build/**")])
+    let doc = PrefsEdit.upsert("{\n}", path: ["file_audit", "ignore_list"], value: list)
+    assertTrue(doc.contains("[\"dist/**\", \"build/**\"]"), "deve gravar como array: \(doc)")
+    assertFalse(doc.contains("\"dist/**, build/**\""), "não pode virar string única")
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")

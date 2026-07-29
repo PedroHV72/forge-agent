@@ -271,6 +271,31 @@ final class AppState: ObservableObject {
 
     private func shq(_ s: String) -> String { ForgeCore.shellQuote(s) }
 
+    /// Set the persistent default — what a bare `claude` attaches to. Distinct
+    /// from launching: several terminals can run on different accounts without
+    /// any of them changing this.
+    func setDefaultAccount(_ name: String) {
+        let r = ForgeCore.run("forge-accounts.js", ["--default", name])
+        if r.ok { show("\(name) agora é a conta padrão"); loadAccounts() }
+        else { show(r.stderr.isEmpty ? "falha ao definir padrão" : r.stderr, error: true) }
+    }
+
+    /// Record which Anthropic identity this account is, so the status line can
+    /// name it. Captures the CURRENT session's identity — the engine refuses to
+    /// clobber an existing one, and capturing automatically would risk stamping
+    /// the wrong account.
+    func captureAccountIdentity(_ name: String) {
+        let r = ForgeCore.run("forge-accounts.js", ["--set-email", name])
+        if r.ok { show("Identidade registrada em \(name)"); loadAccounts() }
+        else { show(r.stderr.isEmpty ? "não consegui registrar" : r.stderr, error: true) }
+    }
+
+    func removeAccount(_ name: String) {
+        let r = ForgeCore.run("forge-accounts.js", ["--remove", name])
+        if r.ok { show("\(name) removida"); loadAccounts() }
+        else { show(r.stderr.isEmpty ? "falha ao remover" : r.stderr, error: true) }
+    }
+
     /// Open a terminal on another account, in-app.
     func launch(account: String) {
         let cwd = workspaces.first ?? FileManager.default.homeDirectoryForCurrentUser.path

@@ -20,16 +20,13 @@ struct PrefField: Identifiable, Hashable {
     let key: String              // "review.challenger"
     let group: String            // "review"
     let leaf: String             // "challenger"
-    let type: String             // boolean | string | integer | number | array | object
+    let types: [String]          // schema type(s) — may be a union
     let enumValues: [String]
     let defaultValue: JSONValue?
     let description: String
+    let kind: PrefKind
 
     var id: String { key }
-
-    var isToggle: Bool { type == "boolean" }
-    var isPicker: Bool { !enumValues.isEmpty }
-    var isNumber: Bool { type == "integer" || type == "number" }
 }
 
 // MARK: - Store
@@ -40,6 +37,7 @@ final class PrefsStore: ObservableObject {
     @Published private(set) var values: [String: JSONValue] = [:]   // resolved (effective)
     @Published private(set) var overrides: [String: JSONValue] = [:] // what the file sets
     @Published private(set) var globalFile: String?
+    @Published private(set) var localFile: String?
     @Published private(set) var loadError: String?
     @Published var dirty = false
 
@@ -56,6 +54,28 @@ final class PrefsStore: ObservableObject {
 
     func fields(in group: String) -> [PrefField] {
         fields.filter { $0.group == group }.sorted { $0.leaf < $1.leaf }
+    }
+
+    /// How many knobs in this group differ from the schema default — so the
+    /// group list answers "where did I change things?" without opening each one.
+    func changedCount(in group: String) -> Int {
+        fields(in: group).filter { isOverridden($0) }.count
+    }
+
+    /// Which layer set this key. The cascade is global → local (last wins), and
+    /// showing only "definido" would hide that a local file is overriding the
+    /// shared one.
+    func origin(of f: PrefField) -> String? {
+        if pendingEdits[f.key] != nil { return "não salvo" }
+        guard overrides[f.key] != nil else { return nil }
+        if let local = localFile, definesKey(f, in: local) { return "local" }
+        return "global"
+    }
+
+    private func definesKey(_ f: PrefField, in path: String) -> Bool {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return text.components(separatedBy: "\n")
+            .contains { PrefsEdit.isAssignment($0, key: f.leaf) }
     }
 
     /// Effective value: pending edit → file override → resolved → schema default.
@@ -107,6 +127,7 @@ final class PrefsStore: ObservableObject {
             values = Self.flattenValues(payload.prefs)
             overrides = values
             globalFile = payload.layers?.global?.files?.first
+            localFile = payload.layers?.local?.files?.first
         }
         if globalFile == nil {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -166,6 +187,9 @@ final class PrefsStore: ObservableObject {
         let `default`: JSONValue?
         let description: String?
         let properties: [String: SchemaNode]?
+        let items: Items?
+
+        struct Items: Codable { let type: JSONValue? }
     }
 
     private struct ResolvedPayload: Codable {
@@ -173,6 +197,7 @@ final class PrefsStore: ObservableObject {
         let layers: Layers?
         struct Layers: Codable {
             let global: Layer?
+            let local: Layer?
             struct Layer: Codable { let source: String?; let files: [String]? }
         }
     }
@@ -195,14 +220,27 @@ final class PrefsStore: ObservableObject {
     }
 
     private static func field(group: String, leaf: String, node: SchemaNode) -> PrefField {
-        PrefField(
+        // `type` may be a single string or a union array — both are valid JSON
+        // Schema and both appear in this file (tier_models is string|array).
+        var types: [String] = []
+        switch node.type {
+        case .string(let t): types = [t]
+        case .array(let list): types = list.compactMap(\.asString)
+        default: types = ["string"]
+        }
+        let enums = (node.enum ?? []).compactMap(\.asString)
+        let itemsAreStrings = node.items?.type?.asString == "string"
+
+        return PrefField(
             key: group == "geral" ? leaf : "\(group).\(leaf)",
             group: group,
             leaf: leaf,
-            type: node.type?.asString ?? "string",
-            enumValues: (node.enum ?? []).compactMap(\.asString),
+            types: types,
+            enumValues: enums,
             defaultValue: node.default,
-            description: node.description ?? "")
+            description: node.description ?? "",
+            kind: PrefKind.from(types: types, hasEnum: !enums.isEmpty,
+                                itemsAreStrings: itemsAreStrings))
     }
 
     private static func flattenValues(_ prefs: [String: JSONValue]?) -> [String: JSONValue] {
@@ -225,6 +263,8 @@ struct PrefsView: View {
     @ObservedObject var state: AppState
     @State private var group: String?
     @State private var search = ""
+    @State private var showDiff = false
+    @State private var onlyChanged = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -236,10 +276,22 @@ struct PrefsView: View {
             HSplitView {
                 List(selection: $group) {
                     ForEach(store.groups, id: \.self) { g in
-                        Text(g == "geral" ? "Geral" : g).tag(g)
+                        HStack {
+                            Text(g == "geral" ? "Geral" : g)
+                            Spacer()
+                            // A count per group answers "where did I change
+                            // things?" without opening all 22 of them.
+                            let n = store.changedCount(in: g)
+                            if n > 0 {
+                                Text("\(n)")
+                                    .font(.caption2).monospacedDigit()
+                                    .foregroundStyle(Color.accentOrange)
+                            }
+                        }
+                        .tag(g)
                     }
                 }
-                .frame(minWidth: 150, maxWidth: 190)
+                .frame(minWidth: 160, maxWidth: 200)
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
@@ -259,6 +311,12 @@ struct PrefsView: View {
         }
         .searchable(text: $search, prompt: "Buscar preferência")
         .navigationTitle("Preferências")
+        .sheet(isPresented: $showDiff) {
+            PrefsDiffSheet(store: store, isPresented: $showDiff) {
+                if let err = store.save() { state.show(err, error: true) }
+                else { state.show("Preferências salvas") }
+            }
+        }
         .onAppear {
             store.load()
             if group == nil { group = store.groups.first }
@@ -266,17 +324,20 @@ struct PrefsView: View {
     }
 
     private var visibleFields: [PrefField] {
-        let base = search.isEmpty
+        var base = search.isEmpty
             ? store.fields(in: group ?? store.groups.first ?? "geral")
             : store.fields.filter {
                 $0.key.localizedCaseInsensitiveContains(search) ||
                 $0.description.localizedCaseInsensitiveContains(search)
             }.sorted { $0.key < $1.key }
+        if onlyChanged { base = base.filter { store.isOverridden($0) } }
         return base
     }
 
     private var footer: some View {
         HStack(spacing: 10) {
+            Toggle("Só modificadas", isOn: $onlyChanged)
+                .toggleStyle(.checkbox).font(.caption2)
             if let f = store.globalFile {
                 Button {
                     ForgeCore.reveal(f)
@@ -292,11 +353,8 @@ struct PrefsView: View {
                 Text("\(store.pendingEdits.count) alteração(ões)")
                     .font(.caption2).foregroundStyle(.secondary)
                 Button("Descartar") { store.discard() }.controlSize(.small)
-                Button("Salvar") {
-                    if let err = store.save() { state.show(err, error: true) }
-                    else { state.show("Preferências salvas") }
-                }
-                .controlSize(.small).keyboardShortcut("s", modifiers: .command)
+                Button("Revisar e salvar") { showDiff = true }
+                    .controlSize(.small).keyboardShortcut("s", modifiers: .command)
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 9)
@@ -306,55 +364,200 @@ struct PrefsView: View {
 struct PrefRow: View {
     let field: PrefField
     @ObservedObject var store: PrefsStore
+    @State private var expanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(field.leaf).font(.callout).bold()
-                if store.isOverridden(field) {
-                    Text("definido").font(.caption2)
-                        .foregroundStyle(Color.accentOrange)
+                if let origin = store.origin(of: field) {
+                    Text(origin)
+                        .font(.caption2)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(origin == "não salvo" ? AnyShapeStyle(Color.accentOrange.opacity(0.22))
+                                                          : AnyShapeStyle(.quaternary),
+                                    in: Capsule())
+                        .foregroundStyle(origin == "não salvo" ? Color.accentOrange : .secondary)
+                        .help(originHelp(origin))
                 }
                 Spacer()
                 control
+                if store.isOverridden(field) {
+                    Button {
+                        store.revert(field)
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward").font(.caption2)
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.tertiary)
+                    .help("Voltar ao padrão (remove a chave do arquivo)")
+                }
             }
+
             if !field.description.isEmpty {
                 Text(field.description)
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            if field.kind == .stringList { listEditor }
+
             if let d = field.defaultValue {
                 Text("padrão: \(d.display)")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
         .padding(12)
-        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 9))
+        .background(store.isOverridden(field) ? AnyShapeStyle(.quaternary.opacity(0.42))
+                                              : AnyShapeStyle(.quaternary.opacity(0.2)),
+                    in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private func originHelp(_ o: String) -> String {
+        switch o {
+        case "local":     return "Definido no arquivo local (não commitado) — sobrepõe o global"
+        case "global":    return "Definido no arquivo global"
+        case "não salvo": return "Alteração pendente — clique em Salvar"
+        default:          return o
+        }
     }
 
     @ViewBuilder private var control: some View {
-        if field.isToggle {
+        switch field.kind {
+        case .toggle:
             Toggle("", isOn: Binding(
                 get: { store.value(for: field)?.asBool ?? false },
                 set: { store.set(field, .bool($0)) }))
             .labelsHidden()
-        } else if field.isPicker {
+
+        case .choice:
             Picker("", selection: Binding(
                 get: { store.value(for: field)?.asString ?? field.enumValues.first ?? "" },
                 set: { store.set(field, .string($0)) })) {
                 ForEach(field.enumValues, id: \.self) { Text($0).tag($0) }
             }
-            .labelsHidden().frame(maxWidth: 170)
-        } else if field.isNumber {
+            .labelsHidden().frame(maxWidth: 180)
+
+        case .number:
             TextField("", value: Binding(
                 get: { store.value(for: field)?.asDouble ?? 0 },
                 set: { store.set(field, .number($0)) }), format: .number)
-            .textFieldStyle(.roundedBorder).frame(width: 90)
-        } else {
+            .textFieldStyle(.roundedBorder).frame(width: 100)
+
+        case .text:
             TextField("", text: Binding(
-                get: { store.value(for: field)?.display ?? "" },
+                get: { store.value(for: field)?.asString ?? "" },
                 set: { store.set(field, .string($0)) }))
-            .textFieldStyle(.roundedBorder).frame(width: 190)
+            .textFieldStyle(.roundedBorder).frame(width: 200)
+
+        case .stringList:
+            Text("\(currentList.count) item(ns)")
+                .font(.caption2).foregroundStyle(.secondary)
+
+        case .opaque:
+            // Editing a nested object (or a string|array union) as text would
+            // rewrite it in the wrong shape. Show it and point at the file.
+            HStack(spacing: 6) {
+                Text(store.value(for: field)?.display ?? "—")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.tail).frame(maxWidth: 190, alignment: .trailing)
+                Image(systemName: "lock").font(.caption2).foregroundStyle(.tertiary)
+                    .help("Estrutura aninhada — edite no arquivo para não corromper o formato")
+            }
         }
+    }
+
+    // MARK: List editor
+
+    private var currentList: [String] {
+        store.value(for: field)?.asStringArray ?? []
+    }
+
+    /// Lists are edited as lists. Round-tripping them through a text field is
+    /// what used to turn ["dist/**"] into the string "dist/**".
+    private var listEditor: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(currentList.enumerated()), id: \.offset) { idx, item in
+                HStack(spacing: 6) {
+                    Text("•").foregroundStyle(.tertiary)
+                    TextField("", text: Binding(
+                        get: { item },
+                        set: { newValue in
+                            var list = currentList
+                            guard idx < list.count else { return }
+                            list[idx] = newValue
+                            store.set(field, .array(list.map { .string($0) }))
+                        }))
+                    .textFieldStyle(.roundedBorder)
+                    Button {
+                        var list = currentList
+                        guard idx < list.count else { return }
+                        list.remove(at: idx)
+                        store.set(field, .array(list.map { .string($0) }))
+                    } label: {
+                        Image(systemName: "minus.circle").font(.caption)
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.tertiary)
+                }
+            }
+            Button {
+                store.set(field, .array((currentList + [""]).map { .string($0) }))
+            } label: {
+                Label("Adicionar", systemImage: "plus").font(.caption2)
+            }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+        }
+        .padding(.top, 2)
+    }
+}
+
+/// What a save will actually write. Preferences are edited rarely and the file
+/// is shared with the engines, so showing the change beats trusting it.
+struct PrefsDiffSheet: View {
+    @ObservedObject var store: PrefsStore
+    @Binding var isPresented: Bool
+    let onConfirm: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Confirmar alterações").font(.headline)
+            Text(store.globalFile.map { "Serão gravadas em \(($0 as NSString).lastPathComponent)" }
+                 ?? "Arquivo de preferências")
+                .font(.caption).foregroundStyle(.secondary)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(store.pendingEdits.keys.sorted(), id: \.self) { key in
+                        let newValue = store.pendingEdits[key]!
+                        HStack(alignment: .top, spacing: 8) {
+                            Text(key).font(.caption).bold().frame(width: 190, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 1) {
+                                if case .null = newValue {
+                                    Text("removido — volta ao padrão")
+                                        .font(.caption).foregroundStyle(.orange)
+                                } else {
+                                    Text(newValue.display).font(.caption)
+                                }
+                                if let old = store.values[key] {
+                                    Text("antes: \(old.display)")
+                                        .font(.caption2).foregroundStyle(.tertiary)
+                                }
+                            }
+                            Spacer()
+                        }
+                        .padding(8)
+                        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 7))
+                    }
+                }
+            }
+            .frame(maxHeight: 280)
+
+            HStack {
+                Button("Cancelar") { isPresented = false }.keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Gravar") { onConfirm(); isPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20).frame(width: 520)
     }
 }

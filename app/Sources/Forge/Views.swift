@@ -467,26 +467,18 @@ struct AccountCard: View {
     let account: Account
     let usage: AccountUsage?
     @ObservedObject var state: AppState
+    @State private var confirmingRemove = false
+
+    /// Two different notions of "current", and conflating them is how you end
+    /// up thinking a terminal is on an account it is not:
+    ///   default  — what a bare `claude` will attach (persisted in the registry)
+    ///   sessão   — what THIS app's launches are using (FORGE_ACCOUNT)
+    private var isDefault: Bool { state.activeAccount == account.name }
+    private var inSessions: Bool { state.sessions.contains { $0.account == account.name } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
-                    .font(.caption)
-                    .foregroundStyle(isActive ? Color.accentOrange : Color.secondary)
-                Text(account.name).font(.headline)
-                if !account.has_token {
-                    Text("sem token").font(.caption2).foregroundStyle(.orange)
-                }
-                Spacer()
-                if isActive {
-                    Text("ativa").font(.caption2).foregroundStyle(Color.accentOrange)
-                } else if account.has_token {
-                    Button("Usar") { state.launch(account: account.name) }
-                        .controlSize(.small)
-                        .help("Abre um terminal novo nesta conta (não muda o padrão)")
-                }
-            }
+            header
 
             if let u = usage {
                 UsageBar(label: "5h", window: u.five_hour)
@@ -496,16 +488,114 @@ struct AccountCard: View {
                     .font(.caption2).foregroundStyle(.tertiary)
             }
 
-            if let d = account.days_left {
-                Text("token expira em \(d) dias")
-                    .font(.caption2).foregroundStyle(.tertiary)
+            meta
+
+            if account.has_token { actions }
+            else {
+                Label("sem token — registre pelo terminal: forge-accounts add \(account.name)",
+                      systemImage: "key.slash")
+                    .font(.caption2).foregroundStyle(.orange)
+                    .textSelection(.enabled)
             }
         }
         .padding(16)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(isDefault ? Color.accentOrange.opacity(0.35) : .clear, lineWidth: 1))
+        .confirmationDialog("Remover \(account.name)?",
+                            isPresented: $confirmingRemove, titleVisibility: .visible) {
+            Button("Remover", role: .destructive) { state.removeAccount(account.name) }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("Apaga a conta do registro e o token do Keychain. Não afeta a conta na Anthropic.")
+        }
     }
 
-    private var isActive: Bool { state.activeAccount == account.name }
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isDefault ? "largecircle.fill.circle" : "circle")
+                .font(.caption)
+                .foregroundStyle(isDefault ? Color.accentOrange : Color.secondary)
+            Text(account.name).font(.headline)
+            Spacer()
+            if isDefault {
+                Tag("padrão", accent: true)
+                    .help("Um `claude` sem argumentos entra nesta conta")
+            }
+            if inSessions {
+                Tag("em uso", accent: false)
+                    .help("Há sessão aberta no app usando esta conta")
+            }
+        }
+    }
+
+    private var meta: some View {
+        HStack(spacing: 10) {
+            if let d = account.days_left {
+                Label("\(d)d", systemImage: "key")
+                    .font(.caption2)
+                    .foregroundStyle(d < 30 ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
+                    .help("Token do setup-token expira em \(d) dias")
+            }
+            if let used = account.last_used, let when = Self.relative(used) {
+                Text("usada \(when)").font(.caption2).foregroundStyle(.tertiary)
+            }
+            if let note = account.note, !note.isEmpty {
+                Text(note).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+        }
+    }
+
+    private var actions: some View {
+        HStack(spacing: 6) {
+            Button("Abrir sessão") { state.launch(account: account.name) }
+                .controlSize(.small)
+                .help("Abre um terminal nesta conta sem mudar o padrão")
+            if !isDefault {
+                Button("Tornar padrão") { state.setDefaultAccount(account.name) }
+                    .controlSize(.small)
+                    .help("Um `claude` sem argumentos passa a entrar nesta conta")
+            }
+            Spacer()
+            Menu {
+                Button("Registrar identidade desta sessão") {
+                    state.captureAccountIdentity(account.name)
+                }
+                .help("Grava o e-mail da sessão atual do Claude nesta conta")
+                Divider()
+                Button("Remover…", role: .destructive) { confirmingRemove = true }
+            } label: {
+                Image(systemName: "ellipsis")
+            }
+            .menuStyle(.borderlessButton).frame(width: 24)
+        }
+    }
+
+    private static func relative(_ iso: String) -> String? {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = fmt.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+        guard let date else { return nil }
+        let f = RelativeDateTimeFormatter()
+        f.locale = Locale(identifier: "pt_BR")
+        f.unitsStyle = .abbreviated
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+struct Tag: View {
+    let text: String
+    let accent: Bool
+    init(_ t: String, accent: Bool) { text = t; self.accent = accent }
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(accent ? AnyShapeStyle(Color.accentOrange.opacity(0.2))
+                               : AnyShapeStyle(.quaternary), in: Capsule())
+            .foregroundStyle(accent ? Color.accentOrange : .secondary)
+    }
 }
 
 struct UsageBar: View {
