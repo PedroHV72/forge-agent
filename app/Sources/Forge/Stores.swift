@@ -336,10 +336,6 @@ final class AppState: ObservableObject {
             runId: attachedRun, account: account.isEmpty ? nil : account))
     }
 
-    /// Closing kills the child process, so a session that is still running gets
-    /// a confirmation — the same reasoning as quitting the app: Forge resumes
-    /// from disk, but the in-flight unit is cut off. Returns whether it closed.
-    @discardableResult
     /// Open a session from a free-form line. A leading slash command is passed
     /// through verbatim — whatever Forge gains tomorrow works here with no code
     /// change — and plain text becomes a conversation.
