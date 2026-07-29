@@ -22,6 +22,20 @@ public struct Release: Identifiable, Hashable {
     public var entryCount: Int { sections.reduce(0) { $0 + $1.entries.count } }
 }
 
+public extension String {
+    /// Split "**Lead.** rest of the entry" into its two halves. These notes are
+    /// written that way consistently, and the lead is the part worth reading
+    /// first in a long list.
+    var changelogLead: (lead: String, rest: String)? {
+        guard hasPrefix("**"), let close = range(of: "**", range: index(startIndex, offsetBy: 2)..<endIndex)
+        else { return nil }
+        let lead = String(self[index(startIndex, offsetBy: 2)..<close.lowerBound])
+        let rest = String(self[close.upperBound...]).trimmingCharacters(in: .whitespaces)
+        guard !lead.isEmpty else { return nil }
+        return (lead, rest)
+    }
+}
+
 public struct ReleaseSection: Identifiable, Hashable {
     public let kind: Kind
     public let entries: [String]
@@ -81,7 +95,7 @@ public enum ChangelogParser {
         func flushEntry() {
             let joined = buffer.joined(separator: " ")
                 .trimmingCharacters(in: .whitespaces)
-            if !joined.isEmpty { entries.append(clean(joined)) }
+            if !joined.isEmpty { entries.append(normalise(joined)) }
             buffer = []
         }
 
@@ -142,10 +156,17 @@ public enum ChangelogParser {
         return releases
     }
 
-    /// Strip the markdown that would otherwise render as literal punctuation.
-    /// Bold is dropped rather than honoured because these entries lead with
-    /// **bold** headers that read fine as plain emphasis in a list.
-    public static func clean(_ s: String) -> String {
+    /// Entries keep their markdown: SwiftUI renders **bold** and `code` from an
+    /// AttributedString, and these notes lead with a bold sentence that carries
+    /// the point of the item. Stripping it threw away the only hierarchy the
+    /// entries have.
+    static func normalise(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Markdown removed, for places that cannot render it (a notification body,
+    /// a search index).
+    public static func plain(_ s: String) -> String {
         var out = s.replacingOccurrences(of: "**", with: "")
         out = out.replacingOccurrences(of: "`", with: "")
         return out.trimmingCharacters(in: .whitespaces)

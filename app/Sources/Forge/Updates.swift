@@ -254,26 +254,89 @@ struct ReleaseCard: View {
             }
 
             if expanded {
-                ForEach(release.sections) { section in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Label(section.kind.label, systemImage: section.kind.icon)
-                            .font(.caption).bold()
-                            .foregroundStyle(section.kind == .fixed ? AnyShapeStyle(Color.orange)
-                                                                    : AnyShapeStyle(.secondary))
-                        ForEach(Array(section.entries.enumerated()), id: \.offset) { _, entry in
-                            HStack(alignment: .top, spacing: 6) {
-                                Text("•").foregroundStyle(.tertiary)
-                                Text(entry).font(.caption)
-                                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(release.sections) { section in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Image(systemName: section.kind.icon)
+                                    .font(.caption2)
+                                    .foregroundStyle(section.kind.tint)
+                                Text(section.kind.label.uppercased())
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(section.kind.tint)
+                                Text("\(section.entries.count)")
+                                    .font(.system(size: 9)).monospacedDigit()
+                                    .foregroundStyle(.tertiary)
+                                Spacer()
+                            }
+                            ForEach(Array(section.entries.enumerated()), id: \.offset) { _, entry in
+                                ChangelogEntryView(entry: entry, tint: section.kind.tint)
                             }
                         }
                     }
-                    .padding(.leading, 2)
                 }
+                .padding(.top, 2)
             }
         }
         .padding(15)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+extension ReleaseSection.Kind {
+    /// Only corrections and security get colour. A changelog where every
+    /// section is tinted is a changelog where nothing stands out — and a fix is
+    /// the entry most likely to explain something you already hit.
+    var tint: Color {
+        switch self {
+        case .fixed:    return .orange
+        case .security: return .red
+        default:        return .secondary
+        }
+    }
+}
+
+/// One bullet, rendered as markdown.
+///
+/// These notes are written as "**Lead sentence.** the detail", so the lead is
+/// pulled out and given weight — in a list of thirty entries that is the
+/// difference between scanning and reading everything.
+struct ChangelogEntryView: View {
+    let entry: String
+    let tint: Color
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Circle().fill(tint.opacity(0.5))
+                .frame(width: 4, height: 4).padding(.top, 6)
+
+            VStack(alignment: .leading, spacing: 2) {
+                if let split = entry.changelogLead {
+                    Text(split.lead)
+                        .font(.caption).bold()
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !split.rest.isEmpty {
+                        Text(markdown(split.rest))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text(markdown(entry))
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// Inline markdown only — `code` and **bold**. Failing over to the raw
+    /// string keeps a malformed entry readable instead of blank.
+    private func markdown(_ s: String) -> AttributedString {
+        (try? AttributedString(
+            markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(s)
     }
 }

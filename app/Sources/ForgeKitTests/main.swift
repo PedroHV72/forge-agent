@@ -800,9 +800,32 @@ test("bullet quebrado em várias linhas vira uma entrada") {
     assertTrue(sec.entries[0].contains("continuação"), "linhas juntadas: \(sec.entries[0])")
 }
 
-test("markdown inline é limpo") {
-    assertEqual(ChangelogParser.clean("**Bold.** roda `forge-state.js` agora"),
+test("markdown é preservado para renderização") {
+    // The notes lead with a bold sentence carrying the point of the item;
+    // stripping it threw away the only hierarchy the entries have.
+    let md = """
+    ## v1.0.0 — x
+
+    ### Fixed
+
+    - **Perda de dados.** roda `forge-state.js` agora
+    """
+    let e = ChangelogParser.parse(md)[0].sections[0].entries[0]
+    assertTrue(e.contains("**"), "negrito preservado: \(e)")
+    assertTrue(e.contains("`"), "code preservado")
+}
+
+test("plain remove markdown para onde não dá para renderizar") {
+    assertEqual(ChangelogParser.plain("**Bold.** roda `forge-state.js` agora"),
                 "Bold. roda forge-state.js agora")
+}
+
+test("separa a frase-título do resto") {
+    let split = "**Perda de dados.** o parser truncava a seção".changelogLead
+    assertEqual(split?.lead, "Perda de dados.")
+    assertEqual(split?.rest, "o parser truncava a seção")
+    assertTrue("sem negrito no início".changelogLead == nil)
+    assertTrue("**".changelogLead == nil, "negrito vazio não conta")
 }
 
 test("seção desconhecida cai em Outros") {
