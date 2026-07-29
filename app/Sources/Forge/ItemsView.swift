@@ -16,16 +16,25 @@ final class ItemsStore: ObservableObject {
     @Published private(set) var loading = false
     @Published var error: String?
 
+    /// Guards against out-of-order loads (R1 of the S05 dialectic review):
+    /// each call to `forge-items.js` shells out and has no ordering
+    /// guarantee, so a slow load for a project the user has since switched
+    /// away from must not be allowed to overwrite a later, faster one.
+    private var generation = LoadGeneration()
+
     /// Missing `.gsd/items/` is not an error — the engine already returns an
     /// empty array for a project that has never created an item, so the
     /// board shows an empty state rather than a failure banner.
     func load(project: String) {
         guard !project.isEmpty else { return }
         loading = true
+        error = nil
+        let gen = generation.start()
         Task.detached(priority: .utility) {
             let list = ForgeCore.runJSON([Item].self, "forge-items.js",
                                           ["--list", "--json", "--cwd", project]) ?? []
             await MainActor.run {
+                guard self.generation.isCurrent(gen) else { return }
                 self.items = list
                 self.loading = false
             }

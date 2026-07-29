@@ -1215,6 +1215,20 @@ test("status desconhecido não entra em coluna nenhuma e aparece em unknown") {
     assertTrue(unk.contains { $0.id == "I-3" })
 }
 
+test("LoadGeneration descarta resultado de uma geração anterior") {
+    var gen = LoadGeneration()
+    let genA = gen.start()   // load A começa
+    let genB = gen.start()   // usuário troca de projeto antes de A terminar
+    assertTrue(!gen.isCurrent(genA), "A não é mais a geração atual — resultado de A deve ser descartado")
+    assertTrue(gen.isCurrent(genB), "B é a geração atual — resultado de B deve ser aplicado")
+}
+
+test("LoadGeneration aceita a geração mais recente mesmo sem concorrência") {
+    var gen = LoadGeneration()
+    let only = gen.start()
+    assertTrue(gen.isCurrent(only), "única geração iniciada deve ser sempre a atual")
+}
+
 test("decodifica um item real da saída do engine") {
     // Copiado verbatim de `node scripts/forge-items.js --list --json`.
     let json = """

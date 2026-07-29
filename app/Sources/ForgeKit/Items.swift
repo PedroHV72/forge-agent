@@ -128,3 +128,32 @@ public enum ItemBoard {
         items.filter { $0.parsedStatus?.isOpen == true }.count
     }
 }
+
+/// A monotonic guard against out-of-order async loads.
+///
+/// `ItemsStore.load(project:)` shells out to `forge-items.js` on a detached
+/// task; nothing guarantees those tasks complete in the order they were
+/// started. Without a guard, a slow load for project A that started before a
+/// fast load for project B can finish *after* B and overwrite B's items with
+/// A's — the picker says B, the board shows A. `start()` is called when a
+/// load begins and returns the generation to carry through the async work;
+/// `isCurrent(_:)` is checked right before applying the result, so only the
+/// most recently started load is ever allowed to win.
+public struct LoadGeneration {
+    private var current: Int = 0
+
+    public init() {}
+
+    /// Call when a new load begins. Capture the returned value and pass it
+    /// to `isCurrent(_:)` before applying that load's result.
+    public mutating func start() -> Int {
+        current += 1
+        return current
+    }
+
+    /// True when `generation` is still the most recently started one — i.e.
+    /// no newer load has begun since this one started.
+    public func isCurrent(_ generation: Int) -> Bool {
+        generation == current
+    }
+}
