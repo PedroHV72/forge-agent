@@ -1097,6 +1097,62 @@ test("fração nunca passa de 1 nem fica negativa") {
 }
 
 
+print("\nWorkspaceDefaults")
+
+test("pref explícito vence o último usado") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: "/repo/a", lastUsed: "/repo/b", known: ["/repo/a", "/repo/b"])
+    assertEqual(p.workspace, "/repo/a")
+    assertEqual(p.reason, .pref)
+    assertTrue(p.warning == nil, "pref registrado não deve gerar aviso")
+}
+
+test("último usado é o segundo default") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: nil, lastUsed: "/repo/b", known: ["/repo/a", "/repo/b"])
+    assertEqual(p.workspace, "/repo/b")
+    assertEqual(p.reason, .lastUsed)
+    assertTrue(p.warning == nil)
+}
+
+test("sem pref e sem último usado não resolve nada") {
+    // The b992edf regression test: `known` has two projects, but with no
+    // pref and no last-used, nothing must be preselected — `known.first`
+    // is never consulted.
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: nil, lastUsed: nil, known: ["/repo/a", "/repo/b"])
+    assertTrue(p.workspace == nil, "sem configuração nenhuma, workspace deve ser nil")
+    assertEqual(p.reason, .none)
+}
+
+test("último usado que saiu da lista não vira outro projeto") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: nil, lastUsed: "/repo/removido", known: ["/repo/a", "/repo/b"])
+    assertTrue(p.workspace == nil, "last-used stale não deve substituir por outro projeto")
+    assertEqual(p.reason, .none)
+}
+
+test("pref fora da lista de projetos resolve com aviso") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: "/repo/fora", lastUsed: "/repo/a", known: ["/repo/a"])
+    assertEqual(p.workspace, "/repo/fora")
+    assertEqual(p.reason, .pref)
+    assertTrue(p.warning != nil, "pref fora de known deve carregar aviso")
+}
+
+test("root dir expande ~ e cai no home quando vazio") {
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: nil, home: "/Users/x"), "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "  ", home: "/Users/x"), "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~", home: "/Users/x"), "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~/code", home: "/Users/x"), "/Users/x/code")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "/abs/path", home: "/Users/x"), "/abs/path")
+}
+
+// Both preselect() and sessionRoot() are pure and Foundation-free at the
+// call boundary above; the tests here are what pins the b992edf invariant
+// down mechanically, so a future edit that reintroduces `known.first`
+// breaks the build, not just the behaviour.
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {
