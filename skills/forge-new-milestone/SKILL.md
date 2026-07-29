@@ -63,6 +63,96 @@ mkdir -p .gsd/milestones/{MILESTONE_ID}/slices
 
 ---
 
+## Step 1.5 — Itens abertos do backlog (insumo)
+
+Lista os itens abertos do backlog (`.gsd/items/`) antes do brainstorm, deixa o operador escolher quais alimentam este milestone, e promove os escolhidos para `{MILESTONE_ID}`. Regras completas (filtro, formato de listagem, promoção, postura de falha) em `shared/forge-items-readback.md § Listagem de itens abertos` e `§ Promoção` — este step só referencia, não restate.
+
+**Resolve scripts dir:**
+```bash
+if [ -f "scripts/forge-items.js" ]; then
+  FORGE_SCRIPTS_DIR="scripts"
+else
+  FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
+fi
+```
+
+**Listar:**
+```bash
+OPEN_ITEMS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-items.js" --list --json --cwd "$(pwd)" 2>/dev/null)
+LIST_EXIT=$?
+if [ "$LIST_EXIT" -ne 0 ]; then
+  echo "⚠ Falha ao listar itens do backlog — seguindo sem insumo de backlog."
+  OPEN_ITEMS_JSON="[]"
+fi
+```
+
+Filtra em `inbox`/`triaged` com `node -e` (nunca grep em JSON):
+```bash
+OPEN_ITEMS=$(echo "$OPEN_ITEMS_JSON" | node -e '
+  let d = "";
+  process.stdin.on("data", c => d += c).on("end", () => {
+    try {
+      const items = JSON.parse(d || "[]");
+      const open = items.filter(i => i.status === "inbox" || i.status === "triaged");
+      process.stdout.write(JSON.stringify(open));
+    } catch (e) {
+      process.stdout.write("[]");
+    }
+  });
+')
+OPEN_COUNT=$(echo "$OPEN_ITEMS" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).length))}catch(e){process.stdout.write("0")}})')
+```
+
+**Zero itens abertos ⇒ pular o step inteiro, silenciosamente** — sem heading, sem prompt, sem linha de output. Um projeto com backlog vazio vê exatamente o fluxo de hoje. Só continue com o restante deste step se `OPEN_COUNT` > 0.
+
+**Renderizar a listagem** (`{I-id} · {status} · {title}`, mais `source` quando presente):
+```bash
+echo "Itens abertos do backlog:"
+echo "$OPEN_ITEMS" | node -e '
+  let d = "";
+  process.stdin.on("data", c => d += c).on("end", () => {
+    const items = JSON.parse(d);
+    for (const i of items) {
+      const src = i.source ? ` · ${i.source}` : "";
+      console.log(`${i.id} · ${i.status} · ${i.title}${src}`);
+    }
+  });
+'
+```
+
+**Se `FAST_MODE=true`:** pare aqui — a listagem é informativa; sem `AskUserQuestion`, sem promoção, sem `promoted_to`. Continue para o Step 2.
+
+**Caso contrário**, chame `AskUserQuestion` multi-select sobre os itens listados, sempre incluindo a opção explícita "Nenhum — começar do zero":
+
+```
+AskUserQuestion({
+  questions: [{
+    question: "Quais itens do backlog este milestone deve absorver?",
+    header: "Backlog",
+    multiSelect: true,
+    options: [
+      { label: "{I-id curto}", description: "{title} — {status}{ · source, se presente}" },
+      ...
+      { label: "Nenhum — começar do zero", description: "Não promover nenhum item; seguir com o fluxo normal" }
+    ]
+  }]
+})
+```
+
+Guarde as escolhas (excluindo "Nenhum") como `SELECTED_ITEMS` (lista de `{id, title, source, body}`, derivada do `OPEN_ITEMS` original).
+
+**Promover cada escolha** (uma por uma; falha é advisory — uma linha `⚠` nomeando o item, segue com o resto):
+```bash
+for id in $PICKED_IDS; do
+  node "$FORGE_SCRIPTS_DIR/forge-items.js" --promote "$id" "$MILESTONE_ID" --cwd "$(pwd)" \
+    || echo "⚠ Falha ao promover item $id — seguindo sem bloquear a criação do milestone."
+done
+```
+
+Se `SELECTED_ITEMS` estiver vazio (operador escolheu "Nenhum" ou não há itens), não há bloco de contexto a propagar nos Steps 2 e 4 — os prompts ficam byte-idênticos ao fluxo de hoje.
+
+---
+
 ## Step 2 — Brainstorm (skip if FAST_MODE)
 
 **If FAST_MODE=true:** Skip to Step 3.
@@ -114,10 +204,12 @@ Delegate to an isolated subagent to keep brainstorm output out of main context:
 
 > Antes de despachar o brainstorm, exiba o **Spawn Liveness Banner** (ver `shared/forge-dispatch.md § Spawn Liveness Banner`) com duração estimada apropriada para esta subagent (consulte a tabela de duração).
 
+**Se `SELECTED_ITEMS` (Step 1.5) não estiver vazio**, monte um bloco `## Itens do backlog selecionados` (título + source + um resumo de uma linha do body, por item) e anexe ao prompt do subagente abaixo — quando `SELECTED_ITEMS` estiver vazio, omita o bloco inteiramente (o prompt fica byte-idêntico ao de hoje).
+
 ```
 Agent({
   description: "Brainstorm {MILESTONE_ID}",
-  prompt: "You are running the forge-brainstorm skill for milestone {MILESTONE_ID}: {MILESTONE_DESC}.\nWorking directory: {pwd}\n\nInvoke: Skill({ skill: \"forge-brainstorm\", args: \"{MILESTONE_ID}: {MILESTONE_DESC}\" })\n\nAfter the skill writes the BRAINSTORM.md file, return ONLY:\n- Path of file written\n- Recommended approach (1 paragraph)\n- Top 3 risks (bullet list)\n- Open questions (bullet list)\n\nDo NOT return the full file content."
+  prompt: "You are running the forge-brainstorm skill for milestone {MILESTONE_ID}: {MILESTONE_DESC}.\nWorking directory: {pwd}\n\nInvoke: Skill({ skill: \"forge-brainstorm\", args: \"{MILESTONE_ID}: {MILESTONE_DESC}\" })\n\nAfter the skill writes the BRAINSTORM.md file, return ONLY:\n- Path of file written\n- Recommended approach (1 paragraph)\n- Top 3 risks (bullet list)\n- Open questions (bullet list)\n\nDo NOT return the full file content.[SE SELECTED_ITEMS NÃO VAZIO, ANEXAR:]\n\n## Itens do backlog selecionados\n- {I-id}: {title} ({source}) — {resumo de uma linha do body}\n..."
 })
 ```
 
@@ -145,6 +237,8 @@ After the agent returns, confirm `.gsd/milestones/{MILESTONE_ID}/{MILESTONE_ID}-
 ---
 
 ## Step 4 — Discuss (interactive, stays in main context)
+
+**Se `SELECTED_ITEMS` (Step 1.5) não estiver vazio**, mostre o bloco `## Itens do backlog selecionados` (título + source + resumo de uma linha do body, por item) no contexto interativo antes de iniciar as perguntas — os itens ficam visíveis enquanto decisões são tomadas. Não re-pergunte ao operador para confirmar as escolhas já feitas no Step 1.5. Se `SELECTED_ITEMS` estiver vazio, omita este bloco inteiramente.
 
 **If SESSION_ID is set:** Pre-populate CONTEXT.md with decisions already captured in the session (from `## Captured Decisions` in `SESSION_FILE`). These are locked — do NOT re-ask them.
 
