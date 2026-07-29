@@ -757,44 +757,102 @@ struct PrefsDiffSheet: View {
     }
 }
 
-/// A model id: pick a known one or type anything. Closed pickers would block a
-/// model released after this build — which is a certainty, not a risk.
+extension ModelFamily {
+    var color: Color {
+        switch colorName {
+        case "green":  return .green
+        case "blue":   return .blue
+        case "purple": return .purple
+        case "orange": return Color.accentOrange
+        case "teal":   return .teal
+        case "indigo": return .indigo
+        default:       return .secondary
+        }
+    }
+}
+
+/// Pick a model.
+///
+/// A menu of known ids is the default path: typing one produces a value that
+/// only fails at dispatch, deep inside a run, and a typo is indistinguishable
+/// from a deliberate choice until then. Free text stays available behind
+/// "Outro…", because a model released tomorrow must be usable today.
 struct ModelField: View {
     let id: String
+    var engine: ModelEngine = .claude
     let onChange: (String) -> Void
-    @State private var text: String = ""
+
+    @State private var custom = ""
+    @State private var editingCustom = false
+
+    private var choices: [ModelChoice] { ModelCatalog.suggestions(for: engine) }
+    private var family: ModelFamily { ModelCatalog.family(of: id) }
+    private var isKnown: Bool { choices.contains { $0.id == id } }
 
     var body: some View {
-        HStack(spacing: 5) {
-            TextField("id do modelo", text: $text)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 11, design: .monospaced))
-                .onSubmit { onChange(text) }
-                .onChange(of: text) { new in onChange(new) }
-
-            Menu {
-                ForEach(ModelCatalog.known) { m in
-                    Button {
-                        text = m.id
-                        onChange(m.id)
-                    } label: {
-                        Text("\(m.label)  ·  \(m.tier)")
+        HStack(spacing: 6) {
+            if editingCustom {
+                TextField("id do modelo", text: $custom)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .onSubmit { commitCustom() }
+                Button("OK") { commitCustom() }.controlSize(.small)
+                Button {
+                    editingCustom = false
+                } label: { Image(systemName: "xmark").font(.caption2) }
+                .buttonStyle(.plain).foregroundStyle(.tertiary)
+            } else {
+                Menu {
+                    ForEach(choices) { m in
+                        Button {
+                            onChange(m.id)
+                        } label: {
+                            if m.tier.isEmpty { Text(m.label) }
+                            else { Text("\(m.label)  ·  \(m.tier)") }
+                        }
                     }
+                    Divider()
+                    Button("Outro…") {
+                        custom = id
+                        editingCustom = true
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: family.icon)
+                            .font(.system(size: 10)).foregroundStyle(family.color)
+                        Text(id.isEmpty ? "escolher…" : ModelCatalog.label(for: id))
+                            .font(.caption)
+                            .foregroundStyle(id.isEmpty ? AnyShapeStyle(.tertiary)
+                                                        : AnyShapeStyle(.primary))
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 7)).foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(family.color.opacity(id.isEmpty ? 0 : 0.12),
+                                in: Capsule())
+                    .overlay(Capsule().strokeBorder(.quaternary))
+                    .contentShape(Capsule())
                 }
-            } label: {
-                Image(systemName: "chevron.down").font(.system(size: 8))
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("Modelos conhecidos")
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help(id.isEmpty ? "Escolher um modelo" : id)
 
-            if !id.isEmpty && !ModelCatalog.isKnown(id) {
-                Image(systemName: "questionmark.circle")
-                    .font(.caption2).foregroundStyle(.orange)
-                    .help("Id não reconhecido — pode ser um modelo novo, ou um erro de digitação")
+                if !id.isEmpty && !isKnown {
+                    // Not in the catalogue: could be new, could be a typo. Saying
+                    // which is impossible, so it is flagged rather than blocked.
+                    Image(systemName: "questionmark.circle")
+                        .font(.caption2).foregroundStyle(.orange)
+                        .help("Fora do catálogo — modelo novo ou erro de digitação")
+                }
             }
         }
-        .onAppear { text = id }
+    }
+
+    private func commitCustom() {
+        let clean = custom.trimmingCharacters(in: .whitespaces)
+        editingCustom = false
+        guard !clean.isEmpty, clean != id else { return }
+        onChange(clean)
     }
 }

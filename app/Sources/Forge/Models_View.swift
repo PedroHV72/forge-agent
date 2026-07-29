@@ -17,7 +17,9 @@ final class ModelsStore: ObservableObject {
     @Published private(set) var tiers: [TierRow] = []
     @Published private(set) var routingRows: [RoutingRow] = []
     @Published private(set) var challenger: String = "claude"
+    @Published private(set) var challengerModel: String = ""
     @Published private(set) var advocate: String = "claude"
+    @Published private(set) var advocateModel: String = "claude-fable-5"
     @Published private(set) var engines: [EngineStatus] = []
     @Published private(set) var loading = false
     @Published private(set) var prefsFile: String?
@@ -83,16 +85,19 @@ final class ModelsStore: ObservableObject {
 
         if case .object(let review)? = prefs?["review"] {
             challenger = review["challenger"]?.asString ?? "claude"
+            challengerModel = review["challenger_model"]?.asString ?? ""
             advocate = review["advocate"]?.asString ?? "claude"
+            advocateModel = review["advocate_model"]?.asString ?? "claude-fable-5"
         } else {
             challenger = "claude"; advocate = "claude"
+            challengerModel = ""; advocateModel = "claude-fable-5"
         }
 
-        engines = [
-            engine("claude", binary: "claude", inUse: true),
-            engine("codex", binary: "codex", inUse: challenger == "codex"),
-            engine("gemini", binary: "agy", inUse: challenger == "gemini"),
-        ]
+        engines = ModelEngine.allCases.map {
+            EngineStatus(name: $0.rawValue, binary: $0.binary,
+                         installed: Self.onPath($0.binary),
+                         inUse: $0 == .claude || challenger == $0.rawValue)
+        }
     }
 
     private func engine(_ name: String, binary: String, inUse: Bool) -> EngineStatus {
@@ -138,6 +143,22 @@ final class ModelsStore: ObservableObject {
         } catch {
             saveError = error.localizedDescription
         }
+    }
+
+    /// Review settings live under the same `review` block; writing them through
+    /// PrefsEdit keeps one implementation of the JSONC edit.
+    func setReview(_ leaf: String, _ value: JSONValue) {
+        guard let file = prefsFile else {
+            saveError = "arquivo de preferências desconhecido"
+            return
+        }
+        let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? "{\n}\n"
+        let updated = PrefsEdit.upsert(text, path: ["review", leaf], value: value)
+        do {
+            try updated.write(toFile: file, atomically: true, encoding: .utf8)
+            saveError = nil
+            load()
+        } catch { saveError = error.localizedDescription }
     }
 
     /// Remove the override so the tier falls back to the engine default.
@@ -194,26 +215,107 @@ struct ModelsView: View {
         }
     }
 
+    /// The challenger engine and its model, editable here. `challenger_model`
+    /// is inert when the challenger is Claude — the engine says so explicitly
+    /// (review-config-inert), so the field is hidden rather than shown dead.
     private var reviewCard: some View {
-        HStack(spacing: 20) {
-            roleColumn("Challenger", value: store.challenger,
-                       hint: "Procura brechas no diff")
-            Divider().frame(height: 30)
-            roleColumn("Advocate", value: store.advocate,
-                       hint: "Defende o código contra as objeções")
-            Spacer()
+        VStack(alignment: .leading, spacing: 12) {
+            roleRow(
+                title: "Challenger",
+                hint: "Procura brechas no diff",
+                icon: "magnifyingglass.circle.fill",
+                selection: store.challenger,
+                options: ["claude", "codex", "gemini", "auto"],
+                onSelect: { store.setReview("challenger", .string($0)) })
+
+            if store.challenger != "claude" && store.challenger != "auto" {
+                HStack(spacing: 8) {
+                    Text("modelo").font(.caption2).foregroundStyle(.tertiary)
+                        .frame(width: 82, alignment: .leading)
+                    ModelField(id: store.challengerModel,
+                               engine: engineFor(store.challenger)) { newID in
+                        store.setReview("challenger_model", .string(newID))
+                    }
+                    if store.challengerModel.isEmpty {
+                        Text("default do CLI").font(.caption2).foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                }
+                if let missing = missingBinary(for: store.challenger) {
+                    Label("\(missing) não está no PATH — a review cai no Claude",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2).foregroundStyle(.orange)
+                }
+            }
+
+            Divider()
+
+            roleRow(
+                title: "Advocate",
+                hint: "Defende o código contra as objeções",
+                icon: "shield.lefthalf.filled",
+                selection: store.advocate,
+                options: ["claude", "auto"],
+                onSelect: { store.setReview("advocate", .string($0)) })
+
+            HStack(spacing: 8) {
+                Text("modelo").font(.caption2).foregroundStyle(.tertiary)
+                    .frame(width: 82, alignment: .leading)
+                ModelField(id: store.advocateModel, engine: .claude) { newID in
+                    store.setReview("advocate_model", .string(newID))
+                }
+                Spacer()
+            }
         }
         .padding(15)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private func roleColumn(_ title: String, value: String, hint: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.tertiary)
-            Text(value).font(.callout).bold()
-            Text(hint).font(.caption2).foregroundStyle(.secondary)
+    private func roleRow(title: String, hint: String, icon: String,
+                         selection: String, options: [String],
+                         onSelect: @escaping (String) -> Void) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 16)).foregroundStyle(Color.accentOrange.opacity(0.85))
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout).bold()
+                Text(hint).font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Picker("", selection: Binding(
+                get: { selection },
+                set: { onSelect($0) })) {
+                ForEach(options, id: \.self) { opt in
+                    Text(engineLabel(opt)).tag(opt)
+                }
+            }
+            .labelsHidden().frame(width: 150)
         }
+    }
+
+    private func engineLabel(_ raw: String) -> String {
+        switch raw {
+        case "auto":   return "auto (por autoria)"
+        case "claude": return "Claude"
+        case "codex":  return "Codex (GPT)"
+        case "gemini": return "Gemini"
+        default:       return raw
+        }
+    }
+
+    private func engineFor(_ raw: String) -> ModelEngine {
+        ModelEngine(rawValue: raw) ?? .claude
+    }
+
+    /// The binary a selected engine needs, when it is not installed. This is the
+    /// failure that looks fine in the prefs file while every review silently
+    /// falls back to Claude.
+    private func missingBinary(for raw: String) -> String? {
+        guard let e = ModelEngine(rawValue: raw) else { return nil }
+        let status = store.engines.first { $0.name == e.rawValue }
+        return (status?.installed ?? true) ? nil : e.binary
     }
 
     private var routingCard: some View {
@@ -236,27 +338,37 @@ struct ModelsView: View {
     }
 
     private var enginesCard: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(spacing: 9) {
             ForEach(store.engines) { e in
-                HStack(spacing: 9) {
+                let engine = ModelEngine(rawValue: e.name) ?? .claude
+                let fam: ModelFamily = engine == .codex ? .gpt
+                    : (engine == .gemini ? .gemini : .opus)
+                HStack(spacing: 11) {
+                    ZStack {
+                        Circle().fill(fam.color.opacity(e.installed ? 0.16 : 0.06))
+                            .frame(width: 30, height: 30)
+                        Image(systemName: fam.icon)
+                            .font(.system(size: 13))
+                            .foregroundStyle(e.installed ? AnyShapeStyle(fam.color)
+                                                         : AnyShapeStyle(.tertiary))
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(engine.label).font(.callout)
+                        Text(e.binary).font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    if e.inUse {
+                        Text("em uso").font(.caption2)
+                            .padding(.horizontal, 7).padding(.vertical, 2)
+                            .background(Color.accentOrange.opacity(0.18), in: Capsule())
+                            .foregroundStyle(Color.accentOrange)
+                    }
                     Image(systemName: e.installed ? "checkmark.circle.fill" : "circle.dashed")
                         .font(.caption)
                         .foregroundStyle(e.installed ? AnyShapeStyle(Color.green)
                                                      : AnyShapeStyle(.tertiary))
-                    Text(e.name).font(.callout)
-                    Text(e.binary).font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                    Spacer()
-                    if e.inUse {
-                        Text("em uso").font(.caption2).foregroundStyle(Color.accentOrange)
-                    }
-                    // The failure this catches: an engine selected in prefs whose
-                    // binary is not installed falls back to Claude at review time,
-                    // silently, and the configuration looks fine on paper.
-                    if e.inUse && !e.installed {
-                        Label("binário ausente — cai no Claude", systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption2).foregroundStyle(.orange)
-                    }
+                        .help(e.installed ? "Instalado" : "Binário não encontrado no PATH")
                 }
             }
         }

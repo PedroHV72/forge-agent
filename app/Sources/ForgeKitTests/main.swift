@@ -853,6 +853,46 @@ test("sufixo de pré-release é ignorado na comparação") {
     assertFalse(Version.isNewer("v2.1.0-beta.1", than: "v2.1.0"))
 }
 
+print("\nModelCatalog (o input livre virou picker — typo só falhava em runtime)")
+
+test("família reconhecida pelo id, incluindo sufixo [1m]") {
+    assertEqual(ModelCatalog.family(of: "claude-opus-4-8[1m]"), .opus)
+    assertEqual(ModelCatalog.family(of: "claude-haiku-4-5-20251001"), .haiku)
+    assertEqual(ModelCatalog.family(of: "claude-fable-5"), .fable)
+    assertEqual(ModelCatalog.family(of: "gpt-5-codex"), .gpt)
+    assertEqual(ModelCatalog.family(of: "Gemini 3.1 Pro (High)"), .gemini)
+    assertEqual(ModelCatalog.family(of: "modelo-desconhecido"), .unknown)
+}
+
+test("fable vem antes de opus na detecção") {
+    // Substring order matters: both ids contain "claude-", and a fable id must
+    // not be classified by a later opus check.
+    assertEqual(ModelCatalog.family(of: "claude-fable-5"), .fable)
+}
+
+test("sugestões por engine") {
+    assertEqual(ModelCatalog.suggestions(for: .claude).count, ModelCatalog.known.count)
+    assertTrue(ModelCatalog.suggestions(for: .gemini).contains { $0.id.contains("Gemini") })
+    assertTrue(ModelCatalog.suggestions(for: .codex).contains { $0.id == "gpt-5" })
+}
+
+test("engine sabe qual binário precisa estar no PATH") {
+    assertEqual(ModelEngine.gemini.binary, "agy")
+    assertEqual(ModelEngine.codex.binary, "codex")
+    assertEqual(ModelEngine.claude.binary, "claude")
+}
+
+test("isKnown cobre os catálogos externos") {
+    assertTrue(ModelCatalog.isKnown("claude-opus-5"))
+    assertTrue(ModelCatalog.isKnown("Gemini 3.1 Pro (High)"))
+    assertFalse(ModelCatalog.isKnown("claude-opus-6"), "id inexistente deve ser sinalizado")
+}
+
+test("label cai no id quando não catalogado") {
+    assertEqual(ModelCatalog.label(for: "claude-opus-5"), "Opus 5")
+    assertEqual(ModelCatalog.label(for: "modelo-novo"), "modelo-novo")
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
