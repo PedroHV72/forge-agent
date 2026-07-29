@@ -75,6 +75,7 @@ A partir da v1.0, o Forge Agent usa **3 comandos slash** e **skills** para tudo 
 | `forge-auto` | Executa o milestone inteiro de forma autônoma até concluir |
 | `forge-next` | Executa exatamente uma unidade e para (step mode) |
 | `forge-task <descrição>` | Task autônoma sem milestone — brainstorm → discuss → plan → execute |
+| `forge-task <item-id>` | Consome um item do backlog (`.gsd/items/`, qualquer prefixo único) como task — descrição/proveniência no BRIEF, `doing` + `promoted_to: T-…` |
 | `forge-new-milestone <descrição>` | Cria milestone completo — brainstorm → scope → discuss → ROADMAP |
 | `forge-discuss <milestone\|S##>` | Abre fase de discuss para milestone ou slice |
 | `forge-add-slice`, `forge-add-task` | Adiciona slice ou task a um milestone existente |

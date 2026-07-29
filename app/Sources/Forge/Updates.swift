@@ -77,17 +77,41 @@ final class UpdateStore: ObservableObject {
         }
     }
 
-    /// Run install.sh --update. Opens a terminal rather than running headless:
-    /// the installer prints what it backs up and can ask, and a silent upgrade
-    /// of the tool you are standing on is not something to hide.
+    /// Run install.sh --update --with-app. Opens a terminal rather than running
+    /// headless: the installer prints what it backs up and can ask, and a silent
+    /// upgrade of the tool you are standing on is not something to hide.
+    ///
+    /// `--with-app` is not optional here even though it is opt-in on the command
+    /// line. The app build is gated behind that flag, so an update launched FROM
+    /// the app that omitted it would refresh every agent, skill and script and
+    /// leave the one binary the user is looking at on the old version — the update
+    /// would appear to have worked while the app stayed exactly as it was.
     func runUpdate() {
         guard let repo else { return }
         updating = true
         let cmd = "git -C \(ForgeCore.shellQuote(repo)) pull --ff-only && "
-            + "bash \(ForgeCore.shellQuote("\(repo)/install.sh")) --update"
+            + "bash \(ForgeCore.shellQuote("\(repo)/install.sh")) --update --with-app"
         let r = ForgeCore.openTerminal(cwd: repo, command: cmd, title: "Atualizando o Forge")
         updating = false
         if !r.ok { lastError = r.stderr }
+        // Replacing the bundle does not replace the running process: this
+        // instance keeps executing the code it launched with until it is
+        // restarted. Say so rather than letting a stale window look updated.
+        else { needsRelaunch = true }
+    }
+
+    /// Set once an update has been launched — the new bundle is on disk but this
+    /// process is still the old one.
+    @Published var needsRelaunch = false
+
+    /// Relaunch into the freshly installed bundle. `open -n` starts the new copy
+    /// before this one exits, so the user never faces an empty screen.
+    func relaunch() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-n", Bundle.main.bundlePath]
+        try? p.run()
+        NSApplication.shared.terminate(nil)
     }
 
     /// Announce a newly available version once. Uses the same notifier as
@@ -189,10 +213,16 @@ struct UpdatesView: View {
                 }
             }
             Spacer()
-            if store.updateAvailable {
+            // Relaunch wins the slot: once the installer has run, the useful
+            // action is no longer "update" — it is picking up what was installed.
+            if store.needsRelaunch {
+                Button("Reabrir na nova versão") { store.relaunch() }
+                    .controlSize(.large)
+                    .help("Esta janela ainda roda o binário antigo até reabrir")
+            } else if store.updateAvailable {
                 Button("Atualizar") { store.runUpdate() }
                     .controlSize(.large)
-                    .help("Abre um terminal rodando install.sh --update")
+                    .help("Abre um terminal rodando install.sh --update --with-app")
             }
         }
         .padding(16)

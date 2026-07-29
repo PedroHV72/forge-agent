@@ -348,6 +348,7 @@ struct ProjectCard: View {
 
     @State private var status: ProjectStatus?
     @State private var checkouts: [Checkout] = []
+    @State private var openItems = 0
     @State private var loading = false
     @State private var showLauncher = false
     @State private var launchTarget: String?
@@ -466,6 +467,7 @@ struct ProjectCard: View {
             Stat(value: gatesHere.count, label: "pergunta", accent: !gatesHere.isEmpty)
             Stat(value: runsHere.count, label: "run", accent: false)
             Stat(value: sessionsHere.count, label: "sessão", accent: false)
+            Stat(value: openItems, label: "item", pluralLabel: "itens", accent: false)
         }
     }
 
@@ -565,20 +567,34 @@ struct ProjectCard: View {
         status = await Task.detached(priority: .utility) {
             ForgeCore.runJSON(ProjectStatus.self, "forge-status.js", ["--json", "--cwd", p])
         }.value
+        let items = await Task.detached(priority: .utility) {
+            ForgeCore.runJSON([Item].self, "forge-items.js", ["--list", "--json", "--cwd", p])
+        }.value
+        openItems = ItemBoard.openCount(items ?? [])
     }
 }
 
 struct Stat: View {
     let value: Int
     let label: String
+    /// Explicit plural label for cases where mechanical "+s" pluralization
+    /// would be wrong (e.g. pt-BR "item" -> "itens", not "items").
+    var pluralLabel: String?
     let accent: Bool
+
+    init(value: Int, label: String, pluralLabel: String? = nil, accent: Bool) {
+        self.value = value
+        self.label = label
+        self.pluralLabel = pluralLabel
+        self.accent = accent
+    }
 
     var body: some View {
         HStack(spacing: 4) {
             Text("\(value)")
                 .font(.title3).monospacedDigit()
                 .foregroundStyle(accent ? Color.accentOrange : .primary)
-            Text(value == 1 ? label : label + "s")
+            Text(value == 1 ? label : (pluralLabel ?? label + "s"))
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .opacity(value == 0 ? 0.45 : 1)

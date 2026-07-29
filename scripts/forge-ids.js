@@ -9,12 +9,13 @@
 //   slugify(desc)         → string  // kebab-case ASCII-folded, stopwords removed; '' if empty
 //   makeMilestoneId(desc) → string  // 'M-<ts>-<slug>' or 'M-<ts>' if slug empty
 //   makeTaskId(desc)      → string  // 'T-<ts>-<slug>' or 'T-<ts>' if slug empty
+//   makeItemId(desc)      → string  // 'I-<ts>-<slug>' or 'I-<ts>' if slug empty
 //   nextSequentialMilestoneId(existingIds) → string  // 'M00N' (max legacy M### + 1)
 //   nextSequentialTaskId(existingIds)      → string  // 'TASK-00N' (max legacy TASK-### + 1)
 //   classify(id)          → 'legacy' | 'timestamp'
 //   isValid(id)           → boolean
 //   prefixGlob(id)        → string  // 'M-20260522143012*' or exact id for legacy
-//   entityKind(id)        → 'milestone' | 'task' | 'unknown'
+//   entityKind(id)        → 'milestone' | 'task' | 'item' | 'unknown'
 //
 // Library exports (I/O — prefs cascade + .gsd scan; used by CLI and forge-cli-helpers):
 //   readIdFormat(cwd)               → 'timestamp' | 'sequential'
@@ -108,6 +109,15 @@ function makeTaskId(desc) {
   return slug ? `T-${ts}-${slug}` : `T-${ts}`;
 }
 
+// ── makeItemId ───────────────────────────────────────────────────────────────
+// Work-item IDs (.gsd/items/ fragment store). Compact form only — items are a
+// new kind with no legacy read-compat burden, so no dashed alternate exists.
+function makeItemId(desc) {
+  const slug = slugify(desc);
+  const ts = nowTimestamp();
+  return slug ? `I-${ts}-${slug}` : `I-${ts}`;
+}
+
 // ── nextSequentialMilestoneId ────────────────────────────────────────────────
 // Pure: takes the list of existing IDs (directory names), returns the next
 // legacy-style sequential ID — 'M001' if none exist, else max(M###) + 1.
@@ -139,7 +149,9 @@ function nextSequentialTaskId(existingIds) {
 function classify(id) {
   if (!id) return 'legacy';
   const s = String(id);
-  if (/^[MT]-\d{14}(-|$)/.test(s)) return 'timestamp';
+  // I- (item) participates in the compact form only — the dashed regex below
+  // deliberately stays M|T|TASK.
+  if (/^[MTI]-\d{14}(-|$)/.test(s)) return 'timestamp';
   // Dashed timestamp form: M-YYYYMMDD-HHMMSS / T-… / TASK-… (date and time
   // separated by a hyphen). Observed in the wild alongside the compact 14-digit
   // form — both encode a creation timestamp, so both classify as 'timestamp'.
@@ -158,6 +170,9 @@ function isValid(id) {
   const s = String(id);
   // New timestamp format — compact 14-digit (canonical generated form)
   if (/^[MT]-\d{14}(-[a-z0-9-]*)?$/.test(s)) return true;
+  // Item IDs — compact form ONLY (no dashed alternate: items are new, so there
+  // is no legacy shape to stay read-compatible with).
+  if (/^I-\d{14}(-[a-z0-9-]*)?$/.test(s)) return true;
   // Timestamp format — dashed date-time (M-YYYYMMDD-HHMMSS, T-…, TASK-…),
   // optionally followed by a slug. Read-compatible alternate of the compact form.
   if (/^(?:M|T|TASK)-\d{8}-\d{6}(-[a-z0-9-]*)?$/i.test(s)) return true;
@@ -174,7 +189,7 @@ function isValid(id) {
 function prefixGlob(id) {
   if (!id) return String(id);
   const s = String(id);
-  const m = s.match(/^([MT]-\d{14})/);
+  const m = s.match(/^([MTI]-\d{14})/);
   if (m) return `${m[1]}*`;
   // Dashed timestamp form: glob on the M-YYYYMMDD-HHMMSS prefix.
   const dm = s.match(/^((?:M|T|TASK)-\d{8}-\d{6})/i);
@@ -183,11 +198,14 @@ function prefixGlob(id) {
 }
 
 // ── entityKind ───────────────────────────────────────────────────────────────
-// Prefix-based detection: M prefix → milestone, T/TASK/task prefix → task.
+// Prefix-based detection: M prefix → milestone, T/TASK/task prefix → task,
+// I- prefix → item. The item check runs before the task check so it can never
+// be shadowed; existing return values for M/T/TASK/legacy inputs are unchanged.
 function entityKind(id) {
   if (!id) return 'unknown';
   const s = String(id);
   if (/^M-/.test(s) || /^M\d+$/i.test(s)) return 'milestone';
+  if (/^I-/.test(s)) return 'item';
   if (/^T-/.test(s) || /^TASK-/i.test(s) || /^task-/i.test(s)) return 'task';
   return 'unknown';
 }
@@ -246,6 +264,7 @@ module.exports = {
   slugify,
   makeMilestoneId,
   makeTaskId,
+  makeItemId,
   nextSequentialMilestoneId,
   nextSequentialTaskId,
   classify,

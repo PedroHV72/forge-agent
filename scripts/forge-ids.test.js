@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // forge-ids.test.js — contract test suite for forge-ids.js
-// Exercises all 8 exports: nowTimestamp, slugify, makeMilestoneId, makeTaskId,
-// classify, isValid, prefixGlob, entityKind.
+// Exercises the pure core: nowTimestamp, slugify, makeMilestoneId, makeTaskId,
+// makeItemId, classify, isValid, prefixGlob, entityKind — plus the I/O helpers.
 // Run: node scripts/forge-ids.test.js  (exits 0 = all pass, 1 = any fail)
 
 'use strict';
@@ -270,6 +270,87 @@ test('isValid: M-2026051-153227 (7-digit date) → invalid', () =>
   assert(!ids.isValid('M-2026051-153227')));
 test('isValid: M-20260519-15322 (5-digit time) → invalid', () =>
   assert(!ids.isValid('M-20260519-15322')));
+
+// ── 14. item IDs (I-<ts>-<slug>) ─────────────────────────────────────────────
+// Work items (.gsd/items/) are a distinct ID kind. They participate in the
+// COMPACT timestamp form only — no dashed alternate, because items are new and
+// carry no legacy read-compat burden. The critical property is that widening
+// isValid must not change any existing M/T/TASK/legacy answer.
+console.log('\n14. item IDs (I-<ts>-<slug>)');
+
+test('makeItemId: prefix I- with 14-digit timestamp and slug', () => {
+  const id = ids.makeItemId('backlog board');
+  assert(/^I-\d{14}-[a-z0-9-]+$/.test(id), `got: ${id}`);
+});
+test('makeItemId: output is accepted by isValid', () => {
+  assert(ids.isValid(ids.makeItemId('backlog board')), 'generated item ID must validate');
+});
+test('makeItemId: stopword-only description → I-<ts> with no trailing -slug', () => {
+  const id = ids.makeItemId('de a o');
+  assert(/^I-\d{14}$/.test(id), `expected I-<14d> only, got: ${id}`);
+});
+test('makeItemId: bare I-<ts> form is accepted by isValid', () => {
+  assert(ids.isValid(ids.makeItemId('de a o')), 'slugless item ID must validate');
+});
+test('makeItemId: slug is ASCII-folded (reuses slugify)', () => {
+  const id = ids.makeItemId('Corrigir autenticação');
+  assert(!/[^\x20-\x7E]/.test(id), `non-ASCII in id: ${id}`);
+  assert(id.includes('autenticacao'), `expected folded slug, got: ${id}`);
+});
+
+test('isValid: I-20260729120000-fix-board → valid', () =>
+  assert(ids.isValid('I-20260729120000-fix-board')));
+test('isValid: I-20260729120000 (no slug) → valid', () =>
+  assert(ids.isValid('I-20260729120000')));
+test('isValid: I-123 (too short) → invalid', () =>
+  assert(!ids.isValid('I-123')));
+test('isValid: I-20260729-120000 (dashed form NOT accepted for items) → invalid', () =>
+  assert(!ids.isValid('I-20260729-120000')));
+test('isValid: I-20260729-120000-slug (dashed + slug) → invalid', () =>
+  assert(!ids.isValid('I-20260729-120000-slug')));
+test('isValid: I001 (no legacy sequential form for items) → invalid', () =>
+  assert(!ids.isValid('I001')));
+test('isValid: item-foo (no lowercase-word form for items) → invalid', () =>
+  assert(!ids.isValid('item-foo')));
+test('isValid: I-20260729120000-UPPER (uppercase slug) → invalid', () =>
+  assert(!ids.isValid('I-20260729120000-UPPER')));
+
+test('entityKind: I-20260729120000-x → item', () =>
+  assertEq(ids.entityKind('I-20260729120000-x'), 'item'));
+test('entityKind: I-20260729120000 (no slug) → item', () =>
+  assertEq(ids.entityKind('I-20260729120000'), 'item'));
+
+test('classify: I-20260729120000-x → timestamp', () =>
+  assertEq(ids.classify('I-20260729120000-x'), 'timestamp'));
+test('classify: I-20260729120000 (no slug) → timestamp', () =>
+  assertEq(ids.classify('I-20260729120000'), 'timestamp'));
+test('classify: I-20260729-120000 (dashed) → legacy (not an item shape)', () =>
+  assertEq(ids.classify('I-20260729-120000'), 'legacy'));
+
+test('prefixGlob: I-20260729120000-x → I-20260729120000*', () =>
+  assertEq(ids.prefixGlob('I-20260729120000-x'), 'I-20260729120000*'));
+test('prefixGlob: I-20260729120000 (no slug) → I-20260729120000*', () =>
+  assertEq(ids.prefixGlob('I-20260729120000'), 'I-20260729120000*'));
+
+// Non-regression: the I- widening must leave every other kind byte-identical.
+test('regression: entityKind unchanged for M/T/TASK/task/legacy/garbage', () => {
+  assertEq(ids.entityKind('M005'), 'milestone');
+  assertEq(ids.entityKind('M-20260522143012-auth'), 'milestone');
+  assertEq(ids.entityKind('T-20260522143012-x'), 'task');
+  assertEq(ids.entityKind('TASK-007'), 'task');
+  assertEq(ids.entityKind('task-foo'), 'task');
+  assertEq(ids.entityKind('GARBAGE!!!'), 'unknown');
+  assertEq(ids.entityKind(null), 'unknown');
+});
+test('regression: an item ID is never reported as milestone or task', () => {
+  const k = ids.entityKind('I-20260729120000-backlog');
+  assert(k !== 'milestone' && k !== 'task', `item leaked into kind: ${k}`);
+});
+test('regression: isValid unchanged for the pre-existing shapes', () => {
+  assert(ids.isValid('M005') && ids.isValid('TASK-007') && ids.isValid('task-foo-bar'));
+  assert(ids.isValid('M-20260522143012-auth') && ids.isValid('M-20260519-153227'));
+  assert(!ids.isValid('M-123') && !ids.isValid('GARBAGE!!!') && !ids.isValid(''));
+});
 
 // ── nextSequentialMilestoneId / nextSequentialTaskId (pure) ──────────────────
 test('nextSequentialMilestoneId: empty list → M001', () =>

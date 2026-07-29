@@ -1097,6 +1097,162 @@ test("fração nunca passa de 1 nem fica negativa") {
 }
 
 
+print("\nWorkspaceDefaults")
+
+test("pref explícito vence o último usado") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: "/repo/a", lastUsed: "/repo/b", known: ["/repo/a", "/repo/b"])
+    assertEqual(p.workspace, "/repo/a")
+    assertEqual(p.reason, .pref)
+    assertTrue(p.warning == nil, "pref registrado não deve gerar aviso")
+}
+
+test("último usado é o segundo default") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: nil, lastUsed: "/repo/b", known: ["/repo/a", "/repo/b"])
+    assertEqual(p.workspace, "/repo/b")
+    assertEqual(p.reason, .lastUsed)
+    assertTrue(p.warning == nil)
+}
+
+test("sem pref e sem último usado não resolve nada") {
+    // The b992edf regression test: `known` has two projects, but with no
+    // pref and no last-used, nothing must be preselected — `known.first`
+    // is never consulted.
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: nil, lastUsed: nil, known: ["/repo/a", "/repo/b"])
+    assertTrue(p.workspace == nil, "sem configuração nenhuma, workspace deve ser nil")
+    assertEqual(p.reason, .none)
+}
+
+test("último usado que saiu da lista não vira outro projeto") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: nil, lastUsed: "/repo/removido", known: ["/repo/a", "/repo/b"])
+    assertTrue(p.workspace == nil, "last-used stale não deve substituir por outro projeto")
+    assertEqual(p.reason, .none)
+}
+
+test("pref fora da lista de projetos resolve com aviso") {
+    let p = WorkspaceDefaults.preselect(
+        configuredDefault: "/repo/fora", lastUsed: "/repo/a", known: ["/repo/a"])
+    assertEqual(p.workspace, "/repo/fora")
+    assertEqual(p.reason, .pref)
+    assertTrue(p.warning != nil, "pref fora de known deve carregar aviso")
+}
+
+test("root dir expande ~ e cai no home quando vazio") {
+    let alwaysExists: (String) -> Bool = { _ in true }
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: nil, home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "  ", home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~", home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "~/code", home: "/Users/x", isDirectory: alwaysExists).path, "/Users/x/code")
+    assertEqual(WorkspaceDefaults.sessionRoot(configured: "/abs/path", home: "/Users/x", isDirectory: alwaysExists).path, "/abs/path")
+
+    let nilCase = WorkspaceDefaults.sessionRoot(configured: nil, home: "/Users/x", isDirectory: alwaysExists)
+    assertTrue(nilCase.warning == nil, "sem valor configurado não deve haver aviso")
+}
+
+// R1 fix (S04 review): a configured session root that does not resolve to an
+// existing directory must fall back to $HOME with a visible warning, never
+// silently open somewhere the "abre em …" caption does not describe.
+test("root dir inexistente cai no home com aviso") {
+    let neverExists: (String) -> Bool = { _ in false }
+    let r = WorkspaceDefaults.sessionRoot(configured: "/repo/removido", home: "/Users/x", isDirectory: neverExists)
+    assertEqual(r.path, "/Users/x")
+    assertTrue(r.warning != nil, "diretório inexistente deve carregar aviso")
+}
+
+test("root dir existente é honrado sem aviso") {
+    let alwaysExists: (String) -> Bool = { _ in true }
+    let r = WorkspaceDefaults.sessionRoot(configured: "/repo/valido", home: "/Users/x", isDirectory: alwaysExists)
+    assertEqual(r.path, "/repo/valido")
+    assertTrue(r.warning == nil, "diretório existente não deve carregar aviso")
+}
+
+// Both preselect() and sessionRoot() are pure and Foundation-free at the
+// call boundary above; the tests here are what pins the b992edf invariant
+// down mechanically, so a future edit that reintroduces `known.first`
+// breaks the build, not just the behaviour.
+
+print("\nItems (board)")
+
+test("colunas saem na ordem canônica") {
+    let cols = ItemBoard.columns([])
+    assertEqual(cols.map(\.status), [.inbox, .triaged, .doing, .done, .dropped])
+    assertTrue(cols.allSatisfy { $0.items.isEmpty }, "colunas vazias devem existir mesmo sem itens")
+}
+
+test("rótulos pt-BR de cada status") {
+    assertEqual(ItemStatus.inbox.label, "Entrada")
+    assertEqual(ItemStatus.triaged.label, "Triado")
+    assertEqual(ItemStatus.doing.label, "Fazendo")
+    assertEqual(ItemStatus.done.label, "Feito")
+    assertEqual(ItemStatus.dropped.label, "Descartado")
+}
+
+test("openCount ignora done e dropped") {
+    let items = [
+        Item(id: "I-1", status: "inbox"),
+        Item(id: "I-2", status: "triaged"),
+        Item(id: "I-3", status: "doing"),
+        Item(id: "I-4", status: "done"),
+        Item(id: "I-5", status: "dropped"),
+    ]
+    assertEqual(ItemBoard.openCount(items), 3)
+}
+
+test("status desconhecido não entra em coluna nenhuma e aparece em unknown") {
+    let items = [
+        Item(id: "I-1", status: "inbox"),
+        Item(id: "I-2", status: "arquivado"),
+        Item(id: "I-3", status: nil),
+    ]
+    let cols = ItemBoard.columns(items)
+    assertEqual(cols.flatMap(\.items).count, 1, "só o item conhecido entra em alguma coluna")
+    let unk = ItemBoard.unknown(items)
+    assertEqual(unk.count, 2)
+    assertTrue(unk.contains { $0.id == "I-2" })
+    assertTrue(unk.contains { $0.id == "I-3" })
+}
+
+test("LoadGeneration descarta resultado de uma geração anterior") {
+    var gen = LoadGeneration()
+    let genA = gen.start()   // load A começa
+    let genB = gen.start()   // usuário troca de projeto antes de A terminar
+    assertTrue(!gen.isCurrent(genA), "A não é mais a geração atual — resultado de A deve ser descartado")
+    assertTrue(gen.isCurrent(genB), "B é a geração atual — resultado de B deve ser aplicado")
+}
+
+test("LoadGeneration aceita a geração mais recente mesmo sem concorrência") {
+    var gen = LoadGeneration()
+    let only = gen.start()
+    assertTrue(gen.isCurrent(only), "única geração iniciada deve ser sempre a atual")
+}
+
+test("decodifica um item real da saída do engine") {
+    // Copiado verbatim de `node scripts/forge-items.js --list --json`.
+    let json = """
+    {"id":"I-20260729145851-test-title","title":"Test title","status":"inbox",
+     "origin":"human","created":"2026-07-29T14:58:51.237Z",
+     "updated":"2026-07-29T14:58:51.237Z","body":"Some body text"}
+    """
+    let item = try! JSONDecoder().decode(Item.self, from: Data(json.utf8))
+    assertEqual(item.id, "I-20260729145851-test-title")
+    assertEqual(item.title, "Test title")
+    assertEqual(item.status, "inbox")
+    assertEqual(item.parsedStatus, .inbox)
+    assertEqual(item.origin, "human")
+    assertEqual(item.body, "Some body text")
+}
+
+test("item sem campos opcionais decodifica") {
+    let json = "{\"id\":\"I-20260729000000-bare\"}"
+    let item = try! JSONDecoder().decode(Item.self, from: Data(json.utf8))
+    assertEqual(item.id, "I-20260729000000-bare")
+    assertTrue(item.title == nil)
+    assertTrue(item.parsedStatus == nil)
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

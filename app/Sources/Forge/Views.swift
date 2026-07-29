@@ -19,6 +19,7 @@ enum Section: String, CaseIterable, Identifiable {
     case now = "Início"
     case terminal = "Terminal"
     case projects = "Projetos"
+    case items = "Itens"
     case runs = "Runs"
     case accounts = "Contas"
     case metrics = "Métricas"
@@ -36,6 +37,7 @@ enum Section: String, CaseIterable, Identifiable {
         case .now:      return "bolt.fill"
         case .terminal: return "terminal"
         case .projects: return "folder"
+        case .items:    return "tray.full"
         case .runs:     return "play.circle"
         case .accounts: return "person.2"
         case .metrics:  return "chart.bar.xaxis"
@@ -87,6 +89,7 @@ struct RootView: View {
                 case .now:      NowView(state: state)
                 case .terminal: TerminalsView(state: state)
                 case .projects: ProjectsView(state: state)
+                case .items:    ItemsView(state: state)
                 case .runs:     RunsView(state: state)
                 case .accounts: AccountsView(state: state)
                 case .metrics:  MetricsView(state: state)
@@ -203,6 +206,11 @@ struct NowView: View {
     /// No implicit fallback. Defaulting to the first workspace meant a line
     /// typed without a project silently ran in whichever one sorted first —
     /// a wrong-repo dispatch that looks exactly like a right one.
+    ///
+    /// `project` itself may start out preselected via `state.preselection`
+    /// (a configured default, or the last-used project) on `.onAppear` — that
+    /// is a choice the operator made or a place they already were, never a
+    /// guess. `state.workspaces.first` is still never consulted here.
     private var resolvedProject: String { project }
 
     var body: some View {
@@ -222,6 +230,9 @@ struct NowView: View {
         .navigationTitle("Início")
         .onAppear {
             if commands.isEmpty { commands = CommandCatalog.load() }
+            // Guarded on `project.isEmpty` so a re-appear (e.g. returning from
+            // another tab) never overwrites a project the user already chose.
+            if project.isEmpty, let w = state.preselection.workspace { project = w }
             focused = true
         }
     }
@@ -470,6 +481,9 @@ struct NowView: View {
         guard canSubmit else { return }
         let line = text.trimmingCharacters(in: .whitespaces)
         state.newSessionRaw(cwd: resolvedProject, prompt: line, account: account)
+        // Record where work actually happened, so the next launch preselects
+        // it as the last-used default — the second-choice tier in `preselection`.
+        state.rememberWorkspace(resolvedProject)
         text = ""
         state.show("Sessão aberta — veja em Terminal")
     }

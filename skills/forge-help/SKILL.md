@@ -66,6 +66,7 @@ REPL interativo com menu. Acesso a todas as funcionalidades sem memorizar comand
 | `forge-auto` | **Auto mode** — executa o milestone inteiro de forma autônoma. Para em blocker ou milestone completo. |
 | `forge-next` | **Step mode** — executa exatamente uma unidade e para. Ideal para revisar antes de continuar. |
 | `forge-task <descrição>` | **Task autônoma** — task standalone sem milestone. Fluxo: brainstorm → discuss → research → plan → execute. |
+| `forge-task <item-id>` | Consome um item do backlog (`.gsd/items/`, qualquer prefixo único) como task — descrição e proveniência entram no BRIEF, item vira `doing` e recebe `promoted_to: T-…`. |
 | `forge-task --skip-brainstorm <descrição>` | Pula brainstorm — vai direto para discuss → plan → execute. |
 | `forge-task --resume TASK-001` | Retoma uma task de onde parou. |
 

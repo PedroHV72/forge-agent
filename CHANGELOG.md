@@ -1,3 +1,31 @@
+## v3.1.0 — A backlog for the work Forge already defers
+
+Forge has always produced work items it then had nowhere to put. A conceded review
+objection became a line of prose in `KNOWLEDGE.md`; a deferred plan-gate finding became a
+note in a marker the milestone cleanup later deleted; a blocked unit became an event nobody
+read. This release gives those deferrals a destination, and gives the app a default project
+so it stops asking where you are before every line.
+
+### Added
+
+- **Item store** (`scripts/forge-items.js`, `.gsd/items/`). One markdown fragment per item, per project, in the same merge-safe shape as `.gsd/decisions/` and `.gsd/ledger/` — two branches can each create items and merge without conflict. Closed status set (`inbox → triaged → doing → done|dropped`); anything else is an error, not a warning. IDs are `I-<timestamp>-<slug>` and resolve by any unique prefix, git short-sha style — an ambiguous prefix names its candidates instead of guessing. Durable across `milestone_cleanup`, like the ledger.
+- **Auto-capture at the junctions that already existed** — a review follow-up, a plan-gate `Deferir`, a blocked unit, and the standalone-task review boundary all now create an item carrying its own provenance (`source`, `file:line`, sha, milestone). No new decision points were invented. Cutover, not dual-write: the item is the single destination and the old file keeps a one-line pointer, so `KNOWLEDGE.md` still shows the trail without holding a second copy of the truth.
+- **Read-back into the loop** (`shared/forge-items-readback.md`). `/forge-task <item-id>` resolves an item, carries its provenance into the brief, marks it `doing` and records `promoted_to`; `/forge-new-milestone` lists open items as input before the brainstorm. Without this the store would be the write-only graveyard it was built to replace.
+- **Items board in the macOS app** — a sidebar screen with columns by status and an open-item count on each project card. Every read and write shells out to `forge-items.js`; Swift never reimplements store semantics, so a status transition means the same thing in both front-ends.
+- **`app.default_workspace` and `app.session_root_dir`** — the composer preselects a configured project (falling back to last-used) and always renders the destination before send. `shell` and `chat`, which need no project, open in the configured root directory.
+
+### Fixed
+
+- **The app no longer has any implicit workspace fallback.** `b992edf` removed `workspaces.first` from the composer because it dispatched into whichever repo sorted first — a wrong-repo `/forge-auto` that looks exactly like a correct one. Two more copies survived in `LauncherSheet` and one in `launch(account:)`. All three are gone, and `scripts/forge-app-workspace.test.js` is a standing, platform-independent guard that fails if any of them returns.
+- **The app could not update itself.** `UpdateStore.runUpdate()` shelled out to `install.sh --update`, but the Swift build is gated behind `--with-app` — so the button refreshed every agent, skill, script and hook, reported success, and left the one binary the operator was looking at on the old version. It now passes `--with-app`, and because replacing a bundle does not replace the running process, the card offers "Reabrir na nova versão" instead of letting a stale window look current. `scripts/forge-app-update.test.js` guards both, and asserts the `--with-app` gate in `install.sh` still exists so the first assertion cannot quietly become vacuous.
+- **`install.sh` was not executable in the repository** (mode `100644`), so `./install.sh` — the command the README gives — failed on a fresh clone.
+
+### Notes
+
+Every slice went through the dialectic review with an external challenger (Codex, deliberately the opposite model family from the author). Thirteen objections: ten conceded and fixed, three withdrawn after the author's defense, none left open. The ones worth knowing about were an undefined `$PICKED_IDS` that would have made item absorption silently inert, `app.*` preferences resolving from the project layer despite the schema promising global-only, and an unguarded async load that could show one project's items under another's name.
+
+---
+
 ## v3.0.0-beta — Gate protocol and the macOS app
 
 Two things that only make sense together: a way for an autonomous run to ask a

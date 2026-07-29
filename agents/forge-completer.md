@@ -273,7 +273,7 @@ Given all `T##-SUMMARY.md` files from the slice:
        ```
        Substitute `{M###}` and the serialized `EVENTS` array. The CLI is idempotent — re-piping identical events produces no file change (SHA1 dedup on `kind+dimension+slice+ts`).
 
-    g. **Wrap in try/catch (C7).** This sub-step is **advisory**. Never return `status: blocked` based on this step. Write failures are silent. The fragment store at `.gsd/checker-memory/` is durable across `milestone_cleanup` — same durability contract as `.gsd/ledger/`, `AUTO-MEMORY.md` and `LEDGER.md`. The `.gsd/CHECKER-MEMORY.md` monolith (if present) is now a projection; the fragments are the authoritative source of truth.
+    g. **Wrap in try/catch (C7).** This sub-step is **advisory**. Never return `status: blocked` based on this step. Write failures are silent. The fragment store at `.gsd/checker-memory/` is durable across `milestone_cleanup` — same durability contract as `.gsd/ledger/`, `.gsd/items/`, `AUTO-MEMORY.md` and `LEDGER.md`. The `.gsd/CHECKER-MEMORY.md` monolith (if present) is now a projection; the fragments are the authoritative source of truth.
 
 2. Write `S##-UAT.md` — human test script derived from must-haves:
    ```markdown
@@ -419,7 +419,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
    Parse the JSON output. On non-empty `errors` array: emit warning but proceed (cleanup in step 6 is still safe — per-milestone files remain on disk). On success: log merge counts in the completion report.
 
-   The fragment store (`.gsd/ledger/`), `AUTO-MEMORY.md`, `DECISIONS.md`, `CHECKER-MEMORY.md`, `CODING-STANDARDS.md` and `STATE.md` (dashboard) are durable across `milestone_cleanup` — never touched by archive/delete.
+   The fragment store (`.gsd/ledger/`), `.gsd/items/`, `AUTO-MEMORY.md`, `DECISIONS.md`, `CHECKER-MEMORY.md`, `CODING-STANDARDS.md` and `STATE.md` (dashboard) are durable across `milestone_cleanup` — never touched by archive/delete.
 
 6. **Cleanup milestone artifacts** — based on `milestone_cleanup` from injected config:
    - `keep` (default): do nothing — all files remain
@@ -432,7 +432,7 @@ Given all `T##-SUMMARY.md` files from the slice:
      ```bash
      rm -rf {WORKING_DIR}/.gsd/milestones/{M###}
      ```
-   In all cases `.gsd/LEDGER.md`, `AUTO-MEMORY.md`, `DECISIONS.md`, `CODING-STANDARDS.md`
+   In all cases `.gsd/LEDGER.md`, `.gsd/items/`, `AUTO-MEMORY.md`, `DECISIONS.md`, `CODING-STANDARDS.md`
    and `STATE.md` are never touched — they are the durable record.
 
 7. **Deactivate run in registry** (M005+ — multi-run aware). After cleanup, mark the run as `active:false` in `runs/{id}.json` and regenerate the dashboard. Idempotent: safe to skip if `runs/{id}.json` does not exist (legacy single-run workspace):

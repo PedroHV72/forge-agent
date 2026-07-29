@@ -780,8 +780,8 @@ Agent({ subagent_type: 'forge-executor',
 - For each **OPEN** item, ask the human via `AskUserQuestion` — one question per item (or batched up to 4), header `Review`, options:
   - `Manter abordagem atual` — accept as-is (reviewer's concern noted, not acted on)
   - `Refatorar agora` — dispatch a `review-fix` unit (same shape as Step 7a) for the accepted items
-  - `Criar follow-up` — log it as a known issue to address later
-  Write the chosen decision into the `**Decisão:**` line of that R# in `{S##}-REVIEW.md`.
+  - `Criar follow-up` — create an item per **§ Item capture** (source `review/{S##}/{R#}` or `review/{TASK_ID}/{R#}`, status `inbox`, `file`/`sha` from the finding, `body` = objeção + defesa one-liners) and append the pointer line to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing)
+  Write the chosen decision into the `**Decisão:**` line of that R# in `{S##}-REVIEW.md`; when the choice was `Criar follow-up`, the line records the item ID: `**Decisão:** follow-up → {I-id} — {title}`.
 - **CONCEDED** items with `fixConceded == false`: list them and ask once whether to address now (follow-up task) or record-and-continue. Default record-and-continue.
 
 **`MODE == auto` (forge-auto):**
@@ -798,7 +798,7 @@ Agent({ subagent_type: 'forge-executor',
     --context "$OBJECTION_DETAIL" \
     --option "keep:Manter abordagem atual:Objeção registrada, sem ação" \
     --option "fix:Refatorar agora:Despacha um review-fix para este item" \
-    --option "followup:Criar follow-up:Registra em KNOWLEDGE.md e segue" \
+    --option "followup:Criar follow-up:Cria item no backlog (.gsd/items/) e segue" \
     --default followup \
     --timeout "${GATE_TIMEOUT_MS:-1800000}")
   CHOICE=$(printf '%s' "$RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).choice||'')}catch{console.log('')}})")
@@ -806,14 +806,46 @@ Agent({ subagent_type: 'forge-executor',
   ```
 
   - `fix` → dispatch a `review-fix` unit for that item (same shape as Step 7a).
-  - `keep` / `followup` → write the decision into the `**Decisão:**` line.
-  - `source == timeout-default` → treat exactly as `defer`: mark `**Decisão:** deferido → triagem no fim da milestone` so Step 9 still surfaces it. **Nobody answering must never silently close an item.**
+  - `keep` → write the decision into the `**Decisão:**` line, no item created.
+  - `followup` (chosen OR `source == timeout-default`) → create an item per **§ Item capture** (source `review/{S##}/{R#}` or `review/{TASK_ID}/{R#}`, status `inbox`); when `source == timeout-default`, the item `body` notes `via gate — expirou`. **Nobody answering must never silently close an item — the timeout path still captures.**
 
   Record the provenance on the `**Decisão:**` line (`via gate — humano` vs `via gate — expirou`), so the artefact never claims a human made a call the clock made.
 
   `GATE_TIMEOUT_MS` defaults to 30min and is read from `review.gate_timeout_ms` when set. A run left alone overnight therefore behaves exactly like `defer` — the safe default is the one that happens when nobody is watching.
 
 The gate **never** returns a blocker regardless of posture.
+
+## Item capture (deferral → .gsd/items/)
+
+Any junction that used to write a deferral note into a durable-but-easy-to-miss location (`KNOWLEDGE.md`, a review artifact that gets `milestone_cleanup`'d, a plan-gate marker) now creates a **work-item fragment** in `.gsd/items/` instead. This section defines the procedure exactly once — every consumer below (Step 7b, Step 9, and `shared/forge-plan-gate.md`) cross-references it rather than restating it.
+
+**Invocation (canonical).** `scripts/forge-items.js --add` is the only write path. Build the payload as argv passed to a `node -e` one-liner that emits JSON on stdout, then pipe that into `--add` — never interpolate content directly into a JSON string literal (shell-quoting risk: a title or body containing a quote, backtick or `$()` would corrupt or inject into the JSON):
+
+```bash
+PAYLOAD=$(node -e "process.stdout.write(JSON.stringify({title: process.argv[1], origin: 'auto', status: process.argv[2], source: process.argv[3], file: process.argv[4] || undefined, sha: process.argv[5] || undefined, milestone: process.argv[6] || undefined, body: process.argv[7] || undefined}))" \
+  "$TITLE" "$STATUS" "$SOURCE" "$FILE" "$SHA" "$MILESTONE" "$BODY")
+RESULT=$(printf '%s' "$PAYLOAD" | node "$FORGE_SCRIPTS_DIR/forge-items.js" --add --cwd "$WORKING_DIR")
+ITEM_ID=$(printf '%s' "$RESULT" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).id||'')}catch{console.log('')}})")
+```
+
+`ITEM_ID` (the `id` field of the `{id, path, created}` stdout) is what the pointer line records.
+
+**Payload fields.** `title` and `origin: "auto"` are always present. `status` is `inbox` for every review/plan-gate junction and `triaged` for the blocked-unit junction (see `shared/forge-dispatch.md § Blocked capture` — out of scope for this file, referenced for completeness). `source` is always present (required by `validateItem` for `origin: auto`). `file` (`path:line`), `sha` (HEAD), `milestone` and `body` are included **only when actually known** — omit absent fields entirely, never write a placeholder value (empty string, `"unknown"`, `"n/a"`). A plan-gate deferral, for example, has no `file`/`sha` — the payload simply excludes those keys.
+
+**Source formats (closed list — every junction in this spec and in `shared/forge-plan-gate.md` uses one of these; do not invent new shapes downstream):**
+- `review/{S##}/{R#}` — review follow-up at a slice boundary.
+- `review/{TASK_ID}/{R#}` — review follow-up at a standalone-task boundary (`forge-task`).
+- `plan-gate/{S##}` — plan-gate deferral for `forge-next`.
+- `plan-gate/{TASK_ID}` — plan-gate deferral for `forge-task`.
+- `blocked/{unit_type}/{unit_id}` — a terminal blocked stop (a bare `unit_id`, e.g. `T01`, is ambiguous across slices — the type qualifies it). The failure class goes in the title, not the source: `[{classe}] {unit_type}/{unit_id} bloqueado — {resumo}`.
+
+**Pointer-line format.** `- {I-id} — {title}` — exactly one line: the item ID and its title, never the full body/content. This is the only thing written into `KNOWLEDGE.md § Review follow-ups`, a `**Decisão:**` line, or a plan-gate approval marker.
+
+**Dedup guard (blocked-unit reuse only).** Before `--add` on a `blocked/{unit_type}/{unit_id}` source, run `--list --json` and check for an existing item with the same `source` and a status that is not `done`/`dropped`; skip creation if one is found (a resumed unit that blocks again must not spawn a duplicate item).
+
+**Advisory failure rule.** If `--add` exits non-zero, log a warning and fall back to a **universal durable note**: append the one-line note (no item ID) to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing) — for **every** junction, regardless of which destination the junction normally writes its pointer line to. `KNOWLEDGE.md` survives `milestone_cleanup`; a junction's own marker (e.g. a plan-gate approval marker) does not, so the `KNOWLEDGE.md` note is what actually keeps the deferral from being lost. **Additionally** (not instead), still record the same one-line note in the junction's own destination (`**Decisão:**` line, plan-gate marker, etc.) for in-context visibility — but that copy is best-effort, not the durable one. Then continue. Item capture never blocks a gate, a review, or the loop — same posture as every other advisory mechanism in this spec.
+
+**Headless rule.** Capture fires when the deferral is *recorded*, not when a human answers. A timeout-default resolution (Step 7b `followup` via the gate mailbox) and a headless Step 9 triage (no `AskUserQuestion` available) both still create the item — the absence of a human in the loop is not a reason to lose the deferral.
 
 ## Step 8 — Event log
 
@@ -847,9 +879,10 @@ Consumer: `forge-auto` / `forge-next`, when the derived unit is `complete-milest
 3. **Digest.** Print a digest table to the user — one row per item: `slice · R# · path:line · objeção (one-liner) · status (aberta | concedida-sem-fix)`.
 4. **Triage.** For each item (batched up to 4 per `AskUserQuestion`, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
 5. **Act.** All `Refatorar agora` items → ONE `review-fix` dispatch (Step 7a shape, `UNIT: review-fix/{M###}-triage`, items grouped in a single prompt; slices are merged by now so fixes are normal commits on the current branch). On throw → mark those items `**Decisão:** refatorar — dispatch falhou, virou follow-up` and continue.
-6. **Write back.** Update the `**Decisão:**` line of every triaged R# in its `{S##}-REVIEW.md`. `Criar follow-up` items also get one line appended to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing) so they survive `milestone_cleanup`.
-7. **Event.** Append to `events.jsonl`: `{"ts":"<ISO>","event":"review-triage","milestone":"{M###}","pending":N,"kept":N,"fixed":N,"follow_up":N}`.
-8. Proceed to dispatch `complete-milestone`. The triage **never blocks** the milestone — any failure is recorded and the close-out continues.
+6. **Write back.** Update the `**Decisão:**` line of every triaged R# in its `{S##}-REVIEW.md`. `Criar follow-up` items create an item per **§ Item capture** (source `review/{S##}/{R#}`) and append ONLY the pointer line — `- {I-id} — {title}` — to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing; never the full content) so they survive `milestone_cleanup`.
+7. **Headless fallback.** When `AskUserQuestion` is unavailable at this boundary (headless session, no gate mailbox configured for this junction), Step 4's per-item ask cannot run: instead, create one item per still-pending deferred objection (source `review/{S##}/{R#}`, status `inbox`, `body` noting `triagem não realizada — headless`) so the deferrals survive `milestone_cleanup` rather than dying silently in a `REVIEW.md` that will be cleaned up. Skip Steps 3–6's human-facing digest/triage in this branch; proceed straight to Step 8.
+8. **Event.** Append to `events.jsonl`: `{"ts":"<ISO>","event":"review-triage","milestone":"{M###}","pending":N,"kept":N,"fixed":N,"follow_up":N}`. `follow_up` counts items created in either Step 6 or Step 7 — schema unchanged from before this cutover.
+9. Proceed to dispatch `complete-milestone`. The triage **never blocks** the milestone — any failure is recorded and the close-out continues.
 
 ## Legacy `style: flags` single-pass
 
@@ -863,4 +896,7 @@ When `style == flags`: run Step 2 only — routed by `challenger` (so `codex`/`g
 - `skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md` — gate invocation (before `complete-slice`) + milestone-final triage (Step 9, before `complete-milestone`)
 - `scripts/forge-xllm.js` — S01 adapter for the external challengers (`--mode challenge|rebuttal`, `--engine codex|agy` — GPT via Codex CLI, Gemini via Antigravity CLI); parsing/validation lives there, not here
 - `forge-agent-prefs.jsonc § Review Settings` — `review.{mode,style,rounds,ask_in_auto,fix_conceded,engine,challenger,challenger_model,advocate_model}`
+- `scripts/forge-items.js` — the work-item fragment store consumed by **§ Item capture** (`--add`/`--list` CLI; single write path for `Criar follow-up` and every other deferral junction below)
+- `shared/forge-plan-gate.md § Deferir resolution` — the sibling consumer of **§ Item capture** for plan-gate deferrals (does not restate the invocation)
 - Artifact: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (durable with the milestone; cleaned by `milestone_cleanup`)
+- Artifact: `.gsd/items/*.md` (work items created by this spec; durable — never cleaned by `milestone_cleanup`)

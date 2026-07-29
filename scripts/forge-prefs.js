@@ -313,6 +313,21 @@ function readPrefs(cwd, opts) {
   const errors = [];
   const [globalDescriptor, localDescriptor] = preferenceLayerDescriptors(targetCwd, opts);
   const globalLayer = resolveLayer(globalDescriptor.jsoncPath, globalDescriptor.mdFiles, errors, targetCwd);
+  // R3 fix (S04 review): `--global-only` skips the local layer entirely, so
+  // callers that must resolve a per-operator setting (e.g. `app.*` in the
+  // desktop app) never let a project-local .gsd/ override it, regardless of
+  // which directory the host process happens to be running from.
+  if (opts && opts.globalOnly) {
+    return {
+      ok: errors.length === 0,
+      prefs: globalLayer.prefs,
+      errors,
+      layers: {
+        global: { source: globalLayer.source, files: globalLayer.files },
+        local: { source: 'absent', files: [] },
+      },
+    };
+  }
   const localLayer = resolveLayer(localDescriptor.jsoncPath, localDescriptor.mdFiles, errors, targetCwd);
   const merged = deepMerge(globalLayer.prefs, localLayer.prefs);
   return {
@@ -476,9 +491,10 @@ function buildProvenance(globalPrefs, localPrefs) {
 }
 
 function parseCliArgs(argv) {
-  const args = { resolved: false, scaffold: false, setupScaffold: false, schemaRef: null, setActive: [], rescaffold: null, write: false, out: null, key: null, explain: false, cwd: process.cwd(), globalDir: null, localDir: null };
+  const args = { resolved: false, scaffold: false, setupScaffold: false, schemaRef: null, setActive: [], rescaffold: null, write: false, out: null, key: null, explain: false, cwd: process.cwd(), globalDir: null, localDir: null, globalOnly: false };
   for (let index = 0; index < argv.length; index++) {
     if (argv[index] === '--resolved') args.resolved = true;
+    else if (argv[index] === '--global-only') args.globalOnly = true;
     else if (argv[index] === '--scaffold') args.scaffold = true;
     else if (argv[index] === '--setup-scaffold') args.setupScaffold = true;
     else if (argv[index] === '--schema-ref') args.schemaRef = argv[++index] || '';
@@ -606,6 +622,7 @@ function runCli(argv) {
   const dirOpts = {};
   if (args.globalDir) dirOpts.globalDir = args.globalDir;
   if (args.localDir) dirOpts.localDir = args.localDir;
+  if (args.globalOnly) dirOpts.globalOnly = true;
   const result = readPrefs(args.cwd, dirOpts);
   const warnings = validatePrefs(result.prefs, loadSchema());
   const schemaWarning = schemaLoadWarning();

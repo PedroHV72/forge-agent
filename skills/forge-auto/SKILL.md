@@ -526,7 +526,7 @@ The produced `T##-SECURITY.md` will be injected into that task's worker prompt a
 1. Scan all `{S##}-REVIEW.md` under `.gsd/milestones/{M###}/slices/*/` for pending items: `Decisão: deferido → triagem no fim da milestone`, `Correção: falhou — deferida para triagem final`, or legacy `Decisão: deferido (auto-mode)`.
 2. Zero pending → skip silently and dispatch `complete-milestone` normally.
 3. Otherwise **fire push (call-site 2):** use Push helper with message `"Forge {RUN_ID} — {N} item(ns) de review aguardam sua triagem antes de fechar a milestone."` (N = count of pending items). Then print the digest table (slice · R# · path:line · objeção · status) and triage each item via `AskUserQuestion` (batched up to 4, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
-4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (slices already merged — fixes are normal commits). Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items also append to `.gsd/KNOWLEDGE.md § Review follow-ups` (survives `milestone_cleanup`).
+4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (slices already merged — fixes are normal commits). Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items create an item per `shared/forge-review.md § Item capture` (source `review/{S##}/{R#}`, status `inbox`, provenance from the digest row) and append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing — this survives `milestone_cleanup`; the item is the single destination for full content).
 5. Append the `review-triage` event to `events.jsonl`. The triage **never blocks** the milestone close-out.
 
 > **This gate is the explicit exception to the AUTONOMY RULE** — at this point every slice is done; asking the operator here is the designed arbitration moment that `defer` postponed to. It does not fire on pause/blocked/partial exits — only when the derived unit is `complete-milestone`.
@@ -1489,7 +1489,22 @@ fi
 Parse the `---GSD-WORKER-RESULT---` block:
 - `status: done` → proceed to post-unit housekeeping, then **immediately continue loop** (do NOT pause or ask user)
 - `status: partial` → write `continue.md`, update STATE, emit compact signal, **fire push (call-site 1):** use Push helper with message `"Forge {RUN_ID} travou — partial: {resumo do blocker}. Run pausado, requer ação manual."`, then **deactivate run NOW** (`node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}'` — see `## Deactivate auto-mode indicator`), **stop loop**
-- `status: blocked` → apply failure taxonomy before stopping; if no auto-recovery or recovery exhausted: **fire push (call-site 1):** use Push helper with message `"Forge {RUN_ID} travou — {classe do blocker}: {resumo}. Run pausado, requer ação manual."`, then **deactivate run NOW** (`node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}'` — see `## Deactivate auto-mode indicator`), **stop loop**:
+- `status: blocked` → apply failure taxonomy before stopping; if no auto-recovery or recovery exhausted:
+
+  <!-- item-capture:blocked:start -->
+  Create a work-item so the blocker is not lost, per `shared/forge-review.md § Item capture`. Dedup guard first — skip creation if an open item already exists for this source:
+  ```bash
+  EXISTING=$(node "$FORGE_SCRIPTS_DIR/forge-items.js" --list --json --cwd "$WORKING_DIR" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const items=JSON.parse(s);const found=(items.items||items||[]).some(i=>i.source==='blocked/{unit_type}/{unit_id}'&&!['done','dropped'].includes(i.status));process.stdout.write(found?'1':'')}catch(e){process.stdout.write('')}})")
+  if [ -z "$EXISTING" ]; then
+    PAYLOAD=$(node -e "process.stdout.write(JSON.stringify({title: process.argv[1], origin: 'auto', status: 'triaged', source: process.argv[2], milestone: process.argv[3], body: process.argv[4]}))" \
+      "[{classe}] {unit_type}/{unit_id} bloqueado — {resumo}" "blocked/{unit_type}/{unit_id}" "${RUN_ID:-{M###}}" "{blocker excerpt}. Recuperações tentadas: {recovery attempts, if any}")
+    printf '%s' "$PAYLOAD" | node "$FORGE_SCRIPTS_DIR/forge-items.js" --add --cwd "$WORKING_DIR" || echo "WARN: item capture failed for blocked/{unit_type}/{unit_id} — continuing"
+  fi
+  ```
+  This is a plain Bash call — never behind `AskUserQuestion`, never pauses the loop (AUTONOMY RULE intact). A non-zero `--add` exit is a warning, not a blocker for this stop path.
+  <!-- item-capture:blocked:end -->
+
+  Then **fire push (call-site 1):** use Push helper with message `"Forge {RUN_ID} travou — {classe do blocker}: {resumo}. Run pausado, requer ação manual."`, then **deactivate run NOW** (`node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json '{"active":false}'` — see `## Deactivate auto-mode indicator`), **stop loop**:
 
 **Failure Taxonomy** (check `blocker` field in result, first match wins):
 
@@ -1808,7 +1823,7 @@ Slices entregues:
 | Slice | Objeções | Corrigidas (concedidas) | Triadas | Follow-ups |
 |-------|----------|-------------------------|---------|------------|
 | S01   | 5        | 2                       | 1       | 0          |
-{follow-up lines, if any: "R# path:line — <objeção>" → .gsd/KNOWLEDGE.md § Review follow-ups}
+{follow-up lines, if any: "R# path:line — <objeção>" → item {I-id} (.gsd/items/)}
 
 Próximo milestone: /forge-new-milestone <descrição>
 ```

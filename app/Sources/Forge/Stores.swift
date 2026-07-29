@@ -57,6 +57,11 @@ final class AppState: ObservableObject {
     @Published private(set) var usage: [String: AccountUsage] = [:]
     @Published private(set) var workspaces: [String] = []
 
+    /// Raw values of the two `app.*` prefs, read once at init and on explicit
+    /// reload only — see `loadAppDefaults()`.
+    @Published private(set) var defaultWorkspacePref = ""
+    @Published private(set) var sessionRootDir = ""
+
     @Published var usageLoading = false
     @Published var usageCheckedAt: Date?
     @Published var toast: Toast?
@@ -105,6 +110,7 @@ final class AppState: ObservableObject {
     init() {
         reloadCheap()
         loadAccounts()
+        loadAppDefaults()
 
         // FSEvents drives updates; the timer is only a safety net. It also
         // covers the one change no filesystem can report: a gate reaching its
@@ -172,6 +178,75 @@ final class AppState: ObservableObject {
             }
         }
     }
+
+    // MARK: Workspace defaults
+
+    /// Reads `app.default_workspace` and `app.session_root_dir` once at init
+    /// plus on explicit reload — this must never join `reloadCheap`/the 15s
+    /// timer. Those two knobs only change when the operator edits prefs by
+    /// hand, so polling them on a timer would spawn node every couple of
+    /// seconds for nothing.
+    func loadAppDefaults() {
+        // `--global-only` (R3 fix, S04 review): `app.*` is a per-operator
+        // setting, never per-project. Without this flag, ForgeCore.runJSON
+        // inherits the app process's cwd — which can carry a project-local
+        // .gsd/forge-prefs.jsonc (e.g. `swift run` inside this very repo) —
+        // and that local layer would silently override the operator's
+        // global default. This must always resolve the global layer alone.
+        let resolved = ForgeCore.runJSON(
+            ModelsStore.ResolvedPrefs.self, "forge-prefs.js", ["--resolved", "--global-only"])
+        if case .object(let app)? = resolved?.prefs?["app"] {
+            defaultWorkspacePref = app["default_workspace"]?.asString ?? ""
+            sessionRootDir = app["session_root_dir"]?.asString ?? ""
+        } else {
+            defaultWorkspacePref = ""
+            sessionRootDir = ""
+        }
+        // A misconfigured default must be visible, not silently dropped.
+        if let warning = preselection.warning {
+            show(warning, error: true)
+        }
+        if let warning = sessionRootResolution.warning {
+            show(warning, error: true)
+        }
+    }
+
+    /// The last project a session was opened in, persisted the same way the
+    /// rest of the app persists small per-user state (`Updates.swift:29`,
+    /// `Projects.swift:86`) — no new file next to `forge-gate-workspaces.json`.
+    var lastUsedWorkspace: String {
+        UserDefaults.standard.string(forKey: "lastWorkspace") ?? ""
+    }
+
+    func rememberWorkspace(_ path: String) {
+        guard !path.isEmpty else { return }
+        UserDefaults.standard.set(path, forKey: "lastWorkspace")
+    }
+
+    /// The single entry point every call site uses to ask "which project
+    /// should this start in?" — pref wins, then a still-registered
+    /// last-used, then nothing. Never `workspaces.first`; see
+    /// `WorkspaceDefaults` for why.
+    var preselection: Preselection {
+        WorkspaceDefaults.preselect(
+            configuredDefault: defaultWorkspacePref,
+            lastUsed: lastUsedWorkspace,
+            known: workspaces)
+    }
+
+    /// Full resolution (path + optional warning) for the session root —
+    /// computed once so `resolvedSessionRoot` and the `loadAppDefaults()`
+    /// toast agree on the exact same check.
+    private var sessionRootResolution: WorkspaceDefaults.SessionRootResolution {
+        WorkspaceDefaults.sessionRoot(
+            configured: sessionRootDir,
+            home: FileManager.default.homeDirectoryForCurrentUser.path)
+    }
+
+    /// Where project-less `shell`/`chat` sessions open — the only sanctioned
+    /// non-project cwd. Falls back to `$HOME` (with a toast, see
+    /// `loadAppDefaults()`) when the configured directory does not exist.
+    var resolvedSessionRoot: String { sessionRootResolution.path }
 
     // MARK: Accounts
 
@@ -277,10 +352,6 @@ final class AppState: ObservableObject {
             runId: attachedRun, account: account.isEmpty ? nil : account))
     }
 
-    /// Closing kills the child process, so a session that is still running gets
-    /// a confirmation — the same reasoning as quitting the app: Forge resumes
-    /// from disk, but the in-flight unit is cut off. Returns whether it closed.
-    @discardableResult
     /// Open a session from a free-form line. A leading slash command is passed
     /// through verbatim — whatever Forge gains tomorrow works here with no code
     /// change — and plain text becomes a conversation.
@@ -373,11 +444,17 @@ final class AppState: ObservableObject {
         else { show(r.stderr.isEmpty ? "falha ao remover" : r.stderr, error: true) }
     }
 
-    /// Open a terminal on another account, in-app.
+    /// Open a terminal on another account, in-app. No `workspaces.first`
+    /// fallback: it dispatched into the wrong repo indistinguishably from a
+    /// correct dispatch (`b992edf`). A `.chat` session carries no project
+    /// semantics, so an unresolved preselection lands in the configured
+    /// session root dir instead — never a guess among registered projects.
     func launch(account: String) {
-        let cwd = workspaces.first ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let cwd = preselection.workspace ?? resolvedSessionRoot
         newSession(cwd: cwd, mode: .chat, text: "", account: account)
-        sessions.last.map { _ in show("Sessão aberta na conta \(account)") }
+        sessions.last.map { _ in
+            show("Sessão aberta na conta \(account) — \(URL(fileURLWithPath: cwd).lastPathComponent)")
+        }
     }
 
     func openTerminal(at cwd: String, command: String, title: String) {
