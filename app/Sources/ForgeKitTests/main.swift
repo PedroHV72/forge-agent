@@ -259,6 +259,40 @@ test("testRepeatedEditsAreIdempotent") {
     let twice = PrefsEdit.upsert(once, path: ["review", "challenger"], value: .string("gemini"))
     assertEqual(once, twice, "reescrever o mesmo valor não pode mudar o arquivo")
 }
+
+test("chave nova entra junto do próprio comentário") {
+    // The scaffold documents every knob; a value dropped at the top of the file
+    // sits orphaned while its comment block still shows the default.
+    let doc = """
+    {
+      "$schema": "x",
+      // ── main_branch ─────────────────
+      // Nome da branch principal.
+      // "main_branch": "master",
+      // ── auto_push ───────────────────
+      // "auto_push": false,
+    }
+    """
+    let out = PrefsEdit.upsert(doc, path: ["main_branch"], value: .string("main"))
+    let lines = out.components(separatedBy: "\n")
+    let commented = lines.firstIndex { $0.contains("// \"main_branch\"") }!
+    let live = lines.firstIndex { PrefsEdit.isAssignment($0, key: "main_branch") }!
+    assertEqual(live, commented + 1, "valor deve ficar logo abaixo do comentário que o explica")
+    assertTrue(lines.firstIndex { $0.contains("auto_push") }! > live,
+               "não pode invadir a seção seguinte")
+}
+
+test("sem comentário correspondente, cai no topo") {
+    let out = PrefsEdit.upsert("{\n  \"a\": 1\n}", path: ["novo"], value: .bool(true))
+    let lines = out.components(separatedBy: "\n")
+    assertEqual(lines.firstIndex { $0.contains("novo") }, 1)
+}
+
+test("cabeçalho de seção não é confundido com atribuição comentada") {
+    assertFalse(PrefsEdit.isCommentedAssignment("  // ── main_branch ───", key: "main_branch"))
+    assertTrue(PrefsEdit.isCommentedAssignment("  // \"main_branch\": \"master\",", key: "main_branch"))
+}
+
 print("\nPrefsLocator (achou o repo errado uma vez)")
 
 test("parseRepoPath ignora a linha comentada do scaffold") {

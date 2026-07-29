@@ -199,15 +199,38 @@ public enum PrefsEdit {
         return afterKey.trimmingCharacters(in: .whitespaces).hasPrefix(":")
     }
 
+    /// Insert a new top-level key.
+    ///
+    /// Preferably right below its own commented example, so the value lands
+    /// beside the documentation that explains it. The scaffold is ~450 lines of
+    /// commented catalogue; dropping every new key at the top leaves it orphaned
+    /// while its comment block still shows the default, which reads as if the
+    /// default were still in force.
     private static func insertTopLevel(lines: [String], key: String, raw: String) -> String {
         var lines = lines
+        let line = "  \"\(key)\": \(raw),"
+
+        if let commented = lines.firstIndex(where: { isCommentedAssignment($0, key: key) }) {
+            lines.insert(line, at: commented + 1)
+            return lines.joined(separator: "\n")
+        }
+
         guard let open = lines.firstIndex(where: {
             $0.trimmingCharacters(in: .whitespaces).hasPrefix("{")
         }) else {
             return ["{", "  \"\(key)\": \(raw)", "}"].joined(separator: "\n")
         }
-        lines.insert("  \"\(key)\": \(raw),", at: open + 1)
+        lines.insert(line, at: open + 1)
         return lines.joined(separator: "\n")
+    }
+
+    /// A commented-out assignment of `key` — the scaffold's documented example,
+    /// as opposed to a section header like `// ── key ──`.
+    public static func isCommentedAssignment(_ line: String, key: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard t.hasPrefix("//") else { return false }
+        let body = t.dropFirst(2).trimmingCharacters(in: .whitespaces)
+        return isAssignment(body, key: key)
     }
 
     public static func encode(_ v: JSONValue) -> String {
