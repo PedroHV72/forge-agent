@@ -103,6 +103,11 @@ withHermeticHome((cliEnv) => {
     assertEqual(r.effort_reason, 'unit-type:execute-task', 'defaults effort reason');
     assertEqual(r.engine, 'claude', 'defaults engine claude');
     assertEqual(r.sidecar_model, '', 'claude route has empty sidecar model');
+    assertEqual(r.host_runtime, 'claude', 'legacy omission keeps Claude host compatibility');
+    assertEqual(r.worker_engine, 'native', 'legacy omission keeps native worker target');
+    assertEqual(r.worker_mode, 'native', 'legacy omission keeps native worker mode');
+    assertEqual(r.resolved_worker_engine, 'claude', 'legacy native worker resolves to Claude host');
+    assertEqual(r.dispatch_allowed, true, 'legacy contract remains dispatchable');
     cleanup(f);
   });
 
@@ -369,6 +374,95 @@ withHermeticHome((cliEnv) => {
       assertEqual(parsed.route_source, expected.route_source, 'CLI and library route source agree');
       assertEqual(Object.keys(parsed).slice(0, 11).join(','), 'engine,model,alias,tier,domain,route_source,chain,chain_len,reason,effort,effort_reason', 'CLI contract keys are ordered');
     }
+    cleanup(f);
+  });
+
+  runCase('host_runtime is an additive input and does not reinterpret legacy routing fields', () => {
+    const f = mkFixture({ prefsJsonc: '{"tier_models":{"standard":"claude-opus-4-8"}}' });
+    const legacy = dispatch(f, { unitType: 'execute-task' });
+    const codexHost = dispatch(f, { unitType: 'execute-task', host_runtime: 'codex' });
+    for (const key of ['engine', 'model', 'alias', 'tier', 'domain', 'route_source', 'chain', 'chain_len', 'reason', 'effort', 'effort_reason', 'dispatch_engine']) {
+      assertEqual(JSON.stringify(codexHost[key]), JSON.stringify(legacy[key]), `host input preserves legacy ${key}`);
+    }
+    assertEqual(codexHost.host_runtime, 'codex', 'explicit snake_case host is emitted');
+    assertEqual(codexHost.worker_engine, 'native', 'worker engine remains native when omitted');
+    assertEqual(codexHost.resolved_worker_engine, 'codex', 'native resolves to explicit Codex host');
+    cleanup(f);
+  });
+
+  runCase('CLI accepts --host-runtime and retains the ordered legacy prefix', () => {
+    const f = mkFixture({});
+    const cli = spawnSync('node', [SCRIPT, '--json', '--unit-type', 'execute-task', '--host-runtime', 'codex', '--cwd', f.dir], { encoding: 'utf8', env: cliEnv });
+    let parsed = null;
+    try { parsed = JSON.parse(cli.stdout); } catch (error) { fail('host-runtime CLI stdout is valid JSON', error.message); }
+    assertEqual(cli.status, 0, 'host-runtime CLI exits zero');
+    assert(parsed && parsed.host_runtime === 'codex', 'host-runtime CLI exposes Codex host', cli.stdout);
+    assert(parsed && parsed.resolved_worker_engine === 'codex', 'host-runtime CLI resolves native to Codex', cli.stdout);
+    assertEqual(Object.keys(parsed || {}).slice(0, 11).join(','), 'engine,model,alias,tier,domain,route_source,chain,chain_len,reason,effort,effort_reason', 'host-runtime preserves ordered legacy prefix');
+    cleanup(f);
+  });
+
+  runCase('native target never falls back to a routed model family', () => {
+    const f = mkFixture({ prefsJsonc: '{"routing":{"default":{"executor":{"standard":"claude-opus-4-8"}}}}' });
+    const r = dispatch(f, { unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'native' });
+    assertEqual(r.engine, 'claude', 'route still classifies the Claude model family');
+    assertEqual(r.resolved_worker_engine, 'codex', 'native target remains the Codex host');
+    assertEqual(r.dispatch_allowed, true, 'native host target is allowed');
+    cleanup(f);
+  });
+
+  runCase('implicit Codex-to-Codex sidecar is refused before dispatch', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'codex', workerMode: 'sidecar',
+    });
+    assertEqual(r.dispatch_allowed, false, 'implicit same-host sidecar is refused');
+    assertEqual(r.dispatch_reason_code, 'implicit-recursion-refused', 'recursion refusal uses stable reason code');
+    assertEqual(r.worker_reason_code, 'implicit-recursion-refused', 'worker diagnostic matches dispatch refusal');
+    cleanup(f);
+  });
+
+  runCase('explicitly declared same-host sidecar remains representable', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'codex', workerMode: 'sidecar', sidecarDeclared: true,
+    });
+    assertEqual(r.dispatch_allowed, true, 'declared same-host sidecar is allowed by the contract');
+    assertEqual(r.sidecar_declared, true, 'declaration is emitted');
+    assertEqual(r.resolved_worker_engine, 'codex', 'declared sidecar keeps its Codex target');
+    assertEqual(r.worker_reason_code, 'sidecar-declared', 'declared sidecar reason is stable');
+    cleanup(f);
+  });
+
+  runCase('cross-host sidecar requires an explicit declaration without fallback', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'claude', workerEngine: 'codex', workerMode: 'sidecar',
+    });
+    assertEqual(r.dispatch_allowed, false, 'undeclared cross-host sidecar is refused');
+    assertEqual(r.dispatch_reason_code, 'sidecar-declaration-required', 'cross-host refusal is stable');
+    assertEqual(r.resolved_worker_engine, '', 'refusal does not choose a fallback worker');
+    cleanup(f);
+  });
+
+  runCase('unknown host is a deterministic resolver refusal, never a Claude fallback', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, { unitType: 'execute-task', hostRuntime: 'unknown-host' });
+    assertEqual(r.dispatch_allowed, false, 'unknown host is refused');
+    assertEqual(r.dispatch_reason_code, 'invalid-host-runtime', 'unknown host reason is stable');
+    assertEqual(r.host_runtime, 'unknown-host', 'refusal echoes the requested host for diagnosis');
+    assertEqual(r.resolved_worker_engine, '', 'unknown host does not fall back to Claude');
+    cleanup(f);
+  });
+
+  runCase('CLI represents an explicitly declared sidecar', () => {
+    const f = mkFixture({});
+    const cli = spawnSync('node', [SCRIPT, '--json', '--unit-type', 'execute-task', '--host-runtime', 'codex', '--worker-engine', 'codex', '--worker-mode', 'sidecar', '--sidecar-declared', '--cwd', f.dir], { encoding: 'utf8', env: cliEnv });
+    let parsed = null;
+    try { parsed = JSON.parse(cli.stdout); } catch (error) { fail('sidecar CLI stdout is valid JSON', error.message); }
+    assertEqual(cli.status, 0, 'declared sidecar CLI exits zero');
+    assert(parsed && parsed.dispatch_allowed === true, 'declared sidecar CLI permits dispatch', cli.stdout);
+    assert(parsed && parsed.worker_reason_code === 'sidecar-declared', 'declared sidecar CLI reports its reason', cli.stdout);
     cleanup(f);
   });
 });

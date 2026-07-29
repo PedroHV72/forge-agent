@@ -879,6 +879,63 @@ Placeholder classification:
 
 > **`dispatch_engine` is the canonical branch trigger.** The resolver's chain carries model-family metadata (`claude|gpt|gemini`); `dispatch_engine` normalizes it (`gpt→codex`, `gemini→agy`, otherwise `claude`). Sidecar branches gate only on `$DISPATCH_ENGINE`. Event field `engine` records the normalized engine that actually ran so review pairing and cost aggregation see `claude|codex|agy` consistently.
 
+#### Runtime-neutral host and worker contract (S01/T02)
+
+`scripts/forge-dispatch-resolve.js` also carries the versioned host/worker
+projection from [`scripts/forge-runtime.js`](../scripts/forge-runtime.js).
+This is one resolver call, not a second routing parser. The host is an input to
+the resolver; it is never inferred from `model`, `engine`, `dispatch_engine`,
+or a member of `chain`.
+
+Library callers may use the existing camel-case option names (`hostRuntime`,
+`workerEngine`, `workerMode`, `sidecarDeclared`); JSON/wire callers may use
+the equivalent snake-case keys. The CLI accepts `--host-runtime`,
+`--worker-engine`, `--worker-mode`, and the boolean `--sidecar-declared`.
+
+```text
+node scripts/forge-dispatch-resolve.js --json --unit-type execute-task \
+  --host-runtime codex --worker-engine codex --worker-mode sidecar \
+  --sidecar-declared --cwd "$WORKING_DIR"
+```
+
+The following fields are additive and appear after the established resolver
+fields. The ordered legacy prefix remains `engine, model, alias, tier, domain,
+route_source, chain, chain_len, reason, effort, effort_reason`.
+
+| Field | Meaning |
+|-------|---------|
+| `runtime_protocol_version` | Version emitted by the canonical runtime contract. |
+| `host_runtime` | The current Forge host: `claude` or `codex`; omitted input defaults to `claude`. |
+| `worker_engine` / `worker_mode` | Requested neutral worker target and delivery mode. Omitted values remain `native` / `native`. |
+| `resolved_worker_engine` | Actual target after resolving `worker_engine:native` solely from `host_runtime`. |
+| `sidecar_declared` | Explicit caller assertion needed for any sidecar combination. It is not a permission grant. |
+| `worker_reason_code` | Stable success or refusal reason from `forge-runtime.js`. |
+| `dispatch_allowed` / `dispatch_reason_code` | Pre-dispatch gate. `false` means do not launch a worker and report the stable reason. |
+
+`native` has no cross-provider fallback: on `{host_runtime:"codex",
+worker_engine:"native"}` the `resolved_worker_engine` is `codex`, even if the
+routed model is Claude. Conversely, a `gpt-*` model does not change the host.
+The model-routing fields continue to describe their legacy concerns:
+`engine` remains a model family, `dispatch_engine` remains the sidecar branch
+trigger, and `chain`/`route_source` retain their existing meanings. No runtime
+field removes, renames, or reinterprets any of them.
+
+Before dispatch, consumers must gate on `dispatch_allowed` in addition to
+their existing preferences/error gate. A refused runtime contract never
+silently selects Claude (or another host). In particular,
+`host_runtime:codex + worker_engine:codex + worker_mode:sidecar` without the
+explicit declaration returns `dispatch_allowed:false` and
+`dispatch_reason_code:"implicit-recursion-refused"`. Supplying
+`sidecar_declared:true` makes the same-host sidecar combination representable;
+an adapter/security layer may still deny it. An undeclared cross-host sidecar
+returns `sidecar-declaration-required` instead.
+
+For a legacy caller that supplies none of these inputs, the additive values
+are `host_runtime:"claude"`, `worker_engine:"native"`,
+`worker_mode:"native"`, and `resolved_worker_engine:"claude"`. Routing,
+`engine`, `dispatch_engine`, and all existing consumers therefore retain the
+Claude-first behavior observed in 3.1.4.
+
 #### When to apply
 
 Engine Routing runs at the **top** of the Step 4 dispatch for a worker, **before** Tier Resolution (and therefore before Effort Resolution, which depends on `$MODEL_ID`). The ordering is deliberate: when `dispatch_engine == codex` the Claude Tier/Effort Resolution is **skipped entirely** (Codex resolves its own model), and only runs on the Claude path — including the fallback path, where the fallback re-enters Tier/Effort Resolution as a normal Claude dispatch.

@@ -23,6 +23,7 @@ const { resolveRoute } = require('./forge-routing.js');
 const { modelToAlias, modelFamily } = require('./forge-model-alias.js');
 const { readPrefsCached } = require('./forge-prefs.js');
 const { readTierChain } = require('./forge-tier-chain.js');
+const { resolveWorker, RuntimeContractError } = require('./forge-runtime.js');
 
 const TIER_DEFAULTS = {
   'memory-extract': 'light',
@@ -170,6 +171,56 @@ function sidecarModelFor(dispatchEngine, chain, codexModel) {
   return codexModel || '';
 }
 
+// The dispatch resolver retains its legacy model/routing contract, but also
+// projects the host/worker axes introduced by forge-runtime.  Accept both the
+// library's camelCase convention and the wire-format snake_case names: this
+// keeps direct JSON callers from needing a second adapter.
+function runtimeInputValue(opts, camel, snake) {
+  if (Object.prototype.hasOwnProperty.call(opts, camel)) return opts[camel];
+  return opts[snake];
+}
+
+function runtimeFields(opts) {
+  const o = opts || {};
+  const input = {
+    host_runtime: runtimeInputValue(o, 'hostRuntime', 'host_runtime'),
+    worker_engine: runtimeInputValue(o, 'workerEngine', 'worker_engine'),
+    worker_mode: runtimeInputValue(o, 'workerMode', 'worker_mode'),
+    sidecar_declared: runtimeInputValue(o, 'sidecarDeclared', 'sidecar_declared'),
+    sidecar: o.sidecar,
+  };
+  try {
+    const worker = resolveWorker(input);
+    return {
+      runtime_protocol_version: worker.protocol_version,
+      host_runtime: worker.host_runtime,
+      worker_engine: worker.worker_engine,
+      worker_mode: worker.worker_mode,
+      resolved_worker_engine: worker.resolved_engine,
+      sidecar_declared: worker.sidecar_declared,
+      worker_reason_code: worker.reason_code,
+      dispatch_allowed: true,
+      dispatch_reason_code: '',
+    };
+  } catch (error) {
+    // Invalid runtime input must be visible to the caller as a deterministic
+    // pre-dispatch refusal. Do not turn it into a Claude fallback: that would
+    // violate the native-host and recursion guarantees of the core contract.
+    const code = error instanceof RuntimeContractError || error.code ? error.code : 'invalid-runtime-contract';
+    return {
+      runtime_protocol_version: '',
+      host_runtime: text(input.host_runtime).toLowerCase(),
+      worker_engine: text(input.worker_engine).toLowerCase(),
+      worker_mode: text(input.worker_mode).toLowerCase(),
+      resolved_worker_engine: '',
+      sidecar_declared: input.sidecar === true || input.sidecar_declared === true,
+      worker_reason_code: code,
+      dispatch_allowed: false,
+      dispatch_reason_code: code,
+    };
+  }
+}
+
 function resolveDispatch(opts) {
   const o = opts || {};
   const unitType = text(o.unitType);
@@ -261,6 +312,9 @@ function resolveDispatch(opts) {
   // this orchestration layer aligned with alias/routing model semantics.
   const family = modelFamily(model);
   if (family === null && route.source === 'routing' && !chain[0]) engine = 'claude';
+  // Resolve this after routing/model-family work. The result is deliberately
+  // additive: legacy engine/dispatch_engine/chain retain their 3.1.4 meaning.
+  const runtime = runtimeFields(o);
   return {
     engine,
     model,
@@ -297,11 +351,12 @@ function resolveDispatch(opts) {
     // prefs_ok; the CLI turns prefs_ok:false into a non-zero exit.
     prefs_ok: prefsResult ? prefsResult.ok !== false : true,
     prefs_errors: (prefsResult && prefsResult.errors) || [],
+    ...runtime,
   };
 }
 
 function parseArgs(args) {
-  const parsed = { unitType: '', planPath: null, unitId: '', milestoneId: '', roadmapPath: null, domain: '', cwd: process.cwd(), asJson: false, effortMap: {} };
+  const parsed = { unitType: '', planPath: null, unitId: '', milestoneId: '', roadmapPath: null, domain: '', cwd: process.cwd(), asJson: false, effortMap: {}, hostRuntime: undefined, workerEngine: undefined, workerMode: undefined, sidecarDeclared: undefined };
   for (let i = 0; i < args.length; i += 1) {
     const flag = args[i];
     const value = args[i + 1];
@@ -312,6 +367,10 @@ function parseArgs(args) {
     else if (flag === '--roadmap' && value !== undefined) { parsed.roadmapPath = value; i += 1; }
     else if (flag === '--domain' && value !== undefined) { parsed.domain = value; i += 1; }
     else if (flag === '--cwd' && value !== undefined) { parsed.cwd = value; i += 1; }
+    else if (flag === '--host-runtime' && value !== undefined) { parsed.hostRuntime = value; i += 1; }
+    else if (flag === '--worker-engine' && value !== undefined) { parsed.workerEngine = value; i += 1; }
+    else if (flag === '--worker-mode' && value !== undefined) { parsed.workerMode = value; i += 1; }
+    else if (flag === '--sidecar-declared') parsed.sidecarDeclared = true;
     else if (flag === '--json') parsed.asJson = true;
     else if (flag.startsWith('--effort-') && value !== undefined) { parsed.effortMap[flag.slice('--effort-'.length)] = value; i += 1; }
   }
@@ -338,6 +397,7 @@ function degradedContract(args) {
   } catch { /* minimal ordered contract below */ }
   const model = chain[0] ? chain[0].id : '';
   const alias = modelToAlias(model).alias;
+  const runtime = runtimeFields(parsed);
   return {
     engine: 'claude', model, alias, tier, domain: 'default', route_source: 'tier_models',
     chain, chain_len: chain.length, reason: 'routing-runtime-error; tier_models',
@@ -351,10 +411,11 @@ function degradedContract(args) {
     dispatch_engine: dispatchEngineFor('claude'),
     sidecar_model: sidecarModelFor(dispatchEngineFor('claude'), chain, ''),
     prefs_ok: true, prefs_errors: [],
+    ...runtime,
   };
 }
 
-module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, thinkingHeaderFor, TIER_DEFAULTS, EFFORT_DEFAULTS };
+module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, thinkingHeaderFor, runtimeFields, TIER_DEFAULTS, EFFORT_DEFAULTS };
 
 if (require.main === module) {
   // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a
