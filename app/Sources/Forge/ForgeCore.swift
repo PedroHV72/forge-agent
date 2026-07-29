@@ -89,6 +89,45 @@ enum ForgeCore {
         }
     }
 
+    /// Run an engine with something on stdin. forge-secrets takes the secret
+    /// that way precisely so it never appears in argv.
+    @discardableResult
+    static func runWithInput(_ engineName: String, _ args: [String],
+                             input: String, cwd: String? = nil) -> Result {
+        guard let enginePath = engine(engineName) else {
+            return Result(ok: false, stdout: "", stderr: "\(engineName) não encontrado")
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: nodePath)
+        var argv: [String] = []
+        if nodePath.hasSuffix("/env") { argv.append("node") }
+        argv.append(enginePath)
+        argv += args
+        proc.arguments = argv
+        if let cwd { proc.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+
+        let stdin = Pipe(), out = Pipe(), err = Pipe()
+        proc.standardInput = stdin
+        proc.standardOutput = out
+        proc.standardError = err
+
+        do {
+            try proc.run()
+            stdin.fileHandleForWriting.write(Data(input.utf8))
+            stdin.fileHandleForWriting.closeFile()
+            let o = out.fileHandleForReading.readDataToEndOfFile()
+            let e = err.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return Result(
+                ok: proc.terminationStatus == 0,
+                stdout: String(data: o, encoding: .utf8) ?? "",
+                stderr: (String(data: e, encoding: .utf8) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines))
+        } catch {
+            return Result(ok: false, stdout: "", stderr: error.localizedDescription)
+        }
+    }
+
     /// Decode an engine's `--json` output.
     static func runJSON<T: Decodable>(_ type: T.Type, _ engineName: String,
                                       _ args: [String], cwd: String? = nil) -> T? {
