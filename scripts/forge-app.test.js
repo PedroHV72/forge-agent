@@ -7,6 +7,19 @@
 //
 // The Swift side uses the same harness shape as the JS suites (asserts, exit
 // 0/1) because XCTest ships with full Xcode, not with the Command Line Tools.
+//
+// NOT RUN ON CI, DELIBERATELY
+// ---------------------------
+// `swift run` resolves and compiles the whole package, and the app depends on
+// SwiftTerm — a VT emulator that takes many minutes to build from cold. On a
+// hosted macOS runner with no SPM cache that turned a one-minute CI job into a
+// ten-minute-plus one, on every pull request, to exercise code that only ships
+// to macOS users who build the app themselves.
+//
+// The trade is explicit: these tests run locally, before every commit that
+// touches app/, which is where they have actually caught things — a shadowed
+// ProjectDiscovery, a bar scaled against the wrong denominator, a status model
+// silently decoding to nil. Set FORGE_RUN_APP_TESTS=1 to force them anywhere.
 
 'use strict';
 
@@ -30,9 +43,14 @@ if (!fs.existsSync(path.join(appDir, 'Package.swift'))) skip('app/Package.swift 
 const which = spawnSync('which', ['swift'], { encoding: 'utf8' });
 if (which.status !== 0) skip('swift não encontrado (instale as Command Line Tools)');
 
-// FORGE_SKIP_APP_TESTS=1 keeps a fast local loop available: the first build
-// resolves SwiftTerm from the network and takes minutes.
 if (process.env.FORGE_SKIP_APP_TESTS === '1') skip('FORGE_SKIP_APP_TESTS=1');
+
+// Opt out on CI unless explicitly asked for. See the header: building SwiftTerm
+// from cold dominates the job.
+const onCI = process.env.CI === 'true' || !!process.env.GITHUB_ACTIONS;
+if (onCI && process.env.FORGE_RUN_APP_TESTS !== '1') {
+  skip('CI — compilar o app domina o job (FORGE_RUN_APP_TESTS=1 força)');
+}
 
 console.log('\n=== forge app (Swift) ===\n');
 
