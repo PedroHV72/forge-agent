@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// forge-creds — credential vault for external CLIs (railway, vercel, fly, ...).
+// forge-secrets — credential vault for external CLIs (railway, vercel, fly, ...).
 //
 // WHY THIS EXISTS
 // ---------------
@@ -38,11 +38,11 @@
 //   envVarFor(service)            → conventional variable name
 //
 // CLI:
-//   node forge-creds.js --add <service> <name> [--env VAR] [--note "..."]   (secret on stdin)
-//   node forge-creds.js --list [--json]
-//   node forge-creds.js --exec <service> <name> -- <command> [args...]
-//   node forge-creds.js --remove <service> <name>
-//   node forge-creds.js --services
+//   node forge-secrets.js --add <service> <name> [--env VAR] [--note "..."]   (secret on stdin)
+//   node forge-secrets.js --list [--json]
+//   node forge-secrets.js --exec <service> <name> -- <command> [args...]
+//   node forge-secrets.js --remove <service> <name>
+//   node forge-secrets.js --services
 
 'use strict';
 
@@ -53,11 +53,11 @@ const { execFileSync, spawnSync } = require('child_process');
 
 const IS_DARWIN = process.platform === 'darwin';
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
-const REGISTRY_FILE = process.env.FORGE_CREDS_REGISTRY
-  || path.join(CLAUDE_DIR, 'forge-credentials.json');
-const FALLBACK_FILE = process.env.FORGE_CREDS_REGISTRY
-  ? `${process.env.FORGE_CREDS_REGISTRY}.secrets`
-  : path.join(CLAUDE_DIR, 'forge-credentials-secrets.json');
+const REGISTRY_FILE = process.env.FORGE_SECRETS_REGISTRY
+  || path.join(CLAUDE_DIR, 'forge-secrets.json');
+const FALLBACK_FILE = process.env.FORGE_SECRETS_REGISTRY
+  ? `${process.env.FORGE_SECRETS_REGISTRY}.secrets`
+  : path.join(CLAUDE_DIR, 'forge-secrets-store.json');
 const KEYCHAIN_ACCT = os.userInfo().username;
 
 // ── Known services ───────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ function save(credentials) {
 }
 
 function keychainService(service, name) {
-  return `forge-cred-${service}-${name}`;
+  return `forge-secret-${service}-${name}`;
 }
 
 // ── Secret storage ───────────────────────────────────────────────────────────
@@ -220,6 +220,42 @@ function find(service, name) {
   return load().find(c => c.service === service && c.name === name) || null;
 }
 
+function forService(service) {
+  service = String(service || '').toLowerCase();
+  return load().filter(c => c.service === service);
+}
+
+/// Mark one entry as the service default, so `exec railway -- ...` works
+/// without naming it. Exactly one default per service.
+function setDefault(service, name) {
+  service = String(service || '').toLowerCase();
+  const all = load();
+  if (!all.some(c => c.service === service && c.name === name)) return false;
+  save(all.map(c => c.service === service ? { ...c, is_default: c.name === name } : c));
+  return true;
+}
+
+/// Resolve which entry a command means.
+///
+/// Ambiguity is an ERROR, never a guess: picking the first of three Railway
+/// projects would deploy to the wrong one and look like it worked. The caller
+/// gets the candidates so it can say what to choose between.
+function resolve(service, name) {
+  service = String(service || '').toLowerCase();
+  const candidates = forService(service);
+  if (!candidates.length) return { error: 'none', candidates: [] };
+
+  if (name) {
+    const exact = candidates.find(c => c.name === name);
+    return exact ? { entry: exact } : { error: 'not-found', candidates };
+  }
+  if (candidates.length === 1) return { entry: candidates[0] };
+
+  const marked = candidates.find(c => c.is_default);
+  if (marked) return { entry: marked };
+  return { error: 'ambiguous', candidates };
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 function readStdin() {
   try { return fs.readFileSync(0, 'utf8').replace(/\r?\n$/, ''); }
@@ -228,18 +264,21 @@ function readStdin() {
 
 function usage() {
   return [
-    'forge-creds — cofre de credenciais para CLIs externos',
+    'forge-secrets — cofre de segredos do Forge',
     '',
     'Uso:',
     '  --add <serviço> <nome> [--env VAR] [--note "..."]   segredo vem do stdin',
-    '  --list [--json]',
-    '  --exec <serviço> <nome> -- <comando> [args...]',
+    '  --list [serviço] [--json]',
+    '  --exec <serviço> [nome] -- <comando> [args...]',
+    '  --default <serviço> <nome>                          padrão do serviço',
     '  --remove <serviço> <nome>',
     '  --services                                          serviços conhecidos',
     '',
-    'Exemplos:',
-    '  printf %s "$TOKEN" | forge-creds add railway producao',
-    '  forge-creds exec railway producao -- railway status',
+    'Vários do mesmo serviço convivem — o nome é seu:',
+    '  printf %s "$TOKEN" | forge-secrets add railway lookchina',
+    '  printf %s "$TOKEN" | forge-secrets add railway feirao',
+    '  forge-secrets exec railway lookchina -- railway up',
+    '  forge-secrets default railway lookchina    # aí "exec railway --" já resolve',
     '',
     'O segredo nunca é impresso: use --exec para rodar comandos com ele.',
   ].join('\n');
@@ -264,13 +303,13 @@ function main(argv) {
   if (iAdd >= 0) {
     const service = argv[iAdd + 1];
     const name = argv[iAdd + 2];
-    if (!service || !name) { console.error('forge-creds: --add requer <serviço> <nome>'); return 2; }
+    if (!service || !name) { console.error('forge-secrets: --add requer <serviço> <nome>'); return 2; }
     const iEnv = flag('--env');
     const iNote = flag('--note');
     const secret = readStdin();
     if (!secret) {
-      console.error('forge-creds: nenhum segredo no stdin.');
-      console.error('  ex: printf %s "$TOKEN" | forge-creds add railway producao');
+      console.error('forge-secrets: nenhum segredo no stdin.');
+      console.error('  ex: printf %s "$TOKEN" | forge-secrets add railway producao');
       return 2;
     }
     try {
@@ -282,21 +321,48 @@ function main(argv) {
       const entry = find(r.service, r.name);
       console.log(`✓ ${r.service}/${r.name} guardado (${r.store}) → ${entry.env_var}`);
       return 0;
-    } catch (e) { console.error(`forge-creds: ${e.message}`); return 1; }
+    } catch (e) { console.error(`forge-secrets: ${e.message}`); return 1; }
   }
 
-  if (argv.includes('--list')) {
-    const rows = list();
+  const iList = flag('--list');
+  if (iList >= 0) {
+    const filter = argv[iList + 1] && !argv[iList + 1].startsWith('--')
+      ? argv[iList + 1].toLowerCase() : null;
+    let rows = list();
+    if (filter) rows = rows.filter(c => c.service === filter);
     if (json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
-    if (!rows.length) { console.log('Nenhuma credencial guardada.'); return 0; }
-    for (const c of rows) {
-      const mark = c.has_secret ? '●' : '○';
-      console.log(`  ${mark} ${c.service}/${c.name}`.padEnd(34)
-        + `${c.env_var.padEnd(24)} ${c.note || ''}`);
+    if (!rows.length) {
+      console.log(filter ? `Nenhum segredo de ${filter}.` : 'Nenhum segredo guardado.');
+      return 0;
     }
+    // Grouped by service: with several entries per service a flat list stops
+    // answering "which ones do I have for railway".
+    const services = [...new Set(rows.map(c => c.service))].sort();
+    for (const svc of services) {
+      const group = rows.filter(c => c.service === svc);
+      const known = SERVICES[svc];
+      console.log(`\n  ${svc}${known ? `  (${known.env})` : ''}`);
+      for (const c of group) {
+        const mark = c.has_secret ? '●' : '○';
+        const def = c.is_default ? ' ★' : '  ';
+        console.log(`    ${mark}${def} ${c.name.padEnd(18)} ${c.note || ''}`);
+      }
+    }
+    console.log('');
+    if (rows.some(c => c.is_default)) console.log('  ★ = padrão do serviço');
     if (rows.some(c => !c.has_secret)) {
-      console.log('\n  ○ = registrada sem segredo no Keychain — readicione.');
+      console.log('  ○ = registrado sem segredo no cofre — readicione.');
     }
+    return 0;
+  }
+
+  const iDefault = flag('--default');
+  if (iDefault >= 0) {
+    const svc = argv[iDefault + 1];
+    const nm = argv[iDefault + 2];
+    if (!svc || !nm) { console.error('forge-secrets: --default requer <serviço> <nome>'); return 2; }
+    if (!setDefault(svc, nm)) { console.error(`forge-secrets: ${svc}/${nm} não existe`); return 1; }
+    console.log(`✓ ${svc}/${nm} agora é o padrão de ${svc}`);
     return 0;
   }
 
@@ -310,17 +376,40 @@ function main(argv) {
   const iExec = flag('--exec');
   if (iExec >= 0) {
     const service = argv[iExec + 1];
-    const name = argv[iExec + 2];
-    const sep = argv.indexOf('--', iExec + 3);
-    if (!service || !name || sep < 0 || !argv[sep + 1]) {
-      console.error('forge-creds: --exec <serviço> <nome> -- <comando> [args...]');
+    const sep = argv.indexOf('--', iExec + 1);
+    if (!service || sep < 0 || !argv[sep + 1]) {
+      console.error('forge-secrets: --exec <serviço> [nome] -- <comando> [args...]');
       return 2;
     }
-    const entry = find(service, name);
-    if (!entry) { console.error(`forge-creds: ${service}/${name} não está registrada`); return 1; }
-    const secret = get(service, name);
+    // The name is optional: everything between the service and `--` that is not
+    // the separator itself.
+    const name = sep > iExec + 2 ? argv[iExec + 2] : null;
+
+    const target = resolve(service, name);
+    if (target.error === 'none') {
+      console.error(`forge-secrets: nenhum segredo de ${service} guardado`);
+      console.error(`  ex: printf %s "$TOKEN" | forge-secrets add ${service} <nome>`);
+      return 1;
+    }
+    if (target.error === 'not-found') {
+      console.error(`forge-secrets: ${service}/${name} não existe. Disponíveis:`);
+      for (const c of target.candidates) console.error(`  ${service}/${c.name}`);
+      return 1;
+    }
+    if (target.error === 'ambiguous') {
+      // Guessing here would deploy to the wrong project and look like success.
+      console.error(`forge-secrets: ${service} tem ${target.candidates.length} segredos — diga qual:`);
+      for (const c of target.candidates) {
+        console.error(`  forge-secrets exec ${service} ${c.name} -- ...` +
+          (c.note ? `   (${c.note})` : ''));
+      }
+      console.error(`\n  ou defina um padrão: forge-secrets default ${service} <nome>`);
+      return 2;
+    }
+    const entry = target.entry;
+    const secret = get(entry.service, entry.name);
     if (!secret) {
-      console.error(`forge-creds: segredo de ${service}/${name} não encontrado — readicione`);
+      console.error(`forge-secrets: segredo de ${entry.service}/${entry.name} não encontrado — readicione`);
       return 1;
     }
     const cmd = argv[sep + 1];
@@ -331,7 +420,7 @@ function main(argv) {
       stdio: 'inherit',
       env: { ...process.env, [entry.env_var]: secret },
     });
-    if (r.error) { console.error(`forge-creds: ${r.error.message}`); return 127; }
+    if (r.error) { console.error(`forge-secrets: ${r.error.message}`); return 127; }
     return r.status === null ? 1 : r.status;
   }
 
@@ -341,10 +430,11 @@ function main(argv) {
 
 module.exports = {
   REGISTRY_FILE, SERVICES,
-  load, save, add, remove, get, list, find, envVarFor, keychainService,
+  load, save, add, remove, get, list, find, forService, setDefault, resolve,
+  envVarFor, keychainService,
 };
 
 if (require.main === module) {
   try { process.exit(main(process.argv.slice(2))); }
-  catch (e) { console.error(`forge-creds: ${e.message}`); process.exit(1); }
+  catch (e) { console.error(`forge-secrets: ${e.message}`); process.exit(1); }
 }

@@ -1,0 +1,279 @@
+#!/usr/bin/env node
+// forge-secrets.test.js — contract tests for the credential vault.
+//
+// The properties worth guarding are all about the secret NOT leaking: it must
+// never reach the registry file, never reach stdout, and reach only the child
+// process that needs it.
+//
+// Run: node scripts/forge-secrets.test.js
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const ENGINE = path.join(__dirname, 'forge-secrets.js');
+
+// Isolate the registry; the Keychain is shared, so tests use a unique service
+// prefix and clean up after themselves.
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-secrets-'));
+const REGISTRY = path.join(TMP, 'registry.json');
+const SERVICE = `test${Date.now()}`;
+process.env.FORGE_SECRETS_REGISTRY = REGISTRY;
+
+const secrets = require('./forge-secrets.js');
+
+let passed = 0, failed = 0;
+const failures = [];
+
+function test(name, fn) {
+  try { fn(); passed++; console.log(`  ✓ ${name}`); }
+  catch (e) {
+    failed++; failures.push({ name, error: e.message });
+    console.log(`  ✗ ${name}\n      ${e.message}`);
+  }
+}
+function assert(c, m) { if (!c) throw new Error(m || 'assertion failed'); }
+function assertEq(a, b, m) {
+  if (JSON.stringify(a) !== JSON.stringify(b)) {
+    throw new Error(`${m || 'mismatch'}\n     esperado: ${JSON.stringify(b)}\n     obtido:   ${JSON.stringify(a)}`);
+  }
+}
+function cli(args, input) {
+  return spawnSync(process.execPath, [ENGINE, ...args], {
+    encoding: 'utf8',
+    input: input === undefined ? '' : input,
+    env: { ...process.env, FORGE_SECRETS_REGISTRY: REGISTRY },
+  });
+}
+
+console.log('\n=== forge-secrets.js — contract test suite ===\n');
+
+console.log('mapeamento de env var');
+
+test('serviços conhecidos usam a variável que o CLI realmente lê', () => {
+  // Getting this wrong runs the command unauthenticated, which fails in a way
+  // that looks like a bad token.
+  assertEq(secrets.envVarFor('railway'), 'RAILWAY_TOKEN');
+  assertEq(secrets.envVarFor('vercel'), 'VERCEL_TOKEN');
+  assertEq(secrets.envVarFor('fly'), 'FLY_API_TOKEN');
+  assertEq(secrets.envVarFor('cloudflare'), 'CLOUDFLARE_API_TOKEN');
+});
+
+test('serviço desconhecido cai na convenção SERVICE_TOKEN', () => {
+  assertEq(secrets.envVarFor('meuservico'), 'MEUSERVICO_TOKEN');
+  assertEq(secrets.envVarFor('my-thing'), 'MY_THING_TOKEN');
+});
+
+console.log('\nregistro e segredo');
+
+test('o segredo NUNCA entra no arquivo de registro', () => {
+  const secret = 'sk-super-secreto-12345';
+  secrets.add({ service: SERVICE, name: 'a', secret });
+  const raw = fs.readFileSync(REGISTRY, 'utf8');
+  assert(!raw.includes(secret), 'segredo vazou para o registro!');
+  assert(raw.includes(SERVICE), 'o registro deve conter o serviço');
+});
+
+test('o segredo volta pelo cofre', () => {
+  assertEq(secrets.get(SERVICE, 'a'), 'sk-super-secreto-12345');
+});
+
+test('list() não expõe segredo, só se existe', () => {
+  const rows = secrets.list().filter(c => c.service === SERVICE);
+  assertEq(rows.length, 1);
+  assertEq(rows[0].has_secret, true);
+  assert(!('secret' in rows[0]), 'list() não pode carregar o segredo');
+  assert(!JSON.stringify(rows).includes('sk-super-secreto'), 'segredo em list()');
+});
+
+test('readicionar substitui em vez de duplicar', () => {
+  secrets.add({ service: SERVICE, name: 'a', secret: 'novo-valor' });
+  const rows = secrets.load().filter(c => c.service === SERVICE && c.name === 'a');
+  assertEq(rows.length, 1, 'não pode duplicar a entrada');
+  assertEq(secrets.get(SERVICE, 'a'), 'novo-valor');
+});
+
+test('--env sobrepõe a convenção', () => {
+  secrets.add({ service: SERVICE, name: 'custom', secret: 'x', envVar: 'MINHA_VAR' });
+  assertEq(secrets.find(SERVICE, 'custom').env_var, 'MINHA_VAR');
+});
+
+console.log('\nexec');
+
+test('exec injeta a variável no filho e nada mais', () => {
+  secrets.add({ service: SERVICE, name: 'exec1', secret: 'valor-do-exec' });
+  const r = cli(['--exec', SERVICE, 'exec1', '--',
+    process.execPath, '-e', 'console.log(process.env.' + secrets.envVarFor(SERVICE) + ')']);
+  assertEq(r.status, 0, `exit ${r.status}: ${r.stderr}`);
+  assertEq(r.stdout.trim(), 'valor-do-exec');
+});
+
+test('exec não vaza o segredo para o próprio ambiente', () => {
+  const varName = secrets.envVarFor(SERVICE);
+  assert(!process.env[varName], 'a variável não pode existir no processo pai');
+});
+
+test('exec propaga o código de saída do comando', () => {
+  const r = cli(['--exec', SERVICE, 'exec1', '--', process.execPath, '-e', 'process.exit(3)']);
+  assertEq(r.status, 3, 'o exit code do filho tem que chegar ao chamador');
+});
+
+test('exec de nome inexistente falha listando o que existe', () => {
+  // Naming the alternatives is the difference between a dead end and a fix.
+  const r = cli(['--exec', SERVICE, 'nao-existe', '--', 'echo', 'oi']);
+  assertEq(r.status, 1);
+  assert(/não existe/.test(r.stderr), r.stderr);
+  assert(r.stderr.includes(`${SERVICE}/a`), 'deve listar as alternativas');
+});
+
+test('exec sem -- é erro de uso, não execução às cegas', () => {
+  const r = cli(['--exec', SERVICE, 'exec1']);
+  assertEq(r.status, 2);
+});
+
+console.log('\nsuperfície da CLI');
+
+test('não existe comando que imprima o segredo', () => {
+  // An agent that can print a secret will eventually print it into a
+  // transcript, so the surface simply does not include one.
+  const help = cli(['--help']).stdout;
+  assert(!/--print|--token|--reveal|--show/.test(help), `help oferece impressão:\n${help}`);
+  for (const flag of ['--print', '--token', '--reveal']) {
+    const r = cli([flag, SERVICE, 'a']);
+    assert(!r.stdout.includes('novo-valor'), `${flag} imprimiu o segredo`);
+  }
+});
+
+test('--list --json não carrega segredo', () => {
+  const r = cli(['--list', '--json']);
+  assertEq(r.status, 0);
+  assert(!r.stdout.includes('novo-valor'), 'segredo no --list --json');
+  const rows = JSON.parse(r.stdout);
+  assert(Array.isArray(rows));
+});
+
+test('--add sem stdin recusa em vez de guardar vazio', () => {
+  const r = cli(['--add', SERVICE, 'vazio'], '');
+  assertEq(r.status, 2);
+  assert(/stdin/.test(r.stderr), r.stderr);
+});
+
+test('--add lê o segredo do stdin', () => {
+  const r = cli(['--add', SERVICE, 'viacli'], 'segredo-do-stdin');
+  assertEq(r.status, 0, r.stderr);
+  assertEq(secrets.get(SERVICE, 'viacli'), 'segredo-do-stdin');
+  assert(!r.stdout.includes('segredo-do-stdin'), 'a confirmação não pode ecoar o segredo');
+});
+
+test('--services lista o mapeamento', () => {
+  const r = cli(['--services', '--json']);
+  assertEq(r.status, 0);
+  const rows = JSON.parse(r.stdout);
+  assert(rows.some(s => s.service === 'railway' && s.env === 'RAILWAY_TOKEN'));
+});
+
+console.log('\nvários do mesmo serviço');
+
+test('vários nomes do mesmo serviço convivem, cada um com seu segredo', () => {
+  secrets.add({ service: SERVICE, name: 'ambiente-a', secret: 'token-A' });
+  secrets.add({ service: SERVICE, name: 'ambiente-b', secret: 'token-B' });
+  secrets.add({ service: SERVICE, name: 'ambiente-c', secret: 'token-C' });
+  assertEq(secrets.get(SERVICE, 'ambiente-a'), 'token-A');
+  assertEq(secrets.get(SERVICE, 'ambiente-b'), 'token-B');
+  assertEq(secrets.get(SERVICE, 'ambiente-c'), 'token-C');
+  assertEq(secrets.forService(SERVICE).length >= 3, true);
+});
+
+test('ambiguidade é ERRO, nunca um chute', () => {
+  // Picking the first of three projects would deploy to the wrong one and look
+  // exactly like success.
+  const r = secrets.resolve(SERVICE, null);
+  assertEq(r.error, 'ambiguous');
+  assert(r.candidates.length >= 3, 'o chamador precisa das opções para poder perguntar');
+  assert(!r.entry, 'não pode resolver nada em caso de ambiguidade');
+});
+
+test('nome explícito resolve mesmo havendo vários', () => {
+  assertEq(secrets.resolve(SERVICE, 'ambiente-b').entry.name, 'ambiente-b');
+});
+
+test('padrão do serviço resolve quando o nome é omitido', () => {
+  assertEq(secrets.setDefault(SERVICE, 'ambiente-b'), true);
+  assertEq(secrets.resolve(SERVICE, null).entry.name, 'ambiente-b');
+});
+
+test('só existe um padrão por serviço', () => {
+  secrets.setDefault(SERVICE, 'ambiente-c');
+  const marked = secrets.forService(SERVICE).filter(c => c.is_default);
+  assertEq(marked.length, 1, 'definir um padrão tem que limpar o anterior');
+  assertEq(marked[0].name, 'ambiente-c');
+});
+
+test('padrão em serviço inexistente não inventa entrada', () => {
+  assertEq(secrets.setDefault(SERVICE, 'nao-existe'), false);
+  assertEq(secrets.find(SERVICE, 'nao-existe'), null);
+});
+
+test('serviço único dispensa nome e dispensa padrão', () => {
+  const solo = SERVICE + 'solo';
+  secrets.add({ service: solo, name: 'unico', secret: 's' });
+  assertEq(secrets.resolve(solo, null).entry.name, 'unico');
+  secrets.remove(solo, 'unico');
+});
+
+test('exec sem nome usa o padrão', () => {
+  const r = cli(['--exec', SERVICE, '--',
+    process.execPath, '-e', 'console.log(process.env.' + secrets.envVarFor(SERVICE) + ')']);
+  assertEq(r.status, 0, r.stderr);
+  assertEq(r.stdout.trim(), 'token-C', 'deve usar o padrão marcado');
+});
+
+test('exec ambíguo sai com 2 e lista as opções', () => {
+  const other = SERVICE + 'amb';
+  secrets.add({ service: other, name: 'x', secret: '1' });
+  secrets.add({ service: other, name: 'y', secret: '2' });
+  const r = cli(['--exec', other, '--', 'echo', 'oi']);
+  assertEq(r.status, 2, 'ambiguidade é erro de uso, não execução');
+  assert(/diga qual/.test(r.stderr), r.stderr);
+  assert(r.stderr.includes('/x') || r.stderr.includes(' x '), 'deve listar os candidatos');
+  secrets.remove(other, 'x'); secrets.remove(other, 'y');
+});
+
+test('--list filtra por serviço', () => {
+  const r = cli(['--list', SERVICE, '--json']);
+  assertEq(r.status, 0);
+  const rows = JSON.parse(r.stdout);
+  assert(rows.length >= 3);
+  assert(rows.every(c => c.service === SERVICE), 'filtro deixou passar outro serviço');
+});
+
+console.log('\nremoção');
+
+test('remove apaga registro e segredo', () => {
+  secrets.add({ service: SERVICE, name: 'temp', secret: 'apagar' });
+  assertEq(secrets.remove(SERVICE, 'temp'), true);
+  assertEq(secrets.find(SERVICE, 'temp'), null);
+  assertEq(secrets.get(SERVICE, 'temp'), null, 'o segredo tem que sumir do cofre');
+});
+
+test('remover o que não existe devolve false', () => {
+  assertEq(secrets.remove(SERVICE, 'fantasma'), false);
+});
+
+// ── Cleanup ─────────────────────────────────────────────────────────────────
+for (const c of secrets.load()) {
+  if (c.service === SERVICE) secrets.remove(c.service, c.name);
+}
+try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
+
+console.log(`\n${'─'.repeat(60)}`);
+console.log(`  ${passed} passed, ${failed} failed`);
+if (failed) {
+  console.log('\nFalhas:');
+  for (const f of failures) console.log(`  ✗ ${f.name}\n      ${f.error}`);
+}
+console.log('');
+process.exit(failed ? 1 : 0);
