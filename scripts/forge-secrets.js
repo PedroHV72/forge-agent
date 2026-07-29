@@ -34,6 +34,8 @@
 //   registryPath(), load(), save(list)
 //   add({service,name,secret,envVar,note}) / remove(service,name)
 //   get(service, name)            → secret | null   (for --exec only)
+//   probeSecret(service, name)    → {state, value}  present | absent | unknown
+//   secretState(service, name)    → 'present' | 'absent' | 'unknown'
 //   list()                        → entries without secrets
 //   envVarFor(service)            → conventional variable name
 //
@@ -143,25 +145,88 @@ function storeSecret(service, name, secret) {
   return 'file';
 }
 
-function get(service, name) {
+// ── Reading: three states, never two ─────────────────────────────────────────
+// "I could not read the vault" and "there is nothing in the vault" are
+// different answers, and collapsing them into a boolean is how `--list
+// --verify` came to report a healthy secret as missing and send the user to
+// re-add it. Every read below returns one of:
+//
+//   present  — we read a value
+//   absent   — we read successfully and there is nothing there
+//   unknown  — we could not tell; the value may well be present
+//
+// The rule for turning an error into a state is an ALLOWLIST, deliberately:
+// only errors we have positively identified as "no such item" may produce
+// `absent`. A blocklist ("known failures are errors, everything else is
+// absent") re-creates the same defect for every failure mode nobody thought
+// of yet — and hides it better, because it looks handled.
+
+// `security` exits 44 for an item that is not in the keychain. A timeout, by
+// contrast, arrives as {status: null, signal: 'SIGTERM', code: 'ETIMEDOUT'} —
+// which says nothing about whether the item exists.
+const KEYCHAIN_NOT_FOUND = 44;
+
+function keychainProbe(service, name) {
+  try {
+    const v = execFileSync('security', [
+      'find-generic-password',
+      '-a', KEYCHAIN_ACCT,
+      '-s', keychainService(service, name),
+      '-w',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+         timeout: KEYCHAIN_TIMEOUT_MS }).replace(/\n$/, '');
+    // An empty stored value counts as absent, so it still falls through to the
+    // file store — the behaviour the old `if (v) return v` had.
+    return v ? { state: 'present', value: v } : { state: 'absent', value: null };
+  } catch (e) {
+    if (e && e.status === KEYCHAIN_NOT_FOUND) return { state: 'absent', value: null };
+    return { state: 'unknown', value: null };
+  }
+}
+
+function fileProbe(service, name) {
+  let raw;
+  try {
+    raw = fs.readFileSync(FALLBACK_FILE, 'utf8');
+  } catch (e) {
+    // No file at all is a real answer: nothing was ever written here.
+    if (e && e.code === 'ENOENT') return { state: 'absent', value: null };
+    // EACCES and friends are not — the file may be full of secrets.
+    return { state: 'unknown', value: null };
+  }
+  let store;
+  try { store = JSON.parse(raw); }
+  catch { return { state: 'unknown', value: null }; }
+  const v = store && store[keychainService(service, name)];
+  return v ? { state: 'present', value: v } : { state: 'absent', value: null };
+}
+
+/// Compose the layers: a value found anywhere wins; otherwise any layer that
+/// could not answer makes the whole answer `unknown`. `absent` requires every
+/// layer to have said so.
+function probeSecret(service, name) {
+  let sawUnknown = false;
   if (IS_DARWIN) {
-    try {
-      const v = execFileSync('security', [
-        'find-generic-password',
-        '-a', KEYCHAIN_ACCT,
-        '-s', keychainService(service, name),
-        '-w',
-      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
-           timeout: KEYCHAIN_TIMEOUT_MS }).replace(/\n$/, '');
-      if (v) return v;
-    } catch { /* fall through to the file store */ }
+    const k = keychainProbe(service, name);
+    if (k.state === 'present') return k;
+    if (k.state === 'unknown') sawUnknown = true;
   }
   // Checked on every platform, not just non-darwin: a credential written while
   // the Keychain was unavailable lives here and must still be readable.
-  try {
-    const store = JSON.parse(fs.readFileSync(FALLBACK_FILE, 'utf8'));
-    return store[keychainService(service, name)] || null;
-  } catch { return null; }
+  const f = fileProbe(service, name);
+  if (f.state === 'present') return f;
+  if (f.state === 'unknown') sawUnknown = true;
+
+  return { state: sawUnknown ? 'unknown' : 'absent', value: null };
+}
+
+function secretState(service, name) {
+  return probeSecret(service, name).state;
+}
+
+function get(service, name) {
+  const p = probeSecret(service, name);
+  return p.state === 'present' ? p.value : null;
 }
 
 function deleteSecret(service, name) {
@@ -227,12 +292,23 @@ function remove(service, name) {
 ///
 /// Verification is still available for a health check, where one round of
 /// prompts is a reasonable price for the answer.
+///
+/// With `verify`, `has_secret` is true / false / null, and null keeps its
+/// meaning of "no claim": either nobody looked, or looking failed. A failed
+/// read must never surface as `false` — that is a statement about the vault's
+/// contents that we are in no position to make.
 function list(opts) {
   const verify = !!(opts && opts.verify);
-  return load().map(c => ({
-    ...c,
-    has_secret: verify ? !!get(c.service, c.name) : null,
-  }));
+  return load().map(c => {
+    if (!verify) return { ...c, has_secret: null };
+    const state = secretState(c.service, c.name);
+    return {
+      ...c,
+      has_secret: state === 'present' ? true : (state === 'absent' ? false : null),
+      // Additive: only present when we tried and could not tell.
+      ...(state === 'unknown' ? { verify_failed: true } : {}),
+    };
+  });
 }
 
 function find(service, name) {
@@ -363,9 +439,11 @@ function main(argv) {
       const known = SERVICES[svc];
       console.log(`\n  ${svc}${known ? `  (${known.env})` : ''}`);
       for (const c of group) {
-        // Unverified is a dot, not a cross: "we did not look" and "it is
-        // missing" are different claims and the list must not conflate them.
-        const mark = c.has_secret === null ? '·' : (c.has_secret ? '●' : '○');
+        // Four marks for four claims. "We did not look", "we looked and could
+        // not tell" and "it is missing" are three different things, and only
+        // the last one justifies telling the user to re-add anything.
+        const mark = c.verify_failed ? '⚠'
+          : (c.has_secret === null ? '·' : (c.has_secret ? '●' : '○'));
         const def = c.is_default ? ' ★' : '  ';
         console.log(`    ${mark}${def} ${c.name.padEnd(18)} ${c.note || ''}`);
       }
@@ -375,8 +453,13 @@ function main(argv) {
     if (rows.some(c => c.has_secret === false)) {
       console.log('  ○ = registrado sem valor no cofre — readicione.');
     }
-    if (rows.some(c => c.has_secret === null)) {
+    // Only offer --verify to someone who has not used it. Telling a user who
+    // just ran --verify to run --verify is how the old footer read.
+    if (rows.some(c => c.has_secret === null && !c.verify_failed)) {
       console.log('  · = valor não verificado (use --verify; abre o Keychain)');
+    }
+    if (rows.some(c => c.verify_failed)) {
+      console.log('  ⚠ = não foi possível ler o cofre — o valor pode estar lá (não readicione às cegas)');
     }
     return 0;
   }
@@ -432,11 +515,21 @@ function main(argv) {
       return 2;
     }
     const entry = target.entry;
-    const secret = get(entry.service, entry.name);
-    if (!secret) {
-      console.error(`forge-secrets: segredo de ${entry.service}/${entry.name} não encontrado — readicione`);
+    // One probe, not get() plus a second look: each read of the Keychain can
+    // cost the user an authorisation dialog.
+    const probe = probeSecret(entry.service, entry.name);
+    if (probe.state !== 'present') {
+      // Both states are fatal — running the command without the credential
+      // would fail somewhere far from the cause. Only the reason differs.
+      if (probe.state === 'unknown') {
+        console.error(`forge-secrets: não foi possível ler o segredo de ${entry.service}/${entry.name} no cofre.`);
+        console.error('  O comando não roda sem a credencial. O valor pode estar guardado — não readicione às cegas.');
+      } else {
+        console.error(`forge-secrets: segredo de ${entry.service}/${entry.name} não encontrado — readicione`);
+      }
       return 1;
     }
+    const secret = probe.value;
     const cmd = argv[sep + 1];
     const args = argv.slice(sep + 2);
     // The secret enters the child's environment and nothing else: not argv, not
@@ -456,7 +549,7 @@ function main(argv) {
 module.exports = {
   REGISTRY_FILE, SERVICES,
   load, save, add, remove, get, list, find, forService, setDefault, resolve,
-  envVarFor, keychainService,
+  envVarFor, keychainService, probeSecret, secretState,
 };
 
 if (require.main === module) {

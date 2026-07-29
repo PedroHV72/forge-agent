@@ -90,7 +90,9 @@ enum ForgeCore {
     }
 
     /// Run an engine with something on stdin. forge-secrets takes the secret
-    /// that way precisely so it never appears in argv.
+    /// that way so it never appears in the argv of *this* node process; the
+    /// `security` call the engine then makes still receives it in `-w`, a
+    /// limitation of the tool documented in scripts/forge-secrets.js.
     @discardableResult
     static func runWithInput(_ engineName: String, _ args: [String],
                              input: String, cwd: String? = nil) -> Result {
