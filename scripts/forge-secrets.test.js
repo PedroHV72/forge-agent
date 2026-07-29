@@ -272,23 +272,71 @@ console.log('\nrobustez do cofre');
 test('Keychain travado não pendura — degrada para arquivo', () => {
   // A locked keychain makes `security` prompt for a password; with no TTY it
   // waits forever. This is what hung the macOS CI job past ten minutes.
+  //
+  // run-tests.js sets FORGE_KEYCHAIN_DISABLED=1 for the whole suite, which would
+  // make this pass trivially — the engine would never call `security` at all and
+  // the assertion below would prove nothing about the timeout. So on darwin the
+  // switch is re-enabled for the duration of this one test, against a shim that
+  // SLEEPS: the real hostile condition, reproduced without the real binary (the
+  // shim is ahead of it on PATH, so no real keychain is reachable). Elsewhere
+  // there is no keychain layer and the file store is the only path anyway.
+  const prevDisabled = process.env.FORGE_KEYCHAIN_DISABLED;
+  const prevPath = process.env.PATH;
+  const shimLog = path.join(TMP, 'hang-calls.log');
+  if (process.platform === 'darwin') {
+    const shimDir = path.join(TMP, 'hangbin');
+    fs.mkdirSync(shimDir, { recursive: true });
+    // Logs before sleeping, so the assertion below can prove the engine really
+    // entered the Keychain branch. Without that proof this test would pass just
+    // as happily with the branch skipped entirely — `store: 'file'` is the
+    // outcome either way, which is precisely the false green the kill-switch
+    // would otherwise have introduced here.
+    // Records the call, THEN blocks — the order matters, the log is the proof.
+    // `sleep 10` and not `sleep 30`: comfortably past the budget below, short
+    // enough that a SIGTERM'd shim cannot linger for long if one ever escapes.
+    fs.writeFileSync(path.join(shimDir, 'security'),
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> "${shimLog}"\nsleep 10\n`, { mode: 0o755 });
+    process.env.PATH = `${shimDir}${path.delimiter}${prevPath}`;
+    process.env.FORGE_KEYCHAIN_DISABLED = '';
+  }
   const prev = process.env.FORGE_KEYCHAIN_TIMEOUT_MS;
-  process.env.FORGE_KEYCHAIN_TIMEOUT_MS = '1';
+  // 1000ms, not 1ms. At 1ms the SIGTERM lands before the shim has even finished
+  // exec'ing, so it never records the call and the proof below cannot be made —
+  // process spawn alone costs >250ms under a sandboxed runner. Still a third of
+  // what the assertion allows, and a tenth of the shim's own sleep, so the
+  // measurement stays unambiguous on a slow machine.
+  process.env.FORGE_KEYCHAIN_TIMEOUT_MS = '1000';
   delete require.cache[require.resolve('./forge-secrets.js')];
-  const iso = require('./forge-secrets.js');
 
-  const t0 = Date.now();
-  iso.add({ service: SERVICE + 'to', name: 'x', secret: 'valor' });
-  const took = Date.now() - t0;
+  // The restore MUST be exception-safe. A plain tail of restore statements is
+  // skipped when an assertion throws, and then the sleeping shim stays on PATH
+  // for every later test in the file — each one paying the timeout, which reads
+  // as "the suite hangs" rather than "one assertion failed". Learned the hard
+  // way while proving this very test bites.
+  try {
+    const iso = require('./forge-secrets.js');
 
-  assert(took < 3000, `add demorou ${took}ms — deveria desistir do Keychain rápido`);
-  assertEq(iso.find(SERVICE + 'to', 'x').store, 'file', 'deve registrar que caiu no arquivo');
-  assertEq(iso.get(SERVICE + 'to', 'x'), 'valor', 'o valor tem que continuar acessível');
+    const t0 = Date.now();
+    iso.add({ service: SERVICE + 'to', name: 'x', secret: 'valor' });
+    const took = Date.now() - t0;
 
-  iso.remove(SERVICE + 'to', 'x');
-  if (prev === undefined) delete process.env.FORGE_KEYCHAIN_TIMEOUT_MS;
-  else process.env.FORGE_KEYCHAIN_TIMEOUT_MS = prev;
-  delete require.cache[require.resolve('./forge-secrets.js')];
+    assert(took < 3000, `add demorou ${took}ms — deveria desistir do Keychain rápido`);
+    if (process.platform === 'darwin') {
+      assert(fs.existsSync(shimLog),
+        'o engine nem chamou `security` — este teste não estaria cobrindo o timeout');
+    }
+    assertEq(iso.find(SERVICE + 'to', 'x').store, 'file', 'deve registrar que caiu no arquivo');
+    assertEq(iso.get(SERVICE + 'to', 'x'), 'valor', 'o valor tem que continuar acessível');
+
+    iso.remove(SERVICE + 'to', 'x');
+  } finally {
+    if (prev === undefined) delete process.env.FORGE_KEYCHAIN_TIMEOUT_MS;
+    else process.env.FORGE_KEYCHAIN_TIMEOUT_MS = prev;
+    process.env.PATH = prevPath;
+    if (prevDisabled === undefined) delete process.env.FORGE_KEYCHAIN_DISABLED;
+    else process.env.FORGE_KEYCHAIN_DISABLED = prevDisabled;
+    delete require.cache[require.resolve('./forge-secrets.js')];
+  }
 });
 
 test('cofre ilegível é INDETERMINADO, nunca "sem valor"', () => {

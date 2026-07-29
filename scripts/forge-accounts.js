@@ -59,7 +59,12 @@ const CLAUDE_DIR     = path.join(os.homedir(), '.claude');
 // and for isolating a dev registry). Tokens still live in the Keychain by name.
 const REGISTRY_FILE  = process.env.FORGE_ACCOUNTS_REGISTRY || path.join(CLAUDE_DIR, 'forge-accounts.json');
 const TOKENS_FILE    = path.join(CLAUDE_DIR, 'forge-accounts-tokens.json'); // non-darwin fallback
-const IS_DARWIN      = process.platform === 'darwin';
+// Every Keychain branch below asks this first. See forge-keychain-switch.js:
+// with an isolated HOME `security` raises a modal dialog and blocks, so the test
+// suite must be unable to reach the real binary. With the variable unset — the
+// only state a user's machine is ever in — it is exactly the old
+// `process.platform === 'darwin'` test, so production behaviour is unchanged.
+const { keychainEnabled } = require('./forge-keychain-switch');
 const KEYCHAIN_ACCT  = (() => { try { return os.userInfo().username; } catch { return 'forge'; } })();
 const TOKEN_TTL_DAYS = 365; // setup-token validity window
 // Env var used to inject a per-account token at launch. ANTHROPIC_AUTH_TOKEN
@@ -102,7 +107,7 @@ function saveRegistry(reg) {
 function keychainService(name) { return `forge-account-${name}`; }
 
 function storeToken(name, token) {
-  if (IS_DARWIN) {
+  if (keychainEnabled()) {
     // -U updates if the item already exists. Args passed as an array (no shell),
     // so the token is not subject to shell history/quoting. It is briefly visible
     // in `ps` — acceptable for a local single-user macOS Keychain write.
@@ -129,6 +134,11 @@ function storeToken(name, token) {
     }
   }
   // Fallback: 0600 file. Create with restrictive mode from the start.
+  // mkdir first: this path used to be reachable only on non-darwin, where
+  // ~/.claude had normally been created by something else already, so its
+  // absence went unnoticed and surfaced as ENOENT on the temp file. Exposed by
+  // the kill-switch, which routes darwin here too.
+  try { fs.mkdirSync(CLAUDE_DIR, { recursive: true }); } catch {}
   let map = {};
   try { map = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8')); } catch {}
   map[name] = token;
@@ -141,7 +151,7 @@ function storeToken(name, token) {
 }
 
 function readToken(name) {
-  if (IS_DARWIN) {
+  if (keychainEnabled()) {
     try {
       return execFileSync('security', [
         'find-generic-password',
@@ -162,7 +172,7 @@ function readToken(name) {
 }
 
 function deleteToken(name) {
-  if (IS_DARWIN) {
+  if (keychainEnabled()) {
     try {
       execFileSync('security', [
         'delete-generic-password',
@@ -370,7 +380,10 @@ function useAccount(name) {
 /// Where a token was actually written, recorded at write time so that knowing
 /// "is there a token" never requires reading one. `false` is a real answer
 /// ("we looked and there is none"); `undefined` means nobody recorded it yet.
-function defaultStoreKind() { return IS_DARWIN ? 'keychain' : 'file'; }
+// Consults the switch, not the platform: when the Keychain is disabled
+// `storeToken` writes the 0600 file, so reporting 'keychain' would be a lie
+// about where the token actually is.
+function defaultStoreKind() { return keychainEnabled() ? 'keychain' : 'file'; }
 
 function probeTokenStore(name, recordedStore) {
   return readToken(name) ? (recordedStore || defaultStoreKind()) : false;

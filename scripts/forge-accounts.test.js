@@ -95,6 +95,14 @@ function cli(args, extraEnv) {
       FORGE_ACCOUNTS_REGISTRY: REGISTRY,
       FORGE_ACCOUNT: '',
       PATH: IS_DARWIN ? `${SHIM_DIR}${path.delimiter}${process.env.PATH}` : process.env.PATH,
+      // run-tests.js sets FORGE_KEYCHAIN_DISABLED=1 for every suite so nothing
+      // can reach the real `security` (it raises a modal dialog under an
+      // isolated HOME). THIS suite is the sanctioned exception: it is the one
+      // that measures the darwin branch, and it does so against the counting
+      // shim installed above — which is ahead of the real binary on PATH, so
+      // re-enabling here still cannot touch a real keychain. Cleared rather
+      // than deleted so it also overrides an inherited value.
+      FORGE_KEYCHAIN_DISABLED: '',
       FORGE_TEST_SECURITY_LOG: SEC_LOG,
       FORGE_TEST_SECURITY_STORE: SEC_STORE,
       ...(extraEnv || {}),
