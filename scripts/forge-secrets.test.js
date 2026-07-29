@@ -343,6 +343,45 @@ test('cofre ilegível é INDETERMINADO, nunca "sem valor"', () => {
   }
 });
 
+test('raiz JSON válida mas não-objeto no arquivo fallback é INDETERMINADO, nunca "sem valor"', () => {
+  // R1 review fix: JSON.parse succeeds on `null`, `[]`, a bare string or a
+  // number just as well as on an object — but storeSecret always serializes a
+  // plain object, so any other root is corruption, not an empty vault. Each
+  // case below must report `unknown`/`has_secret: null`, never `absent`/`false`.
+  const svc = SERVICE + 'nonobj';
+  const FALLBACK = `${REGISTRY}.secrets`;
+
+  const creds = secrets.load();
+  creds.push({
+    service: svc, name: 'x', env_var: 'X_TOKEN', note: '',
+    store: 'file', added_at: new Date().toISOString(),
+  });
+  secrets.save(creds);
+
+  const existed = fs.existsSync(FALLBACK);
+  const previous = existed ? fs.readFileSync(FALLBACK, 'utf8') : null;
+  try {
+    for (const root of ['null', '[]', '"a string"', '42']) {
+      fs.writeFileSync(FALLBACK, root, { mode: 0o600 });
+      fs.chmodSync(FALLBACK, 0o600);
+
+      const row = secrets.list({ verify: true }).find(c => c.service === svc);
+      assert(row, `a entrada de teste deveria estar no registro (root=${root})`);
+      assert(row.has_secret !== false,
+        `REGRESSÃO (root=${root}): raiz JSON não-objeto reportada como "sem valor"`);
+      assertEq(row.has_secret, null, `has_secret precisa ser null (root=${root})`);
+      assertEq(secrets.secretState(svc, 'x'), 'unknown', `secretState precisa ser unknown (root=${root})`);
+    }
+  } finally {
+    if (previous === null) { try { fs.rmSync(FALLBACK, { force: true }); } catch {} }
+    else {
+      fs.writeFileSync(FALLBACK, previous, { mode: 0o600 });
+      fs.chmodSync(FALLBACK, 0o600);
+    }
+    secrets.save(secrets.load().filter(c => c.service !== svc));
+  }
+});
+
 console.log('\nremoção');
 
 test('remove apaga registro e segredo', () => {

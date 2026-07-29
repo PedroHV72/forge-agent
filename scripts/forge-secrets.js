@@ -197,7 +197,13 @@ function fileProbe(service, name) {
   let store;
   try { store = JSON.parse(raw); }
   catch { return { state: 'unknown', value: null }; }
-  const v = store && store[keychainService(service, name)];
+  // storeSecret always serializes a plain object (see below) — a parsed root
+  // that is not one is positive evidence of corruption, not of an empty
+  // vault, and must not be reported as `absent`.
+  if (store === null || typeof store !== 'object' || Array.isArray(store)) {
+    return { state: 'unknown', value: null };
+  }
+  const v = store[keychainService(service, name)];
   return v ? { state: 'present', value: v } : { state: 'absent', value: null };
 }
 

@@ -119,14 +119,42 @@ check('no Swift source writes a secret through the Security framework', () => {
 
 // --- The write path still exists ------------------------------------------
 
+// Extracts the body of `func add(...) -> Bool { ... }` on SecretsStore by
+// brace counting from the `func add(` line. Used so the positive assertions
+// below check the actual call site instead of the whole file — the header
+// comment mentions both `forge-secrets.js` and (implicitly, via history)
+// engine calls, so matching the whole source would let the real call be
+// deleted while the assertions still passed on the prose alone.
+function extractAddBody(filePath) {
+  const lines = readLines(filePath);
+  const startIdx = lines.findIndex(l => /\bfunc add\(/.test(l));
+  assert(startIdx !== -1, 'could not locate `func add(` in SecretsView.swift');
+  let depth = 0;
+  let started = false;
+  const body = [];
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i];
+    for (const ch of line) {
+      if (ch === '{') { depth++; started = true; }
+      else if (ch === '}') depth--;
+    }
+    body.push(line);
+    if (started && depth === 0) break;
+  }
+  return body.map(stripLineComments).join('\n');
+}
+
 check('SecretsStore.add writes through the engine via ForgeCore.runWithInput', () => {
   // Without this, deleting the engine call along with the framework write
   // would satisfy the guard above while making add() store nothing at all.
-  const src = fs.readFileSync(secretsViewPath, 'utf8');
-  assert(src.includes('forge-secrets.js'),
-    'SecretsView.swift does not reference forge-secrets.js — the vault may be unwired');
-  assert(src.includes('ForgeCore.runWithInput'),
-    'SecretsView.swift does not call ForgeCore.runWithInput — the secret write path is gone; ' +
+  // Scoped to add()'s own body, comment-stripped, so the header's mention of
+  // forge-secrets.js/the engine cannot satisfy this on its own once the real
+  // call is removed.
+  const body = extractAddBody(secretsViewPath);
+  assert(body.includes('forge-secrets.js'),
+    'SecretsStore.add does not reference forge-secrets.js — the vault may be unwired');
+  assert(body.includes('ForgeCore.runWithInput'),
+    'SecretsStore.add does not call ForgeCore.runWithInput — the secret write path is gone; ' +
     'add() would register metadata with no value behind it');
 });
 
