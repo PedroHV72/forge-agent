@@ -515,7 +515,7 @@ Resolver o challenger e advocate de cada review pela autoria do código reflete 
 
 ## Estado atual
 
-- **Milestone ativo:** — (M017 + TASK-020 mergeados em `master` @ `ed0e2a9`)
+- **Milestone ativo:** — (M017 + TASK-020 rebasados sobre `origin/master` @ v3.1.1, ainda **não pushados**)
 - **Fase:** idle. **M017** (Suporte a SVN no sidecar multi-LLM, Fase 1) encerrado: 6 slices (S01–S06), triagem final de review (3 itens deferidos, todos refatorados e verificados), 9 objeções concedidas+corrigidas, 7 resolvidas no debate, 0 abertas. Entrega: o sidecar codex (`--mode execute`/`--mode plan`) roda de ponta a ponta numa working copy SVN sem tocar git, com a propriedade de segurança provada em fixture real (a sujeira pré-existente do operador sobrevive byte-idêntica a uma falha do sidecar). **TASK-020** (task solta, worktree emprestado da M017) fechou a aceitação silenciosa de alegações `environment` falsas do sidecar — ver a decisão de arquitetura homônima abaixo. Smoke 1795→**1983**, `run-tests.js` **41/41 suites** (era 39 no início da M017).
 - **Próxima ação:** Rodar `/forge-update` para sincronizar as cópias instaladas em `~/.claude` — as edições em `skills/**` e `shared/**` de M017+TASK-020 só valem em runtime após reinstalar. Depois: `/forge-new-milestone <descrição>` para a Fase 2 (isolação real em SVN — worktree/branch equivalente), ou uma task para os follow-ups em `.gsd/KNOWLEDGE.md § Review follow-ups`.
 

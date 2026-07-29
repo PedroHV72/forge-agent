@@ -1,3 +1,29 @@
+## Unreleased — SVN in the sidecar, and the end of `environment` as a free pass
+
+### Added
+
+- **The multi-LLM sidecar runs against a Subversion working copy** (M017, phase 1). `scripts/forge-vcs.js` is the single owner of every VCS primitive the sidecar needs — detection, baseline id, post-run change set — with a closed sentinel per primitive so an unsupported VCS refuses by name instead of silently returning something plausible. `--mode execute` and `--mode plan` go end to end on an SVN checkout **without issuing a single git command**, and the surgical reset keeps its central safety property there: an operator's pre-existing dirty file survives a sidecar failure **byte-identical**, proven against a real `svn` fixture rather than a mock. `require_worktree` no longer strands an SVN checkout — activation resolves to `shared` with a reason that names SVN, instead of failing every repo and stopping the run. Isolation and worktree equivalence for SVN are explicitly **not** in this phase.
+
+### Fixed
+
+- **`scope: environment` stopped being a free pass** (TASK-020). The sidecar could mark a must-have `status: unknown, scope: environment` with an allowlist `reason`, and the pipeline accepted the work with the verification never having run. Measured **13 times across three sessions** — every one false; in one case 6 of 9 must-haves, the entire behavioural proof of a task, went unverified. Three holes that compounded:
+  - The `git-commit-required` corroborator was tautological: `/\bgit\b|commit|push/i` over `item + note` meant any note that *mentioned* git corroborated itself — including one whose text was *"the task prohibits running any git command"*. It now reads `entry.note` only (never `item`, which is plan boilerplate echoed back) and requires a git **write** operation. This is the rigour `sandbox-exec-blocked` already had ten lines below, and which was never carried across to its neighbour.
+  - The re-verification net was hung off a single reason. `needsReverification` and `affectedEntries` both filtered on `sandbox-exec-blocked`, so four of the five reasons never reached it. Both now share one predicate covering the four *execution-blocked* reasons. `gsd-write-refused` is deliberately excluded: a green test suite never touches `.gsd/**`, so its exit code cannot be evidence for a write-refusal claim — promoting it would have replaced silent acceptance with an attestation backed by irrelevant evidence, which the review caught and reproduced. **The trigger and the entry selector always move together**; narrowing one alone yields a gate that fires, spends a full suite run, and selects nothing.
+  - Even when it fired, it had nothing to run here. Stack detection covered `package.json`/`go.mod`/`Cargo.toml`/pytest/`Makefile` and returned `null` in a zero-dep repo — so the net was blind to the very project that ships it. It now falls back to `CODING-STANDARDS.md § Lint & Format Commands → **Test:**`, discarding any candidate that needs shell parsing (globs, metacharacters, quotes, backslashes) because the spawn is `shell:false`. `--gsd-dir` is threaded to the CLI and the four mirrors, since `.gsd/` is not under `CODE_DIR` in worktree mode and walk-up would fail exactly where this runs.
+
+  Proven on live data rather than a fixture: the sidecar produced a 13th false `git-commit-required` claim *during this very task*. The old code promoted it; the new code rejects it.
+
+- **A smoke label that promised more than it measured.** Section 80 asserted "execute on SVN never invokes the PATH git shim" and passed — but a dogfood run against a real `svn` working copy with the real codex CLI showed the CLI probing `git … remote -v` on its own, a pattern absent from the forge codebase and non-fatal. The assertion is unchanged (the git log must still be empty); the label now says what it proves: forge's own code issues no git command. The mocked codex doesn't sniff for git, which is why it passed.
+
+- **A guard that fired on prose, not on behaviour.** `forge-auto/SKILL.md exit '## Deactivate auto-mode indicator'` had been red on `master` since v3.1.0 — including at the v3.1.1 release. The assert anchors on the first match of the section title, but that title also appears earlier as an inline cross-reference inside the `status: partial` bullet; the 1000-char window from there covers the `status: blocked` bullet, and v3.1.0's item-capture block pushed the deactivation command out of it. Nothing had regressed — someone wrote prose nearby. It now anchors on the newline-delimited header, so it reads the section it claims to check. Verified by counterfactual: deleting the deactivation command from that section turns it red again.
+
+### Known, not fixed
+
+- The ambiguity gate (`hasDivergentCommandNotes`) only refuses when entries' notes name *different* runner tokens; a note naming none passes ungated. Tracked as an item.
+- `/forge-init` writes `- **Lint:**`, `- **Format:**` and `- **Type check:**` but never `- **Test:**`, so the fallback above finds nothing in a freshly initialised project — the zero-dep projects that need it most. Tracked as an item.
+
+---
+
 ## v3.1.1 — The vault stops crying wolf, and starts keeping receipts
 
 ### Fixed
