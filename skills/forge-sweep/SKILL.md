@@ -10,7 +10,7 @@ $ARGUMENTS
 
 ---
 
-Prune ephemeral GSD artifacts and tighten durable know-how files (AUTO-MEMORY, CHECKER-MEMORY, DECISIONS) at the end of a task or milestone. Goal: keep shared `.gsd/` files lean and long-lived; avoid SVN/Git merge conflicts.
+Prune ephemeral GSD artifacts and tighten durable know-how files (AUTO-MEMORY, CHECKER-MEMORY, DECISIONS) at the end of a task or milestone. Goal: keep shared `.gsd/` files lean and long-lived; avoid SVN/Git merge conflicts. `.gsd/items/` is never touched by any scope — pruning of `done` items is explicitly Deferred per SCOPE; no sweep logic exists for it here.
 
 Milestone and task directories are **trimmed in place** (preserving only the `*-SUMMARY.md` file) rather than removed entirely — the directory's continued presence in version control signals to the team that the milestone/task existed and was completed, avoiding the "where did M### go?" confusion when one teammate runs `/forge-sweep` and another pulls the result.
 

@@ -34,6 +34,7 @@ const decisionsMod = require('./forge-decisions');
 const memoryMod    = require('./forge-memory');
 const checkerMod   = require('./forge-checker-memory');
 const storeStateMod = require('./forge-store-state');
+const itemsMod     = require('./forge-items');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -659,6 +660,39 @@ function renderChecker(cwd) {
   return lines.join('\n');
 }
 
+// ── renderItems ───────────────────────────────────────────────────────────────
+// Reconstructs the ITEMS.md monolith view from .gsd/items/*.md fragments.
+// On-demand only — never called by writeAll, never persisted as a file.
+// Sections in canonical status order (STATUSES); empty statuses are omitted.
+const ITEM_STATUS_ORDER = ['inbox', 'triaged', 'doing', 'done', 'dropped'];
+
+function renderItems(cwd) {
+  const items = itemsMod.listItems(cwd);
+  const lines = ['# Forge Items', ''];
+  lines.push('> Backlog items grouped by status. On-demand projection — not persisted.');
+  lines.push('');
+
+  if (items.length === 0) {
+    lines.push('_No items yet._');
+    return lines.join('\n') + '\n';
+  }
+
+  for (const status of ITEM_STATUS_ORDER) {
+    const inStatus = items.filter(it => it.status === status);
+    if (inStatus.length === 0) continue;
+
+    lines.push(`## ${status}`);
+    lines.push('');
+    for (const it of inStatus) {
+      const promoted = it.promoted_to ? ` → promoted_to ${it.promoted_to}` : '';
+      lines.push(`- ${it.id} — ${it.title}${promoted}`);
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
 // ── maxMtime ──────────────────────────────────────────────────────────────────
 // Recursively finds the maximum mtime (ms) of all .md files in a directory.
 // Returns 0 if directory does not exist or is empty.
@@ -788,6 +822,7 @@ module.exports = {
   queryMemoryEntries,
   renderMemory,
   renderChecker,
+  renderItems,
   isStale,
   writeAll,
 };
@@ -797,8 +832,9 @@ function printUsage() {
   console.log(`Usage: node forge-projection.js <command> [options]
 
 Commands:
-  --render ledger|decisions|memory|checker [--cwd <dir>]
+  --render ledger|decisions|memory|checker|items [--cwd <dir>]
                           Print reconstructed monolith content to stdout
+                          (items is on-demand only — never written by --write-all)
   --stale [--cwd <dir>]   Print JSON {ledger:bool, decisions:bool, memory:bool}
                           and exit 0 (true = stale)
   --write-all [--cwd <dir>] [--force]
@@ -838,8 +874,8 @@ function cliMain(argv) {
 
   if (cmd === '--render') {
     const name = argv[1];
-    if (!name || !['ledger', 'decisions', 'memory', 'checker'].includes(name)) {
-      process.stderr.write('--render requires: ledger | decisions | memory | checker\n');
+    if (!name || !['ledger', 'decisions', 'memory', 'checker', 'items'].includes(name)) {
+      process.stderr.write('--render requires: ledger | decisions | memory | checker | items\n');
       process.exit(2);
     }
     let content;
@@ -848,6 +884,7 @@ function cliMain(argv) {
       if (name === 'decisions') content = renderDecisions(cwd);
       if (name === 'memory')    content = renderMemory(cwd);
       if (name === 'checker')   content = renderChecker(cwd);
+      if (name === 'items')     content = renderItems(cwd);
     } catch (e) {
       process.stderr.write(`${e.message}\n`);
       process.exit(1);
