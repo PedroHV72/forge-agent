@@ -64,6 +64,12 @@ final class AppState: ObservableObject {
     /// Live terminal sessions hosted inside the app.
     @Published private(set) var sessions: [TerminalSession] = []
 
+    /// Rich per-project status from forge-status.js, keyed by cwd. Spawns node,
+    /// so it is refreshed on a slow cadence — unlike the gate/run files, which
+    /// are plain reads driven by FSEvents.
+    @Published private(set) var status: [String: StatusPayload] = [:]
+    private var statusLoading: Set<String> = []
+
     private var timer: Timer?
     private var watcher: Watcher?
 
@@ -109,8 +115,14 @@ final class AppState: ObservableObject {
         watcher?.watch(workspaces)
 
         timer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.reloadCheap() }
+            Task { @MainActor in
+                self?.reloadCheap()
+                // Progress only changes when a unit finishes, so a slow cadence
+                // is plenty — and each call spawns node.
+                self?.refreshStatus()
+            }
         }
+        refreshStatus()
     }
 
     deinit { timer?.invalidate() }
@@ -141,6 +153,23 @@ final class AppState: ObservableObject {
         return names.filter { $0.hasSuffix(".json") }.compactMap { n in
             guard let d = FileManager.default.contents(atPath: "\(dir)/\(n)") else { return nil }
             return try? dec.decode(T.self, from: d)
+        }
+    }
+
+    /// Fetch status for the projects that have a live run — the only ones whose
+    /// progress can change while you watch.
+    func refreshStatus(force: Bool = false) {
+        let targets = Set(liveRuns.map(\.cwd)).union(force ? Set(workspaces) : [])
+        for cwd in targets where !statusLoading.contains(cwd) {
+            statusLoading.insert(cwd)
+            Task.detached(priority: .utility) {
+                let payload = ForgeCore.runJSON(StatusPayload.self, "forge-status.js",
+                                                ["--json", "--cwd", cwd])
+                await MainActor.run {
+                    self.statusLoading.remove(cwd)
+                    if let payload { self.status[cwd] = payload }
+                }
+            }
         }
     }
 

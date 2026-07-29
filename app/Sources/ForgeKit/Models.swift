@@ -108,6 +108,9 @@ public struct Run: Codable, Identifiable, Hashable {
     public let cwd: String
     public let account: String?
     public let task_description: String?
+    /// Why the run stopped — "encerrado" alone cannot distinguish a milestone
+    /// that finished from one that died.
+    public let deactivated_reason: String?
 
     public var projectName: String { URL(fileURLWithPath: cwd).lastPathComponent }
 

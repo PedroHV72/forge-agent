@@ -280,25 +280,31 @@ struct RunsView: View {
     @ObservedObject var state: AppState
     @State private var showLauncher = false
 
+    /// Runs that stopped recently. A finished milestone is not noise — it is
+    /// the answer to "did that thing I started overnight actually land?".
+    private var recent: [Run] {
+        state.runs.filter { !$0.active }
+            .sorted { ($0.last_heartbeat ?? 0) > ($1.last_heartbeat ?? 0) }
+            .prefix(4).map { $0 }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if state.liveRuns.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Nenhum run ativo.")
-                            .font(.callout).foregroundStyle(.secondary)
-                        Text("Um run aparece aqui assim que o /forge-auto começa — no terminal do app ou fora dele.")
-                            .font(.caption).foregroundStyle(.tertiary)
-                        Button("Abrir sessão…") { showLauncher = true }
-                            .controlSize(.small)
-                    }
-                    .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.quaternary.opacity(0.3),
-                                in: RoundedRectangle(cornerRadius: 12))
+                    emptyState
                 } else {
-                    ForEach(state.liveRuns) { r in RunCard(run: r, state: state) }
+                    ForEach(state.liveRuns) { r in
+                        RunCard(run: r, status: state.status[r.cwd], state: state)
+                    }
+                }
+
+                if !recent.isEmpty {
+                    SectionTitle("Encerrados recentemente")
+                    ForEach(recent) { r in FinishedRunRow(run: r) }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
         }
         .navigationTitle("Runs")
@@ -307,87 +313,278 @@ struct RunsView: View {
         }
         .toolbar {
             ToolbarItem {
+                Button { state.refreshStatus(force: true) } label: {
+                    Label("Atualizar", systemImage: "arrow.clockwise")
+                }
+                .help("Recarrega o progresso de cada projeto")
+            }
+            ToolbarItem {
                 Button { showLauncher = true } label: {
                     Label("Nova sessão", systemImage: "plus")
                 }
             }
         }
+        .onAppear { state.refreshStatus(force: true) }
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Nenhum run ativo.").font(.callout).foregroundStyle(.secondary)
+            Text("Um run aparece aqui assim que o /forge-auto começa — no terminal do app ou fora dele.")
+                .font(.caption).foregroundStyle(.tertiary)
+            Button("Abrir sessão…") { showLauncher = true }.controlSize(.small)
+        }
+        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
 struct RunCard: View {
     let run: Run
+    let status: StatusPayload?
     @ObservedObject var state: AppState
+    @State private var showSlices = false
+
+    private var milestone: MilestoneStatus? {
+        // Only trust the milestone block when it belongs to THIS run: a project
+        // with several runs reports one focused milestone, and attributing it to
+        // the wrong card would show someone else's progress.
+        guard let m = status?.milestone, m.id == run.id else { return nil }
+        return m
+    }
+
+    private var gatesHere: [Gate] {
+        state.pending.filter { $0.cwd == run.cwd && ($0.run_id == run.id || $0.run_id == nil) }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(run.isStale ? Color.orange : Color.green)
-                    .frame(width: 7, height: 7)
-                Text(run.projectName).font(.headline)
-                Text(run.id).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Text(run.statusLabel).font(.caption2).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 11) {
+            header
+            if let m = milestone { progressBlock(m) } else { noStatusYet }
+            liveRow
+            if !gatesHere.isEmpty { gateRow }
+            if let m = milestone, let slices = m.slices, !slices.isEmpty {
+                sliceDisclosure(m, slices)
             }
-
-            if let d = run.task_description, !d.isEmpty {
-                Text(d).font(.callout).lineLimit(2)
-            }
-
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
-                if let w = run.workerParts {
-                    GridRow {
-                        Text("agora").font(.caption).foregroundStyle(.tertiary)
-                        HStack(spacing: 6) {
-                            Text(w.unit).font(.caption).bold()
-                            if !w.id.isEmpty {
-                                Text(w.id).font(.caption).foregroundStyle(.secondary)
-                            }
-                            if let e = run.workerElapsed {
-                                Text("· \(e)").font(.caption).foregroundStyle(.tertiary)
-                            }
-                        }
-                    }
-                }
-                GridRow {
-                    Text("rodando há").font(.caption).foregroundStyle(.tertiary)
-                    Text(run.elapsed).font(.caption)
-                }
-                if let acct = run.account, !acct.isEmpty {
-                    GridRow {
-                        Text("conta").font(.caption).foregroundStyle(.tertiary)
-                        Text(acct).font(.caption)
-                    }
-                }
-                if let iso = run.isolation_mode {
-                    GridRow {
-                        Text("isolamento").font(.caption).foregroundStyle(.tertiary)
-                        Text(iso).font(.caption)
-                    }
-                }
-            }
-
-            HStack(spacing: 8) {
-                let paused = state.isPaused(run)
-                Button(paused ? "Retomar" : "Pausar") { state.togglePause(run) }
-                    .controlSize(.small)
-                    .help(paused ? "Remove o pedido de pausa"
-                                 : "Para ao fim da unidade atual, não no meio")
-                Button("Abrir terminal") { state.resume(run) }
-                    .controlSize(.small)
-                Button("Ver pasta") { ForgeCore.reveal(run.cwd) }
-                    .controlSize(.small)
-                Spacer()
-                if state.isPaused(run) {
-                    Label("pausa pedida", systemImage: "pause.circle")
-                        .font(.caption2).foregroundStyle(.orange)
-                }
-            }
+            Divider().padding(.vertical, 1)
+            actions
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(gatesHere.isEmpty ? .clear : Color.accentOrange.opacity(0.4), lineWidth: 1))
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Circle().fill(run.isStale ? Color.orange : Color.green)
+                .frame(width: 7, height: 7)
+                .help(run.isStale ? "Sem heartbeat há mais de 15min" : "Ativo")
+            Text(run.projectName).font(.headline)
+            if let title = milestone?.displayTitle {
+                Text(title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            if milestone?.auto_mode == "on" {
+                Label("auto", systemImage: "play.circle.fill")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .help("forge-auto está conduzindo este run")
+            }
+            if state.isPaused(run) {
+                Label("pausa pedida", systemImage: "pause.circle.fill")
+                    .font(.caption2).foregroundStyle(Color.accentOrange)
+            }
+        }
+    }
+
+    @ViewBuilder private func progressBlock(_ m: MilestoneStatus) -> some View {
+        if let p = m.progress, p.total > 0 {
+            VStack(alignment: .leading, spacing: 4) {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(.quaternary).frame(height: 6)
+                        Capsule().fill(Color.accentOrange.opacity(0.75))
+                            .frame(width: max(3, geo.size.width * p.fraction), height: 6)
+                    }
+                    .frame(maxHeight: .infinity, alignment: .center)
+                }
+                .frame(height: 8)
+                HStack(spacing: 6) {
+                    Text("\(p.done) de \(p.total) slices")
+                        .font(.caption).monospacedDigit()
+                    Text("· \(p.percent)%").font(.caption).foregroundStyle(.tertiary)
+                    Spacer()
+                    Text(run.id).font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary).textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    private var noStatusYet: some View {
+        HStack(spacing: 6) {
+            Text(run.id).font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary).textSelection(.enabled)
+            Spacer()
+        }
+    }
+
+    /// What is happening right now, and what comes next — the two questions a
+    /// running milestone actually raises.
+    private var liveRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .top, spacing: 8) {
+                Text("agora").font(.caption2).foregroundStyle(.tertiary)
+                    .frame(width: 48, alignment: .leading)
+                if let w = run.workerParts {
+                    HStack(spacing: 5) {
+                        Text(w.unit).font(.caption).bold()
+                        if !w.id.isEmpty {
+                            Text(w.id).font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let e = run.workerElapsed {
+                            Text("· \(e)").font(.caption).foregroundStyle(.tertiary)
+                        }
+                    }
+                } else if let phase = milestone?.phase {
+                    Text(phase).font(.caption).bold()
+                } else {
+                    Text("entre unidades").font(.caption).foregroundStyle(.tertiary)
+                }
+                Spacer()
+            }
+            if let next = milestone?.next_action, !next.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Text("próximo").font(.caption2).foregroundStyle(.tertiary)
+                        .frame(width: 48, alignment: .leading)
+                    Text(next).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// A run blocked on a question is the one thing here that needs acting on.
+    private var gateRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "bolt.fill").font(.caption2).foregroundStyle(Color.accentOrange)
+            Text(gatesHere.count == 1 ? "1 pergunta esperando" : "\(gatesHere.count) perguntas esperando")
+                .font(.caption).foregroundStyle(Color.accentOrange)
+            Spacer()
+        }
+    }
+
+    @ViewBuilder private func sliceDisclosure(_ m: MilestoneStatus, _ slices: [SliceStatus]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { showSlices.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: showSlices ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8))
+                    Text("Slices").font(.caption)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+
+            if showSlices {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(slices) { sl in
+                        HStack(spacing: 6) {
+                            Image(systemName: sl.isDone ? "checkmark.circle.fill"
+                                  : (sl.id == m.active_slice ? "play.circle.fill" : "circle"))
+                                .font(.system(size: 10))
+                                .foregroundStyle(sl.isDone ? AnyShapeStyle(Color.green)
+                                                 : (sl.id == m.active_slice
+                                                    ? AnyShapeStyle(Color.accentOrange)
+                                                    : AnyShapeStyle(.tertiary)))
+                            Text(sl.id).font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary).frame(width: 26, alignment: .leading)
+                            Text(sl.title ?? "").font(.caption2).lineLimit(1)
+                            if sl.isHighRisk && !sl.isDone {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 8)).foregroundStyle(.orange)
+                                    .help("Slice de risco alto")
+                            }
+                            Spacer()
+                            if sl.totalTasks > 0 {
+                                Text("\(sl.doneTasks)/\(sl.totalTasks)")
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                }
+                .padding(8)
+                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 6))
+            }
+        }
+    }
+
+    private var actions: some View {
+        HStack(spacing: 8) {
+            let paused = state.isPaused(run)
+            Button(paused ? "Retomar" : "Pausar") { state.togglePause(run) }
+                .controlSize(.small)
+                .help(paused ? "Remove o pedido de pausa"
+                             : "Para ao fim da unidade atual, não no meio")
+            Button("Abrir terminal") { state.resume(run) }
+                .controlSize(.small)
+            Button("Ver pasta") { ForgeCore.reveal(run.cwd) }
+                .controlSize(.small)
+            Spacer()
+            if let iso = run.isolation_mode {
+                Text(iso).font(.caption2).foregroundStyle(.tertiary)
+                    .help("Modo de isolamento deste run")
+            }
+            if let acct = run.account, !acct.isEmpty {
+                Text(acct).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+/// A run that has stopped. Shows why, because "encerrado" alone does not say
+/// whether it finished or died.
+struct FinishedRunRow: View {
+    let run: Run
+
+    private var reason: String {
+        switch run.deactivated_reason {
+        case "complete-milestone": return "milestone concluída"
+        case "complete-task":      return "task concluída"
+        case "handoff":            return "troca de conta"
+        case "pause":              return "pausado"
+        case .some(let r):         return r
+        case .none:                return "encerrado"
+        }
+    }
+
+    private var isClean: Bool {
+        (run.deactivated_reason ?? "").hasPrefix("complete")
+    }
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: isClean ? "checkmark.circle" : "stop.circle")
+                .font(.caption).foregroundStyle(isClean ? AnyShapeStyle(Color.green)
+                                                        : AnyShapeStyle(.tertiary))
+            Text(run.projectName).font(.callout)
+            Text(run.id).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Text(reason).font(.caption2).foregroundStyle(.secondary)
+            if let hb = run.last_heartbeat, let ago = Duration.short(ms: Date.nowMs - hb) {
+                Text(ago).font(.caption2).foregroundStyle(.tertiary)
+                    .frame(width: 44, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 9))
     }
 }
 

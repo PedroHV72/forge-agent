@@ -689,6 +689,67 @@ test("abbreviate encurta o home") {
     assertEqual(ProjectOrganiser.abbreviate("/outro/x", home: "/h"), "/outro/x")
 }
 
+print("\nStatusModels (o modelo antigo lia o JSON errado, em silêncio)")
+
+test("decodifica o payload real do forge-status") {
+    // Shape taken verbatim from the engine: progress is an OBJECT and the slice
+    // key is active_slice — the previous model declared a String and `slice`,
+    // so both silently decoded to nil.
+    let json = """
+    {"cwd":"/p","runs":{"active":[{"id":"M-1","kind":"milestone","phase":"plan-slice",
+     "heartbeat_age_ms":441136,"stale":false,"isolation_mode":"worktree"}],"focused":"M-1"},
+     "milestone":{"id":"M-1","title":"M-1","phase":"plan-slice","active_slice":"S14",
+     "active_task":"—","auto_mode":"on","next_action":"plan-slice S14 — SKU fiscal",
+     "progress":{"done":13,"total":28},
+     "slices":[{"id":"S01","title":"Link vivo","checked":true,"risk":"high","status":"done",
+       "tasks":[{"id":"T01","title":"Baseline** — `depends:[]`","checked":true,"status":"done"}]}]},
+     "autonomous_tasks":[],"warnings":[]}
+    """
+    let p = try! JSONDecoder().decode(StatusPayload.self, from: Data(json.utf8))
+    assertEqual(p.milestone?.progress?.done, 13)
+    assertEqual(p.milestone?.progress?.total, 28)
+    assertEqual(p.milestone?.progress?.percent, 46)
+    assertEqual(p.milestone?.active_slice, "S14")
+    assertEqual(p.runs?.active?.first?.phase, "plan-slice")
+    assertEqual(p.runs?.active?.first?.isolation_mode, "worktree")
+    assertEqual(p.milestone?.slices?.first?.isDone, true)
+    assertEqual(p.milestone?.slices?.first?.isHighRisk, true)
+}
+
+test("progresso não divide por zero antes do planejamento") {
+    let p = MilestoneStatus.Progress(done: 0, total: 0)
+    assertEqual(p.fraction, 0)
+    assertEqual(p.percent, 0)
+}
+
+test("progresso satura em 100%") {
+    assertEqual(MilestoneStatus.Progress(done: 30, total: 28).percent, 100)
+}
+
+test("título repetido do id não é mostrado") {
+    // The engine repeats the id as title when the milestone has no human name;
+    // showing it twice is noise.
+    let json = "{\"id\":\"M-1\",\"title\":\"M-1\"}"
+    let m = try! JSONDecoder().decode(MilestoneStatus.self, from: Data(json.utf8))
+    assertTrue(m.displayTitle == nil)
+}
+
+test("título de task perde a metadata do plano") {
+    let json = "{\"id\":\"T02\",\"title\":\"Backend — mint do token** — `depends:[T01]` `domain:backend`\"}"
+    let t = try! JSONDecoder().decode(TaskStatus.self, from: Data(json.utf8))
+    assertEqual(t.cleanTitle, "Backend — mint do token")
+}
+
+test("contagem de tasks por slice") {
+    let json = """
+    {"id":"S02","tasks":[{"id":"T01","status":"done"},{"id":"T02","status":"pending"},
+                          {"id":"T03","checked":true}]}
+    """
+    let sl = try! JSONDecoder().decode(SliceStatus.self, from: Data(json.utf8))
+    assertEqual(sl.doneTasks, 2)
+    assertEqual(sl.totalTasks, 3)
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
