@@ -11,10 +11,11 @@ From `$ARGUMENTS`:
 - `--attach <run-id>` → `ATTACH_RUN = <run-id>`. A task passa a operar dentro do worktree desse run, na branch dele.
 - `--skip-brainstorm` or `-skip-brainstorm` → `SKIP_BRAINSTORM = true`
 - `--skip-research` or `-skip-research` → `SKIP_RESEARCH = true`
-- Remaining text after all flags → `TASK_DESCRIPTION`
+- Remaining text after all flags → if it matches the item-ID shape and nothing else (`^I-\d{14}(-[a-z0-9-]*)?$`, per `shared/forge-items-readback.md § Detecção de referência`) → `ITEM_REF = <that text>` (`TASK_DESCRIPTION` stays unset for now — it is derived from the item's title in `## Item intake`). Otherwise → `TASK_DESCRIPTION = <that text>` exactly as today.
 
-If `TASK_DESCRIPTION` is empty AND not resume mode → stop and tell the user:
+If both `TASK_DESCRIPTION` and `ITEM_REF` are empty AND not resume mode → stop and tell the user:
 > Descreva a task: `/forge-task <descrição>`
+> Ou aponte para um item: `/forge-task <item-id>`
 > Para pular brainstorm: `/forge-task --skip-brainstorm <descrição>`
 
 If `--attach` has no value, stop and tell the user:
@@ -85,6 +86,69 @@ Initialize: `session_units = 0`, `COMPACT_AFTER = PREFS.compact_after || 10`
 
 ---
 
+## Item intake (skip if no ITEM_REF)
+
+Rules are canonical in `shared/forge-items-readback.md` — this block only wires them; it never restates the resolver contract, the provenance block shape, or the failure posture. Runs BEFORE `TASK_DESCRIPTION` is consumed by `forge-ids.js --new-task` (Multi-run resolution + TASK_ID, next section).
+
+```bash
+if [ -n "$ITEM_REF" ]; then
+  if [ -f "scripts/forge-items.js" ]; then
+    FORGE_SCRIPTS_DIR="scripts"
+  else
+    FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
+  fi
+  WORKING_DIR="${WORKING_DIR:-$(pwd)}"
+
+  ITEM_ID=$(node "$FORGE_SCRIPTS_DIR/forge-items.js" --resolve "$ITEM_REF" --cwd "$WORKING_DIR")
+  RESOLVE_RC=$?
+  if [ "$RESOLVE_RC" -ne 0 ]; then
+    echo "$ITEM_ID" >&2
+    exit "$RESOLVE_RC"
+  fi
+
+  ITEM_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-items.js" --read "$ITEM_ID" --cwd "$WORKING_DIR")
+  READ_RC=$?
+  if [ "$READ_RC" -ne 0 ]; then
+    echo "$ITEM_JSON" >&2
+    exit "$READ_RC"
+  fi
+
+  ITEM_STATUS=$(printf '%s' "$ITEM_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const o=JSON.parse(s);process.stdout.write(o.status||'')})")
+  if [ "$ITEM_STATUS" = "done" ] || [ "$ITEM_STATUS" = "dropped" ]; then
+    echo "Item $ITEM_ID está $ITEM_STATUS — reabra com: node scripts/forge-items.js --set-status $ITEM_ID triaged" >&2
+    exit 1
+  fi
+
+  ITEM_TITLE=$(printf '%s' "$ITEM_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const o=JSON.parse(s);process.stdout.write(o.title||'')})")
+  TASK_DESCRIPTION="$ITEM_TITLE"
+
+  ITEM_PROVENANCE=$(printf '%s' "$ITEM_JSON" | node -e "
+    let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+      const o=JSON.parse(s);
+      const lines=['## Item de origem',''];
+      const push=(label,val)=>{ if (val !== undefined && val !== null && val !== '') lines.push('- **'+label+':** '+val); };
+      push('ID', o.id);
+      push('Origem', o.source);
+      push('Arquivo', o.file);
+      push('SHA', o.sha);
+      push('Milestone', o.milestone);
+      push('Status', o.status);
+      lines.push('');
+      if (o.body) lines.push(o.body);
+      process.stdout.write(lines.join('\n'));
+    });
+  ")
+
+  echo "→ Item resolvido: $ITEM_ID — $ITEM_TITLE"
+fi
+```
+
+- Loud stop on resolve/read failure — never guess, never fall through to treating `$ITEM_REF` as a free-text description.
+- `TASK_DESCRIPTION` now carries the item title, so `forge-ids.js --new-task "$TASK_DESCRIPTION"` (next section) mints a meaningful `T-<ts>-<slug>` with no change to the ID logic.
+- `ITEM_PROVENANCE` is consumed later by `## Initialize task` (BRIEF) — omitted fields per the omission rule in `shared/forge-items-readback.md`.
+
+---
+
 ## Multi-run resolution + TASK_ID
 
 **Resolve scripts dir** for forge-runs.js / forge-cli-helpers.js:
@@ -117,7 +181,7 @@ mkdir -p .gsd/tasks
 TASK_ID=$(node "$FORGE_SCRIPTS_DIR/forge-ids.js" --new-task "$TASK_DESCRIPTION")
 ```
 
-- Resume mode: `TASK_ID` already set — skip to Dispatch loop
+- Resume mode: `TASK_ID` already set — skip to Dispatch loop. If the existing BRIEF has an `item:` key, read it for display/verification only (`ITEM_ID = <that value>`) — never re-`--promote` (the original registration already wrote it); `--set-status doing` is not re-issued here either (harmless if it were, but not required, per `shared/forge-items-readback.md § Transição para doing`).
 - Formato do `TASK_ID` segue a pref `ids.format` (resolvida pelo próprio forge-ids.js): `timestamp` (default) → `T-<YYYYMMDDHHMMSS>-<slug>` (slug omitido se a descrição for vaga); `sequential` → legado `TASK-00N` (max existente + 1 em `.gsd/tasks/`)
 
 **Isolation setup (branch/worktree)** — apply `forge_isolation` from prefs BEFORE registering the run. An explicit attach validates a registered lender and never creates a worktree; setup remains idempotent (`already-on-branch` / `already-exists`):
@@ -179,6 +243,14 @@ if [ -z "$RESUME_MODE" ]; then
   node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --attached-to "${ATTACH_RUN:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
   # Regenerate dashboard
   node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
+
+  # Item read-back: doing + promoted_to (fresh runs only, per shared/forge-items-readback.md — advisory failure)
+  if [ -n "$ITEM_ID" ]; then
+    node "$FORGE_SCRIPTS_DIR/forge-items.js" --set-status "$ITEM_ID" doing --cwd "$WORKING_DIR" > /dev/null 2>&1 \
+      || echo "⚠ Não foi possível marcar $ITEM_ID como doing (seguindo)" >&2
+    node "$FORGE_SCRIPTS_DIR/forge-items.js" --promote "$ITEM_ID" "$TASK_ID" --cwd "$WORKING_DIR" > /dev/null 2>&1 \
+      || echo "⚠ Não foi possível registrar promoted_to em $ITEM_ID (seguindo)" >&2
+  fi
 fi
 ```
 
@@ -198,7 +270,8 @@ node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK
 mkdir -p .gsd/tasks/{TASK_ID}
 ```
 
-Write `.gsd/tasks/{TASK_ID}/{TASK_ID}-BRIEF.md`:
+Write `.gsd/tasks/{TASK_ID}/{TASK_ID}-BRIEF.md`. When `ITEM_ID` is set, add an `item:` frontmatter key and append `{ITEM_PROVENANCE}` to the body — both omitted entirely for a free-text task, whose BRIEF stays byte-identical to today's. The BRIEF is the single provenance carrier: every downstream `/forge-task` prompt (brainstorm, discuss, research, plan) already inlines `## Task Brief` = this file's content, so one edit here propagates to all four phases without touching their templates.
+
 ```markdown
 ---
 id: {TASK_ID}
@@ -206,9 +279,12 @@ description: {TASK_DESCRIPTION}
 created: {ISO8601 date}
 skip_brainstorm: {true|false}
 skip_research: {true|false}
+item: {ITEM_ID}    # only when ITEM_ID is set — omit the line otherwise
 ---
 
 # {TASK_DESCRIPTION}
+
+{ITEM_PROVENANCE}   # only when ITEM_ID is set — omit entirely otherwise
 ```
 
 Show the user:
@@ -1218,6 +1294,7 @@ Arquivos modificados:
 Must-haves: todos verificados ✓
 
 → Nova task: /forge-task <descrição>
+→ A partir de um item: /forge-task <item-id>
 → Ver tasks: /forge-status
 ```
 
