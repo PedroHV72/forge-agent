@@ -14,3 +14,9 @@ do-not-commit/
 # estado interno do agente rodando sobre si mesmo, nunca entrega. Em projetos
 # que CONSOMEM o agente, .gsd/ pode ser commitado normalmente.
 .gsd/
+
+# macOS app build output
+app/build/
+
+# SPM build artefacts
+app/.build/

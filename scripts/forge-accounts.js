@@ -365,6 +365,12 @@ function listAccounts() {
       has_token: !!readToken(name),
       is_active: reg.active === name,
       is_env_active: envActive === name,
+      // Recorded identity (present once --set-email ran). Additive: readers
+      // that ignore unknown fields stay compatible. Never a secret — the token
+      // is deliberately absent here and only --token prints it.
+      email: a.email || null,
+      account_uuid: a.account_uuid || null,
+      email_source: a.email_source || null,
     })),
   };
 }

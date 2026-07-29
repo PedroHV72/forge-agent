@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Forge</string>
+  <key>CFBundleDisplayName</key>
+  <string>Forge</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.forge.menubar</string>
+  <key>CFBundleExecutable</key>
+  <string>Forge</string>
+  <key>CFBundleIconFile</key>
+  <string>Forge</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <!-- Deliberately NOT LSUIElement. A menu-bar-only app is invisible when the
+       user's menu bar is full — on a notched Mac the status item silently lands
+       behind the notch and no API can move it. The Dock icon and its badge are
+       the reliable surface. -->
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>

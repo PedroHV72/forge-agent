@@ -6,6 +6,49 @@ Agents: read this file at `~/.claude/forge-mcps.md` when handling MCP operations
 
 ---
 
+## Credentials — use the vault, not `.env`
+
+MCPs that need a secret used to read it from a `.env` file, or worse, take it as
+a command-line argument. Both are avoidable:
+
+- **`.env`** is plaintext on disk, one `git add -A` away from being committed,
+  and readable by anything the user runs.
+- **argv** is visible to `ps` for every process on the machine, for the whole
+  life of the server — not a brief window.
+
+`scripts/forge-secrets.js` stores the secret in the macOS Keychain and injects
+it into the server's environment at launch, and nowhere else:
+
+```bash
+printf %s "$FIGMA_API_KEY" | forge-secrets add figma default
+```
+
+```json
+{
+  "figma": {
+    "command": "forge-secrets",
+    "args": ["exec", "figma", "default", "--",
+             "npx", "-y", "figma-developer-mcp", "--stdio"]
+  }
+}
+```
+
+Three things to check before converting a server this way:
+
+1. **The server must read the value from the environment.** Many accept it only
+   as a flag. Verify rather than assume — `figma-developer-mcp` refuses to start
+   without a key and starts fine with `FIGMA_API_KEY` exported, which is what
+   made it convertible.
+2. **The variable name must be the one the server actually reads.** It is listed
+   per service in `forge-secrets --services`; a wrong name means the server
+   starts unauthenticated and fails as if the token were invalid.
+3. **Use an absolute path to the wrapper** if `~/.local/bin` is not on the PATH
+   the MCP client uses — a client launched from Finder does not inherit a shell
+   rc.
+
+Several secrets for the same service is the normal case (`figma/pessoal`,
+`figma/cliente`): name the entry and reference it in the args.
+
 ## Catalog
 
 ### fetch
@@ -47,9 +90,10 @@ Agents: read this file at `~/.claude/forge-mcps.md` when handling MCP operations
 ### brave-search
 
 - **Package:** `@modelcontextprotocol/server-brave-search`
-- **Command:** `/bin/sh` (shell wrapper — reads BRAVE_API_KEY from env)
-- **Args:** `["-c", "[ -f .env ] && set -a && . .env; exec npx -y @modelcontextprotocol/server-brave-search"]`
-- **Env:** `BRAVE_API_KEY` (read from `.env` or shell environment)
+- **Command:** `forge-secrets` (vault wrapper — injects BRAVE_API_KEY at launch)
+- **Args:** `["exec", "brave", "default", "--", "npx", "-y", "@modelcontextprotocol/server-brave-search"]`
+- **Env:** `BRAVE_API_KEY`, injected from the Keychain — see **Credentials** above.
+  The older `.env` form still works but leaves the key in plaintext on disk.
 - **Scope:** global
 - **Credentials:** yes — Brave Search API key (free tier: 2000 queries/month)
 - **Detect:** always recommended — gives agents a reliable web search backend beyond the built-in WebSearch tool

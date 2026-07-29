@@ -1,3 +1,34 @@
+## v3.0.0-beta — Gate protocol and the macOS app
+
+Two things that only make sense together: a way for an autonomous run to ask a
+question, and somewhere to answer it.
+
+### Added
+
+- **Gate protocol** (`scripts/forge-gate.js`). `AskUserQuestion` is not served to headless sessions — verified: the tool is absent from the `system/init` list — so `/forge-auto` could have autonomy or interactive gates, never both. Gates travel as files under `.gsd/forge/gates/`, the same shape Forge already uses for `pause` and `handoff-request`. Every gate carries a timeout and a declared default, so nobody answering resolves to the safe option instead of blocking forever.
+- **`review.ask_in_auto: gate`** — a third posture beside `defer` and `pause`. Asks without pausing: a timeout resolves as deferred so the milestone-final triage still surfaces it, and the artefact records whether a human or the clock decided. Opt-in; `defer` remains the default.
+- **macOS app** (`app/`, built by `./install.sh --with-app`). A second front-end over the same `.gsd/` files — the terminal stays first-class. Answer gates, watch runs with progress and next action, manage accounts by real headroom, edit preferences generated from the schema, read release notes, and see what the runs cost. Includes a real embedded terminal (SwiftTerm), so work starts in the app rather than being delegated to Terminal.app.
+- **Secrets vault** (`scripts/forge-secrets.js`). Tokens for external CLIs in the Keychain, injected into the child process by `forge-secrets exec` and nowhere else. Several entries per service (`railway/producao`, `railway/staging`), with ambiguity treated as an error rather than a guess. There is deliberately no command that prints a secret.
+- **Metrics** from `.gsd/forge/events.jsonl`, which the orchestrator has been writing since M002 and nothing was reading: spend and tokens by model, engine, phase and domain.
+- **Swift test suite** (`swift run ForgeKitTests`, wired into `node scripts/run-tests.js`).
+
+### Changed
+
+- MCP credentials move to the vault. The Figma key was plaintext in `~/.claude.json` and passed as a command-line flag; it is now in the Keychain and injected at launch. `shared/forge-mcps.md` documents the pattern and the checks that decide whether a server can be converted at all.
+- `forge-accounts --list --json` also emits `email`, `account_uuid` and `email_source` (additive; the token is still only available via `--token`).
+
+### Fixed
+
+- **Every `bin/` wrapper read the retired markdown preferences file.** After the move to JSONC, `forge-run`, `forge-accounts` and `forge-status` could no longer resolve `repo_path`, so the repo fallback was dead in all of them.
+- Preference editing could corrupt list-shaped values: nine knobs are arrays or objects and fell through to a text field that wrote them back as a single string.
+
+### Beta caveats
+
+- The app is ad-hoc signed. macOS therefore refuses it as a notification source — gate alerts fall back to a plain banner without action buttons — and re-asks for Keychain authorisation on every add or verify. A Developer ID resolves both; nothing else in the app depends on it.
+- Windows and Linux are unaffected: the app is macOS-only and `install.sh` builds it only with `--with-app`.
+
+---
+
 ## Unreleased — Cost-aware dispatch and native Claude Code runtime controls
 
 ### Added

@@ -15,6 +15,10 @@ BACKUP_DIR="${CLAUDE_DIR}/forge-agent-backup-$(date +%Y%m%d%H%M%S)"
 DRY_RUN=false
 UPDATE=false
 NO_MODEL_PROBE=false
+# Opt-in: the app is macOS-only and its first build resolves SwiftTerm from the
+# network, which takes minutes. Nobody upgrading the CLI should pay that
+# silently.
+WITH_APP=false
 
 # ── Args ─────────────────────────────────────────────────────────────────────
 for arg in "$@"; do
@@ -22,6 +26,7 @@ for arg in "$@"; do
     --dry-run)         DRY_RUN=true         ;;
     --update)          UPDATE=true          ;;
     --no-model-probe)  NO_MODEL_PROBE=true  ;;
+    --with-app)        WITH_APP=true        ;;
   esac
 done
 
@@ -560,6 +565,32 @@ fi
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════"
+# ── App macOS (opt-in) ────────────────────────────────────────────────────────
+# Not built by default: macOS-only, and the first build downloads SwiftTerm and
+# compiles for several minutes. `./install.sh --with-app` opts in.
+if $WITH_APP; then
+  echo ""
+  info "Building the macOS app..."
+  if [ "$(uname -s)" != "Darwin" ]; then
+    warn "  --with-app ignorado — o app é macOS-only"
+  elif ! command -v swift >/dev/null 2>&1; then
+    warn "  swift não encontrado. Instale as Command Line Tools: xcode-select --install"
+  elif [ ! -f "${REPO_DIR}/app/build.sh" ]; then
+    warn "  app/build.sh ausente neste checkout"
+  elif $DRY_RUN; then
+    dry "build + instalar /Applications/Forge.app"
+  else
+    if bash "${REPO_DIR}/app/build.sh" --install; then
+      success "Forge.app instalado em /Applications"
+      info "  Abra pelo Launchpad ou: open /Applications/Forge.app"
+      info "  Notificações com botões exigem assinar com Developer ID;"
+      info "  sem isso o app usa um aviso alternativo (sem botões)."
+    else
+      warn "  build do app falhou — o CLI continua instalado e funcional"
+    fi
+  fi
+fi
+
 if $DRY_RUN; then
   echo "Dry run completo. Nenhum arquivo foi alterado."
 else
@@ -576,5 +607,9 @@ else
   echo "  Gerenciar MCPs a qualquer momento: /forge-mcps"
   echo ""
   echo "  Ajuda a qualquer momento:   /forge-help"
+  if ! $WITH_APP; then
+    echo ""
+    echo "  App macOS (opcional):       ./install.sh --with-app"
+  fi
 fi
 echo ""

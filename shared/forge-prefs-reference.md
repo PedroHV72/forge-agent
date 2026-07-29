@@ -591,8 +591,8 @@ Review gate dialético antes de complete-slice (branch ainda não-mergeado): cha
 
 - **Tipo:** string
 - **Default:** `"defer"`
-- **Valores permitidos:** `defer`, `pause`
-- **Descrição:** defer = no forge-auto, objeções abertas NÃO pausam o loop — vão para a triagem final da milestone (honra a AUTONOMY RULE). pause = pergunta ao humano por slice mesmo em modo autônomo (opt-in).
+- **Valores permitidos:** `defer`, `pause`, `gate`
+- **Descrição:** defer = no forge-auto, objeções abertas NÃO pausam o loop — vão para a triagem final da milestone (honra a AUTONOMY RULE). pause = pergunta ao humano por slice mesmo em modo autônomo (opt-in). | gate = abre uma pergunta no mailbox (scripts/forge-gate.js) e espera com timeout — o app/CLI responde; sem resposta cai no default declarado, equivalente a defer. Não pausa o loop.
 
 ### `review.fix_conceded`
 
@@ -625,6 +625,12 @@ Review gate dialético antes de complete-slice (branch ainda não-mergeado): cha
 - **Tipo:** string
 - **Default:** `"claude-fable-5"`
 - **Descrição:** Modelo do defender (forge-advocate), resolvido para alias via scripts/forge-model-alias.js e auditado por scripts/forge-review-audit.js. ID sem alias omite model:. Default literal — nunca null.
+
+### `review.gate_timeout_ms`
+
+- **Tipo:** integer
+- **Default:** `1800000`
+- **Descrição:** Timeout (ms) da pergunta quando review.ask_in_auto: gate. Sem resposta dentro do prazo, o item é deferido para a triagem final (Step 9) — nunca fechado em silêncio. Default 30min.
 
 ## plan_gate
 
