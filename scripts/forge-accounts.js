@@ -317,6 +317,9 @@ function addAccount(name, token, note) {
     last_used: existing.last_used || null,
     note: note && note !== true ? String(note) : (existing.note || ''),
     store,
+    // Non-secret: WHERE the token went, never the token. Lets --list answer
+    // "has_token" without opening the Keychain (see listAccounts).
+    token_store: store,
   };
   if (!reg.active) reg.active = name; // first account becomes active by default
   saveRegistry(reg);
@@ -345,7 +348,7 @@ function renameAccount(oldName, newName) {
   const token = readToken(oldName);
   if (!token) throw new Error(`sem token armazenado para '${oldName}' — não dá pra renomear com segurança`);
   const store = storeToken(newName, token);
-  reg.accounts[newName] = { ...reg.accounts[oldName], store };
+  reg.accounts[newName] = { ...reg.accounts[oldName], store, token_store: store };
   delete reg.accounts[oldName];
   if (reg.active === oldName) reg.active = newName;
   saveRegistry(reg);
@@ -364,20 +367,61 @@ function useAccount(name) {
   return launchCommand(name);
 }
 
-function listAccounts() {
+/// Where a token was actually written, recorded at write time so that knowing
+/// "is there a token" never requires reading one. `false` is a real answer
+/// ("we looked and there is none"); `undefined` means nobody recorded it yet.
+function defaultStoreKind() { return IS_DARWIN ? 'keychain' : 'file'; }
+
+function probeTokenStore(name, recordedStore) {
+  return readToken(name) ? (recordedStore || defaultStoreKind()) : false;
+}
+
+/// Registered accounts, without touching the vault.
+///
+/// `has_token` used to be `!!readToken(name)`, which opened the Keychain once
+/// PER ACCOUNT on every call — and the app calls this at init, on `.onAppear`
+/// and after every mutation. On an ad-hoc signed bundle each of those reads can
+/// cost an authorisation dialog.
+///
+/// It is now derived from `token_store`, non-secret metadata persisted by
+/// `storeToken`'s callers. Unlike forge-secrets' `has_secret`, this stays a
+/// REAL BOOLEAN and never null: `ForgeKit/Models.swift` declares it
+/// non-optional, so a null would fail Codable for the whole account list, and
+/// the account pickers / usage poller / auto handoff all select on it.
+///
+/// Lazy backfill is what makes that safe: registries written before this field
+/// existed have no `token_store`, so the first call probes ONCE per account and
+/// persists the answer. Without it every existing account would report
+/// `has_token: false` and empty the pickers.
+///
+/// `verify` re-probes on demand and reconciles the metadata with reality (a
+/// token deleted straight from the Keychain, say) — the one place where paying
+/// the Keychain cost buys something.
+function listAccounts(opts) {
+  const verify = !!(opts && opts.verify);
   const reg = loadRegistry();
   const envActive = process.env.FORGE_ACCOUNT || null;
-  return {
-    active: reg.active,
-    env_active: envActive,
-    accounts: Object.entries(reg.accounts).map(([name, a]) => ({
+  let dirty = false;
+
+  const accounts = Object.entries(reg.accounts).map(([name, a]) => {
+    let tokenStore = a.token_store;
+    if (verify) {
+      const probed = probeTokenStore(name, a.store);
+      if (probed !== tokenStore) { a.token_store = tokenStore = probed; dirty = true; }
+    } else if (tokenStore === undefined) {
+      tokenStore = probeTokenStore(name, a.store);
+      a.token_store = tokenStore;
+      dirty = true;
+    }
+    return {
       name,
       note: a.note || '',
-      store: a.store || (IS_DARWIN ? 'keychain' : 'file'),
+      store: a.store || defaultStoreKind(),
       added_at: a.added_at || null,
       last_used: a.last_used || null,
       days_left: daysLeft(a.added_at),
-      has_token: !!readToken(name),
+      // Always a boolean — never null. See the note above.
+      has_token: !!tokenStore,
       is_active: reg.active === name,
       is_env_active: envActive === name,
       // Recorded identity (present once --set-email ran). Additive: readers
@@ -386,8 +430,14 @@ function listAccounts() {
       email: a.email || null,
       account_uuid: a.account_uuid || null,
       email_source: a.email_source || null,
-    })),
-  };
+    };
+  });
+
+  // Persist the backfill/reconciliation so the probe happens at most once.
+  // A read-only registry must not break listing, hence the swallow.
+  if (dirty) { try { saveRegistry(reg); } catch { /* re-probe next time */ } }
+
+  return { active: reg.active, env_active: envActive, accounts };
 }
 
 function currentAccount() {
@@ -791,7 +841,9 @@ Flags:
                                                 the token automatically (in a TTY)
   --add <name> --token <tok>                    register with an explicit token
   --add <name> --setup                          force the setup-token flow
-  --list [--json]                               list registered accounts
+  --list [--json] [--verify]                    list registered accounts (does NOT
+                                                open the Keychain; --verify re-reads
+                                                the vault and fixes stale metadata)
   --current [--json] [--name]                   show active account (registry + env);
                                                 --name prints just the active name
   --shell-init                                  emit a claude() shell function (zsh/bash)
@@ -859,7 +911,7 @@ function cliMain() {
       process.stdout.write(`added '${res.name}' (token in ${res.store})\n`);
 
     } else if ('list' in args) {
-      const data = listAccounts();
+      const data = listAccounts({ verify: 'verify' in args });
       if (args.json) { process.stdout.write(JSON.stringify(data, null, 2) + '\n'); return; }
       if (!data.accounts.length) { process.stdout.write('(no accounts registered)\n'); return; }
       for (const a of data.accounts) {
