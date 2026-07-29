@@ -130,9 +130,14 @@ struct MetricsView: View {
             if s.totalTokens > 0 {
                 VStack(alignment: .leading, spacing: 3) {
                     GeometryReader { geo in
+                        // Clamped, and never below a visible sliver: an input
+                        // share of 2% should still read as a segment rather
+                        // than vanish into the rounding.
+                        let inputW = max(3, min(geo.size.width - 3,
+                                                geo.size.width * (1 - s.outputShare)))
                         HStack(spacing: 2) {
                             Capsule().fill(Color.secondary.opacity(0.45))
-                                .frame(width: geo.size.width * (1 - s.outputShare))
+                                .frame(width: inputW)
                             Capsule().fill(Color.accentOrange.opacity(0.75))
                         }
                     }
@@ -187,52 +192,87 @@ struct MetricsView: View {
 
     private func breakdown(_ title: String, _ buckets: [MetricsBucket],
                            showFamily: Bool) -> some View {
-        let max = buckets.first?.totalTokens ?? 1
+        // Scale against the largest token count, not the first bucket: the list
+        // is ordered by SPEND, so a cheap high-volume model can sit below a
+        // pricey one and would otherwise render past its track.
+        let peak = MetricsEngine.maxTokens(buckets)
+        let totalCost = buckets.reduce(0) { $0 + $1.cost }
+
         return VStack(alignment: .leading, spacing: 8) {
-            SectionTitle(title)
-            VStack(spacing: 7) {
-                ForEach(buckets.prefix(8)) { b in
-                    HStack(spacing: 9) {
-                        if showFamily {
-                            let fam = ModelCatalog.family(of: b.key)
-                            Image(systemName: fam.icon)
-                                .font(.caption).foregroundStyle(fam.color).frame(width: 16)
-                        }
-                        Text(showFamily ? ModelCatalog.label(for: b.key) : b.key)
-                            .font(.caption).lineLimit(1)
-                            .frame(width: 140, alignment: .leading)
-
-                        GeometryReader { geo in
-                            ZStack(alignment: .leading) {
-                                Capsule().fill(.quaternary).frame(height: 5)
-                                Capsule().fill(barColor(b, showFamily: showFamily))
-                                    .frame(width: geo.size.width
-                                           * (max > 0 ? Double(b.totalTokens) / Double(max) : 0),
-                                           height: 5)
-                            }
-                            .frame(maxHeight: .infinity, alignment: .center)
-                        }
-                        .frame(height: 8)
-
-                        Text(MetricsEngine.tokens(b.totalTokens))
-                            .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
-                            .frame(width: 52, alignment: .trailing)
-                        Text(b.costIncomplete && b.cost == 0 ? "—" : MetricsEngine.money(b.cost))
-                            .font(.caption2).monospacedDigit()
-                            .foregroundStyle(b.cost > 0 ? AnyShapeStyle(.primary)
-                                                        : AnyShapeStyle(.tertiary))
-                            .frame(width: 56, alignment: .trailing)
-                            .help(b.costIncomplete ? "Cobrado fora da Anthropic" : "Custo estimado")
-                        Text("\(b.dispatches)×")
-                            .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
-                            .frame(width: 34, alignment: .trailing)
-                    }
+            HStack(spacing: 6) {
+                SectionTitle(title)
+                Spacer()
+                Text("\(buckets.count)")
+                    .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
+            }
+            VStack(spacing: 0) {
+                ForEach(Array(buckets.prefix(10).enumerated()), id: \.element.id) { idx, b in
+                    if idx > 0 { Divider().opacity(0.4) }
+                    breakdownRow(b, peak: peak, totalCost: totalCost, showFamily: showFamily)
                 }
             }
-            .padding(14)
+            .padding(.horizontal, 14).padding(.vertical, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         }
+    }
+
+    /// One row. The numeric columns keep fixed widths so they line up down the
+    /// list; only the bar flexes, which is what keeps this readable as the
+    /// window resizes.
+    private func breakdownRow(_ b: MetricsBucket, peak: Int, totalCost: Double,
+                              showFamily: Bool) -> some View {
+        let fam = ModelCatalog.family(of: b.key)
+        let share = totalCost > 0 ? b.cost / totalCost : 0
+
+        return HStack(spacing: 10) {
+            if showFamily {
+                Image(systemName: fam.icon)
+                    .font(.system(size: 12)).foregroundStyle(fam.color)
+                    .frame(width: 16)
+            }
+
+            Text(showFamily ? ModelCatalog.label(for: b.key) : b.key)
+                .font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                .frame(minWidth: 90, idealWidth: 130, maxWidth: 170, alignment: .leading)
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.quaternary).frame(height: 6)
+                    Capsule()
+                        .fill(showFamily ? fam.color.opacity(0.85)
+                                         : Color.accentOrange.opacity(0.7))
+                        .frame(width: geo.size.width
+                               * MetricsEngine.fraction(b.totalTokens, of: peak),
+                               height: 6)
+                }
+                .frame(maxHeight: .infinity, alignment: .center)
+            }
+            .frame(minWidth: 60, maxHeight: 22)
+
+            Text(MetricsEngine.tokens(b.totalTokens))
+                .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                .frame(width: 58, alignment: .trailing)
+
+            VStack(alignment: .trailing, spacing: 0) {
+                Text(b.cost > 0 ? MetricsEngine.money(b.cost) : "—")
+                    .font(.system(size: 12)).monospacedDigit()
+                    .foregroundStyle(b.cost > 0 ? AnyShapeStyle(.primary)
+                                                : AnyShapeStyle(.tertiary))
+                if share >= 0.01 {
+                    Text("\(Int(share * 100))%")
+                        .font(.system(size: 9)).monospacedDigit().foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: 64, alignment: .trailing)
+            .help(b.costIncomplete && b.cost == 0
+                  ? "Cobrado fora da Anthropic" : "Custo estimado")
+
+            Text("\(b.dispatches)×")
+                .font(.system(size: 11)).monospacedDigit().foregroundStyle(.tertiary)
+                .frame(width: 40, alignment: .trailing)
+        }
+        .padding(.vertical, 7)
     }
 
     private func barColor(_ b: MetricsBucket, showFamily: Bool) -> Color {

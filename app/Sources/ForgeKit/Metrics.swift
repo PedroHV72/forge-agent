@@ -204,6 +204,23 @@ public enum MetricsEngine {
         return String(format: "%.2fM", Double(n) / 1_000_000)
     }
 
+    /// The largest token count in a set — the denominator a bar must use.
+    ///
+    /// Buckets are ordered by SPEND, so the first one is not necessarily the
+    /// longest bar: a cheap model can dominate token volume. Scaling against
+    /// `first` instead of `max` let a bar render at 297% of its track and cover
+    /// the numbers beside it.
+    public static func maxTokens(_ buckets: [MetricsBucket]) -> Int {
+        max(1, buckets.map(\.totalTokens).max() ?? 1)
+    }
+
+    /// Bar width fraction, clamped to 0...1 so no rounding or stale denominator
+    /// can push a bar past its track.
+    public static func fraction(_ value: Int, of total: Int) -> Double {
+        guard total > 0 else { return 0 }
+        return min(1, max(0, Double(value) / Double(total)))
+    }
+
     public static func money(_ v: Double) -> String {
         v < 0.01 && v > 0 ? "<$0,01" : String(format: "$%.2f", v)
     }

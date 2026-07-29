@@ -1076,6 +1076,26 @@ test("catálogo real da máquina tem comandos do forge") {
                "esperava comandos forge instalados; achei \(all.count)")
 }
 
+test("maxTokens usa o maior, não o primeiro") {
+    // Buckets are ordered by spend, so a cheap high-volume model sits below a
+    // pricey low-volume one — scaling against first() rendered a bar at 297%.
+    var fable = MetricsBucket(key: "claude-fable-5")
+    fable.cost = 70.51; fable.inputTokens = 1_420_000
+    var sonnet = MetricsBucket(key: "claude-sonnet-5")
+    sonnet.cost = 62.64; sonnet.inputTokens = 4_220_000
+
+    let ordered = [fable, sonnet]   // sorted by cost, not tokens
+    assertEqual(MetricsEngine.maxTokens(ordered), 4_220_000)
+    assertEqual(MetricsEngine.fraction(sonnet.totalTokens,
+                                       of: MetricsEngine.maxTokens(ordered)), 1.0)
+}
+
+test("fração nunca passa de 1 nem fica negativa") {
+    assertEqual(MetricsEngine.fraction(500, of: 100), 1.0)
+    assertEqual(MetricsEngine.fraction(-5, of: 100), 0.0)
+    assertEqual(MetricsEngine.fraction(10, of: 0), 0.0, "sem denominador não desenha")
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")

@@ -259,7 +259,7 @@ struct NowView: View {
                 .foregroundStyle(canSubmit ? Color.accentOrange : Color.secondary.opacity(0.35))
                 .disabled(!canSubmit)
                 .keyboardShortcut(.return, modifiers: .command)
-                .help(canSubmit ? "⌘↩ para enviar"
+                .help(canSubmit ? "↩ para enviar · ⇧↩ para nova linha"
                                 : "Escolha um projeto com @ antes de enviar")
                 // Nudge the icon onto the text line: a symbol is taller than
                 // the glyphs it sits beside.
@@ -385,8 +385,14 @@ struct NowView: View {
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
 
-            Text("⌘↩").font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.tertiary)
+            HStack(spacing: 3) {
+                Text("↩").font(.system(size: 11, design: .monospaced))
+                Text("enviar").font(.system(size: 10))
+                Text("·").foregroundStyle(.quaternary)
+                Text("⇧↩").font(.system(size: 11, design: .monospaced))
+                Text("nova linha").font(.system(size: 10))
+            }
+            .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
     }
@@ -398,20 +404,33 @@ struct NowView: View {
     /// movement and newlines behave normally the rest of the time — which a
     /// global event monitor could not promise.
     private func handleKey(_ action: PromptEditor.KeyAction) -> Bool {
-        guard showingMenu else { return false }
-        switch action {
-        case .up:
-            highlighted = max(0, highlighted - 1)
-        case .down:
-            highlighted = min(menuCount - 1, highlighted + 1)
-        case .tab, .enter:
-            acceptHighlighted()
-        case .escape:
-            // End the token rather than clearing the line: the text typed so
-            // far is still what the user meant.
-            text += " "
+        // With the menu open, the keys drive the menu.
+        if showingMenu {
+            switch action {
+            case .up:
+                highlighted = max(0, highlighted - 1)
+            case .down:
+                highlighted = min(menuCount - 1, highlighted + 1)
+            case .tab, .enter:
+                acceptHighlighted()
+            case .shiftEnter:
+                return false        // still a newline
+            case .escape:
+                // End the token rather than clearing the line: what was typed
+                // so far is still what the user meant.
+                text += " "
+            }
+            return true
         }
-        return true
+
+        // Menu closed: Enter sends, Shift+Enter breaks the line. That is the
+        // convention in Claude Code and every chat input, and it is why ⌘↩ read
+        // as an odd requirement rather than a shortcut.
+        if action == .enter {
+            submit()
+            return true
+        }
+        return false
     }
 
     private func acceptHighlighted() {

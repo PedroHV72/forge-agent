@@ -24,7 +24,7 @@ struct PromptEditor: NSViewRepresentable {
     var onKey: (KeyAction) -> Bool = { _ in false }
     var onSubmit: () -> Void = {}
 
-    enum KeyAction { case up, down, tab, enter, escape }
+    enum KeyAction { case up, down, tab, enter, shiftEnter, escape }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -96,7 +96,7 @@ final class KeyCatchingTextView: NSTextView {
         case 126: action = .up
         case 125: action = .down
         case 48:  action = .tab
-        case 36:  action = .enter
+        case 36:  action = event.modifierFlags.contains(.shift) ? .shiftEnter : .enter
         case 53:  action = .escape
         default:  action = nil
         }
