@@ -633,6 +633,62 @@ test("dashboard_refresh_on tem vocabulário fechado") {
                "lista aberta não pode virar checkbox")
 }
 
+print("\nProjectOrganiser (21 projetos aninhados não cabem numa lista plana)")
+
+let sample = [
+    "/h/Development",
+    "/h/Development/message",
+    "/h/Development/lookchina",
+    "/h/Development/lookchina/services",
+    "/h/Development/lookchina/services/asgard",
+    "/h/Development/lookchina/services/loki",
+    "/h/Development/lookchina/apps/odin",
+]
+
+test("agrupa pelo diretório pai") {
+    let g = ProjectOrganiser.groups(sample, home: "/h")
+    let titles = g.map(\.title)
+    assertTrue(titles.contains("~/Development"), "faltou ~/Development: \(titles)")
+    assertTrue(titles.contains("~/Development/lookchina/services"), "faltou services")
+    let services = g.first { $0.title == "~/Development/lookchina/services" }!
+    assertEqual(services.projects.map(ProjectOrganiser.name), ["asgard", "loki"])
+}
+
+test("grupos saem em ordem estável de caminho") {
+    let a = ProjectOrganiser.groups(sample, home: "/h").map(\.path)
+    let b = ProjectOrganiser.groups(sample.reversed(), home: "/h").map(\.path)
+    assertEqual(a, b, "ordem não pode depender da ordem de entrada")
+    assertEqual(a, a.sorted(), "pais ordenados por caminho")
+}
+
+test("detecta projeto que contém outros") {
+    // A stray .gsd/ at the top of a code folder swallows everything below it,
+    // and from a flat list that is invisible.
+    let c = ProjectOrganiser.containment(sample)
+    assertEqual(c["/h/Development"], 6, "Development contém todos os outros")
+    assertEqual(c["/h/Development/lookchina"], 4)
+    assertTrue(c["/h/Development/message"] == nil, "folha não contém nada")
+}
+
+test("prefixo parcial não conta como contido") {
+    // "/h/Dev" must not swallow "/h/Development".
+    let c = ProjectOrganiser.containment(["/h/Dev", "/h/Development"])
+    assertTrue(c["/h/Dev"] == nil, "prefixo de string não é contenção de caminho")
+}
+
+test("container devolve o pai mais próximo") {
+    let owner = ProjectOrganiser.container(of: "/h/Development/lookchina/services/asgard",
+                                           in: sample)
+    assertEqual(owner, "/h/Development/lookchina/services",
+                "o mais próximo, não o mais alto")
+    assertTrue(ProjectOrganiser.container(of: "/h/Development", in: sample) == nil)
+}
+
+test("abbreviate encurta o home") {
+    assertEqual(ProjectOrganiser.abbreviate("/h/Development", home: "/h"), "~/Development")
+    assertEqual(ProjectOrganiser.abbreviate("/outro/x", home: "/h"), "/outro/x")
+}
+
 
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")

@@ -83,38 +83,57 @@ struct ProjectsView: View {
     @State private var scanning = false
     @State private var showDiscovery = false
     @State private var dropTargeted = false
+    @AppStorage("projectsGrouping") private var groupingRaw = ProjectGrouping.byFolder.rawValue
+    @State private var collapsed: Set<String> = []
 
-    /// Projects that need attention float to the top: questions first, then
-    /// active runs, then name. The list answers "where do I go now?" by order.
-    private var ordered: [String] {
-        state.workspaces.sorted { a, b in
+    private var grouping: ProjectGrouping {
+        ProjectGrouping(rawValue: groupingRaw) ?? .byFolder
+    }
+
+    /// Projects needing attention first: questions, then active runs, then name.
+    /// The order answers "where do I go now?" without reading every card.
+    private func ordered(_ list: [String]) -> [String] {
+        list.sorted { a, b in
             let ga = state.pending.filter { $0.cwd == a }.count
             let gb = state.pending.filter { $0.cwd == b }.count
             if ga != gb { return ga > gb }
             let ra = state.liveRuns.filter { $0.cwd == a }.count
             let rb = state.liveRuns.filter { $0.cwd == b }.count
             if ra != rb { return ra > rb }
-            return URL(fileURLWithPath: a).lastPathComponent
-                .localizedCaseInsensitiveCompare(URL(fileURLWithPath: b).lastPathComponent) == .orderedAscending
+            return ProjectOrganiser.name(a)
+                .localizedCaseInsensitiveCompare(ProjectOrganiser.name(b)) == .orderedAscending
         }
     }
 
+    private var containment: [String: Int] {
+        ProjectOrganiser.containment(state.workspaces)
+    }
+
+    private let columns = [GridItem(.adaptive(minimum: 300), spacing: 14)]
+
     var body: some View {
         ScrollView {
-            // Adaptive grid: one column in a narrow window, more as it widens,
-            // instead of a single stretched column that wastes the space.
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 300), spacing: 14)],
-                alignment: .leading, spacing: 14
-            ) {
-                ForEach(ordered, id: \.self) { ws in
-                    ProjectCard(path: ws, state: state)
+            VStack(alignment: .leading, spacing: 14) {
+                if !state.workspaces.isEmpty { hazardNotice }
+
+                switch grouping {
+                case .flat:
+                    LazyVGrid(columns: columns, alignment: .leading, spacing: 14) {
+                        ForEach(ordered(state.workspaces), id: \.self) { ws in
+                            ProjectCard(path: ws, state: state,
+                                        contains: containment[ws] ?? 0)
+                        }
+                    }
+                case .byFolder:
+                    ForEach(ProjectOrganiser.groups(state.workspaces)) { group in
+                        folderSection(group)
+                    }
                 }
+
+                if state.workspaces.isEmpty { empty }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
-
-            if state.workspaces.isEmpty { empty }
         }
         .navigationTitle("Projetos")
         .overlay {
@@ -125,8 +144,6 @@ struct ProjectsView: View {
                     .overlay(Text("Solte para adicionar").font(.callout).bold())
             }
         }
-        // Dropping a folder is the fastest way in when you already have it open
-        // in Finder.
         .onDrop(of: ["public.file-url"], isTargeted: $dropTargeted) { providers in
             for p in providers {
                 _ = p.loadObject(ofClass: URL.self) { url, _ in
@@ -144,6 +161,14 @@ struct ProjectsView: View {
         }
         .toolbar {
             ToolbarItem {
+                Picker("", selection: $groupingRaw) {
+                    ForEach(ProjectGrouping.allCases, id: \.rawValue) { g in
+                        Text(g.rawValue).tag(g.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+            }
+            ToolbarItem {
                 Button { scan() } label: {
                     if scanning { ProgressView().controlSize(.small) }
                     else { Label("Procurar", systemImage: "sparkle.magnifyingglass") }
@@ -159,6 +184,83 @@ struct ProjectsView: View {
         }
     }
 
+    // MARK: Folder section
+
+    @ViewBuilder private func folderSection(_ group: ProjectGroup) -> some View {
+        let isCollapsed = collapsed.contains(group.path)
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    if isCollapsed { collapsed.remove(group.path) }
+                    else { collapsed.insert(group.path) }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 9))
+                    Image(systemName: "folder").font(.caption)
+                    Text(group.title).font(.callout).bold()
+                    Text("\(group.projects.count)")
+                        .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
+                    // Attention rolls up: a collapsed folder still says whether
+                    // something inside needs you.
+                    let pending = group.projects
+                        .flatMap { ws in state.pending.filter { $0.cwd == ws } }.count
+                    if pending > 0 {
+                        Text("\(pending)")
+                            .font(.caption2).monospacedDigit()
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.accentOrange.opacity(0.22), in: Capsule())
+                            .foregroundStyle(Color.accentOrange)
+                    }
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+
+            if !isCollapsed {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 14) {
+                    ForEach(ordered(group.projects), id: \.self) { ws in
+                        ProjectCard(path: ws, state: state, contains: containment[ws] ?? 0)
+                    }
+                }
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    // MARK: Hazard
+
+    /// A project containing most of the others is nearly always a stray .gsd/ at
+    /// the top of a code folder. Never removed automatically — a monorepo does
+    /// legitimately contain its own services — but it should not stay invisible.
+    @ViewBuilder private var hazardNotice: some View {
+        let suspects = containment
+            .filter { $0.value >= max(3, state.workspaces.count / 2) }
+            .sorted { $0.value > $1.value }
+        if let worst = suspects.first {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(Color.accentOrange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(ProjectOrganiser.name(worst.key)) contém \(worst.value) dos outros projetos")
+                        .font(.callout)
+                    Text("Um .gsd/ na raiz de uma pasta de código engole tudo abaixo dela. Se não for proposital, remova-o da lista.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Remover da lista") { state.removeWorkspace(worst.key) }
+                    .controlSize(.small)
+            }
+            .padding(13)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentOrange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.accentOrange.opacity(0.3)))
+        }
+    }
+
     private func scan() {
         scanning = true
         Task.detached(priority: .userInitiated) {
@@ -167,11 +269,8 @@ struct ProjectsView: View {
                 let known = Set(state.workspaces)
                 discovered = hits.filter { !known.contains($0) }
                 scanning = false
-                if discovered.isEmpty {
-                    state.show("Nenhum projeto novo encontrado")
-                } else {
-                    showDiscovery = true
-                }
+                if discovered.isEmpty { state.show("Nenhum projeto novo encontrado") }
+                else { showDiscovery = true }
             }
         }
     }
@@ -194,8 +293,7 @@ struct ProjectsView: View {
     }
 }
 
-/// Results of a scan, with everything pre-selected — the common case is
-/// "add them all".
+/// Results of a scan, pre-selected — the common case is "add them all".
 struct DiscoverySheet: View {
     @ObservedObject var state: AppState
     let found: [String]
@@ -214,8 +312,10 @@ struct DiscoverySheet: View {
                     set: { on in if on { selected.insert(p) } else { selected.remove(p) } }
                 )) {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(URL(fileURLWithPath: p).lastPathComponent).font(.callout)
-                        Text(abbreviate(p)).font(.caption2).foregroundStyle(.tertiary)
+                        Text(ProjectOrganiser.name(p)).font(.callout)
+                        Text(ProjectOrganiser.abbreviate(
+                            p, home: FileManager.default.homeDirectoryForCurrentUser.path))
+                            .font(.caption2).foregroundStyle(.tertiary)
                     }
                 }
             }
@@ -227,29 +327,24 @@ struct DiscoverySheet: View {
                 }
                 .controlSize(.small)
                 Spacer()
-                Button("Cancelar") { isPresented = false }
-                    .keyboardShortcut(.cancelAction)
+                Button("Cancelar") { isPresented = false }.keyboardShortcut(.cancelAction)
                 Button("Adicionar \(selected.count)") {
                     for p in selected { state.addWorkspace(p) }
                     isPresented = false
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(selected.isEmpty)
+                .keyboardShortcut(.defaultAction).disabled(selected.isEmpty)
             }
         }
         .padding(20).frame(width: 520)
         .onAppear { selected = Set(found) }
-    }
-
-    private func abbreviate(_ p: String) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return p.hasPrefix(home) ? "~" + p.dropFirst(home.count) : p
     }
 }
 
 struct ProjectCard: View {
     let path: String
     @ObservedObject var state: AppState
+    /// How many other registered projects live inside this one.
+    var contains: Int = 0
 
     @State private var status: ProjectStatus?
     @State private var checkouts: [Checkout] = []
@@ -342,6 +437,11 @@ struct ProjectCard: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
                     Text(name).font(.headline).lineLimit(1)
+                    if contains > 0 {
+                        Text("⊃ \(contains)")
+                            .font(.system(size: 9)).foregroundStyle(Color.accentOrange)
+                            .help("Contém \(contains) outro(s) projeto(s) registrado(s)")
+                    }
                     ForEach(Array(FolderLook.tagColors(for: path).enumerated()), id: \.offset) { _, c in
                         Circle().fill(c).frame(width: 7, height: 7)
                     }
