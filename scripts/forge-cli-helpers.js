@@ -86,7 +86,10 @@ function resolveRunFromArgs(cwd, argsRaw, opts) {
       return { run_id: null, kind: null, status: 'error', message: `Task ID "${arg}" não encontrado no registry.` };
     }
 
-    // kind === 'unknown' — isValid passed but entityKind returned unknown (should not happen with current patterns)
+    // Neither milestone nor task. Reached by kind === 'item' (I-<ts>-<slug> work
+    // items are valid IDs but are not runnable units — item commands live in
+    // forge-items.js), and by kind === 'unknown' if a future ID shape validates
+    // without a kind. Both error out gracefully here — never treated as a run.
     return { run_id: null, kind: null, status: 'error', message: `Argumento "${arg}" não reconhecido. Use M###, M-<ts>..., TASK-### ou T-<ts>...` };
   }
 
