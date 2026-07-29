@@ -312,7 +312,7 @@ The produced `T##-SECURITY.md` will be injected into the execute-task worker pro
    - The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literals are a violation detected by `forge-review-audit.js`.
    - Resolve (Step 5 truth table), write `{S##}-REVIEW.md` (Step 6).
    - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty.
-   - **OPEN items (Step 7b, interactive):** each OPEN objection is put to the user via `AskUserQuestion` — `Manter abordagem` / `Refatorar agora` (dispatches a `review-fix` unit for the accepted items) / `Criar follow-up` — and the decision is written back into `{S##}-REVIEW.md`.
+   - **OPEN items (Step 7b, interactive):** each OPEN objection is put to the user via `AskUserQuestion` — `Manter abordagem` / `Refatorar agora` (dispatches a `review-fix` unit for the accepted items) / `Criar follow-up` (creates an item per `shared/forge-review.md § Item capture`, source `review/{S##}/{R#}`, plus the pointer line in `.gsd/KNOWLEDGE.md § Review follow-ups`) — and the decision is written back into `{S##}-REVIEW.md`.
    - Append the `review` event to `events.jsonl` (Step 8).
 4. The gate **never blocks** — any `Agent()` throw is recorded and the step proceeds to `complete-slice` regardless.
    - On throw, follow `shared/forge-review.md § Agent unavailability (review-agent-unavailable)`: retry first via `shared/forge-dispatch.md § Retry Handler`; if the agent stays unavailable, emit `review-agent-unavailable` (`review-advocate-unavailable` | `review-challenger-unavailable`) — **never** the CRITICAL failure path.
@@ -323,7 +323,7 @@ The produced `T##-SECURITY.md` will be injected into the execute-task worker pro
 
 > Fires ONLY when the derived unit is `complete-slice`. Boundary is per-slice; standalone `/forge-task` keeps its own step-5.5 review. After the gate, dispatch `forge-completer` normally.
 
-**Review triage gate (before complete-milestone):** If `unit_type == complete-milestone`, run the milestone-final triage (`shared/forge-review.md § Step 9`) BEFORE dispatching `forge-completer`. In pure forge-next sessions OPEN items were already decided live per-slice, so this usually finds nothing and skips silently — it exists for mixed sessions (slices run under `forge-auto` with `ask_in_auto: defer`, milestone closed via `forge-next`): scan all `{S##}-REVIEW.md` for pending `deferido`/`falhou — deferida` items, triage each via `AskUserQuestion`, dispatch ONE `review-fix/{M###}-triage` for the `Refatorar agora` items, write decisions back, append the `review-triage` event. Never blocks the close-out.
+**Review triage gate (before complete-milestone):** If `unit_type == complete-milestone`, run the milestone-final triage (`shared/forge-review.md § Step 9`) BEFORE dispatching `forge-completer`. In pure forge-next sessions OPEN items were already decided live per-slice, so this usually finds nothing and skips silently — it exists for mixed sessions (slices run under `forge-auto` with `ask_in_auto: defer`, milestone closed via `forge-next`): scan all `{S##}-REVIEW.md` for pending `deferido`/`falhou — deferida` items, triage each via `AskUserQuestion`, dispatch ONE `review-fix/{M###}-triage` for the `Refatorar agora` items (`Criar follow-up` items create an item per `shared/forge-review.md § Item capture`, source `review/{S##}/{R#}`, plus the pointer line in `.gsd/KNOWLEDGE.md § Review follow-ups`), write decisions back, append the `review-triage` event. Never blocks the close-out.
 
 **Plan-check gate (between plan-slice and first execute-task):**
 
@@ -497,13 +497,13 @@ Para cada finding individual (ou grupo de warns relacionados), invocar `AskUserQ
 ```
 Header: "Plano {S##} — <nome da dimensão>  [fail|warn]"
 Body:   "<justificativa de uma linha do checker para aquela dimensão/task>"
-Options: ["Manter — aceitar assim", "Corrigir no ato", "Deferir — criar follow-up"]
+Options: ["Manter — aceitar assim", "Corrigir no ato", "Deferir — vira item no backlog"]
 ```
 
 Registrar a resolução de cada finding individualmente (para inclusão no marker):
 - `Manter` → aceitar o finding sem mudança; anotar no marker como `{dimensão}: mantido`.
 - `Corrigir no ato` → prosseguir para Gate Step 3 (edição livre) com intenção de corrigir.
-- `Deferir` → aceitar por ora; anotar no marker como `{dimensão}: deferido`.
+- `Deferir` → cria um item per `shared/forge-review.md § Item capture` (source `plan-gate/{S##}`, `origin: auto`, `status: inbox`, sem `file` — esta junção não tem um) e anota no marker como `{dimensão}: deferido → {I-id} — {title}`.
 
 Se não houver findings `warn`/`fail` (all-pass) e `INTERACTIVE == always` → pular Gate Step 2 (nada a lapidar); ir direto para Gate Step 3 (edição livre opcional).
 
@@ -1260,6 +1260,21 @@ Parse the `---GSD-WORKER-RESULT---` block:
 | `tooling_failure` | "command not found", "permission denied", "ENOENT" | "Tooling error — check that required tools are installed." |
 | `external_dependency` | "API", "network", "not running" | "External dependency unavailable — resolve it and re-run `/forge-next`." |
 | `unknown` | anything else | Surface raw blocker message. |
+
+**Item capture on terminal stops.** Fires only for the branches above that do NOT persist a retry cursor — `scope_exceeded`, `tooling_failure`, `external_dependency`, `unknown`, and the chain-exhausted / tier-max-terminal sub-branches of `context_overflow`, `model_refusal`, `429`, `400` (i.e. exactly where the table says "blocked → human" / "chain exhausted" / no cursor written). It never fires when `$NEXT`/the escalated tier is non-empty and a cursor is written — the system has not given up yet.
+
+  <!-- item-capture:blocked:start -->
+  Create a work-item so the blocker is not lost, per `shared/forge-review.md § Item capture`. Dedup guard first — skip creation if an open item already exists for this source:
+  ```bash
+  EXISTING=$(node "$FORGE_SCRIPTS_DIR/forge-items.js" --list --json --cwd "$WORKING_DIR" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const items=JSON.parse(s);const found=(items.items||items||[]).some(i=>i.source==='blocked/{unit_type}/{unit_id}'&&!['done','dropped'].includes(i.status));process.stdout.write(found?'1':'')}catch(e){process.stdout.write('')}})")
+  if [ -z "$EXISTING" ]; then
+    PAYLOAD=$(node -e "process.stdout.write(JSON.stringify({title: process.argv[1], origin: 'auto', status: 'triaged', source: process.argv[2], milestone: process.argv[3], body: process.argv[4]}))" \
+      "[{classe}] {unit_type}/{unit_id} bloqueado — {resumo}" "blocked/{unit_type}/{unit_id}" "${RUN_ID:-{M###}}" "{blocker excerpt}. Recuperações tentadas: {recovery attempts, if any}")
+    printf '%s' "$PAYLOAD" | node "$FORGE_SCRIPTS_DIR/forge-items.js" --add --cwd "$WORKING_DIR" || echo "WARN: item capture failed for blocked/{unit_type}/{unit_id} — continuing"
+  fi
+  ```
+  This is a plain Bash call — never behind `AskUserQuestion`, never pauses the loop (AUTONOMY RULE intact). A non-zero `--add` exit is a warning, not a blocker for this stop path.
+  <!-- item-capture:blocked:end -->
 
 **Node Repair gate (Layer 3 — disjoint from Layers 1 and 2):** Applies ONLY when `unit_type == execute-task`. Trigger: `status: done` AND `S##-VERIFICATION.md` rows show must_have drift (artifacts `substantive:false` / `wired:false`, test-quality flags) OR `status: partial` with must_haves unmet. `Agent()` throws → Layer 1. `status: blocked` → Layer 2. Do NOT overlap. See full spec: `shared/forge-dispatch.md § Node Repair`.
 
