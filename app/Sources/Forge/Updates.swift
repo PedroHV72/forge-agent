@@ -89,7 +89,11 @@ final class UpdateStore: ObservableObject {
     @Published private(set) var blockedMessage: String?
     @Published private(set) var blockedCommand: String?
 
-    /// Run install.sh --update --with-app headless, streaming its output.
+    /// Run the installer headless, streaming its output. The ONE execution path
+    /// behind both `runUpdate()` and `runReinstall()` — the two differ only in
+    /// the command `InstallerCommand` composes and in whether the git precheck
+    /// applies, so duplicating this body would let them drift apart in behaviour
+    /// nobody is watching.
     ///
     /// No Terminal window: under `--update` the installer cannot ask anything.
     /// Its four interactive reads are all behind `if ! $UPDATE && [ -t 0 ]` — a
@@ -97,21 +101,27 @@ final class UpdateStore: ObservableObject {
     /// headless run has nothing to block on. What the Terminal really provided
     /// was visible progress, and that is now this app's own job.
     ///
-    /// `--with-app` is not optional here even though it is opt-in on the command
-    /// line. The app build is gated behind that flag, so an update launched FROM
-    /// the app that omitted it would refresh every agent, skill and script and
-    /// leave the one binary the user is looking at on the old version — the update
-    /// would appear to have worked while the app stayed exactly as it was.
-    func runUpdate() {
-        guard let repo else { return }
+    /// The command itself — and why `--with-app` is mandatory here, and why the
+    /// reinstall mode never pulls — lives in `InstallerCommand` in ForgeKit,
+    /// where it is unit-tested. This function does not compose shell strings.
+    private func runInstaller(mode: InstallerCommand.Mode) {
+        guard let repo else {
+            // Reachable since v3.2.0: "Reinstalar" renders even with no version
+            // resolved, so a click with no stored repo used to do nothing at all
+            // — no bar, no error.
+            lastError = "não encontrei o repo do Forge nas preferências"
+            return
+        }
         blockedMessage = nil
         blockedCommand = nil
 
         // Check before starting, not after: `git pull --ff-only` failing halfway
         // means the operator watched a progress bar for something that could
-        // never have begun.
+        // never have begun. Only the pulling mode can hit it.
         let ahead = Int(Self.git(["rev-list", "--count", "origin/HEAD..HEAD"], at: repo) ?? "") ?? 0
-        if let blocker = UpdatePrecheck.evaluate(dirty: Git.isDirty(at: repo), ahead: ahead) {
+        if let blocker = UpdatePrecheck.evaluate(dirty: Git.isDirty(at: repo),
+                                                ahead: ahead,
+                                                pulls: mode == .update) {
             blockedMessage = UpdatePrecheck.message(for: blocker)
             blockedCommand = UpdatePrecheck.manualCommand(repo: repo)
             return
@@ -123,8 +133,7 @@ final class UpdateStore: ObservableObject {
         lastError = nil
         needsRelaunch = false
 
-        let cmd = "git -C \(ForgeCore.shellQuote(repo)) pull --ff-only && "
-            + "bash \(ForgeCore.shellQuote("\(repo)/install.sh")) --update --with-app"
+        let cmd = InstallerCommand.build(repo: repo, mode: mode)
         var tracker = InstallerPhaseTracker()
 
         let process = ForgeCore.stream(cwd: repo, command: cmd, onLine: { line in
@@ -152,6 +161,12 @@ final class UpdateStore: ObservableObject {
             return
         }
     }
+
+    /// Pull the newest release and install it, app included.
+    func runUpdate() { runInstaller(mode: .update) }
+
+    /// Reinstall from the repo exactly as it is on disk — no git, no network.
+    func runReinstall() { runInstaller(mode: .reinstall) }
 
     /// The installer is gone; the exit code decides everything.
     ///
@@ -331,6 +346,17 @@ struct UpdatesView: View {
                     .controlSize(.large)
                     .disabled(store.updating)
                     .help("Roda install.sh --update --with-app aqui, mostrando o progresso")
+            } else {
+                // The ladder is needsRelaunch > updateAvailable > reinstall, and
+                // the last two can never compete: in the updateAvailable state
+                // this `else` does not render at all. Deliberately shown even
+                // with no version resolved — reinstalling depends on the repo on
+                // disk, not on remote state.
+                Button("Reinstalar") { store.runReinstall() }
+                    .controlSize(.small)
+                    .disabled(store.updating)
+                    .help("Roda install.sh --update --with-app nesta cópia do repo, "
+                          + "sem git pull: reaplica agentes, skills e scripts e recompila o app")
             }
         }
         .padding(16)

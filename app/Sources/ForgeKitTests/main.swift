@@ -1688,11 +1688,55 @@ test("SectionRestore devolve o raw válido e cai no fallback no resto") {
 }
 
 test("a pré-checagem distingue árvore suja de branch divergente") {
-    assertTrue(UpdatePrecheck.evaluate(dirty: false, ahead: 0) == nil)
-    assertEqual(UpdatePrecheck.evaluate(dirty: true, ahead: 0), .dirtyTree)
-    assertEqual(UpdatePrecheck.evaluate(dirty: false, ahead: 2), .diverged)
-    assertEqual(UpdatePrecheck.evaluate(dirty: true, ahead: 2), .dirtyTree,
+    assertTrue(UpdatePrecheck.evaluate(dirty: false, ahead: 0, pulls: true) == nil)
+    assertEqual(UpdatePrecheck.evaluate(dirty: true, ahead: 0, pulls: true), .dirtyTree)
+    assertEqual(UpdatePrecheck.evaluate(dirty: false, ahead: 2, pulls: true), .diverged)
+    assertEqual(UpdatePrecheck.evaluate(dirty: true, ahead: 2, pulls: true), .dirtyTree,
                 "sujo vence: é o caso mais perigoso de 'resolver' sozinho")
+}
+
+test("reinstalar nunca é bloqueado por estado de git") {
+    assertTrue(UpdatePrecheck.evaluate(dirty: true, ahead: 3, pulls: false) == nil,
+               "sem pull não existe o dano que a checagem previne — bloquear aqui "
+               + "impediria a afordance exatamente na máquina que ela desbloqueia")
+    assertEqual(UpdatePrecheck.evaluate(dirty: true, ahead: 0, pulls: true), .dirtyTree,
+                "o caminho que puxa não mudou")
+}
+
+test("o comando de atualizar puxa antes de instalar, com --update e --with-app") {
+    let cmd = InstallerCommand.build(repo: "/Users/dev/forge-agent", mode: .update)
+    assertTrue(cmd.contains("pull --ff-only"), "sem o pull: \(cmd)")
+    assertTrue(cmd.contains("--update"), "sem --update: \(cmd)")
+    assertTrue(cmd.contains("--with-app"),
+               "sem --with-app o app atualizaria tudo menos ele mesmo: \(cmd)")
+}
+
+test("o comando de reinstalar não executa git nenhum") {
+    let cmd = InstallerCommand.build(repo: "/Users/dev/forge-agent", mode: .reinstall)
+    assertTrue(cmd.contains("--update"), "sem --update: \(cmd)")
+    assertTrue(cmd.contains("--with-app"),
+               "sem --with-app o app reinstalaria tudo menos ele mesmo: \(cmd)")
+    assertFalse(cmd.contains("git"), "a reinstalação executa git: \(cmd)")
+    assertFalse(cmd.contains("pull"), "a reinstalação puxa: \(cmd)")
+}
+
+test("os dois modos diferem só pelo prefixo do pull") {
+    let repo = "/Users/dev/forge-agent"
+    let update = InstallerCommand.build(repo: repo, mode: .update)
+    let reinstall = InstallerCommand.build(repo: repo, mode: .reinstall)
+    assertTrue(update.hasSuffix(reinstall),
+               "reinstalar tem que ser exatamente o rabo de atualizar — se divergir, "
+               + "um dos dois botões instala algo diferente do outro:\n\(update)\n\(reinstall)")
+    assertEqual(update, "git -C '\(repo)' pull --ff-only && " + reinstall,
+                "o modo update deixou de produzir a string que a v3.1.4 executava")
+}
+
+test("o comando de atualizar quota um repo com espaço nas duas posições") {
+    let cmd = InstallerCommand.build(repo: "/Users/dev/My Projects/forge-agent", mode: .update)
+    assertTrue(cmd.contains("git -C '/Users/dev/My Projects/forge-agent'"),
+               "o repo do git -C não foi quotado: \(cmd)")
+    assertTrue(cmd.contains("'/Users/dev/My Projects/forge-agent/install.sh'"),
+               "o caminho do install.sh não foi quotado: \(cmd)")
 }
 
 test("o comando manual só inspeciona — nunca stash, reset ou rebase") {

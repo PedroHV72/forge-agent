@@ -205,13 +205,20 @@ public enum SectionRestore {
 /// nothing here ever rewrites the working tree or the history, and the state is
 /// checked BEFORE
 /// the installer starts, rather than after a bar has been on screen for seconds.
+///
+/// The refusal applies ONLY to the mode that pulls. With no pull there is no
+/// `--ff-only` that can fail and no working tree that can be moved aside, so the
+/// damage this check prevents does not exist — and neither does the symptom
+/// ("watching a bar for something that could never have begun"). That is why
+/// `pulls` has no default value: every call site states which mode it is.
 public enum UpdatePrecheck {
     public enum Blocker: String {
         case dirtyTree
         case diverged
     }
 
-    public static func evaluate(dirty: Bool, ahead: Int) -> Blocker? {
+    public static func evaluate(dirty: Bool, ahead: Int, pulls: Bool) -> Blocker? {
+        guard pulls else { return nil }
         if dirty { return .dirtyTree }
         if ahead > 0 { return .diverged }
         return nil
@@ -241,12 +248,44 @@ public enum UpdatePrecheck {
 /// A single-quote shell-escaping helper local to ForgeKit. ForgeKit cannot
 /// import ForgeCore (the app target), so this cannot reuse `ForgeCore.shellQuote`
 /// even though the two must behave identically — the same repo path is quoted
-/// by both the command this file only DISPLAYS and the command `runUpdate()`
-/// actually executes.
+/// by both the command this file only DISPLAYS
+/// (`UpdatePrecheck.manualCommand`) and the command the app actually executes,
+/// which `InstallerCommand.build` below composes from this very helper. The two
+/// implementations are byte-identical by inspection, and the shared use here is
+/// what keeps them from drifting.
 public enum ShellQuote {
     /// Wraps `s` in single quotes, escaping any embedded single quote as
     /// `'\''` — the standard POSIX-shell technique.
     public static func posix(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+// MARK: - Building the installer command
+
+/// The shell command each affordance runs — the ONE place either of them is
+/// composed, so "what does this button do" has a single answer with unit tests.
+///
+/// `--with-app` is not optional here even though it is opt-in on the command
+/// line. The app build is gated behind that flag, so an update launched FROM
+/// the app that omitted it would refresh every agent, skill and script and
+/// leave the one binary the user is looking at on the old version — the update
+/// would appear to have worked while the app stayed exactly as it was.
+///
+/// Reinstalling never pulls. Three reasons, in order: (a) `--ff-only` would
+/// block the affordance on precisely the machine it exists to unblock — a repo
+/// with uncommitted work or unpushed commits, which is the dogfood loop;
+/// (b) pulling is the semantics of *Atualizar*, and smuggling it in here would
+/// make the same promise the label refuses to make; (c) with no pull there is no
+/// working tree that could be touched at all.
+public enum InstallerCommand {
+    public enum Mode { case update, reinstall }
+
+    public static func build(repo: String, mode: Mode) -> String {
+        let installer = "bash \(ShellQuote.posix("\(repo)/install.sh")) --update --with-app"
+        switch mode {
+        case .reinstall: return installer
+        case .update:    return "git -C \(ShellQuote.posix(repo)) pull --ff-only && " + installer
+        }
     }
 }
