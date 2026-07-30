@@ -212,6 +212,29 @@ check('as duas entradas delegam ao runner e não constroem comando', () => {
   }
 });
 
+check('o precheck de git só roda no modo .update, nunca em .reinstall', () => {
+  // Invariante 3 é sobre o CONTRATO de runReinstall() — mas os dois modos
+  // compartilham runInstaller(), e antes da v3.2.1 os dois probes de git
+  // (`rev-list` e `Git.isDirty`) rodavam incondicionalmente ali, mesmo que o
+  // resultado fosse descartado via `pulls: false`. Isso contradizia "no git,
+  // no network" em runtime: o subprocesso de git rodava de qualquer forma.
+  // Anexar a checagem ao corpo de `if mode == .update` é o que fecha essa
+  // brecha — mover os probes de volta para fora do `if` é a mutação que este
+  // guard existe para pegar.
+  const ifUpdateBlock = bodyOf(runnerBody, 'if mode == .update');
+  assert(
+    /Self\.git\(/.test(ifUpdateBlock) && /Git\.isDirty\(/.test(ifUpdateBlock),
+    'os probes de git (Self.git / Git.isDirty) não estão dentro do `if mode == ' +
+      '.update` de runInstaller() — reinstalar voltaria a rodar git sem necessidade'
+  );
+  const outsideIfUpdate = runnerBody.replace(ifUpdateBlock, '');
+  assert(
+    !/Self\.git\(/.test(outsideIfUpdate) && !/Git\.isDirty\(/.test(outsideIfUpdate),
+    'há uma chamada de git fora do `if mode == .update` em runInstaller() — o ' +
+      'modo reinstall voltaria a pagar por um probe cujo resultado é descartado'
+  );
+});
+
 check('o guard de repo ausente não é mais silencioso', () => {
   const guardBlock = bodyOf(runnerBody, 'guard let repo else');
   assert(

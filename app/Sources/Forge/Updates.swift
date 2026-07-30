@@ -117,14 +117,19 @@ final class UpdateStore: ObservableObject {
 
         // Check before starting, not after: `git pull --ff-only` failing halfway
         // means the operator watched a progress bar for something that could
-        // never have begun. Only the pulling mode can hit it.
-        let ahead = Int(Self.git(["rev-list", "--count", "origin/HEAD..HEAD"], at: repo) ?? "") ?? 0
-        if let blocker = UpdatePrecheck.evaluate(dirty: Git.isDirty(at: repo),
-                                                ahead: ahead,
-                                                pulls: mode == .update) {
-            blockedMessage = UpdatePrecheck.message(for: blocker)
-            blockedCommand = UpdatePrecheck.manualCommand(repo: repo)
-            return
+        // never have begun. Only the pulling mode can hit it — so only `.update`
+        // pays for the git probes at all. `.reinstall` skips them entirely: not
+        // just `pulls: false` at the call site, but no `git` subprocess spawned,
+        // matching the "no git, no network" contract on `runReinstall()`.
+        if mode == .update {
+            let ahead = Int(Self.git(["rev-list", "--count", "origin/HEAD..HEAD"], at: repo) ?? "") ?? 0
+            if let blocker = UpdatePrecheck.evaluate(dirty: Git.isDirty(at: repo),
+                                                    ahead: ahead,
+                                                    pulls: true) {
+                blockedMessage = UpdatePrecheck.message(for: blocker)
+                blockedCommand = UpdatePrecheck.manualCommand(repo: repo)
+                return
+            }
         }
 
         updating = true
@@ -341,22 +346,26 @@ struct UpdatesView: View {
                         .multilineTextAlignment(.trailing)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            } else if store.updateAvailable {
-                Button("Atualizar") { store.runUpdate() }
-                    .controlSize(.large)
-                    .disabled(store.updating)
-                    .help("Roda install.sh --update --with-app aqui, mostrando o progresso")
             } else {
-                // The ladder is needsRelaunch > updateAvailable > reinstall, and
-                // the last two can never compete: in the updateAvailable state
-                // this `else` does not render at all. Deliberately shown even
-                // with no version resolved — reinstalling depends on the repo on
-                // disk, not on remote state.
-                Button("Reinstalar") { store.runReinstall() }
-                    .controlSize(.small)
-                    .disabled(store.updating)
-                    .help("Roda install.sh --update --with-app nesta cópia do repo, "
-                          + "sem git pull: reaplica agentes, skills e scripts e recompila o app")
+                // Both can render together on purpose: an available-but-blocked
+                // update (local commits ahead of origin, or a dirty tree) is
+                // exactly the state "Reinstalar" exists to unblock. Hiding it
+                // whenever "Atualizar" shows would hide it in the one state it
+                // matters most — so needsRelaunch still wins the whole slot, but
+                // updateAvailable no longer keeps Reinstalar off-screen.
+                VStack(alignment: .trailing, spacing: 6) {
+                    if store.updateAvailable {
+                        Button("Atualizar") { store.runUpdate() }
+                            .controlSize(.large)
+                            .disabled(store.updating)
+                            .help("Roda install.sh --update --with-app aqui, mostrando o progresso")
+                    }
+                    Button("Reinstalar") { store.runReinstall() }
+                        .controlSize(.small)
+                        .disabled(store.updating)
+                        .help("Roda install.sh --update --with-app nesta cópia do repo, "
+                              + "sem git pull: reaplica agentes, skills e scripts e recompila o app")
+                }
             }
         }
         .padding(16)
