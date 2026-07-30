@@ -40,6 +40,18 @@ final class UpdateStore: ObservableObject {
     /// commits).
     @Published private(set) var repoDescribe: String?
     @Published private(set) var releases: [Release] = []
+
+    #if DEBUG
+    /// True only for stores built by `staged(...)` (canvas previews). `load()`
+    /// no-ops on them (R7): without this, `UpdatesView.onAppear` would overwrite
+    /// the staged `installed`/`repoDescribe`/`releases` with live git/CHANGELOG
+    /// data on the one machine that has a canvas AND `ForgeCore.repoPath`
+    /// configured — the developer's — silently clobbering fixtures like
+    /// `previewLongReleases` that exist specifically to show a state real data
+    /// would never produce. Production stores are never staged, so `load()`
+    /// behaves exactly as before for them.
+    private(set) var isStagedPreview = false
+    #endif
     @Published private(set) var checking = false
     @Published private(set) var checkedAt: Date?
     @Published private(set) var lastError: String?
@@ -66,6 +78,9 @@ final class UpdateStore: ObservableObject {
     private var repo: String? { ForgeCore.repoPath }
 
     func load() {
+        #if DEBUG
+        guard !isStagedPreview else { return }
+        #endif
         guard let repo else {
             lastError = "repo do Forge não encontrado nas preferências"
             return
@@ -206,6 +221,13 @@ final class UpdateStore: ObservableObject {
     private func finishUpdate(exitCode: Int32) {
         updating = false
         if UpdateOutcome.canRelaunch(exitCode: exitCode) {
+            // A successful update just pulled the repo: `repoDescribe` (and
+            // `installed`) are still whatever `load()` last saw BEFORE the pull,
+            // so without this refresh the still-running old process would keep
+            // comparing its `running` stamp against a stale `repoDescribe` and
+            // read "in sync" at the exact moment the running-vs-repo divergence
+            // becomes real (R6) — the entire reason the footer exists (D25).
+            load()
             needsRelaunch = true
         } else {
             lastError = UpdateOutcome.failureMessage(exitCode: exitCode, lastLines: log)
@@ -718,6 +740,7 @@ extension UpdateStore {
                        running: String? = nil,
                        repoDescribe: String? = nil) -> UpdateStore {
         let s = UpdateStore()
+        s.isStagedPreview = true
         s.installed = installed
         s.running = running
         s.repoDescribe = repoDescribe

@@ -207,13 +207,31 @@ check('o Divider é emitido dentro do único ForEach(Section.allCases)', () => {
 // ------------------------------------------------------- D31: allCases intacto
 
 check('Section continua com 13 casos e nenhum rawValue mudou (D31)', () => {
+  // R1: contar `case \w+ = "` só prova a CONTAGEM — um rename mantém 13 casos e
+  // passaria mesmo assim, degradando silenciosamente toda seleção salva em
+  // `UserDefaults("lastSection")` (Stores.swift persiste `section?.rawValue` e
+  // valida o restore contra `Section.allCases.map(\.rawValue)`) para o fallback
+  // `.now`. A lista explícita e ORDENADA é o que de fato ancora "nenhum
+  // rawValue mudou".
+  const EXPECTED_RAW_VALUES = [
+    'Início', 'Terminal', 'Projetos', 'Itens', 'Runs',
+    'Contas', 'Métricas', 'Modelos', 'Segredos', 'Preferências',
+    'Histórico', 'Atualizações', 'Exemplos',
+  ];
   const views = stripLineComments(read(viewsSwift));
   const decl = bodyOf(views, 'enum Section: String, CaseIterable, Identifiable');
-  const cases = decl.match(/^\s*case \w+ = "/gm) || [];
+  const cases = decl.match(/^\s*case \w+ = "([^"]*)"/gm) || [];
+  const rawValues = cases.map((c) => c.match(/=\s*"([^"]*)"/)[1]);
   assert(
-    cases.length === 13,
-    `esperados 13 casos em Section, encontrados ${cases.length} — a D29 não renomeia `
+    rawValues.length === 13,
+    `esperados 13 casos em Section, encontrados ${rawValues.length} — a D29 não renomeia `
       + 'nem remove seção nenhuma (D31)'
+  );
+  assert(
+    JSON.stringify(rawValues) === JSON.stringify(EXPECTED_RAW_VALUES),
+    'um ou mais rawValue de Section mudaram (D31): '
+      + `esperado ${JSON.stringify(EXPECTED_RAW_VALUES)}, encontrado ${JSON.stringify(rawValues)} — `
+      + 'isso rebaixa silenciosamente qualquer seleção salva de sidebar para o fallback `.now`'
   );
 });
 
@@ -504,27 +522,36 @@ check('build.sh estampa as três chaves via plutil -replace (D25)', () => {
 check('a estampagem acontece entre o cp do plist e o codesign', () => {
   const sh = stripShellComments(read(buildSh));
   const copiedPlist = sh.indexOf('cp "${APP_DIR}/Info.plist"');
-  const stamp = sh.indexOf('plutil -replace');
   const sign = sh.indexOf('codesign --force');
   assert(copiedPlist !== -1, 'o cp do Info.plist para o bundle desapareceu de build.sh');
-  assert(stamp !== -1, 'nenhum `plutil -replace` em build.sh');
   assert(sign !== -1, 'o `codesign --force` desapareceu de build.sh');
-  // Esta é a razão de existir deste guard: as duas fronteiras são INVISÍVEIS em
-  // runtime. Fora de ordem, o build continua saindo 0 e o app continua abrindo.
-  assert(
-    copiedPlist < stamp,
-    'a estampagem vem ANTES do `cp` do Info.plist — nessa ordem ela edita o '
-      + 'app/Info.plist VERSIONADO, e cada build passa a sujar a árvore. A '
-      + 'pré-checagem do atualizador in-app recusa árvore suja, então buildar '
-      + 'bloquearia a própria atualização que a estampagem serve (R8)'
-  );
-  assert(
-    stamp < sign,
-    'a estampagem vem DEPOIS do `codesign` — a assinatura cobre o Info.plist, '
-      + 'então nessa ordem `codesign --verify` deixa de dizer "valid on disk" e '
-      + 'passa a dizer "invalid Info.plist (plist or signature have been '
-      + 'modified)". Probado, não suposto'
-  );
+  // R3: `indexOf('plutil -replace')` só encontra a PRIMEIRA das três chamadas —
+  // build.sh tem uma por chave (ForgeGitDescribe, CFBundleShortVersionString,
+  // CFBundleVersion). Mover só a escrita de CFBundleVersion para depois do
+  // codesign passava nas três checagens de build.sh (a primeira `plutil` segue
+  // antes do sign) e ainda assim invalidava a assinatura — a falha invisível em
+  // runtime que este guard existe para pegar. Cada chave é ancorada por si.
+  const KEYS = ['ForgeGitDescribe', 'CFBundleShortVersionString', 'CFBundleVersion'];
+  for (const key of KEYS) {
+    const stamp = sh.indexOf(`plutil -replace ${key}`);
+    assert(stamp !== -1, `nenhum \`plutil -replace ${key}\` em build.sh`);
+    // Esta é a razão de existir deste guard: as duas fronteiras são INVISÍVEIS em
+    // runtime. Fora de ordem, o build continua saindo 0 e o app continua abrindo.
+    assert(
+      copiedPlist < stamp,
+      `a estampagem de ${key} vem ANTES do \`cp\` do Info.plist — nessa ordem ela edita o `
+        + 'app/Info.plist VERSIONADO, e cada build passa a sujar a árvore. A '
+        + 'pré-checagem do atualizador in-app recusa árvore suja, então buildar '
+        + 'bloquearia a própria atualização que a estampagem serve (R8)'
+    );
+    assert(
+      stamp < sign,
+      `a estampagem de ${key} vem DEPOIS do \`codesign\` — a assinatura cobre o Info.plist, `
+        + 'então nessa ordem `codesign --verify` deixa de dizer "valid on disk" e '
+        + 'passa a dizer "invalid Info.plist (plist or signature have been '
+        + 'modified)". Probado, não suposto'
+    );
+  }
 });
 
 check('nenhuma escrita de plist tem o arquivo versionado como destino (R8)', () => {
