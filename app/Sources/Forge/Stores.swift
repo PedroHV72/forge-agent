@@ -72,7 +72,19 @@ final class AppState: ObservableObject {
     /// Which sidebar section is showing. Owned here rather than as RootView
     /// `@State` because opening a session has to be able to take the operator
     /// to the terminal — the composer that creates it lives on another screen.
-    @Published var section: Section? = .now
+    ///
+    /// Persisted on every change, and restored on every launch — not just after
+    /// a self-update relaunch. One code path, same storage as `lastWorkspace`.
+    /// An unknown raw value (a renamed sidebar label invalidates what was saved)
+    /// falls back explicitly; see `SectionRestore`.
+    @Published var section: Section? = Section(rawValue: SectionRestore.resolve(
+        rawValue: UserDefaults.standard.string(forKey: "lastSection"),
+        valid: Section.allCases.map(\.rawValue),
+        fallback: Section.now.rawValue)) ?? .now {
+        didSet {
+            UserDefaults.standard.set(section?.rawValue ?? "", forKey: "lastSection")
+        }
+    }
 
     /// Which session the terminal screen shows. Same reason: the creating code
     /// path needs to name it, and the terminal screen may not be on screen yet.
