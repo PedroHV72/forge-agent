@@ -938,6 +938,182 @@ test("o detector morde: duas entradas Unreleased dão dois ids iguais") {
                 + "deste fixture — então ele não acusaria a do arquivo tampouco")
 }
 
+// MARK: - ReleaseWindow — 5 cards em repouso, o resto a um clique (D30, R10)
+
+print("\nReleaseWindow (o corte é a cauda histórica, nunca o topo — D30)")
+
+/// Um CHANGELOG sintético a partir de uma lista de versões, na ORDEM DADA.
+///
+/// A ordem é o ponto: a ordem do arquivo não é a ordem das versões neste repo
+/// (`v1.35.0` precede `v1.36.0`), e um fixture que só usa listas decrescentes não
+/// consegue distinguir "janela em ordem de arquivo" de "janela ordenada".
+func windowFixture(_ versions: [String]) -> [Release] {
+    let md = versions
+        .map { "## \($0) — cabeçalho de \($0)\n\n### Added\n\n- entrada de \($0)\n" }
+        .joined(separator: "\n")
+    let rs = ChangelogParser.parse(md)
+    assertEqual(rs.count, versions.count, "o fixture não parseou no número de entradas pedido")
+    return rs
+}
+
+test("dedupe por version: duas entradas Unreleased dão UM card") {
+    // O chunk irmão consertou o arquivo deste repo; isto conserta o PROGRAMA,
+    // que também tem de sobreviver a um fork, a um merge e a uma edição à mão.
+    let rs = windowFixture(["Unreleased", "v3.3.0", "Unreleased", "v3.1.4"])
+    assertEqual(rs.count, 4, "o fixture precisa entrar com a duplicata para o teste valer")
+    let w = ReleaseWindow.visible(releases: rs, installed: nil, latest: nil, limit: 5)
+    assertEqual(w.visible.filter(\.isUnreleased).count, 1,
+                "duas entradas Unreleased chegaram ao ForEach — dois ids iguais")
+    assertEqual(w.visible.map(\.id), ["Unreleased", "v3.3.0", "v3.1.4"])
+    assertEqual(w.hiddenCount, 0, "o deduplicado tem 3 entradas e o limite é 5")
+}
+
+test("limite respeitado quando nenhum pino está fora da janela") {
+    let rs = windowFixture(["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0",
+                            "v4.0.0", "v3.0.0", "v2.0.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "v9.0.0", latest: "v9.0.0", limit: 5)
+    assertEqual(w.visible.count, 5)
+    assertEqual(w.visible.map(\.id), ["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0"])
+    assertEqual(w.hiddenCount, 3, "8 entradas menos as 5 visíveis")
+}
+
+test("R10: SE existe entrada para installed, ela está na janela — mesmo na cauda") {
+    // O invariante da D30, na única forma em que ele é satisfazível (ver o teste
+    // seguinte): condicionado à existência da entrada.
+    let rs = windowFixture(["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0",
+                            "v4.0.0", "v3.0.0", "v2.0.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "v2.0.0", latest: "v9.0.0", limit: 5)
+    assertTrue(w.visible.contains { $0.id == "v2.0.0" },
+               "a entrada da versão INSTALADA caiu atrás do mostrar mais — é justo o que a "
+               + "D30 proíbe: o corte é a cauda histórica, nunca o que o operador está rodando")
+    assertEqual(w.visible.count, 6, "os 5 do topo mais o pino que estava fora")
+    assertEqual(w.hiddenCount, 2)
+    // E a ordem do arquivo é preservada: o pino não é promovido para o topo.
+    assertEqual(w.visible.map(\.id),
+                ["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0", "v2.0.0"])
+}
+
+test("R10 é VACUAMENTE verdadeiro quando installed não tem entrada nenhuma") {
+    // O caso real, não hipotético: `v3.1.4` é a tag instalada hoje e o
+    // CHANGELOG deste repo não tem entrada para ela. Escrito como "o card da
+    // versão instalada está sempre visível", o invariante seria insatisfazível e
+    // este teste falharia contra o próprio arquivo do repo.
+    let rs = windowFixture(["v3.3.0", "v3.2.0", "v3.1.1", "v3.1.0", "v3.0.0", "v2.9.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "v3.1.4", latest: nil, limit: 5)
+    assertEqual(w.visible.count, 5, "um installed inexistente não pode pinar nada")
+    assertEqual(w.hiddenCount, 1)
+    assertFalse(w.visible.contains { $0.id == "v3.1.4" }, "inventou uma entrada que não existe")
+}
+
+test("R10: latest pina do mesmo jeito, e as duas condições compõem") {
+    let rs = windowFixture(["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0",
+                            "v4.0.0", "v3.0.0", "v2.0.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "v3.0.0", latest: "v2.0.0", limit: 5)
+    assertTrue(w.visible.contains { $0.id == "v3.0.0" }, "o pino de installed não entrou")
+    assertTrue(w.visible.contains { $0.id == "v2.0.0" }, "o pino de latest não entrou")
+    assertEqual(w.visible.count, 7)
+    assertEqual(w.hiddenCount, 1, "só v4.0.0 sobra escondida")
+}
+
+test("isUnreleased é pino, esteja onde estiver na cauda") {
+    let rs = windowFixture(["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0",
+                            "v4.0.0", "Unreleased"])
+    let w = ReleaseWindow.visible(releases: rs, installed: nil, latest: nil, limit: 5)
+    assertTrue(w.visible.contains(where: \.isUnreleased),
+               "trabalho ainda não lançado ficou escondido")
+    assertEqual(w.hiddenCount, 1)
+}
+
+test("a ordem do arquivo NÃO é a ordem das versões, e a janela não ordena") {
+    // Pitfall real deste repo: `v1.35.0` aparece ANTES de `v1.36.0`. A janela
+    // promete "as 5 primeiras do arquivo mais os pinos", nunca "as 5 mais
+    // recentes" — e uma lógica que assumisse arquivo ordenado pinaria o card
+    // errado sem nada avisar.
+    let rs = windowFixture(["v1.35.0", "v1.36.0", "v1.34.0", "v1.33.0", "v1.32.0", "v1.31.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: nil, latest: nil, limit: 5)
+    assertEqual(w.visible.map(\.id),
+                ["v1.35.0", "v1.36.0", "v1.34.0", "v1.33.0", "v1.32.0"],
+                "a janela reordenou o arquivo — a promessa é ordem de arquivo")
+    assertEqual(w.hiddenCount, 1)
+}
+
+test("hiddenCount é 0 quando a lista é menor que o limite") {
+    let w = ReleaseWindow.visible(releases: windowFixture(["v3.0.0", "v2.0.0"]),
+                                  installed: "v3.0.0", latest: "v3.0.0", limit: 5)
+    assertEqual(w.visible.count, 2)
+    assertEqual(w.hiddenCount, 0, "com hiddenCount > 0 a view desenharia um controle inútil")
+}
+
+test("expandido (.max) mostra tudo, sem duplicar e sem esconder nada") {
+    let rs = windowFixture(["Unreleased", "v9.0.0", "Unreleased", "v8.0.0", "v7.0.0",
+                            "v6.0.0", "v5.0.0", "v4.0.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "v5.0.0", latest: "v9.0.0",
+                                  limit: Int.max)
+    assertEqual(w.visible.count, 7, "o deduplicado tem 7 entradas")
+    assertEqual(w.hiddenCount, 0)
+    assertEqual(Set(w.visible.map(\.id)).count, w.visible.count, "id duplicado no estado expandido")
+}
+
+test("limite 0 ou negativo ainda devolve os pinos") {
+    // Esconder a versão em execução é o único resultado que a D30 proíbe, então
+    // nem um limite degenerado pode produzi-lo.
+    let rs = windowFixture(["v9.0.0", "v8.0.0", "v7.0.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "v8.0.0", latest: nil, limit: 0)
+    assertEqual(w.visible.map(\.id), ["v8.0.0"])
+    assertEqual(w.hiddenCount, 2)
+    assertEqual(ReleaseWindow.visible(releases: rs, installed: nil, latest: nil, limit: -3)
+                    .visible.count, 0)
+}
+
+test("o dedupe acontece ANTES do pino: uma versão repetida pina uma vez") {
+    let rs = windowFixture(["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0",
+                            "v2.0.0", "v2.0.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "v2.0.0", latest: nil, limit: 5)
+    assertEqual(w.visible.filter { $0.id == "v2.0.0" }.count, 1,
+                "o pino entrou duas vezes — dois ids iguais no ForEach")
+    assertEqual(w.visible.count, 6)
+    assertEqual(w.hiddenCount, 0, "o deduplicado tem 6 entradas, todas visíveis")
+}
+
+test("installed com e sem o `v` nomeiam a mesma release") {
+    // `installed` é uma tag git; as entradas são headings escritos à mão. Um `v`
+    // a mais não pode decidir se o card pode ser escondido.
+    let rs = windowFixture(["v9.0.0", "v8.0.0", "v7.0.0", "v6.0.0", "v5.0.0", "v4.0.0"])
+    let w = ReleaseWindow.visible(releases: rs, installed: "4.0.0", latest: nil, limit: 5)
+    assertTrue(w.visible.contains { $0.id == "v4.0.0" }, "`4.0.0` não casou com `## v4.0.0`")
+    assertEqual(w.hiddenCount, 0)
+}
+
+test("o limite em repouso é uma constante nomeada, e vale 5") {
+    // O número nunca foi validado contra uma lista ao vivo (ninguém respondeu
+    // "olhando, 5 é pouco ou muito?"), então trocá-lo tem de ser uma linha.
+    assertEqual(ReleaseWindow.restingLimit, 5)
+}
+
+test("o rótulo do mostrar-mais concorda em número") {
+    assertEqual(ReleaseWindow.moreLabel(hiddenCount: 1), "Mostrar mais 1 versão")
+    assertEqual(ReleaseWindow.moreLabel(hiddenCount: 7), "Mostrar mais 7 versões")
+    assertEqual(ReleaseWindow.lessLabel, "Mostrar menos")
+}
+
+test("o CHANGELOG real, na janela de repouso, mantém tudo o que a D30 pina") {
+    // Contra o arquivo de verdade, não contra fixture: é o único lugar onde o
+    // Pitfall 8 (installed sem entrada) aparece sozinho.
+    guard let text = try? String(contentsOfFile: repoChangelogPath, encoding: .utf8) else {
+        assertTrue(false, "CHANGELOG.md não encontrado em \(repoChangelogPath)")
+        return
+    }
+    let rs = ChangelogParser.parse(text)
+    let w = ReleaseWindow.visible(releases: rs, installed: "v3.1.4", latest: "v3.3.0",
+                                  limit: ReleaseWindow.restingLimit)
+    assertEqual(Set(w.visible.map(\.id)).count, w.visible.count, "id duplicado na janela real")
+    assertTrue(w.visible.contains { $0.id == "v3.3.0" },
+               "a entrada da versão disponível não está na janela de repouso")
+    assertGreater(w.hiddenCount, 0, "o arquivo real tem mais de 5 entradas — nada a esconder?")
+    assertEqual(w.visible.count + w.hiddenCount, rs.count,
+                "visible + hidden tem de fechar com o total deduplicado")
+}
+
 test("comparação de versão é semântica, não alfabética") {
     // The case that matters as a project ages: a string compare puts v2.9.0
     // above v2.11.0 and would tell you to downgrade.

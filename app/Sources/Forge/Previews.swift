@@ -170,9 +170,82 @@ struct AtualizacoesPreviews: PreviewProvider {
                         + "commitadas — a atualização faria `git pull` sobre elas.",
                     blockedCommand: "cd ~/Development/forge-agent && git status")))
                 .previewDisplayName("Atualizações — bloqueado")
+
+            // The long list (D30): five cards at rest, "Mostrar mais N versões"
+            // below them, and the tail one click away. `installed` is deliberately
+            // a version deep in the tail (`v1.30.0`), so this preview also shows
+            // the pin: the card for what you are RUNNING is in the resting window
+            // even though its position in the file is past the cut. Expanding it
+            // must reveal no duplicate — the two `## Unreleased` headings in the
+            // fixture are one card here.
+            canvas(UpdatesView(
+                state: previewState(),
+                store: .staged(installed: "v1.30.0",
+                               latest: "v3.3.0",
+                               releases: previewLongReleases)))
+                .previewDisplayName("Atualizações — lista longa (5 + mostrar mais)")
         }
     }
 }
+
+/// A long list, with the two things that only show up in a long list.
+///
+/// Nine headings, and two of them are `## Unreleased` — the collision that was
+/// real in this repo's own file (line 1 and line 104). `Release.id` is the
+/// version string, so those two are the same id in a `ForEach`, which SwiftUI
+/// leaves undefined. `ReleaseWindow` dedupes, and this fixture is how that is
+/// visible in a render rather than only in a unit test.
+///
+/// The order is deliberately NOT sorted (`v1.35.0` before `v1.36.0`, exactly as
+/// the real file has it): the window promises file order plus the pins, never
+/// "the 5 most recent", and a fixture in descending order could not tell the two
+/// apart.
+private let previewLongReleases: [Release] = ChangelogParser.parse("""
+## Unreleased
+
+### Added
+- **Trabalho em curso.** ainda não saiu em tag nenhuma.
+
+## v3.3.0 — atualização in-app com barra de progresso
+
+### Added
+- **Barra de progresso no app.** a saída do instalador aparece na própria seção.
+
+## Unreleased
+
+### Fixed
+- **A segunda entrada esquecida.** mesmo id da primeira — o caso que o dedupe pega.
+
+## v3.2.0 — SVN no sidecar
+
+### Added
+- **Sidecar em working copy SVN.** de ponta a ponta, sem tocar git.
+
+## v3.1.1 — correções de terminal
+
+### Fixed
+- **Sessões sobrevivem à navegação.**
+
+## v1.35.0 — antes da 1.36 no arquivo, de propósito
+
+### Added
+- **A ordem do arquivo não é a ordem das versões.**
+
+## v1.36.0 — depois da 1.35 no arquivo
+
+### Added
+- **É por isso que a janela não promete "as mais recentes".**
+
+## v1.30.0 — cauda histórica
+
+### Fixed
+- **Coisa antiga.**
+
+## v1.20.0 — cauda mais antiga ainda
+
+### Fixed
+- **Coisa mais antiga.**
+""")
 
 // MARK: - Sidebar
 

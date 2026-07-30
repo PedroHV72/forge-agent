@@ -298,6 +298,12 @@ struct UpdatesView: View {
     /// Folded by default: the phase label is the answer, the log is the appeal.
     @State private var logExpanded = false
 
+    /// The release list is short at rest (D30) and expands in place. The cut is
+    /// the historical tail only — `ReleaseWindow` pins the installed version, the
+    /// available one and anything unreleased, so nothing the operator needs can
+    /// fall behind the control.
+    @State private var showAllReleases = false
+
     /// The store is injectable so a canvas preview can stage the states this
     /// screen has — up to date, update available, installing, relaunch pending,
     /// blocked. None of them is reachable through the singleton: every field
@@ -327,9 +333,10 @@ struct UpdatesView: View {
                     Label(err, systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.orange)
                 }
-                ForEach(store.releases.prefix(12)) { r in
+                ForEach(releaseWindow.visible) { r in
                     ReleaseCard(release: r, installed: store.installed)
                 }
+                showMoreControl
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
@@ -345,6 +352,37 @@ struct UpdatesView: View {
                 .disabled(store.checking)
                 .help("Consulta as tags do repositório remoto")
             }
+        }
+    }
+
+    /// Which release notes are on screen (D30).
+    ///
+    /// Every rule lives in `ReleaseWindow` in ForgeKit, which is testable; this
+    /// property is only the wiring. It replaced a twelve-item prefix that cut the list
+    /// by position with no notion of which cards must not be cut — with a short
+    /// list that becomes visible, which is why the limit is a NAMED constant and
+    /// not a literal here: the number `5` was never validated against a live
+    /// list, so it has to be changeable in one place.
+    private var releaseWindow: ReleaseWindow.Window {
+        ReleaseWindow.visible(releases: store.releases,
+                              installed: store.installed,
+                              latest: store.latest,
+                              limit: showAllReleases ? .max : ReleaseWindow.restingLimit)
+    }
+
+    /// Reveals the tail in place. Absent when there is no tail — a control that
+    /// says "show more 0" is worse than no control.
+    @ViewBuilder private var showMoreControl: some View {
+        let hidden = releaseWindow.hiddenCount
+        if hidden > 0 || showAllReleases {
+            Button(hidden > 0 ? ReleaseWindow.moreLabel(hiddenCount: hidden)
+                              : ReleaseWindow.lessLabel) {
+                withAnimation(.easeInOut(duration: 0.15)) { showAllReleases.toggle() }
+            }
+            .buttonStyle(.plain)
+            .controlSize(.small)
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 

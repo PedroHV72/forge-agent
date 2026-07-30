@@ -255,14 +255,15 @@ check('o harness de preview está vivo e sob #if DEBUG', () => {
       + 'desta máquina. Use PreviewProvider.'
   );
   // Lower bound, never an exact count: os chunks seguintes acrescentam previews.
-  // Subiu de 8 para 12 no chunk 3 (seis estados do rótulo de versão a mais, hoje
-  // 14 no total). Suba este número quando isso acontecer de novo; nunca o troque
-  // por igualdade — foi um must-have de contagem EXATA que impediu o chunk 1 de
-  // proteger o próprio harness.
+  // Subiu de 8 para 12 no chunk 3 (seis estados do rótulo de versão a mais) e de
+  // 12 para 14 no chunk 6 (a lista longa da D30), hoje 15 no total. Suba este
+  // número quando isso acontecer de novo; nunca o troque por igualdade — foi um
+  // must-have de contagem EXATA que impediu o chunk 1 de proteger o próprio
+  // harness.
   const n = countOf(previews, 'previewDisplayName');
   assert(
-    n >= 12,
-    `esperados >= 8 previewDisplayName em Previews.swift, encontrados ${n} — um chunk `
+    n >= 14,
+    `esperados >= 14 previewDisplayName em Previews.swift, encontrados ${n} — um chunk `
       + 'apagou parte do harness'
   );
 });
@@ -637,6 +638,147 @@ check('as entradas que a D36 nomeia existem em CHANGELOG.md', () => {
         + 'entrada desta leva de tasks; sem ela a tag nasceria sem notas no app'
     );
   }
+});
+
+// ------------------------------- D30/R10: 5 releases em repouso, o resto a um clique
+
+check('a lista de releases não usa mais prefix(12) (D30)', () => {
+  const updates = stripLineComments(read(updatesSwift));
+  assert(
+    !updates.includes('prefix(12)'),
+    'o `prefix(12)` voltou a Updates.swift — ele corta por POSIÇÃO, sem nenhuma noção '
+      + 'de quais cards não podem ser cortados; a D30 exige que a entrada da versão '
+      + 'instalada e a da disponível nunca caiam atrás do "mostrar mais"'
+  );
+  const body = bodyOf(updates, 'var body: some View');
+  assert(
+    !/\.prefix\(/.test(body),
+    'o corpo da UpdatesView voltou a cortar a lista com `.prefix(` inline — a janela '
+      + 'inteira mora em ReleaseWindow, que é onde os pinos existem'
+  );
+});
+
+check('a janela passa por ReleaseWindow, não por literal inline (D30)', () => {
+  const updates = stripLineComments(read(updatesSwift));
+  const body = bodyOf(updates, 'var body: some View');
+  assert(
+    body.includes('releaseWindow.visible'),
+    'o ForEach da lista não renderiza `releaseWindow.visible` — sem isso não há '
+      + 'garantia de que os pinos da D30 cheguem à tela'
+  );
+  const window = bodyOf(updates, 'private var releaseWindow');
+  assert(
+    window.includes('ReleaseWindow.visible('),
+    'a janela deixou de chamar `ReleaseWindow.visible(` — a lógica pura (dedupe, '
+      + 'pinos, hiddenCount) é a única que tem teste, porque o target Forge não é '
+      + 'importável por target de teste'
+  );
+  for (const arg of ['installed:', 'latest:']) {
+    assert(
+      window.includes(arg),
+      `a chamada de ReleaseWindow.visible não passa \`${arg}\` — um pino que não é `
+        + 'informado não é um pino, e o corte voltaria a poder pegar o topo'
+    );
+  }
+  assert(
+    window.includes('ReleaseWindow.restingLimit'),
+    'o limite em repouso virou literal no corpo da view. Ele é uma constante nomeada '
+      + 'de propósito: o número 5 nunca foi validado olhando uma lista ao vivo, então '
+      + 'trocá-lo tem de ser uma linha, não uma caçada'
+  );
+  assert(
+    !/limit:\s*\d/.test(window),
+    'a janela passa um limite numérico literal — use `ReleaseWindow.restingLimit`'
+  );
+});
+
+check('o controle de mostrar mais existe, expande in-place e rotula pelo ForgeKit', () => {
+  const updates = stripLineComments(read(updatesSwift));
+  const body = bodyOf(updates, 'var body: some View');
+  assert(
+    body.includes('showMoreControl'),
+    'o corpo da UpdatesView não monta o controle de mostrar mais — sem ele o corte da '
+      + 'D30 esconde a cauda para sempre, que não é o que ela pede'
+  );
+  const control = bodyOf(updates, 'private var showMoreControl');
+  assert(
+    control.includes('ReleaseWindow.moreLabel(') && control.includes('ReleaseWindow.lessLabel'),
+    'o rótulo do controle não vem do ForgeKit — o plural ("1 versões") é um branch de '
+      + 'verdade, e um corpo de view é onde ele passa despercebido'
+  );
+  assert(
+    /hiddenCount/.test(control),
+    'o controle não consulta `hiddenCount`: um botão que diz "mostrar mais 0" é pior '
+      + 'que nenhum botão'
+  );
+  assert(
+    /showAllReleases\s*\.toggle\(\)/.test(control) || /showAllReleases\.toggle\(\)/.test(control),
+    'o controle não alterna `showAllReleases` — a revelação é in-place, não navegação'
+  );
+});
+
+check('ReleaseWindow deduplica por version e pina os três casos (D30/R10)', () => {
+  const core = stripLineComments(read(updateCoreSwift));
+  const fn = bodyOf(core, 'public static func visible(releases');
+  assert(
+    /Set<String>|Set</.test(fn) && /seen/.test(fn),
+    'a janela não deduplica por version. `Release.id` É a version, então duas entradas '
+      + 'iguais são dois ids iguais num ForEach — comportamento indefinido no SwiftUI, '
+      + 'e silencioso. O arquivo deste repo foi consertado num chunk irmão; isto '
+      + 'protege o PROGRAMA, que também tem de sobreviver a um fork'
+  );
+  for (const pin of ['isUnreleased', 'installed', 'latest']) {
+    assert(
+      fn.includes(pin),
+      `a janela não considera \`${pin}\` como pino — a D30 permite cortar a cauda `
+        + 'histórica e nada mais'
+    );
+  }
+  assert(
+    !/\.sorted|sort\(/.test(fn),
+    'a janela ordena a lista. A ordem do arquivo NÃO é a ordem das versões neste repo '
+      + '(v1.35.0 precede v1.36.0), e a promessa é "as 5 primeiras do arquivo mais os '
+      + 'pinos" — nunca "as 5 mais recentes"'
+  );
+  assert(
+    /restingLimit\s*=\s*5/.test(core),
+    'o limite em repouso deixou de valer 5 (ou deixou de ser uma constante nomeada)'
+  );
+});
+
+check('existe preview de lista longa, com duas Unreleased e fora de ordem (D30)', () => {
+  const previews = read(previewsSwift);
+  assert(
+    previews.includes('previewLongReleases'),
+    'nenhum fixture de lista longa em Previews.swift — o "mostrar mais" e o dedupe só '
+      + 'aparecem num render com mais de 5 entradas'
+  );
+  // Recorte a partir do `parse("""`, não da declaração: o doc comment acima do
+  // fixture CITA `## Unreleased` ao explicar por que ele tem duas, e contar a
+  // citação faria o guard passar por prosa em vez de por conteúdo — foi
+  // exatamente assim que a mutação M24 primeiro escapou.
+  const decl = previews.indexOf('previewLongReleases');
+  const open = previews.indexOf('parse("""', decl);
+  assert(open !== -1, 'o fixture longo não é um literal multi-linha passado ao parser');
+  const fixture = previews.slice(open);
+  const end = fixture.indexOf('""")');
+  const md = fixture.slice(0, end === -1 ? undefined : end);
+  assert(
+    countOf(md, '\n## Unreleased') >= 2,
+    'o fixture longo não tem duas `## Unreleased` — a colisão de id era real neste '
+      + 'repo (linha 1 e linha 104) e o preview é onde o dedupe se vê num render'
+  );
+  const at135 = md.indexOf('## v1.35.0');
+  const at136 = md.indexOf('## v1.36.0');
+  assert(
+    at135 !== -1 && at136 !== -1 && at135 < at136,
+    'o fixture longo está em ordem decrescente — assim ele não distingue "janela em '
+      + 'ordem de arquivo" de "janela ordenada", que é justo o Pitfall deste repo'
+  );
+  assert(
+    previews.includes('previewLongReleases)))'),
+    'o fixture longo existe mas nenhum preview o renderiza'
+  );
 });
 
 // ------------------------------------------------------- bite-proof do bodyOf

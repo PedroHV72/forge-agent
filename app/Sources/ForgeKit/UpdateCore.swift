@@ -309,6 +309,115 @@ public enum VersionFooter {
     }
 }
 
+// MARK: - Which release notes are on screen at rest
+
+/// The window of `ReleaseCard`s the update screen shows before anyone asks for
+/// more (D30).
+///
+/// D30 is an OPERATOR OVERRIDE of the brainstorm, which recommended not doing
+/// this: the whole list already scrolled, and a cut risks hiding the very notes a
+/// sibling task just shipped. The constraint that came with the override is what
+/// this type exists to enforce mechanically: THE CUT IS THE HISTORICAL TAIL,
+/// NEVER THE TOP. The entry for the version you are running, the entry for the
+/// version you could move to, and anything still unreleased are never behind
+/// "show more".
+///
+/// THE INVARIANT IS CONDITIONAL, and that is not a weakening.
+///   `installed` comes from `git describe --tags --abbrev=0`, while the entries
+///   come from `CHANGELOG.md`, and the two disagree in the real repo: `v3.1.4` is
+///   the installed tag and has NO changelog entry at all. So the guarantee can
+///   only be "IF an entry for `installed` exists, it is visible" — written as
+///   "the installed version's card is always visible" it would be unsatisfiable
+///   here, and a test asserting it would fail against this repo's own file. When
+///   the entry does not exist the invariant holds vacuously and nothing is
+///   pinned: absence is a legitimate state, not a case to paper over.
+///
+/// FILE ORDER IS NOT VERSION ORDER. `v1.35.0` precedes `v1.36.0` in this repo's
+/// CHANGELOG. Nothing here sorts, and nothing here promises "the 5 most recent":
+/// the promise is "the first 5 in the file, plus the pins". Windowing logic that
+/// assumed a sorted file would pin and cut the wrong cards, silently.
+///
+/// DEDUPE LIVES HERE, not only in the file. `Release.id` is the version string,
+/// so two entries sharing a version are two identical ids in a `ForEach`, which
+/// is undefined behaviour in SwiftUI. A sibling chunk fixed the two
+/// `## Unreleased` headings in this repo's file; this fixes the PROGRAM, which
+/// also has to survive a fork, a hand-edit and a merge.
+public enum ReleaseWindow {
+    /// How many cards the list shows at rest.
+    ///
+    /// One named value on purpose: the number itself was never validated against
+    /// a live list — nobody has answered "looking at it, is 5 too few?" — so
+    /// changing it has to be a one-line edit, not a hunt through a view body.
+    public static let restingLimit = 5
+
+    public struct Window: Equatable {
+        /// The cards to render, in file order, deduped.
+        public let visible: [Release]
+        /// How many deduped entries `visible` leaves out. `0` means there is
+        /// nothing to reveal and no reason to draw a control.
+        public let hiddenCount: Int
+    }
+
+    /// Two versions naming the same release. `installed` is a git tag and the
+    /// entries are markdown headings written by hand, so a stray `v` or a
+    /// different case should not decide whether a card can be hidden.
+    private static func same(_ a: String, _ b: String) -> Bool {
+        func key(_ s: String) -> String {
+            var t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if t.hasPrefix("v") { t.removeFirst() }
+            return t
+        }
+        return key(a) == key(b)
+    }
+
+    /// The window, given the whole parsed list.
+    ///
+    /// Order of operations matters and is asserted by tests: dedupe first (so a
+    /// duplicate can never be pinned into the window twice), then pin, then take
+    /// the prefix, then union — preserving file order throughout.
+    ///
+    /// `limit` at or above the deduped count returns everything with
+    /// `hiddenCount == 0`; the expanded state passes `.max`. A `limit` of zero or
+    /// less still returns the pins, because hiding the version you are running is
+    /// the one outcome D30 forbids.
+    public static func visible(releases: [Release],
+                               installed: String?,
+                               latest: String?,
+                               limit: Int) -> Window {
+        var deduped: [Release] = []
+        var seen = Set<String>()
+        for r in releases where !seen.contains(r.id) {
+            seen.insert(r.id)
+            deduped.append(r)
+        }
+
+        func isPinned(_ r: Release) -> Bool {
+            if r.isUnreleased { return true }
+            if let installed, same(r.version, installed) { return true }
+            if let latest, same(r.version, latest) { return true }
+            return false
+        }
+
+        let head = max(0, min(limit, deduped.count))
+        var keep = Set<Int>(0..<head)
+        for (i, r) in deduped.enumerated() where isPinned(r) { keep.insert(i) }
+
+        let visible = deduped.enumerated().filter { keep.contains($0.offset) }.map(\.element)
+        return Window(visible: visible, hiddenCount: deduped.count - visible.count)
+    }
+
+    /// The label for the control that reveals the tail.
+    ///
+    /// Here rather than in the view because the plural is a real branch and a
+    /// view body is where "1 versões" ships unnoticed.
+    public static func moreLabel(hiddenCount: Int) -> String {
+        hiddenCount == 1 ? "Mostrar mais 1 versão" : "Mostrar mais \(hiddenCount) versões"
+    }
+
+    /// The label for collapsing back.
+    public static let lessLabel = "Mostrar menos"
+}
+
 // MARK: - Restoring the last selected section
 
 /// Which sidebar section to show at launch.
