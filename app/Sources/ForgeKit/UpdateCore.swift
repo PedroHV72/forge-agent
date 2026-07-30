@@ -183,6 +183,241 @@ public enum RelaunchTarget {
     }
 }
 
+// MARK: - What version is actually running
+
+/// The sidebar footer's text, and the decision of whether there are two numbers
+/// to show instead of one.
+///
+/// The bug this exists to prevent is a footer that lies. Before D25 the only
+/// version the app knew was `git describe` in the repo — read live, at display
+/// time. Pull without rebuilding and the UI announces the new version while the
+/// process running it is the old one, which is the exact opposite of the answer
+/// a version footer exists to give.
+///
+/// So the running version comes from a key stamped into the bundle at build
+/// time, and the repo's describe is a SECOND, separate number. When they differ,
+/// both are shown — the divergence is the information ("you committed but did
+/// not rebuild"), not an error to hide.
+///
+/// THE SENTINEL, and why it is not `"0.1.0"`.
+///   A build that was never stamped has no `ForgeGitDescribe` key at all, and
+///   under `swift run` there is no bundle, so `Bundle.main.infoDictionary` is an
+///   EMPTY dictionary and every key reads `nil`. "Unknown" is therefore the
+///   ABSENCE of the custom key — see `stamped(_:)`. Filtering the value `0.1.0`
+///   (the placeholder in the versioned `Info.plist`) would be a trap: `0.1.0` is
+///   a perfectly legitimate version string, and the day someone ships it the
+///   footer would go blank for no reason anyone could find.
+public enum VersionFooter {
+    /// Interpret a raw Info.plist value as "the version this binary is".
+    ///
+    /// `nil` in, `nil` out; empty or whitespace-only in, `nil` out — a key
+    /// stamped from a failed `git describe` is absent information wearing a
+    /// present key. Any other value is taken at face value, INCLUDING `0.1.0`
+    /// (see the note above).
+    public static func stamped(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
+
+    /// `git describe` shortened for a 152pt column: `v3.1.4-6-g63af17e` →
+    /// `v3.1.4+6`; `v3.1.4` → `v3.1.4` unchanged.
+    ///
+    /// Only the DISPLAY is shortened. Divergence is decided on the full describe
+    /// against the full describe, because two describes can share a tag and a
+    /// commit count while pointing at different commits, and dropping the sha
+    /// before comparing is how "committed but did not rebuild" becomes invisible.
+    ///
+    /// Anything that does not match git's `<tag>-<n>-g<sha>` shape is returned
+    /// verbatim rather than guessed at. That is what keeps a pre-release tag
+    /// (`v3.0.0-beta`, two components, no count) from being mangled into garbage:
+    /// only a trailing numeric count plus a `g`-prefixed hex sha is treated as a
+    /// suffix, so `v3.0.0-beta-6-gabc1234` shortens to `v3.0.0-beta+6` and
+    /// `v3.0.0-beta` is left alone.
+    public static func short(_ describe: String) -> String {
+        let s = describe.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = s.components(separatedBy: "-")
+        guard parts.count >= 3 else { return s }
+        let sha = parts[parts.count - 1]
+        let ahead = parts[parts.count - 2]
+        guard sha.count >= 2, sha.hasPrefix("g"),
+              sha.dropFirst().allSatisfy({ $0.isHexDigit }),
+              !ahead.isEmpty, ahead.allSatisfy({ $0.isNumber })
+        else { return s }
+        let tag = parts[0..<(parts.count - 2)].joined(separator: "-")
+        guard !tag.isEmpty else { return s }
+        return "\(tag)+\(ahead)"
+    }
+
+    /// What the footer shows, plus everything the caller needs to style it.
+    public struct Display: Equatable {
+        /// The short text for the column. Never empty.
+        public let text: String
+        /// The whole sentence, for a `.help()` tooltip — this is where R9 ("say
+        /// which number is which") is paid without spending width. `nil` when
+        /// `text` already says everything.
+        public let detail: String?
+        /// The running binary and the repo are at different commits.
+        public let diverged: Bool
+        /// The running version is known at all (i.e. this build was stamped).
+        public let known: Bool
+    }
+
+    /// The four states, given the stamped describe and the repo's describe.
+    ///
+    /// The second token is labelled `repo` rather than left bare: two unlabelled
+    /// numbers in a footer are worse than one, because the reader cannot tell
+    /// which is the thing they are looking at (R9).
+    public static func display(running: String?, repo: String?) -> Display {
+        let run = stamped(running)
+        let rep = stamped(repo)
+
+        switch (run, rep) {
+        case (nil, nil):
+            return Display(
+                text: "versão desconhecida",
+                detail: "não sei qual versão está em execução: este build não carrega a "
+                    + "chave ForgeGitDescribe, e não consegui ler a tag do repositório",
+                diverged: false,
+                known: false)
+
+        case (nil, let r?):
+            return Display(
+                text: "repo \(short(r))",
+                detail: "não sei qual versão está em execução (este build não foi "
+                    + "estampado); o repositório está em \(short(r))",
+                diverged: false,
+                known: false)
+
+        case (let r?, nil):
+            return Display(
+                text: short(r),
+                detail: "rodando \(short(r)); não consegui ler a tag do repositório",
+                diverged: false,
+                known: true)
+
+        case (let r?, let p?) where r == p:
+            return Display(text: short(r), detail: nil, diverged: false, known: true)
+
+        case (let r?, let p?):
+            return Display(
+                text: "\(short(r)) · repo \(short(p))",
+                detail: "rodando \(short(r)); o repositório está em \(short(p))",
+                diverged: true,
+                known: true)
+        }
+    }
+}
+
+// MARK: - Which release notes are on screen at rest
+
+/// The window of `ReleaseCard`s the update screen shows before anyone asks for
+/// more (D30).
+///
+/// D30 is an OPERATOR OVERRIDE of the brainstorm, which recommended not doing
+/// this: the whole list already scrolled, and a cut risks hiding the very notes a
+/// sibling task just shipped. The constraint that came with the override is what
+/// this type exists to enforce mechanically: THE CUT IS THE HISTORICAL TAIL,
+/// NEVER THE TOP. The entry for the version you are running, the entry for the
+/// version you could move to, and anything still unreleased are never behind
+/// "show more".
+///
+/// THE INVARIANT IS CONDITIONAL, and that is not a weakening.
+///   `installed` comes from `git describe --tags --abbrev=0`, while the entries
+///   come from `CHANGELOG.md`, and the two disagree in the real repo: `v3.1.4` is
+///   the installed tag and has NO changelog entry at all. So the guarantee can
+///   only be "IF an entry for `installed` exists, it is visible" — written as
+///   "the installed version's card is always visible" it would be unsatisfiable
+///   here, and a test asserting it would fail against this repo's own file. When
+///   the entry does not exist the invariant holds vacuously and nothing is
+///   pinned: absence is a legitimate state, not a case to paper over.
+///
+/// FILE ORDER IS NOT VERSION ORDER. `v1.35.0` precedes `v1.36.0` in this repo's
+/// CHANGELOG. Nothing here sorts, and nothing here promises "the 5 most recent":
+/// the promise is "the first 5 in the file, plus the pins". Windowing logic that
+/// assumed a sorted file would pin and cut the wrong cards, silently.
+///
+/// DEDUPE LIVES HERE, not only in the file. `Release.id` is the version string,
+/// so two entries sharing a version are two identical ids in a `ForEach`, which
+/// is undefined behaviour in SwiftUI. A sibling chunk fixed the two
+/// `## Unreleased` headings in this repo's file; this fixes the PROGRAM, which
+/// also has to survive a fork, a hand-edit and a merge.
+public enum ReleaseWindow {
+    /// How many cards the list shows at rest.
+    ///
+    /// One named value on purpose: the number itself was never validated against
+    /// a live list — nobody has answered "looking at it, is 5 too few?" — so
+    /// changing it has to be a one-line edit, not a hunt through a view body.
+    public static let restingLimit = 5
+
+    public struct Window: Equatable {
+        /// The cards to render, in file order, deduped.
+        public let visible: [Release]
+        /// How many deduped entries `visible` leaves out. `0` means there is
+        /// nothing to reveal and no reason to draw a control.
+        public let hiddenCount: Int
+    }
+
+    /// Two versions naming the same release. `installed` is a git tag and the
+    /// entries are markdown headings written by hand, so a stray `v` or a
+    /// different case should not decide whether a card can be hidden.
+    private static func same(_ a: String, _ b: String) -> Bool {
+        func key(_ s: String) -> String {
+            var t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if t.hasPrefix("v") { t.removeFirst() }
+            return t
+        }
+        return key(a) == key(b)
+    }
+
+    /// The window, given the whole parsed list.
+    ///
+    /// Order of operations matters and is asserted by tests: dedupe first (so a
+    /// duplicate can never be pinned into the window twice), then pin, then take
+    /// the prefix, then union — preserving file order throughout.
+    ///
+    /// `limit` at or above the deduped count returns everything with
+    /// `hiddenCount == 0`; the expanded state passes `.max`. A `limit` of zero or
+    /// less still returns the pins, because hiding the version you are running is
+    /// the one outcome D30 forbids.
+    public static func visible(releases: [Release],
+                               installed: String?,
+                               latest: String?,
+                               limit: Int) -> Window {
+        var deduped: [Release] = []
+        var seen = Set<String>()
+        for r in releases where !seen.contains(r.id) {
+            seen.insert(r.id)
+            deduped.append(r)
+        }
+
+        func isPinned(_ r: Release) -> Bool {
+            if r.isUnreleased { return true }
+            if let installed, same(r.version, installed) { return true }
+            if let latest, same(r.version, latest) { return true }
+            return false
+        }
+
+        let head = max(0, min(limit, deduped.count))
+        var keep = Set<Int>(0..<head)
+        for (i, r) in deduped.enumerated() where isPinned(r) { keep.insert(i) }
+
+        let visible = deduped.enumerated().filter { keep.contains($0.offset) }.map(\.element)
+        return Window(visible: visible, hiddenCount: deduped.count - visible.count)
+    }
+
+    /// The label for the control that reveals the tail.
+    ///
+    /// Here rather than in the view because the plural is a real branch and a
+    /// view body is where "1 versões" ships unnoticed.
+    public static func moreLabel(hiddenCount: Int) -> String {
+        hiddenCount == 1 ? "Mostrar mais 1 versão" : "Mostrar mais \(hiddenCount) versões"
+    }
+
+    /// The label for collapsing back.
+    public static let lessLabel = "Mostrar menos"
+}
+
 // MARK: - Restoring the last selected section
 
 /// Which sidebar section to show at launch.

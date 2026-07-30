@@ -54,37 +54,30 @@ enum Section: String, CaseIterable, Identifiable {
 struct RootView: View {
     @ObservedObject var state: AppState
 
+    /// The sidebar observes the update store (D32).
+    ///
+    /// Not polish: `UpdateStore` is a singleton that publishes asynchronously
+    /// (`checkOnLaunch` finishes seconds after the window opens), and without an
+    /// observation here SwiftUI never re-renders the sidebar when it does. The
+    /// consumer is `sidebarFooter` below: `updates.repoDescribe` is filled by
+    /// `load()`, and `updates.updateAvailable` by the launch check, so without
+    /// this the version line would be born empty and stay empty — worse than
+    /// absent. It is also why removing this line breaks the footer silently
+    /// rather than loudly, which is what the comment is for.
+    ///
+    /// The reference sits in a property initializer on purpose. `StateObject`'s
+    /// `init(wrappedValue:)` is `@MainActor` and takes an autoclosure, so
+    /// `shared` is touched on the main actor. Writing it as a default argument of
+    /// an explicit `init` instead is what costs a concurrency warning — that
+    /// expression is evaluated in a nonisolated context (learned in chunk 1).
+    @StateObject private var updates = UpdateStore.shared
+
     // Section selection lives in AppState, not in `@State`: opening a session
     // from the composer has to move the operator to the terminal, and only
     // shared state can be driven from there.
     var body: some View {
         NavigationSplitView {
-            List(selection: $state.section) {
-                ForEach(Section.allCases) { s in
-                    Label {
-                        HStack {
-                            Text(s.rawValue)
-                            Spacer()
-                            if let n = badge(for: s) {
-                                Text("\(n)")
-                                    .font(.caption2).monospacedDigit()
-                                    .foregroundStyle(s == .now ? .white : .secondary)
-                                    .padding(.horizontal, 6).padding(.vertical, 1)
-                                    .background(s == .now ? AnyShapeStyle(Color.accentOrange)
-                                                          : AnyShapeStyle(.quaternary),
-                                                in: Capsule())
-                            }
-                        }
-                    } icon: {
-                        Image(systemName: s.icon)
-                            .foregroundStyle(s == .now && !state.pending.isEmpty
-                                             ? Color.accentOrange : Color.secondary)
-                    }
-                    .tag(s)
-                }
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
-            .safeAreaInset(edge: .bottom) { sidebarFooter }
+            sidebarList
         } detail: {
             Group {
                 switch state.section ?? .now {
@@ -109,29 +102,91 @@ struct RootView: View {
         .animation(.easeInOut(duration: 0.18), value: state.pending.count)
     }
 
+    /// The sidebar list, extracted from `body` so a canvas can render the whole
+    /// column at the 180pt minimum width without a window around it — the width
+    /// where a `Divider`, or anything added to the footer, has to earn its place.
+    private var sidebarList: some View {
+        List(selection: $state.section) {
+            ForEach(Section.allCases) { s in
+                Label {
+                    HStack {
+                        Text(s.rawValue)
+                        Spacer()
+                        if let n = badge(for: s) {
+                            Text("\(n)")
+                                .font(.caption2).monospacedDigit()
+                                .foregroundStyle(s == .now ? .white : .secondary)
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(s == .now ? AnyShapeStyle(Color.accentOrange)
+                                                      : AnyShapeStyle(.quaternary),
+                                            in: Capsule())
+                        }
+                    }
+                } icon: {
+                    Image(systemName: s.icon)
+                        .foregroundStyle(s == .now && !state.pending.isEmpty
+                                         ? Color.accentOrange : Color.secondary)
+                }
+                .tag(s)
+
+                // D29 — one rule between the sections you work in and the ones
+                // you configure. 1pt of hierarchy instead of the ~60pt of chrome
+                // that real `List` sections would cost (D33).
+                //
+                // Emitted inside the same `ForEach` deliberately: splitting
+                // `Section.allCases` into two arrays would put a second source of
+                // truth next to `Stores.swift`, which feeds `SectionRestore`'s
+                // validator from `allCases` (D31).
+                if s == .runs { Divider() }
+            }
+        }
+        .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+        .safeAreaInset(edge: .bottom) { sidebarFooter }
+    }
+
+    /// Counts only, and only where a count means something.
+    ///
+    /// Updates has no case here (D27): the numeral it used to show was always
+    /// `1`, so it counted nothing — it was a dot wearing a number. One signal
+    /// belongs in one place, and that place is the footer, next to the version.
     private func badge(for s: Section) -> Int? {
         switch s {
         case .now:      return state.pending.isEmpty ? nil : state.pending.count
         case .runs:     return state.liveRuns.isEmpty ? nil : state.liveRuns.count
         case .terminal: return state.sessions.isEmpty ? nil : state.sessions.count
         case .projects: return state.workspaces.isEmpty ? nil : state.workspaces.count
-        case .updates:  return UpdateStore.shared.updateAvailable ? 1 : nil
         default:        return nil
         }
     }
 
+    /// Two rows, not one (D26).
+    ///
+    /// The version gets a line of its own because the measurement closes the door
+    /// on sharing: 152pt usable at the 180pt minimum column width, of which
+    /// "Adicionar projeto" already takes ~100pt. Putting the version beside it is
+    /// the arrangement that truncates, and a truncated version string hides
+    /// exactly the second number R9 says must be legible. A footer one line
+    /// taller costs nothing — `safeAreaInset` just yields the height and the
+    /// `List` scrolls if it ever has to.
     private var sidebarFooter: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 6) {
-                Button {
-                    pickWorkspace(state)
-                } label: {
-                    Label("Adicionar projeto", systemImage: "plus")
-                        .font(.caption)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Button {
+                        pickWorkspace(state)
+                    } label: {
+                        Label("Adicionar projeto", systemImage: "plus")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
                 }
-                .buttonStyle(.plain)
-                Spacer()
+                SidebarVersionLabel(
+                    running: updates.running,
+                    repo: updates.repoDescribe,
+                    updateAvailable: updates.updateAvailable,
+                    onTap: { state.section = .updates })
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
         }
@@ -149,6 +204,76 @@ struct RootView: View {
                 .padding(.bottom, 14)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
         }
+    }
+}
+
+#if DEBUG
+extension RootView {
+    /// The sidebar footer on its own, so a canvas can render it at the 180pt
+    /// minimum column width — the tight case, where a second line or an extra
+    /// glyph truncates. A preview of the whole `RootView` would show the footer
+    /// at whatever width the canvas happens to be, which is exactly the width
+    /// that hides the problem.
+    ///
+    /// Same file because `sidebarFooter` is `private`, and a preview is not a
+    /// reason to open it to the rest of the module.
+    var previewSidebarFooter: some View { sidebarFooter }
+
+    /// The whole sidebar column, for the same reason and by the same means: a
+    /// preview of `RootView` would render a full split view at whatever width
+    /// the canvas has, and the `Divider` (D29) is judged against the column, not
+    /// against a window.
+    var previewSidebarList: some View { sidebarList }
+}
+#endif
+
+/// The version in the sidebar footer: what is running, and one click to the
+/// section that can do something about it (D25 UI side, D26).
+///
+/// Every value arrives as a parameter — no store, no `Bundle`, no git. That is
+/// what makes the four states previewable at a fixed 180pt on a machine with no
+/// Xcode and no stamped bundle, which is the only width where the interesting
+/// question about this view exists.
+struct SidebarVersionLabel: View {
+    let running: String?
+    let repo: String?
+    let updateAvailable: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        let display = VersionFooter.display(running: running, repo: repo)
+        return Button {
+            onTap()
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                // VISUAL RULE 1: orange means "needs you". The dot is the whole
+                // update signal now that the sidebar numeral is gone (D27) — one
+                // signal, one place. 5pt because a dot next to 10pt `.caption`
+                // reads as punctuation, and anything bigger reads as a bullet.
+                if updateAvailable {
+                    Image(systemName: "circle.fill")
+                        .font(.system(size: 5))
+                        .foregroundStyle(Color.accentOrange)
+                }
+                Text(display.text)
+                    .font(.caption)
+                    .foregroundStyle(updateAvailable
+                                     ? AnyShapeStyle(Color.accentOrange)
+                                     : AnyShapeStyle(.secondary))
+                    .multilineTextAlignment(.leading)
+                    // Wrap, never truncate. A `Text` in a tight row ellipsises by
+                    // default, and the first thing an ellipsis eats here is the
+                    // second version — the one the reader came for. No
+                    // `lineLimit(1)` anywhere in this view, on purpose.
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // R9 is paid twice over: the short text labels the second number `repo`,
+        // and the tooltip says the whole sentence.
+        .help(display.detail ?? display.text)
     }
 }
 

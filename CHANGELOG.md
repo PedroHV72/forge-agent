@@ -1,4 +1,36 @@
-## Unreleased — SVN in the sidecar, and the end of `environment` as a free pass
+## v3.4.0 — The version you are running
+
+The app announced a version number that was the repository's tag rather than the binary
+you had open — so on a machine where you pull without rebuilding, which is every machine
+this is developed on, the number was confidently wrong. The sidebar now reports what is
+actually running, says so from every screen, and shows both numbers when they disagree.
+
+### Added
+
+- **The installed version is readable from every screen** (`T-20260730020639-sidebar-secao`). The sidebar footer carries it, and it is the version of the **running binary**, not the repository's tag: `app/build.sh` stamps the `git describe` into the bundle's `Info.plist` (`ForgeGitDescribe`, plus `CFBundleShortVersionString` and `CFBundleVersion` for the Finder) between the plist copy and `codesign` — before it, and every build would dirty the versioned file; after it, and the signature would be invalid. When the repository has moved on since that build, the footer shows both numbers with the second one labelled `repo`, which is the "I committed and forgot to rebuild" case the old display could not represent at all. The number is clickable and lands on Atualizações from anywhere in one click. A build that was never stamped says so — the sentinel is the **absence** of the custom key, never a comparison against the `0.1.0` placeholder, which is also a perfectly legitimate version to ship.
+- **One update signal instead of two, and a rule where the list changes register.** The numeral beside "Atualizações" in the sidebar is gone: it was always `1`, so it counted nothing — a dot wearing a number. The signal now lives in one place, on the footer where the version already is, orange with a dot. A single `Divider()` after "Runs" separates the sections where work happens from the ones that hold configuration; the release list keeps five entries at rest, with the rest one click away and the cut taken strictly off the historical tail — the entry for the version you are running, the one you could move to, and anything unreleased are pinned into the visible window whenever they exist at all; and the update card lost the decorative disc that repeated what its own headline and orange border already said.
+
+### Fixed
+
+- **Two `## Unreleased` headings in this file, both of them stale.** `Release.id` is the version string, so the app was handing `ForEach` two rows with the same id — undefined behaviour in SwiftUI, and about to become visible now that the list is short enough for both to fall inside it. Each has been renamed to the version it actually shipped in, determined by ancestry rather than by guess (`git describe --contains` on the commit that introduced the block): the top one is **v3.2.0**, the one below `v3.0.0-beta` is **v2.5.0**. The rename alone would let this come back, so a test now fails if any two releases parsed from `CHANGELOG.md` share an id, or if `## Unreleased` appears more than once.
+- **The sidebar never re-rendered when the update check finished.** `RootView` read `UpdateStore.shared` but did not observe it, so anything in that column that depended on an update being found was born empty and stayed empty until something else forced a redraw. Pre-existing, and load-bearing for everything above: it is why the footer populates on its own when the launch check returns.
+
+---
+
+## v3.3.0 — An installer you can watch
+
+Two tasks about the same complaint: the app would not tell you where it stood while it
+updated itself. It ran behind a spinner with nothing beside it, and it could only be made
+to run the installer when a release happened to be pending.
+
+### Added
+
+- **The in-app installer shows what it is doing while it does it** (`T-20260729191241-atualizacao-barra`). "Atualizar" used to hand off to `install.sh` and then say nothing for minutes, so a slow update and a hung one looked identical and the only way to tell them apart was to give up. The installer now runs headless with its output streamed into the card: a phase label that is the answer on its own, a spinner that stops when the run does, and a log folded away because it is the appeal, not the answer — it is where a failed step explains itself. There is deliberately **no percentage**: the `swift build` alone dominates the wall clock, so any number would be invented, and a bar that stops moving is the complaint rather than the fix. The precheck that refuses to update a dirty or diverged checkout now says that the refusal is **protection** and names the command that clears it, instead of reporting a failure the operator has to interpret. Relaunch is offered only on exit 0, and the relaunch sequence was reordered so that cancelling the live-session alert no longer leaves two copies of the app running.
+- **"Reinstalar"** (`T-20260730004115-afordance-reinstalar`) — reapplies agents, skills, scripts and the app from the checkout you already have, with **no git at all**: no fetch, no pull, no tag comparison. Two things follow. The progress UI above becomes reachable on demand rather than only in the minutes after a release appears; and the one state the precheck refuses — local commits, or a dirty tree — gains an action that works anyway. It renders next to "Atualizar" rather than instead of it, because an available-but-blocked update is exactly the state it exists to unblock.
+
+---
+
+## v3.2.0 — SVN in the sidecar, and the end of `environment` as a free pass
 
 ### Added
 
@@ -101,7 +133,7 @@ question, and somewhere to answer it.
 
 ---
 
-## Unreleased — Cost-aware dispatch and native Claude Code runtime controls
+## v2.5.0 — Cost-aware dispatch and native Claude Code runtime controls
 
 ### Added
 

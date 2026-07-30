@@ -17,7 +17,41 @@ final class UpdateStore: ObservableObject {
 
     @Published private(set) var installed: String?
     @Published private(set) var latest: String?
+
+    /// The version of the binary THIS PROCESS is, stamped into the bundle at
+    /// build time by `app/build.sh` (D25). Never re-read: it cannot change while
+    /// the process lives, which is the whole point of it.
+    ///
+    /// `nil` means "not stamped", and the sentinel is the ABSENCE of the key —
+    /// `VersionFooter.stamped` owns that decision and documents why it is not a
+    /// comparison against `0.1.0`. Two ways to legitimately land here: a bundle
+    /// built before the stamping existed, and `swift run Forge`, where there is
+    /// no bundle at all and `infoDictionary` is an empty dictionary.
+    private(set) var running: String? = VersionFooter.stamped(
+        Bundle.main.object(forInfoDictionaryKey: "ForgeGitDescribe") as? String)
+
+    /// The repo's describe, FULL — no `--abbrev=0`, unlike `installed`.
+    ///
+    /// The two are not interchangeable and neither replaces the other:
+    /// `installed` is a tag, compared semantically against the remote's tag to
+    /// decide whether an update exists; this one carries the commit count and the
+    /// sha, which is the only way "you committed but did not rebuild" is
+    /// detectable at all (comparing abbreviated tags says "in sync" across six
+    /// commits).
+    @Published private(set) var repoDescribe: String?
     @Published private(set) var releases: [Release] = []
+
+    #if DEBUG
+    /// True only for stores built by `staged(...)` (canvas previews). `load()`
+    /// no-ops on them (R7): without this, `UpdatesView.onAppear` would overwrite
+    /// the staged `installed`/`repoDescribe`/`releases` with live git/CHANGELOG
+    /// data on the one machine that has a canvas AND `ForgeCore.repoPath`
+    /// configured — the developer's — silently clobbering fixtures like
+    /// `previewLongReleases` that exist specifically to show a state real data
+    /// would never produce. Production stores are never staged, so `load()`
+    /// behaves exactly as before for them.
+    private(set) var isStagedPreview = false
+    #endif
     @Published private(set) var checking = false
     @Published private(set) var checkedAt: Date?
     @Published private(set) var lastError: String?
@@ -44,11 +78,15 @@ final class UpdateStore: ObservableObject {
     private var repo: String? { ForgeCore.repoPath }
 
     func load() {
+        #if DEBUG
+        guard !isStagedPreview else { return }
+        #endif
         guard let repo else {
             lastError = "repo do Forge não encontrado nas preferências"
             return
         }
         installed = git(["describe", "--tags", "--abbrev=0"], at: repo)
+        repoDescribe = git(["describe", "--tags"], at: repo)
         if let text = try? String(contentsOfFile: "\(repo)/CHANGELOG.md", encoding: .utf8) {
             releases = ChangelogParser.parse(text)
         }
@@ -183,6 +221,13 @@ final class UpdateStore: ObservableObject {
     private func finishUpdate(exitCode: Int32) {
         updating = false
         if UpdateOutcome.canRelaunch(exitCode: exitCode) {
+            // A successful update just pulled the repo: `repoDescribe` (and
+            // `installed`) are still whatever `load()` last saw BEFORE the pull,
+            // so without this refresh the still-running old process would keep
+            // comparing its `running` stamp against a stale `repoDescribe` and
+            // read "in sync" at the exact moment the running-vs-repo divergence
+            // becomes real (R6) — the entire reason the footer exists (D25).
+            load()
             needsRelaunch = true
         } else {
             lastError = UpdateOutcome.failureMessage(exitCode: exitCode, lastLines: log)
@@ -269,11 +314,36 @@ final class UpdateStore: ObservableObject {
 // MARK: - View
 
 struct UpdatesView: View {
-    @StateObject private var store = UpdateStore.shared
+    @StateObject private var store: UpdateStore
     @ObservedObject var state: AppState
 
     /// Folded by default: the phase label is the answer, the log is the appeal.
     @State private var logExpanded = false
+
+    /// The release list is short at rest (D30) and expands in place. The cut is
+    /// the historical tail only — `ReleaseWindow` pins the installed version, the
+    /// available one and anything unreleased, so nothing the operator needs can
+    /// fall behind the control.
+    @State private var showAllReleases = false
+
+    /// The store is injectable so a canvas preview can stage the states this
+    /// screen has — up to date, update available, installing, relaunch pending,
+    /// blocked. None of them is reachable through the singleton: every field
+    /// that selects a state is `@Published private(set)`, and the real ones are
+    /// only set by git and by the installer.
+    ///
+    /// Production passes nothing and gets `.shared`, so the running app still
+    /// has exactly one store, held for the view's lifetime exactly as before.
+    ///
+    /// `nil` rather than `store: UpdateStore = .shared`: a default argument
+    /// expression is evaluated in a nonisolated context, and `shared` is
+    /// main-actor-isolated, which costs a concurrency warning. Resolving it
+    /// inside `StateObject`'s main-actor autoclosure puts the reference back
+    /// exactly where the property initializer had it — hence no new warning.
+    init(state: AppState, store: UpdateStore? = nil) {
+        self.state = state
+        _store = StateObject(wrappedValue: store ?? UpdateStore.shared)
+    }
 
     var body: some View {
         ScrollView {
@@ -285,9 +355,10 @@ struct UpdatesView: View {
                     Label(err, systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.orange)
                 }
-                ForEach(store.releases.prefix(12)) { r in
+                ForEach(releaseWindow.visible) { r in
                     ReleaseCard(release: r, installed: store.installed)
                 }
+                showMoreControl
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
@@ -306,18 +377,49 @@ struct UpdatesView: View {
         }
     }
 
+    /// Which release notes are on screen (D30).
+    ///
+    /// Every rule lives in `ReleaseWindow` in ForgeKit, which is testable; this
+    /// property is only the wiring. It replaced a twelve-item prefix that cut the list
+    /// by position with no notion of which cards must not be cut — with a short
+    /// list that becomes visible, which is why the limit is a NAMED constant and
+    /// not a literal here: the number `5` was never validated against a live
+    /// list, so it has to be changeable in one place.
+    private var releaseWindow: ReleaseWindow.Window {
+        ReleaseWindow.visible(releases: store.releases,
+                              installed: store.installed,
+                              latest: store.latest,
+                              limit: showAllReleases ? .max : ReleaseWindow.restingLimit)
+    }
+
+    /// Reveals the tail in place. Absent when there is no tail — a control that
+    /// says "show more 0" is worse than no control.
+    @ViewBuilder private var showMoreControl: some View {
+        let hidden = releaseWindow.hiddenCount
+        if hidden > 0 || showAllReleases {
+            Button(hidden > 0 ? ReleaseWindow.moreLabel(hiddenCount: hidden)
+                              : ReleaseWindow.lessLabel) {
+                withAnimation(.easeInOut(duration: 0.15)) { showAllReleases.toggle() }
+            }
+            .buttonStyle(.plain)
+            .controlSize(.small)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The icon column this card used to open with — a filled disc with a glyph
+    /// centred in it — is gone (D28). It was the single largest piece of
+    /// decoration on the screen and it carried no information the card did not
+    /// already state twice: the headline says "Atualização disponível: vX" in
+    /// words, and the orange `strokeBorder` below already exercises the file's
+    /// visual rule 1 (orange = needs you) at the card's own boundary.
+    ///
+    /// The action slot is untouched, deliberately: its three states and the
+    /// "Atualizar" + "Reinstalar" coexistence were bought with a review
+    /// objection in a sibling task and are not this subtraction's business.
     private var versionCard: some View {
         HStack(spacing: 16) {
-            ZStack {
-                Circle()
-                    .fill(store.updateAvailable ? Color.accentOrange.opacity(0.15)
-                                                : Color.secondary.opacity(0.12))
-                    .frame(width: 54, height: 54)
-                Image(systemName: store.updateAvailable ? "arrow.down.circle.fill" : "checkmark.circle")
-                    .font(.system(size: 24))
-                    .foregroundStyle(store.updateAvailable ? Color.accentOrange : .secondary)
-            }
-
             VStack(alignment: .leading, spacing: 3) {
                 if store.updateAvailable, let latest = store.latest {
                     Text("Atualização disponível: \(latest)").font(.headline)
@@ -609,3 +711,50 @@ struct ChangelogEntryView: View {
             ?? AttributedString(s)
     }
 }
+
+// MARK: - Preview staging
+
+#if DEBUG
+extension UpdateStore {
+    /// A detached store with its fields set, for canvas previews only.
+    ///
+    /// It lives in THIS file on purpose: the fields that select a state are
+    /// `@Published private(set)`, and `private` in Swift reaches the enclosing
+    /// declaration and its extensions *in the same file*. A factory anywhere
+    /// else would have forced those setters open for production callers too —
+    /// a permanent cost paid for a preview-only need.
+    ///
+    /// `UpdateStore()` does no work (no git, no network, no timer), so a second
+    /// instance is inert; `shared` stays the only store the app itself uses.
+    static func staged(installed: String? = "v3.3.0",
+                       latest: String? = nil,
+                       releases: [Release] = [],
+                       checkedAt: Date? = Date(),
+                       updating: Bool = false,
+                       phase: String? = nil,
+                       log: [String] = [],
+                       blockedMessage: String? = nil,
+                       blockedCommand: String? = nil,
+                       lastError: String? = nil,
+                       needsRelaunch: Bool = false,
+                       running: String? = nil,
+                       repoDescribe: String? = nil) -> UpdateStore {
+        let s = UpdateStore()
+        s.isStagedPreview = true
+        s.installed = installed
+        s.running = running
+        s.repoDescribe = repoDescribe
+        s.latest = latest
+        s.releases = releases
+        s.checkedAt = checkedAt
+        s.updating = updating
+        s.phase = phase
+        s.log = log
+        s.blockedMessage = blockedMessage
+        s.blockedCommand = blockedCommand
+        s.lastError = lastError
+        s.needsRelaunch = needsRelaunch
+        return s
+    }
+}
+#endif

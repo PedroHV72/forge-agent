@@ -159,6 +159,18 @@ final class AppState: ObservableObject {
         refreshStatus()
     }
 
+#if DEBUG
+    /// An inert state for canvas previews. `init()` reads the operator's real
+    /// `.gsd`, spawns node for the per-project status, installs an FSEvents
+    /// watcher and starts a 15s timer — in a canvas that runs on every redraw,
+    /// which makes the preview slow, machine-dependent and noisy. This does none
+    /// of it, so the views render from whatever the preview stages.
+    ///
+    /// Not a `convenience init` in an extension: that would have to call
+    /// `init()`, which is the work being avoided.
+    init(preview: Void) {}
+#endif
+
     deinit { timer?.invalidate() }
 
     // MARK: Cheap reload (files only)
