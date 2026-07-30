@@ -58,9 +58,12 @@ struct RootView: View {
     ///
     /// Not polish: `UpdateStore` is a singleton that publishes asynchronously
     /// (`checkOnLaunch` finishes seconds after the window opens), and without an
-    /// observation here SwiftUI never re-renders the sidebar when it does. Any
-    /// update signal placed in this column — the footer version, next chunk —
-    /// would be born empty and stay empty, which is worse than absent.
+    /// observation here SwiftUI never re-renders the sidebar when it does. The
+    /// consumer is `sidebarFooter` below: `updates.repoDescribe` is filled by
+    /// `load()`, and `updates.updateAvailable` by the launch check, so without
+    /// this the version line would be born empty and stay empty — worse than
+    /// absent. It is also why removing this line breaks the footer silently
+    /// rather than loudly, which is what the comment is for.
     ///
     /// The reference sits in a property initializer on purpose. `StateObject`'s
     /// `init(wrappedValue:)` is `@MainActor` and takes an autoclosure, so
