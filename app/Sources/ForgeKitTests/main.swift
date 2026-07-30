@@ -850,6 +850,94 @@ test("changelog vazio não quebra") {
     assertEqual(ChangelogParser.parse("texto solto sem cabeçalho").count, 0)
 }
 
+// MARK: - Id duplicado no CHANGELOG real (D36)
+//
+// `Release.id` é a própria `version`, e a tela de Atualizações passa a lista para
+// um `ForEach`. Dois headings com a mesma versão — foi o caso real: `## Unreleased`
+// na linha 1 E na 104 — produzem dois ids iguais, que em SwiftUI é comportamento
+// INDEFINIDO, não erro: nada avisa, nada quebra visivelmente, e a lista renderiza
+// uma das duas entradas ou as duas no lugar errado. O conserto do arquivo não se
+// protege sozinho (basta o próximo release abrir um `## Unreleased` novo e esquecer
+// de fechá-lo), então o invariante é asserido contra o arquivo de verdade, aqui.
+
+/// O CHANGELOG.md do repositório, localizado a partir do `#filePath` deste arquivo
+/// e não do diretório de trabalho: `swift run ForgeKitTests` roda de `app/`, mas
+/// `scripts/run-tests.js` invoca de outro lugar, e um teste que só encontra o
+/// arquivo sob um cwd específico é um teste que passa por não achar nada.
+let repoChangelogPath: String = {
+    var url = URL(fileURLWithPath: #filePath)   // …/app/Sources/ForgeKitTests/main.swift
+    for _ in 0..<4 { url = url.deletingLastPathComponent() }
+    return url.appendingPathComponent("CHANGELOG.md").path
+}()
+
+test("o CHANGELOG.md do repositório existe e é parseável") {
+    assertTrue(FileManager.default.fileExists(atPath: repoChangelogPath),
+               "CHANGELOG.md não encontrado em \(repoChangelogPath) — os dois testes "
+               + "seguintes passariam por vacuidade")
+    let text = (try? String(contentsOfFile: repoChangelogPath, encoding: .utf8)) ?? ""
+    assertGreater(ChangelogParser.parse(text).count, 10,
+                  "o CHANGELOG real parseou em quase nada — o formato mudou e os "
+                  + "invariantes abaixo deixaram de medir o arquivo")
+}
+
+test("nenhuma release do CHANGELOG.md real tem id duplicado (D36)") {
+    let text = (try? String(contentsOfFile: repoChangelogPath, encoding: .utf8)) ?? ""
+    var seen: [String: Int] = [:]
+    for r in ChangelogParser.parse(text) { seen[r.id, default: 0] += 1 }
+    let dupes = seen.filter { $0.value > 1 }.keys.sorted()
+    assertTrue(dupes.isEmpty,
+               "headings `## <version>` repetidos em CHANGELOG.md: \(dupes.joined(separator: ", ")) "
+               + "— `Release.id` é a version, então isso dá ids iguais num ForEach "
+               + "(comportamento indefinido). Renomeie o heading para a versão que a "
+               + "entrada efetivamente é (`git describe --contains <commit>` responde qual)")
+}
+
+test("o CHANGELOG.md real tem no máximo um `## Unreleased` (D36)") {
+    let text = (try? String(contentsOfFile: repoChangelogPath, encoding: .utf8)) ?? ""
+    let unreleased = ChangelogParser.parse(text).filter(\.isUnreleased)
+    assertLessOrEqual(unreleased.count, 1,
+                      "\(unreleased.count) entradas `Unreleased` em CHANGELOG.md — todas "
+                      + "colidem no mesmo id. Feche a antiga com a versão em que ela saiu")
+}
+
+test("o detector morde: duas entradas Unreleased dão dois ids iguais") {
+    // Sem este caso os dois testes acima seriam indistinguíveis de asserções
+    // vazias: eles provam que o arquivo está limpo, não que a sujeira seria vista.
+    let md = """
+    ## Unreleased — primeiro bloco
+
+    ### Added
+
+    - a
+
+    ---
+
+    ## v1.0.0 — meio
+
+    ### Fixed
+
+    - b
+
+    ---
+
+    ## Unreleased — segundo bloco, esquecido de fechar
+
+    ### Added
+
+    - c
+    """
+    let rs = ChangelogParser.parse(md)
+    assertEqual(rs.count, 3)
+    assertEqual(rs.filter(\.isUnreleased).count, 2)
+    // O ponto: os ids são IGUAIS, e é isso que o ForEach recebe.
+    assertEqual(rs[0].id, rs[2].id)
+    var seen: [String: Int] = [:]
+    for r in rs { seen[r.id, default: 0] += 1 }
+    assertEqual(seen.filter { $0.value > 1 }.count, 1,
+                "o mesmo cálculo que roda contra o arquivo real não acusou a duplicata "
+                + "deste fixture — então ele não acusaria a do arquivo tampouco")
+}
+
 test("comparação de versão é semântica, não alfabética") {
     // The case that matters as a project ages: a string compare puts v2.9.0
     // above v2.11.0 and would tell you to downgrade.

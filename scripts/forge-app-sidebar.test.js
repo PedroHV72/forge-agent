@@ -40,6 +40,16 @@
 //      invisible at runtime — out of order, the build still exits 0 and the app
 //      still launches — while one order dirties the versioned file on every build
 //      and the other invalidates the signature. Nothing but a guard notices.
+//   8. The `versionCard` has no 54pt `Circle` (D28) — and still has all three
+//      states of its action slot, "Atualizar" and "Reinstalar" together (D34).
+//      Both halves are asserted in the same place on purpose: the subtraction is
+//      the icon column and only the icon column, and "simplifying the card" is
+//      exactly how a property bought with a review objection gets lost.
+//   9. No two `## <version>` headings in CHANGELOG.md, and no `## Unreleased`
+//      at all (D36). `Release.id` is the version string, so a repeat is a
+//      duplicate id in a `ForEach` — undefined behaviour, and silent. This was
+//      real: `## Unreleased` sat at line 1 and line 104. Renaming the two fixed
+//      the file; only this guard stops the habit that produced them.
 //
 // Pure file reading, like forge-app-update.test.js and unlike forge-app.test.js:
 // no swift invocation, so it NEVER skips and runs everywhere, Windows included.
@@ -56,6 +66,7 @@ const previewsSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Previews.s
 const updatesSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Updates.swift');
 const updateCoreSwift = path.join(repoRoot, 'app', 'Sources', 'ForgeKit', 'UpdateCore.swift');
 const buildSh = path.join(repoRoot, 'app', 'build.sh');
+const changelogMd = path.join(repoRoot, 'CHANGELOG.md');
 
 let passed = 0;
 let failed = 0;
@@ -541,6 +552,91 @@ check('o --install copia o bundle já assinado e já estampado', () => {
       + '`--install` "para pegar as duas cópias" pega ZERO cópias corretamente '
       + 'assinadas: /Applications recebe uma cópia do bundle já pronto'
   );
+});
+
+// --------------------------------- D28: o versionCard perdeu a coluna de ícone
+
+check('o versionCard não tem mais o Circle de 54pt (D28)', () => {
+  const updates = stripLineComments(read(updatesSwift));
+  const card = bodyOf(updates, 'private var versionCard');
+  assert(
+    !card.includes('Circle('),
+    'o Circle voltou ao versionCard: era o maior pedaço de decoração da tela e não '
+      + 'dizia nada que o headline ("Atualização disponível: vX", em palavras) e a '
+      + 'strokeBorder laranja da própria borda do card já não dissessem (D28)'
+  );
+  assert(
+    !/\b54\b/.test(card),
+    'o número 54 reapareceu no versionCard — era o diâmetro do disco removido (D28)'
+  );
+});
+
+check('o slot de ação do versionCard segue intacto (D34)', () => {
+  // A subtração da D28 é a COLUNA DO ÍCONE, e só ela. A coexistência
+  // Atualizar+Reinstalar foi comprada com objeção de review numa task irmã
+  // (esconder Reinstalar quando o update aparece o escondia no único estado em
+  // que ele importa), e "simplificar o card" é justamente como ela se perderia.
+  const updates = stripLineComments(read(updatesSwift));
+  const card = bodyOf(updates, 'private var versionCard');
+  for (const label of ['Atualizar', 'Reinstalar', 'Reabrir na nova versão']) {
+    assert(
+      card.includes(`"${label}"`),
+      `o botão "${label}" desapareceu do versionCard — os três estados do slot de `
+        + 'ação e a coexistência Atualizar+Reinstalar são intocáveis (D34)'
+    );
+  }
+  assert(
+    /needsRelaunch/.test(card),
+    'o versionCard não distingue mais `needsRelaunch`: o relaunch ganha o slot '
+      + 'inteiro depois que o instalador roda, e perder isso deixa o operador '
+      + 'olhando uma janela velha que parece atual (D34)'
+  );
+});
+
+// ------------------------------------- D36: o CHANGELOG deixa de colidir em id
+
+check('nenhum heading `## <version>` se repete em CHANGELOG.md (D36)', () => {
+  // `Release.id` é a própria version (Changelog.swift), e a tela passa a lista a
+  // um ForEach: dois headings iguais são dois ids iguais, que em SwiftUI é
+  // comportamento INDEFINIDO — nada avisa. Era o caso real (`## Unreleased` na
+  // linha 1 e na 104) e ficaria visível agora que a lista é curta.
+  const src = read(changelogMd);
+  const seen = new Map();
+  for (const line of src.split('\n')) {
+    if (!line.startsWith('## ')) continue;
+    const version = line.slice(3).split(/ — | - /)[0].trim();
+    seen.set(version, (seen.get(version) || 0) + 1);
+  }
+  const dupes = [...seen.entries()].filter(([, n]) => n > 1).map(([v, n]) => `${v} (${n}x)`);
+  assert(
+    dupes.length === 0,
+    `headings repetidos em CHANGELOG.md: ${dupes.join(', ')} — renomeie para a versão `
+      + 'que a entrada efetivamente é; `git describe --contains <commit>` responde qual'
+  );
+  assert(seen.size > 10, `só ${seen.size} headings lidos em CHANGELOG.md — o formato mudou`);
+});
+
+check('nenhum `## Unreleased` sobrou em CHANGELOG.md (D36)', () => {
+  const n = countOf(read(changelogMd), '\n## Unreleased');
+  const first = read(changelogMd).startsWith('## Unreleased') ? 1 : 0;
+  assert(
+    n + first === 0,
+    `${n + first} heading(s) \`## Unreleased\` em CHANGELOG.md. Todos colidem no mesmo `
+      + 'id, e o hábito de abrir um e não fechá-lo é exatamente como a colisão voltou '
+      + 'a existir na linha 1 depois de já ter sido criada a tag v3.2.0'
+  );
+});
+
+check('as entradas que a D36 nomeia existem em CHANGELOG.md', () => {
+  const src = read(changelogMd);
+  for (const v of ['v3.3.0', 'v3.2.0', 'v2.5.0']) {
+    assert(
+      src.startsWith(`## ${v} `) || src.includes(`\n## ${v} `),
+      `nenhum heading \`## ${v}\` em CHANGELOG.md — os dois Unreleased foram renomeados `
+        + 'para as versões em que efetivamente saíram (v3.2.0 e v2.5.0), e a v3.3.0 é a '
+        + 'entrada desta leva de tasks; sem ela a tag nasceria sem notas no app'
+    );
+  }
 });
 
 // ------------------------------------------------------- bite-proof do bodyOf

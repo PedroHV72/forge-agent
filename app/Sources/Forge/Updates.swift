@@ -348,18 +348,18 @@ struct UpdatesView: View {
         }
     }
 
+    /// The icon column this card used to open with — a filled disc with a glyph
+    /// centred in it — is gone (D28). It was the single largest piece of
+    /// decoration on the screen and it carried no information the card did not
+    /// already state twice: the headline says "Atualização disponível: vX" in
+    /// words, and the orange `strokeBorder` below already exercises the file's
+    /// visual rule 1 (orange = needs you) at the card's own boundary.
+    ///
+    /// The action slot is untouched, deliberately: its three states and the
+    /// "Atualizar" + "Reinstalar" coexistence were bought with a review
+    /// objection in a sibling task and are not this subtraction's business.
     private var versionCard: some View {
         HStack(spacing: 16) {
-            ZStack {
-                Circle()
-                    .fill(store.updateAvailable ? Color.accentOrange.opacity(0.15)
-                                                : Color.secondary.opacity(0.12))
-                    .frame(width: 54, height: 54)
-                Image(systemName: store.updateAvailable ? "arrow.down.circle.fill" : "checkmark.circle")
-                    .font(.system(size: 24))
-                    .foregroundStyle(store.updateAvailable ? Color.accentOrange : .secondary)
-            }
-
             VStack(alignment: .leading, spacing: 3) {
                 if store.updateAvailable, let latest = store.latest {
                     Text("Atualização disponível: \(latest)").font(.headline)
