@@ -47,6 +47,18 @@ func assertEqual<T: Equatable>(_ a: T, _ b: T, _ msg: String = "") {
 func assertGreater<T: Comparable>(_ a: T, _ b: T, _ msg: String = "") {
     if !(a > b) { failures.append((current, msg)); failed += 1; print("  ✗ \(current)\n      \(msg)") }
 }
+func assertLessOrEqual<T: Comparable>(_ a: T, _ b: T, _ msg: String = "") {
+    if !(a <= b) {
+        let m = "\(msg)\n     esperado <= \(b)\n     obtido:    \(a)"
+        failures.append((current, m)); failed += 1; print("  ✗ \(current)\n      \(m)")
+    }
+}
+func assertNil<T>(_ v: T?, _ msg: String = "esperado nil") {
+    if v != nil {
+        let m = "\(msg)\n     obtido: \(String(describing: v))"
+        failures.append((current, m)); failed += 1; print("  ✗ \(current)\n      \(m)")
+    }
+}
 func assertNoThrow(_ body: () throws -> Void, _ msg: String = "") {
     do { try body() } catch {
         failures.append((current, msg)); failed += 1; print("  ✗ \(current)\n      \(msg)")
@@ -1766,6 +1778,126 @@ test("a mensagem de bloqueio explica que a recusa é proteção") {
         assertGreater(m.count, 40, "mensagem curta demais para explicar: \(m)")
         assertFalse(m.contains("stash"), "a mensagem sugere stash: \(m)")
     }
+}
+
+// MARK: - VersionFooter (D25 UI side, R9)
+
+// The property under test is "the footer does not lie". Three states are real
+// and reachable TODAY, before any stamping exists: unstamped (no bundle key at
+// all), stamped-and-in-sync, and stamped-but-the-repo-moved.
+
+test("short encurta um describe com sufixo de commits") {
+    assertEqual(VersionFooter.short("v3.1.4-6-g63af17e"), "v3.1.4+6")
+    assertEqual(VersionFooter.short("v3.1.4-7-gabc1234"), "v3.1.4+7")
+    assertEqual(VersionFooter.short("v1.36.0-142-gdeadbee"), "v1.36.0+142")
+}
+
+test("short devolve uma tag sem sufixo inalterada") {
+    assertEqual(VersionFooter.short("v3.1.4"), "v3.1.4")
+    assertEqual(VersionFooter.short("3.1.4"), "3.1.4")
+}
+
+test("short não estraga uma tag pré-release") {
+    // Duas componentes, nenhuma contagem: nada a encurtar.
+    assertEqual(VersionFooter.short("v3.0.0-beta"), "v3.0.0-beta")
+    assertEqual(VersionFooter.short("v3.0.0-rc.1"), "v3.0.0-rc.1")
+    // Com sufixo de verdade, o hífen do pré-release fica no lugar.
+    assertEqual(VersionFooter.short("v3.0.0-beta-6-gabc1234"), "v3.0.0-beta+6")
+}
+
+test("short devolve verbatim qualquer coisa que não seja forma de git describe") {
+    // Sem `g` no sha, sem contagem numérica, sem tag: nada é adivinhado.
+    assertEqual(VersionFooter.short("v3.1.4-6-63af17e"), "v3.1.4-6-63af17e")
+    assertEqual(VersionFooter.short("v3.1.4-seis-g63af17e"), "v3.1.4-seis-g63af17e")
+    assertEqual(VersionFooter.short("-6-g63af17e"), "-6-g63af17e")
+    assertEqual(VersionFooter.short(""), "")
+}
+
+test("stamped: a sentinela é a AUSÊNCIA da chave, nunca o literal 0.1.0") {
+    assertNil(VersionFooter.stamped(nil), "chave ausente tem de virar nil")
+    assertNil(VersionFooter.stamped(""), "chave vazia é informação ausente")
+    assertNil(VersionFooter.stamped("   \n"), "chave só com espaço é informação ausente")
+    // `0.1.0` é o placeholder do Info.plist versionado — e também uma versão
+    // perfeitamente legítima. Filtrá-la aqui apagaria o rodapé de quem a
+    // publicasse de verdade, e ninguém acharia a causa.
+    assertEqual(VersionFooter.stamped("0.1.0"), "0.1.0")
+    assertEqual(VersionFooter.stamped(" v3.1.4-6-g63af17e \n"), "v3.1.4-6-g63af17e")
+}
+
+test("rodapé em dia: um número só, sem detalhe, sem divergência") {
+    let d = VersionFooter.display(running: "v3.3.0", repo: "v3.3.0")
+    assertEqual(d.text, "v3.3.0")
+    assertNil(d.detail, "não há nada a explicar quando há um número só")
+    assertFalse(d.diverged, "running == repo não é divergência")
+    assertTrue(d.known, "um describe estampado é versão conhecida")
+}
+
+test("rodapé divergente: dois números, o segundo rotulado repo (R9)") {
+    let d = VersionFooter.display(running: "v3.1.4-6-g63af17e", repo: "v3.1.4-7-gabc1234")
+    assertEqual(d.text, "v3.1.4+6 · repo v3.1.4+7")
+    assertTrue(d.diverged, "describes diferentes são divergência")
+    assertTrue(d.known, "o binário em execução é conhecido")
+    // R9: o texto curto rotula o segundo, e o detalhe diz a frase inteira.
+    assertTrue(d.text.contains("repo "), "o segundo número não está rotulado: \(d.text)")
+    let detail = d.detail ?? ""
+    assertTrue(detail.contains("rodando v3.1.4+6"), "o detalhe não diz o que roda: \(detail)")
+    assertTrue(detail.contains("repositório está em v3.1.4+7"),
+               "o detalhe não diz onde o repo está: \(detail)")
+}
+
+test("rodapé não estampado: diz o repo e admite não saber o que roda") {
+    let d = VersionFooter.display(running: nil, repo: "v3.1.4-7-gabc1234")
+    assertEqual(d.text, "repo v3.1.4+7")
+    assertFalse(d.known, "sem a chave do bundle a versão em execução é desconhecida")
+    assertFalse(d.diverged, "não se pode divergir do que não se conhece")
+    assertTrue((d.detail ?? "").contains("não sei qual versão está em execução"),
+               "o detalhe não admite o desconhecido: \(d.detail ?? "nil")")
+}
+
+test("rodapé sem nada: texto explícito, nunca vazio") {
+    let d = VersionFooter.display(running: nil, repo: nil)
+    assertEqual(d.text, "versão desconhecida")
+    assertFalse(d.known)
+    assertFalse(d.diverged)
+    assertTrue((d.detail ?? "").contains("ForgeGitDescribe"),
+               "o detalhe não nomeia a chave que falta: \(d.detail ?? "nil")")
+}
+
+test("rodapé estampado com repo ilegível: mostra o que roda, sem inventar repo") {
+    let d = VersionFooter.display(running: "v3.1.4-6-g63af17e", repo: nil)
+    assertEqual(d.text, "v3.1.4+6")
+    assertTrue(d.known, "o bundle foi estampado; isso é sabido")
+    assertFalse(d.diverged, "sem describe do repo não há com o que divergir")
+    assertFalse(d.text.contains("repo"),
+                "rotulou um repo que não foi lido: \(d.text)")
+}
+
+test("divergência é decidida no describe COMPLETO, não na forma curta") {
+    // O caso que morde: mesma tag, mesma contagem, commits diferentes. Comparar
+    // a forma curta (`v3.1.4+6` == `v3.1.4+6`) diria "em dia" e esconderia
+    // exatamente o "commitei e não recompilei" que o rodapé existe para mostrar.
+    let d = VersionFooter.display(running: "v3.1.4-6-gaaaaaaa", repo: "v3.1.4-6-gbbbbbbb")
+    assertTrue(d.diverged, "shas diferentes com a mesma contagem não foram detectados")
+    assertEqual(d.text, "v3.1.4+6 · repo v3.1.4+6")
+
+    // E o inverso: describe idêntico com sufixo não é divergência.
+    let same = VersionFooter.display(running: "v3.1.4-6-gaaaaaaa", repo: "v3.1.4-6-gaaaaaaa")
+    assertFalse(same.diverged, "o mesmo describe foi lido como divergente")
+    assertEqual(same.text, "v3.1.4+6")
+}
+
+test("o texto do rodapé cabe no orçamento de largura de 152pt") {
+    // A medição do research: 152pt úteis a 180pt de coluna. `.caption` no macOS
+    // é 10pt, ~4,6pt por caractere em média — o pior caso realista tem de ficar
+    // na casa dos 30 caracteres, não dos 40 (dois describes inteiros dariam 44).
+    let worst = VersionFooter.display(running: "v3.1.4-6-g63af17e",
+                                      repo: "v3.1.4-7-gabc1234")
+    assertLessOrEqual(worst.text.count, 30,
+                      "o texto do pior caso ficou longo demais para 152pt: "
+                      + "\(worst.text.count) caracteres — \(worst.text)")
+    // E o detalhe, que vive num tooltip, pode e deve ser prolixo.
+    assertGreater((worst.detail ?? "").count, worst.text.count,
+                  "o detalhe não é mais informativo que o texto curto")
 }
 
 print("\n" + String(repeating: "─", count: 60))

@@ -183,6 +183,132 @@ public enum RelaunchTarget {
     }
 }
 
+// MARK: - What version is actually running
+
+/// The sidebar footer's text, and the decision of whether there are two numbers
+/// to show instead of one.
+///
+/// The bug this exists to prevent is a footer that lies. Before D25 the only
+/// version the app knew was `git describe` in the repo — read live, at display
+/// time. Pull without rebuilding and the UI announces the new version while the
+/// process running it is the old one, which is the exact opposite of the answer
+/// a version footer exists to give.
+///
+/// So the running version comes from a key stamped into the bundle at build
+/// time, and the repo's describe is a SECOND, separate number. When they differ,
+/// both are shown — the divergence is the information ("you committed but did
+/// not rebuild"), not an error to hide.
+///
+/// THE SENTINEL, and why it is not `"0.1.0"`.
+///   A build that was never stamped has no `ForgeGitDescribe` key at all, and
+///   under `swift run` there is no bundle, so `Bundle.main.infoDictionary` is an
+///   EMPTY dictionary and every key reads `nil`. "Unknown" is therefore the
+///   ABSENCE of the custom key — see `stamped(_:)`. Filtering the value `0.1.0`
+///   (the placeholder in the versioned `Info.plist`) would be a trap: `0.1.0` is
+///   a perfectly legitimate version string, and the day someone ships it the
+///   footer would go blank for no reason anyone could find.
+public enum VersionFooter {
+    /// Interpret a raw Info.plist value as "the version this binary is".
+    ///
+    /// `nil` in, `nil` out; empty or whitespace-only in, `nil` out — a key
+    /// stamped from a failed `git describe` is absent information wearing a
+    /// present key. Any other value is taken at face value, INCLUDING `0.1.0`
+    /// (see the note above).
+    public static func stamped(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
+
+    /// `git describe` shortened for a 152pt column: `v3.1.4-6-g63af17e` →
+    /// `v3.1.4+6`; `v3.1.4` → `v3.1.4` unchanged.
+    ///
+    /// Only the DISPLAY is shortened. Divergence is decided on the full describe
+    /// against the full describe, because two describes can share a tag and a
+    /// commit count while pointing at different commits, and dropping the sha
+    /// before comparing is how "committed but did not rebuild" becomes invisible.
+    ///
+    /// Anything that does not match git's `<tag>-<n>-g<sha>` shape is returned
+    /// verbatim rather than guessed at. That is what keeps a pre-release tag
+    /// (`v3.0.0-beta`, two components, no count) from being mangled into garbage:
+    /// only a trailing numeric count plus a `g`-prefixed hex sha is treated as a
+    /// suffix, so `v3.0.0-beta-6-gabc1234` shortens to `v3.0.0-beta+6` and
+    /// `v3.0.0-beta` is left alone.
+    public static func short(_ describe: String) -> String {
+        let s = describe.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = s.components(separatedBy: "-")
+        guard parts.count >= 3 else { return s }
+        let sha = parts[parts.count - 1]
+        let ahead = parts[parts.count - 2]
+        guard sha.count >= 2, sha.hasPrefix("g"),
+              sha.dropFirst().allSatisfy({ $0.isHexDigit }),
+              !ahead.isEmpty, ahead.allSatisfy({ $0.isNumber })
+        else { return s }
+        let tag = parts[0..<(parts.count - 2)].joined(separator: "-")
+        guard !tag.isEmpty else { return s }
+        return "\(tag)+\(ahead)"
+    }
+
+    /// What the footer shows, plus everything the caller needs to style it.
+    public struct Display: Equatable {
+        /// The short text for the column. Never empty.
+        public let text: String
+        /// The whole sentence, for a `.help()` tooltip — this is where R9 ("say
+        /// which number is which") is paid without spending width. `nil` when
+        /// `text` already says everything.
+        public let detail: String?
+        /// The running binary and the repo are at different commits.
+        public let diverged: Bool
+        /// The running version is known at all (i.e. this build was stamped).
+        public let known: Bool
+    }
+
+    /// The four states, given the stamped describe and the repo's describe.
+    ///
+    /// The second token is labelled `repo` rather than left bare: two unlabelled
+    /// numbers in a footer are worse than one, because the reader cannot tell
+    /// which is the thing they are looking at (R9).
+    public static func display(running: String?, repo: String?) -> Display {
+        let run = stamped(running)
+        let rep = stamped(repo)
+
+        switch (run, rep) {
+        case (nil, nil):
+            return Display(
+                text: "versão desconhecida",
+                detail: "não sei qual versão está em execução: este build não carrega a "
+                    + "chave ForgeGitDescribe, e não consegui ler a tag do repositório",
+                diverged: false,
+                known: false)
+
+        case (nil, let r?):
+            return Display(
+                text: "repo \(short(r))",
+                detail: "não sei qual versão está em execução (este build não foi "
+                    + "estampado); o repositório está em \(short(r))",
+                diverged: false,
+                known: false)
+
+        case (let r?, nil):
+            return Display(
+                text: short(r),
+                detail: "rodando \(short(r)); não consegui ler a tag do repositório",
+                diverged: false,
+                known: true)
+
+        case (let r?, let p?) where r == p:
+            return Display(text: short(r), detail: nil, diverged: false, known: true)
+
+        case (let r?, let p?):
+            return Display(
+                text: "\(short(r)) · repo \(short(p))",
+                detail: "rodando \(short(r)); o repositório está em \(short(p))",
+                diverged: true,
+                known: true)
+        }
+    }
+}
+
 // MARK: - Restoring the last selected section
 
 /// Which sidebar section to show at launch.

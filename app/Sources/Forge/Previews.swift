@@ -1,23 +1,38 @@
 // Previews — the update UI's states, renderable without reaching them.
 //
-// THE THREE LOOPS, AND WHAT EACH ONE REALLY COSTS
+// THE LOOPS, AND WHICH ONES ACTUALLY EXIST HERE
 //
-//   1. Xcode canvas — sub-second, per keystroke.
+// Corrected in chunk 3: this header used to promise three loops. On the machine
+// this app is developed on, TWO OF THEM DO NOT EXIST — measured, not assumed.
+//
+//   1. Xcode canvas — sub-second, per keystroke. REQUIRES XCODE.
 //      Open `app/Package.swift` in Xcode (File ▸ Open, pick the Package.swift
 //      itself, not the folder), then open this file and press ⌥⌘↩ for the
-//      canvas. Every state below renders side by side. This is the loop to use
-//      while deciding how something LOOKS.
+//      canvas. Every state below renders side by side.
+//      Unavailable when `xcode-select -p` points at
+//      `/Library/Developer/CommandLineTools` — which is this machine.
 //
-//   2. `cd app && swift run Forge` — ~6s, the whole app, debug.
-//      Real navigation, real git, real installer. Note: there is no bundle on
-//      this path, so `Bundle.main.infoDictionary` is an EMPTY dictionary and
-//      every Info.plist key reads `nil`. Anything that displays a bundle
-//      version is legitimately unknown here — that is the build, not a bug.
+//   2. `cd app && swift run Forge` — DOES NOT RUN.
+//      It dies in `Notifier.shared`:
+//      `UNUserNotificationCenter.currentNotificationCenter()` throws
+//      `bundleProxyForCurrentProcess is nil`, because UserNotifications requires
+//      a real bundle. The app is not wrong; running a bundleless binary is.
 //
-//   3. `./app/build.sh --run` — minutes, release, real .app.
-//      `swift build -c release` plus bundle assembly and codesign. The only
-//      loop with full fidelity: bundle keys, icon, ad-hoc signature. Use it to
-//      confirm, not to iterate.
+//   3. `./app/build.sh --debug --run` — ~2s warm, ~12s cold. THE REAL LOOP HERE.
+//      Debug binary in a real bundle, so notifications, Info.plist keys and
+//      navigation all work. Touches nothing in /Applications without
+//      `--install`. Judge FORM here.
+//
+//   4. `./app/build.sh --run` — minutes, release, real .app.
+//      `swift build -c release` plus bundle assembly and codesign. Full
+//      fidelity: this is what proves the stamped version and the final form.
+//      Confirm here, do not iterate here.
+//
+// A note that is worth what it cost to learn: a bundle that was never STAMPED
+// (`ForgeGitDescribe` absent) is a legitimate state, not a bug — see
+// `VersionFooter`. Loops 1 and 2 have no bundle at all, and loop 3 has one whose
+// keys are the placeholders from the versioned `Info.plist`. Anything that
+// displays a running version reads "unknown" or "repo only" in all three.
 //
 // WHY `PreviewProvider` AND NOT `#Preview`
 //   The `#Preview` macro is implemented by a compiler plugin (`PreviewsMacros`)
@@ -168,6 +183,13 @@ struct AtualizacoesPreviews: PreviewProvider {
 /// label alone takes ~100pt of it. Anything added to this footer has to fit in
 /// what is left, so previewing it at a comfortable width would hide the only
 /// interesting question about it.
+///
+/// Since chunk 3 the footer has two rows: the button, and the version on a line
+/// of its own (D26). This preview renders the REAL `RootView` footer, so it reads
+/// the real `UpdateStore` — meaning the version here shows whatever this build
+/// actually knows, which under an unstamped bundle is honestly "unknown". The
+/// four states of the label itself are staged by parameter in
+/// `SidebarVersionLabelPreviews` below.
 struct SidebarRodapePreviews: PreviewProvider {
     static var previews: some View {
         RootView(state: previewState())
@@ -175,6 +197,62 @@ struct SidebarRodapePreviews: PreviewProvider {
             .frame(width: 180)
             .padding(.vertical, 20)
             .previewDisplayName("Sidebar — rodapé a 180pt (mínimo)")
+    }
+}
+
+/// The version label in the footer, in every state it has (D25/D26/R9).
+///
+/// All five are locked to 180pt — the `min:` of the column — because the only
+/// open question about this view is whether the text fits there, and a
+/// comfortable width answers a question nobody asked. The last entry is the
+/// pathological case: two long describes, which is where the promise "wrap,
+/// never truncate" either holds or is exposed.
+///
+/// Note what the second state really is: `running` = `nil` is not a contrived
+/// input. It is the state of every build made before the stamping exists, and of
+/// `swift run Forge` forever — no bundle, empty `infoDictionary`, every key nil.
+struct SidebarVersionLabelPreviews: PreviewProvider {
+    static var previews: some View {
+        Group {
+            SidebarVersionLabel(running: "v3.3.0", repo: "v3.3.0",
+                                updateAvailable: false, onTap: {})
+                .frame(width: 180)
+                .padding(.vertical, 12)
+                .previewDisplayName("Rodapé — versão em dia")
+
+            SidebarVersionLabel(running: "v3.1.4-6-g63af17e", repo: "v3.1.4-7-gabc1234",
+                                updateAvailable: false, onTap: {})
+                .frame(width: 180)
+                .padding(.vertical, 12)
+                .previewDisplayName("Rodapé — repo andou (divergente)")
+
+            SidebarVersionLabel(running: nil, repo: "v3.1.4-7-gabc1234",
+                                updateAvailable: false, onTap: {})
+                .frame(width: 180)
+                .padding(.vertical, 12)
+                .previewDisplayName("Rodapé — build não estampado")
+
+            SidebarVersionLabel(running: nil, repo: nil,
+                                updateAvailable: false, onTap: {})
+                .frame(width: 180)
+                .padding(.vertical, 12)
+                .previewDisplayName("Rodapé — versão desconhecida")
+
+            SidebarVersionLabel(running: "v3.3.0", repo: "v3.3.0",
+                                updateAvailable: true, onTap: {})
+                .frame(width: 180)
+                .padding(.vertical, 12)
+                .previewDisplayName("Rodapé — update disponível (laranja com ponto)")
+
+            // Worst case on record: a long pre-release tag on both sides, with
+            // the update dot also competing for the row.
+            SidebarVersionLabel(running: "v3.10.0-beta.2-128-g63af17e",
+                                repo: "v3.10.0-beta.2-131-gabc1234",
+                                updateAvailable: true, onTap: {})
+                .frame(width: 180)
+                .padding(.vertical, 12)
+                .previewDisplayName("Rodapé — patológico (tem de quebrar, não truncar)")
+        }
     }
 }
 

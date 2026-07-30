@@ -17,6 +17,28 @@ final class UpdateStore: ObservableObject {
 
     @Published private(set) var installed: String?
     @Published private(set) var latest: String?
+
+    /// The version of the binary THIS PROCESS is, stamped into the bundle at
+    /// build time by `app/build.sh` (D25). Never re-read: it cannot change while
+    /// the process lives, which is the whole point of it.
+    ///
+    /// `nil` means "not stamped", and the sentinel is the ABSENCE of the key —
+    /// `VersionFooter.stamped` owns that decision and documents why it is not a
+    /// comparison against `0.1.0`. Two ways to legitimately land here: a bundle
+    /// built before the stamping existed, and `swift run Forge`, where there is
+    /// no bundle at all and `infoDictionary` is an empty dictionary.
+    private(set) var running: String? = VersionFooter.stamped(
+        Bundle.main.object(forInfoDictionaryKey: "ForgeGitDescribe") as? String)
+
+    /// The repo's describe, FULL — no `--abbrev=0`, unlike `installed`.
+    ///
+    /// The two are not interchangeable and neither replaces the other:
+    /// `installed` is a tag, compared semantically against the remote's tag to
+    /// decide whether an update exists; this one carries the commit count and the
+    /// sha, which is the only way "you committed but did not rebuild" is
+    /// detectable at all (comparing abbreviated tags says "in sync" across six
+    /// commits).
+    @Published private(set) var repoDescribe: String?
     @Published private(set) var releases: [Release] = []
     @Published private(set) var checking = false
     @Published private(set) var checkedAt: Date?
@@ -49,6 +71,7 @@ final class UpdateStore: ObservableObject {
             return
         }
         installed = git(["describe", "--tags", "--abbrev=0"], at: repo)
+        repoDescribe = git(["describe", "--tags"], at: repo)
         if let text = try? String(contentsOfFile: "\(repo)/CHANGELOG.md", encoding: .utf8) {
             releases = ChangelogParser.parse(text)
         }
@@ -653,9 +676,13 @@ extension UpdateStore {
                        blockedMessage: String? = nil,
                        blockedCommand: String? = nil,
                        lastError: String? = nil,
-                       needsRelaunch: Bool = false) -> UpdateStore {
+                       needsRelaunch: Bool = false,
+                       running: String? = nil,
+                       repoDescribe: String? = nil) -> UpdateStore {
         let s = UpdateStore()
         s.installed = installed
+        s.running = running
+        s.repoDescribe = repoDescribe
         s.latest = latest
         s.releases = releases
         s.checkedAt = checkedAt

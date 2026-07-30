@@ -21,7 +21,17 @@
 //      re-renders the sidebar when `checkOnLaunch` publishes, and every update
 //      signal in this column is born empty. This was a real pre-existing bug,
 //      not a hypothetical.
-//   4. The preview harness is alive: `Previews.swift` exists, is inside
+//   4. The footer shows the RUNNING version and the sentinel for "unknown" is
+//      the ABSENCE of the `ForgeGitDescribe` bundle key — never a comparison
+//      against `0.1.0` (D25). `0.1.0` is the placeholder in the versioned
+//      Info.plist and also a legitimate version string: filtering it would blank
+//      the footer for whoever actually shipped it, with no findable cause. The
+//      shortcut is tempting for exactly as long as the placeholder is still
+//      there, which is why this is pinned rather than trusted.
+//   5. The version label wraps instead of truncating (`fixedSize`, no
+//      `lineLimit(1)`). At the 180pt minimum the ellipsis eats the second number,
+//      which is the one R9 says must be legible.
+//   6. The preview harness is alive: `Previews.swift` exists, is inside
 //      `#if DEBUG`, and still has previews. On a machine without Xcode the
 //      harness is the only way to judge form at a fixed width, and a chunk that
 //      deletes it would look like a passing build.
@@ -38,6 +48,8 @@ const repoRoot = path.resolve(__dirname, '..');
 const viewsSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Views.swift');
 const storesSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Stores.swift');
 const previewsSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Previews.swift');
+const updatesSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Updates.swift');
+const updateCoreSwift = path.join(repoRoot, 'app', 'Sources', 'ForgeKit', 'UpdateCore.swift');
 
 let passed = 0;
 let failed = 0;
@@ -225,12 +237,14 @@ check('o harness de preview está vivo e sob #if DEBUG', () => {
       + 'nas Command Line Tools, e derruba `swift build` — o único sinal autoritativo '
       + 'desta máquina. Use PreviewProvider.'
   );
-  // Lower bound, never an exact count: os chunks seguintes acrescentam previews
-  // (o rodapé com versão são quatro estados a mais). Suba este número quando
-  // isso acontecer; nunca o troque por igualdade.
+  // Lower bound, never an exact count: os chunks seguintes acrescentam previews.
+  // Subiu de 8 para 12 no chunk 3 (seis estados do rótulo de versão a mais, hoje
+  // 14 no total). Suba este número quando isso acontecer de novo; nunca o troque
+  // por igualdade — foi um must-have de contagem EXATA que impediu o chunk 1 de
+  // proteger o próprio harness.
   const n = countOf(previews, 'previewDisplayName');
   assert(
-    n >= 8,
+    n >= 12,
     `esperados >= 8 previewDisplayName em Previews.swift, encontrados ${n} — um chunk `
       + 'apagou parte do harness'
   );
@@ -247,6 +261,188 @@ check('existe preview da sidebar completa a 180pt', () => {
     /previewSidebarList[\s\S]{0,200}?width:\s*180/.test(previews),
     'o preview da sidebar não está travado em 180pt: é o `min:` da coluna, a largura '
       + 'onde qualquer adição tem de caber'
+  );
+});
+
+// -------------------------------------------- D25/D26: o rodapé mostra a versão
+
+check('o rodapé monta o SidebarVersionLabel numa linha própria (D26)', () => {
+  const views = stripLineComments(read(viewsSwift));
+  const footer = bodyOf(views, 'private var sidebarFooter');
+  assert(
+    footer.includes('SidebarVersionLabel('),
+    'o rodapé não monta mais o SidebarVersionLabel — a versão em execução voltou a '
+      + 'não ser visível de nenhuma tela (D25/D26)'
+  );
+  assert(
+    footer.includes('Adicionar projeto'),
+    'o botão "Adicionar projeto" saiu do rodapé: a versão foi ACRESCENTADA numa '
+      + 'segunda linha, não trocada pelo que já estava lá'
+  );
+  // A linha própria é a decisão de largura, não estética: a 180pt sobram 152pt
+  // úteis e "Adicionar projeto" já toma ~100pt. Se os dois voltarem para o mesmo
+  // HStack, o texto da versão trunca — e a elipse come justamente o segundo
+  // número (R9).
+  const atButton = footer.indexOf('Adicionar projeto');
+  const atLabel = footer.indexOf('SidebarVersionLabel(');
+  assert(
+    atButton < atLabel,
+    'o SidebarVersionLabel aparece antes do "Adicionar projeto": a versão é a '
+      + 'segunda linha do rodapé'
+  );
+  assert(
+    /VStack\(alignment:\s*\.leading/.test(footer),
+    'o rodapé não empilha mais em VStack(alignment: .leading) — sem isso as duas '
+      + 'linhas voltam a competir pela mesma largura'
+  );
+});
+
+check('o rótulo de versão deriva o texto de VersionFooter.display (D25)', () => {
+  const views = stripLineComments(read(viewsSwift));
+  const label = bodyOf(views, 'struct SidebarVersionLabel');
+  assert(
+    label.includes('VersionFooter.display('),
+    'SidebarVersionLabel não chama VersionFooter.display — os quatro estados do '
+      + 'rodapé (e a decisão de divergência) são lógica pura testada em ForgeKit, '
+      + 'e reimplementá-los na view os tira do alcance dos testes'
+  );
+});
+
+check('a versão do rodapé leva à seção Atualizações em um clique (D26)', () => {
+  const views = stripLineComments(read(viewsSwift));
+  const footer = bodyOf(views, 'private var sidebarFooter');
+  assert(
+    /state\.section\s*=\s*\.updates/.test(footer),
+    'clicar a versão não seleciona mais a seção Atualizações: `state.section` é '
+      + '@Published e o binding de List(selection:) é bidirecional, então essa '
+      + 'atribuição é o que também acende a linha na sidebar (D26)'
+  );
+});
+
+check('o rótulo quebra em duas linhas em vez de truncar a 180pt', () => {
+  const views = stripLineComments(read(viewsSwift));
+  const label = bodyOf(views, 'struct SidebarVersionLabel');
+  assert(
+    /fixedSize\(horizontal:\s*false,\s*vertical:\s*true\)/.test(label),
+    'SidebarVersionLabel perdeu `.fixedSize(horizontal: false, vertical: true)` — '
+      + 'sem isso o Text é comprimido verticalmente e o pior caso a 180pt trunca'
+  );
+  assert(
+    !/lineLimit\(1\)/.test(label),
+    'apareceu `lineLimit(1)` no rótulo de versão: a 180pt o pior caso tem de '
+      + 'QUEBRAR, e a elipse esconde justamente o segundo número (R9)'
+  );
+});
+
+check('o único sinal de update no rodapé é laranja com ponto (D26/D27)', () => {
+  const views = stripLineComments(read(viewsSwift));
+  const label = bodyOf(views, 'struct SidebarVersionLabel');
+  assert(
+    label.includes('updateAvailable'),
+    'SidebarVersionLabel não lê mais `updateAvailable` — a D27 tirou o numeral da '
+      + 'lista prometendo que o sinal viveria aqui; sem isso o app perdeu o sinal'
+  );
+  assert(
+    label.includes('accentOrange'),
+    'o rótulo não usa mais Color.accentOrange: laranja = "precisa de você" é a '
+      + 'regra visual 1 do arquivo, e o rodapé é agora o único lugar que a exerce'
+  );
+  assert(
+    /circle\.fill|Circle\(\)/.test(label),
+    'o ponto de update desapareceu do rótulo — cor sozinha é sinal frágil'
+  );
+});
+
+// ------------------------------- a sentinela é a AUSÊNCIA da chave, não o 0.1.0
+
+check('a versão em execução vem da chave ForgeGitDescribe do bundle (D25)', () => {
+  const updates = stripLineComments(read(updatesSwift));
+  assert(
+    /Bundle\.main\.object\(forInfoDictionaryKey:\s*"ForgeGitDescribe"\)/.test(updates),
+    'o store não lê mais `ForgeGitDescribe` do bundle — voltaria a exibir a tag do '
+      + 'repo como se fosse a versão em execução, que é a mentira que a D25 conserta'
+  );
+  assert(
+    /VersionFooter\.stamped\(/.test(updates),
+    'a leitura do bundle não passa mais por VersionFooter.stamped — a decisão '
+      + '"o que conta como não estampado" é pura e testada; duplicá-la na view a '
+      + 'tira do alcance dos testes'
+  );
+});
+
+check('nada trata o literal 0.1.0 como sentinela de "não estampado"', () => {
+  // A sentinela é a AUSÊNCIA da chave custom. `0.1.0` é o placeholder do
+  // Info.plist versionado E uma versão perfeitamente legítima: filtrá-la
+  // apagaria o rodapé de quem a publicasse de verdade, e a causa seria
+  // inachável. Este guard existe porque o atalho é tentador exatamente enquanto
+  // o placeholder ainda está lá.
+  for (const [name, file] of [
+    ['Updates.swift', updatesSwift],
+    ['UpdateCore.swift', updateCoreSwift],
+    ['Views.swift', viewsSwift],
+  ]) {
+    const src = stripLineComments(read(file));
+    assert(
+      !src.includes('0.1.0'),
+      `${name} compara com o literal 0.1.0: a sentinela de "build não estampado" `
+        + 'é a ausência da chave ForgeGitDescribe, nunca um valor de versão'
+    );
+  }
+});
+
+check('VersionFooter existe em ForgeKit, com os quatro estados alcançáveis', () => {
+  const core = stripLineComments(read(updateCoreSwift));
+  const decl = bodyOf(core, 'public enum VersionFooter');
+  for (const sig of ['static func stamped(', 'static func short(', 'static func display(']) {
+    assert(decl.includes(sig), `VersionFooter perdeu \`${sig}\` — é a lógica que o `
+      + 'rodapé exibe, e ela mora em ForgeKit porque o target Forge não é '
+      + 'importável por target de teste');
+  }
+  for (const field of ['let text', 'let detail', 'let diverged', 'let known']) {
+    assert(
+      decl.includes(field),
+      `VersionFooter.Display perdeu \`${field}\` — o rodapé precisa dos quatro: `
+        + 'texto curto, frase inteira para o .help(), divergência e "sei ou não"'
+    );
+  }
+});
+
+check('divergência é decidida no describe completo, não na forma curta', () => {
+  const core = stripLineComments(read(updateCoreSwift));
+  const decl = bodyOf(core, 'public enum VersionFooter');
+  const body = bodyOf(decl, 'static func display(');
+  // A comparação tem de ser entre os valores crus (`r == p`), nunca entre
+  // `short(r) == short(p)`: mesma tag e mesma contagem com shas diferentes é
+  // justo o caso "commitei e não recompilei" que o rodapé existe para mostrar.
+  assert(
+    !/short\([^)]*\)\s*==\s*short\(/.test(body),
+    'display() compara formas curtas: dois describes com a mesma tag e a mesma '
+      + 'contagem de commits seriam lidos como "em dia" mesmo apontando para '
+      + 'commits diferentes'
+  );
+});
+
+// -------------------------------------- previews dos estados do rodapé (chunk 3)
+
+check('os quatro estados do rótulo de versão têm preview a 180pt', () => {
+  const previews = read(previewsSwift);
+  assert(
+    previews.includes('SidebarVersionLabel('),
+    'nenhum preview renderiza SidebarVersionLabel — os estados dele não são '
+      + 'alcançáveis por navegação (exigem um bundle estampado e um repo que andou)'
+  );
+  const n = countOf(previews, 'SidebarVersionLabel(');
+  assert(
+    n >= 5,
+    `esperados >= 5 previews de SidebarVersionLabel (em dia, divergente, não `
+      + `estampado, desconhecido, update disponível), encontrados ${n}`
+  );
+  // O estado não estampado é o que se pode rodar HOJE, antes de existir
+  // estampagem nenhuma — e o que `swift run Forge` mostra para sempre.
+  assert(
+    /SidebarVersionLabel\(running:\s*nil/.test(previews),
+    'nenhum preview cobre `running: nil` — é o estado real de todo build feito '
+      + 'antes da estampagem e de qualquer `swift run`, não um caso hipotético'
   );
 });
 

@@ -156,18 +156,34 @@ struct RootView: View {
         }
     }
 
+    /// Two rows, not one (D26).
+    ///
+    /// The version gets a line of its own because the measurement closes the door
+    /// on sharing: 152pt usable at the 180pt minimum column width, of which
+    /// "Adicionar projeto" already takes ~100pt. Putting the version beside it is
+    /// the arrangement that truncates, and a truncated version string hides
+    /// exactly the second number R9 says must be legible. A footer one line
+    /// taller costs nothing — `safeAreaInset` just yields the height and the
+    /// `List` scrolls if it ever has to.
     private var sidebarFooter: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 6) {
-                Button {
-                    pickWorkspace(state)
-                } label: {
-                    Label("Adicionar projeto", systemImage: "plus")
-                        .font(.caption)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Button {
+                        pickWorkspace(state)
+                    } label: {
+                        Label("Adicionar projeto", systemImage: "plus")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
                 }
-                .buttonStyle(.plain)
-                Spacer()
+                SidebarVersionLabel(
+                    running: updates.running,
+                    repo: updates.repoDescribe,
+                    updateAvailable: updates.updateAvailable,
+                    onTap: { state.section = .updates })
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
         }
@@ -207,6 +223,56 @@ extension RootView {
     var previewSidebarList: some View { sidebarList }
 }
 #endif
+
+/// The version in the sidebar footer: what is running, and one click to the
+/// section that can do something about it (D25 UI side, D26).
+///
+/// Every value arrives as a parameter — no store, no `Bundle`, no git. That is
+/// what makes the four states previewable at a fixed 180pt on a machine with no
+/// Xcode and no stamped bundle, which is the only width where the interesting
+/// question about this view exists.
+struct SidebarVersionLabel: View {
+    let running: String?
+    let repo: String?
+    let updateAvailable: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        let display = VersionFooter.display(running: running, repo: repo)
+        return Button {
+            onTap()
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                // VISUAL RULE 1: orange means "needs you". The dot is the whole
+                // update signal now that the sidebar numeral is gone (D27) — one
+                // signal, one place. 5pt because a dot next to 10pt `.caption`
+                // reads as punctuation, and anything bigger reads as a bullet.
+                if updateAvailable {
+                    Image(systemName: "circle.fill")
+                        .font(.system(size: 5))
+                        .foregroundStyle(Color.accentOrange)
+                }
+                Text(display.text)
+                    .font(.caption)
+                    .foregroundStyle(updateAvailable
+                                     ? AnyShapeStyle(Color.accentOrange)
+                                     : AnyShapeStyle(.secondary))
+                    .multilineTextAlignment(.leading)
+                    // Wrap, never truncate. A `Text` in a tight row ellipsises by
+                    // default, and the first thing an ellipsis eats here is the
+                    // second version — the one the reader came for. No
+                    // `lineLimit(1)` anywhere in this view, on purpose.
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // R9 is paid twice over: the short text labels the second number `repo`,
+        // and the tooltip says the whole sentence.
+        .help(display.detail ?? display.text)
+    }
+}
 
 @MainActor
 func pickWorkspace(_ state: AppState) {
