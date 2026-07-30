@@ -152,6 +152,20 @@ struct RootView: View {
     }
 }
 
+#if DEBUG
+extension RootView {
+    /// The sidebar footer on its own, so a canvas can render it at the 180pt
+    /// minimum column width — the tight case, where a second line or an extra
+    /// glyph truncates. A preview of the whole `RootView` would show the footer
+    /// at whatever width the canvas happens to be, which is exactly the width
+    /// that hides the problem.
+    ///
+    /// Same file because `sidebarFooter` is `private`, and a preview is not a
+    /// reason to open it to the rest of the module.
+    var previewSidebarFooter: some View { sidebarFooter }
+}
+#endif
+
 @MainActor
 func pickWorkspace(_ state: AppState) {
     let panel = NSOpenPanel()

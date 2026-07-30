@@ -7,6 +7,13 @@
 #   ./app/build.sh              build into app/build/Forge.app
 #   ./app/build.sh --install    also copy it into /Applications
 #   ./app/build.sh --run        also launch it
+#
+# This is the SLOWEST of three loops, and the only one with full fidelity
+# (bundle, icon, signature). While iterating on how something looks, prefer:
+#   1. Xcode canvas — sub-second. Open app/Package.swift in Xcode, then
+#      app/Sources/Forge/Previews.swift, and press ⌥⌘↩.
+#   2. cd app && swift run Forge — ~6s, whole app, debug. No .app bundle on
+#      this path, so every Info.plist key reads nil.
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +27,7 @@ for arg in "$@"; do
     --install) DO_INSTALL=true ;;
     --run)     DO_RUN=true ;;
     -h|--help)
-      sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "build.sh: opção desconhecida: $arg" >&2; exit 2 ;;
   esac

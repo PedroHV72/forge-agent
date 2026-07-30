@@ -269,11 +269,30 @@ final class UpdateStore: ObservableObject {
 // MARK: - View
 
 struct UpdatesView: View {
-    @StateObject private var store = UpdateStore.shared
+    @StateObject private var store: UpdateStore
     @ObservedObject var state: AppState
 
     /// Folded by default: the phase label is the answer, the log is the appeal.
     @State private var logExpanded = false
+
+    /// The store is injectable so a canvas preview can stage the states this
+    /// screen has — up to date, update available, installing, relaunch pending,
+    /// blocked. None of them is reachable through the singleton: every field
+    /// that selects a state is `@Published private(set)`, and the real ones are
+    /// only set by git and by the installer.
+    ///
+    /// Production passes nothing and gets `.shared`, so the running app still
+    /// has exactly one store, held for the view's lifetime exactly as before.
+    ///
+    /// `nil` rather than `store: UpdateStore = .shared`: a default argument
+    /// expression is evaluated in a nonisolated context, and `shared` is
+    /// main-actor-isolated, which costs a concurrency warning. Resolving it
+    /// inside `StateObject`'s main-actor autoclosure puts the reference back
+    /// exactly where the property initializer had it — hence no new warning.
+    init(state: AppState, store: UpdateStore? = nil) {
+        self.state = state
+        _store = StateObject(wrappedValue: store ?? UpdateStore.shared)
+    }
 
     var body: some View {
         ScrollView {
@@ -609,3 +628,45 @@ struct ChangelogEntryView: View {
             ?? AttributedString(s)
     }
 }
+
+// MARK: - Preview staging
+
+#if DEBUG
+extension UpdateStore {
+    /// A detached store with its fields set, for canvas previews only.
+    ///
+    /// It lives in THIS file on purpose: the fields that select a state are
+    /// `@Published private(set)`, and `private` in Swift reaches the enclosing
+    /// declaration and its extensions *in the same file*. A factory anywhere
+    /// else would have forced those setters open for production callers too —
+    /// a permanent cost paid for a preview-only need.
+    ///
+    /// `UpdateStore()` does no work (no git, no network, no timer), so a second
+    /// instance is inert; `shared` stays the only store the app itself uses.
+    static func staged(installed: String? = "v3.3.0",
+                       latest: String? = nil,
+                       releases: [Release] = [],
+                       checkedAt: Date? = Date(),
+                       updating: Bool = false,
+                       phase: String? = nil,
+                       log: [String] = [],
+                       blockedMessage: String? = nil,
+                       blockedCommand: String? = nil,
+                       lastError: String? = nil,
+                       needsRelaunch: Bool = false) -> UpdateStore {
+        let s = UpdateStore()
+        s.installed = installed
+        s.latest = latest
+        s.releases = releases
+        s.checkedAt = checkedAt
+        s.updating = updating
+        s.phase = phase
+        s.log = log
+        s.blockedMessage = blockedMessage
+        s.blockedCommand = blockedCommand
+        s.lastError = lastError
+        s.needsRelaunch = needsRelaunch
+        return s
+    }
+}
+#endif
