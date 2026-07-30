@@ -35,6 +35,11 @@
 //      `#if DEBUG`, and still has previews. On a machine without Xcode the
 //      harness is the only way to judge form at a fixed width, and a chunk that
 //      deletes it would look like a passing build.
+//   7. `build.sh` stamps the bundle copy of Info.plist, and stamps it strictly
+//      BETWEEN the plist copy and `codesign` (D25, R8). Both fronteiras are
+//      invisible at runtime — out of order, the build still exits 0 and the app
+//      still launches — while one order dirties the versioned file on every build
+//      and the other invalidates the signature. Nothing but a guard notices.
 //
 // Pure file reading, like forge-app-update.test.js and unlike forge-app.test.js:
 // no swift invocation, so it NEVER skips and runs everywhere, Windows included.
@@ -50,6 +55,7 @@ const storesSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Stores.swift
 const previewsSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Previews.swift');
 const updatesSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Updates.swift');
 const updateCoreSwift = path.join(repoRoot, 'app', 'Sources', 'ForgeKit', 'UpdateCore.swift');
+const buildSh = path.join(repoRoot, 'app', 'build.sh');
 
 let passed = 0;
 let failed = 0;
@@ -443,6 +449,97 @@ check('os quatro estados do rótulo de versão têm preview a 180pt', () => {
     /SidebarVersionLabel\(running:\s*nil/.test(previews),
     'nenhum preview cobre `running: nil` — é o estado real de todo build feito '
       + 'antes da estampagem e de qualquer `swift run`, não um caso hipotético'
+  );
+});
+
+// ------------------------------------- D25/R8: build.sh estampa o bundle (chunk 4)
+
+/// Strip WHOLE-LINE `#` comments from a shell script, and only those. Stripping
+/// from the first `#` anywhere would mangle `sed 's/^# \{0,1\}//'`, which is real
+/// code; and NOT stripping at all would let the long comment block that explains
+/// the stamp ordering — it names `codesign`, `PlistBuddy` and `app/Info.plist` —
+/// satisfy or trip every guard below on prose instead of on behaviour.
+function stripShellComments(source) {
+  return source
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n');
+}
+
+check('build.sh estampa as três chaves via plutil -replace (D25)', () => {
+  const sh = stripShellComments(read(buildSh));
+  assert(
+    sh.includes('plutil -replace'),
+    'a estampagem desapareceu de build.sh — sem ela `ForgeGitDescribe` nunca '
+      + 'chega ao bundle e o rodapé volta a dizer "repo vX" para sempre (D25)'
+  );
+  for (const key of ['ForgeGitDescribe', 'CFBundleShortVersionString', 'CFBundleVersion']) {
+    assert(
+      new RegExp(`plutil -replace ${key}\\b`).test(sh),
+      `build.sh não estampa ${key} — as três chaves têm consumidores diferentes: `
+        + 'a custom alimenta o rodapé, e as duas da Apple são o que o Finder e o '
+        + 'próprio macOS mostram'
+    );
+  }
+  assert(
+    !/PlistBuddy/.test(sh),
+    'build.sh usa PlistBuddy: `-c "Set …"` numa chave AUSENTE sai 1, e sob '
+      + '`set -euo pipefail` isso mata o build no primeiro uso. `plutil -replace` '
+      + 'cria a chave e sai 0'
+  );
+});
+
+check('a estampagem acontece entre o cp do plist e o codesign', () => {
+  const sh = stripShellComments(read(buildSh));
+  const copiedPlist = sh.indexOf('cp "${APP_DIR}/Info.plist"');
+  const stamp = sh.indexOf('plutil -replace');
+  const sign = sh.indexOf('codesign --force');
+  assert(copiedPlist !== -1, 'o cp do Info.plist para o bundle desapareceu de build.sh');
+  assert(stamp !== -1, 'nenhum `plutil -replace` em build.sh');
+  assert(sign !== -1, 'o `codesign --force` desapareceu de build.sh');
+  // Esta é a razão de existir deste guard: as duas fronteiras são INVISÍVEIS em
+  // runtime. Fora de ordem, o build continua saindo 0 e o app continua abrindo.
+  assert(
+    copiedPlist < stamp,
+    'a estampagem vem ANTES do `cp` do Info.plist — nessa ordem ela edita o '
+      + 'app/Info.plist VERSIONADO, e cada build passa a sujar a árvore. A '
+      + 'pré-checagem do atualizador in-app recusa árvore suja, então buildar '
+      + 'bloquearia a própria atualização que a estampagem serve (R8)'
+  );
+  assert(
+    stamp < sign,
+    'a estampagem vem DEPOIS do `codesign` — a assinatura cobre o Info.plist, '
+      + 'então nessa ordem `codesign --verify` deixa de dizer "valid on disk" e '
+      + 'passa a dizer "invalid Info.plist (plist or signature have been '
+      + 'modified)". Probado, não suposto'
+  );
+});
+
+check('nenhuma escrita de plist tem o arquivo versionado como destino (R8)', () => {
+  const sh = stripShellComments(read(buildSh));
+  for (const line of sh.split('\n')) {
+    if (!line.includes('plutil')) continue;
+    assert(
+      !line.includes('${APP_DIR}/Info.plist'),
+      `uma escrita de plist tem o arquivo versionado como destino: ${line.trim()}`
+    );
+    assert(
+      line.includes('${BUNDLE}/Contents/Info.plist'),
+      `uma escrita de plist não tem a cópia do bundle como destino: ${line.trim()}`
+    );
+  }
+});
+
+check('o --install copia o bundle já assinado e já estampado', () => {
+  const sh = stripShellComments(read(buildSh));
+  const sign = sh.indexOf('codesign --force');
+  const install = sh.indexOf('if $DO_INSTALL');
+  assert(install !== -1, 'o bloco `if $DO_INSTALL` desapareceu de build.sh');
+  assert(
+    sign < install,
+    'a instalação acontece antes de assinar. Mover a estampagem para depois do '
+      + '`--install` "para pegar as duas cópias" pega ZERO cópias corretamente '
+      + 'assinadas: /Applications recebe uma cópia do bundle já pronto'
   );
 });
 

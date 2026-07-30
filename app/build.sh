@@ -22,6 +22,11 @@
 #   (release)   minutes. This is the loop that proves the stamped version (D25)
 #               and final fidelity; a debug bundle never substitutes for it.
 #
+# Both configurations stamp the bundle's Info.plist with the git describe
+# (CFBundleShortVersionString, CFBundleVersion, ForgeGitDescribe) so the sidebar
+# footer reports the version actually running. The versioned app/Info.plist is
+# never touched.
+#
 # The other loop, when Xcode exists: the canvas. Open app/Package.swift in
 # Xcode, then app/Sources/Forge/Previews.swift, and press ⌥⌘↩ — sub-second.
 set -euo pipefail
@@ -39,7 +44,7 @@ for arg in "$@"; do
     --run)     DO_RUN=true ;;
     --debug)   DO_DEBUG=true ;;
     -h|--help)
-      sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "build.sh: opção desconhecida: $arg" >&2; exit 2 ;;
   esac
@@ -88,6 +93,54 @@ if [ -f "$ICON" ]; then
 fi
 
 cp "${APP_DIR}/Info.plist" "${BUNDLE}/Contents/Info.plist"
+
+# ── Stamp the version into the bundle (D25) ───────────────────────────────────
+# Position is load-bearing in BOTH directions, and neither is obvious:
+#
+#   * AFTER the cp above: stamping before it would edit the versioned
+#     app/Info.plist (R8). The operator develops in this repo, and the in-app
+#     updater refuses to run on a dirty tree, so a build that dirtied the tree
+#     could block the very update path this stamp exists to serve.
+#   * BEFORE the codesign below: the signature covers Info.plist. Stamping a
+#     signed bundle turns `codesign --verify` from "valid on disk" into
+#     "invalid Info.plist (plist or signature have been modified)" — probed, not
+#     assumed. A JS guard (scripts/forge-app-sidebar.test.js) pins this ordering
+#     because it is invisible at runtime: an out-of-order stamp still produces a
+#     bundle that looks right and launches.
+#
+# `plutil -replace` rather than `PlistBuddy -c "Set …"`: Set on an absent key
+# exits 1, which under `set -euo pipefail` would kill the build; -replace creates
+# the key and exits 0. Both ship with stock macOS.
+#
+# Not moved below `if $DO_INSTALL` "to catch both copies": --install copies the
+# already-signed, already-stamped bundle, so there is only ever one copy to
+# stamp — and stamping after the copy would leave both signatures invalid.
+GIT_DESCRIBE="$( cd "$APP_DIR" && git describe --tags 2>/dev/null || true )"
+# Apple wants CFBundleShortVersionString as dot-separated integers only, so the
+# tag is reduced to its numeric prefix: v3.3.0 → 3.3.0, v3.0.0-beta → 3.0.0.
+SHORT_VERSION="$( printf '%s' "$GIT_DESCRIBE" | sed 's/^v//; s/-.*$//; s/[^0-9.]//g' )"
+BUILD_NUMBER="$( cd "$APP_DIR" && git rev-list --count HEAD 2>/dev/null || true )"
+
+if [ -n "$GIT_DESCRIBE" ]; then
+  echo "▸ Estampando versão (${GIT_DESCRIBE})"
+  plutil -replace ForgeGitDescribe -string "$GIT_DESCRIBE" "${BUNDLE}/Contents/Info.plist"
+  # if/then, never `[ -n "$x" ] && plutil …`: a bare `test && cmd` statement whose
+  # test is false makes the statement itself exit 1, and `set -e` would abort the
+  # build on the very fallback path this guard exists to survive.
+  if [ -n "$SHORT_VERSION" ]; then
+    plutil -replace CFBundleShortVersionString -string "$SHORT_VERSION" "${BUNDLE}/Contents/Info.plist"
+  fi
+  if [ -n "$BUILD_NUMBER" ]; then
+    plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "${BUNDLE}/Contents/Info.plist"
+  fi
+else
+  # Outside a git clone (tarball, no tags) there is nothing truthful to stamp.
+  # The build must still work, so this is a warning, not an error — and the keys
+  # are left alone rather than blanked: the footer's sentinel is the ABSENCE of
+  # ForgeGitDescribe, so an unstamped bundle reports itself honestly as unknown,
+  # whereas an empty-but-present key would read as a stamped build with no name.
+  echo "  aviso: git describe indisponível — bundle não estampado (o rodapé dirá 'versão desconhecida')"
+fi
 
 echo "▸ Assinando (ad-hoc)"
 # Ad-hoc signature: enough for the app to run locally. A Developer ID would be
