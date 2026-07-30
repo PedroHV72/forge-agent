@@ -7,13 +7,23 @@
 #   ./app/build.sh              build into app/build/Forge.app
 #   ./app/build.sh --install    also copy it into /Applications
 #   ./app/build.sh --run        also launch it
+#   ./app/build.sh --debug      assemble the bundle from the DEBUG binary
 #
-# This is the SLOWEST of three loops, and the only one with full fidelity
-# (bundle, icon, signature). While iterating on how something looks, prefer:
-#   1. Xcode canvas — sub-second. Open app/Package.swift in Xcode, then
-#      app/Sources/Forge/Previews.swift, and press ⌥⌘↩.
-#   2. cd app && swift run Forge — ~6s, whole app, debug. No .app bundle on
-#      this path, so every Info.plist key reads nil.
+# --debug composes freely with --run and --install; it changes only which
+# binary gets packaged, never where the bundle goes. It exists because a real
+# bundle is the only way to run this app at all: `swift run Forge` dies inside
+# Notifier.shared's init, where UNUserNotificationCenter needs a bundle and
+# throws "bundleProxyForCurrentProcess is nil". On a machine without Xcode the
+# canvas is unavailable too, which leaves this script as the whole loop.
+#
+# Costs, measured on this machine:
+#   --debug     ~10s, because an incremental `swift build` is sub-second and the
+#               rest is icon, plist and codesign. Use it to judge FORM.
+#   (release)   minutes. This is the loop that proves the stamped version (D25)
+#               and final fidelity; a debug bundle never substitutes for it.
+#
+# The other loop, when Xcode exists: the canvas. Open app/Package.swift in
+# Xcode, then app/Sources/Forge/Previews.swift, and press ⌥⌘↩ — sub-second.
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,12 +32,14 @@ BUNDLE="${BUILD_DIR}/Forge.app"
 
 DO_INSTALL=false
 DO_RUN=false
+DO_DEBUG=false
 for arg in "$@"; do
   case "$arg" in
     --install) DO_INSTALL=true ;;
     --run)     DO_RUN=true ;;
+    --debug)   DO_DEBUG=true ;;
     -h|--help)
-      sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "build.sh: opção desconhecida: $arg" >&2; exit 2 ;;
   esac
@@ -43,11 +55,23 @@ echo "▸ Limpando build anterior"
 rm -rf "$BUNDLE"
 mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources"
 
-echo "▸ Compilando (swift build, SwiftTerm)"
 # SPM rather than a bare swiftc invocation: the terminal needs SwiftTerm's VT
 # emulator as a dependency. First build downloads it; later builds are cached.
-( cd "$APP_DIR" && swift build -c release --arch arm64 ) || exit 1
-BIN="$(cd "$APP_DIR" && swift build -c release --arch arm64 --show-bin-path)/Forge"
+#
+# `-c debug` is spelled out rather than left as an empty array: this script runs
+# under `set -u`, and expanding an empty array trips it on the bash 3.2 that
+# ships with macOS.
+if $DO_DEBUG; then
+  SWIFT_ARGS=(-c debug)
+  CONFIG_LABEL="debug"
+else
+  SWIFT_ARGS=(-c release --arch arm64)
+  CONFIG_LABEL="release, arm64"
+fi
+
+echo "▸ Compilando (swift build ${CONFIG_LABEL}, SwiftTerm)"
+( cd "$APP_DIR" && swift build "${SWIFT_ARGS[@]}" ) || exit 1
+BIN="$(cd "$APP_DIR" && swift build "${SWIFT_ARGS[@]}" --show-bin-path)/Forge"
 if [ ! -f "$BIN" ]; then
   echo "build.sh: binário não encontrado em $BIN" >&2
   exit 1

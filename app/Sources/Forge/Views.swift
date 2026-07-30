@@ -54,37 +54,27 @@ enum Section: String, CaseIterable, Identifiable {
 struct RootView: View {
     @ObservedObject var state: AppState
 
+    /// The sidebar observes the update store (D32).
+    ///
+    /// Not polish: `UpdateStore` is a singleton that publishes asynchronously
+    /// (`checkOnLaunch` finishes seconds after the window opens), and without an
+    /// observation here SwiftUI never re-renders the sidebar when it does. Any
+    /// update signal placed in this column — the footer version, next chunk —
+    /// would be born empty and stay empty, which is worse than absent.
+    ///
+    /// The reference sits in a property initializer on purpose. `StateObject`'s
+    /// `init(wrappedValue:)` is `@MainActor` and takes an autoclosure, so
+    /// `shared` is touched on the main actor. Writing it as a default argument of
+    /// an explicit `init` instead is what costs a concurrency warning — that
+    /// expression is evaluated in a nonisolated context (learned in chunk 1).
+    @StateObject private var updates = UpdateStore.shared
+
     // Section selection lives in AppState, not in `@State`: opening a session
     // from the composer has to move the operator to the terminal, and only
     // shared state can be driven from there.
     var body: some View {
         NavigationSplitView {
-            List(selection: $state.section) {
-                ForEach(Section.allCases) { s in
-                    Label {
-                        HStack {
-                            Text(s.rawValue)
-                            Spacer()
-                            if let n = badge(for: s) {
-                                Text("\(n)")
-                                    .font(.caption2).monospacedDigit()
-                                    .foregroundStyle(s == .now ? .white : .secondary)
-                                    .padding(.horizontal, 6).padding(.vertical, 1)
-                                    .background(s == .now ? AnyShapeStyle(Color.accentOrange)
-                                                          : AnyShapeStyle(.quaternary),
-                                                in: Capsule())
-                            }
-                        }
-                    } icon: {
-                        Image(systemName: s.icon)
-                            .foregroundStyle(s == .now && !state.pending.isEmpty
-                                             ? Color.accentOrange : Color.secondary)
-                    }
-                    .tag(s)
-                }
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
-            .safeAreaInset(edge: .bottom) { sidebarFooter }
+            sidebarList
         } detail: {
             Group {
                 switch state.section ?? .now {
@@ -109,13 +99,59 @@ struct RootView: View {
         .animation(.easeInOut(duration: 0.18), value: state.pending.count)
     }
 
+    /// The sidebar list, extracted from `body` so a canvas can render the whole
+    /// column at the 180pt minimum width without a window around it — the width
+    /// where a `Divider`, or anything added to the footer, has to earn its place.
+    private var sidebarList: some View {
+        List(selection: $state.section) {
+            ForEach(Section.allCases) { s in
+                Label {
+                    HStack {
+                        Text(s.rawValue)
+                        Spacer()
+                        if let n = badge(for: s) {
+                            Text("\(n)")
+                                .font(.caption2).monospacedDigit()
+                                .foregroundStyle(s == .now ? .white : .secondary)
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(s == .now ? AnyShapeStyle(Color.accentOrange)
+                                                      : AnyShapeStyle(.quaternary),
+                                            in: Capsule())
+                        }
+                    }
+                } icon: {
+                    Image(systemName: s.icon)
+                        .foregroundStyle(s == .now && !state.pending.isEmpty
+                                         ? Color.accentOrange : Color.secondary)
+                }
+                .tag(s)
+
+                // D29 — one rule between the sections you work in and the ones
+                // you configure. 1pt of hierarchy instead of the ~60pt of chrome
+                // that real `List` sections would cost (D33).
+                //
+                // Emitted inside the same `ForEach` deliberately: splitting
+                // `Section.allCases` into two arrays would put a second source of
+                // truth next to `Stores.swift`, which feeds `SectionRestore`'s
+                // validator from `allCases` (D31).
+                if s == .runs { Divider() }
+            }
+        }
+        .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+        .safeAreaInset(edge: .bottom) { sidebarFooter }
+    }
+
+    /// Counts only, and only where a count means something.
+    ///
+    /// Updates has no case here (D27): the numeral it used to show was always
+    /// `1`, so it counted nothing — it was a dot wearing a number. One signal
+    /// belongs in one place, and that place is the footer, next to the version.
     private func badge(for s: Section) -> Int? {
         switch s {
         case .now:      return state.pending.isEmpty ? nil : state.pending.count
         case .runs:     return state.liveRuns.isEmpty ? nil : state.liveRuns.count
         case .terminal: return state.sessions.isEmpty ? nil : state.sessions.count
         case .projects: return state.workspaces.isEmpty ? nil : state.workspaces.count
-        case .updates:  return UpdateStore.shared.updateAvailable ? 1 : nil
         default:        return nil
         }
     }
@@ -163,6 +199,12 @@ extension RootView {
     /// Same file because `sidebarFooter` is `private`, and a preview is not a
     /// reason to open it to the rest of the module.
     var previewSidebarFooter: some View { sidebarFooter }
+
+    /// The whole sidebar column, for the same reason and by the same means: a
+    /// preview of `RootView` would render a full split view at whatever width
+    /// the canvas has, and the `Divider` (D29) is judged against the column, not
+    /// against a window.
+    var previewSidebarList: some View { sidebarList }
 }
 #endif
 

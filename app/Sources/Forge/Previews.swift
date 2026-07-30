@@ -177,4 +177,28 @@ struct SidebarRodapePreviews: PreviewProvider {
             .previewDisplayName("Sidebar — rodapé a 180pt (mínimo)")
     }
 }
+
+/// The whole sidebar column, at both ends of its width range.
+///
+/// Two widths rather than one because the open question about the `Divider`
+/// (D29) is not "is it there" — a guard proves that — but "does 1pt read as
+/// hierarchy at all". That answer changes with the column width, and 180pt
+/// (`min:`) and 240pt (`max:`) are the two the operator can actually get by
+/// dragging. 420pt of height fits all thirteen rows plus the footer, so the
+/// question is never confused with a scrolling artefact.
+struct SidebarPreviews: PreviewProvider {
+    static var previews: some View {
+        Group {
+            RootView(state: previewState())
+                .previewSidebarList
+                .frame(width: 180, height: 420)
+                .previewDisplayName("Sidebar — completa a 180pt")
+
+            RootView(state: previewState())
+                .previewSidebarList
+                .frame(width: 240, height: 420)
+                .previewDisplayName("Sidebar — completa a 240pt")
+        }
+    }
+}
 #endif
