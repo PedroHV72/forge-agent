@@ -503,3 +503,118 @@ Tests use `process.execPath`, argument arrays, `shell:false`, a filesystem
 barrier, a temporary directory containing spaces and Unicode, and real Claude
 and Codex metadata contenders. This exercises the durable result rather than
 assuming any scheduler order or POSIX-only behavior.
+
+---
+
+## 9. Provider-neutral unit controller (S02/T04)
+
+`scripts/forge-unit-controller.js` is the single workflow API consumed by
+future CLI adapters. It coordinates selection, unit leases, durable
+transitions, results, events, STATE projection and handoff. Claude and Codex
+call the same functions and pass only the explicit `host_runtime` value; the
+controller never selects a provider from a model family, a session prefix, or
+the caller's home directory.
+
+### Selection boundary
+
+`selectNextUnit(input)` is pure after the orchestrator supplies `state`, the
+roadmap inventory and resolved preferences. The ordered decision is:
+
+1. missing roadmap → `plan-milestone`;
+2. missing milestone context → `discuss-milestone` unless skip is resolved;
+3. missing milestone research → `research-milestone` unless skip is resolved;
+4. missing active slice plan/research → `plan-slice` or `research-slice`;
+5. first unchecked task → `execute-task`;
+6. planned slice without summary → `complete-slice`;
+7. remaining unchecked slice → its next plan/task;
+8. otherwise → `complete-milestone` or `no-next-unit`.
+
+The controller reads the canonical preference resolver and status/roadmap
+parser. It does not copy their defaults, regular expressions, model tables or
+provider branches. A preference parse error is loud-stop: no lease, intent,
+STATE, event or result is created.
+
+### Transaction protocol
+
+Every mutating action has an idempotency key. The canonical intent is stored
+at `.gsd/forge/transactions/<encoded-key>.json` before any side effect. A
+transaction advances only through these durable phases:
+
+```text
+intent
+  → result-published
+  → event-published
+  → boundary-pending
+  → state-published
+  → lease-released
+  → boundary-ready
+  → committed
+```
+
+Each result, event, boundary and transaction uses temp-file-plus-rename. The
+event JSONL is read, validated, rebuilt and atomically published under the
+short owner-safe mutex; concurrent append is never used. Existing records with
+the same idempotency key are accepted only when their stable content matches,
+otherwise the controller fails loudly rather than silently forking history.
+
+The recorded `before` and `after` snapshots contain logical STATE checksums.
+Runtime/session fields are excluded from the logical projection, while the
+durable transaction can retain host/runtime audit data. A crash before a
+phase marker leaves an earlier phase and `resume` replays the missing
+publication. A crash after publication sees the existing idempotent artifact
+and advances without duplication. Orphan temporary files are ignored and
+removed by the underlying writer on the next mutation.
+
+### Transition and result rules
+
+`begin`, `running`, `persist-result`, `complete`, `pause`, `fail` and
+`expired-safe` are the closed action set. `begin` acquires a T03 lease with
+the caller's owner token and records the generation in the intent. Every
+subsequent transition proves that exact token/generation; run ID, PID,
+file-lock ownership and host runtime do not authorize execution.
+
+Terminal actions normalize results through `forge-runtime`, publish the
+normalized result and event, project only the owned state patch, and release
+the lease owner-scoped. The boundary is marked handoff-ready only after the
+lease is absent and all prior writes are durable. A failed release or an
+unexpected lease owner leaves the transaction pending and blocks handoff.
+
+Result payloads are JSON-safe and reject cycles, functions, symbols, bigint,
+credentials, conversation transcripts and token-like fields. Worker claims
+such as `files_changed` are therefore data to validate, never an authorization
+or source-of-truth shortcut.
+
+### Transferable handoff boundary
+
+Only `completed`, `paused`, `failed-persisted` and `expired-safe` boundaries
+are transferable. Handoff denies by default when a boundary is absent,
+uncommitted, has a pending transaction, or observes any lease record (even an
+expired one awaiting grace/recovery). A successful handoff response carries
+only the unit, milestone, boundary kind, outcome, checksums, timestamp and
+next host runtime. It never carries owner tokens, credentials, provider
+session contents, transcript or conversational context.
+
+The next host starts by selecting/acquiring normally. It does not inherit a
+mid-unit process, a Claude conversation, a Codex context window, or an
+adapter-specific session. Thus Claude→Codex and Codex→Claude have identical
+logical STATE, result and event projections while retaining explicit runtime
+metadata for audit.
+
+### Resume and recovery
+
+`resume` enumerates only non-committed intents, reuses their idempotency keys,
+and re-enters the phase machine. It first observes the same lease generation;
+if the old generation was safely recovered, the caller must acquire a new
+lease before continuing. Already published result/event/boundary files are
+content-compared and not duplicated. A pending transaction is a durable
+recovery obligation, so new begin/transition/handoff requests fail with
+`transaction-pending` until resume or explicit recovery finishes it.
+
+The controller is intentionally small and provider-neutral. CLI commands,
+skills, account rotation, sidecars and conversation orchestration remain
+adapters outside this boundary. This keeps the `.gsd` files portable across
+Windows, macOS and Linux and makes the same core callable from both Claude
+Code and Codex CLI.
+
+The schema and conformance suite are the executable reference for these
+ordering and handoff guarantees.

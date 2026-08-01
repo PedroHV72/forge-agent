@@ -1,0 +1,342 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge-agent.local/schemas/forge-unit-controller.schema.json",
+  "title": "Forge provider-neutral unit controller protocol",
+  "description": "Durable transaction, normalized result, event and handoff boundary records.",
+  "oneOf": [
+    { "$ref": "#/$defs/transaction" },
+    { "$ref": "#/$defs/normalizedResult" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/boundary" },
+    { "$ref": "#/$defs/handoffResult" }
+  ],
+  "$defs": {
+    "protocolVersion": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "unitKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "milestoneId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "hostRuntime": {
+      "type": "string",
+      "enum": ["claude", "codex"]
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "begin",
+        "running",
+        "persist-result",
+        "complete",
+        "pause",
+        "fail",
+        "expired-safe"
+      ]
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "intent",
+        "result-published",
+        "event-published",
+        "boundary-pending",
+        "state-published",
+        "lease-released",
+        "boundary-ready",
+        "committed"
+      ]
+    },
+    "boundaryKind": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "paused",
+        "failed-persisted",
+        "expired-safe"
+      ]
+    },
+    "resultStatus": {
+      "type": "string",
+      "enum": ["succeeded", "failed", "cancelled"]
+    },
+    "checksum": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "isoTimestamp": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "key"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1 },
+        "id": { "type": "string" },
+        "key": { "$ref": "#/$defs/unitKey" }
+      }
+    },
+    "stateSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state_checksum", "state"],
+      "properties": {
+        "state_checksum": { "$ref": "#/$defs/checksum" },
+        "state": {
+          "type": ["object", "null"],
+          "additionalProperties": true
+        },
+        "state_patch": {
+          "type": "object",
+          "additionalProperties": true,
+          "not": {
+            "required": ["owner_token"]
+          }
+        }
+      }
+    },
+    "normalizedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "idempotency_key",
+        "unit",
+        "milestone",
+        "status",
+        "reason_code",
+        "summary",
+        "output",
+        "committed_at"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "idempotency_key": { "$ref": "#/$defs/idempotencyKey" },
+        "unit": { "$ref": "#/$defs/unitKey" },
+        "milestone": { "$ref": "#/$defs/milestoneId" },
+        "status": { "$ref": "#/$defs/resultStatus" },
+        "reason_code": { "type": "string", "maxLength": 256 },
+        "summary": { "type": "string", "maxLength": 2048 },
+        "output": {},
+        "committed_at": { "$ref": "#/$defs/isoTimestamp" }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["owner_token"] },
+          { "required": ["credential"] },
+          { "required": ["conversation"] }
+        ]
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "idempotency_key",
+        "ts",
+        "event",
+        "action",
+        "unit",
+        "milestone",
+        "host_runtime",
+        "outcome",
+        "reason_code"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "idempotency_key": { "$ref": "#/$defs/idempotencyKey" },
+        "ts": { "type": "string", "format": "date-time" },
+        "event": {
+          "type": "string",
+          "enum": ["unit-began", "result-persisted", "unit-transition"]
+        },
+        "action": { "$ref": "#/$defs/action" },
+        "unit": { "$ref": "#/$defs/unitKey" },
+        "milestone": { "$ref": "#/$defs/milestoneId" },
+        "host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "outcome": { "type": "string" },
+        "reason_code": { "type": "string" },
+        "sequence": { "type": "integer", "minimum": 1 }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["owner_token"] },
+          { "required": ["session"] },
+          { "required": ["credential"] },
+          { "required": ["conversation"] }
+        ]
+      }
+    },
+    "boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "idempotency_key",
+        "unit",
+        "milestone",
+        "kind",
+        "outcome",
+        "reason_code",
+        "result_ref",
+        "result_checksum",
+        "event_checksum",
+        "state_checksum",
+        "previous_host_runtime",
+        "handoff_ready",
+        "committed_at"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "idempotency_key": { "$ref": "#/$defs/idempotencyKey" },
+        "unit": { "$ref": "#/$defs/unitKey" },
+        "milestone": { "$ref": "#/$defs/milestoneId" },
+        "kind": { "$ref": "#/$defs/boundaryKind" },
+        "outcome": { "$ref": "#/$defs/resultStatus" },
+        "reason_code": { "type": "string" },
+        "result_ref": { "type": "string", "minLength": 1 },
+        "result_checksum": { "$ref": "#/$defs/checksum" },
+        "event_checksum": { "$ref": "#/$defs/checksum" },
+        "state_checksum": { "$ref": "#/$defs/checksum" },
+        "previous_host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "handoff_ready": { "type": "boolean" },
+        "committed_at": { "$ref": "#/$defs/isoTimestamp" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "handoff_ready": { "const": true } },
+            "required": ["handoff_ready"]
+          },
+          "then": {
+            "properties": { "committed_at": { "type": "string", "format": "date-time" } }
+          }
+        }
+      ],
+      "not": {
+        "anyOf": [
+          { "required": ["owner_token"] },
+          { "required": ["session"] },
+          { "required": ["credentials"] },
+          { "required": ["conversation"] },
+          { "required": ["transcript"] }
+        ]
+      }
+    },
+    "transaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "idempotency_key",
+        "action",
+        "unit",
+        "milestone",
+        "host_runtime",
+        "owner_digest",
+        "lease_generation",
+        "phase",
+        "created_at",
+        "updated_at",
+        "before",
+        "after",
+        "result",
+        "event",
+        "boundary"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "idempotency_key": { "$ref": "#/$defs/idempotencyKey" },
+        "action": { "$ref": "#/$defs/action" },
+        "unit": { "$ref": "#/$defs/unit" },
+        "milestone": { "$ref": "#/$defs/milestoneId" },
+        "host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "owner_digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "lease_generation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "phase": { "$ref": "#/$defs/phase" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "before": { "$ref": "#/$defs/stateSnapshot" },
+        "after": { "$ref": "#/$defs/stateSnapshot" },
+        "result": {
+          "oneOf": [
+            { "$ref": "#/$defs/normalizedResult" },
+            { "type": "null" }
+          ]
+        },
+        "event": { "$ref": "#/$defs/event" },
+        "boundary": {
+          "oneOf": [
+            { "$ref": "#/$defs/boundary" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "not": {
+        "required": ["owner_token"]
+      }
+    },
+    "handoffResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "reason",
+        "unit",
+        "milestone",
+        "boundary_kind",
+        "previous_host_runtime",
+        "next_host_runtime",
+        "outcome",
+        "result_ref",
+        "result_checksum",
+        "state_checksum",
+        "committed_at"
+      ],
+      "properties": {
+        "ok": { "const": true },
+        "reason": { "const": "handoff-ready" },
+        "unit": { "$ref": "#/$defs/unitKey" },
+        "milestone": { "$ref": "#/$defs/milestoneId" },
+        "boundary_kind": { "$ref": "#/$defs/boundaryKind" },
+        "previous_host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "next_host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "outcome": { "$ref": "#/$defs/resultStatus" },
+        "result_ref": { "type": "string" },
+        "result_checksum": { "$ref": "#/$defs/checksum" },
+        "state_checksum": { "$ref": "#/$defs/checksum" },
+        "committed_at": { "type": "string", "format": "date-time" }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["owner_token"] },
+          { "required": ["generation"] },
+          { "required": ["session"] },
+          { "required": ["credential"] },
+          { "required": ["conversation"] }
+        ]
+      }
+    }
+  }
+}
