@@ -218,8 +218,7 @@ function childAcquire(cwd, unit, hostRuntime, token, barrier) {
     "const cwd=process.argv[2],unit=process.argv[3],host=process.argv[4],token=process.argv[5],barrier=process.argv[6];",
     "while(!fs.existsSync(barrier)){}",
     "const r=l.acquire(cwd,unit,{hostRuntime:host,ownerToken:token,ttlMs:5000,graceMs:100});",
-    "process.stdout.write(JSON.stringify(r));",
-    "if(r.ok) setTimeout(function(){l.release(cwd,unit,r.owner_token,r.generation);},200);"
+    "process.stdout.write(JSON.stringify(r));"
   ].join('');
   return new Promise((resolve, reject) => {
     const processChild = childProcess.spawn(process.execPath, [
