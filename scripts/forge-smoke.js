@@ -244,16 +244,18 @@ function smokeLock() {
 
   let r = runScript('forge-lock.js', ['--acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
   assert(r.status === 0, 'acquire DECISIONS.md', r.stderr);
+  const acquiredLock = JSON.parse(r.stdout);
 
   r = runScript('forge-lock.js', ['--try-acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
   assert(r.status === 1 && /busy/.test(r.stderr), 'try-acquire returns busy when held');
 
-  r = runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--cwd', dir]);
+  r = runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--token', acquiredLock.metadata.owner_token, '--generation', acquiredLock.metadata.generation, '--cwd', dir]);
   assert(r.status === 0, 'release DECISIONS.md');
 
   r = runScript('forge-lock.js', ['--try-acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
   assert(r.status === 0, 'try-acquire after release succeeds');
-  runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--cwd', dir]);
+  const reacquiredLock = JSON.parse(r.stdout);
+  runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--token', reacquiredLock.metadata.owner_token, '--generation', reacquiredLock.metadata.generation, '--cwd', dir]);
 
   cleanup(dir);
 }
@@ -403,25 +405,27 @@ function smokeFilelock() {
   runScript('forge-runs.js', ['--add', '--id', 'M070', '--kind', 'milestone', '--session', 'sess-x', '--cwd', dir]);
   runScript('forge-runs.js', ['--add', '--id', 'M071', '--kind', 'milestone', '--session', 'sess-y', '--cwd', dir]);
 
-  let r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--cwd', dir]);
+  let r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--ttl', '1000', '--cwd', dir]);
   assert(r.status === 0, 'M070 acquires src/foo.ts');
   let res = JSON.parse(r.stdout);
   assert(res.acquired === true, 'acquired:true on fresh acquire');
+  const firstFileLock = res;
 
-  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--cwd', dir]);
+  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--ttl', '1000', '--cwd', dir]);
   assert(r.status === 1, 'M071 blocked');
   res = JSON.parse(r.stdout);
   assert(res.acquired === false && res.holder.run_id === 'M070', 'holder details surfaced');
 
   // M070 same-run renew
-  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--cwd', dir]);
+  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--token', firstFileLock.owner_token, '--ttl', '1000', '--cwd', dir]);
   assert(r.status === 0, 'M070 renews own lock');
 
   // Deactivate M070 → M071 can steal
   runScript('forge-runs.js', ['--update', 'M070', '--json', '{"active":false}', '--cwd', dir]);
-  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--cwd', dir]);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
+  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--ttl', '1000', '--cwd', dir]);
   res = JSON.parse(r.stdout);
-  assert(res.acquired === true && res.stolen && res.stolen.reason === 'inactive', 'M071 steals from inactive M070');
+  assert(res.acquired === true && res.stolen && res.stolen.reason === 'expired', 'M071 steals only after TTL expiry');
 
   cleanup(dir);
 }
