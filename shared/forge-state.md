@@ -277,12 +277,16 @@ Used by `scripts/forge-lock.js`. Path is a **directory** (created via `mkdir` fo
 
 ```
 .gsd/.locks/DECISIONS.md/
-  metadata.json   { acquired_at, holder_pid, holder_run_id, ttl_ms }
+  metadata.json   { generation, owner_token, acquired_at, renewed_at, ttl_ms }
+  owner-<token>/  ownership marker
 ```
 
 - TTL default 30s, configurable per acquire call
-- Stale (mtime > TTL): next acquirer can `rmdir` + `mkdir` to steal (with a warning log)
-- Released by removing the directory (`rmdir` after deleting metadata.json)
+- A stale contender first claims the old owner marker, then quarantines the
+  directory before removing it. An old release cannot remove a successor
+  (ABA-safe).
+- Release and renewal require the opaque owner token plus generation. PID and
+  run identifiers are diagnostic metadata only.
 - No file locks (`fcntl`/`LockFileEx`) — directory locks are cross-platform and crash-resilient
 
 ---
@@ -375,3 +379,127 @@ The implementation uses only Node `fs`, `path`, and relative module imports.
 It does not read `~/.claude`, `~/.codex`, environment-specific commands, or
 provider configuration. This keeps the same durable files portable across all
 supported hosts and operating systems.
+
+---
+
+## 8. Persistent unit leases (S02/T03)
+
+`scripts/forge-unit-lease.js` is the durable authorization boundary for one
+logical unit. It is deliberately separate from the short mutex in §6, the run
+registry in §2, and the path defence in `forge-filelock.js`. Holding a mutex,
+having an active run, or editing a protected file never grants permission to
+execute a unit.
+
+### Canonical location and identity
+
+Each lease lives at:
+
+```text
+.gsd/forge/leases/<base64url(normalized-unit-key)>.json
+```
+
+The unit key is either a non-empty logical string or `{ type, id }`, rendered
+as `type/id`, trimmed and normalized to Unicode NFC. It is not a filesystem
+path. The encoded filename and SHA-256-derived mutex name are both calculated
+from that same normalized key, so object and string forms cannot create
+parallel lease records. This supports spaces and Unicode on Windows, macOS and
+Linux without relying on shell quoting or host path rules.
+
+### Storage record
+
+The versioned canonical record contains:
+
+```json
+{
+  "protocol_version": "1.0.0",
+  "unit": "execute-task/T03",
+  "owner_token": "opaque-write-credential",
+  "host_runtime": "codex",
+  "session": "opaque-correlation-value",
+  "request_id": "optional-idempotency-key",
+  "generation": "opaque-generation",
+  "acquired_at": 1770000000000,
+  "heartbeat_at": 1770000000000,
+  "expires_at": 1770000030000,
+  "grace_ms": 5000
+}
+```
+
+`owner_token` and `request_id` are credentials/correlation values and must not
+be emitted by `observe`. The public status has `owner: "redacted"`, preserves
+only useful audit metadata (`host_runtime`, opaque `session`, generation and
+timestamps), and tells observers whether the record is expired or recoverable.
+No provider-specific session format has semantic meaning.
+
+### Lifecycle and authorization
+
+1. `acquire(cwd, unit, options)` takes the per-unit short mutex, re-reads the
+   record, and atomically publishes exactly one new generation when absent.
+2. A current record denies a different owner with `lease-active`; it remains
+   owned regardless of host runtime, PID, process liveness, or run status.
+3. Retrying acquire with the same owner token and request id returns
+   `already-acquired` and the same generation, rather than creating a second
+   record.
+4. `heartbeat(cwd, unit, ownerToken, generation, options)` can renew only the
+   exact active credential pair and returns `owner-mismatch` to every other
+   caller.
+5. `release(cwd, unit, ownerToken, generation)` likewise compares both values,
+   quarantines then removes only its own record, and returns `already-released`
+   on a safe repeated release.
+
+The acquisition owner receives its opaque token in the acquire result. It must
+store that token only in a trusted caller boundary; status output, run records,
+and logs must not become a source of authorization.
+
+### Expiry, grace, and recovery
+
+Expiry does not itself select a new owner. A record is merely expired after
+`expires_at`, and is eligible for stale recovery only when the injected clock
+is strictly later than `expires_at + grace_ms`. Before that point recovery and
+competing acquisition return `expired-awaiting-grace`. The current owner can
+heartbeat while its generation remains installed; once another caller has
+recovered and acquired a successor, the prior token/generation can no longer
+renew or release it.
+
+`recover` is idempotent: it removes one record that passed the expiry-plus-
+grace test, returns `recovered`, and later repeats return `already-released`.
+PID checks, `process.kill`, run heartbeat, account name, and provider session
+shape are forbidden as takeover authorization. They may appear only in a
+separate diagnostic layer.
+
+### Atomicity and crash recovery
+
+Every mutation happens beneath the T01 owner-safe mutex. It writes a complete
+replacement to a uniquely named temporary file in the lease directory and
+renames it over the canonical record. Rename is the publication point. A crash
+before rename leaves the old record (or no record) canonical; a crash after
+rename leaves the new complete record canonical. Orphan temporary files are
+deleted during a later mutating operation and are never promoted as ownership.
+
+Malformed or incomplete canonical records are quarantined under the same
+mutex, then treated as recoverable absence. Release/recovery also quarantine
+before deletion, preventing an old callback from deleting a new generation.
+At all stable observation points a unit has zero or one parseable lease record,
+never two active owners.
+
+### Stable results
+
+The API/schema reason codes are: `acquired`, `already-acquired`,
+`lease-active`, `owner-mismatch`, `renewed`, `released`, `already-released`,
+`expired-awaiting-grace`, `recovered`, `contended-recovery`, `invalid-request`,
+and `guard-busy`. Callers should branch on those stable codes rather than
+English or Portuguese prose. A temporary guard contention is not a lease
+decision and can be retried by the caller.
+
+### Operational boundaries
+
+`forge-runs` may mirror owner/heartbeat metadata for visibility, but it is not
+read to authorize acquisition, renewal, release, or recovery. `forge-filelock`
+protects a named edited path and does not create a unit lease. `forge-lock`
+protects only the few filesystem operations necessary to change a lease. The
+unit lease is the sole proof that a worker may execute that unit.
+
+Tests use `process.execPath`, argument arrays, `shell:false`, a filesystem
+barrier, a temporary directory containing spaces and Unicode, and real Claude
+and Codex metadata contenders. This exercises the durable result rather than
+assuming any scheduler order or POSIX-only behavior.
