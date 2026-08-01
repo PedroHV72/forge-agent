@@ -233,6 +233,28 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     This sub-step is **advisory**. Do NOT return `status: blocked` based on verifier output. Do NOT abort merge. The section is purely documentation. If `scripts/forge-verifier.js` does not exist (e.g., running against a pre-M003/S03 checkout), write the fallback line and proceed.
 
+1.85. **Route audit — invoke detector + write `## Route` to `S##-SUMMARY.md`** (advisory; always runs).
+
+    a. **Invoke the detector CLI:**
+       ```bash
+       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-route-audit.js ] && echo scripts || echo "$HOME/.claude/scripts")
+       node "$FORGE_SCRIPTS_DIR/forge-route-audit.js" \
+         --slice {S##} \
+         --milestone {M###} \
+         --cwd {WORKING_DIR} \
+         --write "{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-SUMMARY.md"
+       ```
+       Capture stdout and the exit code separately. If exit is non-zero **or** stdout is not valid JSON, write the fallback below; the script itself owns the normal `## Route` upsert.
+
+    b. **Fallback (route detector unavailable):**
+       ```markdown
+       ## Route (unavailable)
+
+       _Route detector failed to run: {reason from stderr or "unknown"}. Advisory — does not block closure._
+       ```
+
+    This sub-step is advisory: never return `status: blocked` from route findings and never abort merge. Installed copies of `agents/` and `skills/` require `/forge-update` before this wiring takes effect.
+
 1.9. **Checker Memory update — emit quality events to fragment store** (advisory; skipped when `checker_memory.mode: disabled`).
 
     <!-- pre-S04: rewrote M###-CHECKER-MEMORY.md monolith in-place; now emits events via forge-checker-memory.js -->

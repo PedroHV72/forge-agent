@@ -10712,6 +10712,59 @@ function smokeIsolationSvnAndVcsTelemetry() {
   pass('(final) Section 82: SVN shared isolation, git preservation, setup/cleanup vcs, DISPATCH_VCS prelude, and nine telemetry emitters verified');
 }
 
+// ── Section 83: detector de rota inerte ───────────────────────────────────
+function smokeRouteAudit() {
+  process.stdout.write('\n▸ Section 83: detector de rota inerte\n');
+  const dir = mkTmp('route-audit');
+  try {
+    const summary = path.join(dir, '.gsd', 'S03-SUMMARY.md');
+    const events = path.join(dir, '.gsd', 'forge', 'events.jsonl');
+    fs.writeFileSync(summary, '# Summary\n\n## Forward Intelligence\nkeep\n', 'utf8');
+    fs.writeFileSync(events, [
+      JSON.stringify({ event: 'dispatch', milestone: 'M127', slice: 'S03', unit: 'execute-task/T01', engine: 'codex' }),
+      JSON.stringify({ event: 'worker-engine-fallback', milestone: 'M127', slice: 'S03', unit: 'execute-task/T01', reason: 'timeout', hint: 'x' }),
+      JSON.stringify({ event: 'dispatch', milestone: 'M127', slice: 'S03', unit: 'execute-task/T01', engine: 'claude' }),
+    ].join('\n') + '\n', 'utf8');
+    const args = ['--slice', 'S03', '--milestone', 'M127', '--cwd', dir, '--json'];
+    const inspect = runScript('forge-route-audit.js', args);
+    assert(inspect.status === 0 && JSON.parse(inspect.stdout).units.length === 1 && !fs.readFileSync(summary, 'utf8').includes('## Route'), '(a) inspection is pure read');
+    const writeArgs = [...args, '--write', summary];
+    const first = runScript('forge-route-audit.js', writeArgs); const once = fs.readFileSync(summary, 'utf8');
+    const second = runScript('forge-route-audit.js', writeArgs); const twice = fs.readFileSync(summary, 'utf8');
+    assert(first.status === 0 && second.status === 0 && once === twice && (twice.match(/^## Route$/gm) || []).length === 1, '(b) write is idempotent with one Route section');
+    assert(twice.indexOf('## Route') < twice.indexOf('## Forward Intelligence'), '(c) Route precedes Forward Intelligence');
+    fs.unlinkSync(events);
+    assert(runScript('forge-route-audit.js', args).status === 0, '(d) absent events exit zero');
+    fs.writeFileSync(events, '{truncated\n', 'utf8');
+    assert(runScript('forge-route-audit.js', args).status === 0, '(d) corrupt events exit zero');
+    const outside = path.join(dir, 'outside.md'); fs.writeFileSync(outside, 'keep\n');
+    const refused = runScript('forge-route-audit.js', [...args, '--write', outside]);
+    assert(refused.status === 0 && fs.readFileSync(outside, 'utf8') === 'keep\n', '(f) outside .gsd is refused without write');
+    const expected = [
+      ['skills/forge-auto/SKILL.md', 2], ['skills/forge-next/SKILL.md', 2], ['skills/forge-task/SKILL.md', 1],
+      ['shared/forge-dispatch.md', 2],
+    ];
+    for (const [file, count] of expected) {
+      const text = readRepoText(path.join(path.dirname(SCRIPTS), file));
+      // The hint is computed ONCE, in the fence that resolves CODE_DIR, and persisted; every emitter
+      // re-reads it from that durable file, because shell state dies at the Bash-tool boundary.
+      assert(text.split('"hint":%s').length - 1 === count, `(e) exact hint emitter count in ${file}`);
+      assert(text.split('HINT_JSON=$(node -e').length - 1 === 1
+        && text.split('printf \'%s\' "$HINT_JSON" > "$CODE_DIR_HINT_FILE"').length - 1 === 1,
+        `(e) ${file} computes and persists the hint exactly once, in the CODE_DIR fence`);
+      assert(text.split('HINT_JSON=$(cat "${CODE_DIR_HINT_FILE:-$WORKING_DIR/.gsd/forge/code-dir-hint.json}"').length - 1 === count,
+        `(e) ${file} re-reads the persisted hint at each of its ${count} emitter(s)`);
+      assert(text.split('[ -n "$HINT_JSON" ] || HINT_JSON=\'""\'').length - 1 === count + 1,
+        `(e) ${file} guards every HINT_JSON against an empty substitution`);
+    }
+    const completer = readRepoText(path.join(path.dirname(SCRIPTS), 'agents/forge-completer.md'));
+    assert((completer.match(/^1\.85\./gm) || []).length === 1, '(e) completer has sub-step 1.85');
+    const source = fs.readFileSync(__filename, 'utf8'); const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeRouteAudit\(\); \}/.test(mainBody), '(g) Section 83 is registered through a closure in main()');
+    pass('(final) Section 83: detector de rota inerte, upsert, refusal, docs and registration verified');
+  } finally { cleanup(dir); }
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -10809,6 +10862,7 @@ async function main() {
       () => { smokeSidecarDiffCanonical(); },
       () => { smokeXllmSvn(); },
       () => { smokeIsolationSvnAndVcsTelemetry(); },
+      () => { smokeRouteAudit(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
