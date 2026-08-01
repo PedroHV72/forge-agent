@@ -23,6 +23,8 @@
 const fs   = require('fs');
 const path = require('path');
 const ids  = require('./forge-ids.js');
+const lock = require('./forge-lock.js');
+const { normalizeHostRuntime } = require('./forge-runtime.js');
 
 const STALE_THRESHOLD_MS  = 30 * 60 * 1000;   // 30min: garbage-collect
 const ACTIVE_THRESHOLD_MS = 15 * 60 * 1000;   // 15min: run "fresco" — Stop hook + statusline
@@ -87,16 +89,38 @@ function writeAtomic(filePath, record) {
   fs.renameSync(tmp, filePath);
 }
 
+// Preserve a deliberately small, explicit metadata boundary. These values are
+// correlation/liveness data only: run selection continues to use active and
+// started_at, and lease code owns any later expiry interpretation.
+function normalizeMetadataPatch(patch) {
+  const next = Object.assign({}, patch || {});
+  if (Object.prototype.hasOwnProperty.call(next, 'host_runtime')) {
+    if (next.host_runtime === undefined || next.host_runtime === null || next.host_runtime === '') delete next.host_runtime;
+    else next.host_runtime = normalizeHostRuntime(next.host_runtime);
+  }
+  for (const key of ['owner', 'session', 'heartbeat', 'expires_at', 'worker_engine']) {
+    if (Object.prototype.hasOwnProperty.call(next, key) && next[key] === undefined) delete next[key];
+  }
+  return next;
+}
+
+function withRunLock(cwd, id, fn) {
+  const handle = lock.acquireSync(cwd, `run-${id}`, { holderRunId: id, retries: 80 });
+  try { return fn(); } finally { handle.release(); }
+}
+
 function add(cwd, record) {
-  if (!record || !record.id || !record.kind || !record.session_id) {
-    throw new Error('forge-runs.add: record requires id, kind, session_id');
+  if (!record || !record.id || !record.kind || (!record.session_id && !record.session)) {
+    throw new Error('forge-runs.add: record requires id, kind and session_id or session');
   }
   ensureRunsDir(cwd);
+  return withRunLock(cwd, record.id, () => {
   const now = Date.now();
-  const full = {
+  const supplied = normalizeMetadataPatch(record);
+  const full = Object.assign({}, supplied, {
     kind: record.kind,
     id: record.id,
-    session_id: record.session_id,
+    session_id: record.session_id || record.session,
     active: record.active !== false,
     started_at: record.started_at || now,
     last_heartbeat: record.last_heartbeat || now,
@@ -109,7 +133,12 @@ function add(cwd, record) {
     // Additive fields keep older registry records readable without migration.
     worktrees: Array.isArray(record.worktrees) ? record.worktrees : [],
     attached_to: record.attached_to || null,
-  };
+  });
+  if (Object.prototype.hasOwnProperty.call(supplied, 'host_runtime')) full.host_runtime = supplied.host_runtime;
+  if (Object.prototype.hasOwnProperty.call(supplied, 'session')) full.session = supplied.session;
+  if (Object.prototype.hasOwnProperty.call(supplied, 'owner')) full.owner = supplied.owner;
+  if (Object.prototype.hasOwnProperty.call(supplied, 'heartbeat')) full.heartbeat = supplied.heartbeat;
+  if (Object.prototype.hasOwnProperty.call(supplied, 'expires_at')) full.expires_at = supplied.expires_at;
   if (record.kind === 'task') {
     full.task_description = record.task_description || '';
     full.pending_decisions = record.pending_decisions || [];
@@ -118,21 +147,26 @@ function add(cwd, record) {
   writeAtomic(runFile(cwd, record.id), full);
   refreshLegacyAlias(cwd);
   return full;
+  });
 }
 
 function update(cwd, id, patch) {
-  const current = get(cwd, id);
-  if (!current) throw new Error(`forge-runs.update: run ${id} not found`);
-  const next = Object.assign({}, current, patch);
-  writeAtomic(runFile(cwd, id), next);
-  refreshLegacyAlias(cwd);
-  return next;
+  return withRunLock(cwd, id, () => {
+    const current = get(cwd, id);
+    if (!current) throw new Error(`forge-runs.update: run ${id} not found`);
+    const next = Object.assign({}, current, normalizeMetadataPatch(patch));
+    writeAtomic(runFile(cwd, id), next);
+    refreshLegacyAlias(cwd);
+    return next;
+  });
 }
 
 function remove(cwd, id) {
-  const f = runFile(cwd, id);
-  if (fs.existsSync(f)) fs.unlinkSync(f);
-  refreshLegacyAlias(cwd);
+  return withRunLock(cwd, id, () => {
+    const f = runFile(cwd, id);
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+    refreshLegacyAlias(cwd);
+  });
 }
 
 function bumpHeartbeat(cwd, id, ts) {
@@ -152,6 +186,12 @@ function cleanupStale(cwd, thresholdMs) {
   return removed;
 }
 
+// Records read by older tools may not have a neutral session or host metadata.
+// Read operations intentionally return those records unchanged: normalizing on
+// read would turn a harmless inspection into a schema migration. Writers only
+// add metadata a caller explicitly supplies, and selection remains based on
+// `active` plus the existing timestamps regardless of host/session values.
+
 // ── Legacy alias (auto-mode.json mirror of oldest active) ───────────────────
 function refreshLegacyAlias(cwd) {
   const aliasPath = path.join(cwd, '.gsd', 'forge', ALIAS_FILE);
@@ -170,7 +210,7 @@ function refreshLegacyAlias(cwd) {
   }
   try {
     fs.mkdirSync(path.dirname(aliasPath), { recursive: true });
-    fs.writeFileSync(aliasPath, JSON.stringify(mirror), 'utf8');
+    writeAtomic(aliasPath, mirror);
   } catch { /* alias is best-effort */ }
 }
 
@@ -353,7 +393,7 @@ module.exports = {
   bumpHeartbeat, cleanupStale,
   resolveBySessionId, oldestActive,
   refreshLegacyAlias, migrateLegacyState,
-  runsDir, runFile,
+  runsDir, runFile, writeAtomic, withRunLock, normalizeMetadataPatch,
   STALE_THRESHOLD_MS,
   ACTIVE_THRESHOLD_MS,
 };

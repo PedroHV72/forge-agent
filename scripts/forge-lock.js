@@ -84,6 +84,25 @@ function tryAcquireSync(cwd, name, opts) {
   try { return create(cwd, name, { ...opts, ttlMs }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; if (stealIfStale(dir, ttlMs, nowOf(opts))) { try { return create(cwd, name, { ...opts, ttlMs }); } catch { } } return null; }
 }
+// Synchronous consumers (the state/run registries predate promises) still need
+// the same owner-scoped mutex. Atomics.wait is available in Node on every host
+// we support and avoids shell-specific sleep helpers.
+function acquireSync(cwd, name, opts) {
+  opts = opts || {}; validateName(name);
+  const retries = positive(opts.retries, DEFAULT_RETRIES, 'retries');
+  const ttlMs = positive(opts.ttlMs, DEFAULT_TTL_MS, 'ttl');
+  const backoffMin = positive(opts.backoffMin, DEFAULT_BACKOFF_MIN, 'backoff');
+  const backoffMax = positive(opts.backoffMax, DEFAULT_BACKOFF_MAX, 'backoff');
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const handle = tryAcquireSync(cwd, name, { ...opts, ttlMs });
+    if (handle) return handle;
+    if (attempt + 1 < retries) Atomics.wait(sleeper, 0, 0, jitter(backoffMin, backoffMax));
+  }
+  const error = new Error(`forge-lock: mutex ocupado para "${name}"`);
+  error.code = 'LOCK_BUSY';
+  throw error;
+}
 function renewHandle(handle, opts) {
   opts = opts || {}; const meta = readMetadata(handle.lockDir);
   if (!sameOwner(meta, handle) || !fs.existsSync(markerPath(handle.lockDir, handle.ownerToken))) return { ok: false, reason: 'owner_mismatch' };
@@ -111,4 +130,4 @@ function status(cwd, name, opts) { const dir = lockPath(cwd, name); if (!fs.exis
 function parseArgs(argv) { const out = {}; for (let i = 0; i < argv.length; i++) if (argv[i].startsWith('--')) { const k = argv[i].slice(2), n = argv[i + 1]; out[k] = n && !n.startsWith('--') ? (i++, n) : true; } return out; }
 async function cliMain() { const args = parseArgs(process.argv.slice(2)), cwd = args.cwd || process.cwd(); try { if (args.acquire || args['try-acquire']) { const fn = args.acquire ? acquire : tryAcquireSync; const h = await fn(cwd, args.acquire || args['try-acquire'], { ttlMs: args.ttl && Number(args.ttl), holderRunId: args.holder, retries: args.retries && Number(args.retries) }); if (!h) { process.stderr.write('busy\n'); process.exitCode = 1; return; } process.stdout.write(JSON.stringify({ lockDir: h.lockDir, metadata: h.metadata }) + '\n'); } else if (args.release) { const ok = releaseSync(cwd, args.release, args.token, args.generation); process.stdout.write(ok ? 'released\n' : 'not held (token obrigatório)\n'); process.exitCode = ok ? 0 : 1; } else if (args.status) process.stdout.write(JSON.stringify(status(cwd, args.status), null, 2) + '\n'); else { process.stderr.write('forge-lock: comando inválido\n'); process.exitCode = 2; } } catch (e) { process.stderr.write(`forge-lock error: ${e.message}\n`); process.exitCode = 1; } }
 if (require.main === module) cliMain();
-module.exports = { acquire, tryAcquireSync, releaseSync, releaseHandle, renewHandle, status, locksDir, lockPath, metaPath, stealIfStale, DEFAULT_TTL_MS };
+module.exports = { acquire, acquireSync, tryAcquireSync, releaseSync, releaseHandle, renewHandle, status, locksDir, lockPath, metaPath, stealIfStale, DEFAULT_TTL_MS };

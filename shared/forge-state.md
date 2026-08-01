@@ -284,3 +284,94 @@ Used by `scripts/forge-lock.js`. Path is a **directory** (created via `mkdir` fo
 - Stale (mtime > TTL): next acquirer can `rmdir` + `mkdir` to steal (with a warning log)
 - Released by removing the directory (`rmdir` after deleting metadata.json)
 - No file locks (`fcntl`/`LockFileEx`) — directory locks are cross-platform and crash-resilient
+
+---
+
+## 7. Atomic, runtime-neutral persistence (S02/T02)
+
+`forge-state.js` and `forge-runs.js` are the executable compatibility boundary
+for durable Forge state. Consumers must use their public update APIs rather
+than writing `STATE.md` or `runs/*.json` directly.
+
+### Publication rule
+
+Every canonical state or run mutation follows this sequence:
+
+1. Acquire the owner-scoped `forge-lock` mutex for `state-{milestone}` or
+   `run-{id}`.
+2. Re-read the durable file while holding that mutex.
+3. Merge only the supplied patch fields onto the freshly-read record.
+4. Write the complete replacement to a uniquely named temporary file in the
+   target directory.
+5. Rename that file over the target, then release the same owner token.
+
+The temporary file and destination live on the same filesystem. `rename` is
+therefore the publication point on Windows, macOS and Linux: readers see the
+old complete document or the new complete document, never an incomplete JSON
+or Markdown body. A failed canonical write is an error. Temporary files are
+not a recovery protocol and must not be treated as a competing source of truth.
+
+### STATE metadata
+
+Per-milestone STATE frontmatter may additionally carry the following optional
+fields:
+
+| Field | Meaning | Semantic effect |
+| --- | --- | --- |
+| `owner` | opaque writer or lease-owner label | audit only |
+| `host_runtime` | `claude` or `codex` | validated when supplied; no phase change |
+| `worker_engine` | requested worker engine | audit/routing input only |
+| `session` | provider-neutral opaque session reference | correlation only |
+| `heartbeat` | durable heartbeat value | liveness metadata only |
+| `expires_at` | optional expiry value | consumed by later lease code |
+
+These fields do not select a task, calculate `phase`, or alter `next_action`.
+`host_runtime` is normalized by `forge-runtime.js` only when supplied. Unknown
+values fail with its normal `invalid-host-runtime` diagnostic. Omission means
+legacy input remains Claude-first at the runtime normalization boundary; it does
+not cause `host_runtime: claude` to be written back to a legacy file.
+
+### RunRecord metadata and aliases
+
+Run records retain `session_id` because 3.1.4 readers use it. New callers may
+supply `session`; the registry stores it as additive neutral metadata and keeps
+`session_id` as a compatibility alias. No code infers a provider from the value
+or shape of either field. `owner`, `host_runtime`, `heartbeat`, and `expires_at`
+are likewise optional additive fields. Unknown record keys survive an update so
+future writers can extend the schema without a migration race.
+
+`auto-mode.json` remains a best-effort legacy mirror only. It is atomically
+published for reader safety, but it is never used to choose a run, establish
+ownership, or make a lease decision. If refreshing that alias fails, the
+canonical state/run mutation remains successful.
+
+### Compatibility examples
+
+A 3.1.4 record without new metadata stays valid after an unrelated update:
+
+```json
+{"id":"M065","kind":"milestone","session_id":"legacy-value","active":true}
+```
+
+A neutral record may add metadata without changing selection behavior:
+
+```json
+{"id":"M065","session":"opaque","host_runtime":"codex","owner":"token"}
+```
+
+Neither example references a provider home directory, a CLI command, or a
+provider-specific session-id grammar. Session identifiers are opaque text.
+
+### Concurrency and callers
+
+Heartbeat, worker, and ordinary state patches are independent merge patches.
+Each operation re-reads under its granular mutex, so a heartbeat update cannot
+erase a worker patch that was already persisted, and vice versa. Callers should
+submit only fields they own; whole-record replacement outside these APIs is not
+supported. The lock is a short persistence mutex, not a unit lease and not an
+authorization to execute work.
+
+The implementation uses only Node `fs`, `path`, and relative module imports.
+It does not read `~/.claude`, `~/.codex`, environment-specific commands, or
+provider configuration. This keeps the same durable files portable across all
+supported hosts and operating systems.
