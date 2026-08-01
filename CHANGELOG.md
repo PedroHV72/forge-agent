@@ -1,3 +1,18 @@
+## Unreleased
+
+### Added
+
+- **A slice can no longer lose its configured route in silence** (`TASK-021`). When a unit routed to the sidecar falls back to Claude, the only trace used to be one line in `events.jsonl` — so a whole slice could run on the wrong engine and read as normal. `scripts/forge-route-audit.js` derives the record from the event log and writes the `## Route` section into `S##-SUMMARY.md` itself; `forge-completer` only invokes it (sub-step 1.85) and never authors the prose, which is the entire point — the failure this closes was a narration that contradicted a warning the harness had already printed. Drift is decided by **two** signals, not one: a `worker-engine-fallback` event, **or** `engine_final != engine_attempted[0]` — the cross-engine chain walk changes engine without announcing it, so anchoring on the fallback event alone would have missed that class entirely. The section is emitted **always**, including when clean (`rota configurada rodou em N/N tasks`): silence is indistinguishable from a detector that never ran. Advisory — exit 0 in every circumstance, never blocks a complete.
+- **`worker-engine-fallback` carries the resolver `hint`.** The value was already computed and echoed to the terminal; it was never recorded, so the exact fix for a refusal ("declare `repo: <name>` in the plan frontmatter") lived only in a scrollback nobody re-read. It now reaches the audited artifact. The hint is taken **from the event or not at all** — a static `reason → hint` table is forbidden, since `hintFor` depends on `declared_repo`/`repos_touched` and a table would be model-authored truth recompiled.
+
+### Fixed
+
+- **The `hint` field would have shipped permanently empty.** `$CODE_DIR_HINT` is assigned in the `CODE_DIR`-resolution fence and read in the fallback fence — a **different Bash invocation**, where shell state no longer exists — and the plan-slice branch never assigned it at all. Caught by the dialectic review before the first commit and fixed by persisting the value across the fence boundary, then proven in two separate shell invocations rather than by reading. Without that catch this would have shipped the exact pathology it exists to detect: a gate that reads green and emits nothing.
+- **A codex `plan-slice` dispatch was invisible to the audit.** The two plan-slice emitters wrote neither `slice` nor `milestone`, so a successful codex plan-slice went unrecorded and a fallback rendered `attempted=[claude]` — erasing the codex attempt from its own record. Both fields added additively.
+- **RUN_ID is accepted as an alias of the milestone id.** Events record `milestone` as `${RUN_ID:-{M###}}` while the completer queries `--milestone {M###}`, so a codex dispatch and its Claude fallback could land under two spellings and count as two units. The audit folds them, reading the runs registry through `forge-runs.listAll`. The slice-only degradation path it replaces is deleted: a milestone with no evidence now reports `0 tasks` instead of borrowing another slice's dispatches under this heading.
+
+---
+
 ## v3.4.0 — The version you are running
 
 The app announced a version number that was the repository's tag rather than the binary
