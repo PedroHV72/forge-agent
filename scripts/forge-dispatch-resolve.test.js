@@ -411,6 +411,18 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  runCase('routed Codex sidecar is refused on a Codex host until explicitly declared', () => {
+    const f = mkFixture({ prefsJsonc: '{"routing":{"default":{"executor":{"standard":["gpt-5-codex"]}}}}' });
+    const implicit = dispatch(f, { unitType: 'execute-task', hostRuntime: 'codex' });
+    assertEqual(implicit.dispatch_engine, 'codex', 'routing still exposes the legacy Codex dispatch trigger');
+    assertEqual(implicit.dispatch_allowed, false, 'effective routed same-host sidecar is refused');
+    assertEqual(implicit.dispatch_reason_code, 'implicit-recursion-refused', 'routed recursion uses stable reason code');
+    const declared = dispatch(f, { unitType: 'execute-task', hostRuntime: 'codex', sidecarDeclared: true });
+    assertEqual(declared.dispatch_allowed, true, 'declared routed same-host sidecar remains allowed');
+    assertEqual(declared.worker_mode, 'sidecar', 'routed Codex dispatch projects sidecar mode');
+    cleanup(f);
+  });
+
   runCase('implicit Codex-to-Codex sidecar is refused before dispatch', () => {
     const f = mkFixture({});
     const r = dispatch(f, {

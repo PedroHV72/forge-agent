@@ -13,6 +13,7 @@ const { HOST_RUNTIMES } = require('./forge-runtime.js');
 
 const AVAILABILITY = Object.freeze(['implemented', 'planned', 'conditional', 'unavailable']);
 const KINDS = Object.freeze(['skill', 'agent', 'command', 'hook', 'headless', 'mcp', 'statusline', 'accounts', 'app']);
+const PLATFORMS = Object.freeze(['macos', 'windows', 'linux']);
 
 // Public API notes for adapter authors:
 // AVAILABILITY is deliberately closed so a typo cannot claim a green host.
@@ -70,6 +71,16 @@ function discover(root) {
 
 function issue(issues, message) { issues.push(message); }
 
+function rejectUnknownKeys(issues, value, allowed, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    issue(issues, `${label} must be an object`);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) issue(issues, `${label}: unknown key ${key}`);
+  }
+}
+
 function validateCatalog(catalog, schema) {
   const issues = [];
   if (!catalog || typeof catalog !== 'object' || Array.isArray(catalog)) return ['catalog must be an object'];
@@ -94,13 +105,21 @@ function validateCatalog(catalog, schema) {
     if (!KINDS.includes(capability.kind)) issue(issues, `${id}: invalid kind ${capability.kind}`);
     if (!/^[a-z][a-z0-9-]*$/.test(String(capability.owner || ''))) issue(issues, `${id}: owner is required`);
     if (typeof capability.required !== 'boolean') issue(issues, `${id}: required must be boolean`);
+    rejectUnknownKeys(issues, capability.hosts || {}, HOST_RUNTIMES, `${id}: hosts`);
     for (const host of HOST_RUNTIMES) {
       const status = (capability.hosts || {})[host];
       if (!AVAILABILITY.includes(status)) issue(issues, `${id}: invalid ${host} classification ${JSON.stringify(status)}`);
     }
     const probe = capability.probe || {};
-    if (probe.kind !== 'filesystem' || typeof probe.path !== 'string' || !probe.path || probe.path.includes('\\')) issue(issues, `${id}: probe must be a normalized filesystem path`);
+    if (probe.kind !== 'filesystem' || typeof probe.path !== 'string' || !probe.path || probe.path.includes('\\') || probe.path.split('/').some((segment) => segment === '.' || segment === '..')) issue(issues, `${id}: probe must be a normalized filesystem path`);
     if (capability.required && (!probe.path || !probe.kind)) issue(issues, `${id}: required capability has no planned probe`);
+    if (capability.platforms !== undefined) {
+      rejectUnknownKeys(issues, capability.platforms, PLATFORMS, `${id}: platforms`);
+      for (const platform of PLATFORMS) {
+        const status = (capability.platforms || {})[platform];
+        if (!AVAILABILITY.includes(status)) issue(issues, `${id}: invalid ${platform} classification ${JSON.stringify(status)}`);
+      }
+    }
   }
   return issues;
 }
@@ -136,13 +155,17 @@ function matrix(catalog) {
     required: entry.required,
     claude: entry.hosts.claude,
     codex: entry.hosts.codex,
+    platforms: entry.platforms || null,
     probe: entry.probe.path,
   }));
 }
 
 function renderText(rows) {
-  const header = ['Capability', 'Kind', 'Owner', 'Claude', 'Codex', 'Probe'];
-  const body = rows.map((row) => [row.capability_id, row.kind, row.owner, row.claude, row.codex, row.probe]);
+  const header = ['Capability', 'Kind', 'Owner', 'Claude', 'Codex', 'Platforms', 'Probe'];
+  const body = rows.map((row) => [
+    row.capability_id, row.kind, row.owner, row.claude, row.codex,
+    row.platforms ? PLATFORMS.map((platform) => `${platform}:${row.platforms[platform]}`).join('; ') : 'all', row.probe,
+  ]);
   const widths = header.map((value, index) => Math.max(value.length, ...body.map((row) => row[index].length)));
   const format = (row) => row.map((value, index) => value.padEnd(widths[index])).join('  ');
   return [format(header), format(widths.map((width) => '-'.repeat(width))), ...body.map(format)].join('\n');
@@ -177,7 +200,7 @@ function run(argv = process.argv.slice(2), write = process.stdout.write.bind(pro
   return 0;
 }
 
-module.exports = { AVAILABILITY, KINDS, posixPath, loadCatalog, discover, validateCatalog, audit, matrix, renderText, parseArgs, run };
+module.exports = { AVAILABILITY, KINDS, PLATFORMS, posixPath, loadCatalog, discover, validateCatalog, audit, matrix, renderText, parseArgs, run };
 
 if (require.main === module) {
   try { process.exitCode = run(); } catch (error) { process.stderr.write(`forge-capabilities: ${error.message}\n`); process.exitCode = 1; }

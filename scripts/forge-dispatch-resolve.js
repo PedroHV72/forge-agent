@@ -180,7 +180,7 @@ function runtimeInputValue(opts, camel, snake) {
   return opts[snake];
 }
 
-function runtimeFields(opts) {
+function runtimeFields(opts, dispatchEngine) {
   const o = opts || {};
   const input = {
     host_runtime: runtimeInputValue(o, 'hostRuntime', 'host_runtime'),
@@ -189,6 +189,14 @@ function runtimeFields(opts) {
     sidecar_declared: runtimeInputValue(o, 'sidecarDeclared', 'sidecar_declared'),
     sidecar: o.sidecar,
   };
+  // The legacy dispatch branch still treats a routed Codex member as a
+  // sidecar. On a Codex host that would recurse unless the caller declared
+  // it, so project that effective worker before asking the canonical runtime
+  // validator. The omitted-host Claude path remains byte-compatible.
+  if (text(input.host_runtime).toLowerCase() === 'codex' && dispatchEngine === 'codex') {
+    input.worker_engine = 'codex';
+    input.worker_mode = 'sidecar';
+  }
   try {
     const worker = resolveWorker(input);
     return {
@@ -314,7 +322,8 @@ function resolveDispatch(opts) {
   if (family === null && route.source === 'routing' && !chain[0]) engine = 'claude';
   // Resolve this after routing/model-family work. The result is deliberately
   // additive: legacy engine/dispatch_engine/chain retain their 3.1.4 meaning.
-  const runtime = runtimeFields(o);
+  const dispatchEngine = dispatchEngineFor(engine);
+  const runtime = runtimeFields(o, dispatchEngine);
   return {
     engine,
     model,
@@ -343,9 +352,9 @@ function resolveDispatch(opts) {
     // Additive dispatch trigger: normalized from the resolved top-level `engine`
     // (family). gpt→codex, gemini→agy, else→claude. Orchestrator branches gate
     // on this (`== "codex"`), NOT on `engine`/`chain[].engine` (kept family).
-    dispatch_engine: dispatchEngineFor(engine),
+    dispatch_engine: dispatchEngine,
     // codex_model remains emitted separately as the legacy flat preference.
-    sidecar_model: sidecarModelFor(dispatchEngineFor(engine), chain, workers.codex_model),
+    sidecar_model: sidecarModelFor(dispatchEngine, chain, workers.codex_model),
     // Additive loud-stop surface (M008-CONTEXT #2): a malformed prefs layer must
     // not silently degrade to the claude/effort-default fallback. Callers inspect
     // prefs_ok; the CLI turns prefs_ok:false into a non-zero exit.
@@ -397,7 +406,7 @@ function degradedContract(args) {
   } catch { /* minimal ordered contract below */ }
   const model = chain[0] ? chain[0].id : '';
   const alias = modelToAlias(model).alias;
-  const runtime = runtimeFields(parsed);
+  const runtime = runtimeFields(parsed, dispatchEngineFor('claude'));
   return {
     engine: 'claude', model, alias, tier, domain: 'default', route_source: 'tier_models',
     chain, chain_len: chain.length, reason: 'routing-runtime-error; tier_models',

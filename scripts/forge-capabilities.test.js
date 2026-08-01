@@ -83,6 +83,10 @@ test('audit rejects an invalid host classification', () => {
   const data = fixture();
   try { data.catalog.capabilities[0].hosts.codex = 'green'; has(api.validateCatalog(data.catalog, data.schema), 'invalid codex classification'); } finally { data.cleanup(); }
 });
+test('audit rejects unknown host keys', () => {
+  const data = fixture();
+  try { data.catalog.capabilities[0].hosts.agy = 'planned'; has(api.validateCatalog(data.catalog, data.schema), 'hosts: unknown key agy'); } finally { data.cleanup(); }
+});
 test('audit rejects an invalid host enum in the schema', () => {
   const data = fixture();
   try { data.schema.$defs.host.enum = ['claude']; has(api.validateCatalog(data.catalog, data.schema), 'host enum drifted'); } finally { data.cleanup(); }
@@ -107,6 +111,17 @@ test('audit rejects an unnormalized probe path', () => {
   const data = fixture();
   try { data.catalog.capabilities[0].probe.path = 'skills\\forge-sample\\SKILL.md'; has(api.validateCatalog(data.catalog, data.schema), 'normalized filesystem path'); } finally { data.cleanup(); }
 });
+test('audit rejects dot and dot-dot probe path segments', () => {
+  const data = fixture();
+  try {
+    const schemaPattern = new RegExp(api.loadCatalog(path.resolve(__dirname, '..')).schema.$defs.probe.properties.path.pattern);
+    for (const probe of ['skills/./forge-sample/SKILL.md', 'skills/../outside']) {
+      data.catalog.capabilities[0].probe.path = probe;
+      has(api.validateCatalog(data.catalog, data.schema), 'normalized filesystem path');
+      assert.strictEqual(schemaPattern.test(probe), false, `schema accepted traversal probe ${probe}`);
+    }
+  } finally { data.cleanup(); }
+});
 test('audit rejects a required capability with no probe', () => {
   const data = fixture();
   try { data.catalog.capabilities[0].probe = {}; has(api.validateCatalog(data.catalog, data.schema), 'required capability has no planned probe'); } finally { data.cleanup(); }
@@ -130,6 +145,13 @@ test('matrix ordering is deterministic', () => {
 test('text rendering is deterministic and readable', () => {
   const data = fixture();
   try { const rendered = api.renderText(api.matrix(data.catalog)); assert.match(rendered, /Capability/); assert.match(rendered, /skill-forge-sample/); } finally { data.cleanup(); }
+});
+test('matrix preserves platform-specific availability for Forge.app', () => {
+  const matrix = api.matrix(api.loadCatalog(path.resolve(__dirname, '..')).catalog);
+  const app = matrix.find((entry) => entry.capability_id === 'operational-app');
+  assert.deepStrictEqual(app.platforms, { macos: 'conditional', windows: 'unavailable', linux: 'unavailable' });
+  assert.match(api.renderText([app]), /windows:unavailable/);
+  assert.match(api.renderText([app]), /linux:unavailable/);
 });
 test('JSON output is stable across repeated invocations', () => {
   let left = ''; let right = '';

@@ -54,6 +54,10 @@ Every row includes both `claude` and `codex` statuses.
 
 Every row also has an owner and a stable `capability_id`.
 
+Some rows include an explicit `platforms` map when the surface is restricted
+to an operating system. An omitted map means the catalog has no
+platform-specific restriction for that surface.
+
 An ID is kebab-case and must not be reused for another surface.
 
 ## Current release posture
@@ -68,7 +72,8 @@ The statusline is conditional because it depends on local configuration.
 
 Accounts are conditional for the same reason.
 
-The desktop app is conditional for Claude and unavailable for Codex today.
+Forge.app is conditional for Claude on macOS only. Its platform matrix marks
+Windows and Linux unavailable; it is unavailable for Codex on every platform.
 
 Hooks are implemented for Claude and planned for Codex.
 
@@ -132,7 +137,7 @@ The audit rejects duplicate IDs.
 
 The audit rejects duplicate probe paths.
 
-The audit rejects invalid hosts and availability values.
+The audit rejects invalid hosts, platform keys, and availability values.
 
 The audit rejects a missing owner.
 

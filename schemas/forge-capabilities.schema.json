@@ -21,7 +21,7 @@
       "required": ["kind", "path"],
       "properties": {
         "kind": { "const": "filesystem" },
-        "path": { "type": "string", "minLength": 1, "pattern": "^[^\\\\]+$" }
+        "path": { "type": "string", "minLength": 1, "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\\\]+$" }
       },
       "additionalProperties": false
     },
@@ -34,6 +34,16 @@
       },
       "additionalProperties": false
     },
+    "platforms": {
+      "type": "object",
+      "required": ["macos", "windows", "linux"],
+      "properties": {
+        "macos": { "$ref": "#/$defs/availability" },
+        "windows": { "$ref": "#/$defs/availability" },
+        "linux": { "$ref": "#/$defs/availability" }
+      },
+      "additionalProperties": false
+    },
     "capability": {
       "type": "object",
       "required": ["capability_id", "kind", "owner", "required", "hosts", "probe"],
@@ -43,7 +53,8 @@
         "owner": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
         "required": { "type": "boolean" },
         "hosts": { "$ref": "#/$defs/hosts" },
-        "probe": { "$ref": "#/$defs/probe" }
+        "probe": { "$ref": "#/$defs/probe" },
+        "platforms": { "$ref": "#/$defs/platforms" }
       },
       "additionalProperties": false
     },
