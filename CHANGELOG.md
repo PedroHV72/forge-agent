@@ -1,4 +1,9 @@
-## Unreleased
+## v3.5.0 — The route that ran, on the record
+
+A unit that fell back from the sidecar to Claude left one line in `events.jsonl` and
+nothing else, so an entire slice could run on the wrong engine and read as perfectly
+normal. The record now names the engine that actually ran, every time, including when
+nothing went wrong.
 
 ### Added
 
