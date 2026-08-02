@@ -1,3 +1,74 @@
+## v4.0.0 — The board you can read
+
+The kanban shipped in `M-20260730101543` and then got looked at for the first time. Every
+change here came from that look, and none of it was reachable by the suites: no agent on
+this machine sees a screen, which is exactly why a board with three different badge
+heights, an invisible accent bar and a filter that could only ever return nothing passed
+sixty green suites and six dialectic reviews.
+
+### Breaking
+
+- **macOS 13–25 are no longer supported.** `app/Package.swift` moves from `.macOS(.v13)`
+  to `.macOS("26.0")`, which is what the container drag APIs require — dragging a card
+  between columns was deferred in the roadmap for precisely this reason and is now
+  delivered. This is the whole reason the release is major: the app simply will not run
+  below 26. (`.v26` does not exist in this toolchain's `PackageDescription`; the string
+  form does.)
+
+### Added
+
+- **Drag a card between columns.** `BoardGesture` gains `.drag`, and the D9/F7
+  counter-criterion — five organising gestures must produce zero terminal sessions — is
+  proved for it by **both** sides of the shared fixture rather than inherited from
+  `.move`. Organising a board still cannot originate work.
+- **`blocked_by` on an item**, encoded exactly like `labels`: a comma-separated scalar on
+  disk, an array only at the `--list --json` edge. The encoding is not a preference — S01
+  proved that a YAML list here is silent data loss, since the continuation lines fail
+  `parseItem`'s `^key: value` regex and the key vanishes on the next write with no error
+  and no exit code, across every item fragment in the repo.
+- **The body renders as markdown** in the detail sheet — headings, lists, quotes, rules,
+  and fenced code kept verbatim, so a diff pasted into an item is not chewed into headings
+  and bullets. It was showing raw source before.
+- **Signals the board never had**: task age on a thermal ramp (grey → blue → yellow →
+  orange → red, and always quiet on a closed item), checklist progress counted off parsed
+  blocks so a `- [ ]` inside a fence is not mistaken for a checkbox, a blocked badge, and
+  a project badge when more than one project is on screen.
+- **Every project at once.** No project selected now means *all of them*, not *nothing*.
+  Each item carries which project it came from, so a status change on that board reaches
+  the right `--cwd` instead of whichever project happened to be selected.
+- **Developer-mode badge** in the sidebar footer, gated by `#if DEBUG` — not by a
+  describe heuristic, which answers a different question ("has commits beyond the tag" is
+  true for a release cut mid-cycle and false for a debug build of a clean tag).
+
+### Changed
+
+- **The card shows three elements at rest, not seven.** This reverses criterion #4, the
+  spine of S04: at 268pt the seven were a paragraph and roughly three cards fit on a
+  screen. Body, id, source and closing date **moved** rather than vanished — the detail
+  sheet, a hover expansion after a one-second dwell, and a copy button — and the guards
+  assert the destination, not merely the absence.
+- **Search and label filter are separate controls.** Search matches title and id by
+  substring, which is what a board whose items carry no labels actually needs; the label
+  filter stays exact, because criterion #5's parity against `jq '.labels|index(…)'`
+  depends on it. One box would have to pick one semantics and quietly break the other —
+  with substring, `ui` matches `ui-bug`, the one-card divergence the criterion calls a
+  failure.
+- **The sidebar footer is the version, and only the version.** "Adicionar projeto" left
+  it: the action already lives in the app menu, the Projects toolbar and the Projects
+  empty state, and at the 180pt minimum width it was crowding the one thing a footer is
+  for.
+
+### Fixed
+
+- **Colour that meant nothing.** Label chips derived their tone from a sum of unicode
+  scalars, which put `bug`, `ui`, `progresso` and `d8` — four of the repo's five real
+  labels — on the same slot. FNV-1a spreads them, and a test now fails if the five real
+  labels collapse into fewer than four tones.
+- **Two `Toast` types one word apart** in the same module, one global and one nested in
+  `AppState`. The board's is now `ItemToast`.
+
+---
+
 ## v3.5.0 — The route that ran, on the record
 
 A unit that fell back from the sidecar to Claude left one line in `events.jsonl` and
