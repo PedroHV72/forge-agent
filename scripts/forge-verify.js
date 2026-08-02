@@ -39,7 +39,8 @@
 
 const { spawnSync } = require('child_process');
 const { existsSync, readFileSync, mkdirSync, appendFileSync } = require('fs');
-const { join, dirname } = require('path');
+const { join, dirname, resolve, basename } = require('path');
+const { resolveOwner } = require('./forge-workspace.js');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -453,6 +454,7 @@ if (require.main === module) {
     let unit = "unknown";
     let preferenceCommands = [];
     let timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS;
+    let gsdDir = null;
     // --from-verify: accepted but ignored (reserved for orchestrator anti-recursion)
     // let fromVerify = false;
 
@@ -464,6 +466,11 @@ if (require.main === module) {
         cwd = args[++i];
       } else if (arg === "--unit" && args[i + 1] !== undefined) {
         unit = args[++i];
+      } else if (arg === "--gsd-dir" && args[i + 1] !== undefined) {
+        // Explicit owner. The orchestrator knows which project this run belongs
+        // to; in worktree isolation mode `.gsd/` is not under CODE_DIR at all,
+        // so walking up from --cwd cannot find it.
+        gsdDir = args[++i];
       } else if (arg === "--preference" && args[i + 1] !== undefined) {
         preferenceCommands.push(args[++i]);
       } else if (arg === "--timeout" && args[i + 1] !== undefined) {
@@ -501,22 +508,54 @@ if (require.main === module) {
     });
     const duration = Date.now() - startTime;
 
-    // Append to events.jsonl — I/O errors MUST throw (telemetry is not silent-fail)
-    const eventsDir = join(cwd, ".gsd", "forge");
-    mkdirSync(eventsDir, { recursive: true });
-    const eventsPath = join(eventsDir, "events.jsonl");
-    const eventLine = JSON.stringify({
-      ts: new Date().toISOString(),
-      event: "verify",
-      unit,
-      discovery_source: result.discoverySource,
-      commands: result.checks.map(c => c.command),
-      passed: result.passed,
-      ...(result.skipped ? { skipped: result.skipped } : {}),
-      duration_ms: duration,
-    });
-    // No try/catch — I/O errors propagate to caller (orchestrator handles)
-    appendFileSync(eventsPath, eventLine + "\n", "utf-8");
+    // Telemetry is recorded against the project that *owns* the work, never
+    // against whatever repo the commands happened to run in.
+    //
+    // This was `mkdirSync(join(cwd, ".gsd", "forge"), { recursive: true })`,
+    // and the `-p` semantics planted a `.gsd/` in every repo a run reached
+    // into — the exact marker the app uses to detect projects. Measured: 5 of
+    // 18 registered projects on the author's machine were repos this line
+    // enrolled; `asgard`, `saga` and `skuld` held nothing but the events.jsonl
+    // written here. See `scripts/forge-workspace.js` for the full account.
+    //
+    // Owner resolution: `--gsd-dir` when the orchestrator passed one (required
+    // under worktree isolation, where `.gsd/` is not below CODE_DIR at all),
+    // otherwise the nearest ancestor that is a real project. No owner means no
+    // record: skipping loses one telemetry line, while writing would create a
+    // phantom project that outlives the run by months.
+    const cwdAbs = resolve(cwd);
+    const ownerGsd = gsdDir ? resolve(gsdDir) : null;
+    const ownerRoot = ownerGsd ? dirname(ownerGsd) : resolveOwner(cwdAbs);
+    const eventsDir = ownerGsd ? join(ownerGsd, "forge")
+                    : ownerRoot ? join(ownerRoot, ".gsd", "forge")
+                    : null;
+
+    if (eventsDir) {
+      const eventLine = JSON.stringify({
+        ts: new Date().toISOString(),
+        event: "verify",
+        unit,
+        // Present only when the verified repo is not the owner — that is the
+        // cross-repo fact the old layout expressed by scattering directories.
+        ...(ownerRoot && cwdAbs !== ownerRoot
+            ? { repo: basename(cwdAbs), repo_path: cwdAbs }
+            : {}),
+        discovery_source: result.discoverySource,
+        commands: result.checks.map(c => c.command),
+        passed: result.passed,
+        ...(result.skipped ? { skipped: result.skipped } : {}),
+        duration_ms: duration,
+      });
+      // `.gsd/` exists by construction here, so this only creates `forge/`.
+      mkdirSync(eventsDir, { recursive: true });
+      // No try/catch — I/O errors propagate to caller (orchestrator handles)
+      appendFileSync(join(eventsDir, "events.jsonl"), eventLine + "\n", "utf-8");
+    } else {
+      // Visible, not silent: an unrecorded verify must be arguable with.
+      process.stderr.write(JSON.stringify({
+        warning: `no owning Forge project at or above ${cwdAbs} — verify event not recorded`,
+      }) + "\n");
+    }
 
     console.log(JSON.stringify(result));
     process.exit(result.passed ? 0 : 1);

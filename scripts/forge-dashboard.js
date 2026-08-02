@@ -24,6 +24,7 @@ const path = require('path');
 const runs = require('./forge-runs.js');
 const lock = require('./forge-lock.js');
 const forgeState = require('./forge-state.js');
+const { isProject } = require('./forge-workspace.js');
 
 const STALE_WARNING_MS = 5  * 60 * 1000;  // yellow chip
 const STALE_MS         = 15 * 60 * 1000;  // red chip / "stale" label (M005.3+: 15min matches statusline)
@@ -263,6 +264,22 @@ async function regenerate(cwd, opts) {
   opts = opts || {};
   const content = render(cwd);
   if (opts.dryRun) return content;
+
+  // A dashboard describes a project's runs; rendering one into a directory
+  // that is not a project *creates* the project. That is not hypothetical:
+  // `~/Development/.gsd` — one level above every real project on the author's
+  // machine — contained exactly `.locks/` and a STATE.md written here. The
+  // detector then read it as a project containing fifteen others.
+  //
+  // Refusing costs nothing (there are no runs to report in an uninitialised
+  // directory) and is loud rather than silent, so a genuine misconfiguration
+  // surfaces instead of quietly enrolling a folder.
+  if (!isProject(cwd)) {
+    const err = new Error(
+      `forge-dashboard: ${cwd} is not a Forge project (.gsd/ absent or holds only runtime scratch) — nothing regenerated`);
+    err.code = 'ENOTPROJECT';
+    throw err;
+  }
 
   // Acquire .gsd/.locks/STATE.md/ — short TTL since regen is idempotent and fast
   let held;

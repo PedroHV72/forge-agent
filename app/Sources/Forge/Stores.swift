@@ -57,6 +57,11 @@ final class AppState: ObservableObject {
     @Published private(set) var usage: [String: AccountUsage] = [:]
     @Published private(set) var workspaces: [String] = []
 
+    /// Registered paths that hold a `.gsd/` but no work — repos a run reached
+    /// into, which our tooling enrolled as a side effect. Surfaced rather than
+    /// filtered away: a misclassification has to cost a click, never a project.
+    @Published private(set) var touchedWorkspaces: [String] = []
+
     /// Raw values of the two `app.*` prefs, read once at init and on explicit
     /// reload only — see `loadAppDefaults()`.
     @Published private(set) var defaultWorkspacePref = ""
@@ -176,7 +181,18 @@ final class AppState: ObservableObject {
     // MARK: Cheap reload (files only)
 
     func reloadCheap() {
-        workspaces = Workspaces.load()
+        // Registered ≠ project. Our own scripts used to write `.gsd/` into any
+        // repo they touched, so the registry accumulated directories that never
+        // held work (see `ProjectMarker`). Splitting here rather than in the
+        // Projects screen fixes every consumer at once: the composer, the
+        // pickers and the metrics screen stop offering a repo nobody planned
+        // work in — which is the wrong-repo dispatch hazard `WorkspaceDefaults`
+        // exists to prevent.
+        let registered = Workspaces.load()
+        let marks = registered.map { ($0, ProjectMarker.classify($0).kind) }
+        workspaces = marks.filter { $0.1 == .project }.map(\.0)
+        touchedWorkspaces = marks.filter { $0.1 != .project }.map(\.0)
+
         var g: [Gate] = [], r: [Run] = []
         for ws in workspaces {
             g += Self.decodeDir("\(ws)/.gsd/forge/gates", as: Gate.self)

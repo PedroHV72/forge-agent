@@ -130,7 +130,9 @@ struct ProjectsView: View {
                     }
                 }
 
-                if state.workspaces.isEmpty { empty }
+                if state.workspaces.isEmpty && state.touchedWorkspaces.isEmpty { empty }
+
+                if !state.touchedWorkspaces.isEmpty { touchedNotice }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
@@ -261,12 +263,51 @@ struct ProjectsView: View {
         }
     }
 
+    // MARK: Touched
+
+    /// Registered directories holding a `.gsd/` with no work inside.
+    ///
+    /// Listed rather than quietly dropped. The predicate is a heuristic, and
+    /// the operator is the one who knows whether a repo is a project that lost
+    /// its artifacts or a repo a run merely walked through — hiding these would
+    /// look exactly like a detector that had broken.
+    @ViewBuilder private var touchedNotice: some View {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Image(systemName: "circle.dashed").font(.caption)
+                Text("Tocados por outro projeto").font(.callout).bold()
+                Text("\(state.touchedWorkspaces.count)")
+                    .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
+            }
+            Text("Têm .gsd/ mas nada de trabalho dentro. O Forge criava essa pasta em todo repositório que uma run encostava; não cria mais.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(state.touchedWorkspaces, id: \.self) { p in
+                HStack(spacing: 8) {
+                    Text(ProjectOrganiser.abbreviate(p, home: home))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    Button("Remover") { state.removeWorkspace(p) }
+                        .controlSize(.small).buttonStyle(.borderless)
+                }
+            }
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private func scan() {
         scanning = true
         Task.detached(priority: .userInitiated) {
             let hits = ProjectDiscovery.scan()
             await MainActor.run {
-                let known = Set(state.workspaces)
+                // Touched paths count as known: they are registered, so
+                // re-offering one that gained a milestone would duplicate it.
+                let known = Set(state.workspaces).union(state.touchedWorkspaces)
                 discovered = hits.filter { !known.contains($0) }
                 scanning = false
                 if discovered.isEmpty { state.show("Nenhum projeto novo encontrado") }

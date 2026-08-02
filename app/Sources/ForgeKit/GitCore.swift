@@ -99,7 +99,12 @@ public enum Git {
 }
 
 /// Finds Forge projects on disk instead of making the user navigate to each one.
-/// A project is any directory containing .gsd/ — the same marker every engine uses.
+///
+/// "Any directory containing .gsd/" was the rule until it turned out our own
+/// scripts wrote that directory into every repo they touched — see
+/// `ProjectMarker`, which owns the predicate now. Discovery offers only real
+/// projects; directories merely touched by a run are surfaced from the
+/// registered list instead, where the operator can act on them.
 public enum ProjectDiscovery {
     /// Where people actually keep code. Scanned shallowly on purpose: a deep
     /// walk of $HOME would take seconds and wander into node_modules.
@@ -129,7 +134,7 @@ public enum ProjectDiscovery {
         guard depth <= maxDepth else { return }
         let fm = FileManager.default
 
-        if fm.fileExists(atPath: dir.appendingPathComponent(".gsd").path) {
+        if ProjectMarker.isProject(dir.path) {
             found.insert(dir.path)
             // Keep descending: a monorepo can hold nested Forge projects, so
             // stopping at the first hit would miss them.

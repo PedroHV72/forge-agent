@@ -30,6 +30,31 @@ function locksDir(cwd) {
   return path.join(cwd, '.gsd', '.locks');
 }
 
+/**
+ * Create `.gsd/.locks/` — but only inside a directory that already has `.gsd/`.
+ *
+ * This used to be a bare `mkdirSync(locksDir(cwd), { recursive: true })`, and
+ * the `-p` semantics created `.gsd/` on the way to `.gsd/.locks/`. Taking a
+ * lock therefore *enrolled* the directory as a Forge project: running the
+ * dashboard once from `~/Development` planted `~/Development/.gsd`, one level
+ * above every real project. See `scripts/forge-workspace.js` for the full
+ * measurement.
+ *
+ * Creating `.gsd/` is `/forge-init`'s job and nothing else's. A lock is a claim
+ * about a project's state, so refusing here loses nothing: there is no state to
+ * protect in a directory that was never initialised.
+ */
+function ensureLocksDir(cwd) {
+  const gsd = path.join(cwd, '.gsd');
+  if (!fs.existsSync(gsd)) {
+    const err = new Error(
+      `forge-lock: ${cwd} has no .gsd/ — refusing to create one (run /forge-init first)`);
+    err.code = 'ENOGSD';
+    throw err;
+  }
+  fs.mkdirSync(path.join(gsd, '.locks'), { recursive: true });
+}
+
 function lockPath(cwd, name) {
   // Sanitize: only allow safe chars in name
   const safe = String(name).replace(/[^\w.\-]/g, '_');
@@ -82,7 +107,7 @@ async function acquire(cwd, name, opts) {
   const backoffMin = opts.backoffMin || DEFAULT_BACKOFF_MIN;
   const backoffMax = opts.backoffMax || DEFAULT_BACKOFF_MAX;
 
-  fs.mkdirSync(locksDir(cwd), { recursive: true });
+  ensureLocksDir(cwd);
   const lockDir = lockPath(cwd, name);
 
   const metadata = {
@@ -125,7 +150,14 @@ async function acquire(cwd, name, opts) {
 function tryAcquireSync(cwd, name, opts) {
   opts = opts || {};
   const ttlMs = opts.ttlMs || DEFAULT_TTL_MS;
-  fs.mkdirSync(locksDir(cwd), { recursive: true });
+  // Best-effort variant: an uninitialised directory is "busy" as far as callers
+  // are concerned — never a reason to plant `.gsd/`.
+  try {
+    ensureLocksDir(cwd);
+  } catch (e) {
+    if (e.code === 'ENOGSD') return null;
+    throw e;
+  }
   const lockDir = lockPath(cwd, name);
 
   const metadata = {
