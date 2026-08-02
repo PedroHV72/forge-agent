@@ -98,6 +98,22 @@ struct ItemsView: View {
     @StateObject private var store = ItemsStore()
     @State private var project: String = ""
     @State private var adding = false
+    /// The item whose detail sheet is open. `Item` is already `Identifiable`,
+    /// so `.sheet(item:)` handles presentation and dismissal from this one
+    /// value — no parallel `isPresented` flag to keep in sync.
+    @State private var detail: Item?
+
+    /// The label filter query (S05/T02). The rule itself lives in
+    /// `ItemLabelFilter` (S05/T01) — this view only holds the text the
+    /// operator typed.
+    @State private var labelQuery: String = ""
+
+    /// The single list every part of the board reads from (D-S05-2, LOCKED):
+    /// both `ItemBoard.columns` and `ItemBoard.unknown` derive from this, not
+    /// from `store.items` directly. Filtering after the split would let the
+    /// "Desconhecido" column disagree with the CLI count — the exact
+    /// divergence criterion #5 forbids.
+    private var visibleItems: [Item] { ItemLabelFilter.apply(store.items, query: labelQuery) }
 
     var body: some View {
         Group {
@@ -133,6 +149,9 @@ struct ItemsView: View {
         .sheet(isPresented: $adding) {
             NewItemSheet(store: store, project: project, isPresented: $adding)
         }
+        .sheet(item: $detail) { item in
+            ItemDetailSheet(item: item, detail: $detail)
+        }
     }
 
     private func reload() {
@@ -159,17 +178,25 @@ struct ItemsView: View {
     // MARK: Board
 
     private var board: some View {
-        ScrollView(.horizontal) {
-            HStack(alignment: .top, spacing: 14) {
-                ForEach(ItemBoard.columns(store.items)) { column in
-                    columnView(column)
+        VStack(alignment: .leading, spacing: 0) {
+            LabelFilterField(query: $labelQuery,
+                              labels: ItemLabelFilter.availableLabels(store.items),
+                              visibleCount: visibleItems.count)
+                .padding(.horizontal, 18)
+                .padding(.top, 14)
+
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 14) {
+                    ForEach(ItemBoard.columns(visibleItems)) { column in
+                        columnView(column)
+                    }
+                    let unknown = ItemBoard.unknown(visibleItems)
+                    if !unknown.isEmpty {
+                        unknownColumn(unknown)
+                    }
                 }
-                let unknown = ItemBoard.unknown(store.items)
-                if !unknown.isEmpty {
-                    unknownColumn(unknown)
-                }
+                .padding(18)
             }
-            .padding(18)
         }
         .overlay(alignment: .top) {
             if let e = store.error {
@@ -190,9 +217,11 @@ struct ItemsView: View {
             }
             VStack(spacing: 8) {
                 ForEach(column.items) { item in
-                    ItemCard(item: item, otherStatuses: ItemStatus.allCases.filter { $0 != column.status }) {
-                        store.setStatus(item.id, to: $0, project: project)
-                    }
+                    ItemCard(item: item,
+                             otherStatuses: ItemStatus.allCases.filter { $0 != column.status },
+                             onMove: { store.setStatus(item.id, to: $0, project: project) },
+                             onOpenDetail: { detail = item },
+                             onStart: { startWork(item) })
                 }
             }
         }
@@ -208,41 +237,265 @@ struct ItemsView: View {
             }
             VStack(spacing: 8) {
                 ForEach(items) { item in
-                    ItemCard(item: item, otherStatuses: ItemStatus.allCases) {
-                        store.setStatus(item.id, to: $0, project: project)
-                    }
+                    ItemCard(item: item,
+                             otherStatuses: ItemStatus.allCases,
+                             onMove: { store.setStatus(item.id, to: $0, project: project) },
+                             onOpenDetail: { detail = item },
+                             onStart: { startWork(item) })
                 }
             }
         }
         .frame(width: 220, alignment: .top)
     }
+
+    /// The ONE place on the board that opens a tab (D9/F7, LOCKED). Moving a
+    /// card never reaches here — `onMove:` goes straight to `store.setStatus`.
+    /// The decision of WHETHER to launch is entirely `ItemLaunch`'s (D-S06-1):
+    /// this function only executes a non-nil result, never inspects `item`
+    /// itself.
+    private func startWork(_ item: Item) {
+        guard let req = ItemLaunch.decide(.start(item)) else { return }
+        state.newSession(cwd: project, mode: .task, text: req.taskArgument, account: "")
+        state.rememberWorkspace(project)
+    }
 }
 
-private struct ItemCard: View {
+/// The filter field above the board (S05/T02): a text query, a menu of
+/// existing labels, a clear button, and the visible-card count.
+///
+/// `internal`, not `private` — `Previews.swift` needs to instantiate it
+/// directly, the same move S04 made for `ItemCard`/`LabelChip`. It draws no
+/// rule of its own: the match is `ItemLabelFilter.apply` (S05/T01), and
+/// `visibleCount` is handed in already computed rather than recomputed here,
+/// so there is exactly one place that counts.
+struct LabelFilterField: View {
+    @Binding var query: String
+    /// Every label seen across the whole board (unfiltered), so the menu
+    /// keeps offering the labels that would remove the current filter —
+    /// deriving these from `visibleItems` instead would make them vanish the
+    /// moment the operator filters.
+    let labels: [String]
+    let visibleCount: Int
+
+    var body: some View {
+        HStack(spacing: 8) {
+            TextField("filtrar por label", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 180)
+
+            Menu("labels") {
+                ForEach(labels, id: \.self) { label in
+                    Button(label) { query = label }
+                }
+            }
+            .disabled(labels.isEmpty)
+
+            Button("limpar") { query = "" }
+                .disabled(query.isEmpty)
+
+            // The number the UAT compares against `jq` (D-S05-3, LOCKED): a
+            // stable, unabbreviated string is what lets the S05/T03 guard
+            // find it in the rendered tree.
+            Text("\(visibleCount) cards")
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+
+            Spacer()
+        }
+    }
+}
+
+/// A card that reads like an issue: seven elements where there used to be
+/// three.
+///
+/// Not one of those seven is decided here — including the title. What counts
+/// as "no title" (missing, or whitespace-only) is decided once by
+/// `ItemCardPresentation.displayTitle` in ForgeKit (S04/T01, hardened in the
+/// S04 review) — this view only draws whatever that function returns. How
+/// many body lines survive, how many chips are drawn, and whether a closing
+/// date exists at all are answered the same way. That split is not stylistic:
+/// `Forge` is not importable from a test target on this machine, so a rule
+/// written here would be verifiable only by looking at a screen, and "show
+/// the date when it is done" written here would also mean a raw status
+/// literal in this file, which `scripts/forge-app-items.test.js` forbids
+/// outright.
+struct ItemCard: View {
     let item: Item
     let otherStatuses: [ItemStatus]
     let onMove: (ItemStatus) -> Void
+    let onOpenDetail: () -> Void
+    /// Executes what `ItemLaunch.decide(.start(item))` already decided
+    /// (D-S06-1) — this view draws the affordance and forwards the tap, it
+    /// never asks "should this item start?" itself.
+    let onStart: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(item.title ?? "(sem título)").font(.system(size: 12)).lineLimit(3)
+            Text(ItemCardPresentation.displayTitle(item)).font(.system(size: 12)).lineLimit(3)
+
+            // The `lineLimit` here is defensive redundancy, not the rule: the
+            // pure layer already cut the text. If the view were the only guard
+            // of the number, "three lines" would silently become "whatever
+            // fits".
+            if let preview = ItemCardPresentation.bodyPreview(item.body) {
+                Text(preview.truncated ? preview.text + "…" : preview.text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(ItemCardPresentation.bodyLineLimit)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Labels, priority and closing date share one row: they are all
+            // short metadata. Each stays its own view — concatenating them
+            // into a single string would collapse three elements into one.
+            let chips = ItemCardPresentation.labelChips(item.labels)
+            let priority = ItemPriority.parse(item.priority)
+            let closed = ItemCardPresentation.closedDay(item)
+            if chips != nil || priority != nil || closed != nil {
+                HStack(spacing: 4) {
+                    if let chips {
+                        ForEach(chips.shown, id: \.self) { chip in
+                            LabelChip(text: chip)
+                        }
+                        if chips.overflow > 0 {
+                            LabelChip(text: "+\(chips.overflow)")
+                        }
+                    }
+                    if let priority {
+                        Text(priority.mark)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .help(priority.label)
+                    }
+                    if let closed {
+                        Text("fechado em \(closed)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+
             HStack(spacing: 6) {
                 Text(item.id).font(.caption2).foregroundStyle(.tertiary)
                 if let s = item.source, !s.isEmpty {
                     Text(s).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
+                Spacer()
+                // `.buttonStyle(.borderless)` is NOT cosmetic (D-S06-5): the
+                // card's whole surface has `.onTapGesture(perform: onOpenDetail)`
+                // below, and a plain `Button` inside a container carrying its
+                // own tap gesture fires BOTH handlers — clicking "Começar"
+                // would also pop the detail sheet. `.disabled`/`.help` come
+                // straight from the pure layer (`ItemLaunch`), never from a
+                // status check written here.
+                Button("Começar") { onStart() }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                    .disabled(!ItemLaunch.canStart(item))
+                    .help(ItemLaunch.refusal(for: item) ?? "Abre uma sessão /forge-task para este item")
             }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onOpenDetail)
         .contextMenu {
+            Button("Começar") { onStart() }
+                .disabled(!ItemLaunch.canStart(item))
+            Button("Ver detalhe") { onOpenDetail() }
             Menu("Mover para") {
                 ForEach(otherStatuses, id: \.self) { s in
                     Button(s.label) { onMove(s) }
                 }
             }
         }
+    }
+}
+
+/// One label pill. Also used for the `+N` overflow chip, which is why it takes
+/// a plain string rather than a label.
+struct LabelChip: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(.quaternary, in: Capsule())
+    }
+}
+
+/// The whole item, read-only.
+///
+/// The card truncates on purpose (D8, LOCKED: truncated card plus a detail
+/// panel — in-place expansion was refused); this is where the operator gets
+/// the rest. Every field is shown in full here: the entire body, every label,
+/// the pt-BR words behind the status and priority marks.
+///
+/// Read-only by design. Every write still goes through `forge-items.js`
+/// (ROADMAP Note 5), and this sheet adds no write path.
+struct ItemDetailSheet: View {
+    let item: Item
+    @Binding var detail: Item?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            Text(ItemCardPresentation.displayTitle(item)).font(.headline)
+
+            HStack(spacing: 8) {
+                Text(item.id).font(.caption2).foregroundStyle(.tertiary)
+                if let s = item.source, !s.isEmpty {
+                    Text(s).font(.caption2).foregroundStyle(.secondary)
+                }
+                if let status = item.parsedStatus {
+                    Text(status.label).font(.caption2).foregroundStyle(.secondary)
+                }
+                if let p = ItemPriority.parse(item.priority) {
+                    Text(p.label).font(.caption2).foregroundStyle(.secondary)
+                }
+                if let closed = ItemCardPresentation.closedDay(item) {
+                    Text("fechado em \(closed)").font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+
+            if let labels = item.labels, !labels.isEmpty {
+                // All of them, not the first three: the cut belongs to the
+                // card, which has 220pt; this panel does not. An unbounded
+                // `HStack` inside the sheet's fixed 420pt width would just
+                // squeeze every chip down to an unreadable sliver once the
+                // operator piles on enough labels (S04 review R1) — a
+                // horizontal scroll keeps every chip at full, legible size
+                // instead of shrinking them to fit. `Layout`/`FlowLayout`
+                // wrapping would read better but needs an API level above
+                // this package's `.macOS(.v13)` floor; this is the option
+                // that is actually available on the baseline.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(labels, id: \.self) { LabelChip(text: $0) }
+                    }
+                }
+            }
+
+            ScrollView {
+                Text(item.body ?? "(sem corpo)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(item.body == nil ? .secondary : .primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 220)
+
+            HStack {
+                Spacer()
+                Button("Fechar") { detail = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 420)
     }
 }
 

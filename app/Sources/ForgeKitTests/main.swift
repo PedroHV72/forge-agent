@@ -1529,6 +1529,238 @@ test("item sem campos opcionais decodifica") {
     assertTrue(item.parsedStatus == nil)
 }
 
+test("decodifica closed_at, labels e priority da saída real pós-T03") {
+    // Copiado verbatim de `node scripts/forge-items.js --list --json`
+    // (item criado, --set-priority p1, --update labels, --set-status done).
+    let json = """
+    [{"id":"I-20260730180758-test-title","title":"Test title","status":"done",
+      "priority":"p1","labels":["bug","ui"],"origin":"human",
+      "created":"2026-07-30T18:07:58.670Z","updated":"2026-07-30T18:07:59.007Z",
+      "closed_at":"2026-07-30T18:07:59.009Z","body":""}]
+    """
+    let items = try! JSONDecoder().decode([Item].self, from: Data(json.utf8))
+    let item = items[0]
+    assertEqual(item.closed_at, "2026-07-30T18:07:59.009Z")
+    assertEqual(item.priority, "p1")
+    assertEqual(item.labels ?? [], ["bug", "ui"])
+}
+
+test("item legado sem closed_at/labels/priority decodifica com os três nil") {
+    let json = """
+    {"id":"I-20260729145851-test-title","title":"Test title","status":"inbox",
+     "origin":"human","created":"2026-07-29T14:58:51.237Z",
+     "updated":"2026-07-29T14:58:51.237Z","body":"Some body text"}
+    """
+    let item = try! JSONDecoder().decode(Item.self, from: Data(json.utf8))
+    assertTrue(item.closed_at == nil, "item legado não tem closed_at")
+    assertTrue(item.labels == nil, "item legado não tem labels — nil, não []")
+    assertTrue(item.priority == nil, "item legado não tem priority")
+}
+
+test("labels vazio no JSON decodifica como array vazio, não nil") {
+    let json = """
+    {"id":"I-20260730000000-sem-labels","title":"Sem labels","status":"inbox",
+     "labels":[]}
+    """
+    let item = try! JSONDecoder().decode(Item.self, from: Data(json.utf8))
+    assertTrue(item.labels != nil, "labels: [] deve decodificar como array vazio, não nil")
+    assertEqual(item.labels ?? ["sentinel"], [])
+}
+
+print("\nItems (card)")
+
+// O critério #4 da milestone é uma CONTAGEM: onde o card mostra 3 coisas hoje,
+// tem de mostrar 7. Estes testes são o que torna esse critério verificável sem
+// olhar para uma tela — o target `Forge` não é importável daqui, então tudo o
+// que decidisse conteúdo dentro de `ItemCard` ficaria fora de qualquer suíte.
+//
+// A ordem é asserida junto com a contagem de propósito: contar 7 não detecta
+// uma troca de ordem, e a ordem é o que faz o card ler como issue.
+
+/// Item com todos os campos que o card sabe desenhar — o "depois".
+private func fullItem(status: String = "done") -> Item {
+    Item(
+        id: "I-20260730120000-completo",
+        title: "Corrigir o parser de datas do progresso",
+        status: status,
+        source: "roadmap",
+        body: "Primeiro parágrafo.\n\nSegundo parágrafo.\n\nTerceiro parágrafo.\n\nQuarto parágrafo.\n\nQuinto parágrafo.",
+        closed_at: "2026-07-30T12:00:00.000Z",
+        labels: ["bug", "ui"],
+        priority: "p1"
+    )
+}
+
+test("item completo desenha 7 elementos, na ordem canônica") {
+    let els = ItemCardPresentation.elements(for: fullItem())
+    assertEqual(els.count, 7, "o card completo tem de ter 7 elementos — é o critério #4")
+
+    guard els.count == 7 else { return }
+    // Ordem, caso a caso: title, id, source, body, labels, priority, closedDay.
+    if case .title(let t) = els[0] { assertEqual(t, "Corrigir o parser de datas do progresso") }
+    else { assertTrue(false, "elemento 0 deveria ser .title, veio \(els[0])") }
+    if case .id(let i) = els[1] { assertEqual(i, "I-20260730120000-completo") }
+    else { assertTrue(false, "elemento 1 deveria ser .id, veio \(els[1])") }
+    if case .source(let s) = els[2] { assertEqual(s, "roadmap") }
+    else { assertTrue(false, "elemento 2 deveria ser .source, veio \(els[2])") }
+    if case .body(let text, let truncated) = els[3] {
+        assertEqual(text.split(separator: "\n").count, 3, "o corpo do card é cortado em 3 linhas")
+        assertTrue(truncated, "5 parágrafos cortados em 3 têm de sinalizar truncagem")
+    } else { assertTrue(false, "elemento 3 deveria ser .body, veio \(els[3])") }
+    if case .labels(let shown, let overflow) = els[4] {
+        assertEqual(shown, ["bug", "ui"])
+        assertEqual(overflow, 0)
+    } else { assertTrue(false, "elemento 4 deveria ser .labels, veio \(els[4])") }
+    if case .priority(let p) = els[5] { assertEqual(p, .p1) }
+    else { assertTrue(false, "elemento 5 deveria ser .priority, veio \(els[5])") }
+    if case .closedDay(let d) = els[6] { assertEqual(d, "2026-07-30") }
+    else { assertTrue(false, "elemento 6 deveria ser .closedDay, veio \(els[6])") }
+}
+
+test("item legado desenha exatamente 3 elementos — este é o 'antes' do 3 → 7") {
+    // O shape exato dos itens reais que o repo tem hoje: sem corpo, sem label,
+    // sem prioridade, sem closed_at.
+    let legacy = Item(id: "I-20260729145851-test-title", title: "Test title",
+                      status: "inbox", source: "manual")
+    let els = ItemCardPresentation.elements(for: legacy)
+    assertEqual(els.count, 3, "o card legado tem 3 elementos")
+    guard els.count == 3 else { return }
+    if case .title = els[0] {} else { assertTrue(false, "0 deveria ser .title") }
+    if case .id = els[1] {} else { assertTrue(false, "1 deveria ser .id") }
+    if case .source = els[2] {} else { assertTrue(false, "2 deveria ser .source") }
+}
+
+test("item sem source cai para 2 elementos — source só entra quando há") {
+    let els = ItemCardPresentation.elements(for: Item(id: "I-1", title: "Sem fonte", status: "inbox"))
+    assertEqual(els.count, 2)
+}
+
+test("dropped NÃO mostra data de fechamento, mesmo com closed_at gravado") {
+    let dropped = fullItem(status: "dropped")
+    assertNil(ItemCardPresentation.closedDay(dropped), "dropped nunca mostra 'fechado em' (S04-b)")
+    let els = ItemCardPresentation.elements(for: dropped)
+    assertEqual(els.count, 6, "sem a data, sobram 6 dos 7")
+    assertFalse(els.contains { if case .closedDay = $0 { return true } else { return false } },
+                "nenhum .closedDay pode aparecer num item dropped")
+}
+
+test("done sem closed_at (os itens legados do repo) não mostra data e não crasha") {
+    let done = Item(id: "I-2", title: "Feito antigo", status: "done", source: "manual")
+    assertNil(ItemCardPresentation.closedDay(done))
+    let els = ItemCardPresentation.elements(for: done)
+    assertEqual(els.count, 3)
+}
+
+test("closedDay só aceita done — os outros três status também ficam de fora") {
+    for s in ["inbox", "triaged", "doing"] {
+        assertNil(ItemCardPresentation.closedDay(fullItem(status: s)),
+                  "status \(s) não deve ter data de fechamento")
+    }
+    assertEqual(ItemCardPresentation.closedDay(fullItem(status: "done")), "2026-07-30")
+}
+
+test("closedDay aceita as três formas de data que o engine escreve") {
+    func at(_ raw: String) -> Item { Item(id: "I-3", status: "done", closed_at: raw) }
+    assertEqual(ItemCardPresentation.closedDay(at("2026-07-30T12:00:00.000Z")), "2026-07-30")
+    assertEqual(ItemCardPresentation.closedDay(at("2026-07-30T12:00:00Z")), "2026-07-30")
+    assertEqual(ItemCardPresentation.closedDay(at("2026-07-30")), "2026-07-30")
+    assertNil(ItemCardPresentation.closedDay(at("ontem")), "forma não reconhecida vira nil, não crash")
+}
+
+test("bodyPreview corta em 3 linhas e sinaliza o corte") {
+    let five = "um\ndois\ntrês\nquatro\ncinco"
+    let p = ItemCardPresentation.bodyPreview(five)
+    assertEqual(p?.text, "um\ndois\ntrês")
+    assertEqual(p?.truncated, true)
+}
+
+test("bodyPreview de 2 linhas não sinaliza corte") {
+    let p = ItemCardPresentation.bodyPreview("um\ndois")
+    assertEqual(p?.text, "um\ndois")
+    assertEqual(p?.truncated, false)
+}
+
+test("bodyPreview descarta linhas em branco antes de contar as 3") {
+    let p = ItemCardPresentation.bodyPreview("um\n\n\ndois\n\ntrês")
+    assertEqual(p?.text, "um\ndois\ntrês")
+    assertEqual(p?.truncated, false, "linha em branco não conta como conteúdo cortado")
+}
+
+test("bodyPreview devolve nil para corpo ausente, vazio ou só espaço") {
+    assertNil(ItemCardPresentation.bodyPreview(nil))
+    assertNil(ItemCardPresentation.bodyPreview(""))
+    assertNil(ItemCardPresentation.bodyPreview("   \n\n  \n"))
+}
+
+test("labelChips corta em 3 e reporta o overflow, preservando a ordem do engine") {
+    let c = ItemCardPresentation.labelChips(["zeta", "alpha", "meio", "quarto", "quinto"])
+    assertEqual(c?.shown ?? [], ["zeta", "alpha", "meio"], "ordem é a do disco, não alfabética")
+    assertEqual(c?.overflow, 2)
+}
+
+test("labelChips com 1 label não tem overflow; vazio e nil somem") {
+    assertEqual(ItemCardPresentation.labelChips(["bug"])?.overflow, 0)
+    assertEqual(ItemCardPresentation.labelChips(["bug"])?.shown ?? [], ["bug"])
+    assertNil(ItemCardPresentation.labelChips([]))
+    assertNil(ItemCardPresentation.labelChips(nil))
+    assertNil(ItemCardPresentation.labelChips(["", "   "]), "só espaço não é label")
+}
+
+test("prioridade: parse dos quatro valores, marca e rótulo pt-BR") {
+    assertEqual(ItemPriority.parse("p0"), .p0)
+    assertEqual(ItemPriority.parse("p1"), .p1)
+    assertEqual(ItemPriority.parse("p2"), .p2)
+    assertEqual(ItemPriority.parse("p3"), .p3)
+    assertEqual(ItemPriority.p0.mark, "P0")
+    assertEqual(ItemPriority.p3.mark, "P3")
+    assertEqual(ItemPriority.p0.label, "crítica")
+    assertEqual(ItemPriority.p1.label, "alta")
+    assertEqual(ItemPriority.p2.label, "média")
+    assertEqual(ItemPriority.p3.label, "baixa")
+}
+
+test("prioridade desconhecida vira nil e some do card — nada é inventado") {
+    assertNil(ItemPriority.parse("lixo"))
+    assertNil(ItemPriority.parse(nil))
+    assertNil(ItemPriority.parse("P0"), "o valor do engine é minúsculo; não normalizamos aqui")
+    let item = Item(id: "I-4", title: "t", status: "inbox", priority: "lixo")
+    let els = ItemCardPresentation.elements(for: item)
+    assertFalse(els.contains { if case .priority = $0 { return true } else { return false } },
+                "prioridade desconhecida não desenha marca nenhuma")
+}
+
+test("título vazio cai no fallback e continua sempre presente") {
+    let els = ItemCardPresentation.elements(for: Item(id: "I-5", title: "   ", status: "inbox"))
+    if case .title(let t) = els[0] { assertEqual(t, "(sem título)") }
+    else { assertTrue(false, "título sempre presente, mesmo em branco") }
+}
+
+// S04 review (R2): the card view and the detail sheet used to each write
+// their own `item.title ?? "(sem título)"`, which let a whitespace-only
+// title (present, but only spaces) through unfiltered — `elements(for:)`
+// already normalised that case, but the raw views did not. `displayTitle`
+// is the single function both views now call; these tests pin its contract
+// directly, independent of `elements(for:)`.
+test("displayTitle: título normal passa direto") {
+    let item = Item(id: "I-6", title: "Corrigir bug", status: "inbox")
+    assertEqual(ItemCardPresentation.displayTitle(item), "Corrigir bug")
+}
+
+test("displayTitle: título ausente cai no fallback") {
+    let item = Item(id: "I-7", status: "inbox")
+    assertEqual(ItemCardPresentation.displayTitle(item), "(sem título)")
+}
+
+test("displayTitle: título só de espaços cai no fallback — não é 'presente'") {
+    let item = Item(id: "I-8", title: "   ", status: "inbox")
+    assertEqual(ItemCardPresentation.displayTitle(item), "(sem título)")
+}
+
+test("displayTitle: espaços nas bordas de um título real são aparados") {
+    let item = Item(id: "I-9", title: "  com espaços  ", status: "inbox")
+    assertEqual(ItemCardPresentation.displayTitle(item), "com espaços")
+}
+
 print("\nNodeLocator (descoberta de node fora dos três caminhos fixos)")
 
 // Fake probe: the filesystem is a set of executable paths and a directory map,
@@ -2162,6 +2394,1042 @@ test("o texto do rodapé cabe no orçamento de largura de 152pt") {
     // E o detalhe, que vive num tooltip, pode e deve ser prolixo.
     assertGreater((worst.detail ?? "").count, worst.text.count,
                   "o detalhe não é mais informativo que o texto curto")
+}
+
+print("Progress — itens fechados e janela")
+
+// ProgressTests — window resolution (instant + day, DS1) and the "closed
+// items" panel source (DS8 done-only, DS9 parse trap, D5 declared coverage).
+
+func progressItem(status: String, closedAt: String?) -> Item {
+    Item(id: "x", status: status, closed_at: closedAt)
+}
+
+test("cobertura declarada: 3 done sem closed_at → closed 0 e rótulo, não só o número") {
+    let items = [
+        progressItem(status: "done", closedAt: nil),
+        progressItem(status: "done", closedAt: nil),
+        progressItem(status: "done", closedAt: nil),
+    ]
+    let r = ClosedItems.count(items: items, window: .all)
+    assertEqual(r.closed, 0, "closed deveria ser 0")
+    assertEqual(r.missingClosedAt, 3, "missingClosedAt deveria contar os 3")
+    assertTrue(r.coverageLabel != nil, "coverageLabel não pode ser nil quando há itens sem data")
+}
+
+test("dropped com closed_at na janela não conta (DS8) — done conta") {
+    let now = Date()
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let raw = iso.string(from: now)
+    let items = [
+        progressItem(status: "dropped", closedAt: raw),
+        progressItem(status: "done", closedAt: raw),
+    ]
+    let r = ClosedItems.count(items: items, window: .all, now: now)
+    assertEqual(r.closed, 1, "só o done deveria contar")
+}
+
+test("closed_at fracionado (toISOString real) parseia e conta em .all e numa janela que o contém") {
+    // Sample literal exatamente no formato que Date.toISOString() emite —
+    // ISO8601DateFormatter sem .withFractionalSeconds devolve nil para isso
+    // (DS9): esse teste existe para tornar esse nil impossível de passar
+    // despercebido.
+    let raw = "2026-07-30T18:20:00.123Z"
+    let (instant, day) = ProgressDate.parse(raw)
+    assertTrue(instant != nil, "parse fracionado não pode devolver nil (DS9)")
+    assertEqual(day, "2026-07-30", "day deveria ser os 10 primeiros chars")
+
+    let now = ISO8601DateFormatter().date(from: "2026-07-30T18:25:00Z")!
+    let items = [progressItem(status: "done", closedAt: raw)]
+    assertEqual(ClosedItems.count(items: items, window: .all, now: now).closed, 1,
+                "deveria contar em .all")
+    assertEqual(ClosedItems.count(items: items, window: .day24h, now: now).closed, 1,
+                "deveria contar numa janela que contém o instante")
+}
+
+test("closed_at data-só conta por resolução de dia, não como meia-noite UTC") {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "America/Sao_Paulo")!
+    let now = calendar.date(from: DateComponents(year: 2026, month: 7, day: 30, hour: 12))!
+    let items = [progressItem(status: "done", closedAt: "2026-07-30")]
+    let r = ClosedItems.count(items: items, window: .day24h, now: now, calendar: calendar)
+    assertEqual(r.closed, 1, "data-só de hoje deveria contar em .day24h por resolução de dia")
+}
+
+test("borda de janela: closed_at 8 dias atrás fica fora de .week, dentro de .month") {
+    let now = Date()
+    let eightDaysAgo = now.addingTimeInterval(-86_400 * 8)
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let raw = iso.string(from: eightDaysAgo)
+    let items = [progressItem(status: "done", closedAt: raw)]
+    assertEqual(ClosedItems.count(items: items, window: .week, now: now).closed, 0,
+                "8 dias atrás deveria ficar fora de .week")
+    assertEqual(ClosedItems.count(items: items, window: .month, now: now).closed, 1,
+                "8 dias atrás deveria ficar dentro de .month")
+}
+
+test("ProgressWindow.dayThreshold para .week com now fixo é exatamente hoje-6d") {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    let now = calendar.date(from: DateComponents(year: 2026, month: 7, day: 30))!
+    let expected = calendar.date(from: DateComponents(year: 2026, month: 7, day: 24))!
+    let expectedStr = ProgressDate.dayString(expected, calendar: calendar)
+    assertEqual(ProgressWindow.week.dayThreshold(now: now, calendar: calendar), expectedStr,
+                "threshold de .week deveria ser hoje-6d")
+}
+
+test("ProgressWindow.ledgerWindowLabel: 'hoje' só para .day24h (DS1)") {
+    assertEqual(ProgressWindow.day24h.ledgerWindowLabel, "hoje")
+    assertNil(ProgressWindow.week.ledgerWindowLabel)
+    assertNil(ProgressWindow.month.ledgerWindowLabel)
+    assertNil(ProgressWindow.all.ledgerWindowLabel)
+}
+
+print("Ledger — leitor mínimo e janela por dia")
+
+// LedgerTests — fence-and-root-only scanner (DS2/blocker 3) and day-window
+// resolution (DS1/blocker 1).
+
+// Literal copy of the real fragment shape at
+// `.gsd/ledger/T-20260730020639-sidebar-secao.md` (list `key_decisions:`
+// with `- ` items AND `|` block scalars with indented continuation lines) —
+// embedded because `.gsd/` is gitignored (S02-PLAN Note 2), so the suite
+// runs identically in any clone.
+let ledgerFixtureReal = """
+---
+completed_at: 2026-07-30
+id: T-20260730020639-sidebar-secao
+key_decisions:
+  - A versão exibida era a tag do repo, não a do binário rodando (Info.plist com 0.1.0 fixo, build.sh nunca reescrevia) — corrigido estampando 3 chaves no bundle entre a cópia do plist e o codesign, com plutil -replace
+  - |
+    Não agrupar as 13 seções: List sections adicionariam ~60pt de header e subiriam a contagem em repouso de 13 para 16, piorando a única métrica contável de minimalismo
+  - Nenhuma renomeação de seção — Section.rawValue é rótulo E chave do @AppStorage via SectionRestore
+  - |
+    D15 da task irmã preservada: o slot de ação Atualizar+Reinstalar é intocado
+  - |
+    R6 do review: repoDescribe ficava stale após update, então o rodapé lia 'em dia' no instante em que a divergência passava a existir
+  - O repo se auto-tagueia no merge via .github/workflows/release.yml — a discussão D35/D37 sobre quem taggeia era desnecessária
+key_files:
+  - app/build.sh
+  - app/Sources/ForgeKit/UpdateCore.swift
+  - app/Sources/Forge/Views.swift
+  - app/Sources/Forge/Updates.swift
+  - app/Sources/Forge/Previews.swift
+  - scripts/forge-app-sidebar.test.js
+  - CHANGELOG.md
+slices: []
+title: Sidebar e seção de atualizações mais minimalistas, com versão sempre visível
+---
+
+A UI de progresso entregue nas duas tasks irmãs era inalcançável e a versão exibida era do repo, não do binário.
+"""
+
+test("fixture real (lista + bloco) parseia id e completedDay corretos") {
+    let f = Ledger.parseFragment(ledgerFixtureReal)
+    assertEqual(f.id, "T-20260730020639-sidebar-secao", "id deveria vir da raiz")
+    assertEqual(f.completedDay, "2026-07-30", "completedDay deveria vir da raiz")
+}
+
+test("armadilha: completed_at indentado num bloco | e outro após a cerca não sobrescrevem a raiz") {
+    let trap = """
+    ---
+    completed_at: 2026-07-30
+    id: T-trap
+    key_decisions:
+      - |
+        Nota falsa que tenta confundir o scanner:
+        completed_at: 1999-01-01
+      - Outra linha normal
+    ---
+    Corpo com outra menção fora da cerca:
+    completed_at: 1999-01-01
+    """
+    let f = Ledger.parseFragment(trap)
+    assertEqual(f.completedDay, "2026-07-30",
+                "o scanner não pode ler o valor de dentro do bloco nem o de depois da cerca")
+    assertEqual(f.id, "T-trap", "id deveria continuar vindo da raiz")
+}
+
+test("deliveries: fragmento de hoje conta em .day24h com windowLabel 'hoje'; ontem não") {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    let now = calendar.date(from: DateComponents(year: 2026, month: 7, day: 30, hour: 12))!
+    let today = LedgerFragment(id: "a", completedDay: "2026-07-30")
+    let yesterday = LedgerFragment(id: "b", completedDay: "2026-07-29")
+
+    let day = Ledger.deliveries(fragments: [today, yesterday], window: .day24h, now: now, calendar: calendar)
+    assertEqual(day.count, 1, "só o fragmento de hoje deveria contar em .day24h")
+    assertEqual(day.windowLabel, "hoje", "windowLabel deveria ser 'hoje' para .day24h (DS1)")
+
+    let week = Ledger.deliveries(fragments: [today, yesterday], window: .week, now: now, calendar: calendar)
+    assertEqual(week.count, 2, "ambos deveriam contar em .week")
+    assertNil(week.windowLabel, "windowLabel deveria ser nil fora de .day24h")
+}
+
+test("borda de 7 dias: hoje-6d dentro de .week, hoje-7d fora") {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    let now = calendar.date(from: DateComponents(year: 2026, month: 7, day: 30))!
+    let sixDaysAgoDate = calendar.date(byAdding: .day, value: -6, to: now)!
+    let sevenDaysAgoDate = calendar.date(byAdding: .day, value: -7, to: now)!
+    let sixDaysAgo = ProgressDate.dayString(sixDaysAgoDate, calendar: calendar)
+    let sevenDaysAgo = ProgressDate.dayString(sevenDaysAgoDate, calendar: calendar)
+    let fragments = [
+        LedgerFragment(id: "in", completedDay: sixDaysAgo),
+        LedgerFragment(id: "out", completedDay: sevenDaysAgo),
+    ]
+    let r = Ledger.deliveries(fragments: fragments, window: .week, now: now, calendar: calendar)
+    assertEqual(r.count, 1, "só hoje-6d deveria estar dentro de .week (threshold inclusivo)")
+
+    let month = Ledger.deliveries(fragments: fragments, window: .month, now: now, calendar: calendar)
+    assertEqual(month.count, 2, "ambos deveriam estar dentro de .month")
+}
+
+test("fragmento sem completed_at válido nunca entra em janela; conta em undated") {
+    let noDate = LedgerFragment(id: "x", completedDay: nil)
+    let dated = LedgerFragment(id: "y", completedDay: "2026-07-30")
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    let now = calendar.date(from: DateComponents(year: 2026, month: 7, day: 30))!
+
+    let all = Ledger.deliveries(fragments: [noDate, dated], window: .all, now: now, calendar: calendar)
+    assertEqual(all.count, 1, "undated não deveria entrar no count mesmo em .all")
+    assertEqual(all.undated, 1, "undated deveria reportar o fragmento sem data")
+
+    let day = Ledger.deliveries(fragments: [noDate, dated], window: .day24h, now: now, calendar: calendar)
+    assertEqual(day.undated, 1, "undated deveria ser reportado em qualquer janela")
+}
+
+test("Ledger.read(dir:) ordena por nome e devolve [] para diretório ausente") {
+    assertEqual(Ledger.read(dir: "/tmp/forge-ledger-test-nonexistent-\(UUID().uuidString)"), [],
+                "diretório ausente não é erro")
+
+    let tmp = NSTemporaryDirectory() + "forge-ledger-read-\(UUID().uuidString)"
+    try! FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let bFrag = """
+    ---
+    completed_at: 2026-07-29
+    id: b-frag
+    ---
+    """
+    let aFrag = """
+    ---
+    completed_at: 2026-07-30
+    id: a-frag
+    ---
+    """
+    try! bFrag.write(toFile: tmp + "/b-frag.md", atomically: true, encoding: .utf8)
+    try! aFrag.write(toFile: tmp + "/a-frag.md", atomically: true, encoding: .utf8)
+    try! "not a fragment, ignored by extension".write(toFile: tmp + "/notes.txt", atomically: true, encoding: .utf8)
+
+    let read = Ledger.read(dir: tmp)
+    assertEqual(read.count, 2, "só os .md deveriam ser lidos")
+    assertEqual(read.map { $0.id }, ["a-frag", "b-frag"], "ordem deveria ser por nome de arquivo")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+print("GitActivity — dedupe, globs e janela")
+
+/// Run git with a HERMETIC environment. The point is that this fixture builds
+/// the same repo on any machine: `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` at
+/// /dev/null so no `~/.gitconfig` leaks in (a global `commit.gpgsign = true` or
+/// a `init.defaultBranch` would otherwise decide whether the test passes), and
+/// identity plus dates passed explicitly so commits are reproducible.
+@discardableResult
+func fixtureGit(_ args: [String], at path: String, date: String = "2026-07-30T12:00:00Z") -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    p.arguments = ["-C", path,
+                   "-c", "user.name=Forge Fixture",
+                   "-c", "user.email=fixture@forge.test",
+                   "-c", "commit.gpgsign=false"] + args
+    var env = ProcessInfo.processInfo.environment
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+    env["GIT_AUTHOR_DATE"] = date
+    env["GIT_COMMITTER_DATE"] = date
+    p.environment = env
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = Pipe()
+    try! p.run()
+    let d = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: d, encoding: .utf8) ?? ""
+}
+
+func fixtureWrite(_ text: String, to path: String) {
+    try! FileManager.default.createDirectory(
+        atPath: (path as NSString).deletingLastPathComponent,
+        withIntermediateDirectories: true)
+    try! text.write(toFile: path, atomically: true, encoding: .utf8)
+}
+
+test("parseLog lê header + numstat, com binário e rename, na forma exata") {
+    // O `-` de binário NÃO é falha de parse: um arquivo cujas linhas não se
+    // contam continua pertencendo ao commit, e recusar a linha derrubaria o
+    // resto dele. O rename é normalizado para o lado NOVO antes de qualquer
+    // glob — senão mover um arquivo para dentro de dist/ continua contando.
+    let log = """
+    a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 1753900000
+
+    12\t3\tsrc/a.swift
+    -\t-\tassets/logo.png
+    4\t0\ta/{b => c}/d.js
+
+    00112233445566778899aabbccddeeff00112233 1753800000
+
+    1\t1\tREADME.md
+    """
+    let commits = GitActivity.parseLog(log)
+    assertEqual(commits.count, 2, "dois headers deveriam virar dois commits")
+
+    assertEqual(commits[0].sha, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0")
+    assertEqual(commits[0].epoch, 1753900000, "epoch vem do %ct")
+    assertEqual(commits[0].files.count, 3, "as três linhas numstat deveriam sobreviver")
+    assertEqual(commits[0].files[0], FileStat(added: 12, deleted: 3, path: "src/a.swift"))
+    assertEqual(commits[0].files[1], FileStat(added: 0, deleted: 0, path: "assets/logo.png"),
+                "binário conta 0 linhas em vez de quebrar o commit")
+    assertEqual(commits[0].files[2], FileStat(added: 4, deleted: 0, path: "a/c/d.js"),
+                "rename com chaves deveria normalizar para o caminho NOVO")
+
+    assertEqual(commits[1].sha, "00112233445566778899aabbccddeeff00112233")
+    assertEqual(commits[1].files.count, 1)
+}
+
+test("parseLog normaliza as três formas de rename e pula linha torta") {
+    // Molde do MetricsEngine.parse: a saída vem de subprocesso e a última linha
+    // pode vir truncada — uma linha ilegível não pode custar a janela inteira.
+    let log = """
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1753900000
+
+    1\t0\tvelho.js => novo.js
+    2\t0\t{old => new}.js
+    3\t0\tsrc/{ => nested}/x.js
+    isto não é numstat nem header
+    \t\t
+    4\t0\tsem/rename.js
+    """
+    let commits = GitActivity.parseLog(log)
+    assertEqual(commits.count, 1)
+    assertEqual(commits[0].files.map { $0.path },
+                ["novo.js", "new.js", "src/nested/x.js", "sem/rename.js"],
+                "as três formas de rename normalizam para o lado novo; linha torta é pulada")
+}
+
+test("parseLog tolera commit de merge (header sem numstat)") {
+    let log = """
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1753900000
+
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 1753800000
+
+    5\t5\tx.swift
+    """
+    let commits = GitActivity.parseLog(log)
+    assertEqual(commits.count, 2, "merge sem numstat continua sendo um commit")
+    assertEqual(commits[0].files.count, 0)
+    assertEqual(commits[1].files.count, 1)
+}
+
+test("union deduplica por SHA mantendo a primeira aparição e a ordem") {
+    let a = Commit(sha: "aaa1111", epoch: 3, files: [FileStat(added: 1, deleted: 0, path: "a")])
+    let b = Commit(sha: "bbb2222", epoch: 2, files: [])
+    let c = Commit(sha: "ccc3333", epoch: 1, files: [])
+    let merged = GitActivity.union([[a, b], [b, c]])
+    assertEqual(merged.map { $0.sha }, ["aaa1111", "bbb2222", "ccc3333"],
+                "SHA repetido entre checkouts deveria entrar uma vez só")
+}
+
+test("critério #10: união entre 2 checkouts reais é 3, e a soma ingênua é 5") {
+    // Blocker 2 do RISK, e a razão de este teste existir: `git worktree list`
+    // NESTE repo devolve UM checkout, então um `union` que só concatena passaria
+    // em qualquer teste escrito contra o repo real — a inflação seria de 1x e
+    // portanto invisível. O fixture constrói dois checkouts que compartilham
+    // história de verdade, e o teste afirma DUAS coisas: que a união bate com o
+    // `sort -u` dos SHAs, e que a concatenação é ESTRITAMENTE MAIOR. Sem a
+    // segunda afirmação o teste não distingue um dedupe funcionando de um no-op.
+    let tmp = NSTemporaryDirectory() + "forge-gitactivity-\(UUID().uuidString)"
+    let main = tmp + "/main"
+    let side = tmp + "/side"
+    try! FileManager.default.createDirectory(atPath: main, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    fixtureGit(["init", "-b", "main"], at: main)
+    fixtureWrite("um\n", to: main + "/src/a.swift")
+    fixtureGit(["add", "src/a.swift"], at: main)
+    fixtureGit(["commit", "-m", "c1"], at: main, date: "2026-07-28T10:00:00Z")
+    fixtureWrite("dois\n", to: main + "/src/b.swift")
+    fixtureGit(["add", "src/b.swift"], at: main)
+    fixtureGit(["commit", "-m", "c2"], at: main, date: "2026-07-29T10:00:00Z")
+
+    // O segundo checkout parte da MESMA história: é o cenário real do
+    // forge_isolation.mode = worktree, onde os commits da milestone vivem fora
+    // da pasta que o operador adicionou (DS6).
+    fixtureGit(["worktree", "add", side, "-b", "side"], at: main)
+    fixtureWrite("três\n", to: side + "/src/c.swift")
+    fixtureGit(["add", "src/c.swift"], at: side)
+    fixtureGit(["commit", "-m", "c3"], at: side, date: "2026-07-30T10:00:00Z")
+
+    let checkouts = [Checkout(path: main, branch: "main", isPrimary: true),
+                     Checkout(path: side, branch: "side", isPrimary: false)]
+    let perCheckout = GitActivity.collect(checkouts: checkouts)
+    assertEqual(perCheckout.count, 2, "deveria haver um log por checkout")
+
+    let concatenated = perCheckout.flatMap { $0 }
+    let united = GitActivity.union(perCheckout)
+
+    // `sort -u` calculado in-test: a verdade independente contra a qual a
+    // implementação é conferida.
+    let uniqueShas = Set(concatenated.map { $0.sha })
+    assertEqual(uniqueShas.count, 3, "os dois checkouts deveriam somar 3 commits distintos")
+    assertEqual(united.count, uniqueShas.count, "a união deveria bater com o sort -u dos SHAs")
+    assertEqual(Set(united.map { $0.sha }), uniqueShas, "a união deveria ter exatamente esses SHAs")
+
+    assertEqual(concatenated.count, 5,
+                "main tem 2 commits e side tem 3 (2 compartilhados + 1) — a concatenação é 5")
+    assertGreater(concatenated.count, united.count,
+                  "a concatenação TEM de ser maior que a união: se fossem iguais, este teste "
+                  + "não distinguiria um dedupe de um no-op")
+}
+
+test("linhas contam sobre a UNIÃO, não por checkout (o dobro seria silencioso)") {
+    // O mesmo commit alcançável por dois checkouts contaria duas vezes se as
+    // linhas fossem somadas por checkout e depois agregadas.
+    let shared = Commit(sha: "aaa1111", epoch: 1,
+                        files: [FileStat(added: 10, deleted: 4, path: "src/a.swift")])
+    let perCheckout = [[shared], [shared]]
+    let naive = perCheckout.map { GitActivity.linesTouched($0, ignoring: []) }
+        .reduce(into: (added: 0, deleted: 0)) { $0.added += $1.added; $0.deleted += $1.deleted }
+    let correct = GitActivity.linesTouched(GitActivity.union(perCheckout), ignoring: [])
+    assertEqual(correct.added, 10, "a união conta o commit compartilhado uma vez")
+    assertEqual(correct.deleted, 4)
+    assertEqual(naive.added, 20, "somar por checkout dobraria — é a armadilha que a união evita")
+}
+
+test("linesTouched soma só o que está fora dos ignore-globs") {
+    let c = Commit(sha: "aaa1111", epoch: 1, files: [
+        FileStat(added: 10, deleted: 2, path: "dist/x.js"),
+        FileStat(added: 3, deleted: 1, path: "src/a.js"),
+    ])
+    let r = GitActivity.linesTouched([c], ignoring: GitActivity.defaultIgnoreList)
+    assertEqual(r.added, 3, "dist/x.js está sob dist/** e não deveria contar")
+    assertEqual(r.deleted, 1)
+
+    let unfiltered = GitActivity.linesTouched([c], ignoring: [])
+    assertEqual(unfiltered.added, 13, "sem globs, tudo conta — o filtro é a diferença")
+}
+
+test("Glob fala exatamente o vocabulário da lista default") {
+    assertTrue(GitActivity.Glob.matches(".gsd/**", ".gsd/forge/events.jsonl"),
+               "sufixo /** casa o prefixo de diretório em qualquer profundidade")
+    assertFalse(GitActivity.Glob.matches("dist/**", "mydist/a.js"),
+                "dist/** é um diretório, não um prefixo de nome — mydist/ não é dist/")
+    assertTrue(GitActivity.Glob.matches("dist/**", "dist/a/b.js"))
+    assertTrue(GitActivity.Glob.matches("package-lock.json", "app/nested/package-lock.json"),
+               "padrão sem / casa o basename em qualquer diretório")
+    assertTrue(GitActivity.Glob.matches("package-lock.json", "package-lock.json"))
+    assertFalse(GitActivity.Glob.matches("package-lock.json", "package-lock.json.bak"))
+    assertTrue(GitActivity.Glob.matches("*.lock", "a/b/Cargo.lock"), "* casa dentro do segmento")
+    assertFalse(GitActivity.Glob.matches("src/*.js", "src/deep/a.js"),
+                "* nunca atravessa a barra")
+    assertTrue(GitActivity.Glob.matches("src/*.js", "src/a.js"))
+}
+
+test("resolveIgnoreList: caller manda; ausente ou vazio cai no default do engine") {
+    assertEqual(GitActivity.resolveIgnoreList(prefValue: nil), GitActivity.defaultIgnoreList,
+                "sem prefs resolvidas, vale o default do engine (DS5)")
+    assertEqual(GitActivity.resolveIgnoreList(prefValue: []), GitActivity.defaultIgnoreList,
+                "lista vazia da cascata significa 'chave não definida', como no completer")
+    assertEqual(GitActivity.resolveIgnoreList(prefValue: ["só-isto"]), ["só-isto"],
+                "valor resolvido pelo caller ganha")
+    assertEqual(GitActivity.defaultIgnoreList.count, 7,
+                "os 7 defaults do engine — divergir de agents/forge-completer.md é o que "
+                + "scripts/forge-app-progress.test.js existe para pegar")
+}
+
+test("a janela filtra pelo epoch parseado, não pelo comando") {
+    // DS7: o comando é constante e o `--since` não existe, para que parse e
+    // janela sejam puros — e para que 24h aqui signifique o mesmo que nas
+    // outras duas fontes.
+    let old = Commit(sha: "old1111", epoch: 1_700_000_000, files: [])
+    let recent = Commit(sha: "new2222", epoch: 1_753_900_000, files: [])
+    let since = Date(timeIntervalSince1970: 1_750_000_000)
+    let kept = GitActivity.inWindow([old, recent], since: since)
+    assertEqual(kept.map { $0.sha }, ["new2222"], "só o commit dentro da janela sobrevive")
+    assertEqual(GitActivity.inWindow([old, recent], since: nil).count, 2,
+                "sem janela, nada é filtrado")
+}
+
+print("Divergence + ProgressSummary")
+
+test("Divergence: os 4 padrões canônicos produzem exatamente 1 frase cada, todas distintas") {
+    let p1 = Divergence.sentence(closed: 0, deliveries: 0, commits: 5)
+    let p2 = Divergence.sentence(closed: 3, deliveries: 0, commits: 4)
+    let p3 = Divergence.sentence(closed: 0, deliveries: 2, commits: 6)
+    let p4 = Divergence.sentence(closed: 1, deliveries: 2, commits: 0)
+    assertTrue(p1 != nil, "P1 (commits>0, entregas==0, fechados==0) tem de emitir")
+    assertTrue(p2 != nil, "P2 (fechados>0, entregas==0) tem de emitir")
+    assertTrue(p3 != nil, "P3 (entregas>0, fechados==0) tem de emitir")
+    assertTrue(p4 != nil, "P4 (entregas>0, commits==0) tem de emitir")
+    let sentences = Set([p1, p2, p3, p4].compactMap { $0 })
+    assertEqual(sentences.count, 4, "as 4 frases têm de ser distintas entre si")
+}
+
+test("Divergence: os três > 0 (proporcional) — SILÊNCIO, o caso que uma implementação sempre-emite falha") {
+    let sentence = Divergence.sentence(closed: 7, deliveries: 3, commits: 22)
+    assertTrue(sentence == nil,
+               "todos > 0 é o caso proporcional — uma frase aqui é o bug que o critério #9 existe para pegar")
+}
+
+test("Divergence: janela vazia (0,0,0) não é divergência — silêncio também") {
+    assertTrue(Divergence.sentence(closed: 0, deliveries: 0, commits: 0) == nil,
+               "nada aconteceu, nada para relatar")
+}
+
+test("Divergence: overlap entre P3 e P4 resolve por precedência — exatamente 1 frase, nunca 2") {
+    // fechados=0, entregas=2, commits=0: casa tanto P3 (entregas>0 ∧ fechados==0)
+    // quanto P4 (entregas>0 ∧ commits==0). A tabela manda P3 vencer.
+    let sentence = Divergence.sentence(closed: 0, deliveries: 2, commits: 0)
+    assertEqual(sentence, "entrega sem higiene de board", "P3 vence por precedência sobre P4")
+}
+
+test("ProgressSummary não expõe nenhum campo composto — só os 3 contadores + divergence") {
+    let summary = ProgressSummary(window: .day24h,
+                                   closedItems: ClosedItemsCount(closed: 1, missingClosedAt: 0),
+                                   ledger: LedgerCount(count: 1, undated: 0, windowLabel: "hoje"),
+                                   gitCommits: 1, gitAdded: 1, gitDeleted: 1, divergence: nil)
+    // Regressão do critério #7 em texto: nenhuma destas palavras aparece no
+    // arquivo fonte (checado via shell no T04-SUMMARY / lint command), este
+    // assert cobre só que os campos individuais continuam acessíveis
+    // separadamente (não hipoteticamente combinados aqui).
+    assertEqual(summary.closedItems.closed, 1)
+    assertEqual(summary.ledger.count, 1)
+    assertEqual(summary.gitCommits, 1)
+}
+
+test("ProgressEngine.summarise: fixture end-to-end — cobertura declarada, rótulo 'hoje', dedupe de commits") {
+    let calendar = Calendar(identifier: .gregorian)
+    let now = ISO8601DateFormatter().date(from: "2026-07-30T12:00:00Z")!
+
+    // 3 `done` legados sem closed_at (S01 backfill ainda não rodou neles) — a
+    // contagem de fechados tem de ser 0, COM rótulo de cobertura, nunca um 0
+    // silencioso.
+    let items = (1...3).map { Item(id: "T\($0)", status: "done") }
+
+    // 1 fragmento de hoje.
+    let ledgerFragments = [
+        LedgerFragment(id: "M001", completedDay: ProgressDate.dayString(now, calendar: calendar)),
+    ]
+
+    // Logs de 2 checkouts com um SHA compartilhado — o dedupe tem de contar 1.
+    let shared = Commit(sha: "abc1234", epoch: Int(now.timeIntervalSince1970) - 60,
+                        files: [FileStat(added: 5, deleted: 2, path: "src/a.swift")])
+    let gitLogs = [[shared], [shared]]
+
+    let summary = ProgressEngine.summarise(items: items, ledgerFragments: ledgerFragments,
+                                            gitLogs: gitLogs, window: .day24h, now: now,
+                                            calendar: calendar)
+
+    assertEqual(summary.closedItems.closed, 0, "nenhum dos 3 tem closed_at — 0 é o número honesto")
+    assertTrue(summary.closedItems.coverageLabel != nil,
+               "critério #8: o rótulo tem de existir — o teste é sobre o RÓTULO, não o número bruto")
+    assertEqual(summary.ledger.count, 1, "1 entrega hoje")
+    assertEqual(summary.ledger.windowLabel, "hoje", "janela 24h rotula 'hoje' na fonte ledger (DS1)")
+    assertEqual(summary.gitCommits, 1, "commit compartilhado entre 2 checkouts conta 1 vez (dedupe)")
+    assertEqual(summary.gitAdded, 5)
+    assertEqual(summary.gitDeleted, 2)
+    // fechados==0, entregas==1>0 → P3 é o padrão coerente com este fixture.
+    assertEqual(summary.divergence, "entrega sem higiene de board",
+                "divergence tem de refletir as contagens reais do summary, não um valor solto")
+}
+
+// MARK: - ItemLabelFilter (S05)
+
+test("ItemLabelFilter.apply: query nil devolve a lista inteira, nunca vazia") {
+    let items = [Item(id: "1", labels: ["a"]), Item(id: "2", labels: nil)]
+    let result = ItemLabelFilter.apply(items, query: nil)
+    assertEqual(result.count, 2, "query nil não é filtro — devolve tudo")
+    assertEqual(result.map { $0.id }, ["1", "2"], "ordem de entrada preservada")
+}
+
+test("ItemLabelFilter.apply: query vazia (\"\") devolve a lista inteira") {
+    let items = [Item(id: "1", labels: ["a"]), Item(id: "2", labels: [])]
+    let result = ItemLabelFilter.apply(items, query: "")
+    assertEqual(result.count, 2)
+}
+
+test("ItemLabelFilter.apply: query só-espaço (\"   \") devolve a lista inteira") {
+    let items = [Item(id: "1", labels: ["a"]), Item(id: "2", labels: nil)]
+    let result = ItemLabelFilter.apply(items, query: "   ")
+    assertEqual(result.count, 2, "espaço puro é ausência de filtro, não uma consulta vazia")
+}
+
+test("ItemLabelFilter.apply: prefixo — \"ui\" não casa item cujo único label é \"ui-bug\"") {
+    let itemUI = Item(id: "1", labels: ["ui"])
+    let itemUIBug = Item(id: "2", labels: ["ui-bug"])
+    let result = ItemLabelFilter.apply([itemUI, itemUIBug], query: "ui")
+    assertEqual(result.count, 1, "casamento exato de elemento — nunca substring")
+    assertEqual(result.first?.id, "1", "só o item com o label exato \"ui\" sobrevive")
+}
+
+test("ItemLabelFilter.apply: case — \"Bug\" devolve 0 itens quando o único label é \"bug\"") {
+    let items = [Item(id: "1", labels: ["bug"])]
+    let result = ItemLabelFilter.apply(items, query: "Bug")
+    assertEqual(result.count, 0, "sensível a maiúsculas, igual ao jq index()")
+}
+
+test("ItemLabelFilter.apply: item sem labels (nil) nunca casa") {
+    let items = [Item(id: "1", labels: nil)]
+    let result = ItemLabelFilter.apply(items, query: "bug")
+    assertEqual(result.count, 0)
+}
+
+test("ItemLabelFilter.apply: item com labels: [] nunca casa") {
+    let items = [Item(id: "1", labels: [])]
+    let result = ItemLabelFilter.apply(items, query: "bug")
+    assertEqual(result.count, 0)
+}
+
+test("ItemLabelFilter.apply: labels com espaço no disco casam trimados, vazio descartado") {
+    let items = [Item(id: "1", labels: [" bug ", ""])]
+    let result = ItemLabelFilter.apply(items, query: "bug")
+    assertEqual(result.count, 1, "\" bug \" trimado casa \"bug\"; \"\" nunca conta como label")
+}
+
+test("ItemLabelFilter.apply: item com status desconhecido casa normalmente (D-S05-2)") {
+    let items = [Item(id: "1", status: "zzz", labels: ["bug"])]
+    let result = ItemLabelFilter.apply(items, query: "bug")
+    assertEqual(result.count, 1, "o filtro é sobre label, não sobre status — a coluna Desconhecido também filtra")
+}
+
+test("ItemLabelFilter.matches: item sem labels retorna false") {
+    assertFalse(ItemLabelFilter.matches(Item(id: "1", labels: nil), label: "bug"))
+}
+
+test("ItemLabelFilter.matches: casamento exato sensível a maiúsculas") {
+    assertTrue(ItemLabelFilter.matches(Item(id: "1", labels: ["bug"]), label: "bug"))
+    assertFalse(ItemLabelFilter.matches(Item(id: "1", labels: ["bug"]), label: "Bug"))
+    assertFalse(ItemLabelFilter.matches(Item(id: "1", labels: ["ui-bug"]), label: "ui"))
+}
+
+test("ItemLabelFilter.normalise: nil, vazio e só-espaço devolvem nil") {
+    assertNil(ItemLabelFilter.normalise(nil))
+    assertNil(ItemLabelFilter.normalise(""))
+    assertNil(ItemLabelFilter.normalise("   "))
+    assertNil(ItemLabelFilter.normalise("\n\t "))
+}
+
+test("ItemLabelFilter.normalise: trima whitespace/newlines em torno de uma consulta real") {
+    assertEqual(ItemLabelFilter.normalise("  bug\n"), "bug")
+}
+
+test("ItemLabelFilter.availableLabels: únicos, ordenados, sem vazios, sobre lista com repetição") {
+    let items = [
+        Item(id: "1", labels: ["bug", "ui"]),
+        Item(id: "2", labels: ["ui", ""]),
+        Item(id: "3", labels: nil),
+        Item(id: "4", labels: [" bug "]),
+    ]
+    let result = ItemLabelFilter.availableLabels(items)
+    assertEqual(result, ["bug", "ui"], "únicos, trimados, ordenados — sem duplicata entre \"bug\" e \" bug \"")
+}
+
+test("ItemLabelFilter.availableLabels: lista vazia de itens devolve lista vazia") {
+    assertEqual(ItemLabelFilter.availableLabels([]), [])
+}
+
+// MARK: - Paridade do filtro por label (S05/T04)
+//
+// O criterio #5 exige que a contagem na tela seja IGUAL a contagem da CLI —
+// divergencia de 1 card e falha. Provar isso comparando o filtro Swift contra
+// uma reimplementacao em Swift seria tautologia (D-S05-6). Entao a prova mora
+// num fixture unico, `app/fixtures/label-filter-parity.json`, lido por DOIS
+// lados independentes:
+//
+//   - este arquivo assere ItemLabelFilter.apply(items, query: L).count ==
+//     expected[L] para TODA chave de expected;
+//   - scripts/forge-app-label-filter.test.js RECALCULA expected a partir dos
+//     mesmos items com a expressao equivalente ao `jq index()` e ainda ancora
+//     a forma de `labels` rodando o engine de verdade sobre um store temporario.
+//
+// Consequencia deliberada: afrouxar um valor de `expected` para fazer o lado
+// Swift passar quebra o lado JS. Nao existe atalho verde aqui.
+//
+// O fixture vive em app/fixtures/, FORA de qualquer `path:` de target no
+// Package.swift — um .json dentro de Sources/ForgeKitTests/ viraria recurso
+// nao declarado.
+
+struct LabelParityFixture: Decodable {
+    let items: [Item]
+    let expected: [String: Int]
+}
+
+/// Resolve o fixture por `#filePath` (main.swift -> ForgeKitTests -> Sources ->
+/// app), com fallback para o cwd. Devolve `nil` se nenhum dos dois existir — e
+/// o chamador FALHA nesse caso: um fixture nao encontrado nunca pode virar
+/// teste que passa silenciosamente.
+func labelParityFixtureURL() -> URL? {
+    let fromSource = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()   // ForgeKitTests/
+        .deletingLastPathComponent()   // Sources/
+        .deletingLastPathComponent()   // app/
+        .appendingPathComponent("fixtures/label-filter-parity.json")
+    if FileManager.default.fileExists(atPath: fromSource.path) { return fromSource }
+
+    let fromCwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("fixtures/label-filter-parity.json")
+    if FileManager.default.fileExists(atPath: fromCwd.path) { return fromCwd }
+
+    return nil
+}
+
+test("Paridade: o fixture de paridade existe e decodifica em [Item] + expected") {
+    guard let url = labelParityFixtureURL() else {
+        assertTrue(false, "fixture label-filter-parity.json nao encontrado nem por #filePath nem pelo cwd — " +
+                          "um fixture ausente NAO pode virar teste verde")
+        return
+    }
+    let data = try Data(contentsOf: url)
+    let fixture = try JSONDecoder().decode(LabelParityFixture.self, from: data)
+    assertGreater(fixture.items.count, 0, "fixture.items nao pode ser vazio")
+    assertGreater(fixture.expected.count, 0, "fixture.expected nao pode ser vazio")
+}
+
+test("Paridade: ItemLabelFilter.apply reproduz expected para TODO label do fixture") {
+    guard let url = labelParityFixtureURL() else {
+        assertTrue(false, "fixture label-filter-parity.json nao encontrado — nao ha o que verificar, isto e falha")
+        return
+    }
+    let fixture = try JSONDecoder().decode(LabelParityFixture.self, from: try Data(contentsOf: url))
+    for (label, count) in fixture.expected.sorted(by: { $0.key < $1.key }) {
+        assertEqual(ItemLabelFilter.apply(fixture.items, query: label).count, count,
+                    "paridade quebrada para o label \"\(label)\" — a contagem do filtro diverge do expected do fixture")
+    }
+}
+
+test("Paridade: consulta vazia e nil devolvem a lista inteira do fixture (D-S05-4)") {
+    guard let url = labelParityFixtureURL() else {
+        assertTrue(false, "fixture label-filter-parity.json nao encontrado — isto e falha")
+        return
+    }
+    let fixture = try JSONDecoder().decode(LabelParityFixture.self, from: try Data(contentsOf: url))
+    assertEqual(ItemLabelFilter.apply(fixture.items, query: "").count, fixture.items.count,
+                "consulta vazia nao e filtro — tem de devolver tudo")
+    assertEqual(ItemLabelFilter.apply(fixture.items, query: nil).count, fixture.items.count,
+                "consulta nil nao e filtro — tem de devolver tudo")
+    assertEqual(ItemLabelFilter.apply(fixture.items, query: "   ").count, fixture.items.count,
+                "consulta so-espaco nao e filtro — tem de devolver tudo")
+}
+
+test("Paridade: o item de status desconhecido do fixture tambem e filtrado (D-S05-2)") {
+    guard let url = labelParityFixtureURL() else {
+        assertTrue(false, "fixture label-filter-parity.json nao encontrado — isto e falha")
+        return
+    }
+    let fixture = try JSONDecoder().decode(LabelParityFixture.self, from: try Data(contentsOf: url))
+    let unknown = fixture.items.filter { $0.parsedStatus == nil }
+    assertGreater(unknown.count, 0, "o fixture precisa de ao menos um item com status que o Swift nao reconhece")
+    // Esse item carrega label; filtrar por ela tem de alcanca-lo — se o filtro
+    // fosse aplicado por coluna, o item da coluna "Desconhecido" escaparia.
+    for item in unknown {
+        guard let label = item.labels?.first else {
+            assertTrue(false, "o item de status desconhecido precisa carregar label, senao nao prova nada")
+            continue
+        }
+        assertTrue(ItemLabelFilter.apply(fixture.items, query: label).contains(item),
+                   "o item de status desconhecido \"\(item.id)\" sumiu ao filtrar por \"\(label)\"")
+    }
+}
+
+test("Paridade: o par prefixo do fixture discrimina exato de substring (D-S05-1)") {
+    guard let url = labelParityFixtureURL() else {
+        assertTrue(false, "fixture label-filter-parity.json nao encontrado — isto e falha")
+        return
+    }
+    let fixture = try JSONDecoder().decode(LabelParityFixture.self, from: try Data(contentsOf: url))
+    let all = ItemLabelFilter.availableLabels(fixture.items)
+
+    // Achar o par (curto, longo) em que o curto e prefixo estrito do longo —
+    // e ele que mata casamento por substring. Sem esse par, o fixture nao
+    // detecta a regressao que existe para detectar.
+    var pair: (String, String)? = nil
+    for short in all {
+        for long in all where long != short && long.hasPrefix(short) { pair = (short, long) }
+    }
+    guard let (short, long) = pair else {
+        assertTrue(false, "o fixture nao tem par prefixo (ex.: \"ui\" / \"ui-bug\") — substring passaria despercebido")
+        return
+    }
+
+    // Um casamento por substring devolveria os itens de AMBOS os labels para a
+    // consulta curta; o casamento exato devolve so os do curto.
+    let exact = ItemLabelFilter.apply(fixture.items, query: short)
+    let substringLike = fixture.items.filter { ($0.labels ?? []).contains { $0.contains(short) } }
+    assertGreater(substringLike.count, exact.count,
+                  "o par \"\(short)\"/\"\(long)\" nao distingue exato de substring neste fixture")
+    assertTrue(exact.allSatisfy { ($0.labels ?? []).contains(short) },
+               "apply(query: \"\(short)\") trouxe item que nao tem exatamente esse label")
+    assertFalse(exact.contains { ($0.labels ?? []).contains(long) && !($0.labels ?? []).contains(short) },
+                "apply(query: \"\(short)\") vazou um item que so tem \"\(long)\" — isso e 1 card a mais que o jq")
+}
+
+// MARK: - ItemLaunch (S06)
+
+print("\nItemLaunch (o board origina trabalho — e só pelo botão)")
+
+test("ItemLaunch.decide: os 5 movimentos consecutivos produzem ZERO LaunchRequest (D9/F7)") {
+    let a = Item(id: "I-20260801120001", status: "inbox")
+    let b = Item(id: "I-20260801120002", status: "triaged")
+    let c = Item(id: "I-20260801120003", status: "doing")
+    let d = Item(id: "I-20260801120004", status: "done")
+    let e = Item(id: "I-20260801120005", status: "dropped")
+    let gestures: [BoardGesture] = [
+        .move(a, to: .doing),
+        .move(b, to: .triaged),
+        .move(c, to: .done),
+        .move(d, to: .dropped),
+        .move(e, to: .inbox),
+    ]
+    let requests = gestures.compactMap(ItemLaunch.decide)
+    assertEqual(requests.count, 0, "contra-critério D9/F7: 5 movimentos → 0 abas — este teste é a prova headless dele")
+}
+
+test("ItemLaunch.decide: .move de item com status desconhecido devolve nil") {
+    let item = Item(id: "I-20260801120006", status: "zzz")
+    assertNil(ItemLaunch.decide(.move(item, to: .doing)))
+}
+
+test("ItemLaunch.decide: .openDetail devolve nil para qualquer item") {
+    let open = Item(id: "I-20260801120007", status: "inbox")
+    let done = Item(id: "I-20260801120008", status: "done")
+    let unknown = Item(id: "I-20260801120009", status: "zzz")
+    assertNil(ItemLaunch.decide(.openDetail(open)))
+    assertNil(ItemLaunch.decide(.openDetail(done)))
+    assertNil(ItemLaunch.decide(.openDetail(unknown)))
+}
+
+test("ItemLaunch.decide: .start de item triaged bem-formado devolve request com taskArgument e slashCommand corretos") {
+    let item = Item(id: "I-20260801120010", status: "triaged")
+    guard let request = ItemLaunch.decide(.start(item)) else {
+        assertTrue(false, "item aberto e bem-formado deveria produzir um LaunchRequest")
+        return
+    }
+    assertEqual(request.taskArgument, item.id, "taskArgument tem de ser exatamente o id puro (D-S06-4)")
+    assertEqual(request.slashCommand, "/forge-task \(item.id)")
+}
+
+test("ItemLaunch.decide: .start de item inbox e de item doing também devolvem request (os três abertos)") {
+    let inboxItem = Item(id: "I-20260801120011", status: "inbox")
+    let doingItem = Item(id: "I-20260801120012", status: "doing")
+    assertTrue(ItemLaunch.decide(.start(inboxItem)) != nil, "inbox é status aberto — deve poder começar")
+    assertTrue(ItemLaunch.decide(.start(doingItem)) != nil, "doing é status aberto — deve poder começar")
+}
+
+test("ItemLaunch.decide: .start de item done devolve nil e refusal cita --set-status e o id") {
+    let item = Item(id: "I-20260801120013", status: "done")
+    assertNil(ItemLaunch.decide(.start(item)))
+    guard let msg = ItemLaunch.refusal(for: item) else {
+        assertTrue(false, "item done precisa de uma frase de recusa")
+        return
+    }
+    assertTrue(msg.contains("--set-status"), "a frase de recusa tem de citar --set-status")
+    assertTrue(msg.contains(item.id), "a frase de recusa tem de citar o id do item")
+}
+
+test("ItemLaunch.decide: .start de item dropped devolve nil") {
+    let item = Item(id: "I-20260801120014", status: "dropped")
+    assertNil(ItemLaunch.decide(.start(item)))
+}
+
+test("ItemLaunch.decide: .start de item de status desconhecido devolve nil") {
+    let item = Item(id: "I-20260801120015", status: "zzz")
+    assertNil(ItemLaunch.decide(.start(item)))
+}
+
+test("ItemLaunch.decide: .start de id fora da shape devolve nil em todos os casos") {
+    let malformed = [
+        "itm-20260801120000-x",
+        "I-",
+        "I-2026 08",
+        "I-20260801120000-x extra",
+    ]
+    for id in malformed {
+        let item = Item(id: id, status: "inbox")
+        assertNil(ItemLaunch.decide(.start(item)), "id malformado \"\(id)\" não pode originar trabalho")
+    }
+}
+
+test("ItemLaunch.isWellFormedItemID: aceita prefixo curto e timestamp completo com slug") {
+    assertTrue(ItemLaunch.isWellFormedItemID("I-20260729235447-aceitacao-gui"))
+    assertTrue(ItemLaunch.isWellFormedItemID("I-2026072912"))
+}
+
+test("ItemLaunch.isWellFormedItemID: recusa os quatro exemplos malformados") {
+    assertFalse(ItemLaunch.isWellFormedItemID("itm-20260801120000-x"))
+    assertFalse(ItemLaunch.isWellFormedItemID("I-"))
+    assertFalse(ItemLaunch.isWellFormedItemID("I-2026 08"))
+    assertFalse(ItemLaunch.isWellFormedItemID("I-20260801120000-x extra"))
+}
+
+test("ItemLaunch.refusal: nil para item que pode começar") {
+    let item = Item(id: "I-20260801120016", status: "triaged")
+    assertNil(ItemLaunch.refusal(for: item))
+}
+
+// MARK: - Paridade de gestos do board (S06/T04)
+//
+// O contra-criterio D9/F7 (LOCKED) exige que 5 movimentos consecutivos pelo
+// menu "Mover para" produzam ZERO abas. Provar isso comparando ItemLaunch
+// contra uma reimplementacao em Swift seria tautologia (mesmo raciocinio de
+// D-S05-6). A prova mora num fixture unico,
+// `app/fixtures/board-gesture-launches.json`, lido por DOIS lados
+// independentes:
+//
+//   - este arquivo aplica ItemLaunch.decide a cada gesto NA ORDEM e assere
+//     que a lista resultante de slashCommand bate com expected_launches,
+//     item a item;
+//   - scripts/forge-app-launch-parity.test.js RECALCULA expected_launches a
+//     partir de items+gestures com uma regra propria (sem ler este arquivo)
+//     e ainda ancora a forma do id no engine real (`forge-items.js --add`
+//     sobre um store temporario).
+//
+// Consequencia deliberada: afrouxar um valor de expected_launches para
+// fazer este lado passar quebra o lado JS. Nao existe atalho verde aqui.
+//
+// O fixture vive em app/fixtures/, FORA de qualquer `path:` de target no
+// Package.swift — um .json dentro de Sources/ForgeKitTests/ viraria recurso
+// nao declarado.
+
+struct GestureFixtureItem: Decodable {
+    let id: String
+    let title: String?
+    let status: String?
+    let origin: String?
+    let created: String?
+    let updated: String?
+    let closed_at: String?
+}
+
+struct Gesture: Decodable {
+    let kind: String
+    let item: String
+    let to: String?
+}
+
+struct GestureFixture: Decodable {
+    let items: [GestureFixtureItem]
+    let gestures: [Gesture]
+    let expected_launches: [String]
+}
+
+/// Resolve o fixture por `#filePath` (main.swift -> ForgeKitTests -> Sources ->
+/// app), com fallback para o cwd. Devolve `nil` se nenhum dos dois existir — e
+/// o chamador FALHA nesse caso: um fixture nao encontrado nunca pode virar
+/// teste que passa silenciosamente. Nome novo (nao reusa
+/// `labelParityFixtureURL`, S05/T04) mesmo compartilhando a forma.
+func gestureLaunchFixtureURL() -> URL? {
+    let fromSource = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()   // ForgeKitTests/
+        .deletingLastPathComponent()   // Sources/
+        .deletingLastPathComponent()   // app/
+        .appendingPathComponent("fixtures/board-gesture-launches.json")
+    if FileManager.default.fileExists(atPath: fromSource.path) { return fromSource }
+
+    let fromCwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("fixtures/board-gesture-launches.json")
+    if FileManager.default.fileExists(atPath: fromCwd.path) { return fromCwd }
+
+    return nil
+}
+
+/// Decodifica o fixture e devolve um `[String: Item]` (por id) + a lista de
+/// `Gesture` + `expected_launches`. Falha (via `fatalError`) se o fixture nao
+/// existir — chamado apenas dentro de `test(...)`, cujo harness ja escreve a
+/// mensagem de falha antes de qualquer chamada aqui; um `fatalError` neste
+/// ponto so aconteceria se o teste que verifica a existencia do fixture ja
+/// tivesse sido pulado, o que este arquivo nunca faz.
+func loadGestureFixture() throws -> (items: [String: Item], gestures: [Gesture], expectedLaunches: [String]) {
+    guard let url = gestureLaunchFixtureURL() else {
+        throw NSError(domain: "GestureFixture", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "fixture board-gesture-launches.json nao encontrado nem por #filePath nem pelo cwd"
+        ])
+    }
+    let data = try Data(contentsOf: url)
+    let fixture = try JSONDecoder().decode(GestureFixture.self, from: data)
+    var byId: [String: Item] = [:]
+    for raw in fixture.items {
+        byId[raw.id] = Item(
+            id: raw.id, title: raw.title, status: raw.status, origin: raw.origin,
+            created: raw.created, updated: raw.updated, closed_at: raw.closed_at
+        )
+    }
+    return (byId, fixture.gestures, fixture.expected_launches)
+}
+
+/// Constroi o `BoardGesture` correspondente a uma entrada do fixture. Falha
+/// (via `fatalError`) se `kind` for desconhecido ou se `item` nao existir em
+/// `items` — um gesto que silenciosamente vira no-op mataria a prova.
+func boardGesture(for g: Gesture, items: [String: Item]) -> BoardGesture {
+    guard let item = items[g.item] else {
+        fatalError("gesto referencia item \"\(g.item)\" que nao existe no fixture")
+    }
+    switch g.kind {
+    case "move":
+        guard let toRaw = g.to, let to = ItemStatus(rawValue: toRaw) else {
+            fatalError("gesto move para \"\(g.to ?? "nil")\" nao e um ItemStatus valido")
+        }
+        return .move(item, to: to)
+    case "start":
+        return .start(item)
+    case "openDetail":
+        return .openDetail(item)
+    default:
+        fatalError("gesto de kind desconhecido: \"\(g.kind)\"")
+    }
+}
+
+test("Paridade de gestos: o fixture existe e decodifica em items + gestures + expected_launches") {
+    guard gestureLaunchFixtureURL() != nil else {
+        assertTrue(false, "fixture board-gesture-launches.json nao encontrado nem por #filePath nem pelo cwd — " +
+                          "um fixture ausente NAO pode virar teste verde")
+        return
+    }
+    let (items, gestures, expectedLaunches) = try loadGestureFixture()
+    assertGreater(items.count, 0, "fixture.items nao pode ser vazio")
+    assertGreater(gestures.count, 0, "fixture.gestures nao pode ser vazio")
+    assertEqual(expectedLaunches.count, 1, "expected_launches do fixture tem de ter exatamente 1 entrada")
+}
+
+test("Paridade de gestos: ItemLaunch.decide aplicado NA ORDEM reproduz expected_launches item a item (D9/F7)") {
+    guard gestureLaunchFixtureURL() != nil else {
+        assertTrue(false, "fixture board-gesture-launches.json nao encontrado — isto e falha")
+        return
+    }
+    let (items, gestures, expectedLaunches) = try loadGestureFixture()
+    let boardGestures = gestures.map { boardGesture(for: $0, items: items) }
+    let launches = boardGestures.compactMap(ItemLaunch.decide).map(\.slashCommand)
+    assertEqual(launches, expectedLaunches,
+                "paridade quebrada: a lista de launches produzida por ItemLaunch.decide diverge de expected_launches do fixture")
+}
+
+test("Paridade de gestos: o contra-criterio D9/F7 em voz alta — o prefixo dos 5 primeiros gestos produz ZERO launches") {
+    guard gestureLaunchFixtureURL() != nil else {
+        assertTrue(false, "fixture board-gesture-launches.json nao encontrado — isto e falha")
+        return
+    }
+    let (items, gestures, _) = try loadGestureFixture()
+    assertGreater(gestures.count, 4, "fixture precisa de pelo menos 5 gestos para exercitar o contra-criterio")
+    let firstFive = Array(gestures.prefix(5))
+    assertTrue(firstFive.allSatisfy { $0.kind == "move" },
+               "os 5 primeiros gestos do fixture precisam ser todos \"move\" — o contra-criterio literal")
+    let boardGestures = firstFive.map { boardGesture(for: $0, items: items) }
+    let launches = boardGestures.compactMap(ItemLaunch.decide)
+    assertEqual(launches.count, 0,
+                "contra-criterio D9/F7: 5 movimentos consecutivos pelo menu \"Mover para\" tem de produzir ZERO LaunchRequest, produziu \(launches.count)")
 }
 
 print("\n" + String(repeating: "─", count: 60))

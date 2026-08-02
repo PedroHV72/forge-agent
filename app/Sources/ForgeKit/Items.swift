@@ -12,6 +12,14 @@ import Foundation
 ///
 /// Every field besides `id` is optional: the engine omits empty keys rather
 /// than emitting `null`, so a strict decode would fail on real output.
+///
+/// `closed_at`, `labels` and `priority` are engine-owned (S01): Swift only
+/// labels what the engine already decided (see the file-top comment). `labels`
+/// arrives as `[String]?` ONLY at the `--list --json` boundary — on disk it is
+/// a comma-separated scalar (`scripts/forge-items.js`, `labelsToArray`); this
+/// type never decodes the on-disk scalar shape. `priority` stays a raw
+/// `String?` — ordering/labelling it is the UI's job, validating it is the
+/// engine's.
 public struct Item: Codable, Identifiable, Hashable {
     public let id: String
     public let title: String?
@@ -19,17 +27,21 @@ public struct Item: Codable, Identifiable, Hashable {
     public let origin: String?
     public let created: String?
     public let updated: String?
+    public let closed_at: String?
     public let source: String?
     public let file: String?
     public let sha: String?
     public let milestone: String?
     public let promoted_to: String?
     public let body: String?
+    public let labels: [String]?
+    public let priority: String?
 
     public init(id: String, title: String? = nil, status: String? = nil,
                 origin: String? = nil, created: String? = nil, updated: String? = nil,
                 source: String? = nil, file: String? = nil, sha: String? = nil,
-                milestone: String? = nil, promoted_to: String? = nil, body: String? = nil) {
+                milestone: String? = nil, promoted_to: String? = nil, body: String? = nil,
+                closed_at: String? = nil, labels: [String]? = nil, priority: String? = nil) {
         self.id = id
         self.title = title
         self.status = status
@@ -42,6 +54,9 @@ public struct Item: Codable, Identifiable, Hashable {
         self.milestone = milestone
         self.promoted_to = promoted_to
         self.body = body
+        self.closed_at = closed_at
+        self.labels = labels
+        self.priority = priority
     }
 
     /// The typed status, or `nil` when the engine's `status` string does not

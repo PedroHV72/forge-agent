@@ -337,6 +337,136 @@ struct SidebarVersionLabelPreviews: PreviewProvider {
 /// (`min:`) and 240pt (`max:`) are the two the operator can actually get by
 /// dragging. 420pt of height fits all thirteen rows plus the footer, so the
 /// question is never confused with a scrolling artefact.
+// MARK: - Item card
+
+/// A fully populated item — every field the card knows how to draw.
+///
+/// Five paragraphs and five labels are not padding: they are the two cuts the
+/// card makes (three body lines, three chips plus `+2`), and a fixture that
+/// fits would hide both.
+private let previewFullItem = Item(
+    id: "I-20260730120000-completo",
+    title: "Corrigir o parser de datas do progresso",
+    status: "done",
+    source: "roadmap",
+    body: """
+    O contador de fechados zerava em silêncio.
+    A causa é `.withFractionalSeconds` ausente no formatter.
+    Sem ele, `ISO8601DateFormatter` devolve nil para o que o engine escreve.
+    Corrigido em ProgressDate.parse, com as três formas cobertas.
+    Falta decidir se o backfill de S01 vira migração explícita.
+    """,
+    closed_at: "2026-07-30T12:00:00.000Z",
+    labels: ["bug", "ui", "progresso", "parser", "d8"],
+    priority: "p1"
+)
+
+/// The exact shape of the three items this repo actually holds today: title,
+/// id, source, and nothing else.
+private let previewLegacyItem = Item(
+    id: "I-20260729145851-test-title",
+    title: "Test title",
+    status: "inbox",
+    source: "manual"
+)
+
+/// The card, at the width it really gets.
+///
+/// 220pt is `ItemsView.columnView`'s `.frame(width:)` — the only width this
+/// card is ever drawn at. Previewing it comfortably would answer a question
+/// nobody has: the open one is whether seven elements fit in a backlog column
+/// without turning into noise.
+///
+/// The third state is the one worth staring at: an item that was DROPPED with
+/// a `closed_at` on disk. No closing date may appear on it (S04-b). If one
+/// does, the rule leaked out of `ItemCardPresentation` and back into the view.
+struct ItemCardPreviews: PreviewProvider {
+    static var previews: some View {
+        Group {
+            ItemCard(item: previewFullItem,
+                     otherStatuses: ItemStatus.allCases,
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                .frame(width: 220)
+                .padding(16)
+                .previewDisplayName("Card — completo (7 elementos, a 220pt)")
+
+            ItemCard(item: previewLegacyItem,
+                     otherStatuses: ItemStatus.allCases,
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                .frame(width: 220)
+                .padding(16)
+                .previewDisplayName("Card — legado (3 elementos, o 'antes')")
+
+            ItemCard(item: Item(id: previewFullItem.id,
+                                title: previewFullItem.title,
+                                status: "dropped",
+                                source: previewFullItem.source,
+                                body: previewFullItem.body,
+                                closed_at: previewFullItem.closed_at,
+                                labels: previewFullItem.labels,
+                                priority: previewFullItem.priority),
+                     otherStatuses: ItemStatus.allCases,
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                .frame(width: 220)
+                .padding(16)
+                .previewDisplayName("Card — dropped com closed_at (data NÃO aparece)")
+
+            // The new state for T02: `status: "done"` makes `ItemLaunch.canStart`
+            // return false, so "Começar" renders disabled with the readback
+            // refusal sentence in its tooltip — no separate rule staged here,
+            // the card just reflects what `ItemLaunch` decided.
+            ItemCard(item: Item(id: previewFullItem.id,
+                                title: previewFullItem.title,
+                                status: "done",
+                                source: previewFullItem.source,
+                                body: previewFullItem.body,
+                                closed_at: previewFullItem.closed_at,
+                                labels: previewFullItem.labels,
+                                priority: previewFullItem.priority),
+                     otherStatuses: ItemStatus.allCases,
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                .frame(width: 220)
+                .padding(16)
+                .previewDisplayName("Card — done (botão Começar desabilitado)")
+
+            ItemDetailSheet(item: previewFullItem, detail: .constant(previewFullItem))
+                .previewDisplayName("Detalhe — o corpo inteiro, não o truncado")
+        }
+    }
+}
+
+/// The three states of `LabelFilterField` (S05/T02): empty (full board),
+/// a query that matches, and a query that matches nothing (`0 cards`) —
+/// `.constant(...)` for the binding since these are read-only stagings, no
+/// interaction is exercised.
+///
+/// The counts here are staged fixtures, not derived from `ItemLabelFilter` —
+/// the rule itself is proven headless in `ItemFilterTests` (S05/T01); this
+/// preview only stages what the field looks like once a count arrives.
+struct LabelFilterPreviews: PreviewProvider {
+    static var previews: some View {
+        Group {
+            LabelFilterField(query: .constant(""),
+                              labels: ["bug", "ui", "progresso", "parser", "d8"],
+                              visibleCount: 12)
+                .padding(16)
+                .previewDisplayName("Filtro — vazio (board inteiro)")
+
+            LabelFilterField(query: .constant("bug"),
+                              labels: ["bug", "ui", "progresso", "parser", "d8"],
+                              visibleCount: 3)
+                .padding(16)
+                .previewDisplayName("Filtro — consulta que acha (contagem reduzida)")
+
+            LabelFilterField(query: .constant("nao-existe"),
+                              labels: ["bug", "ui", "progresso", "parser", "d8"],
+                              visibleCount: 0)
+                .padding(16)
+                .previewDisplayName("Filtro — consulta que nao acha nada (0 cards)")
+        }
+    }
+}
+
 struct SidebarPreviews: PreviewProvider {
     static var previews: some View {
         Group {
@@ -349,6 +479,101 @@ struct SidebarPreviews: PreviewProvider {
                 .previewSidebarList
                 .frame(width: 240, height: 420)
                 .previewDisplayName("Sidebar — completa a 240pt")
+        }
+    }
+}
+
+// MARK: - Progress panel (T04)
+
+/// Fixtures for `ProgressPanel` (T02) — four states built as `ProgressSummary`
+/// values in memory. No disk, no git, no shell: `ProgressWindow`,
+/// `ClosedItemsCount`, `LedgerCount` and `ProgressSummary` are plain value
+/// types with public memberwise-shaped inits, so a panel state is just a
+/// literal here, exactly like `previewFullItem`/`previewLegacyItem` above are
+/// for `ItemCard`.
+///
+/// The `divergence` strings below are never invented: each one is a literal
+/// return value of `Divergence.sentence(closed:deliveries:commits:)`
+/// (`Progress.swift:199-217`) for the counts the fixture claims, copied by
+/// hand from that switch. A preview whose sentence the engine could not
+/// actually produce would be showing a state the product cannot reach.
+
+/// State 1 — the sources disagree. `closed == 0`, `deliveries > 0`,
+/// `commits > 0`: matches P3 (`deliveries > 0, closed == 0`), so
+/// `Divergence.sentence` returns `"entrega sem higiene de board"`. The
+/// sentence is visible in this state (D3): the panel must render the
+/// `Label` under the three stats.
+private let previewProgressDivergent = ProgressSummary(
+    window: .week,
+    closedItems: ClosedItemsCount(closed: 0, missingClosedAt: 0),
+    ledger: LedgerCount(count: 4, undated: 0, windowLabel: nil),
+    gitCommits: 6,
+    gitAdded: 214,
+    gitDeleted: 38,
+    divergence: "entrega sem higiene de board")
+
+/// State 2 — proportional: all three counts are `> 0`, which is the "all
+/// non-zero" branch `Divergence.sentence` falls through with `nil` (no `if`
+/// in P1–P4 matches when `closed > 0 && deliveries > 0 && commits > 0`).
+/// **No sentence on screen is the property being staged here** (D9/critério
+/// #9) — the panel must show three stats and nothing under them, not a
+/// "tudo em ordem" fallback that doesn't exist in the model.
+private let previewProgressAligned = ProgressSummary(
+    window: .day24h,
+    closedItems: ClosedItemsCount(closed: 5, missingClosedAt: 0),
+    ledger: LedgerCount(count: 5, undated: 0, windowLabel: "hoje"),
+    gitCommits: 5,
+    gitAdded: 180,
+    gitDeleted: 42,
+    divergence: nil)
+
+/// State 3 — a coverage gap: three `done` items with no `closed_at` at all
+/// (pre-S01 legacy, per `ClosedItemsCount.coverageLabel`), surfaced as
+/// `"3 sem data de fechamento"` under the "itens fechados" stat rather than
+/// folded silently into `closed` (D5/critério #8 — the gap the operator
+/// almost never sees by accident). Counts are proportional on purpose here
+/// (`closed`/`deliveries`/`commits` all `> 0`), so `divergence` is `nil` and
+/// the coverage label is the only secondary text in this state — nothing
+/// competes with it for attention.
+private let previewProgressCoverageGap = ProgressSummary(
+    window: .week,
+    closedItems: ClosedItemsCount(closed: 7, missingClosedAt: 3),
+    ledger: LedgerCount(count: 6, undated: 1, windowLabel: nil),
+    gitCommits: 9,
+    gitAdded: 340,
+    gitDeleted: 95,
+    divergence: nil)
+
+/// The four `ProgressPanel` states, side by side.
+///
+/// The fourth — "sem projeto" — needs no `ProgressSummary` fixture at all:
+/// `hasProject: false` is the state where `summary` is never even read by
+/// the view (`MetricsView.swift:137-139`), so the panel renders only the
+/// instruction line and zero numbers, no matter what `summary` is set to.
+/// It is passed `nil` here to make that independence visible in the fixture
+/// itself, not just asserted in prose.
+struct ProgressPanelPreviews: PreviewProvider {
+    static var previews: some View {
+        Group {
+            ProgressPanel(summary: previewProgressDivergent, hasProject: true)
+                .frame(width: 520)
+                .padding(16)
+                .previewDisplayName("Progresso — as fontes discordam (frase visível)")
+
+            ProgressPanel(summary: previewProgressAligned, hasProject: true)
+                .frame(width: 520)
+                .padding(16)
+                .previewDisplayName("Progresso — proporcional (SEM frase, silêncio é a propriedade)")
+
+            ProgressPanel(summary: previewProgressCoverageGap, hasProject: true)
+                .frame(width: 520)
+                .padding(16)
+                .previewDisplayName("Progresso — 3 itens sem data de fechamento (cobertura declarada)")
+
+            ProgressPanel(summary: nil, hasProject: false)
+                .frame(width: 520)
+                .padding(16)
+                .previewDisplayName("Progresso — nenhum projeto escolhido")
         }
     }
 }

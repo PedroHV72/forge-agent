@@ -1,0 +1,77 @@
+{
+  "_why": "Paridade tela<->CLI do criterio #5 (S05/T04). Este arquivo e lido por DOIS lados independentes: app/Sources/ForgeKitTests/main.swift assere que ItemLabelFilter.apply(items, query: L).count == expected[L]; scripts/forge-app-label-filter.test.js RECALCULA expected a partir de items com a expressao equivalente ao jq index() e ainda ancora a forma de labels no engine real (scripts/forge-items.js) sobre um store temporario. Comparar Swift com Swift seria tautologia (D-S05-6) — afrouxar um valor de expected para o Swift passar tem de quebrar o lado JS.",
+  "_shape": "items esta na forma exata de `forge-items.js --list --json` (labels como ARRAY; o disco guarda escalar — D6). Um item SEM labels omite a chave, que e como o engine omite (nunca null).",
+  "_deliberate": [
+    "par prefixo ui / ui-bug: mata casamento por substring (D-S05-1) — 'ui' conta 1, nao 2",
+    "Bug: 0 fixa a sensibilidade a maiusculas como EXPECTATIVA, nao como acidente",
+    "item sem a chave labels: prova que ausencia nunca casa",
+    "item status done com closed_at: entra na contagem como qualquer outro",
+    "item com status desconhecido (zzz): prova que a coluna Desconhecido tambem e filtrada (D-S05-2)",
+    "ui-bug repetido em dois itens: algum expected vale 2, nao so 0 ou 1"
+  ],
+  "items": [
+    {
+      "id": "itm-20260801120000-ajustar-espacamento",
+      "title": "Ajustar espacamento do board",
+      "status": "triaged",
+      "origin": "human",
+      "created": "2026-08-01T12:00:00.000Z",
+      "updated": "2026-08-01T12:00:00.000Z",
+      "labels": ["ui"]
+    },
+    {
+      "id": "itm-20260801120100-card-corta-titulo",
+      "title": "Card corta o titulo em telas estreitas",
+      "status": "doing",
+      "origin": "human",
+      "created": "2026-08-01T12:01:00.000Z",
+      "updated": "2026-08-01T12:01:00.000Z",
+      "labels": ["ui-bug", "bug"]
+    },
+    {
+      "id": "itm-20260801120200-filtro-perde-acento",
+      "title": "Filtro perde acento na consulta",
+      "status": "inbox",
+      "origin": "human",
+      "created": "2026-08-01T12:02:00.000Z",
+      "updated": "2026-08-01T12:02:00.000Z",
+      "labels": ["bug"]
+    },
+    {
+      "id": "itm-20260801120300-item-sem-labels",
+      "title": "Item sem labels nenhum",
+      "status": "inbox",
+      "origin": "human",
+      "created": "2026-08-01T12:03:00.000Z",
+      "updated": "2026-08-01T12:03:00.000Z"
+    },
+    {
+      "id": "itm-20260801120400-migrar-runner",
+      "title": "Migrar runner de testes",
+      "status": "done",
+      "origin": "human",
+      "created": "2026-08-01T12:04:00.000Z",
+      "updated": "2026-08-01T12:04:30.000Z",
+      "closed_at": "2026-08-01T12:04:30.000Z",
+      "labels": ["infra"]
+    },
+    {
+      "id": "itm-20260801120500-status-desconhecido",
+      "title": "Item com status que o Swift nao reconhece",
+      "status": "zzz",
+      "origin": "human",
+      "created": "2026-08-01T12:05:00.000Z",
+      "updated": "2026-08-01T12:05:00.000Z",
+      "labels": ["ui-bug"]
+    }
+  ],
+  "expected": {
+    "ui": 1,
+    "ui-bug": 2,
+    "bug": 2,
+    "infra": 1,
+    "Bug": 0,
+    "UI": 0,
+    "naoexiste": 0
+  }
+}
