@@ -206,6 +206,30 @@ check('o Divider é emitido dentro do único ForEach(Section.allCases)', () => {
 
 // ------------------------------------------------------- D31: allCases intacto
 
+check('a sidebar renderiza Section.title, nunca o rawValue (rotulo != chave)', () => {
+  const src = read(viewsSwift);
+  const lines = stripLineComments(src).split('\n');
+  const list = lines.slice(lines.findIndex((l) => l.includes('private var sidebarList')));
+  const end = list.findIndex((l, i) => i > 0 && /^    \}/.test(l));
+  const body = list.slice(0, end === -1 ? 60 : end).join('\n');
+  assert(!/Text\(s\.rawValue\)/.test(body),
+    'a sidebar voltou a exibir s.rawValue. rawValue e a CHAVE de persistencia '
+    + '(Stores.swift grava section?.rawValue em UserDefaults("lastSection") e valida o restore '
+    + 'contra Section.allCases.map(\\.rawValue)); exibir por ele faz qualquer renome de rotulo '
+    + 'derrubar a secao restaurada de todo usuario (MEM004). Use Section.title.');
+  assert(/Text\(s\.title\)/.test(body),
+    'a sidebar nao exibe Section.title — o rotulo deixou de ter fonte propria');
+});
+
+check('Section.title cobre todos os casos e items le "Tarefas"', () => {
+  const src = stripLineComments(read(viewsSwift));
+  assert(/var title: String/.test(src), 'Section.title sumiu — rotulo e chave voltaram a ser a mesma coisa');
+  assert(/case \.items: return "Tarefas"/.test(src),
+    'Section.items deveria exibir "Tarefas" enquanto persiste como "Itens"');
+  assert(/case items = "Itens"/.test(src),
+    'o rawValue de items mudou — isso invalida o lastSection gravado, que e justamente o que title evita');
+});
+
 check('Section continua com 13 casos e nenhum rawValue mudou (D31)', () => {
   // R1: contar `case \w+ = "` só prova a CONTAGEM — um rename mantém 13 casos e
   // passaria mesmo assim, degradando silenciosamente toda seleção salva em
@@ -302,7 +326,7 @@ check('existe preview da sidebar completa a 180pt', () => {
 
 // -------------------------------------------- D25/D26: o rodapé mostra a versão
 
-check('o rodapé monta o SidebarVersionLabel numa linha própria (D26)', () => {
+check('o rodapé monta o SidebarVersionLabel, e nada disputa a linha com ele (D26)', () => {
   const views = stripLineComments(read(viewsSwift));
   const footer = bodyOf(views, 'private var sidebarFooter');
   assert(
@@ -310,26 +334,22 @@ check('o rodapé monta o SidebarVersionLabel numa linha própria (D26)', () => {
     'o rodapé não monta mais o SidebarVersionLabel — a versão em execução voltou a '
       + 'não ser visível de nenhuma tela (D25/D26)'
   );
+  // Este check EXIGIA "Adicionar projeto" no rodapé: a D26 acrescentou a versão
+  // ao lado do que ja estava la, e o guard travou aquele arranjo. O operador
+  // removeu o botao — a acao existe no menu do app, na toolbar de Projetos e no
+  // estado vazio de Projetos, entao nada se perdeu. A PROPRIEDADE que a D26
+  // protegia nunca foi "o botao existe": era a largura. A 180pt sobram 152pt
+  // uteis, e qualquer controle de ~100pt dividindo a linha faz o texto da versao
+  // truncar — e a elipse come justamente o segundo numero (R9). Com o rodape so
+  // para a versao, a propriedade fica MAIS forte, nao menos.
   assert(
-    footer.includes('Adicionar projeto'),
-    'o botão "Adicionar projeto" saiu do rodapé: a versão foi ACRESCENTADA numa '
-      + 'segunda linha, não trocada pelo que já estava lá'
-  );
-  // A linha própria é a decisão de largura, não estética: a 180pt sobram 152pt
-  // úteis e "Adicionar projeto" já toma ~100pt. Se os dois voltarem para o mesmo
-  // HStack, o texto da versão trunca — e a elipse come justamente o segundo
-  // número (R9).
-  const atButton = footer.indexOf('Adicionar projeto');
-  const atLabel = footer.indexOf('SidebarVersionLabel(');
-  assert(
-    atButton < atLabel,
-    'o SidebarVersionLabel aparece antes do "Adicionar projeto": a versão é a '
-      + 'segunda linha do rodapé'
+    !/Label\("Adicionar projeto"/.test(footer),
+    'um botão "Adicionar projeto" voltou ao rodapé — a 180pt ele divide a linha com a '
+      + 'versão e a elipse come o segundo número (R9). A ação vive no menu do app e na seção Projetos'
   );
   assert(
-    /VStack\(alignment:\s*\.leading/.test(footer),
-    'o rodapé não empilha mais em VStack(alignment: .leading) — sem isso as duas '
-      + 'linhas voltam a competir pela mesma largura'
+    !/\bLabel\(|\bTextField\(|\bPicker\(/.test(footer.replace(/SidebarVersionLabel\([^)]*\)/g, '')),
+    'outro controle apareceu no rodapé disputando largura com a versão'
   );
 });
 
@@ -368,6 +388,27 @@ check('o rótulo quebra em duas linhas em vez de truncar a 180pt', () => {
     'apareceu `lineLimit(1)` no rótulo de versão: a 180pt o pior caso tem de '
       + 'QUEBRAR, e a elipse esconde justamente o segundo número (R9)'
   );
+});
+
+check('modo desenvolvedor: badge por #if DEBUG, sem roubar o sinal de update', () => {
+  const views = read(viewsSwift);
+  const label = bodyOf(stripLineComments(views), 'struct SidebarVersionLabel');
+  assert(/#if DEBUG/.test(label),
+    'o badge "dev" não é gateado por #if DEBUG — sem o flag de compilação a única alternativa '
+    + 'seria uma heurística sobre o describe, que responde outra pergunta: "tem commits além da tag" '
+    + 'é VERDADE para um release cortado no meio do ciclo e FALSO para um debug de tag limpa');
+  assert(/"dev"/.test(label), 'o badge "dev" sumiu do rótulo de versão');
+  // O badge nao pode virar um segundo sinal de update: laranja e o ponto sao da
+  // REGRA VISUAL 1 ("precisa de voce"), e rodar um build de dev e um fato sobre
+  // o binario, nao um chamado para acao. Um dev build COM update pendente tem de
+  // mostrar os dois — badge e ponto — sem que um se disfarce do outro.
+  const devBlock = label.slice(label.indexOf('#if DEBUG'), label.indexOf('#endif'));
+  assert(!/accentOrange/.test(devBlock),
+    'o badge "dev" usa accentOrange — laranja é reservado a "precisa de você" (REGRA VISUAL 1), '
+    + 'e um build de desenvolvimento não é um chamado para ação');
+  assert(!/circle\.fill/.test(devBlock),
+    'o badge "dev" usa o ponto — o ponto é o sinal de update (D26/D27), e dois sinais com a '
+    + 'mesma forma deixam de distinguir estado de chamado');
 });
 
 check('o único sinal de update no rodapé é laranja com ponto (D26/D27)', () => {

@@ -102,10 +102,10 @@ check('fixture has items, gestures and expected_launches, well-formed', () => {
   assert(Array.isArray(gestures) && gestures.length > 0, 'fixture.gestures must be a non-empty array');
   assert(Array.isArray(expectedLaunches), 'fixture.expected_launches must be an array');
   for (const g of gestures) {
-    assert(['move', 'start', 'openDetail'].includes(g.kind), `unknown gesture kind "${g.kind}"`);
+    assert(['move', 'drag', 'start', 'openDetail'].includes(g.kind), `unknown gesture kind "${g.kind}"`);
     assert(itemById(g.item), `gesture references unknown item "${g.item}"`);
-    if (g.kind === 'move') {
-      assert(typeof g.to === 'string' && g.to.length > 0, 'move gesture must carry a "to" status');
+    if (g.kind === 'move' || g.kind === 'drag') {
+      assert(typeof g.to === 'string' && g.to.length > 0, `${g.kind} gesture must carry a "to" status`);
     }
   }
 });
@@ -133,6 +133,17 @@ check('fixture carries the deliberate cases the slice requires', () => {
 
   const startMalformed = gestures.find(g => g.kind === 'start' && !ID_SHAPE.test(itemById(g.item).id));
   assert(startMalformed, 'fixture has no "start" of an item whose id does not match the readback shape — the silent-failure case (D-S06-4)');
+
+  // Arrastar entrou quando o piso subiu para macOS 26. E o MESMO ato que o menu
+  // "Mover para" — organizar — entao o contra-criterio D9/F7 vale para ele. Se
+  // o gesto existe no app e nao esta aqui, o fixture deixou de cobrir metade do
+  // caminho de mover.
+  const drags = gestures.filter((g) => g.kind === 'drag');
+  assert(drags.length >= 5,
+    `fixture tem ${drags.length} gesto(s) "drag" — o contra-criterio precisa de pelo menos 5, `
+    + 'igual ao do menu, senao arrastar vira o caminho nao auditado');
+  assert(recomputeLaunches(drags).length === 0,
+    'arrastar produziu launch — arrastar e organizar, nunca originar trabalho (D9/F7)');
 
   assert(expectedLaunches.length === 1, 'expected_launches must have EXACTLY 1 entry — otherwise "zero everywhere" could pass by accident');
 });

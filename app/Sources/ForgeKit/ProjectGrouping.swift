@@ -84,3 +84,31 @@ public enum ProjectOrganiser {
         path.hasPrefix(home) ? "~" + String(path.dropFirst(home.count)) : path
     }
 }
+
+/// Type-to-search over the registered project paths.
+public enum ProjectFilter {
+    /// Paths whose display name **or** full path contains `query`, case- and
+    /// diacritic-insensitively, preserving the input order.
+    ///
+    /// Both fields on purpose: the operator sees the short name in the picker
+    /// but often remembers where a project lives (`~/work/…`), and a filter
+    /// that only matched the visible label would fail exactly the person who
+    /// typed the thing they were looking at in Finder.
+    ///
+    /// An empty or whitespace-only query returns everything rather than
+    /// nothing — an empty search box means "no filter", never "no results".
+    public static func matches(_ paths: [String], query: String) -> [String] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return paths }
+        return paths.filter { path in
+            fold(ProjectOrganiser.name(path)).contains(fold(q)) || fold(path).contains(fold(q))
+        }
+    }
+
+    /// Case- and diacritic-insensitive comparison key. `Métricas` has to match
+    /// `metricas`: this UI is in Portuguese and nobody types the accents into a
+    /// search box.
+    private static func fold(_ s: String) -> String {
+        s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
+}

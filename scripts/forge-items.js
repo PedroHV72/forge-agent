@@ -72,7 +72,7 @@ const ORIGINS = Object.freeze(['human', 'auto']);
 // position. That is a property, not a hope — section 8 of forge-items.test.js
 // round-trips real pre-closed_at fragments byte-for-byte and would fail here.
 const KEY_ORDER = Object.freeze([
-  'id', 'title', 'status', 'priority', 'labels', 'origin', 'created', 'updated', 'closed_at',
+  'id', 'title', 'status', 'priority', 'labels', 'blocked_by', 'origin', 'created', 'updated', 'closed_at',
   'source', 'file', 'sha', 'milestone', 'promoted_to',
 ]);
 
@@ -174,6 +174,12 @@ function normalizeLabels(value) {
   return value.map(String).map(s => s.trim()).filter(Boolean).join(', ');
 }
 
+// `blocked_by` is the SAME encoding problem as `labels` — a list of short tokens
+// that must live on disk as one scalar line — so it reuses the same pair of
+// boundary functions rather than growing a second, subtly different one. A YAML
+// list here would be silently dropped by parseItem exactly as it is for labels.
+const normalizeBlockedBy = normalizeLabels;
+
 // ── labelsToArray ─────────────────────────────────────────────────────────────
 // The read side of the same boundary: scalar → array. Absent/empty yields [],
 // so a consumer can iterate unconditionally without a presence check.
@@ -189,7 +195,7 @@ function labelsToArray(value) {
 // store shape, so the on-disk encoding stays the single source of truth and no
 // caller can accidentally write an array back.
 function toJsonShape(item) {
-  return { ...item, labels: labelsToArray(item.labels) };
+  return { ...item, labels: labelsToArray(item.labels), blocked_by: labelsToArray(item.blocked_by) };
 }
 
 // ── validateItem ──────────────────────────────────────────────────────────────
@@ -325,6 +331,7 @@ function addItem(cwd, fields, opts) {
   // Array → scalar BEFORE validation and before disk. Doing it here rather than
   // in the CLI covers library callers as well.
   if ('labels' in item) item.labels = normalizeLabels(item.labels);
+  if ('blocked_by' in item) item.blocked_by = normalizeBlockedBy(item.blocked_by);
 
   // An item born closed (imported backlog, an item logged only once it was
   // already resolved) never passes through updateItem's transition, so it would
@@ -408,6 +415,7 @@ function updateItem(cwd, idOrPrefix, patch, opts) {
   // Same array → scalar join as addItem, applied post-merge so a patch carrying
   // an array is normalized while an untouched stored scalar passes through.
   if ('labels' in merged) merged.labels = normalizeLabels(merged.labels);
+  if ('blocked_by' in merged) merged.blocked_by = normalizeBlockedBy(merged.blocked_by);
 
   // ── closed_at, keyed on the TRANSITION ──────────────────────────────────────
   // Derived from existing.status → merged.status, never from the patch. That is
@@ -502,6 +510,7 @@ module.exports = {
   validateItem,
   normalizeLabels,
   labelsToArray,
+  normalizeBlockedBy,
   toJsonShape,
   addItem,
   readItem,

@@ -11,7 +11,7 @@ import PackageDescription
 
 let package = Package(
     name: "Forge",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS("26.0")],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.15.0"),
     ],

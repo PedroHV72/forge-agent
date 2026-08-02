@@ -35,13 +35,18 @@ public struct Item: Codable, Identifiable, Hashable {
     public let promoted_to: String?
     public let body: String?
     public let labels: [String]?
+    /// Ids of items that must close before this one can move. Scalar on disk,
+    /// array at the `--list --json` edge — the same boundary `labels` uses, and
+    /// for the same reason (a YAML list is silently dropped by the parser).
+    public let blocked_by: [String]?
     public let priority: String?
 
     public init(id: String, title: String? = nil, status: String? = nil,
                 origin: String? = nil, created: String? = nil, updated: String? = nil,
                 source: String? = nil, file: String? = nil, sha: String? = nil,
                 milestone: String? = nil, promoted_to: String? = nil, body: String? = nil,
-                closed_at: String? = nil, labels: [String]? = nil, priority: String? = nil) {
+                closed_at: String? = nil, labels: [String]? = nil, priority: String? = nil,
+                blocked_by: [String]? = nil) {
         self.id = id
         self.title = title
         self.status = status
@@ -57,6 +62,7 @@ public struct Item: Codable, Identifiable, Hashable {
         self.closed_at = closed_at
         self.labels = labels
         self.priority = priority
+        self.blocked_by = blocked_by
     }
 
     /// The typed status, or `nil` when the engine's `status` string does not

@@ -8,10 +8,15 @@
 // so anything written into `ItemCard` is verifiable only by looking at a
 // screen. Moved here, the same rules run under `swift run ForgeKitTests`.
 //
-// The count is the point: `elements(for:)` returns SEVEN entries for a fully
-// populated item and THREE for the legacy shape the repo actually holds
-// today. That pair is the milestone's "3 → 7" criterion as an assertion
-// rather than an inspection.
+// The count is the point: `elements(for:)` returns THREE entries for a fully
+// populated item and ONE for the legacy shape the repo actually holds today.
+//
+// It was SEVEN — criterion #4's "3 → 7". The operator reversed that after
+// seeing the card on a real board: at 268pt, seven elements is a paragraph and
+// about three cards fit on screen. Body, id, source and closing date moved to
+// the detail sheet, to the hover expansion, and (for the id) to a copy button;
+// `scripts/forge-app-items.test.js` asserts those destinations rather than
+// merely asserting their absence here.
 //
 // Same rule as the rest of ForgeKit (ROADMAP Note 5): Swift only labels what
 // the engine already decided. Nothing here validates, transitions or rejects.
@@ -70,14 +75,24 @@ public enum ItemCardPresentation {
     /// One drawable element of a card, in canonical order. `elements(for:)`
     /// emits these in the order the cases are declared; a case is emitted
     /// only when it has content.
+    /// What the **card** draws — not everything the item has.
+    ///
+    /// Was seven cases (title, id, source, body, labels, priority, closedDay),
+    /// the shape criterion #4 specified when the card went from 3 to 7. The
+    /// operator reversed that after seeing it on a real board: at 268pt a card
+    /// carrying a three-line body plus a 40-character id plus a source plus a
+    /// date is a paragraph, not a card, and roughly three fit on screen.
+    ///
+    /// The four that left were **moved, not dropped** — body, id, source and
+    /// closing date all live in `ItemDetailSheet` (one click away) and in the
+    /// detail sheet and hover expansion. `scripts/forge-app-items.test.js` asserts that
+    /// destination rather than merely asserting their absence here: an element
+    /// that vanished from both places would be a regression, and a guard that
+    /// only checked the card would call it a success.
     public enum Element: Hashable {
         case title(String)
-        case id(String)
-        case source(String)
-        case body(text: String, truncated: Bool)
         case labels(shown: [String], overflow: Int)
         case priority(ItemPriority)
-        case closedDay(String)
     }
 
     /// The first `bodyLineLimit` non-blank lines of `body`, and whether
@@ -139,32 +154,21 @@ public enum ItemCardPresentation {
 
     /// Every element the card should draw for `item`, in canonical order.
     ///
-    /// Seven for a fully populated item, three for the legacy shape. Callers
+    /// Three for a fully populated item, one for the legacy shape. Callers
     /// (the view) ask what came back; they never re-derive the conditions.
     public static func elements(for item: Item) -> [Element] {
         var out: [Element] = []
 
-        // Always present: an untitled item still needs a handle, and the id
-        // is how the operator talks to the engine about this card.
+        // Always present: an untitled item still needs a handle.
         out.append(.title(displayTitle(item)))
-        out.append(.id(item.id))
 
-        // Matches what the board draws today: source only when non-empty.
-        if let s = item.source?.trimmingCharacters(in: .whitespaces), !s.isEmpty {
-            out.append(.source(s))
-        }
-        if let preview = bodyPreview(item.body) {
-            out.append(.body(text: preview.text, truncated: preview.truncated))
-        }
         if let chips = labelChips(item.labels) {
             out.append(.labels(shown: chips.shown, overflow: chips.overflow))
         }
         if let priority = ItemPriority.parse(item.priority) {
             out.append(.priority(priority))
         }
-        if let day = closedDay(item) {
-            out.append(.closedDay(day))
-        }
         return out
     }
+
 }

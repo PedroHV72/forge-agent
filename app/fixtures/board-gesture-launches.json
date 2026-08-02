@@ -1,15 +1,7 @@
 {
   "_why": "Contra-criterio D9/F7 (LOCKED): mover card e organizacao e acontece o tempo todo; disparar uma sessao Claude por engano num gesto de organizacao e caro. Este arquivo e lido por DOIS lados independentes: app/Sources/ForgeKitTests/main.swift aplica ItemLaunch.decide a cada gesto NA ORDEM e assere que a lista de slashCommand bate com expected_launches item a item; scripts/forge-app-launch-parity.test.js RECALCULA expected_launches a partir de items+gestures com uma regra propria (sem ler o Swift) e ainda ancora a forma do id no engine real (scripts/forge-items.js --add sobre um store temporario). Comparar Swift com Swift seria tautologia — afrouxar um expected_launches para o Swift passar tem de quebrar o lado JS.",
   "_shape": "items na forma exata de forge-items.js --list --json (id, title, status, origin, created, updated). gestures e uma lista ORDENADA de { kind: 'move'|'start'|'openDetail', item: <id>, to?: <status> } — a ordem importa, o resultado e cumulativo sobre a mesma lista de items. expected_launches e a lista ordenada dos slashCommand que os gestos produzem — vazio em cada posicao onde o gesto nao origina trabalho.",
-  "_deliberate": [
-    "5 gestos move consecutivos, ANTES de qualquer start, cobrindo destinos diferentes (inclusive done e dropped) — o contra-criterio D9/F7 literal: o total esperado desses 5 e ZERO launches",
-    "um move de item com status desconhecido (zzz) — a coluna Desconhecido tambem nao dispara nada ao ser movida",
-    "um openDetail — abrir detalhe nao e comecar trabalho, mesmo para um item aberto e elegivel",
-    "um start de item triaged bem-formado -> 1 launch, com o slashCommand exato /forge-task <id>",
-    "um start de item done -> 0 launches (recusa deterministica, D-S06-3)",
-    "um start de item cujo id NAO casa a shape do readback (itm-... em vez de I-...) -> 0 launches, e a falha silenciosa de D-S06-4 virando expectativa provada",
-    "expected_launches final tem EXATAMENTE 1 entrada, para que '0 em tudo' nao passe por acidente"
-  ],
+  "_deliberate": "5 gestos move consecutivos, ANTES de qualquer start, cobrindo destinos diferentes (inclusive done e dropped) — o contra-criterio D9/F7 literal: o total esperado desses 5 e ZERO launches,um move de item com status desconhecido (zzz) — a coluna Desconhecido tambem nao dispara nada ao ser movida,um openDetail — abrir detalhe nao e comecar trabalho, mesmo para um item aberto e elegivel,um start de item triaged bem-formado -> 1 launch, com o slashCommand exato /forge-task <id>,um start de item done -> 0 launches (recusa deterministica, D-S06-3),um start de item cujo id NAO casa a shape do readback (itm-... em vez de I-...) -> 0 launches, e a falha silenciosa de D-S06-4 virando expectativa provada,expected_launches final tem EXATAMENTE 1 entrada, para que '0 em tudo' nao passe por acidente Os gestos kind:drag foram acrescentados quando o piso subiu para macOS 26 e o arrastar virou caminho real: arrastar e organizar, e o contra-criterio D9/F7 vale para ele igual ao menu.",
   "items": [
     {
       "id": "I-20260801130001-mover-a",
@@ -94,16 +86,77 @@
     }
   ],
   "gestures": [
-    { "kind": "move", "item": "I-20260801130001-mover-a", "to": "doing" },
-    { "kind": "move", "item": "I-20260801130002-mover-b", "to": "done" },
-    { "kind": "move", "item": "I-20260801130003-mover-c", "to": "dropped" },
-    { "kind": "move", "item": "I-20260801130004-mover-d", "to": "triaged" },
-    { "kind": "move", "item": "I-20260801130005-mover-e", "to": "inbox" },
-    { "kind": "move", "item": "I-20260801130006-status-desconhecido", "to": "doing" },
-    { "kind": "openDetail", "item": "I-20260801130007-abrir-detalhe" },
-    { "kind": "start", "item": "I-20260801130008-comecar" },
-    { "kind": "start", "item": "I-20260801130009-feito" },
-    { "kind": "start", "item": "itm-20260801130010-id-malformado" }
+    {
+      "kind": "move",
+      "item": "I-20260801130001-mover-a",
+      "to": "doing"
+    },
+    {
+      "kind": "move",
+      "item": "I-20260801130002-mover-b",
+      "to": "done"
+    },
+    {
+      "kind": "move",
+      "item": "I-20260801130003-mover-c",
+      "to": "dropped"
+    },
+    {
+      "kind": "move",
+      "item": "I-20260801130004-mover-d",
+      "to": "triaged"
+    },
+    {
+      "kind": "move",
+      "item": "I-20260801130005-mover-e",
+      "to": "inbox"
+    },
+    {
+      "kind": "move",
+      "item": "I-20260801130006-status-desconhecido",
+      "to": "doing"
+    },
+    {
+      "kind": "openDetail",
+      "item": "I-20260801130007-abrir-detalhe"
+    },
+    {
+      "kind": "start",
+      "item": "I-20260801130008-comecar"
+    },
+    {
+      "kind": "start",
+      "item": "I-20260801130009-feito"
+    },
+    {
+      "kind": "start",
+      "item": "itm-20260801130010-id-malformado"
+    },
+    {
+      "kind": "drag",
+      "item": "I-20260801130001-mover-a",
+      "to": "doing"
+    },
+    {
+      "kind": "drag",
+      "item": "I-20260801130002-mover-b",
+      "to": "doing"
+    },
+    {
+      "kind": "drag",
+      "item": "I-20260801130003-mover-c",
+      "to": "doing"
+    },
+    {
+      "kind": "drag",
+      "item": "I-20260801130004-mover-d",
+      "to": "doing"
+    },
+    {
+      "kind": "drag",
+      "item": "I-20260801130005-mover-e",
+      "to": "doing"
+    }
   ],
   "expected_launches": [
     "/forge-task I-20260801130008-comecar"

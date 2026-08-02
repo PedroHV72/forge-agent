@@ -202,9 +202,33 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Open tasks across every registered project, for the sidebar badge.
+    ///
+    /// Aggregated here rather than in `ItemsView` because the badge has to be
+    /// right while the operator is looking at some other section — a count that
+    /// only exists while its own screen is open is not a badge, it is a label.
+    @Published private(set) var openItemCount = 0
+
+    /// Recount open items across all workspaces. One shell-out per project,
+    /// riding the same cadence as `refreshStatus` instead of adding a poll.
+    func refreshItemCount() {
+        let targets = workspaces
+        guard !targets.isEmpty else { openItemCount = 0; return }
+        Task.detached(priority: .utility) {
+            var total = 0
+            for cwd in targets {
+                let items = ForgeCore.runJSON([Item].self, "forge-items.js",
+                                               ["--list", "--json", "--cwd", cwd]) ?? []
+                total += ItemBoard.openCount(items)
+            }
+            await MainActor.run { self.openItemCount = total }
+        }
+    }
+
     /// Fetch status for the projects that have a live run — the only ones whose
     /// progress can change while you watch.
     func refreshStatus(force: Bool = false) {
+        refreshItemCount()
         let targets = Set(liveRuns.map(\.cwd)).union(force ? Set(workspaces) : [])
         for cwd in targets where !statusLoading.contains(cwd) {
             statusLoading.insert(cwd)

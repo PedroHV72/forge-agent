@@ -24,6 +24,12 @@ import Foundation
 public enum BoardGesture {
     case start(Item)
     case move(Item, to: ItemStatus)
+    /// Dragging a card between columns. Semantically the same act as `.move` —
+    /// organising the board — and therefore subject to the same contra-criterion
+    /// (D9/F7): it must never originate work. It exists as its own case so the
+    /// fixture can exercise the drag path explicitly instead of assuming it
+    /// inherits `.move`'s guarantee.
+    case drag(Item, to: ItemStatus)
     case openDetail(Item)
 }
 
@@ -92,7 +98,7 @@ public enum ItemLaunch {
     /// those two gestures at all.
     public static func decide(_ gesture: BoardGesture) -> LaunchRequest? {
         switch gesture {
-        case .move, .openDetail:
+        case .move, .drag, .openDetail:
             return nil
         case .start(let item):
             guard canStart(item) else { return nil }

@@ -79,3 +79,38 @@ public enum ItemLabelFilter {
         return seen.sorted()
     }
 }
+
+/// Free-text search across a card's readable fields.
+///
+/// Distinct from `ItemLabelFilter` on purpose, and both survive:
+/// `ItemLabelFilter.apply` is EXACT, case-sensitive label equality — the rule
+/// criterion #5 pins against `jq '.labels|index("x")'`, proved by the shared
+/// fixture, and nothing here weakens it.
+///
+/// This exists because that rule answers a question most boards cannot ask: an
+/// operator whose items carry no labels gets an empty result for every query,
+/// and a filter that can only ever return nothing is not a filter. So the field
+/// searches what a card actually shows — title first, then id, then labels.
+public enum ItemSearch {
+    /// Items whose title, id or any label contains `query`, case- and
+    /// diacritic-insensitively. Empty query returns everything.
+    ///
+    /// Substring here, unlike `ItemLabelFilter`: this is a search box, and
+    /// "parse" should find "Corrigir o parser". The exactness that criterion #5
+    /// needs lives in the other function, where the parity fixture can hold it
+    /// to the letter.
+    public static func apply(_ items: [Item], query: String?) -> [Item] {
+        let q = (query ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return items }
+        let needle = fold(q)
+        return items.filter { item in
+            if fold(item.title ?? "").contains(needle) { return true }
+            if fold(item.id).contains(needle) { return true }
+            return (item.labels ?? []).contains { fold($0).contains(needle) }
+        }
+    }
+
+    private static func fold(_ s: String) -> String {
+        s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
+}

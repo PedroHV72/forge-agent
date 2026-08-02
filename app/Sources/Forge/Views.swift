@@ -32,6 +32,22 @@ enum Section: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// What the sidebar shows. Split from `rawValue`, which is the **persistence
+    /// key**: `Stores.swift` writes `section?.rawValue` into
+    /// `UserDefaults("lastSection")` and validates the restore against
+    /// `Section.allCases.map(\.rawValue)`, so renaming a `rawValue` silently
+    /// invalidates the stored value and drops every user back to the fallback
+    /// section (MEM004 — the exact reason guard D31 pins the ordered list).
+    ///
+    /// With the two separated, renaming a label costs nothing: `items` still
+    /// persists as `"Itens"` forever while reading "Tarefas" on screen.
+    var title: String {
+        switch self {
+        case .items: return "Tarefas"
+        default: return rawValue
+        }
+    }
+
     var icon: String {
         switch self {
         case .now:      return "bolt.fill"
@@ -110,7 +126,8 @@ struct RootView: View {
             ForEach(Section.allCases) { s in
                 Label {
                     HStack {
-                        Text(s.rawValue)
+                        // `.title`, never `.rawValue` — see `Section.title`.
+                        Text(s.title)
                         Spacer()
                         if let n = badge(for: s) {
                             Text("\(n)")
@@ -155,6 +172,9 @@ struct RootView: View {
         case .runs:     return state.liveRuns.isEmpty ? nil : state.liveRuns.count
         case .terminal: return state.sessions.isEmpty ? nil : state.sessions.count
         case .projects: return state.workspaces.isEmpty ? nil : state.workspaces.count
+        // Open only (`ItemBoard.openCount`): a badge counting done and dropped
+        // would grow forever and stop meaning "there is work here".
+        case .items:    return state.openItemCount == 0 ? nil : state.openItemCount
         default:        return nil
         }
     }
@@ -171,24 +191,20 @@ struct RootView: View {
     private var sidebarFooter: some View {
         VStack(spacing: 0) {
             Divider()
+            // "Adicionar projeto" left this footer: the same action already
+            // lives in the app menu, in the Projects toolbar and in the Projects
+            // empty state. Three doors to one room, and this was the one nobody
+            // was looking at — it was here only because the footer had space,
+            // and it was crowding the one thing that genuinely belongs in a
+            // footer: which build you are running.
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Button {
-                        pickWorkspace(state)
-                    } label: {
-                        Label("Adicionar projeto", systemImage: "plus")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.plain)
-                    Spacer()
-                }
                 SidebarVersionLabel(
                     running: updates.running,
                     repo: updates.repoDescribe,
                     updateAvailable: updates.updateAvailable,
                     onTap: { state.section = .updates })
             }
-            .padding(.horizontal, 14).padding(.vertical, 8)
+            .padding(.horizontal, 8).padding(.vertical, 8)
         }
     }
 
@@ -240,37 +256,93 @@ struct SidebarVersionLabel: View {
     let updateAvailable: Bool
     let onTap: () -> Void
 
+    @State private var hovering = false
+
     var body: some View {
         let display = VersionFooter.display(running: running, repo: repo)
         return Button {
             onTap()
         } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
+            HStack(spacing: 8) {
+                // Static glyph, deliberately NOT tinted by update state: VISUAL
+                // RULE 1 says orange means "needs you", and D27 put that signal
+                // in one place. An icon that also changed colour would be a
+                // second signal saying the same thing — which is how a rule that
+                // says "one place" quietly becomes two.
+                Image(systemName: "hammer.fill")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 14)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 5) {
+                        Text("Forge")
+                            .font(.caption).fontWeight(.medium)
+                            .foregroundStyle(.secondary)
+                        // Developer mode: this binary was compiled by
+                        // `app/build.sh --debug`, which is what the operator
+                        // runs while working on the app itself.
+                        //
+                        // `#if DEBUG` and not a describe heuristic: "has commits
+                        // beyond the tag" is TRUE for a release cut mid-cycle and
+                        // FALSE for a debug build of a clean tag, so it answers a
+                        // different question than the one being asked. The
+                        // compile flag is the only thing that actually knows how
+                        // this binary was built.
+                        //
+                        // Not orange, and not a dot: VISUAL RULE 1 reserves both
+                        // for "needs you", and running a dev build is a fact
+                        // about the binary, not a call to action. The two states
+                        // coexist — a dev build with an update pending shows the
+                        // badge AND the orange dot, which is exactly the case
+                        // this footer has to survive.
+                        #if DEBUG
+                        Text("dev")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(.quaternary, in: Capsule())
+                            .help("Build de desenvolvimento (app/build.sh --debug)")
+                        #endif
+                    }
+                    Text(display.text)
+                        .font(.caption2)
+                        .foregroundStyle(updateAvailable
+                                         ? AnyShapeStyle(Color.accentOrange)
+                                         : AnyShapeStyle(.tertiary))
+                        .multilineTextAlignment(.leading)
+                        // Wrap, never truncate. A `Text` in a tight row
+                        // ellipsises by default, and the first thing an ellipsis
+                        // eats here is the second version — the one the reader
+                        // came for. No `lineLimit(1)` anywhere, on purpose.
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 4)
+
                 // VISUAL RULE 1: orange means "needs you". The dot is the whole
-                // update signal now that the sidebar numeral is gone (D27) — one
-                // signal, one place. 5pt because a dot next to 10pt `.caption`
-                // reads as punctuation, and anything bigger reads as a bullet.
+                // update signal (D26/D27) — one signal, one place. 5pt because a
+                // dot next to 10pt `.caption` reads as punctuation, and anything
+                // bigger reads as a bullet.
                 if updateAvailable {
                     Image(systemName: "circle.fill")
                         .font(.system(size: 5))
                         .foregroundStyle(Color.accentOrange)
                 }
-                Text(display.text)
-                    .font(.caption)
-                    .foregroundStyle(updateAvailable
-                                     ? AnyShapeStyle(Color.accentOrange)
-                                     : AnyShapeStyle(.secondary))
-                    .multilineTextAlignment(.leading)
-                    // Wrap, never truncate. A `Text` in a tight row ellipsises by
-                    // default, and the first thing an ellipsis eats here is the
-                    // second version — the one the reader came for. No
-                    // `lineLimit(1)` anywhere in this view, on purpose.
-                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            // The footer was flat text that happened to be tappable — nothing
+            // said so until you clicked it. A hover fill is the cheapest way to
+            // say "this goes somewhere", and it costs no resting ink.
+            .background(hovering ? AnyShapeStyle(.quaternary.opacity(0.4))
+                                 : AnyShapeStyle(.clear),
+                        in: RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeInOut(duration: 0.1), value: hovering)
         // R9 is paid twice over: the short text labels the second number `repo`,
         // and the tooltip says the whole sentence.
         .help(display.detail ?? display.text)

@@ -1591,64 +1591,45 @@ private func fullItem(status: String = "done") -> Item {
     )
 }
 
-test("item completo desenha 7 elementos, na ordem canônica") {
+test("card denso: item completo desenha 3 elementos, na ordem canônica") {
+    // Era 7 (critério #4, S04). O operador reverteu depois de ver num board
+    // real: a 268pt, corpo de 3 linhas + id de 40 caracteres + origem + data
+    // viram parágrafo, e cabiam ~3 cards na tela. Corpo/id/origem/data NÃO
+    // sumiram — ver os dois testes de `cardTooltip` abaixo e o guard do sheet
+    // em scripts/forge-app-items.test.js.
     let els = ItemCardPresentation.elements(for: fullItem())
-    assertEqual(els.count, 7, "o card completo tem de ter 7 elementos — é o critério #4")
+    assertEqual(els.count, 3, "o card denso tem 3 elementos: título, labels, prioridade")
 
-    guard els.count == 7 else { return }
-    // Ordem, caso a caso: title, id, source, body, labels, priority, closedDay.
+    guard els.count == 3 else { return }
     if case .title(let t) = els[0] { assertEqual(t, "Corrigir o parser de datas do progresso") }
     else { assertTrue(false, "elemento 0 deveria ser .title, veio \(els[0])") }
-    if case .id(let i) = els[1] { assertEqual(i, "I-20260730120000-completo") }
-    else { assertTrue(false, "elemento 1 deveria ser .id, veio \(els[1])") }
-    if case .source(let s) = els[2] { assertEqual(s, "roadmap") }
-    else { assertTrue(false, "elemento 2 deveria ser .source, veio \(els[2])") }
-    if case .body(let text, let truncated) = els[3] {
-        assertEqual(text.split(separator: "\n").count, 3, "o corpo do card é cortado em 3 linhas")
-        assertTrue(truncated, "5 parágrafos cortados em 3 têm de sinalizar truncagem")
-    } else { assertTrue(false, "elemento 3 deveria ser .body, veio \(els[3])") }
-    if case .labels(let shown, let overflow) = els[4] {
+    if case .labels(let shown, let overflow) = els[1] {
         assertEqual(shown, ["bug", "ui"])
         assertEqual(overflow, 0)
-    } else { assertTrue(false, "elemento 4 deveria ser .labels, veio \(els[4])") }
-    if case .priority(let p) = els[5] { assertEqual(p, .p1) }
-    else { assertTrue(false, "elemento 5 deveria ser .priority, veio \(els[5])") }
-    if case .closedDay(let d) = els[6] { assertEqual(d, "2026-07-30") }
-    else { assertTrue(false, "elemento 6 deveria ser .closedDay, veio \(els[6])") }
+    } else { assertTrue(false, "elemento 1 deveria ser .labels, veio \(els[1])") }
+    if case .priority(let p) = els[2] { assertEqual(p, .p1) }
+    else { assertTrue(false, "elemento 2 deveria ser .priority, veio \(els[2])") }
 }
 
-test("item legado desenha exatamente 3 elementos — este é o 'antes' do 3 → 7") {
+test("card denso: item legado desenha 1 elemento — só o título") {
     // O shape exato dos itens reais que o repo tem hoje: sem corpo, sem label,
     // sem prioridade, sem closed_at.
     let legacy = Item(id: "I-20260729145851-test-title", title: "Test title",
                       status: "inbox", source: "manual")
     let els = ItemCardPresentation.elements(for: legacy)
-    assertEqual(els.count, 3, "o card legado tem 3 elementos")
-    guard els.count == 3 else { return }
+    assertEqual(els.count, 1, "sem label e sem prioridade, sobra só o título")
     if case .title = els[0] {} else { assertTrue(false, "0 deveria ser .title") }
-    if case .id = els[1] {} else { assertTrue(false, "1 deveria ser .id") }
-    if case .source = els[2] {} else { assertTrue(false, "2 deveria ser .source") }
-}
-
-test("item sem source cai para 2 elementos — source só entra quando há") {
-    let els = ItemCardPresentation.elements(for: Item(id: "I-1", title: "Sem fonte", status: "inbox"))
-    assertEqual(els.count, 2)
 }
 
 test("dropped NÃO mostra data de fechamento, mesmo com closed_at gravado") {
     let dropped = fullItem(status: "dropped")
     assertNil(ItemCardPresentation.closedDay(dropped), "dropped nunca mostra 'fechado em' (S04-b)")
-    let els = ItemCardPresentation.elements(for: dropped)
-    assertEqual(els.count, 6, "sem a data, sobram 6 dos 7")
-    assertFalse(els.contains { if case .closedDay = $0 { return true } else { return false } },
-                "nenhum .closedDay pode aparecer num item dropped")
 }
 
 test("done sem closed_at (os itens legados do repo) não mostra data e não crasha") {
     let done = Item(id: "I-2", title: "Feito antigo", status: "done", source: "manual")
     assertNil(ItemCardPresentation.closedDay(done))
-    let els = ItemCardPresentation.elements(for: done)
-    assertEqual(els.count, 3)
+    assertEqual(ItemCardPresentation.elements(for: done).count, 1)
 }
 
 test("closedDay só aceita done — os outros três status também ficam de fora") {
@@ -3383,6 +3364,11 @@ func boardGesture(for g: Gesture, items: [String: Item]) -> BoardGesture {
             fatalError("gesto move para \"\(g.to ?? "nil")\" nao e um ItemStatus valido")
         }
         return .move(item, to: to)
+    case "drag":
+        guard let toRaw = g.to, let to = ItemStatus(rawValue: toRaw) else {
+            fatalError("gesto drag para \"\(g.to ?? "nil")\" nao e um ItemStatus valido")
+        }
+        return .drag(item, to: to)
     case "start":
         return .start(item)
     case "openDetail":
@@ -3430,6 +3416,391 @@ test("Paridade de gestos: o contra-criterio D9/F7 em voz alta — o prefixo dos 
     let launches = boardGestures.compactMap(ItemLaunch.decide)
     assertEqual(launches.count, 0,
                 "contra-criterio D9/F7: 5 movimentos consecutivos pelo menu \"Mover para\" tem de produzir ZERO LaunchRequest, produziu \(launches.count)")
+}
+
+// MARK: - Items (tokens visuais)
+
+test("ItemStatus: os cinco status tem simbolo e tom, e nenhum simbolo se repete") {
+    let symbols = ItemStatus.allCases.map(\.symbolName)
+    assertEqual(symbols.count, 5, "esperados 5 status, vieram \(symbols.count)")
+    assertEqual(Set(symbols).count, 5,
+                "dois status compartilham o mesmo SF Symbol — a forma sozinha deixa de separar as colunas: \(symbols)")
+    for s in ItemStatus.allCases {
+        assert(!s.symbolName.isEmpty, "status \(s.rawValue) sem simbolo")
+    }
+}
+
+test("ItemStatus: cada status tem tom proprio — nenhum par colide") {
+    // `inbox` voltou a .neutral por decisao do operador (viu teal e indigo, e
+    // recusou os dois). O que continua sendo propriedade: nenhum par de status
+    // compartilha tom, senao a leitura por cor deixa de distinguir colunas.
+    let tints = ItemStatus.allCases.map(\.tint)
+    assertEqual(Set(tints).count, 5,
+                "dois status compartilham tom: \(tints)")
+    assertEqual(ItemStatus.doing.tint, ItemTint.orange, "doing continua sendo o unico tom quente")
+    assertEqual(ItemStatus.done.tint, ItemTint.green, "done deveria ser verde")
+}
+
+test("ItemPriority: as quatro urgencias tem simbolo proprio e distinto") {
+    let symbols = ItemPriority.allCases.map(\.symbolName)
+    assertEqual(Set(symbols).count, 4,
+                "duas prioridades compartilham simbolo — a leitura por forma deixa de funcionar: \(symbols)")
+    for p in ItemPriority.allCases { assert(!p.symbolName.isEmpty, "\(p.rawValue) sem simbolo") }
+}
+
+test("ItemPriority: o tom e monotonico com a urgencia — p0 vermelho, p3 neutro") {
+    assertEqual(ItemPriority.p0.tint, ItemTint.red, "p0 deveria ser vermelho")
+    assertEqual(ItemPriority.p3.tint, ItemTint.neutral, "p3 nao deveria competir por atencao")
+    assertEqual(Set(ItemPriority.allCases.map(\.tint)).count, 4,
+                "duas prioridades compartilham tom — a triagem por cor deixa de funcionar")
+}
+
+test("labelTint: a paleta exclui neutral e red") {
+    assert(!ItemCardPresentation.labelPalette.contains(.neutral),
+           "um chip neutral e indistinguivel de um chip sem estilo")
+    assert(!ItemCardPresentation.labelPalette.contains(.red),
+           "vermelho e reservado a p0 — um label nao pode se passar por urgencia")
+}
+
+test("labelTint: determinismo — o mesmo texto sempre cai no mesmo tom") {
+    for label in ["bug", "ui", "progresso", "parser", "d8", ""] {
+        assertEqual(ItemCardPresentation.labelTint(label), ItemCardPresentation.labelTint(label),
+                    "labelTint(\(label)) nao e deterministico")
+    }
+    // Regressao contra String.hashValue, que o Swift semeia por processo: se
+    // alguem trocar FNV-1a por hashValue, estes valores fixos passam a variar
+    // entre execucoes e o operador nunca aprende a cor.
+    func fnv(_ s: String) -> ItemTint {
+        var h: UInt32 = 2_166_136_261
+        for b in Array(s.utf8) { h ^= UInt32(b); h = h &* 16_777_619 }
+        return ItemCardPresentation.labelPalette[Int(h % UInt32(ItemCardPresentation.labelPalette.count))]
+    }
+    for label in ["bug", "ui", "progresso", "parser", "d8"] {
+        assertEqual(ItemCardPresentation.labelTint(label), fnv(label),
+                    "labelTint deixou de derivar de FNV-1a sobre os bytes utf8")
+    }
+}
+
+test("labelTint: os labels reais do repo nao colapsam num tom so") {
+    // A soma de escalares (primeira tentativa) jogava bug/ui/progresso/d8 todos
+    // no mesmo slot — 4 de 5 iguais, o que anula a leitura por cor. Este teste
+    // e a medida que reprovou aquela implementacao, nao uma formalidade.
+    let labels = ["bug", "ui", "progresso", "parser", "d8"]
+    let tints = Set(labels.map(ItemCardPresentation.labelTint))
+    assert(tints.count >= 4,
+           "\(labels.count) labels reais colapsaram em \(tints.count) tom(ns) — a cor deixa de distinguir: \(labels.map { "\($0)=\(ItemCardPresentation.labelTint($0).rawValue)" })")
+}
+
+test("shortID: devolve o slug de um id completo") {
+    assertEqual(ItemCardPresentation.shortID("I-20260730202553-card-item-7-elementos"),
+                "card-item-7-elementos",
+                "o slug e a metade legivel do id")
+}
+
+test("shortID: sem slug cai nos ultimos 6 digitos do timestamp") {
+    assertEqual(ItemCardPresentation.shortID("I-20260730202553"), "202553",
+                "id sem slug deveria virar os ultimos 6 digitos")
+}
+
+test("shortID: id fora da forma I-<digitos>-<slug> volta inteiro, nunca mutilado") {
+    assertEqual(ItemCardPresentation.shortID("TASK-017"), "TASK-017", "prefixo desconhecido deveria voltar inteiro")
+    assertEqual(ItemCardPresentation.shortID("I-naodigito-slug"), "I-naodigito-slug",
+                "timestamp nao numerico deveria voltar inteiro")
+    assertEqual(ItemCardPresentation.shortID(""), "", "string vazia deveria voltar inteira")
+}
+
+// MARK: - Markdown (blocos)
+
+test("markdown: paragrafos separados por linha em branco viram blocos distintos") {
+    let b = MarkdownDoc.blocks("Primeiro.\n\nSegundo.")
+    assertEqual(b.count, 2, "esperados 2 paragrafos, vieram \(b.count): \(b)")
+    assertEqual(b, [.paragraph("Primeiro."), .paragraph("Segundo.")])
+}
+
+test("markdown: linhas consecutivas se juntam num paragrafo so") {
+    assertEqual(MarkdownDoc.blocks("uma linha\noutra linha"), [.paragraph("uma linha outra linha")])
+}
+
+test("markdown: heading exige espaco depois dos hashes — #hashtag nao e heading") {
+    assertEqual(MarkdownDoc.blocks("## Titulo"), [.heading(level: 2, text: "Titulo")])
+    assertEqual(MarkdownDoc.blocks("#hashtag"), [.paragraph("#hashtag")],
+                "#hashtag sem espaco tem de continuar paragrafo")
+}
+
+test("markdown: bullets viram UM bloco com os itens") {
+    assertEqual(MarkdownDoc.blocks("- um\n- dois\n- tres"),
+                [.bullets(["um", "dois", "tres"])])
+}
+
+test("markdown: *enfase* no inicio da linha NAO vira bullet") {
+    assertEqual(MarkdownDoc.blocks("*enfase* no comeco"), [.paragraph("*enfase* no comeco")],
+                "o marcador de bullet exige espaco — senao toda enfase inicial vira lista")
+}
+
+test("markdown: lista numerada") {
+    assertEqual(MarkdownDoc.blocks("1. um\n2. dois"), [.numbered(["um", "dois"])])
+}
+
+test("markdown: fence preserva o conteudo VERBATIM — # e - la dentro sao codigo") {
+    let src = "```swift\n# nao e heading\n- nao e bullet\n```"
+    assertEqual(MarkdownDoc.blocks(src),
+                [.code(language: "swift", text: "# nao e heading\n- nao e bullet")],
+                "um diff colado no corpo nao pode ser mastigado como heading/bullet")
+}
+
+test("markdown: fence sem linguagem e fence nao fechado nao crasham") {
+    assertEqual(MarkdownDoc.blocks("```\nx\n```"), [.code(language: nil, text: "x")])
+    assertEqual(MarkdownDoc.blocks("```\nsem fim"), [.code(language: nil, text: "sem fim")],
+                "fence nao fechado deveria consumir ate o fim, nao perder o conteudo")
+}
+
+test("markdown: regra horizontal e citacao") {
+    assertEqual(MarkdownDoc.blocks("---"), [.rule])
+    assertEqual(MarkdownDoc.blocks("> citado\n> em duas"), [.quote("citado em duas")])
+}
+
+test("markdown: --- e reconhecido como regra, nao como bullet") {
+    let b = MarkdownDoc.blocks("antes\n\n---\n\ndepois")
+    assertEqual(b, [.paragraph("antes"), .rule, .paragraph("depois")])
+}
+
+test("markdown: corpo vazio produz zero blocos") {
+    assertEqual(MarkdownDoc.blocks(""), [])
+    assertEqual(MarkdownDoc.blocks("\n\n   \n"), [])
+}
+
+test("markdown: documento misto na ordem do documento") {
+    let src = "# Titulo\n\nUm paragrafo.\n\n- a\n- b\n\n```\ncodigo\n```\n\nFim."
+    assertEqual(MarkdownDoc.blocks(src),
+                [.heading(level: 1, text: "Titulo"),
+                 .paragraph("Um paragrafo."),
+                 .bullets(["a", "b"]),
+                 .code(language: nil, text: "codigo"),
+                 .paragraph("Fim.")])
+}
+
+// MARK: - Idade e checklist do card
+
+test("checklist: conta [ ] e [x] do corpo") {
+    let r = MarkdownDoc.checklist("- [x] feito\n- [ ] pendente\n- [ ] outro")
+    assertEqual(r?.done, 1)
+    assertEqual(r?.total, 3)
+}
+
+test("checklist: bullets normais nao contam") {
+    assertNil(MarkdownDoc.checklist("- so um bullet\n- outro"))
+}
+
+test("checklist: um [ ] DENTRO de fence e literal, nao checkbox") {
+    // Grepar a fonte crua contaria; blocks() preserva fence verbatim, entao o
+    // filtro por .bullets ganha essa propriedade de graca.
+    assertNil(MarkdownDoc.checklist("```\n- [ ] isso e exemplo de codigo\n```"),
+              "checkbox dentro de fence nao pode ser contado")
+}
+
+test("checklist: corpo vazio ou nil devolve nil") {
+    assertNil(MarkdownDoc.checklist(nil))
+    assertNil(MarkdownDoc.checklist(""))
+}
+
+test("age: escala de agora ate meses, com now injetado") {
+    let base = ProgressDate.parse("2026-08-02T12:00:00.000Z").instant!
+    func item(_ iso: String) -> Item { Item(id: "I-1", title: "t", status: "inbox", created: iso) }
+    assertEqual(ItemCardPresentation.age(for: item("2026-08-02T11:59:30.000Z"), now: base), "agora")
+    assertEqual(ItemCardPresentation.age(for: item("2026-08-02T11:30:00.000Z"), now: base), "30min")
+    assertEqual(ItemCardPresentation.age(for: item("2026-08-02T09:00:00.000Z"), now: base), "3h")
+    assertEqual(ItemCardPresentation.age(for: item("2026-07-28T12:00:00.000Z"), now: base), "5d")
+    assertEqual(ItemCardPresentation.age(for: item("2026-07-05T12:00:00.000Z"), now: base), "4sem")
+}
+
+test("age: created ausente, ilegivel ou no futuro devolve nil") {
+    let base = ProgressDate.parse("2026-08-02T12:00:00.000Z").instant!
+    assertNil(ItemCardPresentation.age(for: Item(id: "I-1", title: "t", status: "inbox"), now: base))
+    assertNil(ItemCardPresentation.age(for: Item(id: "I-1", title: "t", status: "inbox", created: "lixo"), now: base))
+    assertNil(ItemCardPresentation.age(for: Item(id: "I-1", title: "t", status: "inbox",
+                                                 created: "2026-09-01T12:00:00.000Z"), now: base),
+              "timestamp no futuro deveria devolver nil — 'ha -2d' e pior que nada")
+}
+
+// MARK: - Arrastar card e tom da idade
+
+test("contra-criterio D9/F7 vale para o ARRASTAR igual ao menu — 5 drags, 0 launches") {
+    let item = Item(id: "I-20260801120000-aberto", title: "Aberto", status: "doing")
+    var launches: [LaunchRequest] = []
+    for _ in 0..<5 {
+        if let r = ItemLaunch.decide(.drag(item, to: .done)) { launches.append(r) }
+    }
+    assertEqual(launches.count, 0,
+                "arrastar e organizar: 5 drags consecutivos tem de produzir ZERO LaunchRequest, produziu \(launches.count)")
+}
+
+test("drag nao olha o item — nem um item perfeitamente elegivel dispara") {
+    // Mesma propriedade que .move: a recusa e estrutural, nao condicional.
+    let elegivel = Item(id: "I-20260801120000-ok", title: "Ok", status: "doing",
+                        body: "corpo", labels: ["bug"], priority: "p0")
+    assertNil(ItemLaunch.decide(.drag(elegivel, to: .done)),
+              "drag de item elegivel ainda assim nao pode disparar trabalho")
+}
+
+test("ageTint: fica mais alto conforme a tarefa envelhece") {
+    let base = ProgressDate.parse("2026-08-02T12:00:00.000Z").instant!
+    func item(_ iso: String, _ status: String = "inbox") -> Item {
+        Item(id: "I-1", title: "t", status: status, created: iso)
+    }
+    assertEqual(ItemCardPresentation.ageTint(for: item("2026-08-02T06:00:00.000Z"), now: base), ItemTint.neutral)
+    assertEqual(ItemCardPresentation.ageTint(for: item("2026-08-01T00:00:00.000Z"), now: base), ItemTint.blue)
+    assertEqual(ItemCardPresentation.ageTint(for: item("2026-07-30T12:00:00.000Z"), now: base), ItemTint.yellow)
+    assertEqual(ItemCardPresentation.ageTint(for: item("2026-07-24T12:00:00.000Z"), now: base), ItemTint.orange)
+    assertEqual(ItemCardPresentation.ageTint(for: item("2026-07-01T12:00:00.000Z"), now: base), ItemTint.red)
+
+    // A rampa tem de ser MONOTONICA: mais velho nunca pode ficar mais calmo.
+    let ordem: [ItemTint] = [.neutral, .blue, .yellow, .orange, .red]
+    let amostras = ["2026-08-02T06:00:00.000Z", "2026-08-01T00:00:00.000Z",
+                    "2026-07-30T12:00:00.000Z", "2026-07-24T12:00:00.000Z",
+                    "2026-07-01T12:00:00.000Z"]
+    let obtidos = amostras.map { ItemCardPresentation.ageTint(for: item($0), now: base) }
+    assertEqual(obtidos, ordem, "a rampa de idade deixou de ser calma -> urgente sem inversao")
+}
+
+test("ageTint: tarefa fechada nunca grita, por mais velha que seja") {
+    let base = ProgressDate.parse("2026-08-02T12:00:00.000Z").instant!
+    for st in ["done", "dropped"] {
+        let velha = Item(id: "I-1", title: "t", status: st, created: "2025-01-01T12:00:00.000Z")
+        assertEqual(ItemCardPresentation.ageTint(for: velha, now: base), ItemTint.neutral,
+                    "status \(st): idade de item fechado e historia — gritar treina o operador a ignorar a cor")
+    }
+}
+
+test("ageTint: created ausente devolve neutral, nunca crasha") {
+    assertEqual(ItemCardPresentation.ageTint(for: Item(id: "I-1", title: "t", status: "inbox")), ItemTint.neutral)
+}
+
+// MARK: - Bloqueio
+
+test("blockedCount: conta os ids e ignora vazios") {
+    let it = Item(id: "I-1", title: "t", status: "doing", blocked_by: ["I-a", " ", "I-b", ""])
+    assertEqual(ItemCardPresentation.blockedCount(it), 2, "ids em branco nao contam")
+}
+
+test("blockedCount: sem blocked_by, ou lista vazia, devolve nil e nao zero") {
+    assertNil(ItemCardPresentation.blockedCount(Item(id: "I-1", title: "t", status: "doing")))
+    assertNil(ItemCardPresentation.blockedCount(Item(id: "I-1", title: "t", status: "doing", blocked_by: [])))
+    assertNil(ItemCardPresentation.blockedCount(Item(id: "I-1", title: "t", status: "doing", blocked_by: ["  "])),
+              "so espaco em branco nao e bloqueio")
+}
+
+test("blockedCount: item fechado nunca aparece bloqueado") {
+    for st in ["done", "dropped"] {
+        let it = Item(id: "I-1", title: "t", status: st, blocked_by: ["I-a", "I-b"])
+        assertNil(ItemCardPresentation.blockedCount(it),
+                  "status \(st): ja entregou — bloqueio virou historia, e badge vermelho em card fechado e ruido")
+    }
+}
+
+// MARK: - Texto dos recibos
+
+test("shortTitle: titulo curto passa inteiro") {
+    let it = Item(id: "I-1", title: "Corrigir o parser", status: "inbox")
+    assertEqual(ItemCardPresentation.shortTitle(it), "Corrigir o parser")
+}
+
+test("shortTitle: corta em fronteira de palavra quando ha uma no ultimo terco") {
+    let it = Item(id: "I-1", title: "Criacao anonima de pedido sem rate limit", status: "inbox")
+    let out = ItemCardPresentation.shortTitle(it, max: 28)
+    assertTrue(out.hasSuffix("…"), "deveria sinalizar corte")
+    assertFalse(out.contains("  "), "nao deveria sobrar espaco duplo antes das reticencias")
+    assertTrue(out.count <= 29, "passou do teto: \(out.count) — \(out)")
+    assertFalse(out.dropLast().hasSuffix(" "), "nao deveria terminar em espaco antes das reticencias")
+}
+
+test("shortTitle: sem espaco no ultimo terco corta seco, sem perder o teto") {
+    let it = Item(id: "I-1", title: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", status: "inbox")
+    let out = ItemCardPresentation.shortTitle(it, max: 10)
+    assertEqual(out, "AAAAAAAAAA…")
+}
+
+test("shortTitle: item sem titulo cai no fallback, nao em string vazia") {
+    assertEqual(ItemCardPresentation.shortTitle(Item(id: "I-1", title: "   ", status: "inbox")),
+                ItemCardPresentation.missingTitle)
+}
+
+// MARK: - Busca de projeto
+
+test("ProjectFilter: busca vazia devolve tudo, nunca nada") {
+    let ps = ["/a/forge-agent", "/b/lookchina"]
+    assertEqual(ProjectFilter.matches(ps, query: ""), ps)
+    assertEqual(ProjectFilter.matches(ps, query: "   "), ps,
+                "caixa de busca em branco significa SEM filtro, nao SEM resultado")
+}
+
+test("ProjectFilter: casa pelo nome exibido e tambem pelo caminho") {
+    let ps = ["/Users/x/work/forge-agent", "/Users/x/side/lookchina"]
+    assertEqual(ProjectFilter.matches(ps, query: "forge"), ["/Users/x/work/forge-agent"])
+    assertEqual(ProjectFilter.matches(ps, query: "side"), ["/Users/x/side/lookchina"],
+                "quem lembra onde o projeto mora tem de conseguir achar pelo caminho")
+}
+
+test("ProjectFilter: ignora caixa e acento") {
+    let ps = ["/a/Metricas-Painel", "/b/outro"]
+    assertEqual(ProjectFilter.matches(ps, query: "MÉTRICAS"), ["/a/Metricas-Painel"],
+                "ninguem digita acento numa caixa de busca")
+}
+
+test("ProjectFilter: preserva a ordem de entrada") {
+    let ps = ["/z/alfa-x", "/a/alfa-y"]
+    assertEqual(ProjectFilter.matches(ps, query: "alfa"), ps,
+                "a ordem e a que o operador registrou; reordenar aqui seria decisao escondida")
+}
+
+test("ProjectFilter: sem casamento devolve lista vazia") {
+    assertEqual(ProjectFilter.matches(["/a/forge-agent"], query: "zzz"), [])
+}
+
+// MARK: - Busca livre no board
+
+private func searchFixture() -> [Item] {
+    [Item(id: "I-20260801120001-parser", title: "Corrigir o parser de datas", status: "inbox",
+          labels: ["bug"]),
+     Item(id: "I-20260801120002-sem-label", title: "Tarefa sem label nenhum", status: "doing"),
+     Item(id: "I-20260801120003-outro", title: "Métricas do painel", status: "inbox")]
+}
+
+test("ItemSearch: acha por titulo, que e o caso que o filtro de label nao cobre") {
+    let r = ItemSearch.apply(searchFixture(), query: "parser")
+    assertEqual(r.count, 1)
+    assertEqual(r.first?.id, "I-20260801120001-parser")
+}
+
+test("ItemSearch: acha item SEM label — o cenario que tornava o campo inutil") {
+    let r = ItemSearch.apply(searchFixture(), query: "sem label")
+    assertEqual(r.count, 1, "um item sem labels tem de continuar alcancavel pela busca")
+}
+
+test("ItemSearch: acha por id e por label") {
+    assertEqual(ItemSearch.apply(searchFixture(), query: "120003").count, 1)
+    assertEqual(ItemSearch.apply(searchFixture(), query: "bug").count, 1)
+}
+
+test("ItemSearch: ignora caixa e acento") {
+    assertEqual(ItemSearch.apply(searchFixture(), query: "METRICAS").count, 1,
+                "ninguem digita acento numa caixa de busca")
+}
+
+test("ItemSearch: busca vazia devolve tudo") {
+    assertEqual(ItemSearch.apply(searchFixture(), query: "").count, 3)
+    assertEqual(ItemSearch.apply(searchFixture(), query: nil).count, 3)
+    assertEqual(ItemSearch.apply(searchFixture(), query: "   ").count, 3)
+}
+
+test("ItemSearch NAO substitui ItemLabelFilter — a regra exata do criterio #5 segue intacta") {
+    // ItemSearch e substring; ItemLabelFilter e igualdade de elemento. Confundir
+    // os dois faria "ui" casar "ui-bug", que e a divergencia de 1 card que o
+    // criterio #5 chama de falha.
+    let its = [Item(id: "I-1", title: "t", status: "inbox", labels: ["ui-bug"])]
+    assertEqual(ItemLabelFilter.apply(its, query: "ui").count, 0,
+                "ItemLabelFilter continua exato")
+    assertEqual(ItemSearch.apply(its, query: "ui").count, 1,
+                "ItemSearch e substring de proposito — sao regras diferentes, e as duas existem")
 }
 
 print("\n" + String(repeating: "─", count: 60))

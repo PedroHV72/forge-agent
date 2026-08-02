@@ -63,6 +63,12 @@ function stripLineComments(line) {
   return idx === -1 ? line : line.slice(0, idx);
 }
 
+// `stripLineComments` opera linha a linha; para varrer um corpo inteiro de
+// struct precisamos da versao multi-linha.
+function stripAllComments(source) {
+  return source.split('\n').map(stripLineComments).join('\n');
+}
+
 function readLines(filePath) {
   return fs.readFileSync(filePath, 'utf8').split('\n');
 }
@@ -168,20 +174,44 @@ check('ForgeKit/Items.swift exists, declares ItemBoard and ItemStatus, and is a 
 
 // --- No pre-macOS-13 APIs in the new/changed slice files -------------------
 
-check('no pre-macOS-13 API usage in the slice files', () => {
-  const forbidden = ['.onKeyPress', '.draggable(', '.dropDestination('];
+// O piso NAO e mais hardcoded aqui. Ele era `13`, e quando o operador decidiu
+// subir para 26 (para habilitar drag entre colunas) este guard reprovou uma
+// mudanca legitima enquanto afirmava uma baseline que o Package.swift ja nao
+// tinha. Um guard que mente sobre a configuracao e pior que nenhum: agora ele
+// LE o piso da fonte da verdade e so proibe o que estiver de fato acima dela.
+function packageFloorMajor() {
+  const pkg = fs.readFileSync(path.join(repoRoot, 'app', 'Package.swift'), 'utf8');
+  const m = pkg.match(/platforms:\s*\[\s*\.macOS\(\s*(?:\.v(\d+)|"(\d+)(?:\.\d+)?")/);
+  assert(m, 'nao consegui ler o piso de plataforma do app/Package.swift');
+  return Number(m[1] || m[2]);
+}
+
+// API -> versao minima de macOS que a suporta.
+const API_FLOOR = Object.freeze({
+  '.onKeyPress': 14,
+  '.draggable(': 14,
+  '.dropDestination(': 14,
+});
+
+check('nenhuma API acima do piso declarado no Package.swift', () => {
+  const floor = packageFloorMajor();
   const files = [itemsViewPath, projectsPath, viewsPath, forgeKitItemsPath];
   const hits = [];
-  for (const file of files) {
-    for (const pattern of forbidden) {
-      hits.push(...findForbiddenPattern(file, pattern));
-    }
+  for (const [pattern, needs] of Object.entries(API_FLOOR)) {
+    if (needs <= floor) continue;   // permitida pelo piso atual
+    for (const file of files) hits.push(...findForbiddenPattern(file, pattern));
   }
   assert(
     hits.length === 0,
-    'API above macOS 13 baseline found in slice files (S05 Acceptance Criteria #7):\n' +
+    `API acima do piso macOS ${floor} declarado em app/Package.swift:\n` +
       hits.map(h => `    ${h}`).join('\n')
   );
+});
+
+check('o guard de piso acompanha o Package.swift — piso lido e >= 13', () => {
+  const floor = packageFloorMajor();
+  assert(Number.isInteger(floor) && floor >= 13,
+    `piso lido do Package.swift veio invalido: ${floor}`);
 });
 
 check('guard actually bites — a real (non-comment) above-baseline API is detected', () => {
@@ -219,32 +249,144 @@ check('ItemCard draws the title (ItemCardPresentation.displayTitle)', () => {
     'ItemCard does not call ItemCardPresentation.displayTitle — the title element may be missing or reading item.title raw again');
 });
 
-check('ItemCard draws the id (item.id)', () => {
-  assert(itemCardBody().includes('item.id'), 'ItemCard does not reference item.id — the id element may be missing');
-});
+// --- Card denso: o que saiu do card tem de estar no sheet -----------------
+//
+// O card foi de 7 elementos para 3 (título, labels, prioridade) por decisão do
+// operador, depois de ver o board real: a 268pt, corpo de 3 linhas + id de 40
+// caracteres + origem + data viram parágrafo e cabiam ~3 cards na tela.
+//
+// Os quatro que saíram — id, origem, corpo, data — NÃO podem simplesmente
+// desaparecer. Apagar os checks antigos e seguir em frente seria o mesmo erro
+// que a `## Correção de critério` do SCOPE registra: um critério que passa pelo
+// motivo errado. Então cada um vira um par: ausente do card, PRESENTE no
+// destino (sheet e/ou tooltip).
 
-check('ItemCard draws the source (item.source)', () => {
-  assert(itemCardBody().includes('item.source'), 'ItemCard does not reference item.source — the source element may be missing');
-});
+function itemDetailSheetBody() {
+  const src = fs.readFileSync(itemsViewPath, 'utf8');
+  const m = src.match(/struct\s+ItemDetailSheet\s*:[\s\S]*?\n\}\n/);
+  assert(m, 'could not locate the ItemDetailSheet struct body in ItemsView.swift');
+  return m[0];
+}
 
-check('ItemCard draws the truncated body (bodyPreview)', () => {
-  assert(itemCardBody().includes('bodyPreview'), 'ItemCard does not call ItemCardPresentation.bodyPreview — the truncated body element may be missing');
-});
-
-check('ItemCard draws label chips (labelChips)', () => {
-  assert(itemCardBody().includes('labelChips'), 'ItemCard does not reference labelChips — the label chips element may be missing');
-});
-
-check('ItemCard draws the priority mark (ItemPriority / .priority)', () => {
+check('card denso: em repouso o card não desenha origem nem data', () => {
   const body = itemCardBody();
-  assert(
-    body.includes('ItemPriority') && body.includes('.priority'),
-    'ItemCard does not reference ItemPriority/item.priority — the priority element may be missing'
-  );
+  for (const [needle, label] of [['item.source', 'origem'], ['closedDay', 'data de fechamento']]) {
+    assert(!body.includes(needle),
+      `ItemCard voltou a desenhar ${label} (${needle}) — em repouso o card mostra título, `
+      + 'labels e prioridade; se a decisão mudou, mude os testes do contrato em ForgeKitTests junto');
+  }
+  // `item.id` recebe tratamento proprio: o card nao pode DESENHA-LO, mas pode
+  // usa-lo para o clipboard (o botao "copiar id" ao lado da data). A proibicao
+  // e sobre RENDERIZACAO — `Text(...)`/`Label(...)` recebendo o id.
+  assert(!/(?:Text|Label)\(\s*(?:item\.id|ItemCardPresentation\.shortID)/.test(body),
+    'ItemCard voltou a DESENHAR o id — usar item.id para clipboard/tooltip é permitido, renderizá-lo não');
 });
 
-check('ItemCard draws the closing date (closedDay)', () => {
-  assert(itemCardBody().includes('closedDay'), 'ItemCard does not reference closedDay — the closing-date element may be missing');
+check('o corpo só aparece expandido — nunca em repouso', () => {
+  // `bodyPreview` voltou ao card DE PROPOSITO (o operador pediu que o mouse
+  // expandisse o resumo). O que a densidade exige e que ele NAO esteja presente
+  // em repouso: se alguem tirar a condicao, o card volta a ser o de 7 elementos
+  // em silencio.
+  const body = itemCardBody();
+  const lines = body.split('\n').map(stripLineComments);
+  const idx = lines.findIndex((l) => l.includes('bodyPreview'));
+  assert(idx !== -1, 'ItemCard não referencia bodyPreview — a expansão sumiu');
+  const window = lines.slice(Math.max(0, idx - 3), idx + 1).join('\n');
+  assert(/if\s+expanded\s*,/.test(window),
+    'bodyPreview no ItemCard não está atrás de `if expanded,` — o corpo voltou a ser '
+    + 'desenhado em repouso e o card denso deixou de ser denso');
+});
+
+check('a expansão exige DWELL, não hover cru', () => {
+  // A diferenca nao e cosmetica: com expansao instantanea, arrastar o ponteiro
+  // por uma coluna reflui todo card que ele cruza e o board inteiro ondula
+  // enquanto o operador so esta viajando ate outro lugar.
+  const body = itemCardBody();
+  const src = stripAllComments(body);
+  assert(/\.onHover\s*\{/.test(src), 'ItemCard não tem .onHover — a expansão perdeu o gatilho');
+  assert(/Task\.sleep/.test(src),
+    'o handler de hover não dorme antes de expandir — `expanded` estaria sendo ligado no hover cru, '
+    + 'sem o dwell de ItemCardPresentation.hoverExpandDelaySeconds');
+  assert(/hoverExpandDelaySeconds/.test(src),
+    'o atraso não vem de ItemCardPresentation.hoverExpandDelaySeconds — um literal enterrado na view '
+    + 'é exatamente o que a constante nomeada existe para evitar');
+  assert(/dwell\?\.cancel\(\)/.test(src),
+    'o dwell não é cancelado — um card por onde o ponteiro só passou expandiria um segundo depois, '
+    + 'pelas costas do operador');
+});
+
+check('os ícones de ação têm caixa fixa — nenhum fica maior por ter glifo mais largo', () => {
+  const src = fs.readFileSync(itemsViewPath, 'utf8');
+  const m = src.match(/struct\s+IconAction[\s\S]*?\n\}\n/);
+  assert(m, 'não encontrei a struct IconAction — o wrapper dos ícones de ação sumiu');
+  const body = stripAllComments(m[0]);
+  assert(/\.frame\(\s*width:\s*\d+\s*,\s*height:\s*\d+\s*\)/.test(body),
+    'IconAction não fixa a caixa do glifo — sem isso o badge fica tão largo quanto o símbolo que '
+    + 'carrega, e arrow.left.arrow.right (dois glifos lado a lado) parece maior que terminal na '
+    + 'mesma fonte. A caixa fixa é o que permite escolher o ícone por significado, não por largura');
+});
+
+check('linha de metadados: todo badge usa o mesmo modificador de tamanho', () => {
+  // "tudo do mesmo tamanho" so continua verdade se for propriedade do codigo.
+  // Antes havia tres alturas na mesma linha: capsulas 5/1, Labels sem padding e
+  // icones sem caixa.
+  const body = stripAllComments(itemCardBody());
+  const badgeCarriers = ['systemImage: "lock"', 'systemImage: "checklist"',
+                         'systemImage: "clock"', 'systemImage: "doc.on.doc"',
+                         'systemImage: "arrow.left.arrow.right"', 'systemImage: "terminal"'];
+  // Cada readout/acao da linha tem de estar a <= 4 linhas de um .metaBadge(.
+  const lines = body.split('\n');
+  for (const carrier of badgeCarriers) {
+    const i = lines.findIndex((l) => l.includes(carrier));
+    if (i === -1) continue;   // elemento pode ter saido do card por decisao
+    const window = lines.slice(Math.max(0, i - 3), i + 5).join('\n');
+    assert(/\.metaBadge\(|IconAction\(/.test(window),
+      `o badge com ${carrier} não passa por .metaBadge( — ele voltou a ter altura própria, `
+      + 'e a linha de metadados volta a ter tamanhos diferentes');
+  }
+  assert(/func metaBadge\(/.test(fs.readFileSync(itemsViewPath, 'utf8')),
+    'o modificador metaBadge sumiu — não há mais uma métrica única para os badges');
+});
+
+check('o id continua alcançável do card — pelo botão de copiar', () => {
+  const body = itemCardBody();
+  assert(/NSPasteboard[\s\S]{0,200}item\.id/.test(body),
+    'o card não copia o id para o clipboard — com o hover expandindo o resumo em vez de mostrar '
+    + 'dados, este botão passou a ser o único caminho do id a partir do card');
+});
+
+check('guard morde — bodyPreview solto (sem hover) é pego', () => {
+  const fake = ['                let x = 1', '                ItemCardPresentation.bodyPreview(item.body)'];
+  const idx = fake.findIndex((l) => l.includes('bodyPreview'));
+  const window = fake.slice(Math.max(0, idx - 3), idx + 1).join('\n');
+  assert(!/if\s+hovering\s*,/.test(window),
+    'matcher falharia em detectar um bodyPreview fora de uma condição de hover');
+});
+
+check('o que saiu do card está no ItemDetailSheet — id, origem, corpo e data', () => {
+  const sheet = itemDetailSheetBody();
+  assert(sheet.includes('item.id'), 'o id sumiu do card E do sheet — isso é perda, não densidade');
+  assert(sheet.includes('item.source'), 'a origem sumiu do card E do sheet');
+  // `includes('item.body')` NÃO serve aqui, e isso foi provado por mutação: o
+  // sheet mencionava `item.body` numa condição de estilo, então apagar a
+  // renderização deixava o guard verde com o corpo fora da tela. O que importa
+  // é que o corpo chegue a um RENDERIZADOR, não que seja mencionado.
+  //
+  // Dois renderizadores são aceitos porque os dois de fato desenham o corpo:
+  // `MarkdownBody(source:)` (atual — parseia blocos via MarkdownDoc) e
+  // `Text(item.body)` (o anterior, texto cru). Fixar só o primeiro amarraria o
+  // guard à implementação de hoje pela segunda vez.
+  assert(/MarkdownBody\(\s*source:\s*item\.body/.test(sheet) || /Text\(\s*item\.body/.test(sheet),
+    'o sheet não entrega item.body a um renderizador (MarkdownBody ou Text) — o corpo '
+    + 'sumiu do card E do sheet, que era o destino declarado por D8 '
+    + '(mencionar item.body numa condição não conta)');
+  assert(sheet.includes('closedDay'), 'a data de fechamento sumiu do card E do sheet');
+});
+
+check('guard morde — um sheet sem item.body é pego', () => {
+  const fake = 'struct ItemDetailSheet: View {\n  var body: some View { Text(item.id) }\n}\n';
+  assert(!fake.includes('item.body'),
+    'matcher falharia em detectar um sheet que perdeu o corpo');
 });
 
 // --- No priority literal in ItemsView.swift, same rule as status ----------
@@ -352,15 +494,22 @@ function itemsViewBody() {
   return m[0];
 }
 
-check('ItemsView delegates label matching to ItemLabelFilter.apply', () => {
-  assert(itemsViewBody().includes('ItemLabelFilter.apply'),
-    'ItemsView struct body does not call ItemLabelFilter.apply — label matching may have been reimplemented ' +
-      'or dropped');
+check('ItemsView delega o casamento a ForgeKit, nunca reimplementa', () => {
+  // Era `includes('ItemLabelFilter.apply')`. Isso fixava QUAL funcao, nao a
+  // propriedade: quando o campo passou a buscar titulo/id/label (porque um
+  // filtro so-de-label devolve vazio em board sem labels), a view trocou para
+  // `ItemSearch.apply` e este guard reprovou uma delegacao perfeitamente
+  // correta. O que importa e que a regra viva em ForgeKit, onde e testavel sem
+  // tela — qual das duas regras a view usa e decisao de produto.
+  const body = itemsViewBody();
+  assert(/ItemSearch\.apply|ItemLabelFilter\.apply/.test(body),
+    'ItemsView não chama nenhuma regra de casamento de ForgeKit (ItemSearch.apply ou '
+    + 'ItemLabelFilter.apply) — o casamento pode ter sido reimplementado na view ou perdido');
 });
 
-check('guard actually bites — a synthetic ItemsView body lacking ItemLabelFilter.apply would be caught', () => {
+check('guard morde — uma ItemsView sem regra de ForgeKit é pega', () => {
   const fakeBody = 'struct ItemsView: View {\n    var body: some View { Text("x") }\n}\n';
-  assert(!fakeBody.includes('ItemLabelFilter.apply'),
+  assert(!/ItemSearch\.apply|ItemLabelFilter\.apply/.test(fakeBody),
     'matcher failed to catch the absence of ItemLabelFilter.apply in a synthetic body lacking it');
 });
 
@@ -385,22 +534,45 @@ check('guard actually bites — a real (non-comment) store.items regression in I
     'matcher incorrectly flagged a comment-only ItemBoard.unknown(store.items) mention');
 });
 
-check('LabelFilterField exists and draws visibleCount plus the "cards" label', () => {
-  const src = fs.readFileSync(itemsViewPath, 'utf8');
-  const m = src.match(/struct\s+LabelFilterField\s*:[\s\S]*?\n\}\n/);
-  assert(m, 'could not locate the LabelFilterField struct body in ItemsView.swift');
-  const body = m[0];
-  assert(body.includes('visibleCount'),
-    'LabelFilterField does not reference visibleCount — the visible-card count may have been dropped');
-  assert(body.includes('cards'),
-    'LabelFilterField does not render the "cards" label — the count would be on screen but unreadable');
+check('a busca da view é ItemSearch, e a regra exata de label continua existindo', () => {
+  // O campo passou a buscar titulo/id/label (substring) porque um filtro que so
+  // casa label devolve vazio em todo board sem labels. A regra EXATA do
+  // criterio #5 nao foi afrouxada: ela continua em ItemLabelFilter, com o
+  // fixture de paridade contra o `jq` intacto. As duas coexistem de proposito —
+  // confundi-las faria "ui" casar "ui-bug", que e a divergencia de 1 card que o
+  // criterio chama de falha.
+  const view = stripAllComments(fs.readFileSync(itemsViewPath, 'utf8'));
+  assert(/ItemSearch\.apply/.test(view),
+    'a view não usa ItemSearch.apply — o campo voltou a filtrar só por label e fica inerte '
+    + 'em qualquer board cujos itens não tenham labels');
+  const kit = fs.readFileSync(path.join(appSourcesDir, 'ForgeKit', 'ItemFilter.swift'), 'utf8');
+  assert(/enum ItemLabelFilter/.test(kit),
+    'ItemLabelFilter sumiu — a regra exata que o critério #5 prova contra o jq foi apagada junto '
+    + 'com a troca do campo, e a paridade deixou de ter dono');
+  assert(/enum ItemSearch/.test(kit), 'ItemSearch não está em ForgeKit — a regra de busca voltou para a view');
 });
 
-check('guard actually bites — a synthetic LabelFilterField without visibleCount would be caught', () => {
-  const fakeBody = 'struct LabelFilterField: View {\n    var body: some View { TextField("x", text: .constant("")) }\n}\n';
-  assert(!fakeBody.includes('visibleCount'),
-    'matcher failed to catch the absence of visibleCount in a synthetic LabelFilterField body lacking it');
+check('a contagem de cards visíveis está na tela (D-S05-3)', () => {
+  // Antes este guard exigia a struct `LabelFilterField`, que hospedava o
+  // numero. Ela deixou de existir: o filtro virou `.searchable` nativo e a
+  // contagem foi para `.navigationSubtitle`. O guard fixava o ENDERECO; o que
+  // o criterio #5 exige e a PROPRIEDADE — que o numero que a UAT compara com o
+  // `jq` continue visivel em algum lugar da tela.
+  const src = stripAllComments(fs.readFileSync(itemsViewPath, 'utf8'));
+  assert(/visibleItems\.count/.test(src),
+    'ItemsView não referencia visibleItems.count — a contagem de cards visíveis sumiu, e com ela '
+    + 'a paridade tela↔CLI que o critério #5 exige (D-S05-3)');
+  assert(/\bcards\b/.test(src),
+    'a palavra "cards" não aparece junto do número — o valor estaria na tela mas sem rótulo, '
+    + 'e a UAT compara um número com o jq, não um número anônimo');
 });
+
+check('guard morde — uma ItemsView sem visibleItems.count é pega', () => {
+  const fake = 'struct ItemsView: View { var body: some View { Text("Tarefas") } }';
+  assert(!/visibleItems\.count/.test(fake),
+    'matcher falharia em detectar a ausência da contagem de cards visíveis');
+});
+
 
 // `\.labels\b` (word boundary after "labels") deliberately does not match
 // `.labelsHidden(` — a Picker modifier already in this struct that has
@@ -597,17 +769,39 @@ check('guard actually bites — text: item.id or a title concatenation is caught
   assert(codeB.includes('item.title'), 'matcher failed to catch an item.title concatenation');
 });
 
-check('both onMove: closures call only store.setStatus — never newSession or ItemLaunch.decide', () => {
+check('every onMove: closure calls only store.setStatus — never newSession or ItemLaunch.decide', () => {
   const lines = itemsViewStrippedLines();
   const bodies = allBodiesFrom(lines, 'onMove: {');
-  assert(bodies.length === 2, `expected 2 onMove: closures (columnView + unknownColumn), found ${bodies.length}`);
+  // Was `=== 2` (one closure per column). That pinned an implementation detail,
+  // not the property: factoring columnView + unknownColumn onto a shared
+  // `boardColumn` helper dropped the count to 1 and failed a guard whose whole
+  // subject — "a move never originates work" — had gotten STRONGER, since one
+  // shared closure cannot drift from its twin. The property is "at least one
+  // move path exists, and EVERY one of them is clean"; `forEach` below already
+  // covers every closure however many there are.
+  assert(bodies.length >= 1, `expected at least one onMove: closure, found ${bodies.length}`);
+  // Duas formas legitimas coexistem desde que a coluna virou `BoardColumnView`:
+  // a TERMINAL (`store.setStatus`, em ItemsView) e a de ENCAMINHAMENTO
+  // (`onMove(item, $0)`, dentro da coluna, que so repassa para cima). Exigir
+  // `store.setStatus` de todas reprovava o encaminhamento, que nao e um caminho
+  // novo — e o mesmo caminho, com um salto a mais. A proibicao dura (nunca
+  // newSession, nunca ItemLaunch.decide) continua valendo para TODAS.
+  let terminals = 0;
   bodies.forEach((body, i) => {
-    assert(body.includes('store.setStatus'), `onMove: closure #${i + 1} does not call store.setStatus`);
+    const terminal = body.includes('store.setStatus');
+    if (terminal) terminals++;
+    assert(terminal || /onMove\(/.test(body),
+      `onMove: closure #${i + 1} nao chama store.setStatus nem encaminha para onMove( — `
+      + 'um caminho de mover que nao faz nem uma coisa nem outra e um gesto morto ou um caminho novo nao auditado');
     assert(!body.includes('newSession'),
       `onMove: closure #${i + 1} reaches newSession — a drag-move must never originate work (D9/F7, LOCKED)`);
     assert(!body.includes('ItemLaunch.decide'),
       `onMove: closure #${i + 1} reaches ItemLaunch.decide — moving a card is not a launch gesture`);
   });
+  // Se TODAS encaminharem, o gesto nao chega ao engine: mover pararia de mover
+  // e a suite ficaria verde porque nenhuma closure individual violou nada.
+  assert(terminals >= 1,
+    'nenhuma closure onMove: chega a store.setStatus — o gesto de mover nao alcanca o engine');
 });
 
 check('guard actually bites — an onMove: closure reaching newSession is caught', () => {

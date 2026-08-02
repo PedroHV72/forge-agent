@@ -385,14 +385,14 @@ struct ItemCardPreviews: PreviewProvider {
         Group {
             ItemCard(item: previewFullItem,
                      otherStatuses: ItemStatus.allCases,
-                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {}, notify: { _, _ in }, projectLabel: nil)
                 .frame(width: 220)
                 .padding(16)
                 .previewDisplayName("Card — completo (7 elementos, a 220pt)")
 
             ItemCard(item: previewLegacyItem,
                      otherStatuses: ItemStatus.allCases,
-                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {}, notify: { _, _ in }, projectLabel: nil)
                 .frame(width: 220)
                 .padding(16)
                 .previewDisplayName("Card — legado (3 elementos, o 'antes')")
@@ -406,7 +406,7 @@ struct ItemCardPreviews: PreviewProvider {
                                 labels: previewFullItem.labels,
                                 priority: previewFullItem.priority),
                      otherStatuses: ItemStatus.allCases,
-                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {}, notify: { _, _ in }, projectLabel: nil)
                 .frame(width: 220)
                 .padding(16)
                 .previewDisplayName("Card — dropped com closed_at (data NÃO aparece)")
@@ -424,7 +424,7 @@ struct ItemCardPreviews: PreviewProvider {
                                 labels: previewFullItem.labels,
                                 priority: previewFullItem.priority),
                      otherStatuses: ItemStatus.allCases,
-                     onMove: { _ in }, onOpenDetail: {}, onStart: {})
+                     onMove: { _ in }, onOpenDetail: {}, onStart: {}, notify: { _, _ in }, projectLabel: nil)
                 .frame(width: 220)
                 .padding(16)
                 .previewDisplayName("Card — done (botão Começar desabilitado)")
@@ -435,37 +435,6 @@ struct ItemCardPreviews: PreviewProvider {
     }
 }
 
-/// The three states of `LabelFilterField` (S05/T02): empty (full board),
-/// a query that matches, and a query that matches nothing (`0 cards`) —
-/// `.constant(...)` for the binding since these are read-only stagings, no
-/// interaction is exercised.
-///
-/// The counts here are staged fixtures, not derived from `ItemLabelFilter` —
-/// the rule itself is proven headless in `ItemFilterTests` (S05/T01); this
-/// preview only stages what the field looks like once a count arrives.
-struct LabelFilterPreviews: PreviewProvider {
-    static var previews: some View {
-        Group {
-            LabelFilterField(query: .constant(""),
-                              labels: ["bug", "ui", "progresso", "parser", "d8"],
-                              visibleCount: 12)
-                .padding(16)
-                .previewDisplayName("Filtro — vazio (board inteiro)")
-
-            LabelFilterField(query: .constant("bug"),
-                              labels: ["bug", "ui", "progresso", "parser", "d8"],
-                              visibleCount: 3)
-                .padding(16)
-                .previewDisplayName("Filtro — consulta que acha (contagem reduzida)")
-
-            LabelFilterField(query: .constant("nao-existe"),
-                              labels: ["bug", "ui", "progresso", "parser", "d8"],
-                              visibleCount: 0)
-                .padding(16)
-                .previewDisplayName("Filtro — consulta que nao acha nada (0 cards)")
-        }
-    }
-}
 
 struct SidebarPreviews: PreviewProvider {
     static var previews: some View {
