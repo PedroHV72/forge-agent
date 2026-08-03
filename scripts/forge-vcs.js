@@ -10,8 +10,17 @@
  * NUL delimitation (-z) is load-bearing: paths may contain spaces, quotes, and
  * newlines. SVN has no NUL status format: newline-containing paths are routed
  * one-at-a-time in argv rather than through its newline-delimited targets file.
- * SVN targets also carry peg-revision syntax (`path@rev`), so every path handed
- * to `svn` goes through svnPegSafe — see its comment.
+ * SVN targets also carry peg-revision syntax (`path@rev`). svnIsTracked escapes
+ * its target through svnPegSafe — see its comment. The revert paths below do
+ * NOT, and a path containing a literal `@` therefore fails them: `svn revert`
+ * answers E200009 ("a peg revision is not allowed here") for both the argv and
+ * the `--targets` form, and the batch form aborts the WHOLE set, reverting none
+ * of it. That failure is closed and loud — svnRestoreAndRemove checks the exit
+ * status and returns `{ ok: false }`, so nothing is applied by halves — but it
+ * is a gap, not a design. Extending the escape is a follow-up: verified against
+ * svn 1.14.2 that `svn revert -- 'SERVICES/services@1.2.0.ts@'` reverts the
+ * file, so the same helper is the fix; it wants its own regression test before
+ * it lands in code this critical.
  * opts.vcs defaults explicitly to 'git' so this seam never probes SVN on its
  * hot path (the M017 S01 4.2–4.9x regression).
  */
@@ -441,6 +450,9 @@ function svnRestoreAndRemove(cwd, baseline, target, opts) { // baseline is inten
  * `plain.md@` and `plain.md` address the same node (verified, svn 1.14.2).
  * `--` does NOT cover this: peg parsing is part of the target syntax, not
  * option parsing.
+ *
+ * Call sites: svnIsTracked only. The reverts pass raw targets — see the file
+ * header for the measured consequence and why closing it is a follow-up.
  */
 function svnPegSafe(target) {
   return `${target}@`;
