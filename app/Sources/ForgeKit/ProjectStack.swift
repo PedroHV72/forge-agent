@@ -302,6 +302,15 @@ public struct StackGlyph: Equatable {
     /// that does not exist renders as a blank square, which is precisely the
     /// empty slot this whole file replaces.
     public let symbol: String
+    /// The vendored brand mark to draw INSTEAD of `symbol`, or `nil` when the
+    /// glyph stands for something no brand mark exists for (a role, a measured
+    /// absence, a failure to measure).
+    ///
+    /// Both are carried, never one or the other, and that is the degradation
+    /// rule: the view draws `mark` when it resolves and `symbol` when it does
+    /// not, so a resource bundle that failed to ship costs last week's icon
+    /// rather than an empty slot. A card is never blank because of this field.
+    public let mark: BrandMark?
     /// What the icon is claiming, in pt-BR. Never empty — the card hangs this
     /// on `.help()`, so the glyph can always be interrogated rather than
     /// merely obeyed.
@@ -312,15 +321,44 @@ public struct StackGlyph: Equatable {
     /// re-deriving the distinction from the symbol name.
     public let isStack: Bool
 
-    public init(symbol: String, help: String, isStack: Bool) {
+    /// `mark` defaults to `nil` so a caller that has no brand mark to offer
+    /// says so by saying nothing, rather than by passing a placeholder.
+    public init(symbol: String, help: String, isStack: Bool, mark: BrandMark? = nil) {
         self.symbol = symbol
         self.help = help
         self.isStack = isStack
+        self.mark = mark
     }
 }
 
 public extension StackKind {
-    /// SF Symbol for the stack.
+    /// The stack's REAL mark, vendored from Simple Icons.
+    ///
+    /// This is what the card draws; `symbolName` below is the fallback for a
+    /// build whose resource bundle did not make it (see `BrandArt`). Every
+    /// stack has one, which is why this is non-optional — the SF Symbols were
+    /// an approximation of these marks, and where a real mark exists there is
+    /// no reason to draw the approximation.
+    var mark: BrandMark {
+        switch self {
+        case .next: return .next
+        case .swift: return .swift
+        case .go: return .go
+        case .rust: return .rust
+        case .python: return .python
+        case .node: return .node
+        case .docker: return .docker
+        }
+    }
+
+    /// SF Symbol for the stack — now the FALLBACK, drawn only when the vendored
+    /// mark above does not resolve.
+    ///
+    /// Kept rather than deleted, and the reason is the measurement that
+    /// motivated `BrandMark`: twelve of the operator's fourteen cards landed on
+    /// two of these shapes, so as an identity system this was weak — but as the
+    /// thing that draws when a resource is missing it is exactly right, because
+    /// the alternative is the blank square. It is still asserted to resolve.
     ///
     /// Chosen so SHAPE alone separates them, for the same reason
     /// `ItemStatus.symbolName` is: the icons sit at 30 pt in a corner and will
@@ -388,7 +426,13 @@ public extension StackGlyph {
             let all = kinds.map(\.label).joined(separator: " · ")
             let help = kinds.count > 1 ? "\(primary.label) — detectado: \(all)"
                                        : primary.label
-            return StackGlyph(symbol: primary.symbolName, help: help, isStack: true)
+            // A mark rides along here and ONLY here. `.none` and `.unmeasured`
+            // stay markless on purpose: the brand marks say "built with X", and
+            // there is no X in either of those cases — a role fallback wearing
+            // a logo would be the confident false claim this screen spent four
+            // commits removing, just prettier.
+            return StackGlyph(symbol: primary.symbolName, help: help, isStack: true,
+                              mark: primary.mark)
 
         case .none(let why):
             // A NAMED neutral. The role glyph is a real statement about the

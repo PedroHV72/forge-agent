@@ -290,6 +290,70 @@ public struct GitBaselineMark: Equatable {
     }
 }
 
+/// Where the code is hosted, as a leading mark on the git row.
+///
+/// THE RULE THIS TYPE ENFORCES: a host mark means the remote was MEASURED to be
+/// that host. It is never inferred from a project's name, never defaulted to
+/// GitHub because most repositories are, and never drawn at all when the remote
+/// could not be read. All four of the operator's checked repositories are
+/// `github.com` today, which is exactly the condition under which "just always
+/// draw the octocat" would look right and be wrong on the fifth.
+///
+/// SILENCE IS NOT AVAILABLE, so the absences do not simply omit the mark and say
+/// nothing: every case carries a sentence that joins the row's tooltip. A card
+/// with no host mark can therefore always be interrogated — "sem remoto" and
+/// "não verificada" are different answers and the operator can tell which one
+/// they got, which is the property four commits of this branch were spent
+/// restoring.
+public struct GitHostMark: Equatable {
+    /// The brand mark, or `nil` for every case that is not a recognised host.
+    /// There is no SF Symbol fallback here, and that is deliberate: `StackGlyph`
+    /// falls back because its slot must never be empty, while this mark is an
+    /// OPTIONAL adornment on a row that is already complete without it. A
+    /// generic cloud glyph standing in for "some host" would claim a
+    /// measurement nobody made.
+    public let mark: BrandMark?
+    /// Words for the host, for the row's tooltip. Never empty.
+    public let help: String
+    /// True when a real host was measured — the flag the view uses to decide
+    /// whether to draw anything, without re-deriving it from `mark`.
+    public let isMeasured: Bool
+
+    public init(mark: BrandMark?, help: String, isMeasured: Bool) {
+        self.mark = mark
+        self.help = help
+        self.isMeasured = isMeasured
+    }
+
+    /// THE COMPOSITION RULE for the host mark, in one place.
+    ///
+    /// `nil` means the caller has a repository but has not read the remote yet —
+    /// a fact that can be unknown INDEPENDENTLY of the others, exactly like
+    /// `GitBaselineMark`'s pending case, and one that must never draw as "no
+    /// remote".
+    public static func of(_ remote: GitRemote?) -> GitHostMark {
+        guard let remote else {
+            return GitHostMark(mark: nil, help: "hospedagem ainda não verificada",
+                               isMeasured: false)
+        }
+        switch remote {
+        case .host(let kind, let host):
+            return GitHostMark(mark: kind.mark,
+                               help: "hospedado no \(kind.label) (\(host))",
+                               isMeasured: true)
+        case .other(let host):
+            // A real, measured host with no vendored mark. Said in words
+            // instead — never approximated with another host's logo.
+            return GitHostMark(mark: nil, help: "remoto em \(host)", isMeasured: true)
+        case .absent(let why):
+            return GitHostMark(mark: nil, help: "\(why) — repositório só local",
+                               isMeasured: false)
+        case .unmeasured(let why):
+            return GitHostMark(mark: nil, help: why, isMeasured: false)
+        }
+    }
+}
+
 /// The git line a card should draw: an optional glyph, the text, the tone, and
 /// the sentence explaining all three.
 ///
@@ -325,18 +389,30 @@ public struct GitGlyph: Equatable {
     /// What the row is claiming, in pt-BR, for `.help()`. Never empty.
     public let help: String
     public let tone: GitTone
+    /// The vendored branch mark to draw INSTEAD of `symbol`, or `nil` for the
+    /// states that deliberately draw nothing — and for `failed`, whose warning
+    /// triangle is an SF Symbol and must stay one. Same degradation rule as
+    /// `StackGlyph.mark`: the view draws this when it resolves and `symbol`
+    /// when it does not, so the row never loses its mark to a missing resource.
+    public let mark: BrandMark?
+    /// Where the code is hosted. Always present — its own absences are named —
+    /// so the row's tooltip can state the host question in every state.
+    public let host: GitHostMark
     /// The trailing default-branch mark, or `nil` for the states where there is
     /// no repository to compare — `absent`, `failed` and `pending` cannot have
     /// drifted from a default branch, because nothing established they have one.
     public let baseline: GitBaselineMark?
 
     public init(symbol: String?, text: String, help: String, tone: GitTone,
-                baseline: GitBaselineMark? = nil) {
+                baseline: GitBaselineMark? = nil, mark: BrandMark? = nil,
+                host: GitHostMark = GitHostMark.of(nil)) {
         self.symbol = symbol
         self.text = text
         self.help = help
         self.tone = tone
         self.baseline = baseline
+        self.mark = mark
+        self.host = host
     }
 
     /// SF Symbol for a branch. One constant, so the mark cannot be spelled
@@ -350,34 +426,62 @@ public struct GitGlyph: Equatable {
     /// blank square this line of work removes.
     public static let branchSymbol = "arrow.trianglehead.branch"
 
+    /// The vendored branch mark — Octicons' `git-branch`, GitHub's own set.
+    ///
+    /// ONE VISUAL SYSTEM PER CONCEPT is what decides this. With a host mark now
+    /// on the same row, an Apple-drawn branch arrow sitting beside a Simple
+    /// Icons octocat is a visible seam at 9 pt — two drawing conventions, two
+    /// stroke weights, for one idea. Octicons is git's own vocabulary and the
+    /// natural neighbour of the host marks. `branchSymbol` stays as the
+    /// fallback, so a build with no resources draws last week's row.
+    public static let branchMark = BrandMark.gitBranch
+
     /// THE COMPOSITION RULE, in one place.
     ///
     /// `nil` means the caller has not measured git yet — which the digest
     /// cannot know, because deferring the probe is the CALLER's decision.
-    public static func of(_ field: DigestGitField?) -> GitGlyph {
+    ///
+    /// `remote` is a SECOND deferrable measurement and defaults to `nil`, which
+    /// renders as "not verified yet" rather than as "no remote". A caller that
+    /// paid for git may or may not have paid for the config read, and those are
+    /// different facts.
+    public static func of(_ field: DigestGitField?, remote: GitRemote? = nil) -> GitGlyph {
+        // Composed once, for every branch below: the host question has an
+        // answer in every state — including "there is no repository to host" —
+        // and the tooltip says it in all of them.
+        let host = GitHostMark.of(remote)
         switch field {
         case .state(let s):
             return GitGlyph(symbol: branchSymbol,
                             text: s.line,
-                            help: s.help,
+                            help: s.help + " — " + host.help,
                             tone: s.dirty ? .dirty : .clean,
-                            baseline: GitBaselineMark.of(s.baseline))
+                            baseline: GitBaselineMark.of(s.baseline),
+                            mark: branchMark,
+                            host: host)
         case .absent(let why):
             // No glyph: the sentence IS the whole row, and a mark here would
             // be one more shape competing with the branch mark above it.
+            // The host sentence is NOT appended here, nor to the two states
+            // below, and the omission is reasoned: with no repository there is
+            // no remote to have, so "hospedagem não verificada" would answer a
+            // question the row never raised. `host` is still carried, so the
+            // three-way distinction the type protects is available structurally
+            // — it is only the WORDING that is spared a redundant clause.
             return GitGlyph(symbol: nil, text: why,
                             help: "git respondeu: não há repositório aqui",
-                            tone: .absent)
+                            tone: .absent, host: host)
         case .unavailable(let why):
             // Never "sem git". Git was asked and did not answer, which is a
             // different fact from there being no repository, and the reason it
             // arrived with is kept on hover.
             return GitGlyph(symbol: "exclamationmark.triangle",
-                            text: "git não respondeu", help: why, tone: .failed)
+                            text: "git não respondeu", help: why, tone: .failed,
+                            host: host)
         case .none:
             return GitGlyph(symbol: nil, text: "git…",
                             help: "git ainda não consultado — a sonda roda fora do ciclo de recarga",
-                            tone: .pending)
+                            tone: .pending, host: host)
         }
     }
 }
@@ -431,14 +535,22 @@ public struct ProjectDigest: Equatable {
     public let identity: DigestText
     public let activity: DigestActivityField
     public let git: DigestGitField
+    /// Where `origin` lives. On the CHEAP path deliberately, unlike `git`: it
+    /// is one head-bounded read of `.git/config` with no process, in the same
+    /// class as the PROJECT.md read (0.29 ms/card), whereas the git status probe
+    /// is ~102 ms and had to be staged off the reload cycle. Splitting it out
+    /// would buy nothing and would give the card a fifth loading state.
+    public let remote: GitRemote
 
     public init(role: ProjectRole, repos: Int?, identity: DigestText,
-                activity: DigestActivityField, git: DigestGitField) {
+                activity: DigestActivityField, git: DigestGitField,
+                remote: GitRemote = .unmeasured("remoto não verificado")) {
         self.role = role
         self.repos = repos
         self.identity = identity
         self.activity = activity
         self.git = git
+        self.remote = remote
     }
 
     /// `"workspace · 33 repos"`, or just `"workspace"` when the count was
@@ -523,7 +635,8 @@ extension ProjectDigest {
             repos: repos,
             identity: loadIdentity(path: path, fileManager: fm),
             activity: loadActivity(path: path, fileManager: fm, now: now, calendar: calendar),
-            git: loadGit(path: path, probe: probe)
+            git: loadGit(path: path, probe: probe),
+            remote: GitRemoteHost.origin(at: path, fileManager: fm)
         )
     }
 

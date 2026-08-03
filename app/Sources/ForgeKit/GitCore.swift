@@ -102,6 +102,211 @@ public enum GitBaseline: Equatable {
     }
 }
 
+// MARK: - Where the code is hosted
+
+/// A git host a mark exists for. Deliberately three.
+///
+/// A case is added when a mark is vendored for it and not before: the whole
+/// value of a host mark is that it is RECOGNISED without decoding, and a case
+/// with no mark would have to fall back to a letter, which is worse than the
+/// honest `.other` below (which says the host's name in words).
+public enum GitHostKind: String, Equatable, CaseIterable, Sendable {
+    case github, gitlab, bitbucket
+
+    /// Host suffixes that identify it. Matched on a DOTTED LABEL boundary, not
+    /// by substring: `github.com` matches `ssh.github.com` and never
+    /// `notgithub.com` nor `github.com.evil.example`.
+    ///
+    /// The consequence, declared rather than hidden: a GitHub Enterprise on the
+    /// customer's own domain (`git.company.com`) is NOT recognised and renders
+    /// as `.other` — its name in words. That is the correct failure. The only
+    /// way to catch it would be to guess from a hostname, and a guessed logo is
+    /// exactly what this type exists to prevent.
+    public var domains: [String] {
+        switch self {
+        case .github: return ["github.com"]
+        case .gitlab: return ["gitlab.com"]
+        case .bitbucket: return ["bitbucket.org"]
+        }
+    }
+
+    public var label: String {
+        switch self {
+        case .github: return "GitHub"
+        case .gitlab: return "GitLab"
+        case .bitbucket: return "Bitbucket"
+        }
+    }
+
+    public var mark: BrandMark {
+        switch self {
+        case .github: return .github
+        case .gitlab: return .gitlab
+        case .bitbucket: return .bitbucket
+        }
+    }
+}
+
+/// Where a repository's `origin` lives, or a NAMED reason that is not known.
+///
+/// FOUR cases, and the split is the whole point of the type. A host mark is a
+/// CLAIM — drawing GitHub's octocat next to a GitLab remote is the same failure
+/// as printing "sem git" for a real repository, only wearing a logo. So:
+/// `.host` is drawn as a mark, `.other` is said in words (the host's own name),
+/// and neither absence is allowed to borrow the other's rendering. All four of
+/// the operator's checked repositories are `github.com` today, which is exactly
+/// the condition under which "just always draw the octocat" looks right and is
+/// wrong on the fifth.
+public enum GitRemote: Equatable {
+    /// Measured, and it is a host with a vendored mark.
+    case host(GitHostKind, String)
+    /// Measured, and it is a host with no mark — a self-hosted Gitea, a
+    /// corporate GitLab on its own domain, `git.sr.ht`. The name is carried so
+    /// the card can say it rather than shrug.
+    case other(String)
+    /// Measured: this repository has no remote at all. Local-only is a real and
+    /// common state, not a failure.
+    ///
+    /// `absent` and not `none`, which would have matched the vocabulary of
+    /// `GitBaseline`: a case literally named `none` on an enum that is passed
+    /// around as `GitRemote?` collides with `Optional.none` at every `switch`,
+    /// and the compiler resolves that quietly in favour of one of them. The
+    /// wording is `DigestGitField.absent`'s anyway — "measured, and there is
+    /// none" — so this is the established name, not a new one.
+    case absent(String)
+    /// NOT measured — no `.git`, unreadable config, unparseable URL. Never
+    /// collapses into `.absent`, for the same reason `DigestGitField` refuses to.
+    case unmeasured(String)
+
+    public var kind: GitHostKind? {
+        if case .host(let k, _) = self { return k }
+        return nil
+    }
+}
+
+public enum GitRemoteHost {
+
+    /// The `origin` remote of the repository at `path`, read from `.git/config`.
+    ///
+    /// NO SPAWN. The URL is already on disk and git is the one expensive field
+    /// on this screen (~102 ms/card for the status probe alone, which is why
+    /// that one lives off the reload path). A second process to learn a string
+    /// that `config` states in plain text would double the cost of the row to
+    /// add a logo to it. The read is head-bounded for the same reason the
+    /// PROJECT.md read is: a pathological config must not be read whole on a
+    /// timer.
+    ///
+    /// Worktree-aware via `GitDefaultBranch.commonDir` — `config` lives in the
+    /// COMMON dir, so a linked worktree (which Forge itself creates in
+    /// `forge_isolation.mode: worktree`) has none of its own, and a resolver
+    /// that stopped at the first hop would report every worktree Forge makes as
+    /// remoteless.
+    ///
+    /// `origin` specifically, not "any remote": `origin` is what every other
+    /// part of this codebase means by the remote (`GitDefaultBranch` resolves
+    /// `refs/remotes/origin/HEAD`, `forge-isolation.js` fetches `origin`), and a
+    /// repo with several remotes has no single answer to "where is this hosted"
+    /// that a card could draw.
+    public static let configReadLimit = 64 * 1024
+
+    public static func origin(at path: String,
+                              fileManager fm: FileManager = .default) -> GitRemote {
+        guard let dir = GitDefaultBranch.commonDir(repoPath: path, fileManager: fm) else {
+            return .unmeasured("sem .git — hospedagem não verificada")
+        }
+        guard let text = Ledger.readHead(path: dir + "/config", limit: configReadLimit) else {
+            return .unmeasured("config do git ilegível")
+        }
+        guard let url = originURL(inConfig: text) else {
+            return .absent("sem remoto")
+        }
+        guard let host = host(ofRemoteURL: url) else {
+            return .unmeasured("URL de remoto não reconhecida")
+        }
+        for kind in GitHostKind.allCases
+        where kind.domains.contains(where: { matches(host: host, domain: $0) }) {
+            return .host(kind, host)
+        }
+        return .other(host)
+    }
+
+    /// The `url` of `[remote "origin"]`, from git config's INI-ish text.
+    ///
+    /// Section-aware rather than a grep for `url =`: a config with several
+    /// remotes holds several `url` lines, and the first one is not necessarily
+    /// origin's — a fork checkout would draw the logo of the UPSTREAM. Not a
+    /// general INI parser either; this reads exactly the two constructs git
+    /// writes for a remote.
+    public static func originURL(inConfig text: String) -> String? {
+        var inOrigin = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                // `[remote "origin"]`. The section name is case-insensitive in
+                // git while the subsection name is case-sensitive.
+                inOrigin = line.lowercased().hasPrefix("[remote ") && line.contains("\"origin\"")
+                continue
+            }
+            guard inOrigin, let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[line.startIndex..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+            guard key == "url" else { continue }
+            let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    /// The host of a git remote URL, in every shape git accepts.
+    ///
+    ///     https://github.com/u/r.git        → github.com
+    ///     ssh://git@github.com:22/u/r.git   → github.com
+    ///     git@github.com:u/r.git            → github.com   (scp-like)
+    ///     /Users/x/repo.git, ../bare        → nil           (a path is not a host)
+    ///
+    /// The scp-like form is not a URL and `URLComponents` returns nil for it,
+    /// which is why it is handled before any parsing: it is also the form git
+    /// writes by default for an SSH clone, so treating it as unparseable would
+    /// leave most real repositories unmeasured.
+    public static func host(ofRemoteURL raw: String) -> String? {
+        let url = raw.trimmingCharacters(in: .whitespaces)
+        guard !url.isEmpty else { return nil }
+        // A local path or a `file:` URL is a real remote and has no host. `nil`
+        // here becomes `.unmeasured`, never a host mark.
+        if url.hasPrefix("/") || url.hasPrefix(".") || url.hasPrefix("file:") { return nil }
+
+        if let range = url.range(of: "://") {
+            let rest = url[range.upperBound...]
+            return clean(authority: String(rest.prefix(while: { $0 != "/" })))
+        }
+        // scp-like: `[user@]host:path`. The colon must come before any slash,
+        // otherwise `foo/bar:baz` (a path with a colon in it) would read as a host.
+        if let colon = url.firstIndex(of: ":") {
+            let head = url[url.startIndex..<colon]
+            if !head.contains("/") { return clean(authority: String(head)) }
+        }
+        return nil
+    }
+
+    /// Strips credentials and port from an authority, lowercased.
+    static func clean(authority: String) -> String? {
+        var a = authority
+        if let at = a.lastIndex(of: "@") { a = String(a[a.index(after: at)...]) }
+        if let colon = a.firstIndex(of: ":") { a = String(a[a.startIndex..<colon]) }
+        a = a.lowercased()
+        return a.isEmpty ? nil : a
+    }
+
+    /// Domain match by LABEL boundary, never by substring.
+    ///
+    /// `github.com` matches `github.com` and `ssh.github.com`; it does not match
+    /// `notgithub.com`, and — the one that actually matters — it does not match
+    /// `github.com.attacker.example`, because the check is a suffix on a dotted
+    /// boundary rather than `contains`.
+    public static func matches(host: String, domain: String) -> Bool {
+        host == domain || host.hasSuffix("." + domain)
+    }
+}
+
 /// Which branch a project treats as its default — `main` or `master`.
 ///
 /// PRECEDENCE IS SHARED WITH `gitDefaultBranch()` in `scripts/forge-isolation.js`
@@ -183,8 +388,12 @@ public enum GitDefaultBranch {
     /// that directory holds a `commondir` pointing back at the shared refs. A
     /// resolver that stopped at the first hop would find no `refs/heads/main` in
     /// any worktree Forge makes and report every one of them as undetermined.
-    static func commonDir(repoPath: String) -> String? {
-        let fm = FileManager.default
+    /// `public` since `GitRemoteHost` needs the same worktree-aware hop to find
+    /// `config`. A second implementation of the relation between a checkout and
+    /// its git directory is how the two would drift, and this one already
+    /// carries the linked-worktree case that a naive version gets wrong.
+    public static func commonDir(repoPath: String,
+                                 fileManager fm: FileManager = .default) -> String? {
         let dotGit = repoPath + "/.git"
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: dotGit, isDirectory: &isDir) else { return nil }

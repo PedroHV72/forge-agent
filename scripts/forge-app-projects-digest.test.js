@@ -193,9 +193,25 @@ test('o card nunca imprime "sem git" — a ausência medida vem nomeada do Forge
   const end = code.indexOf('private func gitStyle', i);
   assert(end > i, 'gitStyle não encontrado depois de gitLine — a fatia abaixo perdeu o fim');
   const body = code.slice(i, end);
-  assert(/GitGlyph\.of\(gitField\)/.test(body),
+  assert(/GitGlyph\.of\(gitField\b/.test(body),
     'gitLine não delega mais a GitGlyph.of — a regra de composição da linha de git voltou ' +
     'para dentro da view, fora do alcance do ForgeKitTests');
+  // Este pin FICOU MAIS APERTADO quando a linha ganhou a marca do host, não mais
+  // frouxo: a chamada deixou de ser `of(gitField)` exata, então em lugar de
+  // relaxar o regex ele passou a exigir também DE ONDE vem o remoto. A view
+  // repassa o que o digest mediu e não lê `.git/config` por conta própria —
+  // senão haveria um segundo leitor de remoto, fora do alcance do ForgeKitTests
+  // e livre para desenhar um logo que ninguém mediu.
+  assert(/GitGlyph\.of\(gitField,\s*remote:\s*digest\?\.remote\)/.test(body),
+    'gitLine não repassa mais `digest?.remote` — ou a view parou de informar o host, ou passou ' +
+    'a derivá-lo sozinha; a marca de host é uma AFIRMAÇÃO e tem de vir de uma medição do digest');
+  assert(!/GitRemoteHost|GitHostKind|\.git\/config/.test(body),
+    'gitLine lê o remoto por conta própria — um segundo leitor é como os dois divergem, e este ' +
+    'desenha um logo');
+  // A marca só pode ser desenhada quando o ForgeKit disse que HÁ marca. Um `if`
+  // sobre o host cru na view seria a view decidindo o que foi medido.
+  assert(/g\.host\.mark/.test(body),
+    'gitLine não consulta mais `g.host.mark` — a decisão de desenhar o logo saiu do ForgeKit');
   assert(!/case\s+\.(state|absent|unavailable)\b/.test(body),
     'gitLine voltou a abrir o DigestGitField sozinha — com o campo em mãos ela pode desenhar ' +
     'branch para um diretório que não é repositório, que é exatamente o bug');
@@ -205,9 +221,12 @@ test('o card nunca imprime "sem git" — a ausência medida vem nomeada do Forge
 
   const digest = stripComments(fs.readFileSync(
     path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift'), 'utf8'));
-  const j = digest.indexOf('static func of(_ field: DigestGitField?)');
+  // Prefixo sem o parêntese de fecho: a regra ganhou um segundo parâmetro
+  // (`remote:`) e uma âncora que exigisse `)` acusaria a assinatura em vez da
+  // regra. O que este teste protege são os quatro casos abaixo, não a aridade.
+  const j = digest.indexOf('static func of(_ field: DigestGitField?');
   assert(j >= 0, 'GitGlyph.of não encontrado — a regra de composição da linha de git sumiu');
-  const rule = digest.slice(j, j + 1400);
+  const rule = digest.slice(j, j + 1800);
   for (const [caso, porque] of [
     ['.state', 'o estado medido com repositório'],
     ['.absent', 'a ausência MEDIDA — a única que pode ler "sem git"'],
@@ -325,6 +344,99 @@ test('a lógica pura mora no ForgeKit, testável, e a view só desenha', () => {
   assert(!/FileManager|ProcessInfo|homeDirectory/.test(attn),
     'ProjectAttention.swift toca o filesystem ou o ambiente — a pureza é o que permite testar ' +
     'a mesma coisa duas vezes (o $HOME difere entre `swift run` e run-tests.js)');
+});
+
+// --- 5. Marcas vendorizadas: o caminho do arquivo até a tela ---------------
+//
+// `ForgeKitTests` prova o que dá para provar de dentro do processo de teste:
+// que toda `BrandMark` resolve, carrega, é template e rasteriza. O que ele NÃO
+// alcança é a montagem do `.app` — e é justamente ali que mora a falha
+// invisível: `swift run` acha o resource bundle ao lado do executável, então a
+// suíte inteira fica verde enquanto o `.app` montado pelo `build.sh`, cujo
+// binário mora em `Contents/MacOS` sem bundle nenhum ao lado, não acha nada.
+// Estes pins existem porque essa lacuna não aparece em teste nem em crash: o
+// app abre normalmente e desenha o fallback (ou, sem fallback, nada).
+
+test('as marcas vendorizadas estão no repositório, com a licença que exigem', () => {
+  const dir = path.join(repoRoot, 'app/Sources/ForgeKit/Resources/icons');
+  assert(fs.existsSync(dir), 'a pasta de ícones vendorizados sumiu');
+  const svgs = fs.readdirSync(dir).filter(f => f.endsWith('.svg')).sort();
+  assert(svgs.length > 0, 'nenhum SVG vendorizado — pin cego');
+
+  // Todo caso do enum tem arquivo. O sentido inverso (arquivo sem caso) é
+  // conferido pelo ForgeKitTests contra o BUNDLE, que é onde ele importa.
+  const brand = fs.readFileSync(
+    path.join(repoRoot, 'app/Sources/ForgeKit/BrandMark.swift'), 'utf8');
+  const casos = [...brand.matchAll(/case\s+\w+\s*=\s*"([^"]+)"/g)].map(m => m[1]);
+  assert(casos.length > 0, 'nenhum caso de BrandMark encontrado — o regex quebrou');
+  for (const c of casos) {
+    assert(svgs.includes(c + '.svg'),
+      `BrandMark.${c} não tem arquivo — um nome que não resolve é um quadrado em branco`);
+  }
+
+  // MIT exige o aviso JUNTO das cópias. É a única parte deste trabalho em que
+  // um descuido seria uma violação de licença e não um bug.
+  const lic = path.join(dir, 'LICENSE-octicons.txt');
+  assert(fs.existsSync(lic), 'a licença MIT dos Octicons não viaja com as cópias');
+  assert(/MIT License/.test(fs.readFileSync(lic, 'utf8')), 'LICENSE-octicons.txt não é o MIT');
+  // Simple Icons é CC0 e não exige aviso, mas a procedência tem de ser
+  // rastreável: sem ela, ninguém sabe o que são estes arquivos nem como
+  // re-obtê-los.
+  const prov = path.join(dir, 'PROVENANCE.md');
+  assert(fs.existsSync(prov), 'PROVENANCE.md sumiu — os arquivos viraram anônimos');
+  const provText = fs.readFileSync(prov, 'utf8');
+  for (const fonte of ['simpleicons.org', 'octicons', 'CC0']) {
+    assert(provText.includes(fonte), `PROVENANCE.md não cita mais ${fonte}`);
+  }
+  for (const c of casos) {
+    assert(provText.includes(c + '.svg'), `PROVENANCE.md não registra a origem de ${c}.svg`);
+  }
+});
+
+test('os recursos chegam ao .app — a lacuna que nenhum teste Swift alcança', () => {
+  const pkg = fs.readFileSync(path.join(repoRoot, 'app/Package.swift'), 'utf8');
+  assert(/name:\s*"ForgeKit"[\s\S]{0,200}?resources:\s*\[[^\]]*Resources\/icons/.test(pkg),
+    'ForgeKit não declara mais os ícones como resources — sem isso não existe bundle nenhum ' +
+    'e `Bundle.module` não acha os arquivos em lugar algum');
+
+  const build = fs.readFileSync(path.join(repoRoot, 'app/build.sh'), 'utf8');
+  const iBin = build.indexOf('Contents/MacOS/Forge"');
+  const iBundle = build.indexOf('*.bundle');
+  const iSign = build.indexOf('codesign --force');
+  assert(iBundle > 0,
+    'build.sh não copia mais os *.bundle — o app montado perde os recursos e a lacuna é ' +
+    'INVISÍVEL: os testes passam (swift run acha o bundle ao lado do binário) e o app abre');
+  assert(/cp -R "\$\{BIN_DIR\}\/"\*\.bundle "\$\{BUNDLE\}\/Contents\/Resources\/"/.test(build),
+    'o destino da cópia mudou — Contents/Resources é onde o acessor gerado pelo SwiftPM procura ' +
+    '(Bundle.main.resourceURL); em Contents/MacOS ele não olha');
+  assert(iBin < iBundle && iBundle < iSign,
+    'a cópia dos bundles saiu da ordem: precisa vir DEPOIS do binário (o bin path só é conhecido ' +
+    'ali) e ANTES do codesign (a assinatura cobre o conteúdo do bundle)');
+});
+
+test('a marca nunca é desenhada sem piso — um recurso ausente custa o ícone antigo, não um vazio', () => {
+  // A degradação é a razão de `brandOrSymbol` ser uma função e não dois call
+  // sites: `BrandArt.image` devolve nil exatamente na condição que nenhum teste
+  // alcança (bundle fora do .app). Desenhar a marca sem `else` transformaria
+  // essa condição no quadrado em branco que este trabalho inteiro remove.
+  const i = code.indexOf('private func brandOrSymbol');
+  assert(i >= 0, 'brandOrSymbol sumiu — a degradação para SF Symbol saiu da view');
+  const body = code.slice(i, i + 700);
+  assert(/if let mark,\s*let img = BrandArt\.image\(mark\)/.test(body),
+    'brandOrSymbol não checa mais se a imagem carregou — um `!` ali é o quadrado em branco');
+  assert(/else\s*\{[\s\S]{0,120}Image\(systemName:\s*symbol\)/.test(body),
+    'brandOrSymbol perdeu o ramo de fallback — sem ele, um bundle sem recursos desenha NADA');
+  assert(/renderingMode\(\.template\)/.test(body),
+    'a marca deixou de ser template — para de tingir com o tom do card e ignora o modo escuro');
+
+  // E o ícone do projeto passa pela mesma função, em vez de desenhar a marca
+  // direto (que seria o mesmo furo, num segundo lugar).
+  const j = code.indexOf('private var projectIcon');
+  assert(j >= 0, 'projectIcon sumiu');
+  const icon = code.slice(j, code.indexOf('private func brandOrSymbol', j) + 1);
+  assert(/brandOrSymbol\(glyph\?\.mark,\s*symbol:/.test(icon),
+    'projectIcon não usa mais brandOrSymbol — ou voltou ao SF Symbol puro, ou desenha a marca ' +
+    'sem piso');
 });
 
 console.log('');

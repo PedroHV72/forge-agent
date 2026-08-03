@@ -83,6 +83,26 @@ if [ ! -f "$BIN" ]; then
 fi
 cp "$BIN" "${BUNDLE}/Contents/MacOS/Forge"
 
+# ── SwiftPM resource bundles ──────────────────────────────────────────────────
+# Copying only the binary was enough until ForgeKit declared `resources:`. It is
+# not any more, and the gap is INVISIBLE: `Bundle.module` resolves next to the
+# executable under `swift run`, so every test passes, and the assembled .app —
+# whose executable sits in Contents/MacOS with no bundle beside it — finds
+# nothing and draws blank. Contents/Resources is where SwiftPM's generated
+# accessor looks second (Bundle.main.resourceURL), which is why this is the
+# destination and not Contents/MacOS.
+#
+# The glob is guarded by a `compgen` test rather than left bare: under `set -u`
+# with `nullglob` unset, an unmatched glob expands to the literal pattern and
+# `cp` would fail the build on a configuration that legitimately has no bundles.
+BIN_DIR="$(dirname "$BIN")"
+if compgen -G "${BIN_DIR}/"'*.bundle' >/dev/null; then
+  echo "▸ Copiando bundles de recursos (ícones vendorizados)"
+  cp -R "${BIN_DIR}/"*.bundle "${BUNDLE}/Contents/Resources/"
+else
+  echo "  aviso: nenhum *.bundle em ${BIN_DIR} — marcas vendorizadas cairão no SF Symbol"
+fi
+
 ICON="${APP_DIR}/Forge.icns"
 if [ ! -f "$ICON" ]; then
   echo "▸ Gerando ícone"

@@ -698,9 +698,17 @@ struct ProjectCard: View {
     /// Finder colour TAGS are untouched and still render as dots beside the
     /// name: those carry real information whenever the operator has set them,
     /// which is exactly what the folder icon did not.
+    ///
+    /// THE MARK, WHEN THERE IS ONE. The stack is now drawn with the stack's
+    /// REAL mark (Simple Icons, vendored — see `BrandMark`), because the SF
+    /// Symbols this shipped with were shapes that resemble marks rather than
+    /// the marks themselves, and measured on the operator's registry twelve of
+    /// fourteen cards landed on just two of those shapes. `brandOrSymbol` keeps
+    /// the SF Symbol as the fallback, so a build whose resource bundle did not
+    /// ship draws last week's icon and never an empty slot.
     @ViewBuilder private var projectIcon: some View {
         let glyph = stack.map { StackGlyph.of($0, role: role) }
-        Image(systemName: glyph?.symbol ?? "circle.dashed")
+        brandOrSymbol(glyph?.mark, symbol: glyph?.symbol ?? "circle.dashed", size: 22)
             .font(.system(size: 22, weight: .regular))
             .symbolRenderingMode(.hierarchical)
             // Three tones for three kinds of claim, so the glyph's confidence
@@ -713,6 +721,35 @@ struct ProjectCard: View {
             .frame(width: 30, height: 30)
             .help(glyph?.help ?? "detectando stack…")
             .accessibilityLabel(glyph?.help ?? "detectando stack")
+    }
+
+    /// A vendored brand mark, or the SF Symbol it falls back to.
+    ///
+    /// THE FALLBACK IS THE WHOLE REASON THIS IS A FUNCTION rather than two call
+    /// sites. `BrandArt.image` returns `nil` when the resource bundle did not
+    /// make it into the `.app` — a condition that is invisible in tests, because
+    /// `swift run` finds the bundle next to the executable and only the
+    /// assembled bundle can be missing it. Degrading to the symbol means that
+    /// failure costs the icon that shipped last week; drawing the mark
+    /// unconditionally would cost a blank square, which is the exact failure
+    /// this line of work exists to remove.
+    ///
+    /// Template rendering (`BrandArt` sets `isTemplate`, and `.template` here
+    /// says so to SwiftUI) is what lets the caller's `.foregroundStyle` tint the
+    /// mark — so it follows dark mode and the accent colour exactly as the
+    /// symbol did. Nothing else about the mark is altered.
+    @ViewBuilder
+    private func brandOrSymbol(_ mark: BrandMark?, symbol: String, size: CGFloat) -> some View {
+        if let mark, let img = BrandArt.image(mark) {
+            Image(nsImage: img)
+                .renderingMode(.template)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+        } else {
+            Image(systemName: symbol)
+        }
     }
 
     /// What the project IS, what it last delivered, and where its tree stands.
@@ -783,10 +820,26 @@ struct ProjectCard: View {
     /// the trailing column is the grammar this card already speaks — the
     /// delivery row above puts its age in exactly that position.
     @ViewBuilder private var gitLine: some View {
-        let g = GitGlyph.of(gitField)
+        let g = GitGlyph.of(gitField, remote: digest?.remote)
         HStack(spacing: 4) {
+            // The host mark leads the row, and appears if and only if the
+            // remote was MEASURED to be a host a mark exists for. A repository
+            // with no remote, an unreadable config, and a host with no vendored
+            // mark all draw nothing here and say which one they are in the
+            // tooltip — a logo is a claim, and this row has already shipped one
+            // false claim about the operator's disk.
+            if let hm = g.host.mark, let img = BrandArt.image(hm) {
+                Image(nsImage: img)
+                    .renderingMode(.template).resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 9, height: 9)
+                    .foregroundStyle(.tertiary)
+                    .help(g.host.help)
+                    .accessibilityLabel(g.host.help)
+            }
             if let symbol = g.symbol {
-                Image(systemName: symbol).font(.system(size: 9))
+                brandOrSymbol(g.mark, symbol: symbol, size: 9)
+                    .font(.system(size: 9))
                     .symbolRenderingMode(.hierarchical)
             }
             Text(g.text).font(.system(size: 10)).monospaced()

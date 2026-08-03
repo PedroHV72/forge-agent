@@ -6016,6 +6016,303 @@ test("Git.status enche a divergência da padrão junto — este repo, medido de 
     }
 }
 
+// MARK: - Marcas vendorizadas: todo nome desenha, e nenhuma marca é um palpite
+
+test("BrandMark: toda marca resolve DE VERDADE no bundle — e vira imagem template") {
+    // O mesmo teste que os SF Symbols já têm, pela mesma razão: um nome que não
+    // resolve renderiza como um quadrado em branco, que é exatamente o slot
+    // vazio que este trabalho existe para remover. Aqui é ainda mais
+    // necessário, porque o nome não é validado por ninguém em tempo de
+    // compilação — o arquivo pode simplesmente não ter sido copiado.
+    assertFalse(BrandMark.allCases.isEmpty, "nenhuma marca exercitada = teste cego")
+    for m in BrandMark.allCases {
+        guard let u = BrandArt.url(m) else {
+            assertTrue(false, "marca sem arquivo no bundle: \(m.assetName)")
+            continue
+        }
+        assertTrue(FileManager.default.fileExists(atPath: u.path), "URL não existe: \(u.path)")
+        guard let img = BrandArt.image(m) else {
+            assertTrue(false, "arquivo existe mas o AppKit não desenhou: \(m.assetName)")
+            continue
+        }
+        // Template é o que faz a marca aceitar o tom do card (e o modo escuro).
+        // Uma marca que ignora o tema é PIOR que o SF Symbol que ela substitui.
+        assertTrue(img.isTemplate, "\(m.assetName) não é template — não vai tingir")
+        assertTrue(img.size.width > 0 && img.size.height > 0, "\(m.assetName) tem tamanho zero")
+        // E rasteriza mesmo: `NSImage(contentsOf:)` aceita arquivos que depois
+        // não desenham nada. Forçar o draw é o que separa "carregou" de "aparece".
+        let alvo = NSImage(size: NSSize(width: 24, height: 24))
+        alvo.lockFocus()
+        img.draw(in: NSRect(x: 0, y: 0, width: 24, height: 24))
+        alvo.unlockFocus()
+        assertTrue(alvo.isValid, "\(m.assetName) não rasterizou")
+    }
+}
+
+test("BrandMark: o enum e a pasta de recursos não podem divergir — nos DOIS sentidos") {
+    // Um caso sem arquivo é o quadrado em branco (coberto acima). Um arquivo sem
+    // caso é peso morto que ninguém desenha — e, mais importante, é o sintoma de
+    // uma marca renomeada pela metade.
+    guard let urls = BrandArt.bundle.urls(forResourcesWithExtension: BrandArt.fileExtension,
+                                          subdirectory: BrandArt.directory) else {
+        return assertTrue(false, "a pasta de ícones não existe no bundle — recursos não foram copiados")
+    }
+    let noDisco = Set(urls.map { $0.deletingPathExtension().lastPathComponent })
+    let noEnum = Set(BrandMark.allCases.map(\.assetName))
+    assertEqual(noDisco, noEnum,
+                "só no disco: \(noDisco.subtracting(noEnum).sorted()) — só no enum: \(noEnum.subtracting(noDisco).sorted())")
+}
+
+test("BrandMark: a licença MIT dos Octicons viaja JUNTO com as cópias") {
+    // MIT exige o aviso junto das cópias. Não é formalidade: `git-branch.svg`
+    // é da GitHub, e distribuir o arquivo sem o aviso é a única parte deste
+    // trabalho que seria uma violação e não um bug.
+    guard let lic = BrandArt.bundle.url(forResource: "LICENSE-octicons",
+                                        withExtension: "txt",
+                                        subdirectory: BrandArt.directory),
+          let texto = try? String(contentsOf: lic, encoding: .utf8) else {
+        return assertTrue(false, "LICENSE dos Octicons não está junto dos arquivos")
+    }
+    assertTrue(texto.contains("MIT License"), "o texto não é a licença MIT")
+    assertTrue(texto.contains("GitHub"), "a licença perdeu o detentor do copyright")
+}
+
+test("StackGlyph: a marca REAL substitui o símbolo, mas o símbolo continua o piso") {
+    // Medido nos 14 projetos do operador antes desta troca: 12 dos 14 caíam em
+    // DUAS formas (triângulo e hexágono) a 30 pt. Marcas de verdade são o que
+    // separa; o SF Symbol fica como degradação, nunca como o quadrado vazio.
+    let g = StackGlyph.of(.detected([.next, .node]), role: .project)
+    assertEqual(g.mark, .next, "a marca segue a stack primária, não a lista inteira")
+    assertFalse(g.symbol.isEmpty, "o piso sumiu — sem símbolo, um bundle sem recursos desenha nada")
+    assertEqual(g.symbol, StackKind.next.symbolName)
+
+    // Toda stack tem marca, e são distintas entre si — uma marca repetida
+    // reintroduz exatamente o empate de formas que motivou a troca.
+    let marcas = StackKind.allCases.map(\.mark)
+    assertEqual(Set(marcas).count, StackKind.allCases.count, "marcas repetidas: \(marcas)")
+
+    // E marca NENHUMA onde não há stack: um fallback de role ou uma medição que
+    // falhou usando um logo é a afirmação falsa confiante de volta, só que
+    // bonita. O símbolo continua lá, então o slot nunca fica vazio.
+    for d in [StackDetection.none("x"), .unmeasured("y")] {
+        let f = StackGlyph.of(d, role: .workspace)
+        assertTrue(f.mark == nil, "\(d) desenhou uma marca de stack")
+        assertFalse(f.symbol.isEmpty)
+    }
+}
+
+// MARK: - GitRemoteHost: o logo do host é uma AFIRMAÇÃO, não um enfeite
+
+test("GitRemoteHost: as formas de URL que o git realmente escreve") {
+    let casos: [(String, String?)] = [
+        ("https://github.com/u/r.git", "github.com"),
+        ("http://gitlab.com/u/r", "gitlab.com"),
+        // scp-like é o que o git escreve por padrão num clone por SSH: tratá-la
+        // como ilegível deixaria a MAIORIA dos repositórios reais sem medição.
+        ("git@github.com:u/r.git", "github.com"),
+        ("ssh://git@bitbucket.org:22/u/r.git", "bitbucket.org"),
+        ("https://user:token@github.com/u/r.git", "github.com"),
+        ("https://GITHUB.COM/u/r.git", "github.com"),
+        // Caminhos são remotos legítimos e não têm host — viram `.unmeasured`,
+        // nunca um logo.
+        ("/Users/x/repo.git", nil),
+        ("../bare.git", nil),
+        ("file:///tmp/r.git", nil),
+        ("", nil),
+    ]
+    for (url, esperado) in casos {
+        assertEqual(GitRemoteHost.host(ofRemoteURL: url), esperado, "URL: \(url)")
+    }
+}
+
+test("GitRemoteHost: o casamento de domínio é por RÓTULO, não por substring") {
+    // Um `contains` faria `github.com.attacker.example` desenhar o octocat. O
+    // mark é uma afirmação sobre onde o código do operador mora.
+    assertTrue(GitRemoteHost.matches(host: "github.com", domain: "github.com"))
+    assertTrue(GitRemoteHost.matches(host: "ssh.github.com", domain: "github.com"))
+    assertFalse(GitRemoteHost.matches(host: "notgithub.com", domain: "github.com"))
+    assertFalse(GitRemoteHost.matches(host: "github.com.attacker.example", domain: "github.com"))
+    assertFalse(GitRemoteHost.matches(host: "gitlab.com", domain: "github.com"))
+}
+
+test("GitRemoteHost: o url lido é o do ORIGIN, não o primeiro que aparecer") {
+    // Um config com vários remotes tem vários `url =`, e o primeiro não é
+    // necessariamente o do origin. Um grep ingênuo mostraria o logo do fork.
+    let config = """
+    [core]
+    \trepositoryformatversion = 0
+    [remote "upstream"]
+    \turl = https://gitlab.com/outro/r.git
+    \tfetch = +refs/heads/*:refs/remotes/upstream/*
+    [remote "origin"]
+    \turl = git@github.com:mwtelles/forge.git
+    \tfetch = +refs/heads/*:refs/remotes/origin/*
+    """
+    assertEqual(GitRemoteHost.originURL(inConfig: config), "git@github.com:mwtelles/forge.git")
+    // Sem origin nenhum: nada, e não o url do upstream.
+    let semOrigin = "[remote \"upstream\"]\n\turl = https://gitlab.com/o/r.git\n"
+    assertTrue(GitRemoteHost.originURL(inConfig: semOrigin) == nil)
+}
+
+test("GitRemoteHost.origin: os quatro casos, e nenhum se passa por outro") {
+    // (a) host conhecido
+    let gh = fakeRepo("gh", [".git/config": "[remote \"origin\"]\n\turl = git@github.com:u/r.git\n"])
+    defer { try? FileManager.default.removeItem(atPath: gh) }
+    assertEqual(GitRemoteHost.origin(at: gh).kind, .github)
+
+    // (b) host REAL sem marca vendorizada: dito por extenso, jamais aproximado
+    // com o logo de outro. Um GitHub Enterprise em domínio próprio cai aqui.
+    let self_ = fakeRepo("self", [".git/config": "[remote \"origin\"]\n\turl = https://git.company.com/u/r.git\n"])
+    defer { try? FileManager.default.removeItem(atPath: self_) }
+    guard case .other(let h) = GitRemoteHost.origin(at: self_) else {
+        return assertTrue(false, "host desconhecido não deveria virar host conhecido")
+    }
+    assertEqual(h, "git.company.com")
+
+    // (c) repositório local: ausência MEDIDA
+    let local = fakeRepo("local", [".git/config": "[core]\n\tbare = false\n"])
+    defer { try? FileManager.default.removeItem(atPath: local) }
+    guard case .absent = GitRemoteHost.origin(at: local) else {
+        return assertTrue(false, "repo sem remoto deveria ser ausência medida")
+    }
+
+    // (d) nem repositório é: NÃO medido. Nunca colapsa em (c) — é a mesma
+    // distinção de três casos que `DigestGitField` existe para proteger.
+    let nada = fakeRepo("nada", ["a.txt": "x"])
+    defer { try? FileManager.default.removeItem(atPath: nada) }
+    guard case .unmeasured = GitRemoteHost.origin(at: nada) else {
+        return assertTrue(false, "'não é repo' virou 'não tem remoto'")
+    }
+}
+
+test("GitRemoteHost.origin: um worktree ligado tem host, e não é 'sem remoto'") {
+    // Forge CRIA worktrees (`forge_isolation.mode: worktree`). Um resolvedor que
+    // parasse no primeiro salto não acharia config nenhum e reportaria TODO
+    // worktree que o Forge faz como sem remoto.
+    let principal = fakeRepo("wt-main", [
+        ".git/config": "[remote \"origin\"]\n\turl = https://gitlab.com/u/r.git\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: principal) }
+    let wt = fakeRepo("wt-linked", [
+        ".git": "gitdir: \(principal)/.git/worktrees/w\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: wt) }
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: principal + "/.git/worktrees/w", withIntermediateDirectories: true)
+    fm.createFile(atPath: principal + "/.git/worktrees/w/commondir", contents: Data("../..\n".utf8))
+
+    assertEqual(GitRemoteHost.origin(at: wt).kind, .gitlab,
+                "o config vive no dir comum — o worktree não tem um próprio")
+}
+
+test("GitRemoteHost: os remotos REAIS do disco do operador, incluindo o que não ganha logo") {
+    // Varridos em ~/Development antes deste teste existir. Os quatro formatos
+    // que estão lá de verdade hoje:
+    assertEqual(GitRemoteHost.host(ofRemoteURL: "https://github.com/mwtelles/feirao-do-lu.git"),
+                "github.com")
+    assertEqual(GitRemoteHost.host(ofRemoteURL: "https://github.com/LOOK-CHINA/authz.git"),
+                "github.com")
+    assertEqual(GitRemoteHost.host(ofRemoteURL: "git@github.com:mwtelles/inten.git"), "github.com")
+
+    // `portfolio` usa um APELIDO de host do ~/.ssh/config. É um repositório do
+    // GitHub e NÃO vai receber o octocat — vai ler "remoto em github-personal".
+    //
+    // Declarado como decisão, não descoberto como bug: resolver o apelido
+    // exigiria ler o ~/.ssh/config do operador para desenhar um logo, e o
+    // caminho barato para "acertar" seria adivinhar pelo prefixo do nome —
+    // exatamente o palpite que este tipo existe para proibir. Dizer o nome que
+    // está no config é verdadeiro; desenhar o octocat porque o apelido CONTÉM
+    // "github" seria a mesma classe de afirmação que "sem git" foi.
+    assertEqual(GitRemoteHost.host(ofRemoteURL: "git@github-personal:mwtelles/portfolio.git"),
+                "github-personal")
+    assertFalse(GitRemoteHost.matches(host: "github-personal", domain: "github.com"),
+                "um apelido de SSH que contém 'github' não é github.com")
+}
+
+test("GitRemoteHost: este repositório, medido de verdade no disco do operador") {
+    let repo = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent().path
+    // Não afirma QUAL host — afirma que a leitura MEDE alguma coisa. Um repo
+    // clonado de outro lugar não deve reprovar este teste, mas um leitor
+    // quebrado (que devolvesse `.unmeasured` sempre) deve.
+    let r = GitRemoteHost.origin(at: repo)
+    if case .unmeasured(let why) = r {
+        assertTrue(false, "não mediu o remoto do próprio repositório: \(why)")
+    }
+}
+
+test("GitHostMark: o logo aparece se e somente se o host foi MEDIDO") {
+    let conhecido = GitHostMark.of(.host(.github, "github.com"))
+    let outro = GitHostMark.of(.other("git.sr.ht"))
+    let semRemoto = GitHostMark.of(.absent("sem remoto"))
+    let naoMedido = GitHostMark.of(.unmeasured("config ilegível"))
+    let aindaNao = GitHostMark.of(nil)
+
+    assertEqual(conhecido.mark, .github)
+    assertTrue(conhecido.isMeasured)
+    // Host real sem marca: medido, mas NADA desenhado — dito em palavras.
+    assertTrue(outro.mark == nil, "host sem marca vendorizada pegou o logo de outro")
+    assertTrue(outro.isMeasured)
+    assertTrue(outro.help.contains("git.sr.ht"), "o nome do host sumiu: \(outro.help)")
+    // As três ausências não desenham, e nenhuma delas se passa pela outra: as
+    // frases são distintas, que é o único jeito de o operador saber qual recebeu.
+    for a in [semRemoto, naoMedido, aindaNao] {
+        assertTrue(a.mark == nil); assertFalse(a.isMeasured)
+    }
+    let frases = [semRemoto.help, naoMedido.help, aindaNao.help]
+    assertEqual(Set(frases).count, 3, "duas ausências dizem a mesma coisa: \(frases)")
+    // Nunca em branco — silêncio é indistinguível de bug.
+    for m in [conhecido, outro, semRemoto, naoMedido, aindaNao] { assertFalse(m.help.isEmpty) }
+}
+
+test("GitGlyph: o host entra na linha sem desfazer a distinção de quatro estados") {
+    let repo = GitStatusSnapshot(branch: "main", dirty: false, ahead: 0, behind: 0)
+    let remoto = GitRemote.host(.github, "github.com")
+    let g = [GitGlyph.of(.state(repo), remote: remoto),
+             GitGlyph.of(.absent("sem git"), remote: remoto),
+             GitGlyph.of(.unavailable("timeout"), remote: remoto),
+             GitGlyph.of(nil, remote: remoto)]
+    for i in 0..<g.count {
+        for j in (i + 1)..<g.count {
+            assertFalse(g[i].tone == g[j].tone && g[i].text == g[j].text,
+                        "estados \(i) e \(j) desenham igual DEPOIS do host")
+        }
+    }
+    // A marca de branch continua sendo EVIDÊNCIA: existe se e somente se há
+    // símbolo de branch, e some junto com ele nos estados que não medem repo.
+    assertEqual(g[0].mark, GitGlyph.branchMark)
+    assertEqual(g[0].symbol, GitGlyph.branchSymbol, "o piso SF Symbol sumiu da linha de git")
+    for x in [g[1], g[3]] { assertTrue(x.mark == nil, "estado sem repo desenhou branch") }
+    // `failed` mantém o triângulo de aviso, que é SF Symbol e não pode virar
+    // marca de branch — a medição que falhou não pode se passar por repositório.
+    assertTrue(g[2].mark == nil, "uma medição que falhou virou uma branch")
+    assertFalse(g[2].symbol == GitGlyph.branchSymbol)
+
+    // O tooltip da linha COM repositório diz onde ela mora; a que não tem
+    // repositório não repete a pergunta que ninguém fez.
+    assertTrue(g[0].help.contains("GitHub"), "o host sumiu do tooltip: \(g[0].help)")
+    assertFalse(g[1].help.contains("GitHub"), "card sem repositório afirmou hospedagem")
+
+    // Sem remoto informado, a linha NÃO afirma ausência de remoto.
+    let semInfo = GitGlyph.of(.state(repo))
+    assertTrue(semInfo.host.mark == nil)
+    assertFalse(semInfo.host.isMeasured, "'ainda não lido' virou 'não tem'")
+}
+
+test("ProjectDigest carrega o remoto no caminho BARATO, junto dos outros campos") {
+    // Uma leitura de arquivo com teto (como o PROJECT.md), não um processo. Se
+    // isto virasse um spawn, o custo da linha de git dobraria para ganhar um logo.
+    let repo = fakeRepo("digest-remoto", [
+        ".git/config": "[remote \"origin\"]\n\turl = git@bitbucket.org:u/r.git\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: repo) }
+    // `git: .none` = o caller adiou a sonda cara. O remoto vem mesmo assim.
+    let d = ProjectDigest.load(path: repo, role: .project, repos: nil, git: .none)
+    assertEqual(d.remote.kind, .bitbucket, "o remoto não veio no caminho barato")
+    assertTrue(d.git.isUnavailable, "a sonda cara não deveria ter rodado")
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {
