@@ -19,6 +19,10 @@ const fs = require('fs');
 const path = require('path');
 
 const { listFragments, parseFragment } = require('./forge-memory');
+const { guardReadAndWarn } = require('./forge-schema-guard');
+
+// T02 default artifact path — LOCKED with T03 so the two never diverge.
+const DEFAULT_INDEX_PATH = '.gsd/MEMORY-INDEX-BY-FILE.md';
 
 // ── isWithin (molde de forge-prompt.js:75-78) ──────────────────────────────────
 function isWithin(root, candidate) {
@@ -290,6 +294,27 @@ function buildFileIndex(cwd, opts) {
   opts = opts || {};
   const root = path.resolve(cwd);
 
+  // Guarded read (T02): wired HERE, at the single entry point that reads the
+  // fragment store, so `result.partial` is set for every caller (direct API
+  // and CLI alike) instead of being duplicated at each call site.
+  // `forge-memory.listFragments` already calls the guard internally to decide
+  // whether IT should degrade — but it does not hand `partial` back to us, so
+  // this explicit call exists purely so the ARTIFACT can mark itself partial.
+  // Do not remove this as "duplicate of listFragments' internal guard call" —
+  // it is a second, deliberate call for a different purpose.
+  let guardPartial = false;
+  let guardUnavailable = false;
+  try {
+    const g = guardReadAndWarn(cwd, opts.schemaGuard || {});
+    guardPartial = !!(g && g.partial);
+  } catch (_) {
+    // S01 R1 (known fragility, not fixed here): if the guard fails to load or
+    // throws, degrade to partial:false — but that degradation itself must be
+    // visible, never silent, so it is recorded below as a coverage entry.
+    guardPartial = false;
+    guardUnavailable = true;
+  }
+
   const fileIndex = listRepoFiles(root, opts.listRepoFiles || {});
 
   const unreadableFragments = [];
@@ -438,9 +463,161 @@ function buildFileIndex(cwd, opts) {
     unresolved,
     unreadable_fragments: unreadableFragments,
     scan_capped: fileIndex.capped,
+    guard_unavailable: guardUnavailable,
   };
 
-  return { entries, coverage };
+  return { entries, coverage, partial: guardPartial };
+}
+
+// ── renderIndex ────────────────────────────────────────────────────────────────
+// Deterministic markdown renderer. No wallclock anywhere in the output — two
+// runs over the same store produce byte-identical strings. `coverage` field
+// names come from T01 and are LOCKED: rendered verbatim, never renamed.
+function renderIndex(result, opts) {
+  opts = opts || {};
+  const entries = Array.isArray(result && result.entries) ? result.entries : [];
+  const coverage = (result && result.coverage) || {};
+  const partial = !!(result && result.partial);
+
+  const lines = [];
+
+  lines.push('# Índice de memória por arquivo-fonte');
+  lines.push('');
+  lines.push('_Este arquivo é derivado e regenerável — nunca edite à mão. Para regenerar:_');
+  lines.push('`node scripts/forge-memory-index.js --write`');
+  lines.push('');
+  lines.push('_Consulta sob demanda: este arquivo não é injetado em nenhum prompt._');
+  lines.push('');
+
+  if (partial) {
+    lines.push('> ⚠️ **Índice parcial** — o dado em `.gsd/SCHEMA-VERSION` está à frente da tooling local.');
+    lines.push('> Este índice pode estar incompleto até a tooling ser atualizada (`/forge-update`).');
+    lines.push('');
+  }
+
+  lines.push('## Índice por arquivo-fonte');
+  lines.push('');
+  if (entries.length === 0) {
+    lines.push('_Nenhum fragmento de memória encontrado._');
+    lines.push('');
+  } else {
+    for (const entry of entries) {
+      lines.push(`### ${entry.file}`);
+      lines.push('');
+      for (const fact of entry.facts) {
+        const memId = fact.mem_id || '(sem mem_id)';
+        const category = fact.category || '(sem categoria)';
+        const summary = fact.summary || '(sem resumo)';
+        const unit = fact.unit_id || fact.storage_key || '(unidade desconhecida)';
+        lines.push(`- ${memId} (${category}) — ${summary} — origem: ${unit}`);
+      }
+      lines.push('');
+    }
+  }
+
+  // ── Cobertura e descarte — INCONDICIONAL (never omitted, never skipped). ──
+  lines.push('## Cobertura e descarte');
+  lines.push('');
+  lines.push(`- fragments_read: ${coverage.fragments_read || 0}`);
+  lines.push(`- facts_total: ${coverage.facts_total || 0}`);
+  lines.push(`- facts_with_resolved: ${coverage.facts_with_resolved || 0}`);
+  lines.push(`- citations_total: ${coverage.citations_total || 0}`);
+  lines.push(`- citations_resolved: ${coverage.citations_resolved || 0}`);
+  lines.push(`- files_indexed: ${coverage.files_indexed || 0}`);
+  lines.push('');
+
+  lines.push('### Citações não resolvidas');
+  lines.push('');
+  const unresolved = Array.isArray(coverage.unresolved) ? coverage.unresolved : [];
+  if (unresolved.length === 0) {
+    lines.push('_Nenhuma citação não resolvida._');
+  } else {
+    lines.push('| citação | motivo | ocorrências | exemplo mem_id |');
+    lines.push('|---|---|---|---|');
+    for (const u of unresolved) {
+      lines.push(`| ${u.raw} | ${u.reason} | ${u.count} | ${u.example_mem_id || '(nenhum)'} |`);
+    }
+  }
+  lines.push('');
+
+  lines.push('### Fatos com apenas citações irresolúveis');
+  lines.push('');
+  const unresolvedOnly = Array.isArray(coverage.facts_unresolved_only) ? coverage.facts_unresolved_only : [];
+  if (unresolvedOnly.length === 0) {
+    lines.push('_Nenhum fato com apenas citações irresolúveis._');
+  } else {
+    for (const f of unresolvedOnly) lines.push(`- ${f.mem_id || '(sem mem_id)'} (${f.storage_key || '(unidade desconhecida)'})`);
+  }
+  lines.push('');
+
+  lines.push('### Fatos sem nenhuma citação');
+  lines.push('');
+  const withoutCitation = Array.isArray(coverage.facts_without_citation) ? coverage.facts_without_citation : [];
+  if (withoutCitation.length === 0) {
+    lines.push('_Nenhum fato sem citação._');
+  } else {
+    for (const f of withoutCitation) lines.push(`- ${f.mem_id || '(sem mem_id)'} (${f.storage_key || '(unidade desconhecida)'})`);
+  }
+  lines.push('');
+
+  lines.push('### Fragmentos ilegíveis');
+  lines.push('');
+  const unreadable = Array.isArray(coverage.unreadable_fragments) ? coverage.unreadable_fragments : [];
+  if (unreadable.length === 0) {
+    lines.push('_Nenhum fragmento ilegível._');
+  } else {
+    for (const u of unreadable) lines.push(`- ${u.storageKey || u.path} — ${u.reason}`);
+  }
+  lines.push('');
+
+  if (coverage.scan_capped) {
+    lines.push('> ⚠️ A varredura de arquivos do repositório atingiu o limite (`scan_capped`) — a resolução de citações por basename pode estar incompleta.');
+    lines.push('');
+  }
+
+  if (coverage.guard_unavailable) {
+    lines.push('> ⚠️ O guard de schema não pôde ser carregado nesta execução — leitura degradou para `partial:false` sem checagem de direção.');
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push('');
+  lines.push('_A extração de citações é heurística (regex sobre prosa livre). A seção acima é o contrato de honestidade do gerador: tudo que não pôde ser resolvido está listado, nunca omitido em silêncio._');
+
+  return lines.join('\n') + '\n';
+}
+
+// ── writeIndex ────────────────────────────────────────────────────────────────
+// Writes the rendered markdown to `opts.out` (resolved against cwd, contained
+// under root via isWithin — same containment discipline as citation
+// resolution). Returns { path, bytes, changed }; `changed:false` when the
+// content on disk is already identical (same economy as
+// forge-memory.js writeFragment's pre-write comparison).
+function writeIndex(result, cwd, opts) {
+  opts = opts || {};
+  const root = path.resolve(cwd);
+  const outRel = typeof opts.out === 'string' && opts.out ? opts.out : DEFAULT_INDEX_PATH;
+  const outAbs = path.resolve(root, outRel);
+
+  if (!isWithin(root, outAbs)) {
+    throw new Error(`--out escapes cwd: ${outRel}`);
+  }
+
+  const md = renderIndex(result, opts);
+
+  let unchanged = false;
+  try {
+    if (fs.existsSync(outAbs) && fs.readFileSync(outAbs, 'utf8') === md) unchanged = true;
+  } catch (_) {
+    unchanged = false;
+  }
+
+  if (!unchanged) {
+    fs.mkdirSync(path.dirname(outAbs), { recursive: true });
+    fs.writeFileSync(outAbs, md, 'utf8');
+  }
+
+  return { path: outAbs, bytes: Buffer.byteLength(md, 'utf8'), changed: !unchanged };
 }
 
 module.exports = {
@@ -450,4 +627,81 @@ module.exports = {
   listRepoFiles,
   summarizeFact,
   buildFileIndex,
+  renderIndex,
+  writeIndex,
+  DEFAULT_INDEX_PATH,
 };
+
+// ── CLI ──────────────────────────────────────────────────────────────────────
+// node forge-memory-index.js [--write] [--json] [--out <path>] [--cwd <dir>]
+// Molde: forge-symbol-check.js (argv manual, JSON de 1 linha em stdout,
+// {error} em stderr, exits 0/1/2). Exit 2 rejeita args inválidos explicitamente
+// (S01's guard CLI took a review objection precisely for accepting bad args).
+function parseCliArgs(argv) {
+  const KNOWN = new Set(['--write', '--json', '--out', '--cwd']);
+  const out = { write: false, json: false, out: undefined, cwd: undefined, valid: true };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!KNOWN.has(arg)) { out.valid = false; return out; }
+    if (arg === '--write') { out.write = true; continue; }
+    if (arg === '--json') { out.json = true; continue; }
+    if (arg === '--out') {
+      if (argv[i + 1] === undefined) { out.valid = false; return out; }
+      out.out = argv[++i];
+      continue;
+    }
+    if (arg === '--cwd') {
+      if (argv[i + 1] === undefined) { out.valid = false; return out; }
+      out.cwd = argv[++i];
+      continue;
+    }
+  }
+  return out;
+}
+
+function runCli(argv) {
+  const args = parseCliArgs(argv);
+  if (!args.valid) {
+    process.stderr.write(JSON.stringify({ error: 'Usage: forge-memory-index.js [--write] [--json] [--out <path>] [--cwd <dir>]' }) + '\n');
+    return 2;
+  }
+
+  const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd();
+  // Sem flag de saída explícita → default --write (step 6 do plano).
+  const doWrite = args.write || !args.json;
+
+  try {
+    const result = buildFileIndex(cwd, {});
+
+    let writeInfo = null;
+    if (doWrite) {
+      writeInfo = writeIndex(result, cwd, { out: args.out });
+    }
+
+    if (args.json) {
+      const envelope = {
+        partial: result.partial,
+        counts: {
+          fragments_read: result.coverage.fragments_read,
+          facts_total: result.coverage.facts_total,
+          facts_with_resolved: result.coverage.facts_with_resolved,
+          citations_total: result.coverage.citations_total,
+          citations_resolved: result.coverage.citations_resolved,
+        },
+        coverage: result.coverage,
+        files_indexed: result.coverage.files_indexed,
+        out: writeInfo ? writeInfo.path : null,
+      };
+      process.stdout.write(JSON.stringify(envelope) + '\n');
+    }
+
+    return 0;
+  } catch (err) {
+    process.stderr.write(JSON.stringify({ error: err && err.message ? err.message : String(err) }) + '\n');
+    return 1;
+  }
+}
+
+if (require.main === module) {
+  process.exitCode = runCli(process.argv.slice(2));
+}
