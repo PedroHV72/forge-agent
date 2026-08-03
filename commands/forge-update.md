@@ -11,7 +11,8 @@ allowed-tools: Read, Bash
 
 Resolve `repo_path` through the canonical prefs engine first:
 ```bash
-PREFS_ENGINE="${FORGE_SCRIPTS_DIR:-$HOME/.claude/scripts}/forge-prefs.js"
+FORGE_HOME="${FORGE_HOME:-${HOME}/.forge-agent}"
+PREFS_ENGINE="${FORGE_SCRIPTS_DIR:-$FORGE_HOME/scripts}/forge-prefs.js"
 [ -f "$PREFS_ENGINE" ] || PREFS_ENGINE="scripts/forge-prefs.js"
 REPO_PATH=$(node "$PREFS_ENGINE" --resolved --key repo_path 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(v?String(v):'')}catch{process.stdout.write('')}})")
 ```
@@ -20,12 +21,12 @@ If `REPO_PATH` is set and non-empty → use it.
 
 If the engine returned nothing, try a narrowly-scoped legacy fallback (discovery-only — reads
 the pre-migration global md prefs directly, does not write anything): on a pre-migration install
-`~/.claude/forge-agent-prefs.md` may still hold `repo_path:` while no JSONC layer exists yet, and
+`$FORGE_HOME/forge-agent-prefs.md` may still hold `repo_path:` while no JSONC layer exists yet, and
 the canonical engine hard-stops with no repo_path in that case. This grep exists specifically so
 those pre-migration users can still reach the migrator below instead of being stranded.
 ```bash
-if [ -z "$REPO_PATH" ] && [ -f "$HOME/.claude/forge-agent-prefs.md" ]; then
-  REPO_PATH=$(grep -m1 '^repo_path:' "$HOME/.claude/forge-agent-prefs.md" | sed 's/^repo_path:[[:space:]]*//' | tr -d '"'"'"'' | xargs)
+if [ -z "$REPO_PATH" ] && [ -f "$FORGE_HOME/forge-agent-prefs.md" ]; then
+  REPO_PATH=$(grep -m1 '^repo_path:' "$FORGE_HOME/forge-agent-prefs.md" | sed 's/^repo_path:[[:space:]]*//' | tr -d '"'"'"'' | xargs)
 fi
 ```
 
@@ -97,7 +98,7 @@ cd "{REPO_PATH}" && git pull 2>&1
 - Otherwise → set `GIT_UPDATED=true`. Proceed to reinstall.
 
 > **IMPORTANTE**: SEMPRE prosseguir com a reinstalação, mesmo quando "Already up to date."
-> O repo pode estar atualizado mas os arquivos em `~/.claude/` podem estar defasados.
+> O repo pode estar atualizado mas os arquivos em `$FORGE_HOME/` podem estar defasados.
 > A reinstalação é idempotente e leva <2s.
 
 If `.git` does NOT exist: skip this step and proceed with reinstall using existing files.
@@ -173,7 +174,7 @@ Only after exit 0, re-scaffold **each existing** JSONC catalog. This adds newly
 introduced commented sections while preserving active values and comments:
 
 ```bash
-for PREFS_CATALOG in "$HOME/.claude/forge-agent-prefs.jsonc" "$(pwd)/.gsd/forge-prefs.jsonc"; do
+for PREFS_CATALOG in "$FORGE_HOME/forge-agent-prefs.jsonc" "$(pwd)/.gsd/forge-prefs.jsonc"; do
   if [ -f "$PREFS_CATALOG" ]; then
     node "{REPO_PATH}/scripts/forge-prefs.js" --rescaffold "$PREFS_CATALOG" --write
   else
