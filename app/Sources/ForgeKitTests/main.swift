@@ -4834,7 +4834,19 @@ test("ProjectDigest: nenhum campo renderiza vazio num projeto sem nada — toda 
     assertEqual(a, "nenhuma entrega registrada")
     assertFalse(a.isEmpty)
 
-    guard case .absent(let g) = d.git else {
+    // Git tem DUAS ausências e elas não são a mesma frase. `git: .none` é o
+    // probe que o card usa no primeiro paint: ninguém perguntou nada ainda,
+    // então "sem git" ali seria uma afirmação medida sobre algo não medido —
+    // era exatamente essa troca que punha "sem git" em cima de dois
+    // repositórios reais na tela do operador.
+    guard case .unavailable(let pending) = d.git else {
+        return assertTrue(false, "git não consultado deveria ser não-medido, não ausência")
+    }
+    assertFalse(pending.isEmpty, "e mesmo o não-medido é uma frase, nunca vazio")
+
+    // Medido de verdade num diretório que não é repositório: aí sim.
+    guard case .absent(let g) = ProjectDigest.load(path: tmp, role: .project,
+                                                   repos: nil, git: .system).git else {
         return assertTrue(false, "diretório sem git deveria ser ausência nomeada")
     }
     assertEqual(g, "sem git")
@@ -5083,8 +5095,8 @@ test("ProjectDigest.load é injetável de ponta a ponta — nada aqui lê o $HOM
     var cal = Calendar(identifier: .gregorian)
     cal.timeZone = TimeZone(identifier: "UTC")!
     let now = cal.date(from: DateComponents(year: 2026, month: 8, day: 3))!
-    let probe = GitProbe(snapshot: { _ in
-        GitStatusSnapshot(branch: "main", dirty: false, ahead: 3, behind: 0)
+    let probe = GitProbe(status: { _ in
+        .state(GitStatusSnapshot(branch: "main", dirty: false, ahead: 3, behind: 0))
     })
 
     let d = ProjectDigest.load(path: tmp, role: .workspace, repos: 33,
@@ -5227,6 +5239,172 @@ test("CollapseStore: o que ficou fechado volta fechado, e o vazio não vira cami
     // Ordenado: um conjunto inalterado não reescreve os defaults embaralhado.
     assertEqual(CollapseStore.encode(["/h/b", "/h/a"]), "/h/a\n/h/b")
     assertEqual(CollapseStore.encode([]), "")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+print("Git — o que \"sem git\" tem direito de afirmar")
+
+/// Two real repositories on the operator's machine rendered **"sem git"** on
+/// their cards while `git status` answered them from the shell in milliseconds.
+/// "sem git" is the named-absence wording — it means *measured, and there is
+/// none*. So the card was making a confident false claim about the disk, which
+/// is the one failure this codebase is least allowed to ship.
+///
+/// The cause was not in git and not in the parser. Every card probes git from a
+/// `Task.detached`, i.e. a thread of the cooperative pool, and `Git.run` used to
+/// park that thread on a semaphore signalled from `DispatchQueue.global()`. A
+/// screenful of cards parked every cooperative thread there at once and the
+/// signalling work could not be scheduled, so the probes hit their 5 s timeout
+/// and returned nil — and nil meant "sem git".
+///
+/// Two properties are pinned below, and they are independent: the probe must
+/// SURVIVE that concurrency, and the wording must be honest even when it does
+/// not. Either alone leaves the card able to lie.
+
+func gitTmpDir(_ name: String) -> String {
+    let dir = NSTemporaryDirectory() + "forge-gitstatus-\(name)-\(UUID().uuidString)"
+    try! FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+test("Git.status responde sob a concorrência real da tela — 40 cards de uma vez") {
+    let repo = gitTmpDir("concorrencia")
+    defer { try? FileManager.default.removeItem(atPath: repo) }
+    fixtureGit(["init", "-q", "-b", "main"], at: repo)
+    fixtureWrite("x", to: repo + "/a.txt")
+    fixtureGit(["add", "."], at: repo)
+    fixtureGit(["commit", "-qm", "um"], at: repo)
+
+    // O formato importa tanto quanto o número: `Task.detached` é exatamente o
+    // que `ProjectCard.refresh()` usa, e é o pool cooperativo que a versão
+    // antiga travava. Medido antes do conserto: 32/40 devolviam nil em 20,1 s.
+    // Chamado em série, o mesmo código passava — por isso o defeito chegou à
+    // tela com a suíte verde.
+    let probes = 40
+    let done = DispatchSemaphore(value: 0)
+    let box = ResultBox()
+    Task {
+        await withTaskGroup(of: GitStatus.self) { g in
+            for _ in 0..<probes {
+                g.addTask(priority: .utility) { Git.status(at: repo) }
+            }
+            for await r in g { box.append(r) }
+        }
+        done.signal()
+    }
+    // Teto generoso: o conserto mede 0,29 s para as 40. Se estourar, é a
+    // inanição de volta, não lentidão de máquina.
+    let waited = done.wait(timeout: .now() + 60)
+    assertTrue(waited == .success, "as sondas não terminaram em 60 s — inanição do pool cooperativo")
+
+    let results = box.all
+    assertEqual(results.count, probes)
+    let answered = results.filter { $0.snapshot != nil }.count
+    assertEqual(answered, probes,
+                "\(probes - answered) de \(probes) sondas não obtiveram estado; " +
+                "nenhuma delas poderia virar \"sem git\" numa tela")
+    assertEqual(results.first(where: { $0.snapshot != nil })?.snapshot?.branch, "main")
+
+    // E nenhuma pode ter virado a afirmação medida.
+    assertEqual(results.filter { $0 == .notARepository }.count, 0,
+                "um repositório de verdade foi classificado como \"não é repositório\"")
+}
+
+/// Collects across the task group without a data race — the harness is
+/// synchronous, so the results have to cross back to a blocked main thread.
+final class ResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [GitStatus] = []
+    func append(_ r: GitStatus) { lock.lock(); items.append(r); lock.unlock() }
+    var all: [GitStatus] { lock.lock(); defer { lock.unlock() }; return items }
+}
+
+test("Git.classifyStatus: só uma das quatro saídas tem direito a \"não é repositório\"") {
+    // A única ausência medida: git recusou E não há .git para contradizê-lo.
+    assertEqual(Git.classifyStatus(.failed(128), hasDotGit: false), .notARepository)
+
+    // O mesmo código de saída num diretório que TEM .git é uma medição que
+    // falhou (lock, índice corrompido, dubious ownership) — nunca uma ausência.
+    // É este par que separa "não tem repo" de "não consegui ler o repo", e era
+    // o colapso dos dois que punha "sem git" em cima de dois repositórios.
+    assertFalse(Git.classifyStatus(.failed(128), hasDotGit: true) == .notARepository,
+                "um repositório que existe e não respondeu não é uma ausência")
+    assertEqual(Git.classifyStatus(.timedOut, hasDotGit: true),
+                .unavailable("git não respondeu a tempo"))
+    assertEqual(Git.classifyStatus(.timedOut, hasDotGit: false),
+                .unavailable("git não respondeu a tempo"),
+                "timeout não vira ausência nem quando não há .git — não se mediu nada")
+    assertFalse(Git.classifyStatus(.launchFailed("no such file"), hasDotGit: false) == .notARepository)
+
+    // Saída ilegível é falha de medição, não estado.
+    assertEqual(Git.classifyStatus(.ok("lixo sem cabeçalho ##"), hasDotGit: true),
+                .unavailable("git respondeu num formato não reconhecido"))
+    assertEqual(Git.classifyStatus(.ok("## main...origin/main [ahead 2]\n M a.txt\n"),
+                                   hasDotGit: true),
+                .state(GitStatusSnapshot(branch: "main", dirty: true, ahead: 2, behind: 0)))
+}
+
+test("Git.status classifica de verdade um diretório sem repositório e um repositório real") {
+    let plain = gitTmpDir("sem-repo")
+    defer { try? FileManager.default.removeItem(atPath: plain) }
+    assertEqual(Git.status(at: plain), .notARepository,
+                "um diretório que não é repositório é a única ausência que pode ser afirmada")
+
+    let repo = gitTmpDir("com-repo")
+    defer { try? FileManager.default.removeItem(atPath: repo) }
+    fixtureGit(["init", "-q", "-b", "main"], at: repo)
+    fixtureWrite("x", to: repo + "/a.txt")
+    fixtureGit(["add", "."], at: repo)
+    fixtureGit(["commit", "-qm", "um"], at: repo)
+    // Sujo e sem upstream — a forma de `feirao-do-lu`/`fenrir` no dia do bug.
+    fixtureWrite("solto", to: repo + "/untracked.txt")
+    assertEqual(Git.status(at: repo).snapshot?.branch, "main")
+    assertEqual(Git.status(at: repo).snapshot?.dirty, true)
+}
+
+test("loadGit: \"sem git\" sai de um caso só, e o não-medido é retentável") {
+    let notRepo = GitProbe(status: { _ in .notARepository })
+    assertEqual(ProjectDigest.loadGit(path: "/x", probe: notRepo), .absent("sem git"))
+
+    for probe in [GitProbe(status: { _ in .unavailable("git não respondeu a tempo") }),
+                  GitProbe.none] {
+        let field = ProjectDigest.loadGit(path: "/x", probe: probe)
+        assertFalse(field == .absent("sem git"),
+                    "uma medição que não aconteceu foi impressa como ausência medida")
+        assertTrue(field.isUnavailable, "e o card precisa saber que vale perguntar de novo")
+    }
+
+    // `git: .none` é "ainda não paguei por git", não "não há git": era ele que
+    // o card carregava no primeiro paint de cada reload.
+    assertFalse(ProjectDigest.load(path: "/x", role: .project, repos: nil, git: .none)
+                    .git == .absent("sem git"))
+    assertFalse(ProjectDigest.loadGit(path: "/x", probe: notRepo).isUnavailable,
+                "uma ausência medida nunca deve ser re-perguntada")
+}
+
+test("identityLimit não corta as descrições reais que o card existe para mostrar") {
+    // As duas strings do dia do bug, na íntegra. Com o limite antigo de 120 a
+    // primeira virava um terço de frase, e numa janela larga esses 120 chars
+    // eram UMA linha — a segunda linha que o layout reservou ficava vazia.
+    let feirao = "Plataforma web do maior centro de atacado de moda do RJ (Feirão do Lu, Duque de Caxias/RJ). Reúne um site público (landing pages de lojas, eventos, guias/caravanas, institucional, parceiros e cadastro de leads) e um painel administrativo /admin para alimentar todo o conteúdo do site. O público-alvo do negócio são revendedores e lojistas que compram no atacado."
+    let look = "Workspace raiz que agrupa todos os projetos frontend e backend da Look China. Contém heimdall (frontend monorepo com Turborepo/pnpm) e loki (backend NestJS), além de futuros projetos."
+    assertGreater(feirao.count, 120, "a fixture perdeu a propriedade que a torna útil")
+
+    for prose in [feirao, look] {
+        let line = ProjectDigest.identityLine(fromProjectDoc: "# Project: x\n\n\(prose)\n\n## Stack\n")
+        assertEqual(line.display, prose,
+                    "a descrição chegou cortada ao card — a elisão é do layout, na largura real")
+        assertFalse(line.display.hasSuffix("…"))
+    }
+
+    // Continua sendo um limite: uma PROJECT.md desgovernada não vai inteira
+    // para a view. 400 fica logo acima do que duas linhas comportam num card
+    // de 1000 pt (~365 chars medidos), então nunca morde antes do layout.
+    assertGreater(ProjectDigest.identityLimit, 365)
+    let runaway = String(repeating: "palavra ", count: 200)
+    let cut = ProjectDigest.identityLine(fromProjectDoc: "# t\n\n\(runaway)\n").display
+    assertTrue(cut.hasSuffix("…"))
+    assertLessOrEqual(cut.count, ProjectDigest.identityLimit + 1)
 }
 
 print("\n" + String(repeating: "─", count: 60))

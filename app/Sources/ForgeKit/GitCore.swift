@@ -44,6 +44,33 @@ public struct GitStatusSnapshot: Equatable {
     }
 }
 
+/// How one git invocation ended. The four cases are not interchangeable: only
+/// `.failed` on a directory with no `.git` means "there is no repository here",
+/// and that is the only one a card may render as an absence.
+public enum GitRun: Equatable {
+    case ok(String)
+    /// git ran and refused. 128 is its "not a repository" / fatal code.
+    case failed(Int32)
+    case timedOut
+    case launchFailed(String)
+}
+
+/// The state of a working tree, the measured absence of one, or a named reason
+/// no measurement was obtained.
+public enum GitStatus: Equatable {
+    case state(GitStatusSnapshot)
+    /// Measured: this directory is not a repository.
+    case notARepository
+    /// NOT measured. Rendering this as "sem git" is the defect this case exists
+    /// to make unrepresentable.
+    case unavailable(String)
+
+    public var snapshot: GitStatusSnapshot? {
+        if case .state(let s) = self { return s }
+        return nil
+    }
+}
+
 public enum Git {
 
     public static func checkouts(at path: String) -> [Checkout] {
@@ -115,8 +142,49 @@ public enum Git {
     /// and call three renders a branch name beside another branch's
     /// divergence). One call cannot.
     public static func statusSnapshot(at path: String) -> GitStatusSnapshot? {
-        guard let out = run(["status", "--porcelain", "--branch"], at: path) else { return nil }
-        return parseStatus(out)
+        status(at: path).snapshot
+    }
+
+    /// Where the tree stands — or a NAMED reason there is no answer.
+    ///
+    /// The distinction this type exists for is not cosmetic. `statusSnapshot`
+    /// collapses "this directory is not a repository" and "git did not answer"
+    /// into the same `nil`, and the card downstream rendered that single nil as
+    /// **"sem git"** — a measured absence. Two real repositories on the
+    /// operator's machine (`feirao-do-lu`, `lookchina/apps/fenrir`) read "sem
+    /// git" on screen while `git status` answered them from the shell in
+    /// milliseconds. A confident false claim is the one failure this codebase
+    /// is least allowed to ship, so the failure now carries its own name and
+    /// the caller can retry it.
+    public static func status(at path: String) -> GitStatus {
+        classifyStatus(invoke(["status", "--porcelain", "--branch"], at: path),
+                       hasDotGit: FileManager.default.fileExists(atPath: path + "/.git"))
+    }
+
+    /// Pure half of `status(at:)`, so every branch below is exercisable without
+    /// building four repository shapes on disk.
+    ///
+    /// `.git` presence is what separates the two ways git exits non-zero: a
+    /// directory that simply is not a repository (git says so, and there is no
+    /// `.git` to contradict it) from a repository git refused to read (a lock,
+    /// a corrupt index, dubious ownership). Only the first is an absence that
+    /// was measured; the second is a measurement that failed, and saying "sem
+    /// git" for it is the bug.
+    public static func classifyStatus(_ result: GitRun, hasDotGit: Bool) -> GitStatus {
+        switch result {
+        case .ok(let out):
+            guard let snapshot = parseStatus(out) else {
+                return .unavailable("git respondeu num formato não reconhecido")
+            }
+            return .state(snapshot)
+        case .failed(let code):
+            // A repository that exists and would not answer is not an absence.
+            return hasDotGit ? .unavailable("git falhou (código \(code))") : .notARepository
+        case .timedOut:
+            return .unavailable("git não respondeu a tempo")
+        case .launchFailed(let why):
+            return .unavailable("git não pôde ser executado: \(why)")
+        }
     }
 
     /// Parses `git status --porcelain --branch`. Split from the process call
@@ -184,47 +252,101 @@ public enum Git {
         return GitStatusSnapshot(branch: branch, dirty: dirty, ahead: ahead, behind: behind)
     }
 
-    /// Runs git and gives up after `timeout`.
+    /// Runs git and gives up after `timeout`, saying WHICH of those happened.
     ///
-    /// The timeout exists because these calls now run per card on a screen
-    /// that reloads on a timer: a git that blocks (a lock held by another
-    /// process, a filesystem that stopped answering) would otherwise hang the
-    /// caller forever rather than degrade to a named absence. Terminating and
-    /// returning nil makes a stuck repo indistinguishable from an unreadable
-    /// one, which is the correct outcome — both are "no git state to show".
-    static func run(_ args: [String], at path: String, timeout: TimeInterval = 5) -> String? {
+    /// The timeout exists because these calls run per card on a screen that
+    /// reloads on a timer: a git that blocks (a lock held by another process, a
+    /// filesystem that stopped answering) must degrade to a named absence
+    /// rather than hang the caller forever.
+    ///
+    /// THE SHAPE HERE IS LOAD-BEARING AND WAS MEASURED. The previous version
+    /// read the pipe on `DispatchQueue.global()` and blocked the CALLER on a
+    /// semaphore until that read signalled. Every caller is a
+    /// `Task.detached(priority:)`, i.e. a thread of the *cooperative* pool,
+    /// which has one thread per core and does not grow — so a screenful of
+    /// cards parked every one of those threads on `wait()` and the work that
+    /// would signal them could not be scheduled. Measured against 40
+    /// concurrent probes of a real repository:
+    ///
+    ///     cooperative pool + semaphore     32/40 returned nil   in 20.10 s
+    ///     dispatch queue   + semaphore      0/40                 in  0.50 s
+    ///     cooperative pool, read-then-wait  0/40                 in  0.29 s
+    ///
+    /// Those nils are the whole of the "sem git" bug: git was never broken, it
+    /// was never asked. The middle row shows the semaphore is survivable off
+    /// the cooperative pool, which is why this went unseen in a test that
+    /// called it serially — the defect only exists at the concurrency the
+    /// screen actually runs at.
+    ///
+    /// So: drain the pipe on the calling thread FIRST, then reap. The original
+    /// comment feared the opposite order (blocking on `waitUntilExit` while a
+    /// full pipe stalls the child), and that fear was right — reading first is
+    /// what makes the pipe unable to fill. A child that hangs without writing
+    /// is handled by the watchdog instead of by parking the caller.
+    static func invoke(_ args: [String], at path: String,
+                       timeout: TimeInterval = 5) -> GitRun {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         p.arguments = ["-C", path] + args
         let out = Pipe()
         p.standardOutput = out
         p.standardError = Pipe()
-        // Read on another thread: a pipe that fills while we block on
-        // waitUntilExit deadlocks, and a deadlock is exactly what the timeout
-        // is meant to survive.
-        let box = DataBox()
-        let done = DispatchSemaphore(value: 0)
-        do {
-            try p.run()
-            DispatchQueue.global().async {
-                box.data = out.fileHandleForReading.readDataToEndOfFile()
-                done.signal()
-            }
-            if done.wait(timeout: .now() + timeout) == .timedOut {
-                p.terminate()
-                return nil
-            }
-            p.waitUntilExit()
-            guard p.terminationStatus == 0 else { return nil }
-            return String(data: box.data, encoding: .utf8)
-        } catch { return nil }
+
+        do { try p.run() } catch { return .launchFailed(error.localizedDescription) }
+
+        // The watchdog is disarmed BEFORE the child is waited on, so it can
+        // never signal a pid that has already been reaped and reused.
+        let watchdog = ProcessWatchdog(p)
+        let item = DispatchWorkItem { watchdog.killIfStillRunning() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: item)
+
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        item.cancel()
+        let killed = watchdog.disarm()
+        p.waitUntilExit()
+
+        // A terminated child exits by signal, so `terminationStatus` alone
+        // cannot say "timed out" — the watchdog having fired is what says it.
+        if killed { return .timedOut }
+        guard p.terminationStatus == 0 else { return .failed(p.terminationStatus) }
+        return .ok(String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Output-only wrapper for callers that have nothing to do with a failure
+    /// beyond skipping it. Anything that puts git on a screen wants `invoke`.
+    static func run(_ args: [String], at path: String, timeout: TimeInterval = 5) -> String? {
+        if case .ok(let out) = invoke(args, at: path, timeout: timeout) { return out }
+        return nil
     }
 }
 
-/// Carries the child's stdout across the reader thread. The semaphore orders
-/// the write before the read, so no further synchronisation is needed.
-final class DataBox {
-    var data = Data()
+/// Kills a child that overran its timeout, and remembers that it did.
+///
+/// Two threads meet here — the timer that may kill and the caller that is about
+/// to reap — so both operations take the same lock. `disarm()` is what makes
+/// `waitUntilExit()` safe to call afterwards: once it returns, no `terminate()`
+/// can still be issued against a pid the kernel may have handed to someone else.
+final class ProcessWatchdog {
+    private let lock = NSLock()
+    private let process: Process
+    private var disarmed = false
+    private var killed = false
+
+    init(_ process: Process) { self.process = process }
+
+    func killIfStillRunning() {
+        lock.lock(); defer { lock.unlock() }
+        guard !disarmed, process.isRunning else { return }
+        process.terminate()
+        killed = true
+    }
+
+    /// Blocks out any future kill and reports whether one already happened.
+    func disarm() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        disarmed = true
+        return killed
+    }
 }
 
 /// Finds Forge projects on disk instead of making the user navigate to each one.

@@ -156,9 +156,73 @@ test('a pasta fechada diz o que esconde, não só quantos projetos', () => {
   assert(/rollup\.runs\s*>\s*0/.test(body),
     'o header da pasta não sinaliza mais run ativa lá dentro — colapsar volta a apagar da tela ' +
     'um run em execução');
+  // Aberta ou fechada, a pasta diz quanto representa. No rewrite `apps`
+  // renderizou pelado onde antes lia `apps 5`: uma pasta que não diz quanto
+  // esconde é justamente o roll-up que esta tela existe para dar.
+  assert(/rollup\.projects\s*>\s*0[\s\S]{0,200}?Text\("\\\(rollup\.projects\)"\)/.test(body),
+    'o header da pasta não imprime mais a contagem de projetos ao lado do nome — `apps 5` ' +
+    'voltou a ser só `apps`');
   assert(!/state\.pending\.filter/.test(body),
     'o header voltou a somar state.pending direto — esse era o roll-up parcial que só contava ' +
     'perguntas e perdia todo o resto');
+});
+
+// --- 3b. Git: the card may not claim a measurement it does not have ---------
+
+test('o card nunca imprime "sem git" — a ausência medida vem nomeada do ForgeKit', () => {
+  // Dois repositórios REAIS (`feirao-do-lu`, `lookchina/apps/fenrir`) leram
+  // "sem git" na tela do operador enquanto `git status` os respondia em
+  // milissegundos no shell. "sem git" é a ausência NOMEADA — quer dizer
+  // "medido, e não há". O card estava fazendo uma afirmação falsa confiante
+  // sobre o disco do operador, que é a classe de falha que esta base inteira
+  // caça. A frase só pode nascer no `ProjectDigest.loadGit`, de um caso só.
+  assert(!/"sem git"/.test(code),
+    'Projects.swift escreve a string "sem git" — a view voltou a decidir sozinha o que é ' +
+    'ausência de repositório; essa frase pertence a ProjectDigest.loadGit(.notARepository)');
+
+  const i = code.indexOf('private var gitLine');
+  assert(i >= 0, 'gitLine não encontrado em Projects.swift');
+  const body = code.slice(i, i + 1200);
+  assert(/case\s+\.unavailable\(let\s+\w+\)/.test(body),
+    'gitLine não distingue mais `.unavailable` — uma medição que falhou volta a cair no mesmo ' +
+    'ramo da ausência medida, que é exatamente o bug');
+  assert(/case\s+\.none/.test(body),
+    'gitLine perdeu o estado "ainda não medido" — o primeiro paint volta a renderizar vazio');
+});
+
+test('o git é re-perguntado quando falhou, e nunca quando foi medido', () => {
+  const i = code.indexOf('private func refresh()');
+  const body = code.slice(i, i + 2600);
+  assert(/isUnavailable\s*==\s*true/.test(body),
+    'refresh() não re-tenta mais o git não-medido — um card fica 15 s sem saber nada do ' +
+    'próprio repositório depois de uma falha transitória');
+  assert(!/\.absent[\s\S]{0,40}Task\.sleep/.test(body),
+    'refresh() parece re-perguntar uma ausência medida — só a falha de medição é retentável');
+});
+
+test('Git.invoke não estaciona o chamador num semáforo — foi isso que apagou o git da tela', () => {
+  const git = stripComments(fs.readFileSync(
+    path.join(repoRoot, 'app/Sources/ForgeKit/GitCore.swift'), 'utf8'));
+  const i = git.indexOf('static func invoke(');
+  assert(i >= 0, 'Git.invoke não encontrado — a chamada de processo foi renomeada ou removida');
+  const body = git.slice(i, git.indexOf('static func run(', i));
+
+  // Todo chamador é um `Task.detached`, isto é, uma thread do pool COOPERATIVO,
+  // que tem uma thread por core e não cresce. A versão anterior lia o pipe em
+  // `DispatchQueue.global()` e bloqueava o chamador num semáforo até essa
+  // leitura sinalizar — com uma tela cheia de cards, todas as threads
+  // cooperativas ficavam paradas no `wait()` e o trabalho que as acordaria não
+  // tinha onde ser agendado. Medido com 40 sondas concorrentes de um repo real:
+  // 32/40 devolviam nil em 20,10 s; lendo antes de esperar, 0/40 em 0,29 s.
+  assert(!/DispatchSemaphore/.test(body),
+    'Git.invoke voltou a bloquear o chamador num DispatchSemaphore — com uma tela de cards ' +
+    'isso trava o pool cooperativo e todo git vira timeout, que é o "sem git" de volta');
+  assert(/readDataToEndOfFile\(\)[\s\S]{0,200}?waitUntilExit\(\)/.test(body),
+    'Git.invoke não drena mais o pipe ANTES de reapear — a ordem inversa é o deadlock que o ' +
+    'timeout existia para sobreviver');
+  assert(/case\s+\.timedOut|return\s+\.timedOut/.test(body),
+    'Git.invoke não distingue mais timeout de saída não-zero — sem isso o classificador não ' +
+    'consegue recusar "sem git" para um repo que só não respondeu');
 });
 
 // --- 4. The pure layer is where the logic lives -----------------------------

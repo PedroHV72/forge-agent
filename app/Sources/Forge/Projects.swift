@@ -426,6 +426,19 @@ struct ProjectTreeRow: View {
                     Text(node.title)
                         .font(.system(size: weight.titleSize,
                                       weight: weight.isBold ? .bold : .regular))
+                    // How much this folder stands for, open or closed. Dropped
+                    // in the rewrite — `apps` rendered bare where it used to
+                    // read `apps 5` — and a folder that does not say how much
+                    // it holds is exactly the roll-up this screen exists for.
+                    // While closed the fuller `rollup.summary` below says it in
+                    // words; this is the count that must never disappear.
+                    if rollup.projects > 0 {
+                        Text("\(rollup.projects)")
+                            .font(.caption2).monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                            .help(rollup.projects == 1 ? "1 projeto aqui dentro"
+                                                       : "\(rollup.projects) projetos aqui dentro")
+                    }
                     // Attention rolls up transitively: a collapsed folder still
                     // says whether something inside — at any depth — needs you.
                     // A run underneath used to disappear entirely on collapse.
@@ -718,6 +731,16 @@ struct ProjectCard: View {
                 .lineLimit(1)
         case .absent(let why):
             Text(why).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
+        case .unavailable(let why):
+            // Never "sem git": git was asked and did not answer, which is a
+            // different fact from there being no repository. Said as a failure,
+            // with the reason on hover, so the card is never caught claiming a
+            // measurement it does not have.
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.triangle").font(.system(size: 8))
+                Text("git não respondeu").font(.system(size: 10))
+            }
+            .foregroundStyle(.tertiary).help(why)
         case .none:
             // Named, not blank: git is ~102 ms per card and is deliberately not
             // on the reload path, so this state is normal and must read as
@@ -855,9 +878,19 @@ struct ProjectCard: View {
         // `reloadCheap`'s path. Not cached either: the mtimes that would key a
         // cache (.git/HEAD, .git/index) do not move when an untracked file
         // appears, so a cached "limpo" can be wrong about a dirty tree.
-        gitField = await Task.detached(priority: .utility) {
-            ProjectDigest.loadGit(path: p, probe: .system)
-        }.value
+        //
+        // Retried once, and only when git failed to answer at all: that state
+        // is transient by nature (contention, a lock held for an instant) and
+        // leaving it on screen until the next reload would show a card that
+        // knows nothing about its own repository for 15 s. A `.absent` or a
+        // `.state` is a measurement and is never re-asked.
+        for attempt in 0..<2 {
+            gitField = await Task.detached(priority: .utility) {
+                ProjectDigest.loadGit(path: p, probe: .system)
+            }.value
+            guard gitField?.isUnavailable == true, attempt == 0 else { break }
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        }
 
         guard hasGsd else { return }
         status = await Task.detached(priority: .utility) {

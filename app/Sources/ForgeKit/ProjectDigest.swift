@@ -147,13 +147,29 @@ public extension GitStatusSnapshot {
     }
 }
 
+/// Git on a card: a state, a MEASURED absence, or a named failure to measure.
+///
+/// The third case is not tidiness. With only the first two, everything that is
+/// not a state collapses into `.absent("sem git")` — and "sem git" is the
+/// named-absence wording, the phrase that means *measured, and there is none*.
+/// Two real repositories rendered it because git had been asked and had not
+/// answered (see `Git.invoke`), which is a confident false claim about the
+/// operator's own disk. `.unavailable` is also what tells the caller the value
+/// is worth asking for again; an absence never is.
 public enum DigestGitField: Equatable {
     case state(GitStatusSnapshot)
     case absent(String)
+    case unavailable(String)
 
     public var stateValue: GitStatusSnapshot? {
         if case .state(let s) = self { return s }
         return nil
+    }
+
+    /// True when the field carries no measurement — the caller may retry.
+    public var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
     }
 }
 
@@ -212,17 +228,19 @@ public struct ProjectDigest: Equatable {
 /// after collapsing three processes into one. A first paint can pass `.none`
 /// and fill git in afterwards without this type knowing.
 public struct GitProbe {
-    public var snapshot: (String) -> GitStatusSnapshot?
+    public var status: (String) -> GitStatus
 
-    public init(snapshot: @escaping (String) -> GitStatusSnapshot?) {
-        self.snapshot = snapshot
+    public init(status: @escaping (String) -> GitStatus) {
+        self.status = status
     }
 
-    public static let system = GitProbe(snapshot: { Git.statusSnapshot(at: $0) })
+    public static let system = GitProbe(status: { Git.status(at: $0) })
 
-    /// Answers nothing — a directory that is not a repo, or a caller that has
-    /// chosen not to pay for git yet.
-    public static let none = GitProbe(snapshot: { _ in nil })
+    /// A caller that has chosen not to pay for git yet. Deliberately
+    /// `.unavailable` and not `.notARepository`: not asking is not an answer,
+    /// and a probe that says "no repo" for every directory it never looked at
+    /// would put that lie straight on a card.
+    public static let none = GitProbe(status: { _ in .unavailable("git ainda não consultado") })
 }
 
 extension ProjectDigest {
@@ -233,8 +251,31 @@ extension ProjectDigest {
     /// timer.
     public static let projectDocReadLimit = 8 * 1024
 
-    /// Longest identity line put on a card before it is elided.
-    public static let identityLimit = 120
+    /// Longest identity text handed to a card — a guard against a pathological
+    /// source line, NOT a layout decision.
+    ///
+    /// It was 120, which is a round number and was wrong at every width the
+    /// card actually has. Measured with the real font (`.caption`, 11 pt) and
+    /// the real strings, two lines hold:
+    ///
+    ///     text column   272 pt (narrowest card)      ~93 chars
+    ///                   340 pt                      ~117
+    ///                   586 pt (widest grid column) ~213
+    ///                   1000 pt (tree mode is full width, not in the grid) ~365
+    ///
+    /// So 120 elided `feirao-do-lu`'s 364-char description down to a third of a
+    /// sentence, and on the operator's wide window those 120 chars were ONE
+    /// line — the second line the design had allocated rendered empty. The card
+    /// exists to say what the project is and was cutting the sentence to fit a
+    /// box it was not in.
+    ///
+    /// The card is adaptive (272 pt to the full window), so no single character
+    /// count can be the right elision for it — `.lineLimit(2)` is, and SwiftUI
+    /// places the ellipsis at the real width. This constant only keeps a
+    /// runaway PROJECT.md from being handed to the view whole: 400 is just past
+    /// what two lines hold at a 1000 pt card, so it never bites before the
+    /// layout does at any width a window can have.
+    public static let identityLimit = 400
 
     public static func load(path: String,
                             role: ProjectRole,
@@ -370,8 +411,15 @@ extension ProjectDigest {
     /// `git: .none` and is now filling this one in off the reload path. Public
     /// so that caller does not have to re-derive the `"sem git"` wording, which
     /// would be a second place for it to be different.
+    ///
+    /// `"sem git"` is emitted for exactly one outcome — git ran, refused, and
+    /// there is no `.git` to contradict it. Everything else keeps the reason it
+    /// arrived with.
     public static func loadGit(path: String, probe: GitProbe) -> DigestGitField {
-        guard let snapshot = probe.snapshot(path) else { return .absent("sem git") }
-        return .state(snapshot)
+        switch probe.status(path) {
+        case .state(let s): return .state(s)
+        case .notARepository: return .absent("sem git")
+        case .unavailable(let why): return .unavailable(why)
+        }
     }
 }
