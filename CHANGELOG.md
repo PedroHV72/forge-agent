@@ -1,3 +1,112 @@
+## v4.1.0 — What a project is, and what the screen may claim about it
+
+Two things landed here and they are the same thing seen from two ends. The milestone
+`M-20260802185210-workspace-root-forge` gave Forge a real notion of *where it lives* —
+roots, workspaces, ownership, addressable runs. The Projects screen was then looked at,
+and the look found that almost everything it said about a project was either nothing or
+false. The rule that came out of both, and that governs every change below: **a screen may
+only claim what was measured, and an absence that was measured must never render like an
+absence that was not.**
+
+That rule is not decoration. It was earned: two real repositories were reported as "sem
+git" on a screen with 465 green tests, because nothing distinguished *git was asked and
+said no* from *git was never asked*.
+
+### Breaking
+
+- **`.gsd/` no longer means "a Forge project lives here".** Detection is by *substance* —
+  `scripts/forge-workspace.js` and `app/Sources/ForgeKit/ProjectMarker.swift` classify a
+  directory as `project | touched | none` by what is inside `.gsd/`, not by its existence.
+  A directory a run merely walked through is `touched`, and the Projects screen lists those
+  separately instead of promoting them. Anyone whose registry was full of incidental
+  entries will see the list shrink; nothing is deleted from disk.
+- **Four scripts stopped manufacturing `.gsd/`.** `forge-verify.js`, `forge-lock.js`,
+  `forge-dashboard.js` and `forge-runs.js` each created the directory as a side effect of
+  running, which is what made the marker meaningless in the first place. They now resolve
+  the owning project and refuse — `ENOGSD`, `ENOTPROJECT` — rather than inventing one.
+- **`.gsd/STATE.md` at the root is a generated projection**, not a source of truth, and is
+  no longer documented as one anywhere. It is written by `scripts/forge-dashboard.js` under
+  a lock and carries an `AUTO-GENERATED` marker. A run's durable state lives in
+  `M###-STATE.md`. This is a documentation revocation with a scanner behind it
+  (`scripts/forge-doc-claims.js`), because the previous acceptance criterion for it was
+  vacuously green — `grep` in the maintainer's shell honours `.gitignore`, and
+  `.gitignore` lists the file that carried the claim.
+
+### Added
+
+- **Workspaces, and ownership.** A workspace is a project that contains other registered
+  projects; the hierarchy is derived rather than declared, and ownership resolves by
+  *nearest project wins*. The registry became versioned (`{version, roots[], entries[],
+  quarantine[]}`) instead of a flat list of strings, and the live migration ran with a
+  reviewed dry-run and a preserved `.bak`.
+- **A run has an address.** `scripts/forge-run-address.js` resolves `run → root → project →
+  repo`, byte-identically from any cwd, with every hop carrying `{path, name, source,
+  reason}` — `source` separates a recorded fact from a derived one, and each of the nine
+  degradations has a name instead of a silent `null`.
+- **An overlap signal between concurrent runs.** `forge-touch.js` records which files a run
+  touched (derived from git, not from the evidence log — git answers the question the merge
+  will actually ask), and `forge-overlap.js` compares snapshots with a full census. It is
+  advisory and deliberately *not* an integration queue: no ordering, no merge blocking, no
+  recommendation about who merges first. A test asserts that absence.
+- **The Projects card says what the project is.** Identity from `PROJECT.md`, last delivery
+  from the ledger, git state, detected stack. It previously showed counters that were
+  always zero.
+- **Real brand marks, vendored, with no new dependency.** Ten SVGs from Simple Icons (CC0)
+  and Octicons (MIT), checked in with provenance and licence — stacks, git hosts, and the
+  branch glyph. Measured on fourteen real projects, the previous SF Symbol shapes put nine
+  cards on one triangle and three on one hexagon; the slot carried about one bit. Every
+  mark still carries its SF Symbol, so an unresolvable asset degrades to last week's icon
+  rather than to a blank square.
+- **The git row is paired icon+text segments** — repository name beside the host mark,
+  branch beside the branch mark, changes and divergence each with their own colour. The
+  repository name comes from the same `.git/config` read as the host, so it costs no new
+  spawn, and it is never substituted with the folder name when there is no remote.
+
+### Changed
+
+- **`GitStatus` separates measured from unmeasured** — `.state` / `.notARepository` /
+  `.unavailable(reason)`, and they cannot collapse. The underlying cause of the "sem git"
+  bug was cooperative-pool starvation: forty concurrent probes returned thirty-two nils in
+  twenty seconds. `Git.invoke` no longer parks a cooperative thread on a semaphore; the
+  fixed path returns zero nils in 0.29 s.
+- **The default branch is resolved, not guessed.** `GitDefaultBranch` reads `origin/HEAD`
+  and then the first of `main`/`master` that exists — from refs on disk, 0.9 ms/card
+  against ~40 ms for a spawn, agreeing with `git symbolic-ref` on 14/14. It deliberately
+  differs from `gitDefaultBranch()` in `forge-isolation.js`, which ends in `return 'main'`:
+  a script that must check something out needs a name, a card must not invent one.
+- **Host marks are drawn only for a measured host.** `GitRemote` has four non-collapsing
+  cases, and real disk supplied the two that theory missed — an SSH host alias
+  (`git@github-personal:`) which keeps its repository name but is not github.com, and a
+  genuinely remoteless repository.
+- **"Tocados por outro projeto" carries its evidence.** Each row shows the folder name,
+  what was found inside the `.gsd/`, when it was last touched, and whether there is a git
+  repository — so the decision the row asks for has something to stand on. The remove
+  action gets the destructive icon and colour, and the word "Remover da lista", because it
+  drops a registry entry and deletes nothing from disk.
+- **Worktree cleanup is git-primary.** The registry knew about two of eleven real
+  worktrees; asking git is the only way to find the rest.
+
+### Fixed
+
+- **`tier_models` actually routes.** The tier resolution produced a full model ID while
+  `Agent()` accepts only the four short aliases, and the dispatch omitted the parameter
+  entirely — so editing `tier_models.<tier>` had changed nothing, silently, since it
+  shipped. `scripts/forge-model-alias.js` is the single canonical map; an unmapped ID omits
+  the parameter and warns rather than passing an ID that would break the call.
+- **A hazard notice told the operator to delete a legitimate workspace.** It keyed on
+  containment count with no reference to the role at all. Found by looking at the screen
+  with seventy-six suites green.
+- **Registry round-trip defects** — `missing: true` dropped on load, an absolute path
+  leaking into the file — plus a containment guard that now throws when row counts differ
+  across a rewrite.
+
+### Notes
+
+- The version stamp reads from `git describe`, which was finding a milestone tag with no
+  version shape; this release restores it.
+- Baselines at the cut: **498** Swift tests, **79** JS suites, **2042** smoke assertions,
+  zero failures.
+
 ## v4.0.0 — The board you can read
 
 The kanban shipped in `M-20260730101543` and then got looked at for the first time. Every
