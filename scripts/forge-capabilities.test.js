@@ -173,4 +173,48 @@ test('discovery serializes Windows-safe catalog paths with slashes', () => {
 });
 test('help returns without reading a catalog', () => { let output = ''; assert.strictEqual(api.run(['--help'], (value) => { output += value; }), 0); assert.match(output, /Usage:/); });
 
+test('detects a fake CLI with argv and never spawns the non-selected host', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cap-probe space-Ω-'));
+  const fake = path.join(root, 'fake cli Ω.js');
+  const marker = path.join(root, 'invocations.log');
+  fs.writeFileSync(fake, [
+    "const fs = require('fs');",
+    "if (process.env.FORGE_FAKE_MARKER) fs.appendFileSync(process.env.FORGE_FAKE_MARKER, `${process.argv[2] || ''}\\n`);",
+    "if (process.argv.includes('--version')) process.stdout.write('3.2.0\\n');",
+    "else if (process.argv.includes('--help')) process.stdout.write('fake help\\n');",
+    "else process.exitCode = 2;",
+  ].join('\n'));
+  try {
+    const report = api.detect(path.resolve(__dirname, '..'), {
+      runtime: 'claude',
+      binaries: { claude: { command: process.execPath, args: [fake] }, codex: { command: process.execPath, args: [fake] } },
+      env: { ...process.env, FORGE_FAKE_MARKER: marker },
+    });
+    assert.strictEqual(report.probes.claude.status, 'available');
+    assert.strictEqual(report.probes.claude.reason_code, 'available');
+    assert.strictEqual(report.probes.codex.reason_code, 'not-selected');
+    assert.strictEqual(fs.readFileSync(marker, 'utf8').split(/\r?\n/).filter(Boolean).length, 2);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('classifies missing, unsupported, and invalid CLI probes with stable codes', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cap-probe-negative-'));
+  const low = path.join(root, 'low.js');
+  const invalid = path.join(root, 'invalid.js');
+  fs.writeFileSync(low, "if (process.argv.includes('--version')) process.stdout.write('0.0.1\\n'); else process.stdout.write('help\\n');");
+  fs.writeFileSync(invalid, "if (process.argv.includes('--version')) process.stdout.write('not-a-version\\n'); else process.stdout.write('help\\n');");
+  try {
+    const base = path.resolve(__dirname, '..');
+    const lowReport = api.detect(base, { runtime: 'claude', binaries: { claude: { command: process.execPath, args: [low] } } });
+    assert.strictEqual(lowReport.probes.claude.status, 'unsupported');
+    assert.strictEqual(lowReport.probes.claude.reason_code, 'minimum-version');
+    const invalidReport = api.detect(base, { runtime: 'claude', binaries: { claude: { command: process.execPath, args: [invalid] } } });
+    assert.strictEqual(invalidReport.probes.claude.status, 'inconclusive');
+    assert.strictEqual(invalidReport.probes.claude.reason_code, 'invalid-output');
+    const missingReport = api.detect(base, { runtime: 'claude', binaries: { claude: path.join(root, 'absent') } });
+    assert.strictEqual(missingReport.probes.claude.status, 'missing');
+    assert.strictEqual(missingReport.probes.claude.reason_code, 'missing');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 process.stdout.write(`\n${passed} passed, 0 failed\n`);

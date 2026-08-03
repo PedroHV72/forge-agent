@@ -27,6 +27,7 @@ const { execFileSync } = require('child_process');
 // ── Imports from forge-ignore ─────────────────────────────────────────────────
 const { PROJECTION_IGNORE_PATHS, detectVcs } = require('./forge-ignore');
 const { audit: auditReview } = require('./forge-review-audit');
+const { detect: detectCapabilities } = require('./forge-capabilities');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const CURRENT_SCHEMA = 'fragment-store@1.0.0';
@@ -35,7 +36,7 @@ const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 // Single source of truth for the check names this CLI accepts via `--check`.
 // `runCheck` dispatches these; the unknown-check message and `--help` text
 // must both be derived from this array — never hand-repeated.
-const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared'];
+const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities'];
 
 // ── checkSchema ───────────────────────────────────────────────────────────────
 /**
@@ -255,6 +256,27 @@ function checkPlanRepoDeclared(cwd) {
   };
 }
 
+/**
+ * Detects the selected host runtime without installing, logging in, or using
+ * the other CLI as a fallback. This is intentionally read-only and returns a
+ * stable reason code for every probe.
+ */
+function checkCapabilities(cwd, options = {}) {
+  const report = detectCapabilities(cwd, options);
+  const failures = report.required_failures.map((id) => {
+    const probe = report.probes[id];
+    return { id, status: probe.status, reason_code: probe.reason_code };
+  });
+  const warnings = Object.keys(report.probes).sort()
+    .map((id) => report.probes[id])
+    .filter((probe) => probe.reason_code === 'not-selected' || (probe.status !== 'available' && !report.required_failures.includes(probe.id)))
+    .map((probe) => ({ id: probe.id, status: probe.status, reason_code: probe.reason_code }));
+  const message = report.ok
+    ? `Capabilities ${report.runtime}: required probes available.`
+    : `Capabilities ${report.runtime}: required probe failure (${failures.map((entry) => `${entry.id}:${entry.reason_code}`).join(', ')}).`;
+  return { check: 'capabilities', ok: report.ok, runtime: report.runtime, probes: report.probes, failures, warnings, message };
+}
+
 // ── module.exports ────────────────────────────────────────────────────────────
 module.exports = {
   CURRENT_SCHEMA,
@@ -262,6 +284,7 @@ module.exports = {
   checkSchema,
   checkProjectionVersioned,
   checkPlanRepoDeclared,
+  checkCapabilities,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -278,7 +301,7 @@ function parseArgs(argv) {
   return args;
 }
 
-function runCheck(name, cwd) {
+function runCheck(name, cwd, options = {}) {
   const checks = name === 'all' ? VALID_CHECKS.slice() : [name];
 
   let allOk = true;
@@ -301,6 +324,10 @@ function runCheck(name, cwd) {
       results.push({ check: c, ...r });
       // Advisory: `r.ok` is always true, so this never flips `allOk`.
       if (!r.ok) allOk = false;
+    } else if (c === 'capabilities') {
+      const r = checkCapabilities(cwd, options);
+      results.push(r);
+      if (!r.ok) allOk = false;
     } else {
       process.stderr.write(`forge-doctor: unknown check "${c}". Valid: ${VALID_CHECKS.join(', ')}, all\n`);
       process.exit(2);
@@ -318,6 +345,7 @@ function formatResults(results) {
     const label = r.check === 'schema' ? 'Layer 2 — Schema version'
       : r.check === 'review-model-drift' ? 'Advisory — Review model drift'
       : r.check === 'plan-repo-declared' ? 'Advisory — Plan repo declaration'
+      : r.check === 'capabilities' ? 'Runtime — Capabilities'
       : 'Layer 3 — Projection versioned';
     lines.push(`  ${icon} ${label}`);
     lines.push(`    ${r.message}`);
@@ -326,6 +354,10 @@ function formatResults(results) {
     }
     if (advisoryWarn) {
       for (const p of r.plans) lines.push(`      - ${p}`);
+    }
+    if (r.check === 'capabilities') {
+      for (const failure of r.failures || []) lines.push(`      - ${failure.id}: ${failure.status} (${failure.reason_code})`);
+      for (const warning of r.warnings || []) if (warning.reason_code !== 'not-selected') lines.push(`      - warning ${warning.id}: ${warning.status} (${warning.reason_code})`);
     }
   }
   return lines.join('\n');
@@ -340,6 +372,8 @@ function cliMain() {
 Flags:
   --check <name> [--cwd <dir>]   run check: ${VALID_CHECKS.join(' | ')} |
                                  all
+  --runtime <name>               capabilities host: claude | codex | both
+  --json                         emit deterministic JSON for capability checks
   --fix [--cwd <dir>] [--migrate]  write SCHEMA-VERSION if missing; suggest ignore
                                  fixes. Refuses to stamp an unmigrated store unless
                                  --migrate is given (then runs forge-migrate first).
@@ -475,7 +509,12 @@ Exit codes:
   }
 
   if (args.check) {
-    const { allOk, results } = runCheck(args.check, cwdArg);
+    const { allOk, results } = runCheck(args.check, cwdArg, { runtime: args.runtime });
+    if (args.json) {
+      process.stdout.write(`${JSON.stringify({ ok: allOk, results })}\n`);
+      process.exit(allOk ? 0 : 1);
+      return;
+    }
     process.stdout.write('Forge Doctor\n============\n\n');
     process.stdout.write(formatResults(results) + '\n');
     const passed = results.filter(r => r.ok).length;

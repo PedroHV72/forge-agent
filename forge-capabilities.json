@@ -8,6 +8,27 @@
       "codex": { "optional": true, "host": "codex" }
     }
   },
+  "reason_codes": ["available", "missing", "unsupported", "inconclusive", "permission-denied", "not-selected", "invalid-output", "exit-nonzero", "minimum-version"],
+  "runtimes": {
+    "node": {
+      "required": true,
+      "minimum_version": "18.0.0",
+      "probe": { "kind": "node" },
+      "platforms": { "macos": "common", "windows": "common", "linux": "common" }
+    },
+    "claude": {
+      "required": false,
+      "minimum_version": "3.1.4",
+      "probe": { "kind": "cli", "command": "claude", "version_args": ["--version"], "behavior_args": ["--help"] },
+      "platforms": { "macos": "common", "windows": "common", "linux": "common" }
+    },
+    "codex": {
+      "required": false,
+      "minimum_version": "0.1.0",
+      "probe": { "kind": "cli", "command": "codex", "version_args": ["--version"], "behavior_args": ["--help"] },
+      "platforms": { "macos": "common", "windows": "common", "linux": "common" }
+    }
+  },
   "capabilities": [
     { "capability_id": "skill-forge-accounts", "kind": "skill", "owner": "accounts", "required": true, "hosts": { "claude": "implemented", "codex": "planned" }, "probe": { "kind": "filesystem", "path": "skills/forge-accounts/SKILL.md" } },
     { "capability_id": "skill-forge-add-slice", "kind": "skill", "owner": "planning", "required": true, "hosts": { "claude": "implemented", "codex": "planned" }, "probe": { "kind": "filesystem", "path": "skills/forge-add-slice/SKILL.md" } },
