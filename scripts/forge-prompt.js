@@ -57,6 +57,16 @@ const TASK_ID_RE = /^(?:T\d+(?:\.\d+)?|TASK-\d+|T-\d{14}-[a-z0-9][a-z0-9-]*)$/i;
 const MAX_TEMPLATE_BYTES = 256 * 1024;
 const MAX_DATA_BYTES = 512 * 1024;
 const MAX_CONTEXT_TOKENS = 16000;
+const DEFAULT_STANDARDS_REL = '.gsd/CODING-STANDARDS.md';
+const MEMORY_FRAGMENT_POINTER = '.gsd/memory/';
+
+// Section names as they appear in CODING-STANDARDS.md, per injected placeholder.
+// CS_STRUCTURE concatenates three sections (see extractStandards).
+const STANDARDS_SECTIONS = Object.freeze({
+  CS_LINT: 'Lint & Format Commands',
+  CS_STRUCTURE: 'Directory Conventions + Asset Map + Pattern Catalog',
+  CS_RULES: 'Code Rules',
+});
 
 const REQUIRED_IDS = Object.freeze({
   'execute-task': ['milestoneId', 'sliceId', 'taskId'],
@@ -140,20 +150,74 @@ function resolveRegularFileWithin(root, filename, label, maxBytes) {
   return realTarget;
 }
 
-function truncateChars(text, maxChars) {
+/**
+ * Normalize a truncation pointer for prompt injection: POSIX separators (the
+ * prompt is read by humans and models on every platform) and no newlines, so a
+ * pointer can never break out of the marker it lives in.
+ */
+function normalizePointer(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\\/g, '/').replace(/[\r\n]+/g, ' ').trim();
+}
+
+/**
+ * Marker builders in decreasing order of information. Each takes the cut char
+ * count and returns the exact text appended after the surviving content.
+ * The `[...truncated ` prefix is deliberately shared with forge-tokens.js so
+ * both truncators emit one recognizable family of marker.
+ */
+function markerBuilders(source, section) {
+  const where = section ? `${source} § ${section}` : source;
+  return [
+    cut => `\n\n[...truncated ${cut} chars — see ${where}]`,
+    () => `\n\n[...truncated — see ${source}]`,
+  ];
+}
+
+function cutContent(text, budget) {
+  const raw = text.slice(0, budget);
+  const boundary = raw.lastIndexOf('\n');
+  const cut = boundary >= Math.floor(budget / 2) ? raw.slice(0, boundary) : raw;
+  return cut.trimEnd();
+}
+
+/**
+ * Truncate to at most `maxChars`, telling the reader what was cut and where the
+ * rest lives. The marker is charged against the same budget it protects, so it
+ * degrades full marker -> short marker -> the silent ellipsis, and the result
+ * length never exceeds `maxChars`.
+ */
+function truncateChars(text, maxChars, opts = {}) {
   if (text.length <= maxChars) return text;
   if (maxChars <= 1) return '…'.slice(0, maxChars);
+
+  const source = normalizePointer(opts && opts.source);
+  const section = normalizePointer(opts && opts.section);
+  if (source) {
+    for (const build of markerBuilders(source, section)) {
+      // Reserve using the widest possible cut count so the final marker (built
+      // from the real count) can only be shorter than what we budgeted for.
+      const reserve = build(text.length).length;
+      if (reserve + 1 > maxChars) continue;
+      const content = cutContent(text, maxChars - reserve);
+      if (content.length === 0) continue;
+      const rendered = `${content}${build(text.length - content.length)}`;
+      if (rendered.length <= maxChars) return rendered;
+    }
+  }
+
   const raw = text.slice(0, maxChars - 1);
   const boundary = raw.lastIndexOf('\n');
   const cut = boundary >= Math.floor(maxChars / 2) ? raw.slice(0, boundary) : raw;
   return `${cut.trimEnd()}…`;
 }
 
-function truncateContext(text, maxTokens) {
-  return truncateChars(text, maxTokens * 4);
+function truncateContext(text, maxTokens, opts = {}) {
+  return truncateChars(text, maxTokens * 4, opts);
 }
 
-function boundStandards(standards, maxTokens, template) {
+function boundStandards(standards, maxTokens, template, opts = {}) {
+  const standardsPath = normalizePointer(opts && opts.standardsPath) || DEFAULT_STANDARDS_REL;
   const keys = ['CS_LINT', 'CS_STRUCTURE', 'CS_RULES'];
   const values = Object.fromEntries(keys.map(key => [
     key,
@@ -165,7 +229,10 @@ function boundStandards(standards, maxTokens, template) {
   for (let index = 0; index < used.length; index += 1) {
     const key = used[index];
     const allocation = Math.floor(remaining / (used.length - index));
-    result[key] = truncateChars(values[key], allocation);
+    result[key] = truncateChars(values[key], allocation, {
+      source: standardsPath,
+      section: STANDARDS_SECTIONS[key],
+    });
     remaining -= result[key].length;
   }
   return result;
@@ -245,10 +312,22 @@ function extractStandards(markdown) {
   };
 }
 
-function loadStandards(cwd, standardsPath) {
-  const target = standardsPath
+// Single resolution of the standards file, consumed by the loader and by the
+// truncation pointer so the marker can never name a file we did not read.
+function standardsTarget(cwd, standardsPath) {
+  return standardsPath
     ? path.resolve(cwd, standardsPath)
     : path.join(cwd, '.gsd', 'CODING-STANDARDS.md');
+}
+
+function standardsPointer(cwd, standardsPath) {
+  const relative = path.relative(cwd, standardsTarget(cwd, standardsPath));
+  const normalized = normalizePointer(relative);
+  return normalized && !normalized.startsWith('..') ? normalized : DEFAULT_STANDARDS_REL;
+}
+
+function loadStandards(cwd, standardsPath) {
+  const target = standardsTarget(cwd, standardsPath);
   if (!isWithin(cwd, target)) throw new Error(`Standards path must stay inside cwd: ${target}`);
   if (!fs.existsSync(target)) return extractStandards('');
   const safeTarget = resolveRegularFileWithin(cwd, target, 'Standards', MAX_DATA_BYTES);
@@ -257,8 +336,9 @@ function loadStandards(cwd, standardsPath) {
 
 function formatMemoryResult(result, maxTokens) {
   if (result == null) return '(none)';
-  if (typeof result === 'string') return truncateContext(validateText(result.trim(), 'memories') || '(none)', maxTokens);
-  if (typeof result.markdown === 'string') return truncateContext(validateText(result.markdown.trim(), 'memories') || '(none)', maxTokens);
+  const pointer = { source: MEMORY_FRAGMENT_POINTER };
+  if (typeof result === 'string') return truncateContext(validateText(result.trim(), 'memories') || '(none)', maxTokens, pointer);
+  if (typeof result.markdown === 'string') return truncateContext(validateText(result.markdown.trim(), 'memories') || '(none)', maxTokens, pointer);
   const values = Array.isArray(result)
     ? result
     : Array.isArray(result.facts)
@@ -272,7 +352,7 @@ function formatMemoryResult(result, maxTokens) {
     if (item && typeof item === 'object') return item.fact || item.text || item.content || JSON.stringify(item);
     return String(item);
   }).filter(Boolean).map(line => /^\s*[-*]\s/.test(line) ? line : `- ${line}`);
-  return truncateContext(validateText(lines.join('\n'), 'memories') || '(none)', maxTokens);
+  return truncateContext(validateText(lines.join('\n'), 'memories') || '(none)', maxTokens, pointer);
 }
 
 function resolveMemories(options) {
@@ -384,7 +464,10 @@ function buildValues(options, template) {
     ? (options.standards || loadStandards(options.cwd, options.standardsPath))
     : {};
   const normalizedStandards = usesStandards
-    ? boundStandards(standards, options.standardsMaxTokens, template)
+    ? boundStandards(standards, options.standardsMaxTokens, template, {
+      // Inline standards did not come from a file; point at the canonical one.
+      standardsPath: options.standards ? DEFAULT_STANDARDS_REL : standardsPointer(options.cwd, options.standardsPath),
+    })
     : { CS_LINT: '', CS_STRUCTURE: '', CS_RULES: '' };
   const memories = template.includes('{TOP_MEMORIES}') ? resolveMemories(options) : '';
   return {
@@ -692,6 +775,7 @@ module.exports = {
   materializePrompt,
   cleanupPrompt,
   validateDispatchId,
+  _private: { truncateChars, truncateContext, boundStandards, standardsPointer },
 };
 
 if (require.main === module) {
