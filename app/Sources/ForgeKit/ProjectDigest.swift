@@ -194,6 +194,100 @@ public enum GitTone: String, Equatable, CaseIterable {
     case failed
     /// Not asked yet — git is ~102 ms/card and is off the reload path.
     case pending
+
+    // ── Divergence from the DEFAULT branch (`GitBaseline`) ─────────────────
+    //
+    // A separate tone family because it answers a separate question. The four
+    // above say whether git was measured at all; these say where the branch
+    // stands against `main`/`master`, which is measurable only once it was.
+
+    /// On the default branch, or level with it. Nothing to act on.
+    case level
+    /// Has commits the default lacks. Normal work in progress.
+    case ahead
+    /// MISSING commits the default has. The actionable one — a branch that
+    /// silently fell behind is what produced a worktree 13 commits stale.
+    case behind
+    /// Both directions. Neither side is a fast-forward of the other.
+    case diverged
+    /// The default branch could not be resolved. NOT "level with main".
+    case undetermined
+}
+
+/// The default-branch divergence as a second, trailing mark on the git row.
+///
+/// Separate from `GitGlyph` rather than folded into its `text` for one reason:
+/// it needs its OWN tone. The operator asked for colour on ahead/behind, and a
+/// single `foregroundStyle` over one concatenated string cannot colour a tail
+/// segment differently from the branch name in front of it.
+public struct GitBaselineMark: Equatable {
+    public let symbol: String?
+    public let text: String
+    public let help: String
+    public let tone: GitTone
+
+    public init(symbol: String?, text: String, help: String, tone: GitTone) {
+        self.symbol = symbol
+        self.text = text
+        self.help = help
+        self.tone = tone
+    }
+
+    /// Divergence arrows. Named constants for the same reason `branchSymbol`
+    /// is: a name spelled twice can drift into a blank square in one of them.
+    public static let aheadSymbol = "arrow.up"
+    public static let behindSymbol = "arrow.down"
+    public static let divergedSymbol = "arrow.up.arrow.down"
+    public static let levelSymbol = "equal"
+    public static let undeterminedSymbol = "questionmark"
+
+    /// THE COMPOSITION RULE for the trailing mark, in one place.
+    ///
+    /// `nil` means the caller has a repository but has not measured divergence
+    /// yet — a fifth fact that can be unknown INDEPENDENTLY of the other four,
+    /// and one that must never draw as "level with main". So it gets its own
+    /// wording (`"padrão…"`, the pending ellipsis this screen already uses for
+    /// git itself) distinct from `.unknown`'s (`"padrão?"`, measured and
+    /// unresolvable). Silence is not available to either: an omitted segment is
+    /// indistinguishable from "in sync", which is the fact it is NOT.
+    public static func of(_ baseline: GitBaseline?) -> GitBaselineMark {
+        switch baseline {
+        case .measured(let s) where s.onDefault:
+            // The branch name in front of this mark already IS the default, so
+            // repeating it would print the same word twice on one row. The word
+            // that adds something is what that name MEANS.
+            return GitBaselineMark(symbol: nil, text: "padrão",
+                                   help: "\(s.defaultBranch) é a branch padrão deste projeto",
+                                   tone: .level)
+        case .measured(let s) where s.ahead == 0 && s.behind == 0:
+            return GitBaselineMark(symbol: levelSymbol, text: s.defaultBranch,
+                                   help: "nada a mais nem a menos que \(s.defaultBranch)",
+                                   tone: .level)
+        case .measured(let s) where s.behind == 0:
+            return GitBaselineMark(symbol: aheadSymbol, text: "\(s.ahead) de \(s.defaultBranch)",
+                                   help: "\(s.ahead) commit(s) à frente de \(s.defaultBranch)",
+                                   tone: .ahead)
+        case .measured(let s) where s.ahead == 0:
+            return GitBaselineMark(symbol: behindSymbol, text: "\(s.behind) de \(s.defaultBranch)",
+                                   help: "\(s.behind) commit(s) atrás de \(s.defaultBranch)",
+                                   tone: .behind)
+        case .measured(let s):
+            // Both numbers are shown even though the symbol says "both ways":
+            // this is the state worth acting on, and "diverged" without the
+            // sizes does not tell the operator how much work that is.
+            return GitBaselineMark(symbol: divergedSymbol,
+                                   text: "\(s.ahead)↑ \(s.behind)↓ de \(s.defaultBranch)",
+                                   help: "\(s.ahead) à frente e \(s.behind) atrás de \(s.defaultBranch) — divergiram",
+                                   tone: .diverged)
+        case .unknown(let why):
+            return GitBaselineMark(symbol: undeterminedSymbol, text: "padrão?",
+                                   help: why, tone: .undetermined)
+        case .none:
+            return GitBaselineMark(symbol: nil, text: "padrão…",
+                                   help: "divergência da branch padrão ainda não medida",
+                                   tone: .pending)
+        }
+    }
 }
 
 /// The git line a card should draw: an optional glyph, the text, the tone, and
@@ -231,17 +325,30 @@ public struct GitGlyph: Equatable {
     /// What the row is claiming, in pt-BR, for `.help()`. Never empty.
     public let help: String
     public let tone: GitTone
+    /// The trailing default-branch mark, or `nil` for the states where there is
+    /// no repository to compare — `absent`, `failed` and `pending` cannot have
+    /// drifted from a default branch, because nothing established they have one.
+    public let baseline: GitBaselineMark?
 
-    public init(symbol: String?, text: String, help: String, tone: GitTone) {
+    public init(symbol: String?, text: String, help: String, tone: GitTone,
+                baseline: GitBaselineMark? = nil) {
         self.symbol = symbol
         self.text = text
         self.help = help
         self.tone = tone
+        self.baseline = baseline
     }
 
     /// SF Symbol for a branch. One constant, so the mark cannot be spelled
     /// differently in a second place and drift into a blank square.
-    public static let branchSymbol = "arrow.triangle.branch"
+    ///
+    /// `arrow.trianglehead.branch` and not `arrow.triangle.branch`: same shape,
+    /// drawn in the current SF Symbols weight family, so it sits at the same
+    /// optical weight as the row's text instead of a hair heavier. Safe at this
+    /// deployment target — the package declares macOS 26 — and asserted to
+    /// resolve by the harness, which is what stops a rename from becoming the
+    /// blank square this line of work removes.
+    public static let branchSymbol = "arrow.trianglehead.branch"
 
     /// THE COMPOSITION RULE, in one place.
     ///
@@ -253,7 +360,8 @@ public struct GitGlyph: Equatable {
             return GitGlyph(symbol: branchSymbol,
                             text: s.line,
                             help: s.help,
-                            tone: s.dirty ? .dirty : .clean)
+                            tone: s.dirty ? .dirty : .clean,
+                            baseline: GitBaselineMark.of(s.baseline))
         case .absent(let why):
             // No glyph: the sentence IS the whole row, and a mark here would
             // be one more shape competing with the branch mark above it.
@@ -291,6 +399,10 @@ public extension GitStatusSnapshot {
         } else {
             s += " — sem upstream configurado"
         }
+        // Says "upstream" out loud above, and names the default branch below,
+        // because the tooltip is the one place both numbers appear together and
+        // a reader must not take one for the other.
+        s += " — \(GitBaselineMark.of(baseline).help)"
         return s
     }
 }

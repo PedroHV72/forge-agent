@@ -775,6 +775,13 @@ struct ProjectCard: View {
     /// not a repository, and a card whose git has not been measured, therefore
     /// cannot draw a branch — the distinction the three-case `DigestGitField`
     /// exists to protect is carried by the glyph too, not only by the wording.
+    /// The default-branch mark rides in the TRAILING column, after a `Spacer`,
+    /// rather than as one more `·` segment of `g.text`. Two reasons, both
+    /// measured on this card: the row already carries a branch name that can be
+    /// 27 characters (`feat/projects-screen-richer`) under `lineLimit(1)`, and
+    /// appending there makes the divergence the first thing truncated away; and
+    /// the trailing column is the grammar this card already speaks — the
+    /// delivery row above puts its age in exactly that position.
     @ViewBuilder private var gitLine: some View {
         let g = GitGlyph.of(gitField)
         HStack(spacing: 4) {
@@ -782,21 +789,48 @@ struct ProjectCard: View {
                 Image(systemName: symbol).font(.system(size: 9))
                     .symbolRenderingMode(.hierarchical)
             }
-            Text(g.text).font(.system(size: 10)).monospaced().lineLimit(1)
+            Text(g.text).font(.system(size: 10)).monospaced()
+                .lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(gitStyle(g.tone))
+            if let b = g.baseline {
+                Spacer(minLength: 6)
+                HStack(spacing: 2) {
+                    if let symbol = b.symbol {
+                        Image(systemName: symbol).font(.system(size: 8))
+                            .symbolRenderingMode(.hierarchical)
+                    }
+                    Text(b.text).font(.system(size: 9)).monospacedDigit().lineLimit(1)
+                }
+                .foregroundStyle(gitStyle(b.tone))
+                .help(b.help)
+                .accessibilityLabel(b.help)
+            }
         }
-        .foregroundStyle(gitStyle(g.tone))
         .help(g.help)
         .accessibilityLabel(g.help)
     }
 
     /// Tone token → colour. The one place the view is allowed an opinion about
     /// git, and it has no access to the field to second-guess the token with.
+    ///
+    /// The divergence tones stay inside the ONE-ACCENT rule this app is built on
+    /// (`Color.accentOrange`, "everything else stays neutral on purpose"), so
+    /// they encode URGENCY, not direction — direction is what the arrow glyph is
+    /// for. Being ahead of the default is ordinary work in progress and reads
+    /// neutral; being BEHIND it is the actionable one and takes the accent,
+    /// because a branch that quietly fell behind is precisely what produced a
+    /// worktree 13 commits stale. Diverged takes the accent at full strength.
     private func gitStyle(_ tone: GitTone) -> AnyShapeStyle {
         switch tone {
         case .dirty: return AnyShapeStyle(Color.accentOrange)
         case .clean: return AnyShapeStyle(Color.secondary.opacity(0.7))
         case .absent, .failed: return AnyShapeStyle(.tertiary)
         case .pending: return AnyShapeStyle(.quaternary)
+        case .level: return AnyShapeStyle(.tertiary)
+        case .ahead: return AnyShapeStyle(Color.secondary.opacity(0.85))
+        case .behind: return AnyShapeStyle(Color.accentOrange.opacity(0.85))
+        case .diverged: return AnyShapeStyle(Color.accentOrange)
+        case .undetermined: return AnyShapeStyle(.tertiary)
         }
     }
 

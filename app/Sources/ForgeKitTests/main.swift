@@ -5698,6 +5698,324 @@ test("GitGlyph: todo símbolo que a linha de git pode desenhar existe de verdade
     assertEqual(Set(simbolos).count, 2, "símbolos em uso: \(simbolos)")
 }
 
+// MARK: - Branch padrão: main ou master, resolvida e nunca adivinhada
+
+/// Monta um `.git` de mentira — só arquivos, nenhum binário do git.
+///
+/// A resolução da branch padrão é leitura de refs, então ela é testável sem
+/// construir repositório nenhum: é exatamente por isso que ela lê refs em vez de
+/// chamar `git symbolic-ref` (que custaria ~40 ms por card e um processo a
+/// mais).
+func fakeRepo(_ tag: String, _ files: [String: String]) -> String {
+    let tmp = NSTemporaryDirectory() + "forge-gitdef-\(tag)-\(UUID().uuidString.prefix(8))"
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+    for (f, content) in files {
+        let full = tmp + "/" + f
+        try? fm.createDirectory(atPath: (full as NSString).deletingLastPathComponent,
+                                withIntermediateDirectories: true)
+        fm.createFile(atPath: full, contents: Data(content.utf8))
+    }
+    return tmp
+}
+
+test("GitDefaultBranch: a assimetria REAL do disco — origin/HEAD manda, main e master não empatam") {
+    // As três formas medidas nos 14 projetos registrados do operador.
+    // (a) forge-agent: origin/HEAD solto apontando para master, com main
+    //     INEXISTENTE — se a ordem de fallback vencesse o origin/HEAD, este
+    //     repositório inteiro seria comparado contra a branch errada.
+    let forge = fakeRepo("forge", [
+        ".git/refs/remotes/origin/HEAD": "ref: refs/remotes/origin/master\n",
+        ".git/refs/heads/master": "abc\n",
+        ".git/refs/heads/feat/projects-screen-richer": "def\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: forge) }
+    assertEqual(GitDefaultBranch.resolve(repoPath: forge), "master")
+
+    // (b) feirao-do-lu: NENHUM origin/HEAD no disco (o git só o escreve em
+    //     clone, e este repo não tem) — cai para o primeiro candidato que
+    //     existe de fato.
+    let feirao = fakeRepo("feirao", [".git/refs/heads/main": "abc\n"])
+    defer { try? FileManager.default.removeItem(atPath: feirao) }
+    assertEqual(GitDefaultBranch.resolve(repoPath: feirao), "main")
+
+    // (c) origin/HEAD vence mesmo com main presente: quando o remoto declara
+    //     seu padrão, o palpite local não tem o que dizer.
+    let ambos = fakeRepo("ambos", [
+        ".git/refs/remotes/origin/HEAD": "ref: refs/remotes/origin/master\n",
+        ".git/refs/heads/main": "abc\n",
+        ".git/refs/heads/master": "def\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: ambos) }
+    assertEqual(GitDefaultBranch.resolve(repoPath: ambos), "master",
+                "a ordem de fallback passou por cima do que o remoto declara")
+}
+
+test("GitDefaultBranch: não resolver é NULO — jamais o palpite 'main'") {
+    // O `gitDefaultBranch()` do forge-isolation.js termina em `return 'main'`,
+    // porque um script que precisa dar checkout precisa de um nome de qualquer
+    // jeito. Um CARD não: imprimir "main" para um repositório que não tem main
+    // é a afirmação falsa confiante que `383412d` tirou desta tela.
+    let vazio = fakeRepo("vazio", [".git/HEAD": "ref: refs/heads/trunk\n"])
+    defer { try? FileManager.default.removeItem(atPath: vazio) }
+    assertTrue(GitDefaultBranch.resolve(repoPath: vazio) == nil,
+               "resolveu algo num repo sem origin/HEAD, sem main e sem master — é palpite")
+
+    // Não-repositório: o lookchina do operador, que é workspace e não repo.
+    let naoRepo = fakeRepo("naorepo", ["README.md": "x"])
+    defer { try? FileManager.default.removeItem(atPath: naoRepo) }
+    assertTrue(GitDefaultBranch.resolve(repoPath: naoRepo) == nil)
+}
+
+test("GitDefaultBranch: packed-refs conta, e 'maintenance' não passa por 'main'") {
+    // Um repo repacked não tem refs soltos nenhum. Se packed-refs não fosse
+    // lido, todo repositório empacotado (o estado normal de um clone antigo)
+    // viraria "padrão indeterminado".
+    let packed = fakeRepo("packed", [
+        ".git/packed-refs": "# pack-refs with: peeled fully-peeled sorted\n"
+            + "aaaa1111 refs/heads/main\naaaa2222 refs/remotes/origin/main\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: packed) }
+    assertEqual(GitDefaultBranch.resolve(repoPath: packed), "main")
+
+    // Prefixo não é igualdade. `refs/heads/maintenance` satisfazendo "main"
+    // faria o card comparar contra uma branch que o operador nunca nomeou.
+    let quase = fakeRepo("quase", [
+        ".git/packed-refs": "aaaa1111 refs/heads/maintenance\nbbbb2222 refs/heads/master\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: quase) }
+    assertEqual(GitDefaultBranch.resolve(repoPath: quase), "master",
+                "'maintenance' passou por 'main' — comparação por prefixo")
+
+    // origin/HEAD também vive em packed-refs depois de um repack.
+    let packedHead = fakeRepo("packedhead", [
+        ".git/packed-refs": "ref: refs/remotes/origin/develop\ncccc refs/heads/main\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: packedHead) }
+    assertEqual(GitDefaultBranch.resolve(repoPath: packedHead), "develop")
+}
+
+test("GitDefaultBranch: worktree — o .git é um ARQUIVO e os refs estão no commondir") {
+    // A forma que o próprio Forge cria em `forge_isolation.mode: worktree`. Um
+    // resolvedor que parasse no primeiro salto não acharia refs/heads/ nenhum
+    // dentro de .git/worktrees/<nome>, e TODO worktree do Forge apareceria como
+    // "padrão indeterminado" — na tela do operador que mais usa worktree.
+    let base = fakeRepo("wt", [
+        "principal/.git/refs/remotes/origin/HEAD": "ref: refs/remotes/origin/master\n",
+        "principal/.git/refs/heads/master": "abc\n",
+        "principal/.git/worktrees/w1/commondir": "../..\n",
+        "principal/.git/worktrees/w1/HEAD": "ref: refs/heads/forge/M001\n",
+        "arvore/.git": "gitdir: \(NSTemporaryDirectory())PLACEHOLDER\n",
+    ])
+    defer { try? FileManager.default.removeItem(atPath: base) }
+    // Reescrito com o caminho real (absoluto), que só existe depois do mkdtemp.
+    try? "gitdir: \(base)/principal/.git/worktrees/w1\n"
+        .write(toFile: base + "/arvore/.git", atomically: true, encoding: .utf8)
+    assertEqual(GitDefaultBranch.resolve(repoPath: base + "/arvore"), "master")
+
+    // E o caminho relativo, que é como o git escreve quando o worktree é irmão.
+    try? "gitdir: ../principal/.git/worktrees/w1\n"
+        .write(toFile: base + "/arvore/.git", atomically: true, encoding: .utf8)
+    assertEqual(GitDefaultBranch.resolve(repoPath: base + "/arvore"), "master",
+                "gitdir relativo não foi resolvido contra a pasta do worktree")
+}
+
+test("GitDefaultBranch: este repositório, no disco de verdade, é master") {
+    // O fato assimétrico que dá razão à feature: os projetos do operador usam
+    // `main`, e ESTE usa `master`. Um resolvedor que devolvesse "main" fixo
+    // passaria em todos os testes sintéticos acima e mentiria aqui.
+    let repo = URL(fileURLWithPath: #filePath)          // …/app/Sources/ForgeKitTests/main.swift
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent().path
+    assertEqual(GitDefaultBranch.resolve(repoPath: repo), "master",
+                "resolveu em \(repo)")
+}
+
+test("Git.parseLeftRight: esquerda é ATRÁS — trocar os dois desenha o oposto plausível") {
+    // `git rev-list --left-right --count master...HEAD` sobre este branch
+    // imprime "0\t5": 0 commits que master tem e HEAD não, 5 que HEAD tem e
+    // master não. Invertido, o card diria "5 atrás de master" para um branch
+    // que está 5 À FRENTE — uma afirmação errada que parece perfeitamente
+    // normal na tela, que é o que a torna cara.
+    let c = Git.parseLeftRight("0\t5\n")
+    assertTrue(c != nil)
+    assertEqual(c?.behind, 0)
+    assertEqual(c?.ahead, 5)
+    assertEqual(Git.parseLeftRight("13\t2")?.behind, 13)
+    assertTrue(Git.parseLeftRight("") == nil, "vazio não é (0,0) — é formato não reconhecido")
+    assertTrue(Git.parseLeftRight("7") == nil, "um número só não é uma comparação")
+    assertTrue(Git.parseLeftRight("a\tb") == nil)
+}
+
+test("GitBaselineMark: 'não determinado' nunca se passa por 'em dia com a padrão'") {
+    // O invariante desta task inteira. A divergência da branch padrão é um
+    // QUINTO fato, que pode ser desconhecido de forma independente dos outros
+    // quatro — um repo sem origin, ou uma padrão irresolúvel, tem que aparecer
+    // como não-determinado, jamais como "nivelado com main".
+    let marcas = [
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "master",
+                                                      onDefault: true, ahead: 0, behind: 0))),
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "main",
+                                                      onDefault: false, ahead: 0, behind: 0))),
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "master",
+                                                      onDefault: false, ahead: 5, behind: 0))),
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "main",
+                                                      onDefault: false, ahead: 0, behind: 3))),
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "main",
+                                                      onDefault: false, ahead: 5, behind: 3))),
+        GitBaselineMark.of(.unknown("sem origin/HEAD")),   // medido, irresolúvel
+        GitBaselineMark.of(nil),                            // ainda não medido
+    ]
+    // Sete situações, sete desenhos. Se duas empatarem em tom E texto, dois
+    // fatos viraram um — a colisão exata que pôs "sem git" em repos reais.
+    for i in 0..<marcas.count {
+        for j in (i + 1)..<marcas.count {
+            assertFalse(marcas[i].tone == marcas[j].tone && marcas[i].text == marcas[j].text,
+                        "marcas \(i) e \(j) desenham igual: \(marcas[i].text)")
+        }
+    }
+    // E o nivelado não pode ser confundido com os dois não-medidos em NENHUMA
+    // direção: nem tom, nem texto, nem símbolo.
+    let nivelado = marcas[1]
+    for x in [marcas[5], marcas[6]] {
+        assertFalse(x.tone == nivelado.tone, "não-determinado ganhou o tom de 'nivelado'")
+        assertFalse(x.text.contains("main") && x.symbol == GitBaselineMark.levelSymbol,
+                    "não-determinado desenhando '= main' afirma o que ninguém mediu")
+    }
+    // Nenhum silêncio: um segmento omitido é indistinguível de "em dia".
+    for m in marcas { assertFalse(m.text.isEmpty); assertFalse(m.help.isEmpty) }
+
+    // O tom é urgência, não direção: ficar ATRÁS da padrão é o acionável.
+    assertEqual(marcas[2].tone, .ahead)
+    assertEqual(marcas[3].tone, .behind)
+    assertEqual(marcas[4].tone, .diverged)
+    assertEqual(marcas[0].tone, .level)
+    assertEqual(marcas[1].tone, .level)
+    assertEqual(marcas[5].tone, .undetermined)
+    assertEqual(marcas[6].tone, .pending)
+
+    // Os números aparecem, e do lado certo.
+    assertTrue(marcas[2].text.contains("5") && marcas[2].text.contains("master"),
+               "texto: \(marcas[2].text)")
+    assertTrue(marcas[4].text.contains("5") && marcas[4].text.contains("3"),
+               "divergido sem os dois tamanhos não diz quanto trabalho é: \(marcas[4].text)")
+}
+
+test("GitBaselineMark: divergência da PADRÃO não é divergência do UPSTREAM") {
+    // Os dois números são medidos contra refs diferentes e não se substituem.
+    // Este repositório é a prova viva: `feat/projects-screen-richer` não tem
+    // upstream NENHUM (ahead/behind = nil) e está 5 commits à frente de master.
+    // Um card que só mostrasse o upstream diria "sem upstream" e nada mais —
+    // silêncio sobre os 5 commits que existem.
+    let semUpstream = GitStatusSnapshot(
+        branch: "feat/projects-screen-richer", dirty: false, ahead: nil, behind: nil,
+        baseline: .measured(GitBaselineState(defaultBranch: "master", onDefault: false,
+                                             ahead: 5, behind: 0)))
+    let g = GitGlyph.of(.state(semUpstream))
+    assertTrue(g.text.contains("sem upstream"), "a linha não pode perder o fato do upstream")
+    assertFalse(g.text.contains("master"),
+                "a padrão entrou na linha principal — ela trunca primeiro e é a que some")
+    assertEqual(g.baseline?.text, "5 de master")
+    assertEqual(g.baseline?.tone, .ahead)
+    // O tooltip é o único lugar onde os dois fatos aparecem juntos, e tem que
+    // nomear os dois para que ninguém tome um pelo outro.
+    assertTrue(g.help.contains("upstream") && g.help.contains("master"), "help: \(g.help)")
+
+    // O inverso: em dia com o upstream E atrasado em relação à padrão. Nenhum
+    // dos dois números pode calar o outro.
+    let atrasado = GitStatusSnapshot(
+        branch: "fix/x", dirty: false, ahead: 0, behind: 0,
+        baseline: .measured(GitBaselineState(defaultBranch: "main", onDefault: false,
+                                             ahead: 0, behind: 6)))
+    let h = GitGlyph.of(.state(atrasado))
+    assertTrue(h.help.contains("em dia com o upstream"))
+    assertTrue(h.help.contains("6"), "atraso em relação à padrão sumiu do help: \(h.help)")
+    assertEqual(h.baseline?.tone, .behind)
+}
+
+test("GitBaselineMark: sem repositório não há padrão da qual divergir") {
+    // `absent`, `failed` e `pending` não estabeleceram que existe repositório —
+    // desenhar uma marca de padrão neles é a mesma classe de afirmação
+    // fabricada que a marca de branch já é proibida de fazer.
+    assertTrue(GitGlyph.of(.absent("sem git")).baseline == nil)
+    assertTrue(GitGlyph.of(.unavailable("timeout")).baseline == nil)
+    assertTrue(GitGlyph.of(nil).baseline == nil)
+    // E com repositório sempre há marca — inclusive a de "ainda não medida".
+    let repo = GitStatusSnapshot(branch: "main", dirty: false, ahead: nil, behind: nil)
+    assertTrue(GitGlyph.of(.state(repo)).baseline != nil,
+               "silêncio sobre a padrão é indistinguível de 'em dia com ela'")
+}
+
+test("GitBaselineMark: todo símbolo da marca de padrão existe de verdade") {
+    // Mesmo motivo do teste irmão: um nome inválido de SF Symbol renderiza como
+    // um quadrado em branco.
+    let todos = [GitBaselineMark.aheadSymbol, GitBaselineMark.behindSymbol,
+                 GitBaselineMark.divergedSymbol, GitBaselineMark.levelSymbol,
+                 GitBaselineMark.undeterminedSymbol, GitGlyph.branchSymbol]
+    for n in todos {
+        assertTrue(NSImage(systemSymbolName: n, accessibilityDescription: nil) != nil,
+                   "SF Symbol inexistente: \(n)")
+    }
+    // E são de fato os que o desenho emite — uma constante que ninguém usa não
+    // é cobertura de nada.
+    let emitidos = Set([
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "m", onDefault: false,
+                                                      ahead: 1, behind: 0))),
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "m", onDefault: false,
+                                                      ahead: 0, behind: 1))),
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "m", onDefault: false,
+                                                      ahead: 1, behind: 1))),
+        GitBaselineMark.of(.measured(GitBaselineState(defaultBranch: "m", onDefault: false,
+                                                      ahead: 0, behind: 0))),
+        GitBaselineMark.of(.unknown("x")),
+    ].compactMap(\.symbol))
+    assertEqual(emitidos.count, 5, "símbolos emitidos: \(emitidos.sorted())")
+    assertTrue(emitidos.isSubset(of: Set(todos)))
+}
+
+test("Git.baseline: estar NA padrão não gasta processo nenhum, e é um fato próprio") {
+    // Este repositório: HEAD numa feature branch, padrão master, 5 à frente.
+    let repo = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent().path
+    guard let s = Git.baseline(at: repo, currentBranch: "master").state else {
+        return assertTrue(false, "não resolveu a padrão deste repositório")
+    }
+    // currentBranch == padrão: respondido sem rev-list, e `onDefault` distingue
+    // "você ESTÁ na master" de "seu branch não tem nada além da master".
+    assertTrue(s.onDefault)
+    assertEqual(s.defaultBranch, "master")
+    assertEqual(s.ahead, 0); assertEqual(s.behind, 0)
+    assertEqual(GitBaselineMark.of(.measured(s)).text, "padrão")
+
+    // Um diretório que não é repositório: nomeia o motivo, não inventa padrão.
+    let naoRepo = fakeRepo("semrepo", ["a.txt": "x"])
+    defer { try? FileManager.default.removeItem(atPath: naoRepo) }
+    guard case .unknown(let why) = Git.baseline(at: naoRepo, currentBranch: "main") else {
+        return assertTrue(false, "inventou uma padrão para um diretório sem repositório")
+    }
+    assertFalse(why.isEmpty)
+}
+
+test("Git.status enche a divergência da padrão junto — este repo, medido de verdade") {
+    // Ponta a ponta, no disco do operador. `feat/projects-screen-richer` está 5
+    // à frente de master e sem upstream; os dois fatos convivem no mesmo card.
+    let repo = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent().path
+    guard let snap = Git.status(at: repo).snapshot else {
+        return assertTrue(false, "git não respondeu no próprio repositório")
+    }
+    guard let b = snap.baseline?.state else {
+        return assertTrue(false, "Git.status não mediu a padrão: \(String(describing: snap.baseline))")
+    }
+    assertEqual(b.defaultBranch, "master")
+    assertEqual(b.onDefault, snap.branch == "master")
+    if !b.onDefault {
+        assertTrue(b.ahead > 0, "um branch de trabalho sem nada à frente da master é suspeito")
+    }
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

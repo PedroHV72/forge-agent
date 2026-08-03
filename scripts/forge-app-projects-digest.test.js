@@ -224,6 +224,58 @@ test('o card nunca imprime "sem git" — a ausência medida vem nomeada do Forge
   }
 });
 
+test('a divergência da branch padrão vem pronta do ForgeKit — a view não a re-deriva', () => {
+  // O quinto fato da linha de git: quanto este branch andou em relação à
+  // padrão do projeto (`main` na maioria dos projetos do operador, `master`
+  // neste). É medido contra um ref DIFERENTE do upstream, então tem tom próprio
+  // — e é justamente por precisar de cor própria que ele existe como marca
+  // separada em vez de mais um `·` no texto.
+  //
+  // A mesma disciplina do assert acima vale aqui: se a view puder abrir o
+  // `GitBaseline`, ela pode desenhar "= main" para um repositório cuja padrão
+  // nunca foi resolvida — a afirmação fabricada que este trabalho remove.
+  const i = code.indexOf('private var gitLine');
+  const end = code.indexOf('private func gitStyle', i);
+  assert(end > i, 'gitLine/gitStyle não encontrados em Projects.swift');
+  const body = code.slice(i, end);
+
+  // A presença do nome não basta, e isso foi VISTO: `if let b = g.baseline,
+  // false {` mantém a string no arquivo e apaga a marca da tela. O pino exige a
+  // condição SEM cláusula extra, e o texto de fato desenhado.
+  assert(/if let b = g\.baseline \{/.test(body),
+    'gitLine não desenha mais g.baseline sem condição extra — a marca pode ter sido ' +
+    'apagada por uma cláusula, e um segmento omitido é indistinguível de "em dia com a padrão"');
+  assert(/Text\(b\.text\)/.test(body),
+    'gitLine não imprime mais b.text — a marca ficou sem palavra nenhuma');
+  assert(!/GitBaselineMark\.of\(|case\s+\.(measured|unknown)\b/.test(body),
+    'gitLine abre o GitBaseline sozinha — a regra de composição da marca tem de morar no ' +
+    'ForgeKit, onde ForgeKitTests alcança');
+  assert(!/\b(ahead|behind|onDefault|defaultBranch)\b/.test(body),
+    'gitLine toca os números da divergência — com eles em mãos ela pode inverter frente/atrás, ' +
+    'que é o erro plausível e invisível desta feature');
+
+  // E a view continua tendo UMA opinião só: tom → cor, para todos os tons.
+  const styleEnd = code.indexOf('\n    }', code.indexOf('private func gitStyle'));
+  const style = code.slice(code.indexOf('private func gitStyle'), styleEnd);
+  for (const tom of ['.level', '.ahead', '.behind', '.diverged', '.undetermined']) {
+    assert(new RegExp(`case\\s[^:]*\\${tom}\\b`).test(style),
+      `gitStyle não mapeia o tom ${tom} — um tom sem cor desenha como o vizinho, e dois ` +
+      `fatos viram um`);
+  }
+
+  const digest = stripComments(fs.readFileSync(
+    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift'), 'utf8'));
+  const j = digest.indexOf('static func of(_ baseline: GitBaseline?)');
+  assert(j >= 0, 'GitBaselineMark.of não encontrado — a regra de composição da marca sumiu');
+  const rule = digest.slice(j, j + 2200);
+  // Os dois não-medidos precisam existir separados: `.unknown` é "medido e
+  // irresolúvel", `.none` é "ainda não medido". Colapsá-los é a regressão.
+  assert(/case\s+\.unknown\b/.test(rule), 'GitBaselineMark.of perdeu o caso .unknown');
+  assert(/case\s+\.none\b/.test(rule), 'GitBaselineMark.of perdeu o caso .none (não medido)');
+  assert(/onDefault/.test(rule),
+    'GitBaselineMark.of não distingue mais "você ESTÁ na padrão" de "nivelado com ela"');
+});
+
 test('o git é re-perguntado quando falhou, e nunca quando foi medido', () => {
   const i = code.indexOf('private func refresh()');
   const body = code.slice(i, i + 2600);

@@ -35,12 +35,178 @@ public struct GitStatusSnapshot: Equatable {
     public let dirty: Bool
     public let ahead: Int?
     public let behind: Int?
+    /// Divergence from the project's DEFAULT branch — a different measurement
+    /// from `ahead`/`behind`, which are against the UPSTREAM. `nil` means it has
+    /// not been measured (see `GitBaseline` for why that is not the same as
+    /// "level with the default").
+    public let baseline: GitBaseline?
 
-    public init(branch: String, dirty: Bool, ahead: Int?, behind: Int?) {
+    public init(branch: String, dirty: Bool, ahead: Int?, behind: Int?,
+                baseline: GitBaseline? = nil) {
         self.branch = branch
         self.dirty = dirty
         self.ahead = ahead
         self.behind = behind
+        self.baseline = baseline
+    }
+
+    public func with(baseline: GitBaseline?) -> GitStatusSnapshot {
+        GitStatusSnapshot(branch: branch, dirty: dirty, ahead: ahead,
+                          behind: behind, baseline: baseline)
+    }
+}
+
+/// How this branch stands against the project's default branch — `main` on most
+/// of the operator's repos, `master` on this one.
+///
+/// NOT the same fact as `GitStatusSnapshot.ahead`/`behind`. Those come from
+/// `git status --porcelain --branch`, whose `[ahead N, behind M]` is measured
+/// against the UPSTREAM (`origin/<this-branch>`). Being 3 ahead of
+/// `origin/feat/x` says nothing about how far `feat/x` has drifted from `main`,
+/// and this repo is the proof: `feat/projects-screen-richer` has no upstream at
+/// all and is 5 commits ahead of `master`. Neither number can stand in for the
+/// other, so they are two fields.
+public struct GitBaselineState: Equatable {
+    /// The resolved default branch name — never guessed. See `GitDefaultBranch`.
+    public let defaultBranch: String
+    /// The checked-out branch IS the default. Distinct from being level with
+    /// it: "you are on master" and "your branch has nothing master lacks" are
+    /// different sentences about different situations.
+    public let onDefault: Bool
+    public let ahead: Int
+    public let behind: Int
+
+    public init(defaultBranch: String, onDefault: Bool, ahead: Int, behind: Int) {
+        self.defaultBranch = defaultBranch
+        self.onDefault = onDefault
+        self.ahead = ahead
+        self.behind = behind
+    }
+}
+
+/// A measured divergence from the default branch, or a NAMED reason there is
+/// none.
+///
+/// The second case is the same discipline `GitStatus` enforces one level up: a
+/// repository with no `origin` and no `main`/`master`, or one whose `rev-list`
+/// refused, must render as *not determined* — never as "level with main". That
+/// would be a confident false claim of exactly the kind `383412d` removed from
+/// this screen.
+public enum GitBaseline: Equatable {
+    case measured(GitBaselineState)
+    case unknown(String)
+
+    public var state: GitBaselineState? {
+        if case .measured(let s) = self { return s }
+        return nil
+    }
+}
+
+/// Which branch a project treats as its default — `main` or `master`.
+///
+/// PRECEDENCE IS SHARED WITH `gitDefaultBranch()` in `scripts/forge-isolation.js`
+/// and must stay in step with it (pinned by
+/// `scripts/forge-app-workspace-marker.test.js`). That JS function is
+/// load-bearing: `setupWorktreeOne` branches from `origin/<def>`, and getting
+/// the name wrong once produced a worktree 13 commits behind. The order is:
+///
+///   1. `origin/HEAD` — what the remote itself says its default is
+///   2. the first of `main`, `master` that exists as a local branch
+///
+/// ONE DELIBERATE DIFFERENCE, and it is not drift: the JS ends with `return
+/// 'main'`, a guess, because a script that must check something out needs a
+/// name no matter what. A card must not guess — an unresolvable default is
+/// reported as `.unknown`, because printing "main" for a repo that has no main
+/// is the false-claim failure this whole line of work exists to remove.
+///
+/// Resolved by READING REFS, not by spawning git. Measured across the
+/// operator's 14 registered projects: file reads agreed with
+/// `git symbolic-ref` on 14/14 (including both non-repositories, where both say
+/// nothing) at 0.9 ms/card against git's ~40 ms. Git is the expensive field on
+/// this screen and the card already pays for one spawn; the name is available
+/// on disk, so it costs no second one.
+public enum GitDefaultBranch {
+    /// Fallback names, in order. Same list, same order, as the JS.
+    public static let candidates = ["main", "master"]
+
+    public static func resolve(repoPath: String) -> String? {
+        guard let dir = commonDir(repoPath: repoPath) else { return nil }
+        let packed = (try? String(contentsOfFile: dir + "/packed-refs",
+                                  encoding: .utf8)) ?? ""
+
+        if let named = originHead(commonDir: dir, packed: packed) { return named }
+
+        for c in candidates {
+            if FileManager.default.fileExists(atPath: dir + "/refs/heads/" + c) { return c }
+            if packedHas(packed, ref: "refs/heads/" + c) { return c }
+        }
+        return nil
+    }
+
+    /// `refs/remotes/origin/HEAD` is a symref: `ref: refs/remotes/origin/main`.
+    /// Loose first, then `packed-refs`, which is where a repacked repo keeps it.
+    static func originHead(commonDir: String, packed: String) -> String? {
+        let prefix = "ref: refs/remotes/origin/"
+        if let loose = try? String(contentsOfFile: commonDir + "/refs/remotes/origin/HEAD",
+                                   encoding: .utf8) {
+            let line = loose.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix(prefix) {
+                let name = String(line.dropFirst(prefix.count))
+                if !name.isEmpty && name != "HEAD" { return name }
+            }
+        }
+        for raw in packed.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix(prefix) else { continue }
+            let name = String(line.dropFirst(prefix.count))
+            if !name.isEmpty && name != "HEAD" { return name }
+        }
+        return nil
+    }
+
+    /// Exact ref match, so `refs/heads/main` is never satisfied by
+    /// `refs/heads/maintenance`.
+    static func packedHas(_ packed: String, ref: String) -> Bool {
+        for raw in packed.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.hasPrefix("#"), !line.hasPrefix("^") else { continue }
+            guard let sp = line.firstIndex(of: " ") else { continue }
+            if line[line.index(after: sp)...] == ref[...] { return true }
+        }
+        return false
+    }
+
+    /// The directory refs actually live in.
+    ///
+    /// A linked worktree — which Forge itself creates in `forge_isolation.mode:
+    /// worktree` — has a `.git` FILE pointing at `…/.git/worktrees/<name>`, and
+    /// that directory holds a `commondir` pointing back at the shared refs. A
+    /// resolver that stopped at the first hop would find no `refs/heads/main` in
+    /// any worktree Forge makes and report every one of them as undetermined.
+    static func commonDir(repoPath: String) -> String? {
+        let fm = FileManager.default
+        let dotGit = repoPath + "/.git"
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: dotGit, isDirectory: &isDir) else { return nil }
+        if isDir.boolValue { return dotGit }
+
+        guard let text = try? String(contentsOfFile: dotGit, encoding: .utf8) else { return nil }
+        let marker = "gitdir:"
+        guard let line = text.split(separator: "\n")
+                .first(where: { $0.hasPrefix(marker) }) else { return nil }
+        let raw = String(line.dropFirst(marker.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        let gitDir = raw.hasPrefix("/") ? raw : repoPath + "/" + raw
+
+        if let common = try? String(contentsOfFile: gitDir + "/commondir", encoding: .utf8) {
+            let c = common.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !c.isEmpty {
+                let resolved = c.hasPrefix("/") ? c : gitDir + "/" + c
+                return URL(fileURLWithPath: resolved).standardized.path
+            }
+        }
+        return URL(fileURLWithPath: gitDir).standardized.path
     }
 }
 
@@ -157,8 +323,71 @@ public enum Git {
     /// is least allowed to ship, so the failure now carries its own name and
     /// the caller can retry it.
     public static func status(at path: String) -> GitStatus {
-        classifyStatus(invoke(["status", "--porcelain", "--branch"], at: path),
-                       hasDotGit: FileManager.default.fileExists(atPath: path + "/.git"))
+        let s = classifyStatus(invoke(["status", "--porcelain", "--branch"], at: path),
+                               hasDotGit: FileManager.default.fileExists(atPath: path + "/.git"))
+        guard case .state(let snap) = s else { return s }
+        return .state(snap.with(baseline: baseline(at: path, currentBranch: snap.branch)))
+    }
+
+    /// How far the checked-out branch has drifted from the default branch.
+    ///
+    /// COST, measured in-app across the operator's 14 registered projects:
+    ///
+    ///     git status alone           118.7 ms/card
+    ///     + default-branch baseline   34.4 ms/card   (→ 153.1 ms/card total)
+    ///
+    /// The average hides the shape, and the shape is the point: **5 of the 14**
+    /// cards are off their default branch and pay one `rev-list` (~95 ms each);
+    /// the other 9 pay 0.0–0.6 ms, because resolving the NAME is file reads and
+    /// being on the default makes the count zero by definition. So this is ~29%
+    /// on top of a field the caller already stages off the first paint — it
+    /// rides that same stage rather than earning one of its own, and the
+    /// not-yet-measured state is already drawn distinctly (`padrão…`) rather
+    /// than passing for a determined one.
+    ///
+    /// NO FETCH, ever. This runs per card on a 15 s timer; a fetch here would
+    /// put the operator's network on the reload path. The comparison is against
+    /// refs already on disk, and the local `<def>` is the right one of those:
+    /// the operator's own reading of "5 ahead of master" is against local
+    /// `master` (`origin/master` says 7 on this very branch, because the local
+    /// ref is where their work diverged from).
+    public static func baseline(at path: String, currentBranch: String) -> GitBaseline {
+        guard let def = GitDefaultBranch.resolve(repoPath: path) else {
+            return .unknown("nenhuma branch padrão encontrada — sem origin/HEAD, sem main, sem master")
+        }
+        // The default IS checked out: divergence from it is zero by definition,
+        // and asking git would be a spawn to learn what we already know.
+        if currentBranch == def {
+            return .measured(GitBaselineState(defaultBranch: def, onDefault: true,
+                                              ahead: 0, behind: 0))
+        }
+        switch invoke(["rev-list", "--left-right", "--count", "\(def)...HEAD"], at: path) {
+        case .ok(let out):
+            guard let c = parseLeftRight(out) else {
+                return .unknown("git respondeu num formato não reconhecido ao comparar com \(def)")
+            }
+            return .measured(GitBaselineState(defaultBranch: def, onDefault: false,
+                                              ahead: c.ahead, behind: c.behind))
+        case .failed(let code):
+            return .unknown("git não pôde comparar com \(def) (código \(code))")
+        case .timedOut:
+            return .unknown("git não respondeu a tempo ao comparar com \(def)")
+        case .launchFailed(let why):
+            return .unknown("git não pôde ser executado: \(why)")
+        }
+    }
+
+    /// `git rev-list --left-right --count <def>...HEAD` prints `"<left>\t<right>"`.
+    ///
+    /// LEFT IS BEHIND, RIGHT IS AHEAD, and the order is the whole reason this is
+    /// a named function instead of an inline split: left counts commits reachable
+    /// from `<def>` but not from HEAD — i.e. what this branch is MISSING — and
+    /// swapping them would draw "5 behind" for a branch that is 5 ahead, a
+    /// backwards claim that looks entirely plausible on screen.
+    public static func parseLeftRight(_ out: String) -> (behind: Int, ahead: Int)? {
+        let parts = out.split(whereSeparator: { $0 == "\t" || $0 == " " || $0 == "\n" })
+        guard parts.count >= 2, let l = Int(parts[0]), let r = Int(parts[1]) else { return nil }
+        return (behind: l, ahead: r)
     }
 
     /// Pure half of `status(at:)`, so every branch below is exercisable without

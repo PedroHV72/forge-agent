@@ -517,6 +517,144 @@ test('registrável: folder virar registrável de qualquer um dos lados derruba',
          'comparador não mordeu (JS)');
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// Anchor (e): which branch is the DEFAULT — `main` or `master`
+//
+// Now implemented twice, for the same reason as the marker: two runtimes need
+// it. `gitDefaultBranch()` in `scripts/forge-isolation.js` is load-bearing —
+// `setupWorktreeOne` branches from `origin/<def>`, and the last milestone paid
+// for getting that name wrong with a worktree 13 commits behind. `GitDefaultBranch`
+// in `app/Sources/ForgeKit/GitCore.swift` is what the Projects card draws.
+//
+// Drift here is silent in the worst way: both sides keep answering, they just
+// answer differently, and the card confidently reports divergence against a
+// branch the isolation machinery does not consider the default.
+//
+// Unlike the anchors above, the JS half is EXECUTABLE (it is exported), so the
+// precedence is pinned by running it against real repositories in a temp dir
+// rather than by reading its source. The Swift half is pinned by its literals —
+// and by ONE deliberate difference that must never be "fixed" into agreement.
+// ───────────────────────────────────────────────────────────────────────────
+
+const os = require('os');
+const { execFileSync } = require('child_process');
+const { gitDefaultBranch } = require('./forge-isolation.js');
+
+const gitCoreForDefault = fs.readFileSync(gitCoreSwift, 'utf8');
+
+/** Ordered fallback names from `GitDefaultBranch.candidates`. */
+function swiftDefaultCandidates(swiftSrc) {
+  const m = swiftSrc.match(/public static let candidates = \[([\s\S]*?)\]/);
+  if (!m) throw new Error('GitDefaultBranch.candidates não encontrado em GitCore.swift — regex quebrou?');
+  const names = [...stripLineComments(m[1]).matchAll(/"([^"]+)"/g)].map(x => x[1]);
+  if (names.length < 2) {
+    throw new Error(`só ${names.length} candidatos colhidos (piso 2) — regex quebrou?`);
+  }
+  return names;
+}
+
+/** The same ordered names as spelled in `gitDefaultBranch()`'s own source. */
+function jsDefaultCandidates() {
+  const src = fs.readFileSync(path.join(repoRoot, 'scripts/forge-isolation.js'), 'utf8');
+  const i = src.indexOf('function gitDefaultBranch(');
+  if (i < 0) throw new Error('gitDefaultBranch() sumiu de forge-isolation.js');
+  const body = stripLineComments(src.slice(i, src.indexOf('\n}', i)));
+  const m = body.match(/for \(const b of \[([^\]]+)\]\)/);
+  if (!m) throw new Error('a lista de fallback de gitDefaultBranch() não foi colhida — regex quebrou?');
+  return [...m[1].matchAll(/'([^']+)'|"([^"]+)"/g)].map(x => x[1] || x[2]);
+}
+
+function compareDefaultCandidates(swiftSrc, jsNames) {
+  const a = swiftDefaultCandidates(swiftSrc);
+  if (jsNames.length < 2) throw new Error(`JS com só ${jsNames.length} candidatos (piso 2)`);
+  // ORDER matters here, unlike the set-comparisons above: `["master","main"]`
+  // is the same set and a different answer for every repo that has both.
+  return a.join(',') === jsNames.join(',')
+    ? { ok: true, diff: '' }
+    : { ok: false, diff: `Swift [${a}] ≠ JS [${jsNames}]` };
+}
+
+/** Throwaway repo in tmp. Never touches the operator's repos. */
+function tmpRepo(tag, init) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-gitdef-${tag}-`));
+  const git = (...args) => execFileSync('/usr/bin/git', ['-C', dir, ...args],
+                                        { stdio: 'ignore' });
+  execFileSync('/usr/bin/git', ['init', '-q', '-b', init, dir], { stdio: 'ignore' });
+  git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+  git('add', 'a.txt'); git('commit', '-qm', 'x');
+  return { dir, git };
+}
+
+console.log('\nQual branch é a padrão — main ou master (âncora e)');
+
+test('a ordem de fallback é a mesma dos dois lados', () => {
+  const r = compareDefaultCandidates(gitCoreForDefault, jsDefaultCandidates());
+  assert(r.ok, `candidatos divergiram — ${r.diff}`);
+});
+
+test('a precedência do JS é a que o Swift documenta: origin/HEAD antes de main/master', () => {
+  // Executável, não lido: se alguém reordenar gitDefaultBranch() para preferir
+  // um `main` local ao que o remoto declara, a máquina de isolamento passa a
+  // ramificar de outra base e o card passa a comparar contra outra branch.
+  const { dir, git } = tmpRepo('prec', 'master');
+  try {
+    // Sem origin nenhum: cai no primeiro candidato que EXISTE (master, aqui).
+    assert(gitDefaultBranch(dir) === 'master',
+           `sem origin, esperava master, veio ${gitDefaultBranch(dir)}`);
+
+    // Com origin/HEAD apontando para develop, e um `main` local presente: o
+    // remoto ganha dos dois.
+    git('branch', 'main');
+    git('branch', 'develop');
+    git('remote', 'add', 'origin', dir);
+    git('update-ref', 'refs/remotes/origin/develop', 'refs/heads/develop');
+    git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop');
+    assert(gitDefaultBranch(dir) === 'develop',
+           `origin/HEAD perdeu para o fallback: veio ${gitDefaultBranch(dir)}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('o palpite final do JS é REAL, e o Swift deliberadamente NÃO o copia', () => {
+  // A única diferença intencional entre os dois. O JS termina em `return
+  // 'main'` porque um script que precisa dar checkout precisa de um nome de
+  // qualquer jeito; um card não pode adivinhar, porque imprimir "main" para um
+  // repo sem main é a afirmação falsa confiante que esta tela já teve uma vez.
+  //
+  // Pinado dos DOIS lados para que ninguém "conserte" a divergência: se o JS
+  // parar de palpitar, esta primeira asserção cai e a decisão volta à mesa.
+  const { dir } = tmpRepo('trunk', 'trunk');
+  try {
+    assert(gitDefaultBranch(dir) === 'main',
+           `o palpite final do JS mudou (veio ${gitDefaultBranch(dir)}) — reavaliar a diferença`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // E o Swift não tem esse palpite: `resolve` devolve `String?`.
+  const i = gitCoreForDefault.indexOf('public static func resolve(repoPath:');
+  assert(i >= 0, 'GitDefaultBranch.resolve não encontrado — regex quebrou?');
+  const body = stripLineComments(gitCoreForDefault.slice(i, gitCoreForDefault.indexOf('\n    }', i)));
+  assert(/-> String\?/.test(body), 'resolve() deixou de ser opcional — o palpite voltou');
+  assert(!/return "(main|master)"/.test(body),
+         'resolve() passou a devolver um nome fixo — o card voltou a adivinhar');
+});
+
+test('candidatos: mutar qualquer um dos lados derruba o comparador', () => {
+  // Aditiva de um lado, reordenação do outro — as duas formas reais de drift.
+  const mutated = gitCoreForDefault.replace(/public static let candidates = \[/,
+                                            'public static let candidates = ["trunk", ');
+  assert(mutated !== gitCoreForDefault, 'a mutação não entrou na string — prova inválida');
+  assert(swiftDefaultCandidates(mutated).includes('trunk'), 'mutação não colhida — prova inválida');
+  assert(compareDefaultCandidates(mutated, jsDefaultCandidates()).ok === false,
+         'comparador não mordeu (Swift)');
+  const js = jsDefaultCandidates();
+  assert(compareDefaultCandidates(gitCoreForDefault, [...js].reverse()).ok === false,
+         'comparador não mordeu a INVERSÃO — a ordem não estava sendo comparada');
+});
+
 console.log('\nPinos anti-regressão (S02)');
 
 test('add/remove escrevem sobre loadAllResolved(), nunca sobre load()', () => {
