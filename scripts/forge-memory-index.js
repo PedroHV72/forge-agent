@@ -80,22 +80,28 @@ function findDynamicCandidates(text) {
   let tm;
   while ((tm = tokenRe.exec(text)) !== null) {
     const token = tm[0];
-    if (!EXT_SUFFIX_RE.test(token)) continue;
 
-    const hasTemplate = token.includes('${');
-    const hasWildcard = token.includes('*');
+    // S02 R2: strip ONE wrapping backtick pair BEFORE the extension test.
+    // EXT_SUFFIX_RE anchors on `$`, so a trailing backtick used to block the
+    // match entirely — a wrapped `scripts/forge-${name}.js` was never even
+    // TESTED for `${` and vanished from coverage (silent discard, forbidden by
+    // invariant #1). The original token is kept as `raw` so the report shows
+    // exactly what the fact wrote.
+    const core = (token.length >= 2 && token[0] === '`' && token[token.length - 1] === '`')
+      ? token.slice(1, -1)
+      : token;
 
-    const backtickPositions = [];
-    for (let i = 0; i < token.length; i++) {
-      if (token[i] === '`') backtickPositions.push(i);
-    }
-    // A single wrapping pair (first char + last char) is already handled by the
-    // ordered backtick patterns above — only an ADDITIONAL backtick strictly
-    // inside the token counts as "internal".
-    const hasInternalBacktick = backtickPositions.some((p) => p !== 0 && p !== token.length - 1);
+    if (!EXT_SUFFIX_RE.test(core)) continue;
+
+    const hasTemplate = core.includes('${');
+    const hasWildcard = core.includes('*');
+    // After removing the single wrapping pair, ANY remaining backtick is by
+    // definition internal (a plain `path/file.js` is already handled by the
+    // ordered backtick patterns above and leaves no backtick in `core`).
+    const hasInternalBacktick = core.includes('`');
 
     if (hasTemplate || hasWildcard || hasInternalBacktick) {
-      results.push({ raw: token, path: token, line: null, pattern: 'dynamic', index: tm.index });
+      results.push({ raw: token, path: core, line: null, pattern: 'dynamic', index: tm.index });
     }
   }
   return results;
@@ -320,11 +326,18 @@ function buildFileIndex(cwd, opts) {
   const unreadableFragments = [];
   const allFacts = []; // { fact, fragment }
 
+  // S02 R3: an enumeration failure used to yield fragments_read:0 with an empty
+  // unreadable_fragments and partial untouched — BYTE-IDENTICAL to a genuinely
+  // empty store. The per-fragment read failure right below is enumerated; that
+  // same discipline now covers the enumeration step itself. A consumer must be
+  // able to tell "could not read the store" from "the store is empty".
   let fragments;
+  let fragmentListingFailed = null;
   try {
     fragments = listFragments(cwd, opts.listFragments || {});
-  } catch (_) {
+  } catch (e) {
     fragments = [];
+    fragmentListingFailed = (e && e.message) ? e.message : 'list-error';
   }
 
   for (const fragment of fragments) {
@@ -367,6 +380,13 @@ function buildFileIndex(cwd, opts) {
     }
 
     let anyResolved = false;
+    // S02 R5: citations are deduped by RAW TEXT upstream, but two distinct
+    // citations in one fact can resolve to the SAME target file (e.g.
+    // `scripts/foo.js` via how:'path' and the unique basename `foo.js` via
+    // how:'basename'). Pushing per citation emitted two identical rows under
+    // one file. Dedup per fact by the RESOLVED file, keeping the first
+    // citation's line.
+    const seenFilesForFact = new Set();
 
     for (const citation of citations) {
       const resolution = resolveCitation(citation, cwd, fileIndex);
@@ -375,6 +395,8 @@ function buildFileIndex(cwd, opts) {
       if (resolution.state === 'RESOLVED') {
         anyResolved = true;
         const file = resolution.file;
+        if (seenFilesForFact.has(file)) continue;
+        seenFilesForFact.add(file);
         if (!entriesByFile.has(file)) {
           entriesByFile.set(file, { file, facts: [] });
         }
@@ -464,15 +486,43 @@ function buildFileIndex(cwd, opts) {
     unreadable_fragments: unreadableFragments,
     scan_capped: fileIndex.capped,
     guard_unavailable: guardUnavailable,
+    fragment_listing_failed: fragmentListingFailed,
   };
 
-  return { entries, coverage, partial: guardPartial };
+  return { entries, coverage, partial: guardPartial || fragmentListingFailed !== null };
 }
 
 // ── renderIndex ────────────────────────────────────────────────────────────────
 // Deterministic markdown renderer. No wallclock anywhere in the output — two
 // runs over the same store produce byte-identical strings. `coverage` field
 // names come from T01 and are LOCKED: rendered verbatim, never renamed.
+// S02 R6: every value interpolated into markdown is UNTRUSTED — `raw` comes
+// from free prose scanned as `\S+` tokens (so `a|b*.js` is reachable) and
+// `mem_id` comes from fragment frontmatter. An unescaped `|` turns a 4-column
+// row into a 6-column one, corrupting the one section whose entire purpose is
+// being trustworthy.
+//
+// cell()     — safe for a table cell: no raw pipes, no line breaks.
+// codeCell() — cell() + code-formatted; uses a `` fence when the value itself
+//              contains a backtick, so the span never breaks.
+// prose()    — neutralizes raw HTML for free-text rendered outside a table.
+function cell(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/\r?\n/g, ' ')
+    .replace(/\|/g, '\\|');
+}
+
+function codeCell(value) {
+  const s = cell(value);
+  if (s.length === 0) return '';
+  if (s.includes('`')) return '`` ' + s + ' ``';
+  return '`' + s + '`';
+}
+
+function prose(value) {
+  return cell(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function renderIndex(result, opts) {
   opts = opts || {};
   const entries = Array.isArray(result && result.entries) ? result.entries : [];
@@ -502,13 +552,15 @@ function renderIndex(result, opts) {
     lines.push('');
   } else {
     for (const entry of entries) {
-      lines.push(`### ${entry.file}`);
+      lines.push(`### ${codeCell(entry.file)}`);
       lines.push('');
       for (const fact of entry.facts) {
-        const memId = fact.mem_id || '(sem mem_id)';
-        const category = fact.category || '(sem categoria)';
-        const summary = fact.summary || '(sem resumo)';
-        const unit = fact.unit_id || fact.storage_key || '(unidade desconhecida)';
+        const memId = fact.mem_id ? codeCell(fact.mem_id) : '(sem mem_id)';
+        const category = fact.category ? prose(fact.category) : '(sem categoria)';
+        const summary = fact.summary ? prose(fact.summary) : '(sem resumo)';
+        const unit = (fact.unit_id || fact.storage_key)
+          ? codeCell(fact.unit_id || fact.storage_key)
+          : '(unidade desconhecida)';
         lines.push(`- ${memId} (${category}) — ${summary} — origem: ${unit}`);
       }
       lines.push('');
@@ -518,6 +570,12 @@ function renderIndex(result, opts) {
   // ── Cobertura e descarte — INCONDICIONAL (never omitted, never skipped). ──
   lines.push('## Cobertura e descarte');
   lines.push('');
+  // S02 R3: an enumeration failure must NEVER read as an empty store.
+  if (coverage.fragment_listing_failed) {
+    lines.push(`> 🛑 **Não foi possível LER o store de memória** (\`fragment_listing_failed\`): ${prose(coverage.fragment_listing_failed)}`);
+    lines.push('> Os números abaixo são zerados por FALHA DE LEITURA, não porque o store esteja vazio. Índice marcado como parcial.');
+    lines.push('');
+  }
   lines.push(`- fragments_read: ${coverage.fragments_read || 0}`);
   lines.push(`- facts_total: ${coverage.facts_total || 0}`);
   lines.push(`- facts_with_resolved: ${coverage.facts_with_resolved || 0}`);
@@ -535,7 +593,9 @@ function renderIndex(result, opts) {
     lines.push('| citação | motivo | ocorrências | exemplo mem_id |');
     lines.push('|---|---|---|---|');
     for (const u of unresolved) {
-      lines.push(`| ${u.raw} | ${u.reason} | ${u.count} | ${u.example_mem_id || '(nenhum)'} |`);
+      const raw = codeCell(u.raw) || '(vazio)';
+      const example = u.example_mem_id ? codeCell(u.example_mem_id) : '(nenhum)';
+      lines.push(`| ${raw} | ${cell(u.reason)} | ${cell(u.count)} | ${example} |`);
     }
   }
   lines.push('');
@@ -546,7 +606,7 @@ function renderIndex(result, opts) {
   if (unresolvedOnly.length === 0) {
     lines.push('_Nenhum fato com apenas citações irresolúveis._');
   } else {
-    for (const f of unresolvedOnly) lines.push(`- ${f.mem_id || '(sem mem_id)'} (${f.storage_key || '(unidade desconhecida)'})`);
+    for (const f of unresolvedOnly) lines.push(`- ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} (${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'})`);
   }
   lines.push('');
 
@@ -556,7 +616,7 @@ function renderIndex(result, opts) {
   if (withoutCitation.length === 0) {
     lines.push('_Nenhum fato sem citação._');
   } else {
-    for (const f of withoutCitation) lines.push(`- ${f.mem_id || '(sem mem_id)'} (${f.storage_key || '(unidade desconhecida)'})`);
+    for (const f of withoutCitation) lines.push(`- ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} (${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'})`);
   }
   lines.push('');
 
@@ -566,7 +626,7 @@ function renderIndex(result, opts) {
   if (unreadable.length === 0) {
     lines.push('_Nenhum fragmento ilegível._');
   } else {
-    for (const u of unreadable) lines.push(`- ${u.storageKey || u.path} — ${u.reason}`);
+    for (const u of unreadable) lines.push(`- ${codeCell(u.storageKey || u.path)} — ${prose(u.reason)}`);
   }
   lines.push('');
 

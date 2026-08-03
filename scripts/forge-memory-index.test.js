@@ -231,7 +231,12 @@ test('discard reason: ambiguous-basename (dedicated case, distinct from Section 
 
 test('discard reason: outside-root (relative escape and absolute path)', () => {
   const root = mkStore(
-    [{ unitId: 'T01', text: 'See scripts/../../etc/passwd for the layout.', mem_id: 'mem-outside-rel' }],
+    // S02 R4: the original fixture cited `scripts/../../etc/passwd`, whose
+    // final segment matches NO extension in CODE_EXT — no citation was ever
+    // extracted, so the asserted outside-root entry could not exist and this
+    // "mandatory" case asserted nothing. The escaping path must be EXTRACTABLE
+    // for the case to actually exercise containment.
+    [{ unitId: 'T01', text: 'See scripts/../../etc/secret.js for the layout.', mem_id: 'mem-outside-rel' }],
     ['scripts/forge-alpha.js'],
   );
   try {
@@ -406,26 +411,37 @@ test('writeIndex called twice with no store change → second call reports chang
 // ── Section 9: unreadable fragment ───────────────────────────────────────────
 console.log('\nSection 9: unreadable fragment — degrades by report line, never crashes the run\n');
 
-test('a fragment with a broken frontmatter shape → unreadable_fragments, run does not throw', () => {
+test('a fragment that cannot be read → unreadable_fragments, run does not throw', () => {
   const root = mkStore(
-    [{ unitId: 'T01', text: 'Fixed `scripts/forge-alpha.js` today.', mem_id: 'mem-ok' }],
-    ['scripts/forge-alpha.js'],
+    [
+      { unitId: 'T01', text: 'Fixed `scripts/forge-alpha.js` today.', mem_id: 'mem-ok' },
+      { unitId: 'T02', text: 'Another note about scripts/forge-beta.js.', mem_id: 'mem-broken' },
+    ],
+    ['scripts/forge-alpha.js', 'scripts/forge-beta.js'],
   );
+  // parseFragment never throws on unparseable text (it falls back to body:text),
+  // so the ONLY way to exercise the unreadable_fragments branch is a real
+  // filesystem-level read error. The previous fixture renamed a DIRECTORY to
+  // `T02.md` hoping for EISDIR — but listFragments filters on `entry.isFile()`,
+  // so the directory was never enumerated and the branch never ran (2nd failure
+  // found alongside S02 R4). Stubbing readFileSync for that one path is
+  // deterministic and cross-platform.
+  const realReadFileSync = fs.readFileSync;
+  fs.readFileSync = function (p, ...rest) {
+    if (typeof p === 'string' && p.replace(/\\/g, '/').includes('/.gsd/memory/') && /T02/.test(p)) {
+      const err = new Error('EACCES: simulated unreadable fragment');
+      throw err;
+    }
+    return realReadFileSync.call(fs, p, ...rest);
+  };
   try {
-    // parseFragment never throws on unparseable text (falls back to body:text), so
-    // the only way to exercise the unreadable_fragments branch is a filesystem-level
-    // read error — make the "fragment" a directory instead of a file, forcing
-    // fs.readFileSync to throw EISDIR inside buildFileIndex's per-fragment try/catch.
-    const memDir = path.join(root, '.gsd', 'memory');
-    fs.mkdirSync(path.join(memDir, 'T02'), { recursive: true });
-    fs.renameSync(path.join(memDir, 'T02'), path.join(memDir, 'T02.md'));
-
     let result;
     assert((() => { result = buildFileIndex(root, {}); return true; })(), 'buildFileIndex must not throw on an unreadable fragment');
     assert(result.coverage.unreadable_fragments.length >= 1, 'expected at least one entry in unreadable_fragments');
     const ok = result.entries.find((e) => e.file === 'scripts/forge-alpha.js');
     assert(ok, 'the readable fragment (mem-ok) must still be indexed despite the broken sibling');
   } finally {
+    fs.readFileSync = realReadFileSync;
     cleanup(root);
   }
 });
@@ -567,6 +583,117 @@ test('CLI: --write with no --json grants the default-write path and produces the
     assert(content.includes('## Cobertura e descarte'), 'expected coverage section in the written artifact');
   } finally {
     cleanup(root);
+  }
+});
+
+// ── Section 14: S02 review regressions (R2, R3, R5, R6) ─────────────────────
+console.log('\nSection 14: S02 review regressions — R2, R3, R5, R6\n');
+
+test('R2: a WRAPPED template-literal citation is still enumerated as dynamic', () => {
+  const cites = extractCitations('See `scripts/forge-${name}.js` for details.');
+  assert(cites.length >= 1, 'a wrapped template-literal citation must never vanish from coverage');
+  const hit = cites.find((c) => c.pattern === 'dynamic');
+  assert(hit, 'expected the wrapped template literal to be enumerated as pattern:"dynamic"');
+  assert(hit.raw.includes('${'), `raw must preserve the original token, got ${hit.raw}`);
+});
+
+test('R2: a WRAPPED wildcard path is still enumerated as dynamic', () => {
+  const cites = extractCitations('Any of `scripts/*.js` could be the culprit.');
+  const hit = cites.find((c) => c.pattern === 'dynamic');
+  assert(hit, 'expected the wrapped wildcard path to be enumerated as pattern:"dynamic"');
+  assert(hit.raw.includes('*'), `raw must preserve the original token, got ${hit.raw}`);
+});
+
+test('R2: a plain backticked path is NOT misclassified as dynamic', () => {
+  const cites = extractCitations('See `scripts/forge-alpha.js` for the fix.');
+  assert(!cites.some((c) => c.pattern === 'dynamic'), 'a plain backticked path must stay backticked-path, never dynamic');
+});
+
+test('R3: a listFragments failure is distinguishable from an empty store', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-index-test-'));
+  const realReaddirSync = fs.readdirSync;
+  fs.readdirSync = function (p, ...rest) {
+    if (typeof p === 'string' && p.replace(/\\/g, '/').endsWith('/.gsd/memory')) {
+      throw new Error('EIO: simulated enumeration failure');
+    }
+    return realReaddirSync.call(fs, p, ...rest);
+  };
+  try {
+    fs.mkdirSync(path.join(root, '.gsd', 'memory'), { recursive: true });
+    const result = buildFileIndex(root, {});
+    assert(result.coverage.fragment_listing_failed, 'expected coverage.fragment_listing_failed to record the enumeration failure');
+    assert(/simulated enumeration failure/.test(result.coverage.fragment_listing_failed), 'expected the failure reason to be carried, got: ' + result.coverage.fragment_listing_failed);
+    assertEq(result.partial, true, 'an unreadable store must mark the result partial');
+    const md = renderIndex(result, {});
+    assert(md.includes('fragment_listing_failed'), 'expected a prominent warning inside the coverage section');
+    assert(md.includes('não porque o store esteja vazio'), 'the warning must distinguish "could not read" from "empty"');
+  } finally {
+    fs.readdirSync = realReaddirSync;
+    cleanup(root);
+  }
+});
+
+test('R3: a genuinely empty store does NOT claim a listing failure', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-index-test-'));
+  try {
+    fs.mkdirSync(path.join(root, '.gsd', 'memory'), { recursive: true });
+    const result = buildFileIndex(root, {});
+    assertEq(result.coverage.fragment_listing_failed, null, 'an empty store must report no listing failure');
+    const md = renderIndex(result, {});
+    assert(!md.includes('fragment_listing_failed'), 'an empty store must not render the read-failure warning');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('R5: a fact citing both the path and its unique basename yields ONE row, not two', () => {
+  const root = mkStore(
+    [{ unitId: 'T01', text: 'Fixed `scripts/forge-alpha.js`; note that forge-alpha.js is the only copy.', mem_id: 'mem-dupe' }],
+    ['scripts/forge-alpha.js'],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const entry = result.entries.find((e) => e.file === 'scripts/forge-alpha.js');
+    assert(entry, 'expected an entry for scripts/forge-alpha.js');
+    const rows = entry.facts.filter((f) => f.mem_id === 'mem-dupe');
+    assertEq(rows.length, 1, 'a fact must appear ONCE per resolved target file, not once per citation');
+    assert(rows[0].line === null || typeof rows[0].line === 'number', 'the first citation line must be kept');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('R6: pipe-bearing raw citation and mem_id keep the coverage table at 4 columns', () => {
+  // Reachability first: findDynamicCandidates scans `\S+`, so a pipe lands in raw.
+  const cites = extractCitations('Veja a|b*.js ali.');
+  const dyn = cites.find((c) => c.raw.includes('|'));
+  assert(dyn, 'expected a pipe-bearing raw citation to be reachable from prose');
+
+  const result = {
+    entries: [],
+    partial: false,
+    coverage: {
+      fragments_read: 1,
+      facts_total: 1,
+      facts_with_resolved: 0,
+      citations_total: 1,
+      citations_resolved: 0,
+      files_indexed: 0,
+      facts_unresolved_only: [],
+      facts_without_citation: [],
+      unreadable_fragments: [],
+      unresolved: [{ raw: dyn.raw, reason: 'dynamic', count: 1, example_mem_id: 'mem-x|y' }],
+      fragment_listing_failed: null,
+    },
+  };
+  const md = renderIndex(result, {});
+  const tableRows = md.split('\n').filter((l) => l.startsWith('|') && !/^\|-+/.test(l.replace(/\|/g, '|')));
+  assert(tableRows.length >= 2, 'expected a header row and at least one data row');
+  for (const row of tableRows) {
+    if (/^\|[-|]+\|$/.test(row.replace(/\s/g, ''))) continue; // separator
+    // Split on UNESCAPED pipes only — an escaped `\|` is a literal, not a column break.
+    const cols = row.split(/(?<!\\)\|/);
+    assertEq(cols.length, 6, `expected a 4-column row (6 split parts), got ${cols.length} for: ${row}`);
   }
 });
 
