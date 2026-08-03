@@ -19,7 +19,7 @@
 // "Out of Scope".
 import Foundation
 
-/// The two fields this reader extracts from a ledger fragment's frontmatter.
+/// The three fields this reader extracts from a ledger fragment's frontmatter.
 /// Everything else in the fragment (lists, block scalars, other keys, body)
 /// is deliberately unread — see the file-top comment.
 public struct LedgerFragment: Hashable {
@@ -28,10 +28,20 @@ public struct LedgerFragment: Hashable {
     /// recognised day shape. Day resolution only (DS1) — the ledger never
     /// carries a time component in the shapes seen on disk.
     public let completedDay: String?
+    /// The fragment's `title:` — a plain root scalar, read by the SAME
+    /// fence-and-root-only scanner as `id`, never by a second parser.
+    ///
+    /// The file-top comment's refusal is about *lists* and *block scalars*
+    /// (`key_decisions`, `key_files`), which this scanner still does not
+    /// attempt. `title` is the same shape as `id`, so extracting it costs
+    /// nothing and needs no new machinery. `ProjectDigest` needs it to say
+    /// WHAT was last delivered instead of only when.
+    public let title: String?
 
-    public init(id: String?, completedDay: String?) {
+    public init(id: String?, completedDay: String?, title: String? = nil) {
         self.id = id
         self.completedDay = completedDay
+        self.title = title
     }
 }
 
@@ -91,6 +101,7 @@ public enum Ledger {
 
         var id: String?
         var completedDay: String?
+        var title: String?
 
         for line in lines {
             if line == "---" { break }
@@ -104,8 +115,11 @@ public enum Ledger {
             if let v = rootValue(line, key: "completed_at") {
                 completedDay = dayShape(v)
             }
+            if let v = rootValue(line, key: "title") {
+                title = v
+            }
         }
-        return LedgerFragment(id: id, completedDay: completedDay)
+        return LedgerFragment(id: id, completedDay: completedDay, title: title)
     }
 
     /// `key: value` at column 0 only — `line` must already be confirmed
@@ -149,6 +163,76 @@ public enum Ledger {
             result.append(parseFragment(text))
         }
         return result
+    }
+
+    /// Bytes read from a fragment when only its frontmatter is wanted.
+    ///
+    /// Measured, not guessed: the largest fragment on this machine's two real
+    /// ledgers is 2 655 bytes whole, and the deepest frontmatter closes on
+    /// line 54. 32 KiB is two orders of magnitude of headroom while still
+    /// bounding the read of a file that some future tool decides to make
+    /// enormous. `parseFragment` stops at the closing fence anyway, so
+    /// anything past it was never going to be read.
+    public static let frontmatterReadLimit = 32 * 1024
+
+    /// The most recently written fragment in `dir`, and when it was written.
+    ///
+    /// Cost is the point (see `ProjectDigest`): this stats every entry and
+    /// **reads exactly one file**, so a ledger of 82 fragments costs the same
+    /// one read as a ledger of 3.
+    ///
+    /// Recency is file modification time, not filename order and not
+    /// `completed_at`, because on real disks neither of those is recency:
+    ///
+    ///   - Filenames mix ID schemes. `M-<ts>-<slug>` and legacy `M001` sort
+    ///     against each other by ASCII (`-` < `0`), so every legacy name sorts
+    ///     AFTER every timestamped one — a tail-by-name would return a 2026-04
+    ///     milestone as "last activity" on a project that shipped last week.
+    ///   - `completed_at` is empty in every fragment produced by
+    ///     `forge-ledger-migrate` (48 of 82 in the ledger measured here), so
+    ///     ranking by it would ignore half the store.
+    ///
+    /// Migrated fragments all share one mtime — the migration instant — which
+    /// is old, so they never win against a fragment written by a real
+    /// completion. That is the property this relies on.
+    public static func newest(dir: String,
+                              fileManager fm: FileManager = .default)
+        -> (fragment: LedgerFragment, modified: Date, name: String)? {
+        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
+        var best: (name: String, date: Date)?
+        for name in names where name.hasSuffix(".md") {
+            let path = (dir as NSString).appendingPathComponent(name)
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let date = attrs[.modificationDate] as? Date else { continue }
+            // `>` and not `>=`, plus the name tiebreak, so a directory whose
+            // fragments share one mtime (a fresh migration) still returns a
+            // deterministic answer rather than whatever the FS enumerated first.
+            if best == nil || date > best!.date || (date == best!.date && name > best!.name) {
+                best = (name, date)
+            }
+        }
+        guard let best else { return nil }
+        let path = (dir as NSString).appendingPathComponent(best.name)
+        guard let text = readHead(path: path, limit: frontmatterReadLimit) else { return nil }
+        return (parseFragment(text), best.date, best.name)
+    }
+
+    /// First `limit` bytes of `path` as UTF-8, nil when unreadable.
+    ///
+    /// Truncating UTF-8 mid-codepoint yields nil from the strict initialiser,
+    /// so the lossy conversion is used — a mangled final character in a
+    /// discarded tail is not worth losing the whole frontmatter over.
+    ///
+    /// Public because the bound is the point: "this read is bounded" is not
+    /// observable from `newest`'s or `ProjectDigest`'s return value (a
+    /// bounded and an unbounded read agree on every well-formed fragment), so
+    /// the only way to test it is to call it against a file larger than the
+    /// limit and check that the excess did not arrive.
+    public static func readHead(path: String, limit: Int) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: limit) else { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
 
     /// Counts `fragments` delivered inside `window`, in day resolution

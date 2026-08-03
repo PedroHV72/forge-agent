@@ -4750,6 +4750,354 @@ test("scan(declaredRoots:) sem roots nao varre nada — [] nao vira a lista fixa
                 "cair na lista fixa aqui reintroduziria a varredura adivinhada por baixo")
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// ProjectDigest — what a card says about a project
+//
+// The defect these cover: every card rendered `runsHere.count` and
+// `openItems`, both zero almost always, so three different projects read
+// identically as "0 perguntas · 0 runs · 0 sessões · 0 itens". The digest
+// replaces that with four facts already on disk. Two invariants are worth
+// pinning down harder than the parsing: that NO field ever renders blank
+// (a blank is indistinguishable from a broken reader, which is the exact
+// defect this milestone existed to remove), and that reading the ledger
+// costs one file read no matter how big the ledger is.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A project tree under NSTemporaryDirectory with an explicit, isolated root —
+/// nothing here ever consults the real `$HOME`, which differs between
+/// `swift run ForgeKitTests` by hand and the same binary under
+/// `run-tests.js`.
+func digestTree(_ tag: String) -> String {
+    let tmp = NSTemporaryDirectory() + "forge-digest-\(tag)-\(UUID().uuidString.prefix(8))"
+    try? FileManager.default.createDirectory(atPath: tmp + "/.gsd",
+                                             withIntermediateDirectories: true)
+    return tmp
+}
+
+func digestWrite(_ text: String, to path: String, mtime: Date? = nil) {
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                            withIntermediateDirectories: true)
+    fm.createFile(atPath: path, contents: Data(text.utf8))
+    if let mtime {
+        try? fm.setAttributes([.modificationDate: mtime], ofItemAtPath: path)
+    }
+}
+
+/// The real shape `/forge-init` writes, and the one measured in
+/// `~/Development/lookchina/.gsd/PROJECT.md`.
+let digestProjectDoc = """
+# Project: lookchina
+
+Workspace raiz que agrupa todos os projetos frontend e backend da Look China.
+
+## Stack
+- **Workspace:** Diretório raiz sem monorepo manager próprio
+"""
+
+test("ProjectDigest: a linha de identidade é a primeira prosa, não o título nem a stack") {
+    let id = ProjectDigest.identityLine(fromProjectDoc: digestProjectDoc)
+    assertEqual(id.display,
+                "Workspace raiz que agrupa todos os projetos frontend e backend da Look China.",
+                "o `# Project: lookchina` é o nome da pasta repetido — não descreve nada")
+    assertTrue(id.isPresent)
+}
+
+test("ProjectDigest: PROJECT.md que abre direto em ## Stack não vira o primeiro bullet") {
+    // Sem a parada no `##`, o card imprimiria "**Workspace:** Diretório raiz…"
+    // como se fosse a identidade do projeto: uma linha de configuração
+    // apresentada como descrição, que é pior que nenhuma descrição porque
+    // parece certa.
+    let doc = "# Project: x\n\n## Stack\n- **Workspace:** Diretório raiz\n"
+    let id = ProjectDigest.identityLine(fromProjectDoc: doc)
+    assertFalse(id.isPresent, "não há prosa aqui")
+    assertEqual(id.display, "PROJECT.md sem descrição")
+    assertFalse(id.display.isEmpty)
+}
+
+test("ProjectDigest: nenhum campo renderiza vazio num projeto sem nada — toda ausência é nomeada") {
+    // Este é o teste que a milestone inteira justifica. Um projeto recém-criado
+    // não tem PROJECT.md, não tem ledger e não é repo. As três respostas têm de
+    // ser FRASES, nunca "" — uma linha em branco no card é indistinguível de um
+    // leitor quebrado.
+    let tmp = digestTree("vazio")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let d = ProjectDigest.load(path: tmp, role: .project, repos: nil, git: .none)
+
+    assertFalse(d.identity.display.isEmpty, "identidade vazia = card mudo")
+    assertEqual(d.identity.display, "sem PROJECT.md — nenhuma descrição registrada")
+
+    guard case .absent(let a) = d.activity else {
+        return assertTrue(false, "sem ledger deveria ser ausência nomeada")
+    }
+    assertEqual(a, "nenhuma entrega registrada")
+    assertFalse(a.isEmpty)
+
+    guard case .absent(let g) = d.git else {
+        return assertTrue(false, "diretório sem git deveria ser ausência nomeada")
+    }
+    assertEqual(g, "sem git")
+    assertFalse(g.isEmpty)
+
+    assertEqual(d.roleLine, "projeto", "repos não medidos não podem virar \"0 repos\"")
+}
+
+test("Ledger.parseFragment lê `title` pelo mesmo scanner — e a armadilha pós-cerca continua fechada") {
+    let f = Ledger.parseFragment("""
+    ---
+    completed_at: 2026-07-30
+    id: T-1
+    key_decisions:
+      - title: isto é item de lista, não chave raiz
+    title: Sidebar e seção de atualizações mais minimalistas
+    ---
+
+    title: isto está DEPOIS da cerca e não pode ser lido
+    """)
+    assertEqual(f.title, "Sidebar e seção de atualizações mais minimalistas")
+    assertEqual(f.id, "T-1")
+    assertEqual(f.completedDay, "2026-07-30")
+}
+
+test("Ledger.newest escolhe por mtime — a ordem de nome devolveria a milestone errada") {
+    // A mordida: `M-<ts>-<slug>` e o legado `M001` ordenam por ASCII (`-` <
+    // `0`), então TODO nome legado ordena DEPOIS de todo nome com timestamp.
+    // Um `tail -1` por nome devolveria aqui a entrega de 2026-04 como "última
+    // atividade" de um projeto que entregou ontem. Medido: o ledger real do
+    // lookchina tem 48 dos 82 fragmentos nessa forma legada.
+    let dir = NSTemporaryDirectory() + "forge-newest-\(UUID().uuidString.prefix(8))"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+
+    let old = Date(timeIntervalSince1970: 1_776_000_000)   // 2026-04-13
+    let recent = Date(timeIntervalSince1970: 1_785_000_000) // 2026-07-26
+
+    digestWrite("---\nid: M-20260726120000-novo\ntitle: A entrega recente\ncompleted_at: 2026-07-26\n---\n",
+                to: dir + "/M-20260726120000-novo.md", mtime: recent)
+    digestWrite("---\nid: M001\ntitle: A entrega antiga · 2026-04-13\ncompleted_at: \n---\n",
+                to: dir + "/M001.md", mtime: old)
+
+    // A verdade independente: a ordem por nome é de facto a errada aqui.
+    let byName = (try! FileManager.default.contentsOfDirectory(atPath: dir)).sorted().last
+    assertEqual(byName, "M001.md",
+                "se isto falhar, o fixture parou de exercer a inversão que o teste existe para pegar")
+
+    let newest = Ledger.newest(dir: dir)
+    assertEqual(newest?.name, "M-20260726120000-novo.md")
+    assertEqual(newest?.fragment.title, "A entrega recente")
+}
+
+test("Ledger.newest empatado no mtime é determinístico, não o que o FS enumerar primeiro") {
+    let dir = NSTemporaryDirectory() + "forge-newest-tie-\(UUID().uuidString.prefix(8))"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let same = Date(timeIntervalSince1970: 1_780_000_000)
+    for n in ["M001", "M002", "M003"] {
+        digestWrite("---\nid: \(n)\ntitle: t-\(n)\n---\n", to: dir + "/\(n).md", mtime: same)
+    }
+    let a = Ledger.newest(dir: dir)?.name
+    let b = Ledger.newest(dir: dir)?.name
+    assertEqual(a, "M003.md", "empate desempata por nome — uma migração inteira compartilha um mtime")
+    assertEqual(a, b, "duas leituras do mesmo diretório não podem discordar")
+}
+
+test("Ledger.readHead é limitado de facto — o excesso não chega") {
+    // O limite não é observável pelo retorno de `newest` (uma leitura limitada
+    // e uma ilimitada concordam em todo fragmento bem formado), então a única
+    // prova é chamar contra um arquivo maior que o limite.
+    let path = NSTemporaryDirectory() + "forge-head-\(UUID().uuidString.prefix(8)).md"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    digestWrite(String(repeating: "x", count: 100_000), to: path)
+
+    let head = Ledger.readHead(path: path, limit: 1024)
+    assertEqual(head?.count, 1024, "uma leitura ilimitada devolveria 100 000")
+    assertNil(Ledger.readHead(path: path + ".nao-existe", limit: 1024))
+}
+
+test("ProjectDigest: ledger sem completed_at marca a idade como inferida do arquivo") {
+    // A forma que `forge-ledger-migrate` produz: `completed_at:` vazio. Datar
+    // pelo mtime é uma afirmação mais fraca que a do ledger, e o campo diz
+    // qual das duas foi usada em vez de apresentar as duas como iguais.
+    let tmp = digestTree("inferida")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let now = Date(timeIntervalSince1970: 1_785_000_000)
+    digestWrite("---\nid: M001\ntitle: Entrega migrada\ncompleted_at: \n---\n",
+                to: tmp + "/.gsd/ledger/M001.md",
+                mtime: now.addingTimeInterval(-3 * 86_400))
+
+    let d = ProjectDigest.load(path: tmp, role: .project, repos: nil, now: now, git: .none)
+    let e = d.activity.entryValue
+    assertEqual(e?.title, "Entrega migrada")
+    assertTrue(e?.ageInferred == true, "sem completed_at a data veio do filesystem")
+
+    // E com `completed_at`, a afirmação do ledger vence o mtime do arquivo.
+    digestWrite("---\nid: M002\ntitle: Entrega datada\ncompleted_at: 2026-07-25\n---\n",
+                to: tmp + "/.gsd/ledger/M002.md", mtime: now)
+    let d2 = ProjectDigest.load(path: tmp, role: .project, repos: nil, now: now, git: .none)
+    assertEqual(d2.activity.entryValue?.title, "Entrega datada")
+    assertTrue(d2.activity.entryValue?.ageInferred == false)
+}
+
+test("ProjectDigest: fragmento sem título é ausência nomeada, não um título em branco") {
+    let tmp = digestTree("sem-titulo")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    digestWrite("---\nid: M001\ncompleted_at: 2026-07-25\n---\n",
+                to: tmp + "/.gsd/ledger/M001.md")
+    let d = ProjectDigest.load(path: tmp, role: .project, repos: nil, git: .none)
+    guard case .absent(let a) = d.activity else {
+        return assertTrue(false, "título ausente não pode virar entrada com string vazia")
+    }
+    assertEqual(a, "última entrega sem título")
+}
+
+test("ProjectDigest.age: rótulos em dias, e uma data futura não vira contagem negativa") {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "UTC")!
+    let now = cal.date(from: DateComponents(year: 2026, month: 8, day: 3))!
+    func label(_ daysAgo: Int) -> String {
+        ProjectDigest.age(from: cal.date(byAdding: .day, value: -daysAgo, to: now)!,
+                          now: now, calendar: cal)
+    }
+    assertEqual(label(0), "hoje")
+    assertEqual(label(1), "ontem")
+    assertEqual(label(3), "3d")
+    assertEqual(label(6), "6d")
+    assertEqual(label(14), "2sem")
+    assertEqual(label(150), "5mes")
+    assertEqual(label(800), "2a")
+    assertEqual(label(-5), "hoje", "relógio adiantado não pode render \"-5d\"")
+}
+
+test("Git.parseStatus: um comando devolve branch, sujeira e divergência — e cada forma real de repo") {
+    // Três chamadas separadas amostram três instantes e podem discordar (um
+    // branch trocado entre a 1a e a 3a renderiza o nome de um ao lado da
+    // divergência do outro). Uma chamada não pode. Cada linha abaixo é uma
+    // forma que o git realmente emite.
+    let diverge = Git.parseStatus("## fix/x...origin/fix/x [ahead 2, behind 1]\n M a.txt\n")
+    assertEqual(diverge?.branch, "fix/x")
+    assertEqual(diverge?.ahead, 2)
+    assertEqual(diverge?.behind, 1)
+    assertEqual(diverge?.dirty, true)
+
+    let emDia = Git.parseStatus("## main...origin/main\n")
+    assertEqual(emDia?.branch, "main")
+    assertEqual(emDia?.ahead, 0, "com upstream, silêncio sobre divergência é ZERO, não desconhecido")
+    assertEqual(emDia?.behind, 0)
+    assertEqual(emDia?.dirty, false)
+
+    let semUpstream = Git.parseStatus("## feat/local\n")
+    assertEqual(semUpstream?.branch, "feat/local")
+    assertNil(semUpstream?.ahead, "sem upstream não há com o que comparar — e isso não é \"em dia\"")
+
+    assertEqual(Git.parseStatus("## No commits yet on main\n")?.branch, "main")
+    assertEqual(Git.parseStatus("## HEAD (no branch)\n")?.branch, "destacado")
+    assertEqual(Git.parseStatus("## main...origin/main [ahead 3]\n")?.ahead, 3)
+    assertEqual(Git.parseStatus("## main...origin/main [behind 4]\n")?.behind, 4)
+    assertNil(Git.parseStatus("## main...origin/main [gone]\n")?.ahead,
+              "upstream apagado não tem contagem a mostrar")
+    assertNil(Git.parseStatus(""), "saída vazia não é um repo limpo — é nenhuma resposta")
+}
+
+test("DigestGit.line: sem upstream a divergência é dita, não omitida") {
+    // Omitir o segmento tornaria "sem remoto configurado" idêntico a "em dia
+    // com o remoto" na tela, e são fatos diferentes sobre um branch.
+    assertEqual(GitStatusSnapshot(branch: "main", dirty: false, ahead: 3, behind: 0).line,
+                "main · limpo · ↑3")
+    assertEqual(GitStatusSnapshot(branch: "main", dirty: true, ahead: 0, behind: 2).line,
+                "main · alterações · ↓2")
+    assertEqual(GitStatusSnapshot(branch: "main", dirty: false, ahead: 0, behind: 0).line,
+                "main · limpo", "em dia com o upstream não imprime seta")
+    assertEqual(GitStatusSnapshot(branch: "wip", dirty: false, ahead: nil, behind: nil).line,
+                "wip · limpo · sem upstream")
+}
+
+test("ProjectDigest.load contra um repo git real: branch e sujeira") {
+    let tmp = digestTree("git")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    fixtureGit(["init", "-b", "principal"], at: tmp)
+    fixtureWrite("um\n", to: tmp + "/a.txt")
+    fixtureGit(["add", "a.txt"], at: tmp)
+    fixtureGit(["commit", "-m", "c1"], at: tmp, date: "2026-07-28T10:00:00Z")
+
+    let limpo = ProjectDigest.load(path: tmp, role: .project, repos: nil).git.stateValue
+    assertEqual(limpo?.branch, "principal")
+    assertEqual(limpo?.dirty, false)
+    assertNil(limpo?.ahead, "repo sem remoto não tem com o que divergir")
+    assertEqual(limpo.map { $0.line }, "principal · limpo · sem upstream")
+
+    // A mordida: um arquivo NÃO RASTREADO tem de sujar o estado. É exatamente o
+    // caso que um cache com chave em `.git/index`/`.git/HEAD` erraria, e a razão
+    // documentada de não haver cache aqui.
+    fixtureWrite("novo\n", to: tmp + "/nao-rastreado.txt")
+    assertEqual(ProjectDigest.load(path: tmp, role: .project, repos: nil).git.stateValue?.dirty, true)
+}
+
+test("WorkspaceRegistry.repoCounts: `repos: []` não vira chave — ausência ≠ zero medido") {
+    // Medido no registro real desta máquina: TODA entrada carrega `repos: []`,
+    // `lookchina` incluída, enquanto contém 33 repos no disco. Ler esse `[]`
+    // como "0 repos" poria um zero de aparência medida no card mais denso de
+    // repos que existe registrado.
+    let json = """
+    {"version":1,"roots":[{"path":"~/Dev","primary":true}],"entries":[
+      {"path":"vazio","root":"~/Dev","kind":"workspace","repos":[]},
+      {"path":"contado","root":"~/Dev","kind":"workspace","repos":["a","b","c"]},
+      {"path":"sem-chave","root":"~/Dev","kind":"project"}
+    ]}
+    """
+    let r = WorkspaceRegistry.resolution(from: Data(json.utf8), home: "/home/t")!
+    assertNil(r.repoCounts["/home/t/Dev/vazio"], "`[]` é \"nunca medido\", não zero")
+    assertNil(r.repoCounts["/home/t/Dev/sem-chave"])
+    assertEqual(r.repoCounts["/home/t/Dev/contado"], 3)
+}
+
+test("ProjectDigest.roleLine: contagem ausente cala em vez de afirmar zero") {
+    func line(_ role: ProjectRole, _ repos: Int?) -> String {
+        ProjectDigest(role: role, repos: repos, identity: .absent("x"),
+                      activity: .absent("y"), git: .absent("z")).roleLine
+    }
+    assertEqual(line(.workspace, 33), "workspace · 33 repos")
+    assertEqual(line(.workspace, 1), "workspace · 1 repo")
+    assertEqual(line(.workspace, nil), "workspace")
+    assertEqual(line(.workspace, 0), "workspace", "zero medido e não medido caem na mesma frase honesta")
+    assertEqual(line(.project, nil), "projeto")
+}
+
+test("ProjectDigest.elide corta em fronteira de palavra e só acima do limite") {
+    assertEqual(ProjectDigest.elide("curta", to: 20), "curta")
+    let long = "Plataforma de atacado que agrupa apps e services do grupo inteiro"
+    let cut = ProjectDigest.elide(long, to: 30)
+    assertLessOrEqual(cut.count, 31)
+    assertTrue(cut.hasSuffix("…"))
+    assertFalse(cut.contains("  "))
+    assertTrue(long.hasPrefix(String(cut.dropLast())), "o corte não pode inventar texto")
+    // Uma única palavra longa não tem fronteira: corta seco em vez de devolver "…".
+    assertEqual(ProjectDigest.elide(String(repeating: "a", count: 50), to: 10),
+                String(repeating: "a", count: 10) + "…")
+}
+
+test("ProjectDigest.load é injetável de ponta a ponta — nada aqui lê o $HOME real") {
+    let tmp = digestTree("injecao")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    digestWrite(digestProjectDoc, to: tmp + "/.gsd/PROJECT.md")
+    digestWrite("---\nid: M-1\ntitle: Kanban local\ncompleted_at: 2026-08-01\n---\n",
+                to: tmp + "/.gsd/ledger/M-1.md")
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "UTC")!
+    let now = cal.date(from: DateComponents(year: 2026, month: 8, day: 3))!
+    let probe = GitProbe(snapshot: { _ in
+        GitStatusSnapshot(branch: "main", dirty: false, ahead: 3, behind: 0)
+    })
+
+    let d = ProjectDigest.load(path: tmp, role: .workspace, repos: 33,
+                               now: now, calendar: cal, git: probe)
+
+    // O card do mockup, campo a campo.
+    assertEqual(d.roleLine, "workspace · 33 repos")
+    assertTrue(d.identity.display.hasPrefix("Workspace raiz que agrupa"))
+    assertEqual(d.activity.entryValue?.title, "Kanban local")
+    assertEqual(d.activity.entryValue?.age, "2d")
+    assertEqual(d.git.stateValue?.line, "main · limpo · ↑3")
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

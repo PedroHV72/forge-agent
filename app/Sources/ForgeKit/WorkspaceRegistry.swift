@@ -104,6 +104,19 @@ public enum WorkspaceRegistry {
         /// Read from `entries[]` only. A quarantined row is not active, so it
         /// cannot be the container of anything on screen.
         public let declaredWorkspaces: Set<String>
+
+        /// How many repos each active entry DECLARES it owns, keyed by
+        /// absolute path — for `ProjectDigest`'s "workspace · 33 repos" line.
+        ///
+        /// An entry appears here only when its `repos[]` is non-empty, so a
+        /// missing key means "never measured" and not "owns zero repos". That
+        /// distinction is the whole value of the field: `repos[]` was created
+        /// by the schema and, as `forge-workspace.js` says outright, nothing
+        /// has ever populated it — every live entry on disk carries `repos:
+        /// []`, `lookchina` included, while holding 33 repos in reality.
+        /// Rendering that `[]` as "0 repos" would put a measured-looking zero
+        /// on screen for the single most repo-dense project registered.
+        public let repoCounts: [String: Int]
     }
 
     struct ResolveError: Error { let reason: String }
@@ -261,7 +274,7 @@ public enum WorkspaceRegistry {
             // No roots key exists in the flat shape, so there is nothing to
             // declare: `[]`, and the caller falls back to the seed default.
             return Resolution(paths: paths, rejected: rejected, shape: .legacy,
-                              roots: [], declaredWorkspaces: [])
+                              roots: [], declaredWorkspaces: [], repoCounts: [:])
         }
 
         guard let obj = raw as? [String: Any] else { return nil }
@@ -276,6 +289,7 @@ public enum WorkspaceRegistry {
         var rejected: [Rejection] = []
         var seen = Set<String>()
         var declaredWorkspaces = Set<String>()
+        var repoCounts: [String: Int] = [:]
 
         func take(_ list: Any?, active: Bool) {
             for case let rec as [String: Any] in (list as? [Any] ?? []) {
@@ -288,6 +302,11 @@ public enum WorkspaceRegistry {
                     if seen.insert(abs).inserted { paths.append(abs) }
                     if active, rec[keyKind] as? String == kindWorkspace {
                         declaredWorkspaces.insert(abs)
+                    }
+                    // Non-empty only: an empty `repos[]` is "never measured"
+                    // here, never a measured zero — see `repoCounts`.
+                    if active, let repos = rec[keyRepos] as? [Any], !repos.isEmpty {
+                        repoCounts[abs] = repos.count
                     }
                 } catch let e as ResolveError {
                     rejected.append(Rejection(stored: stored, reason: e.reason))
@@ -303,7 +322,7 @@ public enum WorkspaceRegistry {
 
         return Resolution(paths: paths, rejected: rejected,
                           shape: .versioned(declared ?? version), roots: roots,
-                          declaredWorkspaces: declaredWorkspaces)
+                          declaredWorkspaces: declaredWorkspaces, repoCounts: repoCounts)
     }
 
     /// Convenience over `resolution` for the common caller.
