@@ -399,18 +399,25 @@ After ALL slices have been processed (or if no `risk:high` slices exist), procee
 
 ## Step 7 — Update state and report
 
-Read `.gsd/STATE.md` (required before writing), then overwrite with:
+Write `.gsd/milestones/{MILESTONE_ID}/{MILESTONE_ID}-STATE.md` (per-run state, via `scripts/forge-state.js` — never hand-edit or overwrite the root `.gsd/STATE.md`, which is a generated dashboard):
 ```markdown
-# GSD State
+---
+milestone: {MILESTONE_ID}
+kind: milestone
+created: {ISO8601}
+last_updated: {ISO8601}
+isolation_mode: {isolation_mode from prefs}
+---
 
-**Active Milestone:** {MILESTONE_ID} — {MILESTONE_DESC}
+# {MILESTONE_ID} State
+
 **Active Slice:** none
 **Active Task:** none
 **Phase:** plan-slice (ready to plan first slice)
-
-## Next Action
-Plan first slice: run /forge-next or /forge-auto
+**Auto-mode:** off
+**Next Action:** Plan first slice: run /forge-next or /forge-auto
 ```
+Then run `node scripts/forge-dashboard.js --cwd .` to regenerate the root dashboard.
 
 Report to user:
 ```

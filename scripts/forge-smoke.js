@@ -749,6 +749,231 @@ function smokeIsolation() {
   assert(!fs.existsSync(resumeWtDir) && wtCount() === noNewCount,
     'resume of an attached task creates no new worktree even on lender failure', r.stdout);
 
+  // ── T03: the worktree is anchored to the declared ROOT, not to the repo's
+  // accidental parent. Driven at the CLI level under its OWN synthetic HOME so
+  // the registry fixture cannot disturb any assert above (all of which predate
+  // roots and must keep proving the legacy anchor).
+  const rootDir = mkTmp('iso-root');
+  const rootEnv = { ...process.env, HOME: rootDir, USERPROFILE: rootDir };
+  function rgit(args, cwd) { return spawnSync('git', args, { cwd, encoding: 'utf8', env: rootEnv }); }
+  function writeRootRegistry(layoutValue) {
+    const file = path.join(rootDir, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const root = { path: rootDir, primary: true };
+    if (layoutValue !== null) root.layout = { worktrees: layoutValue };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, roots: [root], entries: [], quarantine: [] }, null, 2));
+    return file;
+  }
+
+  // The repo sits two levels below the root, so a root anchor and the legacy
+  // sibling anchor are unmistakably different directories.
+  const rRepo = path.join(rootDir, 'nested', 'proj');
+  fs.mkdirSync(path.join(rRepo, '.gsd'), { recursive: true });
+  rgit(['init', '-q', '-b', 'main'], rRepo);
+  fs.writeFileSync(path.join(rRepo, 'a.txt'), 'hi\n');
+  rgit(['add', 'a.txt'], rRepo);
+  rgit(['-c', 'user.email=smoke@forge', '-c', 'user.name=smoke', 'commit', '-qm', 'init'], rRepo);
+  fs.writeFileSync(path.join(rRepo, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"worktree","auto_pull_main":false,"worktree_cleanup_on_complete":true}}');
+
+  writeRootRegistry('.wt');
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-ROOT', '--cwd', rRepo], { env: rootEnv });
+  res = parseJSON(r.stdout);
+  const rootWt = res.repos && res.repos[0] && res.repos[0].worktree;
+  const expectedRootWt = path.join(rootDir, '.wt', 'M-ROOT', 'proj');
+  assert(rootWt && fs.existsSync(expectedRootWt) && fs.realpathSync(rootWt) === fs.realpathSync(expectedRootWt),
+    'worktree is created under <root>/.wt/<run>/<repo> (layout.worktrees decides the address)', r.stdout);
+  assert(res.repos[0].anchor === 'root' && fs.realpathSync(res.repos[0].root) === fs.realpathSync(rootDir),
+    'the setup row reports anchor=root and which root won', r.stdout);
+  assert(!fs.existsSync(path.join(rootDir, 'nested', '.forge-worktrees', 'M-ROOT', 'proj')),
+    'and nothing was created at the pre-T03 sibling location', r.stdout);
+
+  // Cleanup is git-primary (T01): it must still find the worktree after the
+  // layout is moved under its feet — the exact orphaning this slice ordered.
+  writeRootRegistry('.moved-elsewhere');
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-ROOT', '--cwd', rRepo], { env: rootEnv });
+  res = parseJSON(r.stdout);
+  assert(res.repos && res.repos[0] && res.repos[0].status === 'removed' && !fs.existsSync(expectedRootWt),
+    'cleanup removes the root-anchored worktree even after layout.worktrees changed', r.stdout);
+
+  // A non-hidden layout would make every worktree a phantom project for
+  // discovery. Setup refuses it loudly instead of quietly defaulting.
+  writeRootRegistry('worktrees');
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-GHOST', '--cwd', rRepo], { env: rootEnv });
+  res = parseJSON(r.stdout);
+  assert(res.repos && res.repos[0] && res.repos[0].status === 'error' &&
+    /forge-gate-workspaces\.json/.test(res.repos[0].error || '') && /"worktrees"/.test(res.repos[0].error || ''),
+    'non-hidden layout.worktrees is refused loudly, naming the registry file and the value', r.stdout);
+  assert(!fs.existsSync(path.join(rootDir, 'worktrees')),
+    'the refused layout created nothing on disk', r.stdout);
+
+  // No registry at all → the legacy sibling convention, unchanged.
+  fs.rmSync(path.join(rootDir, '.claude'), { recursive: true, force: true });
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-LEGACY', '--cwd', rRepo], { env: rootEnv });
+  res = parseJSON(r.stdout);
+  const legacyWt = path.join(rootDir, 'nested', '.forge-worktrees', 'M-LEGACY', 'proj');
+  assert(res.repos && res.repos[0] && res.repos[0].anchor === 'legacy-sibling' && fs.existsSync(legacyWt),
+    'absent registry keeps the legacy sibling anchor (fallback, reported)', r.stdout);
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-LEGACY', '--cwd', rRepo], { env: rootEnv });
+
+  // ── T04 / D4: the DEFAULT mode is derived from the project's shape ────────
+  // Only when `forge_isolation.mode` is absent. A workspace (a registered
+  // project containing registered projects) is where several runs plausibly
+  // collide in one tree, so it defaults to `worktree`; anything else stays
+  // `shared`. Its own synthetic HOME again — the registry IS the fixture here.
+  const shapeDir = mkTmp('iso-shape');
+  const shapeEnv = { ...process.env, HOME: shapeDir, USERPROFILE: shapeDir };
+  const shapeWs = path.join(shapeDir, 'ws');
+  function makeShapeProject(p) {
+    fs.mkdirSync(path.join(p, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(p, '.gsd', 'PROJECT.md'), '# fixture\n');
+    return p;
+  }
+  function writeShapeRegistry(entries) {
+    const file = path.join(shapeDir, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, roots: [], entries, quarantine: [] }, null, 2));
+  }
+  function shapeMode(prefsJson) {
+    fs.writeFileSync(path.join(shapeWs, '.gsd', 'forge-prefs.jsonc'), prefsJson);
+    return parseJSON(runScript('forge-isolation.js', ['--effective-mode', '--cwd', shapeWs], { env: shapeEnv }).stdout);
+  }
+  makeShapeProject(shapeWs);
+  const shapeMember = makeShapeProject(path.join(shapeWs, 'member'));
+
+  // (1) Standalone registered project → shared. This is ALSO the regression pin
+  // for every pre-D4 fixture: no mode pref plus no workspace shape must resolve
+  // exactly as it always did.
+  writeShapeRegistry([{ path: shapeWs }]);
+  let sm = shapeMode('{"workers":{"require_worktree":"false"}}');
+  assert(sm.mode === 'shared' && sm.mode_origin === 'default',
+    'D4: a standalone project with no mode pref still resolves shared (pre-D4 behaviour preserved)', JSON.stringify(sm));
+
+  // (2) Same cwd, same prefs — only the SHAPE changes → worktree.
+  writeShapeRegistry([{ path: shapeWs }, { path: shapeMember }]);
+  sm = shapeMode('{"workers":{"require_worktree":"false"}}');
+  assert(sm.mode === 'worktree' && sm.mode_origin === 'derived-shape' && sm.shape_role === 'workspace',
+    'D4: a workspace-shaped project derives worktree and reports mode_origin=derived-shape', JSON.stringify(sm));
+
+  // (3) The operator's opt-out: an EXPLICIT shared is never overruled.
+  sm = shapeMode('{"forge_isolation":{"mode":"shared"},"workers":{"require_worktree":"false"}}');
+  assert(sm.mode === 'shared' && sm.mode_origin === 'pref',
+    'D4: an explicit shared pref wins over the workspace shape', JSON.stringify(sm));
+
+  // (4) No registry at all → shared, unchanged (derivation failure is silent).
+  fs.rmSync(path.join(shapeDir, '.claude'), { recursive: true, force: true });
+  sm = shapeMode('{"workers":{"require_worktree":"false"}}');
+  assert(sm.mode === 'shared' && sm.mode_origin === 'default',
+    'D4: an absent registry keeps shared — derivation never blocks activation', JSON.stringify(sm));
+
+  // ── T05: the whole ROADMAP demo, as ONE scenario ───────────────────────────
+  // "uma worktree nova cai no caminho previsto pelo layout do root e o cleanup
+  // a encontra e remove, inclusive quando a convenção mudou entre setup e
+  // cleanup" — root+layout setup → convention flip (layout AND worktree_root)
+  // → git-primary cleanup still finds it → --effective-mode derives worktree
+  // for a workspace-shaped project and shared for a standalone one. Own
+  // synthetic HOME so it cannot interact with any fixture above.
+  const e2eDir = mkTmp('iso-e2e');
+  const e2eEnv = { ...process.env, HOME: e2eDir, USERPROFILE: e2eDir };
+  function e2eGit(args, cwd) { return spawnSync('git', args, { cwd, encoding: 'utf8', env: e2eEnv }); }
+  function writeE2ERegistry(layoutWorktrees, extraEntries) {
+    const file = path.join(e2eDir, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const root = { path: e2eDir, primary: true, layout: { worktrees: layoutWorktrees } };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, roots: [root], entries: extraEntries || [], quarantine: [] }, null, 2));
+    return file;
+  }
+  const e2eRepo = path.join(e2eDir, 'nested', 'e2e-proj');
+  fs.mkdirSync(path.join(e2eRepo, '.gsd'), { recursive: true });
+  e2eGit(['init', '-q', '-b', 'main'], e2eRepo);
+  fs.writeFileSync(path.join(e2eRepo, 'a.txt'), 'hi\n');
+  e2eGit(['add', 'a.txt'], e2eRepo);
+  e2eGit(['-c', 'user.email=smoke@forge', '-c', 'user.name=smoke', 'commit', '-qm', 'init'], e2eRepo);
+  fs.writeFileSync(path.join(e2eRepo, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"worktree","auto_pull_main":false,"worktree_cleanup_on_complete":true}}');
+
+  // Step 1: root+layout setup — worktree lands under <root>/.wt/<run>/<repo>.
+  writeE2ERegistry('.wt');
+  r = runScript('forge-isolation.js', ['--setup', '--run', 'M-SMOKE-E2E', '--cwd', e2eRepo], { env: e2eEnv });
+  res = parseJSON(r.stdout);
+  const e2eWt = res.repos && res.repos[0] && res.repos[0].worktree;
+  const e2eExpectedWt = path.join(e2eDir, '.wt', 'M-SMOKE-E2E', 'e2e-proj');
+  assert(e2eWt && fs.existsSync(e2eExpectedWt) && fs.realpathSync(e2eWt) === fs.realpathSync(e2eExpectedWt) &&
+    res.repos[0].anchor === 'root',
+    'E2E step 1: setup lands the worktree at the layout-derived path under the root', r.stdout);
+
+  // Step 2: RED PROOF before trusting the green — sabotage the single anchor
+  // function locally (uncommitted), prove the scenario actually fails, revert.
+  // A green that was never seen to fail on the real defect proves nothing
+  // (S04-RISK executor note): this is why must-have #2 exists as its own line,
+  // not folded silently into step 1's assertion.
+  const isoPath = path.join(__dirname, 'forge-isolation.js');
+  const isoSrcOriginal = fs.readFileSync(isoPath, 'utf8');
+  const isoSrcSabotaged = isoSrcOriginal.replace(
+    'function findContainingRoot(repoPath, roots, home) {',
+    'function findContainingRoot(repoPath, roots, home) { return null; /* SMOKE T05 RED-PROOF SABOTAGE */',
+  );
+  assert(isoSrcSabotaged !== isoSrcOriginal,
+    'RED-PROOF setup: sabotage patch matches current source (guards the guard — a stale patch string would silently no-op)', '');
+  let redFailingAssertName = null;
+  let redAnchorObserved = null;
+  fs.writeFileSync(isoPath, isoSrcSabotaged);
+  try {
+    r = runScript('forge-isolation.js', ['--setup', '--run', 'M-SMOKE-E2E-RED', '--cwd', e2eRepo], { env: e2eEnv });
+    res = parseJSON(r.stdout);
+    redAnchorObserved = res.repos && res.repos[0] && res.repos[0].anchor;
+    redFailingAssertName = 'E2E step 1 analogue with findContainingRoot forced null: anchor must NOT be "root"';
+  } finally {
+    // Uncommitted throughout — restored before any assertion below can fail
+    // and leave the module sabotaged for the rest of the suite.
+    fs.writeFileSync(isoPath, isoSrcOriginal);
+  }
+  assert(redAnchorObserved === 'legacy-sibling',
+    `RED PROOF (${redFailingAssertName}): with the anchor function sabotaged, resolution silently reverts to the legacy sibling instead of the declared root — this is the failure step 1 exists to catch, and it was observed to actually fail before being trusted`,
+    JSON.stringify({ redAnchorObserved }));
+  assert(fs.readFileSync(isoPath, 'utf8') === isoSrcOriginal,
+    'RED-PROOF teardown: forge-isolation.js is restored byte-identical after the sabotage probe', '');
+
+  // Step 3: convention flip — BOTH the registry layout AND the worktree_root
+  // pref change between setup and cleanup. Cleanup must still find and remove
+  // the worktree at its ACTUAL (step-1) location, because it discovers via
+  // `git worktree list --porcelain` (T01) rather than re-deriving (T02/T03).
+  writeE2ERegistry('.wt2');
+  fs.writeFileSync(path.join(e2eRepo, '.gsd', 'forge-prefs.jsonc'),
+    '{"forge_isolation":{"mode":"worktree","auto_pull_main":false,"worktree_cleanup_on_complete":true,"worktree_root":".flipped-convention"}}');
+  r = runScript('forge-isolation.js', ['--cleanup', '--run', 'M-SMOKE-E2E', '--cwd', e2eRepo], { env: e2eEnv });
+  res = parseJSON(r.stdout);
+  const e2eWorktreeListing = e2eGit(['worktree', 'list', '--porcelain'], e2eRepo).stdout;
+  assert(res.repos && res.repos[0] && res.repos[0].status === 'removed' && !fs.existsSync(e2eExpectedWt) &&
+    !e2eWorktreeListing.includes(e2eExpectedWt),
+    'E2E step 3: cleanup finds and removes the worktree even though BOTH layout.worktrees and worktree_root changed since setup', r.stdout);
+
+  // Step 4: --effective-mode derives `worktree` under a workspace-shaped
+  // fixture (root with a registered descendant) and `shared` for a standalone
+  // one — same registry file family this scenario already built, closing the
+  // loop from creation-address to isolation-mode in a single flow.
+  const e2eStandalone = path.join(e2eDir, 'standalone-proj');
+  fs.mkdirSync(path.join(e2eStandalone, '.gsd'), { recursive: true });
+  writeE2ERegistry('.wt2', [{ path: e2eStandalone }]);
+  r = runScript('forge-isolation.js', ['--effective-mode', '--cwd', e2eStandalone], { env: e2eEnv });
+  res = parseJSON(r.stdout);
+  assert(res.mode === 'shared' && res.mode_origin === 'default',
+    'E2E step 4a: a standalone registered project (no registered descendant) stays shared', r.stdout);
+
+  fs.mkdirSync(path.join(e2eDir, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(e2eDir, '.gsd', 'PROJECT.md'), '# fixture\n');
+  const e2eMember = path.join(e2eDir, 'member-proj');
+  fs.mkdirSync(path.join(e2eMember, '.gsd'), { recursive: true });
+  writeE2ERegistry('.wt2', [{ path: e2eDir }, { path: e2eMember }]);
+  r = runScript('forge-isolation.js', ['--effective-mode', '--cwd', e2eDir], { env: e2eEnv });
+  res = parseJSON(r.stdout);
+  assert(res.mode === 'worktree' && res.mode_origin === 'derived-shape' && res.shape_role === 'workspace',
+    'E2E step 4b: a workspace-shaped registered project (with a registered descendant) derives worktree', r.stdout);
+
+  cleanup(e2eDir);
+
+  cleanup(shapeDir);
+  cleanup(rootDir);
   cleanup(dir);
 }
 
@@ -8594,7 +8819,14 @@ function smokeCleanupRegistryMode() {
   assert(/rec\.isolation_mode\.trim\(\)/.test(helperBody), '(d) helper rejects blank registry isolation_mode', helperBody);
   assert(/toLowerCase\(\)/.test(helperBody), '(d) registry mode is normalized case-insensitively', helperBody);
   assert(/try \{ rec = runs\.get/.test(helperBody), '(d) registry lookup is guarded against read errors', helperBody);
-  assert(/const eff = resolveEffectiveMode\(cwd\)/.test(helperBody), '(d) fallback explicitly calls resolveEffectiveMode', helperBody);
+  // T04/D4 strengthened this: the fallback still calls resolveEffectiveMode, but
+  // with the shape derivation DISABLED for a genuine legacy record. R1 (S04
+  // review) split this further: a NULL record (no --add reached at all, e.g.
+  // standalone `--setup --run` or a crash window before registration) must
+  // resolve WITH the shape default, mirroring what setup provisioned at birth
+  // — otherwise a workspace-shaped worktree leaks with no not-found row.
+  assert(/const eff = resolveEffectiveMode\(cwd, \{ shapeDefault: rec === null \}\)/.test(helperBody),
+    '(d) fallback calls resolveEffectiveMode with shape derivation conditioned on rec===null (R1 frozen-at-birth, split by record presence)', helperBody);
   assert(/M014 S03-R2/.test(source) && /worktree_root/.test(source), '(d) helper documents debt and root limitation', source);
   assert(/mode_source: cm\.source/.test(cleanupBody), '(d) cleanup result carries mode_source', cleanupBody);
   assert(/worktreeCleanupOnComplete/.test(cleanupBody), '(d) cleanup still reads worktree cleanup preference', cleanupBody);
@@ -10765,6 +10997,1221 @@ function smokeRouteAudit() {
   } finally { cleanup(dir); }
 }
 
+// ── Section 84: registry schema + migração + guarda ENOGSD ────────────────
+//
+// Everything here runs against a synthetic `$HOME` under mkdtemp, driven through
+// the CLI's `--home`/`--file` flags. The operator's real
+// `~/.claude/forge-gate-workspaces.json` is never read and never written by this
+// suite: a migration is a one-way door, and a regression gate that rehearses it
+// on live data is the accident it was meant to prevent.
+function smokeRegistrySchemaAndEnogsd() {
+  process.stdout.write('\n▸ Section 84: registry schema + migração + guarda ENOGSD\n');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-registry-'));
+  try {
+    // ── fixture: one synthetic home holding every pathology the live registry has
+    const home = path.join(dir, 'home');
+    const mkProject = p => { fs.mkdirSync(path.join(p, '.gsd', 'milestones'), { recursive: true }); return p; };
+    const mkTouched = p => { fs.mkdirSync(path.join(p, '.gsd', 'forge'), { recursive: true }); return p; };
+    const dev = path.join(home, 'Development');
+    const agent = mkProject(path.join(dev, 'forge-agent'));
+    const ws = mkProject(path.join(dev, 'lookchina'));            // unregistered → promotion
+    const odin = mkProject(path.join(ws, 'apps', 'odin'));
+    const services = mkTouched(path.join(ws, 'services'));         // registered but touched
+    const glitnir = mkTouched(path.join(ws, 'apps', 'glitnir'));
+    // A path with spaces, because the live registry has one and a path that only
+    // survives when it is never shell-interpolated is the interesting case.
+    const sandbox = mkProject(path.join(home, 'Library', 'Application Support', 'Forge', 'Sandbox'));
+    const gone = path.join(dev, 'deleted-project');                // registered, absent from disk
+    // Exists but holds nothing active — must NOT be seeded as a root.
+    fs.mkdirSync(path.join(home, 'Documents'), { recursive: true });
+
+    const legacy = [agent, odin, services, glitnir, sandbox, gone];
+    const file = path.join(home, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const legacyBytes = JSON.stringify(legacy, null, 2) + '\n';
+    fs.writeFileSync(file, legacyBytes, 'utf8');
+    const sha = p => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const beforeSha = sha(file);
+    const beforeMtime = fs.statSync(file).mtimeMs;
+    const bak = file + '.bak';
+    const cli = args => runScript('forge-workspace.js', ['--home', home, '--file', file, ...args]);
+
+    // (a) --dry-run is a preview: every input path reported, zero bytes written.
+    const dry = cli(['--migrate', '--dry-run']);
+    assert(dry.status === 0 && /--dry-run: nenhuma escrita realizada/.test(dry.stdout),
+      '(a) --migrate --dry-run exits zero and says it wrote nothing', dry.stderr || dry.stdout);
+    assert(legacy.every(p => dry.stdout.includes(p)) && new RegExp(`entradas lidas: ${legacy.length}`).test(dry.stdout),
+      '(a) dry-run reports one line for every input entry, count measured not constant', dry.stdout);
+    assert(sha(file) === beforeSha && fs.statSync(file).mtimeMs === beforeMtime && !fs.existsSync(bak),
+      '(a) dry-run left sha256 and mtime untouched and produced no .bak');
+
+    // (b) the real migration: backup proven byte-identical, then the new shape.
+    const run = cli(['--migrate']);
+    assert(run.status === 0 && fs.existsSync(bak) && sha(bak) === beforeSha,
+      '(b) --migrate wrote a .bak byte-identical to the pre-migration file', run.stderr);
+    const migrated = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert(migrated.version === 1 && Array.isArray(migrated.roots) && Array.isArray(migrated.entries)
+      && Array.isArray(migrated.quarantine), '(b) migrated file parses as the version-1 object');
+    assert(migrated.roots.length === 1 && migrated.roots[0].path === '~/Development' && migrated.roots[0].primary === true,
+      '(b) only the root holding active entries is seeded, and it is primary', JSON.stringify(migrated.roots));
+
+    // (c) dispositions — read through --registry --json so the assertion covers
+    //     the codec round-trip rather than the in-memory object.
+    const view = cli(['--registry', '--json']);
+    const reg = JSON.parse(view.stdout);
+    const entryFor = abs => reg.entries.find(e => e.abs === abs);
+    const quarFor = abs => reg.quarantine.find(q => q.abs === abs);
+    assert(view.status === 0 && reg.version === 1 && reg.legacy !== true,
+      '(c) --registry --json prints the versioned view', view.stderr);
+    assert(entryFor(agent) && entryFor(agent).kind === 'project' && entryFor(odin),
+      '(c) real projects stay active');
+    assert(entryFor(ws) && entryFor(ws).kind === 'workspace',
+      '(c) the unregistered containing project is promoted to kind workspace');
+    assert(!entryFor(services) && quarFor(services) && quarFor(services).reason === 'touched',
+      '(c) a touched dir leaves the active list without being discarded');
+    assert(quarFor(glitnir) && quarFor(glitnir).reason === 'touched',
+      '(c) every touched dir is quarantined, not deleted');
+    assert(quarFor(sandbox) && quarFor(sandbox).reason === 'scratch' && quarFor(sandbox).root === null,
+      '(c) the scratch dir with spaces is quarantined scratch with root null',
+      JSON.stringify(quarFor(sandbox)));
+    assert(quarFor(gone) && quarFor(gone).reason === 'touched',
+      '(c) a path missing from disk is preserved in quarantine');
+
+    // (d) second --migrate is an explicit no-op and does not touch the backup.
+    const bakSha = sha(bak);
+    const migratedMtime = fs.statSync(file).mtimeMs;
+    const again = cli(['--migrate']);
+    assert(again.status === 0 && /already migrated, version 1/.test(again.stdout),
+      '(d) a second --migrate says already migrated', again.stdout + again.stderr);
+    assert(sha(bak) === bakSha && fs.statSync(file).mtimeMs === migratedMtime,
+      '(d) the no-op rewrote neither the registry nor the .bak');
+
+    // (e) portability: the stored paths are root-relative, so the same bytes
+    //     resolve under a different $HOME. This is what makes the file movable
+    //     between machines instead of pinned to one operator's username.
+    const home2 = path.join(dir, 'home2');
+    fs.mkdirSync(path.join(home2, '.claude'), { recursive: true });
+    for (const p of [agent, odin, ws]) mkProject(p.replace(home, home2));
+    const file2 = path.join(home2, '.claude', 'forge-gate-workspaces.json');
+    fs.copyFileSync(file, file2);
+    const view2 = JSON.parse(runScript('forge-workspace.js', ['--home', home2, '--file', file2, '--registry', '--json']).stdout);
+    assert(view2.entries.length === reg.entries.length
+      && view2.entries.every(e => e.abs.startsWith(home2 + path.sep))
+      && view2.entries.some(e => e.abs === agent.replace(home, home2)),
+      '(e) a registry written under one $HOME resolves under another');
+
+    // (f) the fourth `.gsd/` manufacturer stays closed: add() refuses rather
+    //     than enrolling a clean repo by writing the very marker the app reads.
+    const clean = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-enogsd-'));
+    try {
+      delete require.cache[require.resolve(path.join(SCRIPTS, 'forge-runs.js'))];
+      const runs = require(path.join(SCRIPTS, 'forge-runs.js'));
+      let code = null;
+      try { runs.add(clean, { id: 'M001', kind: 'milestone', session_id: 's1' }); } catch (e) { code = e.code; }
+      assert(code === 'ENOGSD' && !fs.existsSync(path.join(clean, '.gsd')),
+        '(f) forge-runs.add() throws ENOGSD in a clean dir and manufactures no .gsd/',
+        `code=${code} gsd=${fs.existsSync(path.join(clean, '.gsd'))}`);
+    } finally { cleanup(clean); }
+
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeRegistrySchemaAndEnogsd\(\); \}/.test(mainBody),
+      '(g) Section 84 is registered through a closure in main()');
+    pass('(final) Section 84: registry schema, dry-run zero-write, migração + .bak, no-op, portabilidade e ENOGSD verificados');
+  } finally { cleanup(dir); }
+}
+
+// ── Section 85: hierarquia derivada — role, containment transitivo e pastas
+//    sintetizadas ───────────────────────────────────────────────────────────
+//
+// Like Section 84, every fixture here lives under a synthetic `$HOME` in
+// mkdtemp, and the registry it drives is written through the codec
+// (`writeRegistry` + `encodeEntryPath`), never by hand. The operator's real
+// `~/.claude/forge-gate-workspaces.json` is never read here.
+function smokeHierarchyDerived() {
+  process.stdout.write(
+    '\n▸ Section 85: hierarquia derivada — role, containment transitivo e pastas sintetizadas\n');
+  const workspace = require(path.join(SCRIPTS, 'forge-workspace.js'));
+  const { containmentCounts, resolveRole, normalizeRegistry, encodeEntryPath, writeRegistry } = workspace;
+
+  // (a) containmentCounts is transitive and separator-guarded: a grandparent
+  //     counts a grandchild, and a sibling with the same prefix does not fool
+  //     the separator check.
+  const grand = '/a/Dev';
+  const parent = '/a/Dev/mid';
+  const child = '/a/Dev/mid/leaf';
+  const sibling = '/a/Development'; // shares the "/a/Dev" prefix but is not under it
+  const counts = containmentCounts([grand, parent, child, sibling]);
+  assert(counts[grand] === 2, '(a) the grandparent counts both the mid child and the deep grandchild', JSON.stringify(counts));
+  assert(counts[parent] === 1, '(a) the parent counts only its direct child', JSON.stringify(counts));
+  assert(counts[child] === 0, '(a) the leaf has no descendants', JSON.stringify(counts));
+  assert(counts[sibling] === 0,
+    '(a) "/a/Dev" does not contain "/a/Development" — prefix match without a separator boundary must not count',
+    JSON.stringify(counts));
+
+  // (b) resolveRole across the four cases, with classifyFn injected so no disk
+  //     is touched: workspace, project, folder (including the touched-below
+  //     case), null.
+  const rootPath = '/home/dev/lookchina';
+  const memberPath = '/home/dev/lookchina/apps/odin';
+  const touchedPath = '/home/dev/lookchina/services'; // registered as touched, not itself active
+  const foldersOnly = '/home/dev/lookchina/apps'; // never a project, sits above an active member
+  const unrelated = '/home/dev/elsewhere';
+  const classifyFn = p => ({
+    kind: (p === rootPath || p === memberPath) ? 'project' : 'none',
+    signals: [],
+  });
+  const activesForRole = [rootPath, memberPath]; // touchedPath is deliberately NOT active — it is a quarantined dir, not a registry entry
+  assert(resolveRole(rootPath, activesForRole, classifyFn) === 'workspace',
+    '(b) a project that strictly contains another active path is role workspace');
+  assert(resolveRole(memberPath, activesForRole, classifyFn) === 'project',
+    '(b) a project with no active descendant is role project');
+  assert(resolveRole(foldersOnly, activesForRole, classifyFn) === 'folder',
+    '(b) a non-project ancestor of an active path is role folder (synthesised display node)');
+  assert(resolveRole(touchedPath, activesForRole, classifyFn) === null,
+    '(b) a touched (quarantined, non-active) dir with no active descendant of its own resolves to null role — quarantine is not membership');
+  assert(resolveRole(unrelated, activesForRole, classifyFn) === null,
+    '(b) a path unrelated to any active entry has no role');
+
+  // (c) the CLI reports `role` end to end: a synthetic $HOME, a registry
+  //     written through the codec (never hand-rolled JSON) describing a
+  //     workspace root with a member under apps/, then --home/--file/--json.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-hierarchy-'));
+  try {
+    const home = path.join(dir, 'home');
+    const dev = path.join(home, 'Development');
+    const ws = path.join(dev, 'lookchina');
+    const apps = path.join(ws, 'apps');
+    const odin = path.join(apps, 'odin');
+    fs.mkdirSync(path.join(ws, '.gsd', 'milestones'), { recursive: true });
+    fs.mkdirSync(path.join(odin, '.gsd', 'milestones'), { recursive: true });
+
+    const roots = [{ path: '~/Development', primary: true }];
+    const wsEnc = encodeEntryPath(ws, roots, home);
+    const odinEnc = encodeEntryPath(odin, roots, home);
+    const registry = {
+      version: 1,
+      roots,
+      entries: [
+        { path: wsEnc.path, root: wsEnc.root, kind: 'workspace', repos: [] },
+        { path: odinEnc.path, root: odinEnc.root, kind: 'project', repos: [] },
+      ],
+      quarantine: [],
+    };
+    const file = path.join(home, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeRegistry(file, registry);
+
+    const cli = target => runScript('forge-workspace.js', ['--home', home, '--file', file, target, '--json']);
+    const rootView = JSON.parse(cli(ws).stdout);
+    assert(rootView.role === 'workspace', '(c) the CLI reports role "workspace" for the registered root', JSON.stringify(rootView));
+    const appsView = JSON.parse(cli(apps).stdout);
+    assert(appsView.role === 'folder',
+      '(c) the CLI reports role "folder" for a non-project ancestor of an active member (apps/)', JSON.stringify(appsView));
+  } finally { cleanup(dir); }
+
+  // (d) `folder` is never accepted as a stored entry `kind` — the loader
+  //     coerces anything it does not recognise to null and lets the kind be
+  //     recomputed, because a folder is a synthesised display node, not
+  //     something the registry can register.
+  const rawFolderKind = {
+    version: 1,
+    roots: [],
+    entries: [{ path: '~/Development/lookchina/apps', root: null, kind: 'folder', repos: [] }],
+    quarantine: [],
+  };
+  const normalized = normalizeRegistry(rawFolderKind, { home: '/home/dev' });
+  assert(normalized.entries[0].kind === null,
+    '(d) a stored entry with kind "folder" is coerced to null on load — folder is never a registry entry kind, ' +
+    'it is derived at read time from the active set; if this assertion becomes hard to write, T02 loosened the refusal — report it, do not weaken the check',
+    JSON.stringify(normalized.entries[0]));
+
+  // (e) the ownership table covers the ambiguous lookchina cases: scripts,
+  //     libs, infra, and the .gsd-without-substance case (services).
+  const ownershipDoc = fs.readFileSync(path.join(SCRIPTS, '..', 'shared', 'forge-ownership.md'), 'utf8');
+  assert(/WS\/scripts/.test(ownershipDoc),
+    '(e) shared/forge-ownership.md must document the WS/scripts ambiguous case — CONTEXT D1 requires explicit coverage of lookchina\'s ambiguous directories',
+    ownershipDoc.length + ' bytes read');
+  assert(/WS\/libs/.test(ownershipDoc),
+    '(e) shared/forge-ownership.md must document the WS/libs ambiguous case — CONTEXT D1 requires explicit coverage of lookchina\'s ambiguous directories');
+  assert(/WS\/infra/.test(ownershipDoc),
+    '(e) shared/forge-ownership.md must document the WS/infra ambiguous case — CONTEXT D1 requires explicit coverage of lookchina\'s ambiguous directories');
+  assert(/WS\/services/.test(ownershipDoc) && /touched/.test(ownershipDoc),
+    '(e) shared/forge-ownership.md must document the .gsd/-without-substance case (WS/services, touched not project) — CONTEXT D1 requires it',
+    ownershipDoc.length + ' bytes read');
+
+  // (f) live wiring: Projects.swift references ProjectTree and no longer
+  //     references ProjectOrganiser.groups. Duplicates T04's parity pin on
+  //     purpose — this is the net that runs in CI even when the parity suite
+  //     does not.
+  const projectsSwiftPath = path.join(SCRIPTS, '..', 'app', 'Sources', 'Forge', 'Projects.swift');
+  const projectsSwift = fs.readFileSync(projectsSwiftPath, 'utf8');
+  assert(/ProjectTree\b/.test(projectsSwift),
+    '(f) Projects.swift must reference ProjectTree — the app is wired to the new hierarchy view');
+  assert(!/ProjectOrganiser\.groups\b/.test(projectsSwift),
+    '(f) Projects.swift must no longer reference ProjectOrganiser.groups — that is the pre-hierarchy grouping this milestone replaces');
+
+  // (g) registration in main() through a closure, same structural check as
+  //     Sections 83/84.
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeHierarchyDerived\(\); \}/.test(mainBody),
+    '(g) Section 85 is registered through a closure in main()');
+
+  pass('(final) Section 85: role transitivo, containment, recusa de folder como kind de entry, ' +
+    'cobertura da tabela de posse e fiação viva verificados');
+}
+
+// ── Section 86: multi-repo sob workspace — sync, resolução cwd-invariante,
+//    fallback de marcador, precedência do registry, divergência advisory e o
+//    pino do caso TASK-021 ─────────────────────────────────────────────────
+//
+// Like Sections 84/85, every fixture lives under a synthetic `$HOME` in
+// mkdtemp/os.tmpdir(), driven through the CLIs' `--home`/`--file` flags. The
+// operator's real `~/.claude/forge-gate-workspaces.json` is never read and
+// never written here.
+function smokeMultiRepoResolution() {
+  process.stdout.write(
+    '\n▸ Section 86: multi-repo sob workspace — sync, resolução, marcador, divergência\n');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-multirepo-'));
+  try {
+    const workspace = require(path.join(SCRIPTS, 'forge-workspace.js'));
+    const { encodeEntryPath, writeRegistry } = workspace;
+
+    const home = path.join(dir, 'home');
+    const dev = path.join(home, 'Development');
+    const ws = path.join(dev, 'WS');
+    const web = path.join(ws, 'web');                 // 1 level — what discoverRepos alone can see
+    const appsA = path.join(ws, 'apps', 'a');          // 2 levels
+    const freyr = path.join(ws, 'services', 'freyr');  // 2 levels — the TASK-021 payoff repo
+    const decoy = path.join(ws, 'node_modules', 'x');  // must never be discovered
+    for (const d of [web, appsA, freyr, decoy]) fs.mkdirSync(path.join(d, '.git'), { recursive: true });
+    // `kind` is recomputed from disk on load (`deriveEntryKind`), never trusted
+    // from the stored value — a registered dir is `workspace` only when it is
+    // itself a `.gsd/` project AND strictly contains another active entry
+    // (Section 85 established this). Both facts must be real on disk here, or
+    // `--sync-repos` would silently skip WS as a plain `project` (measured: it
+    // did, the first time this fixture was written without them).
+    fs.mkdirSync(path.join(ws, '.gsd', 'milestones'), { recursive: true });
+    fs.mkdirSync(path.join(appsA, '.gsd', 'milestones'), { recursive: true });
+
+    const roots = [{ path: '~/Development', primary: true }];
+    const wsEnc = encodeEntryPath(ws, roots, home);
+    const appsAEnc = encodeEntryPath(appsA, roots, home);
+    const registry = {
+      version: 1,
+      roots,
+      entries: [
+        { path: wsEnc.path, root: wsEnc.root, kind: 'workspace', repos: [] },
+        { path: appsAEnc.path, root: appsAEnc.root, kind: 'project', repos: [] },
+      ],
+      quarantine: [],
+    };
+    const file = path.join(home, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeRegistry(file, registry);
+
+    const sha = p => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const beforeSha = sha(file);
+    const beforeMtime = fs.statSync(file).mtimeMs;
+    const cli = args => runScript('forge-workspace.js', ['--home', home, '--file', file, ...args]);
+
+    // (a) --sync-repos --dry-run is a preview: nothing written, and the
+    //     discovered repos are reported, node_modules decoy excluded.
+    const dry = cli(['--sync-repos', '--dry-run']);
+    assert(dry.status === 0, '(a) --sync-repos --dry-run exits 0', dry.stdout + dry.stderr);
+    assert(sha(file) === beforeSha && fs.statSync(file).mtimeMs === beforeMtime,
+      '(a) --sync-repos --dry-run leaves the registry byte-identical, mtime untouched');
+    assert(/services\/freyr/.test(dry.stdout) && /apps\/a/.test(dry.stdout) && /\bweb\b/.test(dry.stdout),
+      '(a) dry-run preview lists every discovered repo, one and two levels deep', dry.stdout);
+    assert(!/node_modules/.test(dry.stdout), '(a) the node_modules decoy never appears in the preview', dry.stdout);
+
+    // (a2) the real --sync-repos populates repos[] on the workspace entry.
+    const sync = cli(['--sync-repos']);
+    assert(sync.status === 0, '(a2) --sync-repos exits 0', sync.stderr);
+    const view = JSON.parse(cli(['--registry', '--json']).stdout);
+    const wsEntry = view.entries.find(e => e.abs === ws);
+    assert(wsEntry && Array.isArray(wsEntry.repos)
+      && wsEntry.repos.includes('services/freyr') && wsEntry.repos.includes('apps/a') && wsEntry.repos.includes('web'),
+      '(a2) after sync the workspace entry carries repos[] with all three real repos', JSON.stringify(wsEntry));
+    assert(!wsEntry.repos.some(r => r.includes('node_modules')),
+      '(a2) the node_modules decoy never enters repos[]', JSON.stringify(wsEntry));
+
+    // (b) --resolve freyr returns the SAME absolute path from four distinct
+    //     cwds — the workspace root, a member directory, a worktree OUTSIDE
+    //     the workspace tree entirely, and an unrelated directory. Cwd is a
+    //     tiebreaker only; a unique registry match never depends on it.
+    const runRoot = path.join(dir, 'run-root', '.forge-worktrees', 'RUN');
+    const webWt = path.join(runRoot, 'web');
+    const freyrWt = path.join(runRoot, 'freyr-checkout');
+    fs.mkdirSync(webWt, { recursive: true });
+    fs.mkdirSync(freyrWt, { recursive: true });
+    const cwds = [ws, appsA, freyrWt, dir];
+    const resolved = cwds.map(cwd => {
+      const r = runScript('forge-repo-index.js',
+        ['--resolve', 'freyr', '--home', home, '--file', file, '--cwd', cwd, '--json']);
+      let json = {}; try { json = JSON.parse(r.stdout); } catch { json = {}; }
+      return { cwd, status: r.status, json };
+    });
+    assert(resolved.every(r => r.status === 0 && r.json.status === 'ok' && r.json.path === freyr),
+      '(b) --resolve freyr yields the identical absolute path from all four cwds, including a worktree outside WS',
+      JSON.stringify(resolved.map(r => ({ cwd: r.cwd, status: r.status, path: r.json.path }))));
+
+    // (c)/(d) marker precedence (D3): write a marker for WS, then disagree
+    //     with it on purpose. Registry present → registry wins, always.
+    //     Registry absent/unreadable → marker is the only door.
+    const marker = require(path.join(SCRIPTS, 'forge-marker.js'));
+    const derived = marker.deriveMarkerFromRegistry(home, ws);
+    marker.writeMarker(ws, derived);
+    const markerFile = path.join(ws, marker.MARKER_FILENAMES[0]);
+    const markerData = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
+    let sawFreyr = false;
+    for (const r of markerData.repos) {
+      if (r.name === 'freyr') { r.path = 'services/freyr-DISAGREES'; sawFreyr = true; }
+    }
+    assert(sawFreyr, '(c) the derived marker actually carries a freyr entry to disagree with', JSON.stringify(markerData));
+    fs.writeFileSync(markerFile, JSON.stringify(markerData, null, 2) + '\n', 'utf8');
+
+    delete require.cache[require.resolve(path.join(SCRIPTS, 'forge-repo-index.js'))];
+    const repoIndex = require(path.join(SCRIPTS, 'forge-repo-index.js'));
+
+    const idxWithRegistry = repoIndex.buildRepoIndex({ home, registryFile: file, cwd: ws });
+    const resWithRegistry = repoIndex.resolveRepoName('freyr', { index: idxWithRegistry, cwd: ws });
+    assert(resWithRegistry.status === 'ok' && resWithRegistry.source === 'registry' && resWithRegistry.path === freyr,
+      '(c) registry present + a deliberately disagreeing marker → the registry still wins', JSON.stringify(resWithRegistry));
+
+    const registryBytes = fs.readFileSync(file);
+    fs.unlinkSync(file);
+    const idxNoRegistry = repoIndex.buildRepoIndex({ home, registryFile: file, cwd: ws });
+    const resNoRegistry = repoIndex.resolveRepoName('freyr', { index: idxNoRegistry, cwd: ws });
+    assert(resNoRegistry.status === 'ok' && resNoRegistry.source === 'marker',
+      '(d) registry absent → resolution falls back to the on-disk marker (the only door)', JSON.stringify(resNoRegistry));
+    fs.writeFileSync(file, registryBytes);
+
+    // (e) forge-workspace-consistency --check reports the divergence and
+    //     ALWAYS exits 0 — advisory, never blocking.
+    const consistency = runScript('forge-workspace-consistency.js', ['--check', '--home', home, '--file', file, '--json']);
+    assert(consistency.status === 0, '(e) forge-workspace-consistency --check exits 0 unconditionally', consistency.stderr);
+    const consistencyJson = JSON.parse(consistency.stdout);
+    const wsResult = (consistencyJson.workspaces || []).find(w => w.workspace === ws);
+    assert(wsResult && wsResult.status === 'divergent' && wsResult.diffs.some(d => d.name === 'freyr'),
+      '(e) the guard names the freyr divergence between registry and marker', JSON.stringify(wsResult));
+
+    // (f) forge-doctor --check workspace-consistency surfaces the same
+    //     divergence, still exit 0 (D3). checkWorkspaceConsistency reads
+    //     HOME from the environment, not a --home flag, so HOME is injected.
+    const doctor = runScript('forge-doctor.js', ['--check', 'workspace-consistency', '--cwd', ws],
+      { env: Object.assign({}, process.env, { HOME: home }) });
+    assert(doctor.status === 0, '(f) forge-doctor --check workspace-consistency exits 0 (advisory, D3)',
+      doctor.stdout + doctor.stderr);
+    assert(/divergente/i.test(doctor.stdout), '(f) forge-doctor surfaces the divergence in its human output', doctor.stdout);
+
+    // (g) the TASK-021 pin — end to end through the CLI, with our own
+    //     workspace fixture. The isolation has TWO repos one level deep
+    //     (`web`, `apps/a` — exactly what pre-S05 `discoverRepos` could see;
+    //     TWO, never one, or `resolveCodeDir`'s D6 single-repo short-circuit
+    //     would answer without ever consulting `repo:` at all — see Section
+    //     63's own (d)); `freyr` was never isolated. `repo: freyr` ADDRESSES
+    //     via the index (declared_repo_path is the exact absolute path) even
+    //     though it stays refused (unisolated, same reason, same exit 5) —
+    //     T05's documented scope: addressing succeeded, scoping did not.
+    //     Without the index the identical fixture reproduces the pre-S05
+    //     `unknown`.
+    const appsAWt = path.join(runRoot, 'apps-a');
+    fs.mkdirSync(appsAWt, { recursive: true });
+    const isoResult = JSON.stringify({
+      mode: 'worktree',
+      repos: [
+        { path: web, worktree: webWt, status: 'ok' },
+        { path: appsA, worktree: appsAWt, status: 'ok' },
+      ],
+    });
+    const pinPlan = path.join(dir, 'T-pin-PLAN.md');
+    fs.writeFileSync(pinPlan, ['---', 'id: T01', 'repo: freyr', 'writes:', '  - "src/a.ts"', '---', '', '# plano', ''].join('\n'));
+
+    const withIndex = runScript('forge-code-dir.js', [
+      '--resolve', '--iso-result', isoResult, '--plan', pinPlan,
+      '--cwd', freyrWt, '--home', home, '--registry-file', file, '--run', 'RUN',
+    ]);
+    let withIndexJson = {}; try { withIndexJson = JSON.parse(withIndex.stdout); } catch { withIndexJson = {}; }
+    assert(withIndex.status === 5 && withIndexJson.status === 'undeclared'
+      && withIndexJson.declared_repo_status === 'unisolated' && withIndexJson.declared_repo_path === freyr,
+      '(g) with the index, repo: freyr ADDRESSES to the exact path (unisolated, not unknown) even with no worktree for it',
+      JSON.stringify(withIndexJson));
+    assert(typeof withIndexJson.hint === 'string' && withIndexJson.hint.includes(freyr),
+      '(g) the refusal hint names the resolved absolute path', withIndexJson.hint);
+
+    const withoutIndex = runScript('forge-code-dir.js', [
+      '--resolve', '--no-repo-index', '--iso-result', isoResult, '--plan', pinPlan,
+      '--cwd', freyrWt, '--home', home, '--registry-file', file, '--run', 'RUN',
+    ]);
+    let withoutIndexJson = {}; try { withoutIndexJson = JSON.parse(withoutIndex.stdout); } catch { withoutIndexJson = {}; }
+    assert(withoutIndex.status === 5 && withoutIndexJson.declared_repo_status === 'unknown'
+      && withoutIndexJson.declared_repo_path === '',
+      '(g) --no-repo-index on the identical fixture reproduces the pre-S05 unknown verdict',
+      JSON.stringify(withoutIndexJson));
+
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeMultiRepoResolution\(\); \}/.test(mainBody),
+      '(h) Section 86 is registered through a closure in main()');
+    pass('(final) Section 86: repos[] sync, resolução cwd-invariante, precedência de marcador, ' +
+      'divergência advisory (workspace-consistency + doctor) e o pino do caso TASK-021 verificados');
+  } finally { cleanup(dir); }
+}
+
+// ── Section 87: duas runs, mesmo projeto, branches diferentes — visíveis,
+//    endereçáveis e não-corrompentes ──────────────────────────────────────────
+//
+// The pre-S06 failure mode this exists to make visible: two runs on the same
+// project in different branches had BYTE-IDENTICAL `cwd` and no field that
+// separated them. They were two filenames, not two addresses. The sabotage step
+// (e) reproduces exactly that state — `branch` stripped from both records — and
+// the assertion that distinguishes them is watched going RED before it is
+// trusted green. A green never observed failing proves nothing about what it
+// detects; this milestone has paid for that lesson three times.
+//
+// Integrity is proven by HASH, never by inspection: each run's artifact is
+// hashed, the OTHER run writes, and the first is re-hashed for byte-identity.
+//
+// Like Sections 84/85/86, every path lives under a synthetic `$HOME` in
+// mkdtemp/os.tmpdir(). The operator's real `~/.claude/forge-gate-workspaces.json`
+// is never read and never written — asserted at (h) by mtime, not claimed.
+function smokeConcurrentRunAddresses() {
+  process.stdout.write(
+    '\n▸ Section 87: duas runs, mesmo projeto, branches diferentes — visíveis e não-corrompentes\n');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-concurrent-runs-'));
+  const liveRegistry = path.join(os.homedir(), '.claude', 'forge-gate-workspaces.json');
+  const liveMtimeBefore = fs.existsSync(liveRegistry) ? fs.statSync(liveRegistry).mtimeMs : null;
+  try {
+    const workspace = require(path.join(SCRIPTS, 'forge-workspace.js'));
+    const { encodeEntryPath, writeRegistry } = workspace;
+
+    const home = path.join(dir, 'home');
+    const dev  = path.join(home, 'Development');
+    const ws   = path.join(dev, 'WS');            // the ONE project both runs share
+    const web  = path.join(ws, 'web');
+    const api  = path.join(ws, 'services', 'api');
+    const memb = path.join(ws, 'apps', 'a');      // registered member — makes WS a `workspace`
+    for (const d of [web, api, memb]) fs.mkdirSync(path.join(d, '.git'), { recursive: true });
+    fs.mkdirSync(path.join(ws, '.gsd', 'milestones'), { recursive: true });
+    fs.mkdirSync(path.join(memb, '.gsd', 'milestones'), { recursive: true });
+
+    const roots = [{ path: '~/Development', primary: true }];
+    const wsEnc = encodeEntryPath(ws, roots, home);
+    const mbEnc = encodeEntryPath(memb, roots, home);
+    const file = path.join(home, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeRegistry(file, {
+      version: 1,
+      roots,
+      entries: [
+        { path: wsEnc.path, root: wsEnc.root, kind: 'workspace', repos: [] },
+        { path: mbEnc.path, root: mbEnc.root, kind: 'project',   repos: [] },
+      ],
+      quarantine: [],
+    });
+    runScript('forge-workspace.js', ['--home', home, '--file', file, '--sync-repos']);
+
+    const env = Object.assign({}, process.env, { HOME: home, USERPROFILE: home });
+    const runsCli = args => runScript('forge-runs.js', ['--cwd', ws, ...args], { env });
+    const sha = p => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const runFile = id => path.join(ws, '.gsd', 'forge', 'runs', `${id}.json`);
+
+    // (a) TWO runs, SAME project (`--cwd` byte-identical by construction), two
+    //     different branches. Nothing but `--branch` separates them.
+    const addA = runsCli(['--add', '--id', 'M-a', '--kind', 'milestone', '--session', 'sess-a',
+      '--isolation-mode', 'branch', '--branch', 'forge/M-a']);
+    const addB = runsCli(['--add', '--id', 'M-b', '--kind', 'milestone', '--session', 'sess-b',
+      '--isolation-mode', 'branch', '--branch', 'forge/M-b']);
+    assert(addA.status === 0 && addB.status === 0, '(a) both runs register on the same project',
+      addA.stderr + addB.stderr);
+    const recA0 = JSON.parse(addA.stdout);
+    const recB0 = JSON.parse(addB.stdout);
+    assert(recA0.cwd === recB0.cwd,
+      '(a) the two runs really do share a byte-identical cwd — the pre-S06 collision is reproduced, not avoided',
+      `${recA0.cwd} vs ${recB0.cwd}`);
+    assert(recA0.branch === 'forge/M-a' && recB0.branch === 'forge/M-b',
+      '(a) --branch is recorded verbatim on each record', JSON.stringify([recA0.branch, recB0.branch]));
+
+    // started_at pinned so "oldest active" is a fact of the fixture and not of
+    // millisecond luck between two spawns.
+    runsCli(['--update', 'M-a', '--json', JSON.stringify({ started_at: 1000 })]);
+    runsCli(['--update', 'M-b', '--json', JSON.stringify({ started_at: 2000 })]);
+
+    // (b) VISIBILITY: both appear in --list-active, each reporting its own branch.
+    const listed = JSON.parse(runsCli(['--list-active', '--json']).stdout);
+    const ids = listed.map(r => r.id).sort();
+    assert(ids.length === 2 && ids[0] === 'M-a' && ids[1] === 'M-b',
+      '(b) --list-active shows BOTH runs', JSON.stringify(ids));
+    assert(listed.find(r => r.id === 'M-a').branch === 'forge/M-a'
+        && listed.find(r => r.id === 'M-b').branch === 'forge/M-b',
+      '(b) each listed run reports its OWN branch', JSON.stringify(listed.map(r => [r.id, r.branch])));
+
+    // (c) DISTINCT ADDRESSES: same root/project/repos chain (it IS the same
+    //     project), different `run.branch`. That difference is the whole reason
+    //     two runs sharing a cwd are separately addressable.
+    const address = (id, fromCwd) => {
+      const r = runScript('forge-run-address.js',
+        ['--address', id, '--json', '--cwd', fromCwd || ws], { env });
+      let json = null; try { json = JSON.parse(r.stdout); } catch { json = null; }
+      return { status: r.status, json, stderr: r.stderr };
+    };
+    // The predicate under test, named once and reused verbatim by the RED proof
+    // at (e). If the sabotage ran a DIFFERENT expression than the green run, the
+    // red would prove nothing about this assertion.
+    const branchesDistinguish = () => {
+      const a = address('M-a').json;
+      const b = address('M-b').json;
+      if (!a || !b) return false;
+      return !!a.run.branch && !!b.run.branch && a.run.branch !== b.run.branch;
+    };
+    const chainOf = addr => JSON.stringify({ root: addr.root, project: addr.project, repos: addr.repos });
+
+    const aAddr = address('M-a');
+    const bAddr = address('M-b');
+    assert(aAddr.status === 0 && bAddr.status === 0, '(c) both runs resolve an address',
+      aAddr.stderr + bAddr.stderr);
+    assert(chainOf(aAddr.json) === chainOf(bAddr.json),
+      '(c) root → project → repos is byte-identical for both runs — same project, as it must be',
+      chainOf(aAddr.json) + '\n' + chainOf(bAddr.json));
+    assert(aAddr.json.repos.length >= 2 && aAddr.json.repos.some(r => r.name === 'api'),
+      '(c) the shared chain actually reaches the repo leg (not vacuously equal at [])',
+      JSON.stringify(aAddr.json.repos));
+    assert(aAddr.json.run.branch === 'forge/M-a' && bAddr.json.run.branch === 'forge/M-b',
+      '(c) each address reports its own branch — the one field that separates them',
+      JSON.stringify([aAddr.json.run.branch, bAddr.json.run.branch]));
+    assert(branchesDistinguish(), '(c) the distinguishing predicate is GREEN before sabotage');
+    // …and from a cwd outside the tree entirely, the same two answers.
+    const outside = path.join(dir, 'elsewhere');
+    fs.mkdirSync(outside, { recursive: true });
+    const aOut = address('M-a', outside);
+    delete aAddr.json.resolved_from; delete (aOut.json || {}).resolved_from;
+    assert(aOut.status === 0 && JSON.stringify(aOut.json) === JSON.stringify(aAddr.json),
+      '(c) resolving from outside the tree yields a byte-identical address (resolved_from excluded)',
+      JSON.stringify(aOut.json));
+
+    // (d) NON-CORRUPTION BY HASH. One artifact per run under its own
+    //     milestone_dir; B writes, A is re-hashed for byte-identity; then the
+    //     inverse. Hash, not inspection.
+    const artifact = id => path.join(ws, '.gsd', 'milestones', id, `${id}-STATE.md`);
+    for (const id of ['M-a', 'M-b']) {
+      fs.mkdirSync(path.dirname(artifact(id)), { recursive: true });
+      fs.writeFileSync(artifact(id), `# ${id}\nphase: execute\n`, 'utf8');
+    }
+    const artA0 = sha(artifact('M-a'));
+    const artB0 = sha(artifact('M-b'));
+    const runA0 = sha(runFile('M-a'));
+    const runB0 = sha(runFile('M-b'));
+
+    fs.writeFileSync(artifact('M-b'), `# M-b\nphase: complete\nmutated\n`, 'utf8');
+    runsCli(['--update', 'M-b', '--json', JSON.stringify({ worker: 'execute-task/T09' })]);
+    assert(sha(artifact('M-a')) === artA0,
+      "(d) run B writing its artifact leaves run A's artifact byte-identical");
+    assert(sha(runFile('M-a')) === runA0,
+      "(d) run B's registry write leaves run A's record file byte-identical");
+
+    const artB1 = sha(artifact('M-b'));
+    fs.writeFileSync(artifact('M-a'), `# M-a\nphase: review\nmutated\n`, 'utf8');
+    runsCli(['--update', 'M-a', '--json', JSON.stringify({ worker: 'execute-task/T01' })]);
+    assert(sha(artifact('M-b')) === artB1 && sha(artifact('M-b')) !== artB0,
+      "(d) the inverse holds: A writing leaves B's (already mutated) artifact byte-identical");
+
+    // (d2) The per-run-file invariant asserted rather than assumed
+    //      (shared/forge-state.md §2: no lockfile for runs/*.json because each
+    //      file is per-run). Interleaved updates lose no field from either.
+    const finalA = JSON.parse(fs.readFileSync(runFile('M-a'), 'utf8'));
+    const finalB = JSON.parse(fs.readFileSync(runFile('M-b'), 'utf8'));
+    const keysA = Object.keys(recA0).every(k => k in finalA);
+    const keysB = Object.keys(recB0).every(k => k in finalB);
+    assert(keysA && keysB && finalA.branch === 'forge/M-a' && finalB.branch === 'forge/M-b'
+        && finalA.worker === 'execute-task/T01' && finalB.worker === 'execute-task/T09',
+      '(d2) interleaved writes preserve every field of BOTH records — per-run files, no shared mutable path',
+      JSON.stringify([finalA, finalB]));
+    const runsDirFiles = fs.readdirSync(path.join(ws, '.gsd', 'forge', 'runs')).sort();
+    assert(runsDirFiles.length === 2 && runsDirFiles.join(',') === 'M-a.json,M-b.json',
+      '(d2) the registry is two per-run files — there is no single shared runs file to corrupt',
+      runsDirFiles.join(','));
+    assert(sha(runFile('M-b')) !== runB0,
+      "(d2) B's file really did change under its own write — the identity asserts above are not testing a frozen disk");
+
+    // (e) RED PROOF. Strip `branch` from BOTH records — the exact pre-S06 shape
+    //     — and watch the (c) predicate go red. Restore from the saved bytes and
+    //     watch it green again, with the file hashes proving the restore was
+    //     byte-identical and not merely equivalent.
+    const bytesA = fs.readFileSync(runFile('M-a'));
+    const bytesB = fs.readFileSync(runFile('M-b'));
+    const shaBeforeSabotage = [sha(runFile('M-a')), sha(runFile('M-b'))];
+    for (const id of ['M-a', 'M-b']) {
+      const rec = JSON.parse(fs.readFileSync(runFile(id), 'utf8'));
+      delete rec.branch;
+      fs.writeFileSync(runFile(id), JSON.stringify(rec, null, 2) + '\n', 'utf8');
+    }
+    const sabotaged = branchesDistinguish();
+    assert(sabotaged === false,
+      '(e) RED PROOF: with branch stripped from both records the distinguishing predicate FAILS — observed red, not assumed',
+      `predicate returned ${sabotaged}`);
+    const aSab = address('M-a').json;
+    const bSab = address('M-b').json;
+    const strippedIdentity = addr => {
+      const copy = JSON.parse(JSON.stringify(addr));
+      copy.run.id = '<id>'; delete copy.resolved_from;
+      return JSON.stringify(copy);
+    };
+    assert(strippedIdentity(aSab) === strippedIdentity(bSab),
+      '(e) sabotaged, the two addresses are indistinguishable apart from the filename-derived id — exactly the pre-S06 defect',
+      strippedIdentity(aSab) + '\n' + strippedIdentity(bSab));
+    assert(aSab.run.branch === null && bSab.run.branch === null,
+      '(e) a record with no branch key reads back as null, never undefined (S06/T03 defaulting)',
+      JSON.stringify([aSab.run.branch, bSab.run.branch]));
+    fs.writeFileSync(runFile('M-a'), bytesA);
+    fs.writeFileSync(runFile('M-b'), bytesB);
+    assert(sha(runFile('M-a')) === shaBeforeSabotage[0] && sha(runFile('M-b')) === shaBeforeSabotage[1],
+      '(e) the restore is byte-identical, proven by hash');
+    assert(branchesDistinguish() === true,
+      '(e) restored, the same predicate is GREEN again — the assertion has now been seen both ways');
+
+    // (f) MIRROR, NEVER TRUTH (shared/forge-state.md §5). With two active runs
+    //     auto-mode.json reflects exactly ONE of them — the oldest by
+    //     started_at — and carries no run id at all. Whoever reads it as the
+    //     source of truth loses a run; the point is asserted, not narrated.
+    const refresh = runsCli(['--refresh-legacy-alias']);
+    assert(refresh.status === 0, '(f) --refresh-legacy-alias exits 0', refresh.stderr);
+    const alias = JSON.parse(fs.readFileSync(path.join(ws, '.gsd', 'forge', 'auto-mode.json'), 'utf8'));
+    assert(alias.active === true && alias.started_at === 1000,
+      '(f) auto-mode.json mirrors exactly ONE run — the oldest active by started_at', JSON.stringify(alias));
+    assert(!('id' in alias) && !('run_id' in alias) && !('branch' in alias),
+      '(f) the mirror carries no id and no branch — run M-b is not merely unlisted there, it is UNNAMEABLE from it',
+      JSON.stringify(alias));
+    const stillActive = JSON.parse(runsCli(['--list-active', '--json']).stdout).map(r => r.id).sort();
+    const bStill = address('M-b');
+    assert(stillActive.join(',') === 'M-a,M-b' && bStill.status === 0
+        && bStill.json.run.branch === 'forge/M-b',
+      '(f) the non-mirrored run stays fully visible AND fully addressable — the mirror is a projection, not the registry',
+      JSON.stringify({ stillActive, b: bStill.json && bStill.json.run }));
+
+    // (g) The shared write path that DOES exist — the dashboard's single
+    //     `.gsd/STATE.md`, written under lock — represents both runs rather
+    //     than clobbering one. (Step 4 of the plan: assert the invariant,
+    //     don't assume it.)
+    const dash = runScript('forge-dashboard.js', ['--cwd', ws, '--holder', 'smoke:87'], { env });
+    const stateMd = path.join(ws, '.gsd', 'STATE.md');
+    const stateTxt = fs.existsSync(stateMd) ? fs.readFileSync(stateMd, 'utf8') : '';
+    assert(dash.status === 0 && /M-a/.test(stateTxt) && /M-b/.test(stateTxt),
+      '(g) the one shared artifact (.gsd/STATE.md, under lock) lists BOTH runs — no run is clobbered by the other',
+      dash.stdout + dash.stderr + '\n' + stateTxt.slice(0, 400));
+
+    // (h) Zero writes to the operator's live registry, proven by mtime.
+    const liveMtimeAfter = fs.existsSync(liveRegistry) ? fs.statSync(liveRegistry).mtimeMs : null;
+    assert(liveMtimeAfter === liveMtimeBefore,
+      "(h) the operator's live ~/.claude/forge-gate-workspaces.json mtime is unchanged — zero writes, measured",
+      `${liveMtimeBefore} → ${liveMtimeAfter}`);
+    assert(!fs.existsSync(path.join(process.cwd(), '.gsd', 'milestones', 'M-a')),
+      '(h) no .gsd/ outside the fixture was created by this section');
+
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeConcurrentRunAddresses\(\); \}/.test(mainBody),
+      '(i) Section 87 is registered through a closure in main()');
+    pass('(final) Section 87: duas runs no mesmo projeto em branches diferentes — visíveis, ' +
+      'endereçáveis, integridade provada por hash, espelho ≠ verdade, e a asserção vista vermelha antes de verde');
+  } finally { cleanup(dir); }
+}
+
+// ── Section 88: doc-claims guard is wired into acceptance, and cannot be
+// silently undone — the revocation this scanner protects (S06/T01) stays
+// revoked only as long as SOMETHING in the acceptance suite calls the
+// in-process scanner and fails on either a real violation or a floor
+// breach. This section ties that invocation to forge-smoke.js itself, so a
+// future edit that removes the call cannot pass this suite unnoticed.
+function smokeDocClaimsGuard() {
+  process.stdout.write('\n▸ Section 88: doc-claims guard amarrado à suíte de aceitação\n');
+  const docClaims = require('./forge-doc-claims.js');
+  const ROOT = path.dirname(SCRIPTS);
+
+  // (a) the real tree is clean AND above the anti-silence floor — this is
+  // the actual acceptance assertion for S06 criterion #13. If a future edit
+  // reintroduces the revoked claim anywhere in the tree, or the scanner
+  // regresses to scanning 0 files, this line goes red.
+  const real = docClaims.checkTree(ROOT);
+  assert(real.ok === true, '(a) real tree scan: ok === true (no revoked-claim violations)', JSON.stringify(real));
+  assert(real.scanned >= docClaims.MIN_SCANNED_FLOOR,
+    `(a) real tree scan: scanned (${real.scanned}) >= anti-silence floor (${docClaims.MIN_SCANNED_FLOOR})`);
+  assert(Array.isArray(real.violations) && real.violations.length === 0,
+    '(a) real tree scan: violations array is empty', JSON.stringify(real.violations));
+
+  // (b) bite, proven again HERE (not merely trusted from T02's own suite):
+  // reinject the revoked claim into a fixture file, including one inside a
+  // .gitignore-covered name pattern equivalent (CLAUDE.md), and require RED.
+  const dir = mkTmp('doc-claims-guard');
+  try {
+    // The revoked-claim string is assembled from parts at runtime (as T02's
+    // own test does) rather than written as one contiguous literal — so this
+    // file's own source text never carries the claim it is proving the
+    // scanner catches, and does not self-flag when this suite scans itself.
+    const claimParts = ['- **STATE.md', 'é', 'single source of truth', '** — reinjected for bite proof\n'];
+    const claimFile = path.join(dir, 'CLAUDE.md');
+    fs.writeFileSync(claimFile, claimParts.join(' '));
+    const dirty = docClaims.checkTree(dir, { floor: 1 });
+    assert(dirty.ok === false, '(b) fixture with reinjected claim: ok === false (bite observed RED)', JSON.stringify(dirty));
+    assert(dirty.violations.length >= 1, '(b) fixture with reinjected claim: >= 1 violation reported');
+
+    // (c) removing the claim restores GREEN — both directions proven, not
+    // just the one that happens to be convenient.
+    fs.writeFileSync(claimFile, '- STATE.md is documented as a generated projection, not a source of truth\n');
+    const clean = docClaims.checkTree(dir, { floor: 1 });
+    assert(clean.ok === true, '(c) fixture with claim removed: ok === true again (GREEN restored)', JSON.stringify(clean));
+  } finally { cleanup(dir); }
+
+  // (d) the shell-grep blind spot this whole guard exists because of, proven
+  // right here rather than only narrated: the ugrep-wrapping `grep` in this
+  // environment honors .gitignore and CLAUDE.md is listed there, so a bare
+  // `grep -rni` over the repo root never reaches it. This assertion does not
+  // shell out (the scanner it is checking is itself in-process for the same
+  // reason) — it reads .gitignore directly and confirms CLAUDE.md is listed,
+  // which is the precondition for the blind spot to exist at all.
+  let gitignore = '';
+  try { gitignore = fs.readFileSync(path.join(ROOT, '.gitignore'), 'utf8'); } catch {}
+  assert(/CLAUDE\.md/.test(gitignore),
+    '(d) .gitignore lists CLAUDE.md — the measured precondition for the shell-grep blind spot ' +
+    '(bare `grep -rn` never sees the file carrying the revoked claim; only /usr/bin/grep or an ' +
+    'explicit file argument reaches it — this scanner never shells out, so it is immune)');
+
+  // (e) registration in main() through a closure, same structural check used
+  // by Sections 83/84/85 — this is what makes it impossible to silently
+  // un-wire the call and still pass: a future edit that deletes the closure
+  // from main()'s list is not merely a missing section (silent), it fails
+  // this specific assertion inside the section that IS still running today.
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeDocClaimsGuard\(\); \}/.test(mainBody),
+    '(e) Section 88 is registered through a closure in main()');
+
+  pass('(final) Section 88: doc-claims guard scans the real tree clean above the anti-silence floor, ' +
+    'bites on reinjection (both directions proven), and the shell-grep blind spot precondition is confirmed live');
+}
+
+// ── Section 89: o sinal de sobreposição entre runs, ponta-a-ponta ───────────
+//
+// S07's whole claim in one section: two runs that touched the same file are
+// VISIBLE before the merge, two runs that did not are reported `clean` ONLY
+// after real comparison work, and neither verdict costs anybody a gate.
+//
+// The verdict floor is the load-bearing part and the reason this section is
+// long. `clean` is a claim about work performed — "I confronted these pairs
+// and found no collision". A comparator that emits it having confronted
+// nothing reports its own inactivity as good news, and that report is
+// byte-for-byte indistinguishable from a detector that is simply broken.
+// This milestone paid three rounds for exactly that shape (a `grep` that
+// honored .gitignore and so scanned nothing; the scanner that replaced it,
+// blind to its own target wording; the widened pattern still evadable by
+// rewording). So `inconclusive` and `clean` are asserted as DIFFERENT
+// verdicts, in a fixture built to produce each, and the assertions were
+// observed RED under additive mutation before their green was trusted — the
+// four runs are transcribed in T04-SUMMARY.md, not merely claimed here.
+//
+// Everything spawns the REAL CLIs (`forge-touch --record`, `forge-overlap
+// --check`, `forge-doctor --check`), never just the modules: `exit 0 always`
+// is a property of the process, and only a process can be asked about it.
+//
+// Every fixture lives under a synthetic `$HOME` in mkdtemp/os.tmpdir(). The
+// operator's real ~/.claude/forge-gate-workspaces.json is read for its mtime
+// and nothing else — asserted at (g), by measurement, not by claim.
+function smokeRunOverlapSignal() {
+  process.stdout.write('\n▸ Section 89: sinal de sobreposição entre runs — overlap, clean e o piso inconclusive\n');
+
+  const ROOT = path.dirname(SCRIPTS);
+  const liveRegistry = path.join(os.homedir(), '.claude', 'forge-gate-workspaces.json');
+  const liveStampBefore = fs.existsSync(liveRegistry)
+    ? `${fs.statSync(liveRegistry).mtimeMs}:${fs.statSync(liveRegistry).size}`
+    : null;
+
+  const dirs = [];
+  const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+  const sha = p => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+
+  /** A minimal git repo on `main` with one commit — the base every fixture repo starts from. */
+  const makeRepo = (dir) => {
+    fs.mkdirSync(dir, { recursive: true });
+    git(dir, ['init', '-q']);
+    git(dir, ['checkout', '-q', '-b', 'main']);
+    git(dir, ['config', 'user.email', 'fixture@example.com']);
+    git(dir, ['config', 'user.name', 'Fixture']);
+    fs.writeFileSync(path.join(dir, 'base.txt'), 'base\n', 'utf8');
+    git(dir, ['add', 'base.txt']);
+    git(dir, ['commit', '-q', '-m', 'init']);
+    return dir;
+  };
+
+  /**
+   * A workspace with two git repos and N run records, wired exactly like
+   * forge-touch.test.js's own `makeFixture` (registry roots + entries + per-run
+   * files) so this section exercises the shipped address→touch→overlap chain
+   * rather than a smoke-local imitation of it.
+   */
+  const makeFixture = (label, runIds) => {
+    const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `forge-smoke-overlap-${label}-`)));
+    dirs.push(tmp);
+    const home = path.join(tmp, 'home');
+    const ws = path.join(home, 'Development', 'ws');
+    fs.mkdirSync(path.join(ws, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(ws, '.gsd', 'PROJECT.md'), '# fixture\n', 'utf8');
+
+    const repoNames = ['repo-a', 'repo-b'];
+    for (const n of repoNames) makeRepo(path.join(ws, n));
+
+    for (const id of runIds) {
+      const f = path.join(ws, '.gsd', 'forge', 'runs', `${id}.json`);
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, JSON.stringify({
+        kind: 'milestone', id, session_id: `sess-${id}`, active: true,
+        started_at: 1785763253000, last_heartbeat: 1785763253000,
+        worker: null, worker_started: null, isolation_mode: 'branch',
+        milestone_dir: `.gsd/milestones/${id}/`, cwd: ws,
+      }, null, 2), 'utf8');
+    }
+
+    const regFile = path.join(home, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(regFile), { recursive: true });
+    fs.writeFileSync(regFile, JSON.stringify({
+      version: 1,
+      roots: [{ path: '~/Development', primary: true }],
+      entries: [{ path: 'ws', root: '~/Development', kind: 'workspace', repos: repoNames }],
+      quarantine: [],
+    }, null, 2), 'utf8');
+
+    const env = Object.assign({}, process.env, { HOME: home, USERPROFILE: home });
+    return { tmp, home, ws, env, repoNames };
+  };
+
+  const record = (fx, id) => runScript('forge-touch.js', ['--record', id, '--json', '--cwd', fx.ws], { env: fx.env });
+  const check = (fx, extra) => runScript('forge-overlap.js', ['--check', '--cwd', fx.ws, ...(extra || [])], { env: fx.env });
+  const checkJson = (fx) => {
+    const r = check(fx, ['--json']);
+    let json = null;
+    try { json = JSON.parse(r.stdout); } catch { json = null; }
+    return { status: r.status, json, stdout: r.stdout, stderr: r.stderr };
+  };
+
+  try {
+    // ── (f) ENVIRONMENTAL PRECONDITION, asserted BEFORE any verdict is read.
+    //    Section 88's anti-silence floor, applied here: a section whose fixture
+    //    silently built zero runs or zero touched files would sail through every
+    //    verdict assertion below while proving nothing at all. So the fixture is
+    //    measured first, and the measurement is what the verdicts are read
+    //    against.
+    const fxOverlap = makeFixture('overlap', ['M-r1', 'M-r2']);
+    fs.writeFileSync(path.join(fxOverlap.ws, 'repo-a', 'shared.ts'), 'export const x = 1;\n', 'utf8');
+    const rec1 = record(fxOverlap, 'M-r1');
+    const rec2 = record(fxOverlap, 'M-r2');
+    assert(rec1.status === 0 && rec2.status === 0,
+      '(f) forge-touch --record exits 0 for both runs', rec1.stderr + rec2.stderr);
+    let t1 = null; let t2 = null;
+    try { t1 = JSON.parse(rec1.stdout); t2 = JSON.parse(rec2.stdout); } catch { /* asserted next */ }
+    const filesOf = t => (t && t.repos ? t.repos.reduce((n, r) => n + (r.files || []).length, 0) : 0);
+    assert(t1 && t2 && t1.examined === 2 && t2.examined === 2,
+      '(f) precondition: BOTH runs examined the 2 addressed repos — the fixture is not vacuous',
+      JSON.stringify([t1 && t1.examined, t2 && t2.examined]));
+    assert(filesOf(t1) >= 1 && filesOf(t2) >= 1,
+      '(f) precondition: BOTH snapshots carry at least one touched file — a verdict over empty snapshots proves nothing',
+      JSON.stringify([filesOf(t1), filesOf(t2)]));
+
+    // ── (a) OVERLAP: two runs, same file, and the CLI still exits 0.
+    const over = checkJson(fxOverlap);
+    assert(over.json && over.json.verdict === 'overlap',
+      '(a) two runs touching the same file produce verdict === "overlap"',
+      over.stdout + over.stderr);
+    assert(over.status === 0,
+      '(a) the overlap verdict still exits 0 — advisory is a measured property of the process, not an adjective',
+      `status=${over.status}`);
+    const hit = over.json && over.json.overlaps[0];
+    assert(hit && hit.repo === 'repo-a' && hit.files.includes('shared.ts'),
+      '(a) the report names the repo and the colliding FILE', JSON.stringify(over.json && over.json.overlaps));
+    assert(hit && [hit.runs[0], hit.runs[1]].sort().join(',') === 'M-r1,M-r2',
+      '(a) the report names BOTH run ids', JSON.stringify(hit && hit.runs));
+
+    // ── (d) ADVISORY, in two halves, both measured.
+    //    First: `--check` writes NOTHING. Proven by hashing every runs/*.json
+    //    before and after, not by reading the code and believing it.
+    const runsDir = path.join(fxOverlap.ws, '.gsd', 'forge', 'runs');
+    const hashRuns = () => fs.readdirSync(runsDir).sort()
+      .map(f => `${f}:${sha(path.join(runsDir, f))}`).join('|');
+    const runsBefore = hashRuns();
+    check(fxOverlap, ['--json']);
+    check(fxOverlap);
+    assert(hashRuns() === runsBefore,
+      '(d) every runs/*.json is byte-identical after two --check invocations — the detector reads, never writes',
+      `${runsBefore}\n${hashRuns()}`);
+
+    //    Second: the doctor surface. `--fix` seeds SCHEMA-VERSION so that the
+    //    exit code of `--check all` reflects the overlap and nothing else;
+    //    without it a missing schema file would mask the very thing under test.
+    const fix = runScript('forge-doctor.js', ['--fix', '--cwd', fxOverlap.ws], { env: fxOverlap.env });
+    assert(fix.status === 0, '(d) forge-doctor --fix seeds the fixture so the exit code isolates run-overlap', fix.stderr);
+    const docOne = runScript('forge-doctor.js', ['--check', 'run-overlap', '--cwd', fxOverlap.ws], { env: fxOverlap.env });
+    assert(docOne.status === 0 && /Cross-run overlap/.test(docOne.stdout) && /shared\.ts/.test(docOne.stdout),
+      '(d) forge-doctor --check run-overlap surfaces the collision AND exits 0',
+      `status=${docOne.status}\n${docOne.stdout}${docOne.stderr}`);
+    const docAll = runScript('forge-doctor.js', ['--check', 'all', '--cwd', fxOverlap.ws], { env: fxOverlap.env });
+    assert(docAll.status === 0,
+      '(d) --check all still exits 0 WITH an overlap present — the signal informs, it does not gate',
+      `status=${docAll.status}\n${docAll.stdout}${docAll.stderr}`);
+
+    // ── (i) THE WORKTREE CASE, through the shipped CLIs (S07 review-fix).
+    //    The case (a) above cannot reach: two runs in `worktree` isolation, in
+    //    two real `git worktree`s of ONE repo, both editing `shared.ts`.
+    //    Reviewed and conceded as two composing HIGH defects — forge-touch
+    //    derived from the REGISTRY checkout (so both runs snapshotted the same
+    //    unrelated tree) and reposMatch compared PATHS (so two worktrees of one
+    //    repo could never match). Either one alone answers `clean` here, with a
+    //    full and confident census, about two runs headed for a merge conflict.
+    //    `worktree` is S04's shape-derived default wherever a workspace exists,
+    //    i.e. exactly where concurrent runs are plausible.
+    //    Run records are written by hand below (they need `worktrees[]` and
+    //    real worktree paths that only exist after `git worktree add`), so the
+    //    fixture is asked for zero runs and the registry dir is created here.
+    const fxWt = makeFixture('worktree', []);
+    fs.mkdirSync(path.join(fxWt.ws, '.gsd', 'forge', 'runs'), { recursive: true });
+    const wtRepo = path.join(fxWt.ws, 'repo-a');
+    fs.writeFileSync(path.join(wtRepo, 'shared.ts'), 'export const v = 0;\n', 'utf8');
+    git(wtRepo, ['add', 'shared.ts']);
+    git(wtRepo, ['commit', '-q', '-m', 'seed shared.ts']);
+    const wtIds = ['M-w1', 'M-w2'];
+    const wtPaths = {};
+    for (const id of wtIds) {
+      const wt = path.join(fxWt.ws, '.forge-worktrees', id, 'repo-a');
+      git(wtRepo, ['worktree', 'add', '-q', wt, '-b', `forge/${id}`, 'main']);
+      git(wt, ['config', 'user.email', 'fixture@example.com']);
+      git(wt, ['config', 'user.name', 'Fixture']);
+      fs.writeFileSync(path.join(wt, 'shared.ts'), `export const v = '${id}';\n`, 'utf8');
+      fs.writeFileSync(path.join(wt, `${id}-only.ts`), 'x\n', 'utf8');
+      git(wt, ['add', '.']);
+      git(wt, ['commit', '-q', '-m', `work in ${id}`]);
+      wtPaths[id] = wt;
+      fs.writeFileSync(path.join(fxWt.ws, '.gsd', 'forge', 'runs', `${id}.json`), JSON.stringify({
+        kind: 'milestone', id, session_id: `sess-${id}`, active: true,
+        started_at: 1785763253000, last_heartbeat: 1785763253000,
+        worker: null, worker_started: null,
+        isolation_mode: 'worktree', branch: `forge/${id}`,
+        worktrees: [{ repo: wtRepo, path: wt }],
+        milestone_dir: `.gsd/milestones/${id}/`, cwd: fxWt.ws,
+      }, null, 2), 'utf8');
+    }
+    //    PRECONDITION FIRST, same discipline as (f): a fixture that derived
+    //    nothing would sail through the verdict below proving nothing.
+    const wtSnaps = wtIds.map(id => {
+      const r = record(fxWt, id);
+      try { return JSON.parse(r.stdout); } catch { return null; }
+    });
+    const wtRepoEntries = wtSnaps.map(s => (s && s.repos ? s.repos.find(x => x.name === 'repo-a') : null));
+    assert(wtRepoEntries.every(e => e && e.source === 'worktree' && e.files.includes('shared.ts')),
+      "(i) precondition: BOTH runs derived from their own worktree (source === 'worktree') and see their committed work",
+      JSON.stringify(wtRepoEntries.map(e => e && [e.source, e.path, e.files])));
+    assert(wtRepoEntries[0].path !== wtRepoEntries[1].path
+      && wtRepoEntries[0].repo_id && wtRepoEntries[0].repo_id === wtRepoEntries[1].repo_id,
+      '(i) precondition: two genuinely DIFFERENT working trees resolving to ONE repository identity — the whole point of the case',
+      JSON.stringify(wtRepoEntries.map(e => e && [e.path, e.repo_id])));
+    const wtVerdict = checkJson(fxWt);
+    assert(wtVerdict.json && wtVerdict.json.verdict === 'overlap',
+      '(i) two worktrees of one repo touching the same file produce "overlap" — NOT the confident `clean` two path-compared checkouts used to yield',
+      wtVerdict.stdout + wtVerdict.stderr);
+    const wtHit = wtVerdict.json && wtVerdict.json.overlaps[0];
+    assert(wtHit && wtHit.files.join(',') === 'shared.ts',
+      '(i) only the shared file is flagged — each run\'s exclusive file is not a collision',
+      JSON.stringify(wtVerdict.json && wtVerdict.json.overlaps));
+    assert(wtVerdict.status === 0, '(i) and it still exits 0', `status=${wtVerdict.status}`);
+    //    NEGATIVE CONTROL for the identity itself: a detector that matched on
+    //    NAME alone would pass every assertion above while collapsing the
+    //    operator's default-case basename collision (apps/norns +
+    //    services/norns) into one repo. Asserted at the seam, spawned-CLI
+    //    output being unable to reach it.
+    const rm = require(path.join(SCRIPTS, 'forge-overlap.js')).reposMatch;
+    assert(rm({ name: 'norns', path: '/w/apps/norns', repo_id: '/w/apps/norns/.git' },
+      { name: 'norns', path: '/w/services/norns', repo_id: '/w/services/norns/.git' }) === false,
+    '(i) negative control: same NAME, different repositories still do not match — the fix did not degrade to name-only matching');
+    assert(rm({ name: 'freyr', path: '/w/wt/A/freyr', repo_id: '/w/freyr/.git' },
+      { name: 'freyr', path: '/w/wt/B/freyr', repo_id: '/w/freyr/.git' }) === true,
+    '(i) positive control: different paths, one repository identity DO match');
+
+    // ── (b) CLEAN, and only with proof of work. Same two runs, snapshots taken
+    //    at different tree states, so their touched sets are genuinely disjoint.
+    //    `pairs_compared >= 1` is asserted in the SAME breath as the verdict:
+    //    `clean` alone is the exact statement this section exists to distrust.
+    const fxClean = makeFixture('clean', ['M-c1', 'M-c2']);
+    fs.writeFileSync(path.join(fxClean.ws, 'repo-a', 'alpha.ts'), 'a\n', 'utf8');
+    record(fxClean, 'M-c1');
+    fs.unlinkSync(path.join(fxClean.ws, 'repo-a', 'alpha.ts'));
+    fs.writeFileSync(path.join(fxClean.ws, 'repo-b', 'beta.ts'), 'b\n', 'utf8');
+    record(fxClean, 'M-c2');
+    const clean = checkJson(fxClean);
+    assert(clean.json && clean.json.verdict === 'clean' && clean.json.pairs_compared >= 1,
+      '(b) disjoint touches produce "clean" AND pairs_compared >= 1 — the verdict is backed by comparison actually performed',
+      clean.stdout + clean.stderr);
+    assert(clean.json && clean.json.files_compared >= 2 && clean.json.overlaps.length === 0,
+      '(b) the census shows real paths walked and no collision', JSON.stringify(clean.json));
+    assert(clean.status === 0, '(b) clean exits 0', `status=${clean.status}`);
+
+    // ── (c) THE FLOOR. One run with a snapshot, one without: nothing to
+    //    compare, so the verdict is `inconclusive` — and `!== "clean"` is
+    //    asserted explicitly, because the whole bug class this section guards
+    //    is the two collapsing into one.
+    const fxFloor = makeFixture('floor', ['M-f1', 'M-f2']);
+    fs.writeFileSync(path.join(fxFloor.ws, 'repo-a', 'only.ts'), 'o\n', 'utf8');
+    record(fxFloor, 'M-f1');
+    const floor = checkJson(fxFloor);
+    assert(floor.json && floor.json.verdict === 'inconclusive',
+      '(c) fewer than two runs with touch data produce "inconclusive"', floor.stdout + floor.stderr);
+    assert(floor.json && floor.json.verdict !== 'clean',
+      '(c) and it is explicitly NOT "clean" — a comparator that confronted nothing must never report good news',
+      String(floor.json && floor.json.verdict));
+    assert(floor.json && floor.json.pairs_compared === 0 && floor.json.runs_with_touch_data === 1,
+      '(c) the census states plainly WHY: 1 run with data, 0 pairs', JSON.stringify(floor.json));
+    const floorHuman = check(fxFloor);
+    assert(/inconclusive/.test(floorHuman.stdout) && /nada a comparar/.test(floorHuman.stdout),
+      '(c) the human output carries the REASON on the verdict line — a mute inconclusive repeats the defect one level up',
+      floorHuman.stdout);
+    assert(/M-f2 \(no-touch-record\)/.test(floorHuman.stdout),
+      '(c) the run that left the comparison leaves a NAMED reason behind — nothing is discarded silently',
+      floorHuman.stdout);
+    assert(floorHuman.status === 0, '(c) inconclusive exits 0 too', `status=${floorHuman.status}`);
+
+    // ── (c2) THE SAME FLOOR, AGAINST THE LIVE REGISTRY OF THIS REPO.
+    //    Read-only (proven at (d) above and (g) below). Today this tree has
+    //    runs but none carrying touch data, so the honest answer is
+    //    `inconclusive`; a build that answered `clean` here would be the bug,
+    //    reporting "no collisions" about a comparison it never performed. The
+    //    assertion is written as the IMPLICATION rather than the literal
+    //    verdict so it stays true — and stays load-bearing — on the day this
+    //    tree does have two recorded runs.
+    const liveRaw = runScript('forge-overlap.js', ['--check', '--json', '--cwd', ROOT]);
+    let live = null;
+    try { live = JSON.parse(liveRaw.stdout); } catch { /* asserted next */ }
+    assert(live && typeof live.verdict === 'string' && liveRaw.status === 0,
+      '(c2) the real registry of this repo answers, and exits 0', liveRaw.stdout + liveRaw.stderr);
+    assert(!live || live.runs_with_touch_data >= 2 || live.verdict !== 'clean',
+      '(c2) live tree: fewer than two runs with touch data can NEVER yield "clean" — the distinction is load-bearing on real data, not only in fixtures',
+      JSON.stringify(live));
+    assert(live && (live.skipped.length + live.runs_with_touch_data) === live.runs_examined,
+      '(c2) live census accounts for EVERY run — comparable + named skips === examined, no silent shrinkage',
+      JSON.stringify(live && { examined: live.runs_examined, withData: live.runs_with_touch_data, skipped: live.skipped.length }));
+    assert(live && live.skipped.every(s => typeof s.reason === 'string' && s.reason.length > 0),
+      '(c2) every live skip carries a named reason', JSON.stringify(live && live.skipped));
+    process.stdout.write(`    (c2) live census: examined ${live && live.runs_examined}`
+      + ` · with-data ${live && live.runs_with_touch_data} · verdict ${live && live.verdict}\n`);
+
+    // ── (e) SCOPE, as an assertion rather than a sentence. S07 introduces no
+    //    shared JS↔Swift constant and writes nothing under app/, which is why
+    //    criterion #15's parity guard was deliberately NOT extended. That
+    //    declaration is worth exactly as much as its verification, so it is
+    //    verified here.
+    //
+    //    Selection is per-COMMIT, not per-range: b3904a7 ("fix(S03/hazard)") is
+    //    a UAT fix that landed BETWEEN T01 and T02 and does touch app/. A naive
+    //    `base..HEAD` diff would attribute it to S07 and go red for a reason
+    //    that has nothing to do with this slice — so a commit belongs to S07
+    //    only if it touches an S07-exclusive file or names S07 in its subject,
+    //    and every excluded commit is printed rather than dropped.
+    const gitRoot = (args) => {
+      try { return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' }).trim(); }
+      catch { return null; }
+    };
+    const addCommit = (gitRoot(['log', '--diff-filter=A', '--format=%H', '--', 'scripts/forge-touch.js']) || '')
+      .split('\n').filter(Boolean).pop();
+    const sliceBase = addCommit ? gitRoot(['rev-parse', `${addCommit}^`]) : null;
+    if (!sliceBase) {
+      // FAIL, never skip: a scope check that silently excuses itself when its
+      // base does not resolve is the precise defect this milestone spent a
+      // whole slice hunting.
+      fail('(e) slice base resolves (parent of the commit that added scripts/forge-touch.js)',
+        `addCommit=${addCommit}`);
+    } else {
+      const S07_EXCLUSIVE = [
+        'scripts/forge-touch.js', 'scripts/forge-touch.test.js',
+        'scripts/forge-overlap.js', 'scripts/forge-overlap.test.js',
+        'scripts/forge-doctor-run-overlap.test.js',
+      ];
+      const shas = (gitRoot(['rev-list', `${sliceBase}..HEAD`]) || '').split('\n').filter(Boolean);
+      const commits = shas.map(h => ({
+        sha: h,
+        subject: gitRoot(['log', '-1', '--format=%s', h]) || '',
+        files: (gitRoot(['show', '--name-only', '--format=', h]) || '').split('\n').filter(Boolean),
+      }));
+      const isS07 = c => /\bS07\b/.test(c.subject) || c.files.some(f => S07_EXCLUSIVE.includes(f));
+      const selected = commits.filter(isS07);
+      const foreign = commits.filter(c => !isS07(c));
+      const appPaths = f => f.split('/')[0] === 'app';
+      const squashed = selected.some(c => c.files.length >= 30);
+
+      for (const c of foreign) {
+        process.stdout.write(`    (e) fora do escopo de S07: ${c.sha.slice(0, 7)} ${c.subject}`
+          + ` [${c.files.filter(appPaths).length} arquivo(s) em app/]\n`);
+      }
+
+      if (squashed) {
+        // Enumerated and printed, never silent: once this branch is squash-
+        // merged, a single commit carries every slice of the milestone and the
+        // per-commit attribution above stops being meaningful.
+        skip('(e) slice diff carries no app/ path',
+          'slice-history-squashed — a selected commit touches >= 30 files, so per-commit S07 attribution no longer holds');
+      } else {
+        assert(selected.length >= 3,
+          `(e) the S07 commit selector actually selected commits (${selected.length} >= 3) — a selector that matches nothing proves nothing`,
+          JSON.stringify(commits.map(c => [c.sha.slice(0, 7), c.subject, isS07(c)])));
+        const offending = selected.flatMap(c => c.files.filter(appPaths).map(f => `${c.sha.slice(0, 7)}:${f}`));
+        assert(offending.length === 0,
+          '(e) no S07 commit touches app/ — criterion #15 did not fire because its condition never arose, verified rather than omitted',
+          offending.join(', '));
+        assert(foreign.every(c => !/\bS07\b/.test(c.subject)),
+          '(e) every commit excluded from the S07 set is genuinely foreign — an S07-labelled commit could not hide in the exclusions',
+          JSON.stringify(foreign.map(c => [c.sha.slice(0, 7), c.subject])));
+        // POSITIVE CONTROL for the predicate itself. The three prior anti-
+        // silence bugs of this milestone were all detectors blind to their own
+        // target; a scope check trusted green without ever having been shown
+        // firing would be the fourth.
+        const control = ['app/Sources/ForgeKit/Models.swift', 'scripts/forge-overlap.js']
+          .filter(appPaths);
+        assert(control.length === 1 && control[0].startsWith('app/'),
+          '(e) positive control: the same app/ predicate DOES fire on a synthetic app/ path — it is not blind',
+          JSON.stringify(control));
+      }
+    }
+
+    // ── (g) Zero writes to the operator's live registry, by measurement.
+    const liveStampAfter = fs.existsSync(liveRegistry)
+      ? `${fs.statSync(liveRegistry).mtimeMs}:${fs.statSync(liveRegistry).size}`
+      : null;
+    if (liveStampBefore === null && liveStampAfter === null) {
+      skip('(g) operator registry untouched',
+        'no ~/.claude/forge-gate-workspaces.json on this machine — nothing to measure');
+    } else {
+      assert(liveStampAfter === liveStampBefore,
+        "(g) the operator's live ~/.claude/forge-gate-workspaces.json is unchanged (mtime:size) — zero writes, measured",
+        `${liveStampBefore} → ${liveStampAfter}`);
+    }
+    assert(!fs.existsSync(path.join(ROOT, '.gsd', 'forge', 'runs', 'M-r1.json')),
+      '(g) no fixture run leaked into this repo\'s own registry');
+
+    // ── (h) Registration in main(), the same structural check Sections 87/88
+    //    use: deleting the closure is not merely a missing section (silent) —
+    //    it fails this assertion inside the section that is still running.
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeRunOverlapSignal\(\); \}/.test(mainBody),
+      '(h) Section 89 is registered through a closure in main()');
+    const idxSelf = mainBody.indexOf('smokeRunOverlapSignal();');
+    const idxIso = mainBody.indexOf('await smokeSectionIsolation();');
+    assert(idxSelf > 0 && idxIso > idxSelf,
+      '(h) Section 89 is registered BEFORE smokeSectionIsolation, which stays the last entry',
+      `self=${idxSelf} isolation=${idxIso}`);
+
+    pass('(final) Section 89: overlap nomeia arquivo/repo/runs e sai 0, clean só com par confrontado, '
+      + 'inconclusive nunca vira clean (fixture e registry vivo), o detector não escreve, '
+      + 'o doctor não bloqueia, e o diff da slice não toca app/ — com o piso visto vermelho antes de verde');
+  } finally {
+    for (const d of dirs) cleanup(d);
+  }
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -10863,6 +12310,12 @@ async function main() {
       () => { smokeXllmSvn(); },
       () => { smokeIsolationSvnAndVcsTelemetry(); },
       () => { smokeRouteAudit(); },
+      () => { smokeRegistrySchemaAndEnogsd(); },
+      () => { smokeHierarchyDerived(); },
+      () => { smokeMultiRepoResolution(); },
+      () => { smokeConcurrentRunAddresses(); },
+      () => { smokeDocClaimsGuard(); },
+      () => { smokeRunOverlapSignal(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {

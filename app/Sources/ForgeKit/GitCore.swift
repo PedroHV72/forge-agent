@@ -106,8 +106,17 @@ public enum Git {
 /// projects; directories merely touched by a run are surfaced from the
 /// registered list instead, where the operator can act on them.
 public enum ProjectDiscovery {
-    /// Where people actually keep code. Scanned shallowly on purpose: a deep
-    /// walk of $HOME would take seconds and wander into node_modules.
+    /// Seeding default — **not** the scan source.
+    ///
+    /// These names exist to propose roots the first time a registry is created
+    /// (and during migration of a legacy one), when there is nothing declared
+    /// to walk yet. Once the registry declares `roots[]`, discovery walks those
+    /// and only those: see `scan(declaredRoots:)`. Guessing at names is what
+    /// made a project outside `~/Development` invisible with nothing on screen
+    /// to explain it.
+    ///
+    /// Scanned shallowly on purpose: a deep walk of $HOME would take seconds
+    /// and wander into node_modules.
     public static let roots = ["Development", "Documents", "Projects",
                                "Code", "src", "repos", "Desktop"]
     public static let maxDepth = 3
@@ -126,6 +135,31 @@ public enum ProjectDiscovery {
             let dir = base.appendingPathComponent(root)
             guard FileManager.default.fileExists(atPath: dir.path) else { continue }
             walk(dir, depth: 0, into: &found)
+        }
+        return found.sorted()
+    }
+
+    /// Every Forge project under the given absolute roots — and nowhere else.
+    ///
+    /// The roots come from the registry (`WorkspaceRegistry.Resolution.roots`),
+    /// already resolved against an explicit home, so this function never
+    /// consults `roots` above and never expands `~`: a root that arrives
+    /// unresolved is the codec's refusal to make, not a guess to make here.
+    ///
+    /// `maxDepth` counts from each declared root, so declaring a deeper root
+    /// reaches deeper — the same three levels, measured from where the operator
+    /// pointed rather than from a name we picked.
+    ///
+    /// A root that does not exist is skipped in silence: roots outlive the
+    /// directories they name (external volume, other machine), and one stale
+    /// entry must not cost the operator the rest of the scan.
+    public static func scan(declaredRoots: [String]) -> [String] {
+        var found: Set<String> = []
+        for root in declaredRoots where !root.isEmpty {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir),
+                  isDir.boolValue else { continue }
+            walk(URL(fileURLWithPath: root), depth: 0, into: &found)
         }
         return found.sorted()
     }

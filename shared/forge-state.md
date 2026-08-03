@@ -98,6 +98,11 @@ type RunRecord = {
   milestone_dir: string | null;     // ".gsd/milestones/M065/" for kind=milestone; null for kind=task
   cwd: string;                      // Working directory of the orchestrator (worktree path if worktree mode)
 
+  // Address fields — additive, optional, default null. See "Addressing" below.
+  branch: string | null;            // git branch this run owns ("forge/{id}" under branch/worktree)
+  root: string | null;              // declared root containing this run's project (path, ~-anchored path, or root name)
+  project: string | null;           // owning project — the nearest ".gsd/" (ABSOLUTE path)
+
   // Task-only fields (kind=task; absent for kind=milestone)
   task_description?: string;        // The original user prompt for /forge-task
   pending_decisions?: Array<{       // Buffered for merge at complete-task
@@ -129,9 +134,12 @@ type RunRecord = {
   "last_heartbeat": 1779203195000,
   "worker": "execute-task/T03",
   "worker_started": 1779203180000,
-  "isolation_mode": "shared",
+  "isolation_mode": "branch",
   "milestone_dir": ".gsd/milestones/M065/",
-  "cwd": "C:/DEV/lookchina/whatsapp-omnichannel"
+  "cwd": "C:/DEV/lookchina/whatsapp-omnichannel",
+  "branch": "forge/M065",
+  "root": "~/Development",
+  "project": "C:/DEV/lookchina/whatsapp-omnichannel"
 }
 ```
 
@@ -149,11 +157,40 @@ type RunRecord = {
   "isolation_mode": "shared",
   "milestone_dir": null,
   "cwd": "C:/DEV/lookchina/whatsapp-omnichannel",
+  "branch": null,
+  "root": null,
+  "project": null,
   "task_description": "Fix typo in README — 'recieve' → 'receive'",
   "pending_decisions": [],
   "pending_memories": []
 }
 ```
+
+### Addressing (`branch`, `root`, `project`)
+
+These three fields are what make a run **addressable** rather than merely present. Without them, two runs on the same project in different branches carry a **byte-identical `cwd`** and nothing else distinguishes them — they are separable only by the accident of two different filenames in `.gsd/forge/runs/`, which is not an address.
+
+| Field | Type | Meaning | Written by |
+|---|---|---|---|
+| `branch` | string \| null | The git branch this run owns. `forge/{id}` under isolation `branch`/`worktree`; `null` under `shared`. | Orchestrator at run registration (`forge-runs.js --branch`) |
+| `root` | string \| null | The declared root containing this run's project. Accepts an absolute path, a `~`-anchored path, or the **name** of a declared root (matched against the basename of `roots[]` in the workspace registry). | Orchestrator (`--root`); usually left `null` and derived |
+| `project` | string \| null | The project owning the run — the nearest `.gsd/` above the run's `cwd`. **Must be absolute**; a relative value is reported as `record-project-unanchored` and never resolved against the caller's cwd. | Orchestrator (`--project`); usually left `null` and derived |
+
+**Additive, with an explicit `null` default.** Every record written before these fields existed loads unchanged and is **not migrated** — `scripts/forge-runs.js` applies the `null` default on *read* (`withAddressDefaults`) rather than rewriting files. `null` and not `undefined` deliberately: `undefined` disappears through `JSON.stringify`, so a legacy record would serialise with no `branch` key at all, making "no value" indistinguishable from "this field does not exist".
+
+**Recorded beats derived.** `scripts/forge-runs.js` records these verbatim and derives nothing. Resolution is `scripts/forge-run-address.js`:
+
+```
+node scripts/forge-run-address.js --address <run-id> [--json] [--cwd <path>]
+```
+
+`resolveRunAddress(cwd, runId)` returns the full `run → root → project → repo` chain, composing `findContainingRoot` (root containment), `resolveOwner` / `resolveRole` (ownership), and `buildRepoIndex` (repos). A field present on the record is authoritative; derivation runs only where the field is `null`. Every leg carries its own `source` (`record` \| `derived` \| `null`) and a `reason` when it could not resolve — a leg **never** reports an invented path, and only an unknown run id throws.
+
+**The address is cwd-invariant.** Resolving the same run from the project root, from a nested subdirectory, and from a tmpdir outside the tree returns a byte-identical answer. `cwd` says which `.gsd/` to consult and is echoed back as `resolved_from` for audit only; it never enters the identity. This matters because under isolation `worktree` the orchestrator's cwd is `<root>/.forge-worktrees/{RUN}/<repo>` — outside the workspace tree entirely, which is exactly where a cwd-derived address goes wrong.
+
+### Forward compatibility
+
+**Unknown keys are ignored, never dropped.** A reader encountering a field it does not know preserves it through a read/write round-trip. This is what lets an older Forge and a newer one share a workspace without either silently erasing the other's state — the same rule §1's frontmatter parser follows.
 
 ### Lifecycle states
 

@@ -784,6 +784,48 @@ test("detecta projeto que contém outros") {
     assertTrue(c["/h/Development/message"] == nil, "folha não contém nada")
 }
 
+// I-20260803154521 — the notice accused the workspace this milestone promoted.
+//
+// These exercise `ProjectOrganiser.containmentHazards`, which is the predicate
+// the notice calls, but NOT the notice itself: `hazardNotice` is a SwiftUI view
+// in the `Forge` executable target, which `ForgeKitTests` cannot import. What is
+// proven here is the decision; that `Projects.swift` asks this function for it
+// is held by review, not by these asserts.
+test("workspace declarado não é acusado de conter os outros") {
+    let hazards = ProjectOrganiser.containmentHazards(
+        sample, declaredWorkspaces: ["/h/Development/lookchina"])
+    assertFalse(hazards.contains { $0.path == "/h/Development/lookchina" },
+                "um workspace contém seus membros por definição — acusá-lo manda "
+                + "o operador apagar exatamente a entrada que ele promoveu")
+}
+
+test("o .gsd/ perdido continua sendo denunciado") {
+    // The regression guard's other half. Suppressing the workspace must not
+    // suppress the hazard that really existed: a `.gsd/` at ~/Development,
+    // above every real project, enrolling all of them.
+    let hazards = ProjectOrganiser.containmentHazards(
+        sample, declaredWorkspaces: ["/h/Development/lookchina"])
+    assertEqual(hazards.first?.path, "/h/Development", "o intruso não declarado")
+    assertEqual(hazards.first?.count, 6)
+}
+
+test("sem declarações o aviso é exatamente o de antes") {
+    // A legacy registry has no `kind` field, so it declares nothing — and must
+    // behave as it did before workspaces existed.
+    let hazards = ProjectOrganiser.containmentHazards(sample)
+    assertEqual(hazards.map(\.path),
+                ["/h/Development", "/h/Development/lookchina"],
+                "ambos acima do limiar, do maior para o menor")
+    assertFalse(hazards.contains { $0.path == "/h/Development/lookchina/services" },
+                "2 contidos está abaixo do limiar de 3")
+}
+
+test("ordem dos riscos não depende da ordem de entrada") {
+    let a = ProjectOrganiser.containmentHazards(sample)
+    let b = ProjectOrganiser.containmentHazards(sample.reversed())
+    assertEqual(a, b, "empates desempatados por caminho, não pela ordem do dicionário")
+}
+
 test("prefixo parcial não conta como contido") {
     // "/h/Dev" must not swallow "/h/Development".
     let c = ProjectOrganiser.containment(["/h/Dev", "/h/Development"])
@@ -801,6 +843,135 @@ test("container devolve o pai mais próximo") {
 test("abbreviate encurta o home") {
     assertEqual(ProjectOrganiser.abbreviate("/h/Development", home: "/h"), "~/Development")
     assertEqual(ProjectOrganiser.abbreviate("/outro/x", home: "/h"), "/outro/x")
+}
+
+print("\nProjectTree (a hierarquia é transitiva; o agrupamento por pai imediato não era)")
+
+// Three levels on purpose: the grandchild is what tells a transitive tree from
+// a bucket-by-parent one. Under `groups`, `/h/w/apps/odin/vendor/x` came out as
+// a header next to `/h/w` with nothing relating them.
+let treeSample = [
+    "/h/w",
+    "/h/w/apps/odin",
+    "/h/w/apps/odin/vendor/x",
+]
+
+test("três níveis: o neto fica sob o filho, não ao lado do avô") {
+    let forest = ProjectTree.build(projects: treeSample, home: "/h")
+    assertEqual(forest.count, 1, "o topo tem um único nó — o avô")
+    assertEqual(forest[0].path, "/h/w")
+
+    // Depth asserted explicitly: w > apps > odin > vendor > x.
+    let apps = forest[0].children
+    assertEqual(apps.count, 1)
+    assertEqual(apps[0].path, "/h/w/apps")
+    let odin = apps[0].children
+    assertEqual(odin.count, 1)
+    assertEqual(odin[0].path, "/h/w/apps/odin")
+    let vendor = odin[0].children
+    assertEqual(vendor.count, 1)
+    assertEqual(vendor[0].path, "/h/w/apps/odin/vendor")
+    assertEqual(vendor[0].children.map(\.path), ["/h/w/apps/odin/vendor/x"])
+
+    let topPaths = forest.map(\.path)
+    assertFalse(topPaths.contains("/h/w/apps/odin/vendor/x"),
+                "neto no topo é exatamente a regressão para bucket por pai imediato")
+}
+
+test("o intermediário que não é projeto vira folder") {
+    let forest = ProjectTree.build(projects: treeSample, home: "/h")
+    let apps = forest[0].children[0]
+    assertEqual(apps.role, .folder, "apps/ não tem .gsd/ — é nó de display")
+    assertEqual(apps.title, "apps")
+    assertEqual(forest[0].role, .workspace, "w contém projetos")
+    assertEqual(forest[0].children[0].children[0].role, .workspace, "odin contém x")
+}
+
+test("diretório sem projeto abaixo não é sintetizado") {
+    // `/h/w/docs` existe no mundo, mas nada registrado mora lá. A árvore mostra
+    // o que o registro contém; não sai procurando estrutura para desenhar.
+    let forest = ProjectTree.build(projects: treeSample, home: "/h")
+    var seen: [String] = []
+    func walk(_ n: ProjectTreeNode) { seen.append(n.path); n.children.forEach(walk) }
+    forest.forEach(walk)
+    assertFalse(seen.contains("/h/w/docs"), "nó inventado: \(seen)")
+    assertEqual(seen.count, 5, "w, apps, odin, vendor, x — nada além disso: \(seen)")
+}
+
+test("a árvore não depende da ordem de entrada") {
+    let a = ProjectTree.build(projects: treeSample, home: "/h")
+    let b = ProjectTree.build(projects: treeSample.reversed(), home: "/h")
+    assertEqual(a, b, "ordem de entrada não pode mudar a estrutura")
+}
+
+test("registráveis são exatamente os projetos de entrada — nem a mais, nem a menos") {
+    let forest = ProjectTree.build(projects: treeSample, home: "/h")
+    var registrable: [String] = []
+    func walk(_ n: ProjectTreeNode) {
+        if n.role.isRegistrable { registrable.append(n.path) }
+        n.children.forEach(walk)
+    }
+    forest.forEach(walk)
+    assertEqual(registrable.sorted(), treeSample.sorted(),
+                "folder vazando para registrável, ou projeto sumindo, é o mesmo defeito")
+    assertFalse(ProjectRole.folder.isRegistrable, "pasta nunca é registrável")
+    assertTrue(ProjectRole.workspace.isRegistrable && ProjectRole.project.isRegistrable)
+}
+
+test("projectCount é transitivo — o avô conta o neto") {
+    let forest = ProjectTree.build(projects: treeSample, home: "/h")
+    assertEqual(forest[0].projectCount, 2, "odin e x")
+    assertEqual(forest[0].children[0].projectCount, 2, "a pasta apps carrega os dois")
+    assertEqual(forest[0].children[0].children[0].projectCount, 1, "odin conta x")
+}
+
+test("roots declarados ancoram os projetos de topo; root sem projeto não aparece") {
+    let forest = ProjectTree.build(projects: ["/h/Development/message"],
+                                   roots: ["/h/Development", "/h/Desktop"],
+                                   home: "/h")
+    assertEqual(forest.count, 1, "Desktop não tem projeto abaixo — não é sintetizado")
+    assertEqual(forest[0].path, "/h/Development")
+    assertEqual(forest[0].role, .folder)
+    assertEqual(forest[0].title, "~/Development", "topo é abreviado pelo home injetado")
+    assertEqual(forest[0].children.map(\.path), ["/h/Development/message"])
+    assertEqual(forest[0].projectCount, 1)
+}
+
+test("a forma do registro vivo: uma árvore para lookchina, com apps/ e services/") {
+    // Os 14 ativos que o registro contém hoje, como literais. As contagens são
+    // as que ESTA fixture implica (5 e 4) — os 6/7 do texto do ROADMAP
+    // descrevem o registro anterior à migração de S01 e não existem mais.
+    let dev = "/h/Development"
+    let live = [
+        "\(dev)/lookchina",
+        "\(dev)/lookchina/apps/fenrir",
+        "\(dev)/lookchina/apps/heimdall",
+        "\(dev)/lookchina/apps/nidhogg",
+        "\(dev)/lookchina/apps/odin",
+        "\(dev)/lookchina/apps/valyria",
+        "\(dev)/lookchina/services/freyr",
+        "\(dev)/lookchina/services/gna",
+        "\(dev)/lookchina/services/loki",
+        "\(dev)/lookchina/services/muninn",
+        "\(dev)/feirao-do-lu",
+        "\(dev)/forge-agent",
+        "\(dev)/message",
+        "\(dev)/nura-smpp",
+    ]
+    let forest = ProjectTree.build(projects: live, home: "/h")
+
+    assertEqual(forest.count, 5, "quatro soltos + lookchina, sem roots declarados")
+    let look = forest.first { $0.path == "\(dev)/lookchina" }!
+    assertEqual(look.role, .workspace)
+    assertEqual(look.projectCount, 9, "cinco em apps/ e quatro em services/")
+    assertEqual(look.children.map(\.title), ["apps", "services"], "irmãos em ordem estável")
+    assertEqual(look.children.map(\.role), [.folder, .folder],
+                "apps/ e services/ não têm .gsd/ — são pastas, não cards")
+    assertEqual(look.children[0].projectCount, 5)
+    assertEqual(look.children[1].projectCount, 4)
+    assertEqual(look.children[1].children.map(\.title), ["freyr", "gna", "loki", "muninn"])
+    assertTrue(forest.first { $0.path == "\(dev)/message" }?.role == .project,
+               "projeto solto continua projeto")
 }
 
 print("\nStatusModels (o modelo antigo lia o JSON errado, em silêncio)")
@@ -3903,6 +4074,680 @@ test("ItemSearch NAO substitui ItemLabelFilter — a regra exata do criterio #5 
                 "ItemLabelFilter continua exato")
     assertEqual(ItemSearch.apply(its, query: "ui").count, 1,
                 "ItemSearch e substring de proposito — sao regras diferentes, e as duas existem")
+}
+
+// ── WorkspaceRegistry ───────────────────────────────────────────────────────
+//
+// Fixtures are byte literals and `home` is a synthetic string: nothing here
+// reads the operator's real `~/.claude/`. That matters beyond hygiene — these
+// tests run both under `swift run ForgeKitTests` (real $HOME) and through
+// run-tests.js (isolated $HOME), and a test that touched the real path would
+// pass in one launcher and lie in the other.
+
+let synthHome = "/tmp/forge-synth-home"
+
+func regData(_ s: String) -> Data { Data(s.utf8) }
+
+let legacyFixture = regData("""
+["/Users/x/Development/forge-agent","~/Development/lookchina"]
+""")
+
+let versionedFixture = regData("""
+{
+  "version": 1,
+  "roots": [{"path": "~/Development", "primary": true}],
+  "entries": [
+    {"path": "forge-agent", "root": "~/Development", "kind": "project", "repos": []},
+    {"path": "my project", "root": "~/Development", "kind": "project", "repos": ["freyr"]},
+    {"path": "~/Library/Application Support/Forge/Sandbox", "root": null, "kind": "project", "repos": []}
+  ],
+  "quarantine": [
+    {"path": "lookchina/services", "root": "~/Development", "reason": "touched"}
+  ]
+}
+""")
+
+test("WorkspaceRegistry: le a forma legada [String] — o arquivo que esta no disco hoje") {
+    let r = WorkspaceRegistry.resolution(from: legacyFixture, home: synthHome)
+    assertEqual(r?.shape, .legacy)
+    assertEqual(r?.paths.count, 2)
+    assertEqual(r?.paths.first, "/Users/x/Development/forge-agent")
+}
+
+test("WorkspaceRegistry: le a forma versionada como ativos ∪ quarentena") {
+    let r = WorkspaceRegistry.resolution(from: versionedFixture, home: synthHome)
+    assertEqual(r?.shape, .versioned(1))
+    assertEqual(r?.paths.count, 4, "3 entries + 1 quarentena — a quarentena continua visivel")
+    assertTrue(r?.paths.contains("\(synthHome)/Development/forge-agent") == true)
+    assertTrue(r?.paths.contains("\(synthHome)/Development/lookchina/services") == true,
+               "sumir com a quarentena e o mesmo defeito de sumir com o projeto")
+}
+
+test("WorkspaceRegistry: kind workspace chega ao leitor — o campo que o aviso precisa") {
+    // I-20260803154521: the reader dropped `kind` entirely, so the hazard had
+    // nothing to distinguish a promoted workspace from a stray .gsd/ by.
+    let data = Data("""
+    {"version":1,"roots":["~/Development"],"entries":[
+      {"root":"~/Development","path":"lookchina","kind":"workspace","repos":[]},
+      {"root":"~/Development","path":"lookchina/apps/odin","kind":"project","repos":[]}
+    ],"quarantine":[
+      {"root":"~/Development","path":"velho","reason":"touched"}
+    ]}
+    """.utf8)
+    let r = WorkspaceRegistry.resolution(from: data, home: synthHome)
+    assertEqual(r?.declaredWorkspaces, ["\(synthHome)/Development/lookchina"],
+                "so o que declara kind:workspace")
+    assertFalse(r?.declaredWorkspaces.contains("\(synthHome)/Development/velho") == true,
+                "quarentena nao esta ativa — nao pode conter nada na tela")
+}
+
+test("WorkspaceRegistry: forma legada nao declara workspace nenhum") {
+    let r = WorkspaceRegistry.resolution(from: legacyFixture, home: synthHome)
+    assertEqual(r?.declaredWorkspaces, [],
+                "nao ha campo kind na forma plana — declarar seria chutar")
+}
+
+test("WorkspaceRegistry: caminho com espacos sobrevive ao join root-relativo") {
+    let r = WorkspaceRegistry.resolution(from: versionedFixture, home: synthHome)
+    assertTrue(r?.paths.contains("\(synthHome)/Development/my project") == true,
+               "um espaco no nome do diretorio nao pode partir a entrada em duas")
+}
+
+test("WorkspaceRegistry: expansao de ~ usa o home passado, nunca o ambiente") {
+    let a = WorkspaceRegistry.activePaths(from: versionedFixture, home: "/home/alice") ?? []
+    let b = WorkspaceRegistry.activePaths(from: versionedFixture, home: "/home/bob") ?? []
+    assertTrue(a.contains("/home/alice/Library/Application Support/Forge/Sandbox"))
+    assertTrue(b.contains("/home/bob/Library/Application Support/Forge/Sandbox"))
+    assertTrue(!a.contains(where: { $0.hasPrefix("/home/bob") }),
+               "um codec que fecha sobre o home ambiente nao viaja entre maquinas")
+}
+
+test("WorkspaceRegistry: arquivo ilegivel devolve nil, nunca [] — o defeito de origem") {
+    assertNil(WorkspaceRegistry.resolution(from: regData("{ nao e json"), home: synthHome),
+              "registry corrompido e registry vazio sao fatos diferentes")
+    assertNil(WorkspaceRegistry.resolution(from: regData("42"), home: synthHome))
+    let empty = WorkspaceRegistry.resolution(from: regData("[]"), home: synthHome)
+    assertEqual(empty?.paths.count, 0, "vazio de verdade continua sendo vazio")
+}
+
+test("WorkspaceRegistry: version desconhecida ainda e lida — recusar aqui apagaria a lista") {
+    let future = regData("""
+    {"version": 9, "entries": [{"path": "~/Development/x", "root": null}]}
+    """)
+    let r = WorkspaceRegistry.resolution(from: future, home: synthHome)
+    assertEqual(r?.paths, ["\(synthHome)/Development/x"])
+}
+
+test("WorkspaceRegistry: entrada que escapa do root e rejeitada — mesmo guard do codec JS") {
+    let evil = regData("""
+    {"version": 1, "roots": [{"path": "~/Development", "primary": true}],
+     "entries": [{"path": "../../../etc", "root": "~/Development"},
+                 {"path": "/tmp/absoluto", "root": "~/Development"},
+                 {"path": "relativo-sem-root", "root": null},
+                 {"path": "ok", "root": "~/Development"}]}
+    """)
+    let r = WorkspaceRegistry.resolution(from: evil, home: synthHome)
+    assertEqual(r?.paths, ["\(synthHome)/Development/ok"],
+                "dois leitores do mesmo arquivo, o mais fraco define o comportamento")
+    assertEqual(r?.rejected.count, 3, "rejeitada e reportada — nao descartada em silencio")
+}
+
+test("WorkspaceRegistry: save preserva a forma versionada — roots e quarentena sobrevivem") {
+    let paths = WorkspaceRegistry.activePaths(from: versionedFixture, home: synthHome) ?? []
+    let removed = paths.filter { $0 != "\(synthHome)/Development/forge-agent" }
+    let out = WorkspaceRegistry.updatedData(
+        original: versionedFixture, newPaths: removed, home: synthHome)
+    let obj = try! JSONSerialization.jsonObject(with: out!) as! [String: Any]
+    assertEqual((obj["roots"] as? [Any])?.count, 1, "roots[] nao pode evaporar num clique de Remover")
+    assertEqual((obj["quarantine"] as? [Any])?.count, 1)
+    assertEqual(obj["version"] as? Int, 1)
+    let entries = obj["entries"] as! [[String: Any]]
+    assertEqual(entries.count, 2, "so a entrada removida sai")
+    assertTrue(entries.contains { ($0["repos"] as? [String]) == ["freyr"] },
+               "repos[] de uma entrada intocada segue intacto")
+    assertTrue(WorkspaceRegistry.activePaths(from: out!, home: synthHome)?.sorted() == removed.sorted(),
+               "round-trip: o que foi salvo e o que volta a ser lido")
+}
+
+// `layout` (hoje so `layout.worktrees`) e escrito e lido apenas pelo lado JS —
+// `forge-isolation.js` decide por ele onde uma worktree nasce. O app nao sabe o
+// que o campo significa e nao precisa saber; a unica obrigacao dele e nao
+// destruir o campo ao salvar. `updatedData` mexe so em entries/quarantine/
+// version e passa `roots[]` adiante intacto, e isso e a razao de o JS poder ser
+// dono exclusivo do formato. Razao nao verificada e suposicao: um clique em
+// Remover que apagasse `layout` mandaria as worktrees seguintes para outro
+// diretorio, em silencio. Por isso isto e um teste, nao um comentario.
+test("WorkspaceRegistry: save preserva layout do root — o campo de que so o JS e dono") {
+    let withLayout = regData("""
+    {
+      "version": 1,
+      "roots": [{"path": "~/Development", "primary": true,
+                 "layout": {"worktrees": ".forge-worktrees", "futuro": {"n": 1}}},
+                {"path": "~/Desktop"}],
+      "entries": [{"path": "forge-agent", "root": "~/Development", "kind": "project", "repos": []}],
+      "quarantine": []
+    }
+    """)
+    let out = WorkspaceRegistry.updatedData(
+        original: withLayout, newPaths: ["\(synthHome)/Development/outro"], home: synthHome)
+    let obj = try! JSONSerialization.jsonObject(with: out!) as! [String: Any]
+    let roots = obj["roots"] as? [[String: Any]]
+    assertEqual(roots?.count, 2, "os dois roots sobrevivem")
+    let layout = roots?.first?["layout"] as? [String: Any]
+    assertEqual(layout?["worktrees"] as? String, ".forge-worktrees",
+                "layout.worktrees sobrevive ao save — apaga-lo mudaria onde as worktrees nascem")
+    assertEqual((layout?["futuro"] as? [String: Any])?["n"] as? Int, 1,
+                "um campo de layout que este app nem conhece tambem sobrevive — preservacao e opaca, nao seletiva")
+    assertEqual(roots?.last?["path"] as? String, "~/Desktop", "um root sem layout continua sem layout")
+    assertTrue(roots?.last?["layout"] == nil, "e ninguem inventa um layout para ele")
+}
+
+test("WorkspaceRegistry: caminho novo entra como root null e kind project") {
+    let paths = WorkspaceRegistry.activePaths(from: versionedFixture, home: synthHome) ?? []
+    let out = WorkspaceRegistry.updatedData(
+        original: versionedFixture, newPaths: paths + ["\(synthHome)/Development/novo"],
+        home: synthHome)!
+    let obj = try! JSONSerialization.jsonObject(with: out) as! [String: Any]
+    let added = (obj["entries"] as! [[String: Any]]).first { ($0["path"] as? String)?.hasSuffix("novo") == true }
+    assertTrue(added != nil, "a entrada adicionada tem de existir")
+    assertTrue(added?["root"] is NSNull, "root e recalculado pelo loader JS — inventar um aqui e um chute que sobrevive ao clique")
+    assertEqual(added?["kind"] as? String, "project")
+    assertEqual(WorkspaceRegistry.activePaths(from: out, home: synthHome)?.count, 5)
+}
+
+test("WorkspaceRegistry: arquivo legado continua sendo escrito legado — migrar e tarefa da CLI") {
+    let out = WorkspaceRegistry.updatedData(
+        original: legacyFixture, newPaths: ["/b", "/a", "/a"], home: synthHome)!
+    let arr = try! JSONSerialization.jsonObject(with: out) as? [String]
+    assertEqual(arr, ["/a", "/b"], "dedup + sort, exatamente o comportamento anterior")
+}
+
+test("WorkspaceRegistry: sem arquivo, escreve legado (primeiro projeto de uma instalacao nova)") {
+    let out = WorkspaceRegistry.updatedData(original: nil, newPaths: ["/a"], home: synthHome)!
+    assertEqual(try! JSONSerialization.jsonObject(with: out) as? [String], ["/a"])
+}
+
+test("WorkspaceRegistry: save recusa sobrescrever um arquivo ilegivel") {
+    assertNil(WorkspaceRegistry.updatedData(
+        original: regData("{ lixo"), newPaths: ["/a"], home: synthHome),
+        "recusar salvar e recuperavel; sobrescrever o que nao foi entendido nao e")
+}
+
+test("WorkspaceRegistry: R2 - newPaths filtrado por existencia em disco apaga registro valido (mecanismo do bug)") {
+    // Reproduz o mecanismo exato do S01-REVIEW R2: um registro cujo diretorio
+    // sumiu do disco resolve normalmente (resolveStored e puro, nunca toca o
+    // filesystem) mas nao aparece no `newPaths` quando o CHAMADOR filtra por
+    // `fileExists` antes de salvar — exatamente o que `Workspaces.load()`
+    // fazia em `Stores.swift` antes do fix. O fix (Stores.swift `add`/`remove`
+    // usando `loadAllResolved()`, sem filtro de existencia) e o que garante que
+    // o `newPaths` passado aqui contenha SEMPRE a resolucao completa — este
+    // teste falha (perde a entrada) se alguem voltar a filtrar por
+    // `fileExists` antes de montar `newPaths`.
+    let reg = regData("""
+    {"version": 1, "entries": [{"path": "~/Development/deleted-dir", "root": null},
+                               {"path": "~/Development/ok", "root": null}]}
+    """)
+    let allResolved = WorkspaceRegistry.activePaths(from: reg, home: synthHome) ?? []
+    assertEqual(allResolved.count, 2, "resolveStored e puro — ambos resolvem mesmo sem existir no disco")
+
+    // Simula o bug: o chamador filtrou por existencia (nenhum dos dois existe
+    // de verdade neste teste) antes de montar newPaths, entao "deleted-dir"
+    // nao chega em updatedData por um clique em outro projeto qualquer.
+    let filteredLikeOldBug = allResolved.filter { _ in false } // nenhum "existe" no fixture
+    let outBuggy = WorkspaceRegistry.updatedData(
+        original: reg, newPaths: filteredLikeOldBug, home: synthHome)!
+    assertEqual(WorkspaceRegistry.activePaths(from: outBuggy, home: synthHome)?.count, 0,
+                "prova do bug: filtrar por existencia antes de newPaths apaga tudo")
+
+    // O fix: newPaths vem da resolucao completa (loadAllResolved), sem filtro
+    // de existencia — a entrada sobrevive a um add/remove nao relacionado.
+    let outFixed = WorkspaceRegistry.updatedData(
+        original: reg, newPaths: allResolved, home: synthHome)!
+    assertEqual(WorkspaceRegistry.activePaths(from: outFixed, home: synthHome)?.sorted(),
+                allResolved.sorted(),
+                "com newPaths nao-filtrado por existencia, nada e perdido")
+}
+
+test("WorkspaceRegistry: R3 - updatedData recusa reescrever uma versao futura") {
+    let future = regData("""
+    {"version": 9, "entries": [{"path": "~/Development/x", "root": null}]}
+    """)
+    assertNil(WorkspaceRegistry.updatedData(original: future, newPaths: ["/anything"], home: synthHome),
+               "declarar version 9 e escrever de volta sob regras v1 e o defeito exato do R3")
+    // A leitura tolerante continua funcionando — so a escrita e recusada.
+    assertEqual(WorkspaceRegistry.activePaths(from: future, home: synthHome), ["\(synthHome)/Development/x"])
+    // version igual ao que este modulo escreve continua salvando normalmente.
+    let current = regData("""
+    {"version": 1, "entries": [{"path": "~/Development/x", "root": null}]}
+    """)
+    assertTrue(WorkspaceRegistry.updatedData(original: current, newPaths: ["/anything"], home: synthHome) != nil,
+               "version == WorkspaceRegistry.version continua gravavel")
+}
+
+test("WorkspaceRegistry: R4 - root nao ancorado (nem absoluto nem ~) e rejeitado") {
+    let unanchored = regData("""
+    {"version": 1, "entries": [{"path": "x", "root": "relative/root"},
+                               {"path": "y", "root": "~/Development"}]}
+    """)
+    let r = WorkspaceRegistry.resolution(from: unanchored, home: synthHome)
+    assertEqual(r?.paths, ["\(synthHome)/Development/y"],
+                "root relativo herdaria o cwd do processo — mesma classe de risco que entradas soltas ja recusam")
+    assertEqual(r?.rejected.count, 1)
+    assertTrue(r?.rejected.first?.reason.contains("neither absolute nor") == true)
+}
+
+test("WorkspaceRegistry: entrada irresolvivel nao e apagada por um clique alheio") {
+    let broken = regData("""
+    {"version": 1, "entries": [{"path": "relativa-sem-root", "root": null},
+                               {"path": "~/Development/ok", "root": null}]}
+    """)
+    let out = WorkspaceRegistry.updatedData(
+        original: broken, newPaths: ["\(synthHome)/Development/ok"], home: synthHome)!
+    let obj = try! JSONSerialization.jsonObject(with: out) as! [String: Any]
+    assertEqual((obj["entries"] as? [Any])?.count, 2,
+                "a linha que o operador precisa ver para consertar e a que sumiria primeiro")
+}
+
+// ── T05: Run address decode parity ──────────────────────────────────────────
+//
+// `branch`/`root`/`project` are additive (T03, `forge-runs.js`): every one of
+// the 7 run records live on disk when T03 shipped predates them. Both
+// directions are proven against fixture JSON, not by inspection of the
+// `Codable` synthesis.
+
+/// Every key a run record written before T03 has — copied from a live record
+/// shape (`.gsd/forge/runs/*.json` in this repo) verbatim, minus operator PII,
+/// with no `branch`/`root`/`project` key at all (not even `null`) because that
+/// is exactly what "written before the field existed" looks like on disk.
+let legacyRunFixture = """
+{
+  "kind": "milestone",
+  "id": "M-20260729120052-backlog-itens-projeto",
+  "session_id": "faa4abc1-e77a-4737-a72c-57b8d9d99109",
+  "active": false,
+  "started_at": 1785327373325,
+  "last_heartbeat": 1785338419005,
+  "worker": null,
+  "worker_started": null,
+  "isolation_mode": "branch",
+  "milestone_dir": ".gsd/milestones/M-20260729120052-backlog-itens-projeto/",
+  "cwd": "/Users/tester/Development/forge-agent",
+  "account": "lookchina",
+  "task_description": null,
+  "deactivated_reason": null
+}
+"""
+
+test("Run: decodifica um registro legado (sem branch/root/project) — nao lanca, campos ficam nil") {
+    let run = try! JSONDecoder().decode(Run.self, from: Data(legacyRunFixture.utf8))
+    assertEqual(run.id, "M-20260729120052-backlog-itens-projeto")
+    assertNil(run.branch, "campo ausente no JSON legado deve decodificar como nil, nao lancar")
+    assertNil(run.root)
+    assertNil(run.project)
+}
+
+test("Run: decodifica os 7 registros legados vivos sem lancar (shape exato de todos)") {
+    // Sete variações do shape acima — cada uma reflete um traço real observado
+    // nos registros vivos (worker preenchido, deactivated_reason presente,
+    // milestone vs task, account nil) para não testar só o caso feliz de um.
+    let shapes = [
+        legacyRunFixture,
+        legacyRunFixture.replacingOccurrences(of: "\"worker\": null", with: "\"worker\": \"execute-task/T05\""),
+        legacyRunFixture.replacingOccurrences(of: "\"account\": \"lookchina\"", with: "\"account\": null"),
+        legacyRunFixture.replacingOccurrences(of: "\"active\": false", with: "\"active\": true"),
+        legacyRunFixture.replacingOccurrences(of: "\"kind\": \"milestone\"", with: "\"kind\": \"task\""),
+        legacyRunFixture.replacingOccurrences(of: "\"deactivated_reason\": null", with: "\"deactivated_reason\": \"encerrado\""),
+        legacyRunFixture.replacingOccurrences(of: "\"last_heartbeat\": 1785338419005", with: "\"last_heartbeat\": null"),
+    ]
+    for (i, shape) in shapes.enumerated() {
+        let run = try? JSONDecoder().decode(Run.self, from: Data(shape.utf8))
+        assertTrue(run != nil, "registro legado #\(i) deveria decodificar sem lancar")
+        assertNil(run?.branch, "registro legado #\(i): branch deve ser nil")
+        assertNil(run?.root, "registro legado #\(i): root deve ser nil")
+        assertNil(run?.project, "registro legado #\(i): project deve ser nil")
+    }
+}
+
+test("Run: decodifica um registro com branch/root/project presentes — valores chegam intactos") {
+    let json = """
+    {
+      "kind": "task", "id": "T-1", "session_id": "s1", "active": true,
+      "started_at": 1000, "last_heartbeat": 2000, "worker": null,
+      "worker_started": null, "isolation_mode": "branch", "milestone_dir": null,
+      "cwd": "/Users/tester/Development/forge-agent", "account": null,
+      "task_description": null, "deactivated_reason": null,
+      "branch": "forge/T-1", "root": "~/Development", "project": "forge-agent"
+    }
+    """
+    let run = try! JSONDecoder().decode(Run.self, from: Data(json.utf8))
+    assertEqual(run.branch, "forge/T-1")
+    assertEqual(run.root, "~/Development")
+    assertEqual(run.project, "forge-agent")
+}
+
+test("Run: branch/root/project explicitamente null decodificam como nil (forge-runs.js withAddressDefaults)") {
+    // `withAddressDefaults` no lado JS grava `null` (nao omite a chave) quando o
+    // campo e desconhecido — as duas formas (chave ausente / chave null) tem
+    // que chegar iguais do lado Swift.
+    let json = legacyRunFixture.replacingOccurrences(
+        of: "\"deactivated_reason\": null",
+        with: "\"deactivated_reason\": null, \"branch\": null, \"root\": null, \"project\": null")
+    let run = try! JSONDecoder().decode(Run.self, from: Data(json.utf8))
+    assertNil(run.branch)
+    assertNil(run.root)
+    assertNil(run.project)
+}
+
+// ── T05 · I-20260803132250 — call-site regression for the fileExists guard ──
+//
+// The invariant ("a save's newPaths must come from the unfiltered resolution,
+// never from what happens to exist on disk") is proven twice on purpose:
+//
+//   1. `WorkspaceRegistry: R2 - ...` (above, S01-REVIEW) proves the mechanism
+//      inside `updatedData` in isolation.
+//   2. This block proves it at the production CALL SITE — the exact function
+//      `Stores.swift`'s `add`/`remove` route their mutation through,
+//      `WorkspaceRegistry.mutatedPaths(allResolved:adding:removing:)` — with
+//      the specific scenario named in the must-have: an unrelated add/remove
+//      must not evict a `quarantine[]` row whose directory is gone.
+//
+// `ForgeKitTests` cannot import the `Forge` executable target `Stores.swift`
+// lives in, so this guards the underlying `WorkspaceRegistry` mechanism that
+// `Stores.add`/`Stores.remove` call — not `Stores` itself. Said explicitly
+// per T05-PLAN step 6 rather than left implied.
+
+test("I-20260803132250: mutatedPaths ignora existencia em disco por construcao — sem parametro 'visible' para aceitar por engano") {
+    // A quarentena tem um diretorio que nao existe mais no disco. resolveStored
+    // ainda resolve o caminho (e puro), entao ele aparece em allResolved.
+    let reg = regData("""
+    {"version": 1,
+     "entries": [{"path": "ok", "root": "~/Development", "kind": "project", "repos": []}],
+     "quarantine": [{"path": "sumido", "root": "~/Development", "reason": "touched"}]}
+    """)
+    let allResolved = WorkspaceRegistry.activePaths(from: reg, home: synthHome) ?? []
+    assertEqual(allResolved.count, 2, "entry + quarentena, mesmo com o diretorio da quarentena ausente do disco")
+
+    // Um add nao-relacionado, roteado exatamente como Stores.add(_:) roteia.
+    let novo = "\(synthHome)/Development/novo-projeto"
+    let newPaths = WorkspaceRegistry.mutatedPaths(allResolved: allResolved, adding: novo)
+
+    let out = WorkspaceRegistry.updatedData(original: reg, newPaths: newPaths, home: synthHome)!
+    let survivors = WorkspaceRegistry.activePaths(from: out, home: synthHome) ?? []
+    assertTrue(survivors.contains("\(synthHome)/Development/sumido"),
+               "a linha da quarentena cujo diretorio sumiu tem de sobreviver a um add nao-relacionado")
+    assertTrue(survivors.contains("\(synthHome)/Development/ok"))
+    assertTrue(survivors.contains(novo))
+    assertEqual(survivors.count, 3)
+}
+
+test("I-20260803132250: com o mecanismo do bug (newPaths filtrado por existencia), a mesma quarentena e apagada") {
+    // Contraste direto do teste acima: se o chamador tivesse montado newPaths a
+    // partir do que EXISTE no disco (o que `Workspaces.load()` — nunca
+    // `loadAllResolved()` — devolveria), a linha sumida nao sobrevive.
+    let reg = regData("""
+    {"version": 1,
+     "entries": [{"path": "ok", "root": "~/Development", "kind": "project", "repos": []}],
+     "quarantine": [{"path": "sumido", "root": "~/Development", "reason": "touched"}]}
+    """)
+    let allResolved = WorkspaceRegistry.activePaths(from: reg, home: synthHome) ?? []
+    let visibleLikeLoad = allResolved.filter { _ in false } // nada "existe" no fixture — o mesmo que load() filtrado veria aqui
+    let novo = "\(synthHome)/Development/novo-projeto"
+    let buggyNewPaths = WorkspaceRegistry.mutatedPaths(allResolved: visibleLikeLoad, adding: novo)
+
+    let out = WorkspaceRegistry.updatedData(original: reg, newPaths: buggyNewPaths, home: synthHome)!
+    let survivors = WorkspaceRegistry.activePaths(from: out, home: synthHome) ?? []
+    assertTrue(!survivors.contains("\(synthHome)/Development/sumido"),
+               "prova do risco: alimentar mutatedPaths com a lista filtrada apaga a quarentena — e exatamente o que Stores.add/remove NAO fazem")
+    assertTrue(!survivors.contains("\(synthHome)/Development/ok"),
+               "o registro visivel tambem some — o filtro apaga tudo que nao esta no disco agora, nao so a quarentena")
+}
+
+test("I-20260803132250: mutatedPaths remove so o alvo — quarentena e o resto sobrevivem a um remove nao-relacionado") {
+    let reg = regData("""
+    {"version": 1,
+     "entries": [{"path": "ok", "root": "~/Development", "kind": "project", "repos": []},
+                 {"path": "outro", "root": "~/Development", "kind": "project", "repos": []}],
+     "quarantine": [{"path": "sumido", "root": "~/Development", "reason": "touched"}]}
+    """)
+    let allResolved = WorkspaceRegistry.activePaths(from: reg, home: synthHome) ?? []
+    let alvo = "\(synthHome)/Development/outro"
+    let newPaths = WorkspaceRegistry.mutatedPaths(allResolved: allResolved, removing: alvo)
+
+    let out = WorkspaceRegistry.updatedData(original: reg, newPaths: newPaths, home: synthHome)!
+    let survivors = WorkspaceRegistry.activePaths(from: out, home: synthHome) ?? []
+    assertTrue(survivors.contains("\(synthHome)/Development/sumido"), "quarentena sobrevive a um remove alheio")
+    assertTrue(survivors.contains("\(synthHome)/Development/ok"))
+    assertTrue(!survivors.contains(alvo), "o alvo do remove de fato sai")
+    assertEqual(survivors.count, 2)
+}
+
+// ── Declared roots govern the scan ──────────────────────────────────────────
+//
+// Two halves of one property: the registry can say where to look
+// (`Resolution.roots`), and discovery looks exactly there
+// (`scan(declaredRoots:)`). Both halves are exercised without reading
+// `~/.claude/` or the ambient home — byte fixtures for the first, throwaway
+// trees under NSTemporaryDirectory for the second (S02-RISK blocker 3).
+
+let rootsFixture = regData("""
+{
+  "version": 1,
+  "roots": [{"path": "~/Development", "primary": true},
+            "~/my roots/dev",
+            "/opt/shared/code"],
+  "entries": []
+}
+""")
+
+test("roots: caminhos declarados saem absolutos, nas duas formas de registro") {
+    let r = WorkspaceRegistry.resolution(from: rootsFixture, home: synthHome)
+    assertEqual(r?.roots, ["\(synthHome)/Development",
+                           "\(synthHome)/my roots/dev",
+                           "/opt/shared/code"],
+                "objeto {path,primary} e string nua sao as duas formas que o JS aceita")
+    assertEqual(r?.rejected.count, 0)
+}
+
+test("roots: um root com espacos sobrevive — o join nao pode quebrar no primeiro espaco") {
+    let r = WorkspaceRegistry.resolution(from: rootsFixture, home: synthHome)
+    assertTrue(r?.roots.contains("\(synthHome)/my roots/dev") == true,
+               "root com espaco perdido")
+}
+
+test("roots: ~ expande contra o home passado, nunca contra o ambiente") {
+    let alice = WorkspaceRegistry.resolution(from: rootsFixture, home: "/home/alice")?.roots ?? []
+    let bob = WorkspaceRegistry.resolution(from: rootsFixture, home: "/home/bob")?.roots ?? []
+    assertTrue(alice.contains("/home/alice/Development"))
+    assertTrue(bob.contains("/home/bob/Development"))
+    assertTrue(alice != bob, "roots que ignoram o home passado nao sao portaveis")
+    assertTrue(alice.contains("/opt/shared/code") && bob.contains("/opt/shared/code"),
+               "root absoluto nao depende do home")
+}
+
+test("roots: root relativo e rejeitado com motivo — os outros continuam resolvendo") {
+    let mixed = regData("""
+    {"version": 1, "roots": ["Development", "~/Custom"], "entries": []}
+    """)
+    let r = WorkspaceRegistry.resolution(from: mixed, home: synthHome)
+    assertEqual(r?.roots, ["\(synthHome)/Custom"],
+                "root relativo herdaria o diretorio de lancamento — seria varrer outra arvore do disco")
+    assertEqual(r?.rejected.count, 1, "rejeitado, nunca descartado em silencio")
+    assertTrue(r?.rejected.first?.stored == "Development")
+    assertTrue(r?.rejected.first?.reason.contains("neither absolute nor") == true)
+}
+
+test("roots: registro malformado vira rejeicao, nao some e nao derruba a leitura") {
+    let junk = regData("""
+    {"version": 1, "roots": [42, {"primary": true}, "~/Ok"], "entries": []}
+    """)
+    let r = WorkspaceRegistry.resolution(from: junk, home: synthHome)
+    assertTrue(r != nil, "um root ruim nao pode custar o arquivo inteiro")
+    assertEqual(r?.roots, ["\(synthHome)/Ok"])
+    assertEqual(r?.rejected.count, 2)
+}
+
+test("roots: forma legada nao declara root — [] e nao nil") {
+    let r = WorkspaceRegistry.resolution(from: legacyFixture, home: synthHome)
+    assertEqual(r?.shape, .legacy)
+    assertEqual(r?.roots, [], "sem roots declarados; ilegivel continua sendo o Resolution nil")
+    assertTrue(r?.paths.isEmpty == false, "a leitura legada em si nao muda")
+}
+
+test("roots: root duplicado entra uma vez so") {
+    let dup = regData("""
+    {"version": 1, "roots": ["~/Development", {"path": "~/Development"}], "entries": []}
+    """)
+    assertEqual(WorkspaceRegistry.resolution(from: dup, home: synthHome)?.roots,
+                ["\(synthHome)/Development"])
+}
+
+// ── R1/R2 (S02-REVIEW, conceded) — registry-unreadable must preserve, not blank ──
+
+test("R1 - WorkspaceReloadDecision.split preserva o split anterior quando unreadable") {
+    let previous = WorkspaceReloadDecision.Split(
+        workspaces: ["/a", "/b"], touchedWorkspaces: ["/c"])
+    let result = WorkspaceReloadDecision.split(
+        previous: previous,
+        outcome: (visible: [], unreadable: true),
+        isProject: { _ in true })
+    assertEqual(result, previous,
+        "unreadable=true deve devolver o split anterior intacto — nunca [] a partir de outcome.visible")
+
+    // Prove the bite: without the early-return this would rebuild from
+    // `outcome.visible` (empty on the unreadable path) and blank the list,
+    // exactly the regression the notice text ("a lista abaixo NAO foi
+    // alterada") promises never happens.
+    let buggyRebuild = WorkspaceReloadDecision.Split(workspaces: [], touchedWorkspaces: [])
+    assertTrue(result != buggyRebuild, "guarda contra a reconstrucao que apagaria a tela")
+}
+
+test("R1 - WorkspaceReloadDecision.split reconstroi normalmente quando legivel") {
+    let previous = WorkspaceReloadDecision.Split(workspaces: ["/stale"], touchedWorkspaces: [])
+    let result = WorkspaceReloadDecision.split(
+        previous: previous,
+        outcome: (visible: ["/proj", "/touched"], unreadable: false),
+        isProject: { $0 == "/proj" })
+    assertEqual(result.workspaces, ["/proj"])
+    assertEqual(result.touchedWorkspaces, ["/touched"])
+}
+
+test("R2 - arquivo presente mas ilegivel (permissao) deve ser distinguivel de ausente") {
+    // `Workspaces.loadOutcome()` lives in the Forge executable target and
+    // cannot be imported here (ForgeKitTests imports ForgeKit only — same
+    // constraint noted in S01's review-fix). This test instead proves the
+    // Foundation-level mechanism the fix depends on: `contents(atPath:)`
+    // returns nil for BOTH an absent file and a present-but-unreadable one,
+    // and `fileExists(atPath:)` is what tells them apart. That is exactly the
+    // distinction the fix (`Stores.swift` loadOutcome guard) now makes.
+    let fm = FileManager.default
+    let path = NSTemporaryDirectory() + "forge-unreadable-\(UUID().uuidString.prefix(6)).json"
+    fm.createFile(atPath: path, contents: Data("[]".utf8))
+    defer {
+        try? fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path)
+        try? fm.removeItem(atPath: path)
+    }
+    try? fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: path)
+
+    // Root can read past 0o000 permissions (e.g. some CI containers); skip
+    // rather than false-fail if that is the environment we are in.
+    guard fm.contents(atPath: path) == nil else {
+        print("  (skipped — process can read 0o000 files in this environment)")
+        return
+    }
+
+    assertTrue(fm.fileExists(atPath: path),
+        "arquivo presente porem ilegivel: fileExists deve continuar true")
+    assertTrue(fm.contents(atPath: path) == nil,
+        "contents(atPath:) devolve nil tanto para ausente quanto para ilegivel")
+
+    let absentPath = NSTemporaryDirectory() + "forge-absent-\(UUID().uuidString.prefix(6)).json"
+    assertTrue(fm.fileExists(atPath: absentPath) == false,
+        "caso de controle: arquivo ausente nao deve reportar fileExists — e o par que a distincao separa")
+}
+
+/// Builds `<tmp>/<rel>/.gsd/milestones` for each rel, and returns the tmp root.
+func discoveryTree(_ rels: [String], tag: String) -> String {
+    let tmp = NSTemporaryDirectory() + "forge-droots-\(tag)-\(UUID().uuidString.prefix(6))"
+    let fm = FileManager.default
+    for rel in rels {
+        try? fm.createDirectory(atPath: "\(tmp)/\(rel)/.gsd/milestones",
+                                withIntermediateDirectories: true)
+    }
+    return tmp
+}
+
+test("scan(declaredRoots:) varre o root declarado e ignora a lista de nomes fixos") {
+    // projA sits under `Development`, the name the hardcoded list would have
+    // found. Declaring only `Custom` must leave it out — that is the whole
+    // difference between "where we guessed" and "where the operator said".
+    let tmp = discoveryTree(["Development/projA", "Custom/projB"], tag: "names")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let found = ProjectDiscovery.scan(declaredRoots: ["\(tmp)/Custom"])
+    assertTrue(found.contains { $0.hasSuffix("/Custom/projB") }, "projeto do root declarado perdido")
+    assertFalse(found.contains { $0.contains("/Development/") },
+                "Development so foi encontrado porque o nome esta na lista fixa — a lista nao manda mais")
+
+    // And the seed default still behaves as before: same tree, name scan finds
+    // exactly the other one. The two functions are not the same function.
+    let seeded = ProjectDiscovery.scan(home: tmp)
+    assertTrue(seeded.contains { $0.hasSuffix("/Development/projA") })
+    assertFalse(seeded.contains { $0.hasSuffix("/Custom/projB") })
+}
+
+test("scan(declaredRoots:) mede profundidade a partir do root — 3 dentro sim, 4 nao") {
+    // The measured case: ~/Development/lookchina/services/freyr is 3 segments
+    // below the declared root and must be found. Depth counted from anywhere
+    // else silently scans more or less of the disk than declared.
+    let tmp = discoveryTree(["a/b/c", "a/b/c/d"], tag: "depth")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let found = ProjectDiscovery.scan(declaredRoots: [tmp])
+    assertTrue(found.contains { $0.hasSuffix("/a/b/c") },
+               "3 niveis abaixo do root e o caso freyr — tem de aparecer")
+    assertFalse(found.contains { $0.hasSuffix("/a/b/c/d") },
+                "maxDepth continua valendo, medido do root declarado")
+}
+
+test("scan(declaredRoots:) mantem a descida em aninhados e continua pulando node_modules") {
+    let tmp = discoveryTree(["repo", "repo/services",
+                             "repo/node_modules/pkg"], tag: "nested")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let found = ProjectDiscovery.scan(declaredRoots: [tmp])
+    assertTrue(found.contains { $0.hasSuffix("/repo") })
+    assertTrue(found.contains { $0.hasSuffix("/repo/services") },
+               "monorepo: parar no primeiro acerto continuaria errado")
+    assertFalse(found.contains { $0.contains("node_modules") })
+}
+
+test("scan(declaredRoots:) ignora root inexistente e nao perde os demais") {
+    let tmp = discoveryTree(["Custom/projB"], tag: "missing")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let found = ProjectDiscovery.scan(
+        declaredRoots: ["\(tmp)/nao-existe", "\(tmp)/Custom", ""])
+    assertEqual(found.count, 1, "um root morto nao pode custar a varredura inteira")
+    assertTrue(found.first?.hasSuffix("/Custom/projB") == true)
+}
+
+test("scan(declaredRoots:) aceita root com espacos e nao oferece diretorio so tocado") {
+    let tmp = discoveryTree(["my root/projC"], tag: "spaces")
+    let fm = FileManager.default
+    defer { try? fm.removeItem(atPath: tmp) }
+    try? fm.createDirectory(atPath: "\(tmp)/my root/tocado/.gsd/forge",
+                            withIntermediateDirectories: true)
+    fm.createFile(atPath: "\(tmp)/my root/tocado/.gsd/forge/events.jsonl",
+                  contents: Data("{\"event\":\"verify\"}\n".utf8))
+
+    let found = ProjectDiscovery.scan(declaredRoots: ["\(tmp)/my root"])
+    assertEqual(found.count, 1)
+    assertTrue(found.first?.hasSuffix("/my root/projC") == true)
+}
+
+test("scan(declaredRoots:) sem roots nao varre nada — [] nao vira a lista fixa") {
+    assertEqual(ProjectDiscovery.scan(declaredRoots: []).count, 0,
+                "cair na lista fixa aqui reintroduziria a varredura adivinhada por baixo")
 }
 
 print("\n" + String(repeating: "─", count: 60))

@@ -109,11 +109,17 @@ struct ProjectsView: View {
         ProjectOrganiser.containment(state.workspaces)
     }
 
+    private var home: String {
+        FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
     private let columns = [GridItem(.adaptive(minimum: 300), spacing: 14)]
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                if state.registryUnreadable { unreadableNotice }
+
                 if !state.workspaces.isEmpty { hazardNotice }
 
                 switch grouping {
@@ -125,8 +131,15 @@ struct ProjectsView: View {
                         }
                     }
                 case .byFolder:
-                    ForEach(ProjectOrganiser.groups(state.workspaces)) { group in
-                        folderSection(group)
+                    let allTree = ProjectTree.build(projects: state.workspaces,
+                                                    roots: Workspaces.declaredRoots(),
+                                                    home: home)
+                    let tree = ordered(allTree.map(\.path))
+                        .compactMap { path in allTree.first { $0.path == path } }
+                    ForEach(tree) { node in
+                        ProjectTreeRow(node: node, depth: 0, state: state,
+                                      containment: containment, ordered: ordered,
+                                      collapsed: $collapsed, columns: columns)
                     }
                 }
 
@@ -186,73 +199,63 @@ struct ProjectsView: View {
         }
     }
 
-    // MARK: Folder section
+    // MARK: Unreadable registry
 
-    @ViewBuilder private func folderSection(_ group: ProjectGroup) -> some View {
-        let isCollapsed = collapsed.contains(group.path)
-        VStack(alignment: .leading, spacing: 10) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    if isCollapsed { collapsed.remove(group.path) }
-                    else { collapsed.insert(group.path) }
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 9))
-                    Image(systemName: "folder").font(.caption)
-                    Text(group.title).font(.callout).bold()
-                    Text("\(group.projects.count)")
-                        .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
-                    // Attention rolls up: a collapsed folder still says whether
-                    // something inside needs you.
-                    let pending = group.projects
-                        .flatMap { ws in state.pending.filter { $0.cwd == ws } }.count
-                    if pending > 0 {
-                        Text("\(pending)")
-                            .font(.caption2).monospacedDigit()
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Color.accentOrange.opacity(0.22), in: Capsule())
-                            .foregroundStyle(Color.accentOrange)
-                    }
-                    Spacer()
-                }
-                .contentShape(Rectangle())
+    /// The registry file exists but could not be parsed. The list below is
+    /// whatever it was before this reload — never silently emptied — but that
+    /// fact has to be on screen, or a corrupt file and a fresh install look
+    /// identical (I-20260802223042).
+    @ViewBuilder private var unreadableNotice: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.accentOrange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Registro de projetos não pôde ser lido")
+                    .font(.callout).bold()
+                Text("A lista abaixo NÃO foi alterada. Corrija ~/.claude/forge-gate-workspaces.json — há um backup .bak ao lado após a migração.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain).foregroundStyle(.secondary)
-
-            if !isCollapsed {
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 14) {
-                    ForEach(ordered(group.projects), id: \.self) { ws in
-                        ProjectCard(path: ws, state: state, contains: containment[ws] ?? 0)
-                    }
-                }
-            }
+            Spacer()
         }
-        .padding(.bottom, 4)
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentOrange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(Color.accentOrange.opacity(0.3)))
     }
 
     // MARK: Hazard
 
-    /// A project containing most of the others is nearly always a stray .gsd/ at
-    /// the top of a code folder. Never removed automatically — a monorepo does
-    /// legitimately contain its own services — but it should not stay invisible.
+    /// An *undeclared* project containing most of the others is nearly always a
+    /// stray .gsd/ at the top of a code folder.
+    ///
+    /// A declared workspace containing its members is the normal case and is
+    /// never flagged — before that exception existed this notice pointed at
+    /// `lookchina`, the workspace this milestone had just promoted, and told
+    /// the operator to delete it (I-20260803154521). The predicate lives in
+    /// `ProjectOrganiser.containmentHazards`, where it can be tested.
+    ///
+    /// The action is deliberately not destructive. It used to be "Remover da
+    /// lista" as the notice's only, primary button — one click from the top of
+    /// the screen to the removal that cost two registry entries in S05. Removal
+    /// is still offered where it belongs: on the card for that project, marked
+    /// `role: .destructive`, behind its menu. An advisory's job is to get the
+    /// operator looking at the folder, which is what this button now does.
     @ViewBuilder private var hazardNotice: some View {
-        let suspects = containment
-            .filter { $0.value >= max(3, state.workspaces.count / 2) }
-            .sorted { $0.value > $1.value }
+        let suspects = ProjectOrganiser.containmentHazards(
+            state.workspaces, declaredWorkspaces: state.declaredWorkspaces)
         if let worst = suspects.first {
             HStack(alignment: .top, spacing: 9) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(Color.accentOrange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("\(ProjectOrganiser.name(worst.key)) contém \(worst.value) dos outros projetos")
+                    Text("\(ProjectOrganiser.name(worst.path)) contém \(worst.count) dos outros projetos")
                         .font(.callout)
-                    Text("Um .gsd/ na raiz de uma pasta de código engole tudo abaixo dela. Se não for proposital, remova-o da lista.")
+                    Text("Um .gsd/ na raiz de uma pasta de código engole tudo abaixo dela. Se for proposital, promova a pasta a workspace; se não, remova-a pelo menu do card.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Remover da lista") { state.removeWorkspace(worst.key) }
+                Button("Ver pasta") { ForgeCore.reveal(worst.path) }
                     .controlSize(.small)
             }
             .padding(13)
@@ -302,8 +305,11 @@ struct ProjectsView: View {
 
     private func scan() {
         scanning = true
+        let declared = Workspaces.declaredRoots()
         Task.detached(priority: .userInitiated) {
-            let hits = ProjectDiscovery.scan()
+            let hits = declared.isEmpty
+                ? ProjectDiscovery.scan()
+                : ProjectDiscovery.scan(declaredRoots: declared)
             await MainActor.run {
                 // Touched paths count as known: they are registered, so
                 // re-offering one that gained a milestone would duplicate it.
@@ -331,6 +337,94 @@ struct ProjectsView: View {
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity).padding(.top, 40)
+    }
+}
+
+// MARK: - Tree row
+
+/// One node of the *Por pasta* tree, drawn recursively. SwiftUI cannot recurse
+/// directly inside a `@ViewBuilder` without type erasure, so this is a named
+/// `View` rather than a helper method.
+///
+/// The card-or-header decision is `node.role.isRegistrable` — never a path
+/// heuristic. A `folder` node draws a collapsible header and never instantiates
+/// `ProjectCard`; a registrable node draws the card and, if it has children
+/// (a workspace containing other projects), draws them recursively beneath it.
+struct ProjectTreeRow: View {
+    let node: ProjectTreeNode
+    let depth: Int
+    @ObservedObject var state: AppState
+    let containment: [String: Int]
+    let ordered: ([String]) -> [String]
+    @Binding var collapsed: Set<String>
+    let columns: [GridItem]
+
+    private var isCollapsed: Bool { collapsed.contains(node.path) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if node.role.isRegistrable {
+                ProjectCard(path: node.path, state: state,
+                           contains: containment[node.path] ?? 0)
+                    .padding(.leading, CGFloat(depth) * 14)
+            } else {
+                header
+            }
+
+            if !node.children.isEmpty && !isCollapsed {
+                let ordered = ordered(node.children.map(\.path))
+                    .compactMap { path in node.children.first { $0.path == path } }
+                ForEach(ordered) { child in
+                    ProjectTreeRow(node: child, depth: depth + 1, state: state,
+                                  containment: containment, ordered: self.ordered,
+                                  collapsed: $collapsed, columns: columns)
+                }
+            }
+        }
+        .padding(.bottom, node.role.isRegistrable ? 0 : 4)
+    }
+
+    @ViewBuilder private var header: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                if isCollapsed { collapsed.remove(node.path) }
+                else { collapsed.insert(node.path) }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9))
+                Image(systemName: "folder").font(.caption)
+                Text(node.title).font(.callout).bold()
+                Text("\(node.projectCount)")
+                    .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
+                // Attention rolls up transitively: a collapsed folder still says
+                // whether something inside — at any depth — needs you.
+                let pending = descendantPaths(node)
+                    .flatMap { ws in state.pending.filter { $0.cwd == ws } }.count
+                if pending > 0 {
+                    Text("\(pending)")
+                        .font(.caption2).monospacedDigit()
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Color.accentOrange.opacity(0.22), in: Capsule())
+                        .foregroundStyle(Color.accentOrange)
+                }
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).foregroundStyle(.secondary)
+        .padding(.leading, CGFloat(depth) * 14)
+    }
+
+    /// Registrable paths under `node`, at any depth — used for the pending
+    /// rollup, which must count grandchildren, not just direct children.
+    private func descendantPaths(_ node: ProjectTreeNode) -> [String] {
+        node.children.flatMap { child -> [String] in
+            child.role.isRegistrable
+                ? [child.path] + descendantPaths(child)
+                : descendantPaths(child)
+        }
     }
 }
 

@@ -166,6 +166,20 @@ ISO_RUN="${RUN_ID:-<active milestone ID from STATE.md>}"
 ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$ISO_RUN" --cwd "$WORKING_DIR")
 ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
 WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
+# RUN_BRANCH — the branch this run OWNS, read back from what the setup actually
+# did, never re-derived by concatenating `forge/` with the run id. Re-deriving a
+# naming convention is the exact defect S04 removed from `deriveWorktreePath`:
+# the moment `branch_pattern` differs from the default, or a repo failed and was
+# never checked out, a derived string names a branch that does not exist.
+# Reachable cases, all three real:
+#   branch/worktree mode, ≥1 repo ok → that repo's `branch` (all repos of a run
+#                                      share one branch name — `resolveBranchName`
+#                                      is called once per setup)
+#   shared mode                      → `repos: []` by construction (setupForRun
+#                                      returns early) → empty → recorded as null
+#   every repo errored               → no `status!=='error'` row → empty → null,
+#                                      and the ISO_ERRORS rule below already stops
+RUN_BRANCH=$(node -e "const r=JSON.parse(process.argv[1]);const b=(r.repos||[]).find(x=>x.branch&&x.status!=='error');process.stdout.write((b&&b.branch)||r.branch||'')" "$ISO_RESULT")
 ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
 ELEVATED=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).elevated||false))" "$ISO_RESULT")
 ELEV_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).elevation_reason||'')" "$ISO_RESULT")
@@ -193,15 +207,22 @@ Branch on `$STATUS`:
 - **`activate-new`** — register the new run:
   ```bash
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$RUN_ID" --kind "$RUN_KIND" --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --cwd "$WORKING_DIR" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$RUN_ID" --kind "$RUN_KIND" --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --branch "${RUN_BRANCH:-}" --cwd "$WORKING_DIR" > /dev/null
   echo "$MSG"
   ```
   Then continue to legacy activation (which writes auto-mode-started.txt + alias).
 - **`resume`** — emit `$MSG`, set `RUN_ID` (already set). Update the existing registry entry with the new session_id (the previous orchestrator process exited; this is a fresh session that needs to own heartbeat updates) and the freshly-resolved isolation mode:
   ```bash
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}"
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"session_id\":\"$SESSION_ID\",\"active\":true,\"isolation_mode\":\"$ISOLATION_MODE\",\"worktrees\":$WORKTREES_JSON}" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"session_id\":\"$SESSION_ID\",\"active\":true,\"isolation_mode\":\"$ISOLATION_MODE\",\"worktrees\":$WORKTREES_JSON,\"branch\":\"$RUN_BRANCH\"}" > /dev/null
   ```
+  `branch` is refreshed here for the same reason `isolation_mode` is: it is what the
+  setup just resolved, and a record created before the field existed carries `null`.
+  Re-recording it on resume heals those without a migration pass. In `shared` mode
+  `$RUN_BRANCH` is empty and the field is written on disk as `""` (this interpolation
+  bypasses `add()`'s `|| null`) — `forge-runs.js`'s `withAddressDefaults` normalizes
+  `''` to `null` on every read (`get()`/`listAll()`), so it is read back as "no
+  branch", never as a fabricated `forge/{id}` and never as Swift's `.some("")`.
   Without this, `forge-hook.resolveBySessionId` won't match — heartbeats fall back to legacy `auto-mode.json` and `runs/{id}.json` becomes stale.
 
 For all non-legacy paths, the `MILESTONE_DIR` for downstream substitution is `.gsd/milestones/$RUN_ID/` (if kind=milestone) or null (if kind=task). Where bash blocks below reference `{M###}`, substitute `$RUN_ID` (`$RUN_ID` may be a legacy `M###` or a timestamp `M-<ts>-<slug>` ID — the substitution is format-agnostic). Workers receive `{M###}` resolved in their prompt header via the dispatch templates.
@@ -282,7 +303,7 @@ cat .gsd/forge/compact-signal.json 2>/dev/null
 ```
 If the file exists:
 1. Re-read all context files from disk:
-   - `.gsd/STATE.md` → update `STATE`
+   - Per-run state `.gsd/milestones/{M###}/{M###}-STATE.md` (never the root `.gsd/STATE.md`, which is a generated dashboard) → update `STATE`
    - `PREFS` ← re-resolve via the single `node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR"` call (`.prefs`; same loud-stop-on-exit≠0 posture) — NOT a 3-file md re-merge
    - `.gsd/AUTO-MEMORY.md` → update `ALL_MEMORIES`
    - `.gsd/CODING-STANDARDS.md` → re-extract `CS_LINT`, `CS_STRUCTURE`, `CS_RULES`
@@ -494,6 +515,13 @@ If any keyword matches AND `T##-SECURITY.md` does not already exist in that task
 Skill({ skill: "forge-security", args: "{M###} {S##} {T##}" })
 ```
 The produced `T##-SECURITY.md` will be injected into that task's worker prompt as `## Security Checklist`. Skills run in the orchestrator context — loop them serially (fast enough; each is short) before dispatching the batch in parallel.
+
+**Overlap advisory (before complete-slice):** grave o toque desta run e confronte com as demais runs ativas — o sinal existe para ser visto **antes do merge**.
+```bash
+node "{WORKING_DIR}/scripts/forge-touch.js" --record "{RUN_ID}" --cwd "{WORKING_DIR}" || true
+node "{WORKING_DIR}/scripts/forge-overlap.js" --check --cwd "{WORKING_DIR}" || true
+```
+Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqueia o `complete-slice`, nunca ordena runs, nunca faz merge. Verdict `inconclusive` significa "não havia o que comparar" e **não** deve ser lido como limpo.
 
 **Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the slice branch `gsd/{M###}/{S##}` is still unmerged here, so the diff is intact). This is the challenger × defender confrontation:
 
@@ -1885,7 +1913,7 @@ saved_at: {ISO8601}
 {specific next step to resume from}
 ```
 
-2. Update STATE.md to point to this task with `phase: resume`
+2. Write the per-run state `.gsd/milestones/{M###}/{M###}-STATE.md` (via `scripts/forge-state.js` — never the root `.gsd/STATE.md`) to point to this task with `phase: resume`, then run `node scripts/forge-dashboard.js --cwd "$WORKING_DIR"` to regenerate the dashboard.
 3. Emit compact signal and stop.
 
 On resume: STATE has `phase: resume` → read `continue.md`, inline into worker prompt with instruction "Resume from continue.md — skip completed work, start from Next Action."

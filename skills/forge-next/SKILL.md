@@ -297,6 +297,13 @@ Skill({ skill: "forge-security", args: "{M###} {S##} {T##}" })
 ```
 The produced `T##-SECURITY.md` will be injected into the execute-task worker prompt as `## Security Checklist`.
 
+**Overlap advisory (before complete-slice):** grave o toque desta run e confronte com as demais runs ativas — o sinal existe para ser visto **antes do merge**.
+```bash
+node "{WORKING_DIR}/scripts/forge-touch.js" --record "{RUN_ID}" --cwd "{WORKING_DIR}" || true
+node "{WORKING_DIR}/scripts/forge-overlap.js" --check --cwd "{WORKING_DIR}" || true
+```
+Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqueia o `complete-slice`, nunca ordena runs, nunca faz merge. Verdict `inconclusive` significa "não havia o que comparar" e **não** deve ser lido como limpo.
+
 **Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the slice branch `gsd/{M###}/{S##}` is still unmerged here, so the diff is intact). This is the challenger × defender confrontation:
 
 1. Idempotency: if `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already exists → skip the gate, proceed to `complete-slice`.
@@ -1450,7 +1457,7 @@ node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --cleanup --run "$ISO_RUN" --cwd "$
 → Next: /forge-next para {next unit_type} {unit_id}
 ```
 
-Display the progress line AND the next action (read from the STATE.md you just updated). The user needs to know what comes next to decide whether to continue. Do not add summaries, explanations, or other follow-up text beyond these two lines.
+Display the progress line AND the next action (read from the per-run `M###-STATE.md` you just updated, not the root dashboard). The user needs to know what comes next to decide whether to continue. Do not add summaries, explanations, or other follow-up text beyond these two lines.
 
 ---
 
@@ -1488,7 +1495,7 @@ saved_at: {ISO8601}
 {specific next step to resume from}
 ```
 
-2. Update STATE.md to point to this task with `phase: resume`
+2. Write the per-run state `.gsd/milestones/M###/M###-STATE.md` (via `scripts/forge-state.js` — never the root `.gsd/STATE.md`, which is a generated dashboard) to point to this task with `phase: resume`, then run `node scripts/forge-dashboard.js --cwd .` to regenerate the dashboard.
 3. Tell the user: "Trabalho parcial salvo. Execute `/forge-next` para retomar de onde parou."
 
-On resume: STATE has `phase: resume` → read `continue.md`, inline into worker prompt with instruction "Resume from continue.md — skip completed work, start from Next Action."
+On resume: per-run STATE has `phase: resume` → read `continue.md`, inline into worker prompt with instruction "Resume from continue.md — skip completed work, start from Next Action."

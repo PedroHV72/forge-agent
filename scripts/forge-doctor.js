@@ -6,11 +6,13 @@
 //   checkSchema(cwd)            // (cwd?) → { ok, expected, actual, message }
 //   checkProjectionVersioned(cwd) // (cwd?) → { ok, tracked: string[], skipped?: string, message }
 //   checkPlanRepoDeclared(cwd)  // (cwd?) → { ok, plans: string[], skipped?: string, message }  (advisory)
+//   checkWorkspaceConsistency(cwd) // (cwd?) → { ok: true, workspaces, divergentCount, skipped?, message }  (advisory, D3)
 //
 // CLI:
 //   node forge-doctor.js --check schema [--cwd <dir>]
 //   node forge-doctor.js --check projection-versioned [--cwd <dir>]
 //   node forge-doctor.js --check plan-repo-declared [--cwd <dir>]
+//   node forge-doctor.js --check workspace-consistency [--cwd <dir>]
 //   node forge-doctor.js --check all [--cwd <dir>]
 //   node forge-doctor.js --fix [--cwd <dir>]
 //   node forge-doctor.js --regen-projection [--cwd <dir>]
@@ -35,7 +37,7 @@ const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 // Single source of truth for the check names this CLI accepts via `--check`.
 // `runCheck` dispatches these; the unknown-check message and `--help` text
 // must both be derived from this array — never hand-repeated.
-const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared'];
+const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'workspace-consistency', 'run-overlap'];
 
 // ── checkSchema ───────────────────────────────────────────────────────────────
 /**
@@ -255,6 +257,150 @@ function checkPlanRepoDeclared(cwd) {
   };
 }
 
+// ── checkWorkspaceConsistency ─────────────────────────────────────────────────
+/**
+ * Advisory guard (D3, T04): confronts the registry (~/.claude) against the
+ * on-disk marker of each indexed workspace and surfaces divergence. Wraps
+ * `auditWorkspaces` from `forge-workspace-consistency.js` — this function does
+ * not implement the comparison itself, it only shapes the result the way this
+ * CLI's other checks are shaped, following `checkPlanRepoDeclared`'s form.
+ *
+ * ALWAYS `ok: true` — divergence here is advisory information, never a
+ * failure. See `forge-workspace-consistency.js` for the full rationale (D3
+ * mandates this guard never blocks).
+ *
+ * @param {string} [cwd] - Working directory (default: process.cwd())
+ * @returns {{ ok: true, workspaces: object[], divergentCount: number, skipped?: string, message: string }}
+ */
+function checkWorkspaceConsistency(cwd) {
+  const dir = cwd || process.cwd();
+  const { auditWorkspaces } = require('./forge-workspace-consistency');
+
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (!home) {
+    return {
+      ok: true,
+      workspaces: [],
+      divergentCount: 0,
+      skipped: 'no-home',
+      message: 'forge-workspace-consistency: sem HOME resolvível — check pulado (advisory).',
+    };
+  }
+
+  let result;
+  try {
+    result = auditWorkspaces({ home, cwd: dir });
+  } catch (e) {
+    return {
+      ok: true, // advisory — an internal error here still must not fail `--check all`
+      workspaces: [],
+      divergentCount: 0,
+      skipped: `error: ${e.message}`,
+      message: `forge-workspace-consistency: erro ao auditar (${e.message}) — advisory, não bloqueia.`,
+    };
+  }
+
+  if (result.skipped) {
+    return {
+      ok: true,
+      workspaces: [],
+      divergentCount: 0,
+      skipped: result.skipped,
+      message: `forge-workspace-consistency: ${result.skipped} — nada a confrontar.`,
+    };
+  }
+
+  const divergent = result.workspaces.filter((w) => w.status === 'divergent');
+  const unreadable = result.workspaces.filter((w) => w.status === 'marker-unreadable');
+
+  if (divergent.length === 0 && unreadable.length === 0) {
+    return {
+      ok: true,
+      workspaces: result.workspaces,
+      divergentCount: 0,
+      message: `${result.workspaces.length} workspace(s) indexado(s) verificado(s) — registry e marcador consistentes (advisory).`,
+    };
+  }
+
+  const lines = [];
+  for (const w of divergent) {
+    for (const d of w.diffs) {
+      const reg = d.registry_path || '(ausente)';
+      const mk = d.marker_path || '(ausente)';
+      lines.push(`${w.workspace}: ${d.name} [${d.kind}] registry=${reg} marcador=${mk}`);
+    }
+  }
+  for (const w of unreadable) {
+    lines.push(`${w.workspace}: marcador ilegível (${w.error})`);
+  }
+
+  return {
+    ok: true, // advisory — never fails `--check all`; D3 requires exit 0 always
+    workspaces: result.workspaces,
+    divergentCount: divergent.length,
+    message: `${divergent.length + unreadable.length} workspace(s) com registry × marcador divergentes ou ilegíveis (advisory, nunca bloqueia):\n    `
+      + lines.join('\n    '),
+  };
+}
+
+// ── checkRunOverlap ──────────────────────────────────────────────────────────
+/**
+ * Advisory guard (S07/T03): confronts the touch snapshots forge-touch.js
+ * records against every other active run and surfaces cross-run file
+ * collisions. Wraps `collectRunTouches`/`computeOverlap` from
+ * `forge-overlap.js` — this function does not implement the comparison
+ * itself, it only shapes the result the way this CLI's other checks are
+ * shaped, following `checkWorkspaceConsistency`'s form.
+ *
+ * ALWAYS `ok: true` — overlap here is advisory information, never a failure.
+ * See `forge-overlap.js` for the locked boundary (signals, never sequences)
+ * and the verdict floor (`pairs_compared === 0` → `inconclusive`, never a
+ * silent `clean`).
+ *
+ * @param {string} [cwd] - Working directory (default: process.cwd())
+ * @returns {{ ok: true, verdict?: string, overlaps: object[], skipped?: string, message: string }}
+ */
+function checkRunOverlap(cwd) {
+  const dir = cwd || process.cwd();
+  const { collectRunTouches, computeOverlap, formatOverlap } = require('./forge-overlap');
+
+  const runsDir = path.join(dir, '.gsd', 'forge', 'runs');
+  if (!fs.existsSync(runsDir)) {
+    return {
+      ok: true,
+      overlaps: [],
+      skipped: 'no-runs-registry',
+      message: 'forge-overlap: sem .gsd/forge/runs/ — nada a confrontar (advisory).',
+    };
+  }
+
+  let result;
+  try {
+    result = computeOverlap(collectRunTouches(dir, {}));
+  } catch (e) {
+    return {
+      ok: true, // advisory — an internal error here still must not fail `--check all`
+      overlaps: [],
+      skipped: `error: ${e.message}`,
+      message: `forge-overlap: erro ao confrontar (${e.message}) — advisory, não bloqueia.`,
+    };
+  }
+
+  return {
+    ok: true, // advisory — never fails `--check all`, including verdict === 'overlap'
+    verdict: result.verdict,
+    overlaps: result.overlaps,
+    census: {
+      runs_examined: result.runs_examined,
+      runs_with_touch_data: result.runs_with_touch_data,
+      pairs_compared: result.pairs_compared,
+      files_compared: result.files_compared,
+      skipped: result.skipped.length,
+    },
+    message: formatOverlap(result),
+  };
+}
+
 // ── module.exports ────────────────────────────────────────────────────────────
 module.exports = {
   CURRENT_SCHEMA,
@@ -262,6 +408,8 @@ module.exports = {
   checkSchema,
   checkProjectionVersioned,
   checkPlanRepoDeclared,
+  checkWorkspaceConsistency,
+  checkRunOverlap,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -301,6 +449,18 @@ function runCheck(name, cwd) {
       results.push({ check: c, ...r });
       // Advisory: `r.ok` is always true, so this never flips `allOk`.
       if (!r.ok) allOk = false;
+    } else if (c === 'workspace-consistency') {
+      const r = checkWorkspaceConsistency(cwd);
+      results.push({ check: c, ...r });
+      // Advisory (D3): `r.ok` is always true, so this never flips `allOk` — a
+      // registry × marker divergence must never fail `--check all`.
+      if (!r.ok) allOk = false;
+    } else if (c === 'run-overlap') {
+      const r = checkRunOverlap(cwd);
+      results.push({ check: c, ...r });
+      // Advisory: `r.ok` is always true, so this never flips `allOk` — a
+      // cross-run overlap must never fail `--check all`.
+      if (!r.ok) allOk = false;
     } else {
       process.stderr.write(`forge-doctor: unknown check "${c}". Valid: ${VALID_CHECKS.join(', ')}, all\n`);
       process.exit(2);
@@ -313,18 +473,22 @@ function runCheck(name, cwd) {
 function formatResults(results) {
   const lines = [];
   for (const r of results) {
-    const advisoryWarn = r.check === 'plan-repo-declared' && Array.isArray(r.plans) && r.plans.length > 0;
+    const advisoryWarn = (r.check === 'plan-repo-declared' && Array.isArray(r.plans) && r.plans.length > 0)
+      || (r.check === 'workspace-consistency' && r.divergentCount > 0)
+      || (r.check === 'run-overlap' && r.verdict === 'overlap');
     const icon = advisoryWarn ? '⚠' : (r.ok ? '✓' : '✗');
     const label = r.check === 'schema' ? 'Layer 2 — Schema version'
       : r.check === 'review-model-drift' ? 'Advisory — Review model drift'
       : r.check === 'plan-repo-declared' ? 'Advisory — Plan repo declaration'
+      : r.check === 'workspace-consistency' ? 'Advisory — Workspace registry × marker consistency'
+      : r.check === 'run-overlap' ? 'Advisory — Cross-run overlap'
       : 'Layer 3 — Projection versioned';
     lines.push(`  ${icon} ${label}`);
     lines.push(`    ${r.message}`);
     if (!r.ok && r.tracked && r.tracked.length > 0) {
       for (const t of r.tracked) lines.push(`      - ${t}`);
     }
-    if (advisoryWarn) {
+    if (advisoryWarn && r.check === 'plan-repo-declared') {
       for (const p of r.plans) lines.push(`      - ${p}`);
     }
   }

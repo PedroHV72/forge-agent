@@ -26,12 +26,44 @@
 //   attributeRepo(absPath, repos) → repo|null   (longest-prefix, boundary-aware)
 //   parseListField(fm, key) → string[]|null     (copied from forge-parallelism.js — see below)
 //   parseScalarField(fm, key) → string|null
-//   matchDeclaredRepo(value, usable, cwd) → { repo, status }
+//   matchDeclaredRepo(value, usable, cwd, repoIndex) → { repo, status, path }
 //   scorePath(root, repoPath) → number
 //   normalizePath(p) → string
 //
 // CLI:
 //   node forge-code-dir.js --resolve --iso-result <json|@file|-> --plan <plan-path> [--cwd <dir>] [--run <id>] [--json]
+//                          [--no-repo-index] [--home <dir>] [--registry-file <path>]
+//
+// ── The repo index (S05/T05), and why it enters by INJECTION ────────────────
+//
+// TASK-021: four tasks fell to Claude because `repo: freyr` matched nothing. The
+// cause was not the declaration — it was the lookup. `matchDeclaredRepo` compares
+// the declaration against `usable`, which comes from `forge-repos.discoverRepos`,
+// and that walk goes ONE level down while `freyr` sits at `services/freyr`, two
+// down. The answer could not be in the list being searched, so the `hint` that
+// said "declare `repo: freyr`" pointed at a fix that would have produced
+// `declared_repo_status: unknown` all the same.
+//
+// The fix gives the matcher a FOURTH source: the name→path index built from the
+// registry by `forge-repo-index.js`. It arrives as `repoIndex`, injected — never
+// required or read from inside these functions — so the purity contract stated
+// above survives intact: the registry read lives at the CLI boundary (the
+// `require.main` block), and `resolveCodeDir` is still a function of its inputs.
+// That is also what lets the three orchestrator mirrors inherit the fix with ZERO
+// edits under `skills/`: they all shell out to `--resolve`, and the CLI builds the
+// index by default.
+//
+// `repoIndex` is a RESOLVER, not a data structure: either a function
+// `(name, { cwd }) → { status, path }` or an object exposing `.resolve` of that
+// shape. Injecting behaviour rather than the index keeps `forge-repo-index.js`'s
+// matching rules in `forge-repo-index.js` — a second resolver reimplemented here
+// is a second resolver that disagrees with the first.
+//
+// SCOPE, declared: this fixes ADDRESSING, not isolation scoping. A name that
+// resolves to a repo with no worktree in the current run is still a REFUSAL —
+// same reason (`sidecar-code-dir-undeclared`), same exit code 5. Only the `hint`
+// changes, to one that names the resolved absolute path. Resolved name is not
+// isolated repo, and the operator has to see both.
 //
 // Exit codes (semantic, consumed by the three orchestrator mirrors):
 //   0  status ok | shared
@@ -240,7 +272,20 @@ function scorePath(root, repoPath) {
   return 0;
 }
 
-function matchDeclaredRepo(value, usable, cwd) {
+// Normalise the injected resolver to one callable, accepting both shapes. Anything
+// else (including a bare index object with no `.resolve`) is treated as "no index"
+// — degrading to the three historical strategies is always safe.
+function resolverOf(repoIndex) {
+  if (typeof repoIndex === 'function') return repoIndex;
+  if (repoIndex && typeof repoIndex.resolve === 'function') return repoIndex.resolve.bind(repoIndex);
+  return null;
+}
+
+// Order matters and is not arbitrary: the three historical strategies run FIRST,
+// so a repo that is genuinely isolated in this run always wins. The index is
+// consulted only where the old code had already given up — it can turn an
+// `unknown` into an answer, and it can never change an answer that already worked.
+function matchDeclaredRepo(value, usable, cwd, repoIndex) {
   const declared = String(value || '').trim();
   if (!declared) return { repo: null, status: 'unknown' };
   const normalized = normalizePath(declared);
@@ -252,7 +297,34 @@ function matchDeclaredRepo(value, usable, cwd) {
   const declaredLower = declared.toLowerCase();
   const byBasename = usable.filter(r => path.basename(normalizePath(r.path)).toLowerCase() === declaredLower);
   if (byBasename.length === 1) return { repo: byBasename[0], status: 'ok' };
-  return { repo: null, status: byBasename.length > 1 ? 'ambiguous' : 'unknown' };
+  if (byBasename.length > 1) return { repo: null, status: 'ambiguous' };
+
+  // Fourth strategy — the registry index (S05/T05). This is the branch TASK-021
+  // needed and did not have.
+  const resolve = resolverOf(repoIndex);
+  if (resolve) {
+    let res = null;
+    try {
+      res = resolve(declared, { cwd });
+    } catch (_) {
+      res = null; // a resolver that throws degrades to the old verdict, never crashes a dispatch
+    }
+    if (res && res.status === 'ok' && res.path) {
+      const resolved = normalizePath(res.path);
+      // Compare by PATH, not by name: the worktree of a repo may carry a different
+      // basename than the repo itself, and the point of resolving is the path.
+      const byIndex = usable.filter(r => normalizePath(r.path) === resolved);
+      if (byIndex.length === 1) {
+        return { repo: byIndex[0], status: 'ok', path: resolved, source: 'repo-index' };
+      }
+      // Resolved, but this repo has no worktree in the current isolation. Addressing
+      // succeeded; scoping did not. Refuse — with the path, so the hint can say so.
+      return { repo: null, status: 'unisolated', path: resolved };
+    }
+    if (res && res.status === 'ambiguous') return { repo: null, status: 'ambiguous' };
+  }
+
+  return { repo: null, status: 'unknown' };
 }
 
 // ── actionable prose (TASK-018) ─────────────────────────────────────────────
@@ -282,6 +354,15 @@ function hintFor(info) {
     return `\`repo: ${declared}\` não casa com nenhum repo do workspace. `
       + 'Corrija para o nome do diretório (ou o caminho) de um repo existente — '
       + '`/forge-doctor` lista os planos afetados.';
+  }
+  // Resolved by the registry index, but with no worktree in this run. The operator
+  // must see BOTH facts — the name was right, and the repo still is not isolated
+  // here — or they will "fix" a declaration that was never wrong (TASK-021 again).
+  if (declaredStatus === 'unisolated') {
+    const abs = String(o.declared_repo_path || '');
+    return `\`repo: ${declared}\` resolve para \`${abs}\`, mas esse repo não tem worktree nesta run `
+      + '(a descoberta de repos da isolation não o alcançou). O nome está correto — o que falta é escopo. '
+      + 'Declare o caminho completo do repo, ou rode a unidade no workspace que o contém.';
   }
   if (declaredStatus === 'ambiguous') {
     return `\`repo: ${declared}\` casa com mais de um repo do workspace. `
@@ -319,6 +400,9 @@ function emptyResult(extra) {
     multi_repo_root: '',
     declared_repo: '',
     declared_repo_status: '',
+    // Additive (S05/T05) — defaults keep every existing reader byte-identical.
+    declared_repo_source: '',
+    declared_repo_path: '',
     probe: '',
     probe_scores: {},
     hint: '',
@@ -422,12 +506,18 @@ function resolveCodeDir(opts) {
 
   // P2–P4: a declaration is validated before it can select a worktree and never falls through.
   if (declaredRepo) {
-    const match = matchDeclaredRepo(declaredRepo, usable, cwd);
+    const match = matchDeclaredRepo(declaredRepo, usable, cwd, o.repoIndex);
     if (match.status !== 'ok') {
+      // `unisolated` refuses exactly like `unknown` did: same top-level status, same
+      // reason, same exit code 5. Three orchestrator mirrors consume those codes, and
+      // an unseen value would break all three in silence — the failure class this
+      // milestone exists to end. Only the hint improves.
       return emptyResult({ status: 'undeclared', paths_considered: considered.length, paths_unmatched: unmatched, source, run,
         reason: REASON_UNDECLARED, multi_repo_root: commonWorktreeRoot(usable), declared_repo: declaredRepo,
         declared_repo_status: match.status,
-        hint: hintFor({ status: 'undeclared', declared_repo: declaredRepo, declared_repo_status: match.status }) });
+        declared_repo_path: match.path || '',
+        hint: hintFor({ status: 'undeclared', declared_repo: declaredRepo, declared_repo_status: match.status,
+          declared_repo_path: match.path || '' }) });
     }
     if (touched.size === 1 && normalizePath(touched.keys().next().value) !== normalizePath(match.repo.path)) {
       return emptyResult({ status: 'undeclared', paths_considered: considered.length, paths_unmatched: unmatched, source, run,
@@ -438,7 +528,8 @@ function resolveCodeDir(opts) {
     }
     return emptyResult({ status: 'ok', code_dir: match.repo.worktree, repo: match.repo.path || '',
       repos_touched: [match.repo.path || ''], paths_considered: considered.length, paths_unmatched: unmatched, source,
-      resolution: 'declared', run, declared_repo: declaredRepo, declared_repo_status: 'ok' });
+      resolution: 'declared', run, declared_repo: declaredRepo, declared_repo_status: 'ok',
+      declared_repo_source: match.source || '', declared_repo_path: match.path || '' });
   }
 
   let resolution = touched.size > 0 ? 'attribution' : '';
@@ -544,6 +635,7 @@ function cliMain() {
 
 Usage:
   node forge-code-dir.js --resolve --iso-result <json|@file|-> --plan <plan-path> [--cwd <dir>] [--run <id>] [--json]
+                         [--no-repo-index] [--home <dir>] [--registry-file <path>]
 
 Exit: 0 ok/shared · 4 cross-repo · 5 undeclared · 2 usage/parse error
 `);
@@ -568,10 +660,38 @@ Exit: 0 ok/shared · 4 cross-repo · 5 undeclared · 2 usage/parse error
     process.exit(2);
   }
 
+  // ── The one registry read, at the boundary (S05/T05) ─────────────────────
+  //
+  // Built here and NOWHERE else: the library stays pure, and because all three
+  // orchestrator mirrors reach this resolver through this CLI, they inherit the
+  // fix without a single edit under `skills/`. Failure to build the index —
+  // absent registry, unreadable file, malformed marker — DEGRADES to the previous
+  // behaviour (no index, three strategies). An addressing improvement must never
+  // be able to take down a dispatch that used to work.
+  let repoIndex = null;
+  if (!args['no-repo-index']) {
+    try {
+      const home = typeof args.home === 'string'
+        ? args.home
+        : (process.env.HOME || process.env.USERPROFILE || '');
+      const cwd = typeof args.cwd === 'string' ? args.cwd : process.cwd();
+      if (home) {
+        // eslint-disable-next-line global-require
+        const { buildRepoIndex, resolveRepoName } = require('./forge-repo-index.js');
+        const registryFile = typeof args['registry-file'] === 'string' ? args['registry-file'] : undefined;
+        const index = buildRepoIndex({ home, registryFile, cwd });
+        repoIndex = (name, o) => resolveRepoName(name, { index, cwd: (o && o.cwd) || cwd });
+      }
+    } catch (_) {
+      repoIndex = null;
+    }
+  }
+
   let out;
   try {
     out = resolveCodeDir({
       isoResult,
+      repoIndex,
       planPath: typeof args.plan === 'string' ? args.plan : '',
       cwd: typeof args.cwd === 'string' ? args.cwd : process.cwd(),
       // --run is echoed for auditability ONLY; it never triggers any re-derivation.
@@ -597,6 +717,7 @@ module.exports = {
   parseListField,
   parseScalarField,
   matchDeclaredRepo,
+  resolverOf,
   hintFor,
   frontmatterOf,
   normalizePath,

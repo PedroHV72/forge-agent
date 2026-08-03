@@ -61,6 +61,6 @@ $ARGUMENTS
    - Add the new slice entry to `<milestone-id>-ROADMAP.md` with `- [ ]`, risk tag, depends tag, demo sentence
    - Update the Boundary Map section with what this slice produces/consumes
 
-5. **Update STATE.md** if this is the next slice to execute — Read it first before writing
+5. **If this is the next slice to execute**, write `.gsd/milestones/<id>/<id>-STATE.md` (per-run state, via `scripts/forge-state.js` — never hand-edit the root `.gsd/STATE.md`, which is a generated dashboard) to point at it, then run `node scripts/forge-dashboard.js --cwd .` to regenerate the dashboard.
 
 6. Report: slice ID, task breakdown, estimated scope

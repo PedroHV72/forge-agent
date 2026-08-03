@@ -120,7 +120,7 @@ echo '{
 - Multiple decisions can be batched in a single invocation by adding entries to the `decisions` array.
 - Do NOT append directly to `.gsd/DECISIONS.md` or any `M###-DECISIONS.md` file — the CLI is the uniform write path. The global `.gsd/DECISIONS.md` is rebuilt from fragments during `complete-milestone` (forge-completer, step 5).
 
-Read `.gsd/STATE.md`, then update it — set phase to `plan` (ready to plan this milestone/slice).
+Write `.gsd/milestones/<id>/<id>-STATE.md` (per-run state, via `scripts/forge-state.js` — never hand-edit the root `.gsd/STATE.md`, which is a generated dashboard) — set phase to `plan` (ready to plan this milestone/slice). Then run `node scripts/forge-dashboard.js --cwd .` to regenerate the dashboard.
 
 ---
 

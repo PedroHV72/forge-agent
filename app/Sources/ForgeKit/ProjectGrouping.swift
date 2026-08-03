@@ -54,10 +54,10 @@ public enum ProjectOrganiser {
 
     /// Projects that contain other registered projects, mapped to how many.
     ///
-    /// One containing nearly everything is almost always a stray .gsd/ at the
-    /// top of a code directory rather than a real project — worth flagging,
-    /// never worth removing automatically: a monorepo legitimately contains its
-    /// own services.
+    /// Containment alone is *not* a defect — it is the definition of a
+    /// workspace (`ProjectRole.workspace`). Which of these counts is worth
+    /// flagging is `containmentHazards`' question, not this one's; this
+    /// function reports the relation and takes no view of it.
     public static func containment(_ paths: [String]) -> [String: Int] {
         var counts: [String: Int] = [:]
         for parent in paths {
@@ -66,6 +66,51 @@ public enum ProjectOrganiser {
             if !inside.isEmpty { counts[parent] = inside.count }
         }
         return counts
+    }
+
+    /// A containment count worth putting in front of the operator.
+    public struct ContainmentHazard: Equatable, Sendable {
+        public let path: String
+        public let count: Int
+        public init(path: String, count: Int) {
+            self.path = path
+            self.count = count
+        }
+    }
+
+    /// Registered directories that swallow much of the list *without having been
+    /// declared a workspace*.
+    ///
+    /// The original hazard is real and still fires: a `.gsd/` created by
+    /// accident at the top of a code folder (there was one at `~/Development`,
+    /// above every real project) enrols everything beneath it, and from a flat
+    /// list that is invisible.
+    ///
+    /// What changed is that containment stopped being sufficient evidence of an
+    /// accident. A workspace *is* a project that contains other projects — that
+    /// is `ProjectRole.workspace`, and promoting one is a thing the operator
+    /// does on purpose. So the derived role cannot discriminate here (it calls
+    /// every container a workspace, which would silence the hazard entirely);
+    /// the *declared* `kind` in the registry can, because it is written only by
+    /// a deliberate promotion, while anything the app enrols on its own is
+    /// written `kind: project`. Passing `declaredWorkspaces: []` therefore
+    /// restores the pre-workspace behaviour exactly, which is what a legacy
+    /// registry — having no `kind` field to declare — gets.
+    ///
+    /// Advisory only. Nothing is removed automatically: a monorepo legitimately
+    /// contains its own services, and a wrong call here must cost a glance, not
+    /// a project.
+    public static func containmentHazards(
+        _ paths: [String],
+        declaredWorkspaces: Set<String> = []
+    ) -> [ContainmentHazard] {
+        let threshold = max(3, paths.count / 2)
+        return containment(paths)
+            .filter { $0.value >= threshold && !declaredWorkspaces.contains($0.key) }
+            .map { ContainmentHazard(path: $0.key, count: $0.value) }
+            // Path breaks ties so the notice does not reshuffle between reloads
+            // over a dictionary's ordering.
+            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.path < $1.path }
     }
 
     /// The nearest registered project that contains `path`, if any.

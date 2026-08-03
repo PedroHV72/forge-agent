@@ -49,16 +49,32 @@ public struct ProjectMarkerResult: Sendable, Equatable {
     }
 }
 
-/// How a project sits relative to the others registered alongside it.
+/// How a directory sits relative to the projects registered alongside it.
 ///
 /// A workspace is a project that contains other projects — `lookchina` owns its
 /// `apps/` and `services/` repos and carries the standards and memory they
 /// share. It is not a separate kind of thing on disk (it has its own
 /// milestones and tasks like any project); it is a *position*, which is why it
 /// is derived from the set rather than read from the filesystem.
-public enum ProjectRole: String, Sendable, Equatable {
+///
+/// `folder` is the path component in between: `lookchina/apps` holds five
+/// projects and is not one. Before it had a name the tree either hid those
+/// levels or pretended they were projects; naming it lets the hierarchy be
+/// drawn honestly.
+///
+/// The JS half of this list is `ROLE_KINDS` / `REGISTRABLE_ROLES` in
+/// `scripts/forge-workspace.js`, kept in step by
+/// `scripts/forge-app-workspace-marker.test.js`.
+public enum ProjectRole: String, Sendable, Equatable, CaseIterable {
     case workspace
     case project
+    case folder
+
+    /// A `folder` is a *synthesised display node* — it exists only because a
+    /// project lives below it, has no `.gsd/` and no state of its own, and so
+    /// can never be written to the registry, launched, or drawn as a card.
+    /// Every other role is a real directory the operator registered.
+    public var isRegistrable: Bool { self != .folder }
 }
 
 public enum ProjectMarker {

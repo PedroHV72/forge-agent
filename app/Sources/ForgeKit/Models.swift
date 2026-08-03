@@ -112,6 +112,17 @@ public struct Run: Codable, Identifiable, Hashable {
     /// that finished from one that died.
     public let deactivated_reason: String?
 
+    /// Address fields added by T03 (`forge-runs.js`): the git branch this run
+    /// owns (`forge/{id}` under branch/worktree isolation), the declared root
+    /// that contains its project, and the project that owns it. All three are
+    /// additive and optional — `Codable`'s synthesized decoder treats a missing
+    /// key as `nil`, so every one of the 7 legacy run records on disk (written
+    /// before T03) still decodes unchanged. See ForgeKitTests for the decode
+    /// proof in both directions — this comment is not the coverage.
+    public let branch: String?
+    public let root: String?
+    public let project: String?
+
     public var projectName: String { URL(fileURLWithPath: cwd).lastPathComponent }
 
     /// A run whose heartbeat stopped is almost certainly a dead terminal, not

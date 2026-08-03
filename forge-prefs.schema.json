@@ -98,7 +98,9 @@
       "type": "string",
       "default": "",
       "description": "Caminho absoluto do binário node usado pelo Forge.app para rodar os engines. Vazio → descoberta automática (caminhos fixos, gerenciadores de versão, $PATH, shell de login). Preencha quando o app não achar seu node — a variável de ambiente FORGE_NODE_PATH tem precedência sobre esta chave.",
-      "examples": ["/Users/voce/.nvm/versions/node/v24.11.1/bin/node"]
+      "examples": [
+        "/Users/voce/.nvm/versions/node/v24.11.1/bin/node"
+      ]
     },
     "effort": {
       "type": "object",
@@ -277,7 +279,7 @@
             "worktree"
           ],
           "default": "shared",
-          "description": "shared = single working tree, concorrência protegida por file-locks; branch = cria forge/{M###} em cada repo afetado e commita ali; worktree = worktree física por milestone, isolamento total de FS."
+          "description": "shared = single working tree, concorrência protegida por file-locks; branch = cria forge/{M###} em cada repo afetado e commita ali; worktree = worktree física por milestone, isolamento total de FS. DEFAULT DERIVADO DA FORMA DO PROJETO (D4), não de mais uma flag: com este pref AUSENTE, o modo base vem do registro de workspaces (~/.claude/forge-gate-workspaces.json) — um workspace (projeto registrado que contém outros projetos registrados: vários repos, várias runs simultâneas plausíveis) nasce worktree, porque é ali que duas runs colidiriam na mesma working tree; projeto solto, pasta contêiner (role folder), diretório fora do registro, registro ausente ou ilegível → shared (uma run por vez; worktree seria custo sem benefício). Falha de derivação é silenciosa e segura: isso roda em toda ativação e shared é o que essas máquinas sempre tiveram. PRECEDÊNCIA: (1) vcs svn curto-circuita tudo → shared (sem equivalente de worktree/branch na Fase 1 do M017); (2) pref EXPLÍCITO sempre vence a derivação, inclusive um shared explícito dentro de um workspace, que é o opt-out do operador; (3) sem pref, a forma decide o modo base; (4) workers.require_worktree eleva por cima do modo base resultante, com as mesmas regras para base derivada e base vinda de pref — base derivada worktree torna a elevação um no-op, e require_worktree false proíbe ELEVAÇÃO, não desfaz o default derivado. O JSON de --effective-mode reporta mode_origin (pref | derived-shape | default), mais shape_role/shape_reason quando a derivação rodou. CONGELADO NO NASCIMENTO DA RUN: o modo efetivo é resolvido UMA vez, na ativação, e gravado no registro da run (forge-runs --add --isolation-mode); cleanup e todo consumidor posterior lêem esse valor congelado e nada recomputa o modo a partir da forma atual do projeto. Uma run que começou shared termina shared mesmo que o projeto vire workspace no meio — senão os dois modos coexistiriam no mesmo repo e nenhum cleanup enxergaria os artefatos do outro; registros legados (anteriores ao campo isolation_mode) caem num fallback que resolve com a derivação por forma DESLIGADA, pelo mesmo motivo. Dogfood: o próprio repo forge-agent é projeto solto (derivaria shared), e seu pref explícito branch vence e o mantém em branch."
         },
         "branch_pattern": {
           "type": "string",
@@ -297,7 +299,7 @@
         "worktree_root": {
           "type": "string",
           "default": ".forge-worktrees",
-          "description": "Diretório raiz onde as worktrees são criadas (mode = worktree). Relativo ao workspace; caminho absoluto também aceito."
+          "description": "Nome do diretório onde as worktrees são criadas (mode = worktree); caminho absoluto também aceito. Precedência do endereço, três casos e nenhum quarto: (1) pref ABSOLUTO vence sempre → <pref>/<runId>/<repo>, nenhum root é consultado; (2) repo sob um ROOT declarado no registro (~/.claude/forge-gate-workspaces.json) → <root>/<dirName>/<runId>/<repo>, onde dirName = layout.worktrees do root quando declarado, senão este pref relativo (root mais profundo vence, mesma regra de containment do codec); (3) sem registro, registro ilegível, ou repo fora de todo root → fallback legado irmão do repo (<pai-do-repo>/<worktree_root>/<runId>/<repo>), sempre reportado na linha do repo (anchor: 'legacy-sibling', mais warn quando o registro existe e não pôde ser lido) — nunca silencioso. layout.worktrees DEVE ser oculto: relativo, sem '..', primeiro segmento começando por '.' — um diretório de worktree não-oculto é varrido pelo ProjectDiscovery e cada .gsd/ dentro dele vira projeto-fantasma; valor inválido faz o setup recusar em voz alta (status: 'error' nomeando o arquivo de registro e o valor), nunca cai em default silencioso. Um worktree_root (pref) não-oculto sob um root não é erro: degrada para o fallback legado com warn. Mudar o endereço depois não órfã nada — o cleanup pergunta ao `git worktree list --porcelain`, não re-deriva a convenção. Exemplo de root com layout: {\"path\": \"~/Development\", \"primary\": true, \"layout\": {\"worktrees\": \".forge-worktrees\"}}."
         },
         "worktree_cleanup_on_complete": {
           "type": "boolean",

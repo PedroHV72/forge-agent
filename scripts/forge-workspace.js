@@ -161,6 +161,919 @@ function resolveOwner(startDir, opts) {
   }
 }
 
+// ── Registry: versioned schema, root-relative codec, dual-shape loader ──────
+//
+// The registry at `~/.claude/forge-gate-workspaces.json` is, today, nineteen
+// flat absolute strings. That shape cannot say three things the app already
+// needs to know, and every one of them has cost us something measurable:
+//
+//   1. Where projects are looked for. The scan roots live in Swift
+//      (`GitCore.swift:111-112`) and nowhere else, so a workspace outside them
+//      — `lookchina` — is simply absent from the list. Nothing reports that.
+//   2. What an entry *is*. `lookchina/services` sits in the registry as a peer
+//      of its own children; a flat string cannot distinguish a workspace that
+//      contains projects from a project.
+//   3. Which repos an entry owns. TASK-021's inert route — four tasks silently
+//      falling back to Claude for want of `repo: freyr` — was a missing fact
+//      about a registered directory that the registry had no field to hold.
+//
+// So: `{ version, roots[], entries[], quarantine[] }`, with paths stored
+// *relative to a root* (or to `~`) rather than absolute. Root-relative is not
+// cosmetics — it is what makes the file survive a different `$HOME`, and it is
+// why every function here takes `home` as an explicit parameter instead of
+// reaching for `os.homedir()`. A codec that closes over the ambient home cannot
+// be tested against a synthetic one, and an untested codec is how you find out
+// in production that your registry does not move between machines.
+//
+// The one behaviour these functions must never have is the one the current
+// Swift reader has (`Stores.swift:24`): decode fails, return `[]`, list goes
+// blank, nobody is told. An unreadable registry and an empty registry are
+// different facts and must produce different outcomes. Everything below that
+// cannot make sense of its input throws with the file name and what it found.
+//
+// Read-only, like the rest of this module: nothing here writes a file or
+// creates `~/.claude/`. Registry writes arrive with the CLI in T02.
+
+/** Schema version this module writes and is the newest it can read. */
+const REGISTRY_VERSION = 1;
+
+/** Registry basename under `~/.claude/`. One constant, one holder. */
+const REGISTRY_FILENAME = 'forge-gate-workspaces.json';
+
+/**
+ * The position axis for a directory, distinct from `classify().kind`
+ * (substance: project|touched|none, pinned by the JS<->Swift parity guard)
+ * and from a registry entry's stored `kind` (project|workspace). `role` is
+ * the display-facing answer to "where does this directory sit in the tree".
+ *
+ * This is the pair T03 mirrors in Swift (`ProjectRole`) and anchors in the
+ * parity suite — kept as a one-array-literal-per-line shape so it stays
+ * trivially harvestable by regex.
+ */
+const ROLE_KINDS = [
+  'workspace',
+  'project',
+  'folder',
+];
+
+/**
+ * `folder` is a synthesised display node, not a directory with state of its
+ * own: it is never registrable, never launchable, never a card (CONTEXT,
+ * Agent's Discretion). So it is a `ROLE_KINDS` member that can never be
+ * written to the registry.
+ */
+const REGISTRABLE_ROLES = [
+  'workspace',
+  'project',
+];
+
+/** Absolute path of the registry for a given home. `home` is never implicit. */
+function registryPath(home) {
+  requireString(home, 'home');
+  return path.join(home, '.claude', REGISTRY_FILENAME);
+}
+
+function requireString(v, what) {
+  if (typeof v !== 'string' || v.length === 0) {
+    throw new Error(`forge-workspace: ${what} must be a non-empty string, got ${JSON.stringify(v)}`);
+  }
+  return v;
+}
+
+/**
+ * `/a/b` contains `/a/b/c`, and pointedly does not contain `/a/bc`.
+ *
+ * The separator is the whole point: a bare `startsWith` makes sibling
+ * directories look nested, which would let a quarantined path masquerade as
+ * living under a root it has nothing to do with.
+ */
+function isStrictlyUnder(child, parent) {
+  if (child === parent) return false;
+  const base = parent.endsWith(path.sep) ? parent : parent + path.sep;
+  return child.startsWith(base);
+}
+
+/** Expand a leading `~` against an explicit home. Non-`~` paths pass through. */
+function expandTilde(p, home) {
+  if (p === '~') return path.resolve(home);
+  if (p.startsWith('~/') || p.startsWith('~' + path.sep)) {
+    return path.resolve(home, p.slice(2));
+  }
+  return p;
+}
+
+/** Store a path `~`-relative when it is under home, absolute otherwise. */
+function tildify(absPath, home) {
+  const abs = path.resolve(absPath);
+  const h = path.resolve(home);
+  if (abs === h) return '~';
+  if (isStrictlyUnder(abs, h)) return '~/' + path.relative(h, abs).split(path.sep).join('/');
+  return abs;
+}
+
+/**
+ * Roots may arrive as `{path, primary}` or as a bare string. Accept both.
+ *
+ * `layout` (optional, object) is carried through untouched when present. It is
+ * read by exactly one consumer today — `forge-isolation.js` uses
+ * `layout.worktrees` to decide where a worktree is created — and that consumer
+ * validates the value. Validating here would put the rule in the wrong place:
+ * this function's job is to say what shape a root record has, not what a
+ * particular field means to whoever reads it. A non-object `layout` is dropped
+ * rather than thrown on, so a hand-edited registry with a stray `layout: "x"`
+ * still loads (the consumer then simply finds no layout and falls back).
+ */
+function normalizeRootEntry(r, i) {
+  if (typeof r === 'string') return { path: r, primary: i === 0 };
+  if (r && typeof r === 'object' && typeof r.path === 'string') {
+    const out = { path: r.path, primary: r.primary === true };
+    if (r.layout && typeof r.layout === 'object' && !Array.isArray(r.layout)) out.layout = r.layout;
+    return out;
+  }
+  throw new Error(`forge-workspace: registry roots[${i}] is not a path or {path,...}: ${JSON.stringify(r)}`);
+}
+
+/**
+ * Absolute location of a stored root path, against an explicit home.
+ *
+ * A root that is neither absolute nor `~`-anchored resolves against
+ * `process.cwd()` (same trap the codec's own entry decoding already refuses,
+ * see `resolveEntryPath`'s "unanchored" throw): the file would then read
+ * differently depending on which directory Forge happened to launch from,
+ * and the containment check that follows would bless whatever ended up
+ * under that accident. Refuse it here, once, for every caller (this feeds
+ * both `resolveEntryPath` and `encodeEntryPath`'s containment scan).
+ */
+function resolveRootPath(stored, home) {
+  requireString(stored, 'root path');
+  requireString(home, 'home');
+  if (stored !== '~' && !stored.startsWith('~/') && !path.isAbsolute(stored)) {
+    throw new Error(
+      `forge-workspace: root "${stored}" is neither absolute nor ~-anchored — refusing to guess`);
+  }
+  return path.resolve(expandTilde(stored, home));
+}
+
+/**
+ * Encode an absolute path for storage.
+ *
+ * Three cases, in order, and no fourth:
+ *   under a root  → `{ root: <stored root path>, path: <root-relative> }`
+ *   under home    → `{ root: null, path: '~/...' }`
+ *   anywhere else → `{ root: null, path: <absolute> }`
+ *
+ * `root: null` is deliberate and load-bearing (RISK blocker 3): the real
+ * registry contains `~/Library/Application Support/Forge/Sandbox`, which is
+ * under no root and never will be. A codec that insists every path hangs off
+ * some root would have to invent one, and an invented root resolves to the
+ * wrong directory on the next machine. Preserving the path verbatim is the
+ * honest answer.
+ *
+ * The deepest containing root wins, so nesting roots stays unambiguous.
+ */
+function encodeEntryPath(absPath, roots, home) {
+  requireString(absPath, 'absPath');
+  requireString(home, 'home');
+  if (!path.isAbsolute(absPath)) {
+    throw new Error(`forge-workspace: encodeEntryPath needs an absolute path, got "${absPath}"`);
+  }
+  const abs = path.resolve(absPath);
+  const list = (roots || []).map(normalizeRootEntry);
+
+  let best = null;
+  let bestLen = -1;
+  for (const r of list) {
+    const rootAbs = resolveRootPath(r.path, home);
+    if (isStrictlyUnder(abs, rootAbs) && rootAbs.length > bestLen) {
+      best = r;
+      bestLen = rootAbs.length;
+    }
+  }
+  if (best) {
+    const rel = path.relative(resolveRootPath(best.path, home), abs);
+    return { root: best.path, path: rel.split(path.sep).join('/') };
+  }
+  return { root: null, path: tildify(abs, home) };
+}
+
+/**
+ * Decode a stored entry back to an absolute path.
+ *
+ * This is the one place in this task where semi-trusted input reaches a path
+ * join: the registry is hand-editable, so a stored `path` is not ours. Every
+ * branch therefore ends in an explicit containment check rather than trusting
+ * `path.join` — `path.join(root, '../../etc')` resolves happily outside `root`
+ * and says nothing about it.
+ */
+function resolveEntryPath(entry, home) {
+  requireString(home, 'home');
+  if (!entry || typeof entry !== 'object') {
+    throw new Error(`forge-workspace: registry entry is not an object: ${JSON.stringify(entry)}`);
+  }
+  const stored = entry.path;
+  requireString(stored, 'entry path');
+  const homeAbs = path.resolve(home);
+
+  if (entry.root === null || entry.root === undefined) {
+    if (stored === '~' || stored.startsWith('~/') || stored.startsWith('~' + path.sep)) {
+      const abs = path.resolve(expandTilde(stored, homeAbs));
+      if (abs !== homeAbs && !isStrictlyUnder(abs, homeAbs)) {
+        throw new Error(
+          `forge-workspace: rootless entry "${stored}" escapes home (${homeAbs}) after normalisation`);
+      }
+      return abs;
+    }
+    if (path.isAbsolute(stored)) return path.resolve(stored);
+    throw new Error(
+      `forge-workspace: entry "${stored}" is relative but declares no root — unanchored, refusing to guess`);
+  }
+
+  requireString(entry.root, 'entry root');
+  const rootAbs = resolveRootPath(entry.root, homeAbs);
+  if (path.isAbsolute(stored)) {
+    throw new Error(
+      `forge-workspace: entry "${stored}" is absolute but declares root "${entry.root}" — contradictory`);
+  }
+  if (stored === '~' || stored.startsWith('~/') || stored.startsWith('~' + path.sep)) {
+    throw new Error(
+      `forge-workspace: entry "${stored}" is home-relative but declares root "${entry.root}" — contradictory`);
+  }
+  const abs = path.resolve(rootAbs, stored);
+  if (!isStrictlyUnder(abs, rootAbs)) {
+    throw new Error(
+      `forge-workspace: entry "${stored}" escapes its root "${entry.root}" (${rootAbs}) after normalisation`);
+  }
+  return abs;
+}
+
+/**
+ * A registered directory is a `workspace` when it is a project *and* it
+ * contains another registered directory; otherwise it is a `project`.
+ *
+ * Containment is computed among the active entries, not from disk scanning, so
+ * the answer is a fact about the registry rather than about whatever happens to
+ * be checked out. `classifyFn` is injected so tests can state the disk facts
+ * directly instead of building `.gsd/` trees to imply them.
+ */
+/** `true` when some path in `actives` sits strictly under `self`, at any depth. */
+function hasStrictDescendant(self, actives) {
+  for (const other of actives || []) {
+    if (isStrictlyUnder(path.resolve(other), self)) return true;
+  }
+  return false;
+}
+
+function deriveEntryKind(absPath, allActiveAbsPaths, classifyFn) {
+  requireString(absPath, 'absPath');
+  const fn = classifyFn || classify;
+  const self = path.resolve(absPath);
+  if (fn(self).kind !== 'project') return 'project';
+  return hasStrictDescendant(self, allActiveAbsPaths) ? 'workspace' : 'project';
+}
+
+/**
+ * Map every path in `paths` to the count of other paths in the set that sit
+ * strictly under it, at any depth — the grandparent counts the grandchild.
+ * Guarded by `isStrictlyUnder`'s separator check (never a bare `startsWith`),
+ * and independent of input order: every pair is compared once regardless of
+ * which element was seen first.
+ *
+ * Mirrors `ProjectOrganiser.containment` on the Swift side (already
+ * transitive there — see `S03-PLAN.md § Notes`); this is the JS half of the
+ * same relation, not a fourth implementation of it.
+ */
+function containmentCounts(paths) {
+  const resolved = (paths || []).map(p => path.resolve(p));
+  const counts = {};
+  for (const p of resolved) counts[p] = 0;
+  for (const parent of resolved) {
+    for (const child of resolved) {
+      if (child === parent) continue;
+      if (isStrictlyUnder(child, parent)) counts[parent] += 1;
+    }
+  }
+  return counts;
+}
+
+/**
+ * The position of `absPath` relative to the given set of active (registered)
+ * paths:
+ *
+ *   workspace — a project that strictly contains another active path
+ *   project   — a project with no active descendant
+ *   folder    — not a project, but a strict ancestor of at least one active
+ *               path (a synthesised display node — see `ROLE_KINDS`)
+ *   null      — neither (unrelated to any active path)
+ *
+ * `classifyFn` defaults to `classify` but is always accepted so callers can
+ * pass a pure `path -> {kind}` map in tests, touching no disk.
+ */
+function resolveRole(absPath, activePaths, classifyFn) {
+  requireString(absPath, 'absPath');
+  const fn = classifyFn || classify;
+  const self = path.resolve(absPath);
+  const actives = (activePaths || []).map(p => path.resolve(p));
+  const hasDescendant = hasStrictDescendant(self, actives);
+  if (fn(self).kind === 'project') {
+    return hasDescendant ? 'workspace' : 'project';
+  }
+  return hasDescendant ? 'folder' : null;
+}
+
+function normalizeEntryRecord(e, i, kindField) {
+  if (!e || typeof e !== 'object' || Array.isArray(e) || typeof e.path !== 'string') {
+    throw new Error(`forge-workspace: registry ${kindField ? 'entries' : 'quarantine'}[${i}] is malformed: ${JSON.stringify(e)}`);
+  }
+  const out = {
+    path: e.path,
+    root: typeof e.root === 'string' ? e.root : null,
+  };
+  if (kindField) {
+    out.kind = e.kind === 'workspace' || e.kind === 'project' ? e.kind : null;
+    out.repos = Array.isArray(e.repos) ? e.repos.slice() : [];
+  } else {
+    out.reason = e.reason === 'scratch' ? 'scratch' : 'touched';
+    // `missing` is the migration's annotation for "this path was registered but
+    // is not on disk". It is the operator's only record of *why* a row is in
+    // quarantine rather than active, and it cannot be recomputed later — the
+    // directory's absence today says nothing about whether migration saw it.
+    // Dropping it here made every load→write round trip erase the annotation
+    // silently, which is the same class of loss as dropping the row itself,
+    // one field down.
+    if (e.missing === true) out.missing = true;
+  }
+  return out;
+}
+
+/**
+ * Bring either on-disk shape to one in-memory form. Pure and structural: no
+ * `home` lookup on disk, no classification, no resolution — just the schema.
+ *
+ * The legacy `[String]` array becomes `version: 0, legacy: true` with no roots,
+ * every string encoded rootless (`~`-relative when it can be) and `kind: null`
+ * so the loader recomputes it. A version this module does not know, or a shape
+ * it cannot recognise, throws. Returning `[]` there is the precise failure this
+ * milestone exists to kill: it makes "your registry is corrupt" and "you have
+ * no projects" indistinguishable, and the operator only learns which by
+ * noticing that months of state vanished from the app.
+ */
+function normalizeRegistry(raw, opts) {
+  const o = opts || {};
+  const home = requireString(o.home, 'home');
+  const label = o.file || REGISTRY_FILENAME;
+
+  if (Array.isArray(raw)) {
+    return {
+      version: 0,
+      legacy: true,
+      roots: [],
+      entries: raw.map((s, i) => {
+        if (typeof s !== 'string' || s.length === 0) {
+          throw new Error(`forge-workspace: ${label} legacy entry [${i}] is not a path: ${JSON.stringify(s)}`);
+        }
+        const enc = path.isAbsolute(s)
+          ? encodeEntryPath(s, [], home)
+          : { root: null, path: s };
+        return { path: enc.path, root: null, kind: null, repos: [] };
+      }),
+      quarantine: [],
+    };
+  }
+
+  if (!raw || typeof raw !== 'object') {
+    throw new Error(`forge-workspace: ${label} is neither a legacy array nor a versioned object (got ${raw === null ? 'null' : typeof raw})`);
+  }
+
+  const v = raw.version;
+  if (typeof v !== 'number' || !Number.isInteger(v)) {
+    throw new Error(`forge-workspace: ${label} has no usable "version" (found ${JSON.stringify(v)}) — refusing to guess its shape`);
+  }
+  if (v > REGISTRY_VERSION) {
+    throw new Error(`forge-workspace: ${label} is version ${v}, but this Forge understands at most ${REGISTRY_VERSION} — upgrade Forge rather than downgrading the file`);
+  }
+  if (v < 1) {
+    throw new Error(`forge-workspace: ${label} declares version ${v}, which is not a released schema`);
+  }
+
+  return {
+    version: v,
+    legacy: false,
+    roots: (Array.isArray(raw.roots) ? raw.roots : []).map(normalizeRootEntry),
+    entries: (Array.isArray(raw.entries) ? raw.entries : []).map((e, i) => normalizeEntryRecord(e, i, true)),
+    quarantine: (Array.isArray(raw.quarantine) ? raw.quarantine : []).map((e, i) => normalizeEntryRecord(e, i, false)),
+  };
+}
+
+/**
+ * Read a registry file and hand back the normalized form, with each record's
+ * absolute path resolved against the given `home` and — unless asked not to —
+ * its `kind` recomputed from disk facts.
+ *
+ * Stored `kind` is a display cache, never authority. If the containment rule
+ * changes later, or a directory stops being a project, the file does not need
+ * rewriting: the next load corrects itself. That is why a disagreement between
+ * the stored kind and the computed one is silently resolved in favour of the
+ * computation rather than reported as corruption.
+ *
+ * Returns `null` when the file is absent — the caller decides what an absent
+ * registry means. Anything else that goes wrong throws. Never writes; never
+ * creates `~/.claude/`.
+ */
+function loadRegistry(file, opts) {
+  const o = opts || {};
+  const home = requireString(o.home, 'home');
+  const recompute = o.recomputeKinds !== false;
+  requireString(file, 'file');
+
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return null;
+    throw new Error(`forge-workspace: cannot read ${file}: ${e.message}`);
+  }
+
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`forge-workspace: ${file} is not valid JSON (${e.message}) — refusing to treat a corrupt registry as an empty one`);
+  }
+
+  const reg = normalizeRegistry(raw, { home, file });
+  reg.file = file;
+
+  for (const e of reg.entries) e.abs = resolveEntryPath(e, home);
+  for (const q of reg.quarantine) q.abs = resolveEntryPath(q, home);
+
+  if (recompute) {
+    const actives = reg.entries.map(e => e.abs);
+    for (const e of reg.entries) e.kind = deriveEntryKind(e.abs, actives, o.classifyFn);
+  }
+
+  return reg;
+}
+
+// ── Migration: legacy [String] → versioned object ───────────────────────────
+//
+// This is a one-way door over data nobody can reconstruct. The nineteen strings
+// in `~/.claude/forge-gate-workspaces.json` are months of manual registration —
+// there is no source they can be regenerated from, and the app that reads them
+// today returns `[]` rather than complaining when it cannot parse the file. A
+// migration that gets this wrong does not fail loudly; it empties the project
+// list and looks like a fresh install.
+//
+// So the contract is preview-before-write, and it is enforced structurally
+// rather than by discipline:
+//
+//   gatherFacts()  is the only function that touches the disk. It answers
+//                  questions ("does this exist", "is it a project", "what
+//                  unregistered project sits above it") and returns a plain
+//                  object.
+//   migrate()      is pure. Given the old array and those facts it returns the
+//                  new registry plus a report — one line per input entry, no
+//                  summaries. It cannot write because it cannot reach `fs`, and
+//                  the suite scans its source to keep it that way.
+//   writeRegistry() writes, atomically, and only the CLI calls it.
+//
+// Two rules the tests exist to hold:
+//
+//   Nothing is dropped. Every input path leaves as an active entry or as a
+//   quarantine record. A path that no longer exists on disk is quarantined and
+//   annotated, never silently forgotten — the operator registered it for a
+//   reason, and "I deleted the checkout" and "the migration ate it" must not
+//   look the same.
+//
+//   Counts are measured. SCOPE says twenty entries; the disk said nineteen when
+//   this was planned. No message here carries a literal count: the report says
+//   what it found, so the number is evidence rather than an assumption that has
+//   already drifted once.
+
+/**
+ * The directories `ProjectDiscovery.roots` scans, mirrored from
+ * `GitCore.swift:111-112`. One named constant per language, deliberately — S02's
+ * mutation-tested parity guard anchors on this holder.
+ */
+const DISCOVERY_ROOT_NAMES = ['Development', 'Documents', 'Projects', 'Code', 'src', 'repos', 'Desktop'];
+
+/**
+ * Where the app keeps its own scratch checkouts. Anything under here is Forge's
+ * working area, not the operator's project — it is quarantined as `scratch`
+ * whatever it looks like on disk, because a Sandbox that happens to contain
+ * `.gsd/` is still a sandbox.
+ */
+const SCRATCH_DIR_SEGMENTS = ['Library', 'Application Support', 'Forge'];
+
+function scratchDir(home) {
+  return path.join(path.resolve(home), ...SCRATCH_DIR_SEGMENTS);
+}
+
+function isUnderOrEqual(abs, dir) {
+  return abs === dir || isStrictlyUnder(abs, dir);
+}
+
+/**
+ * The impure half of the migration: everything `migrate()` needs to know about
+ * the disk, gathered once and handed over as data.
+ *
+ * Beyond classifying each registered path it walks *upward* from each one
+ * looking for a project that is not itself registered. That walk is how the
+ * `lookchina` workspace gets found: it holds real `.gsd/` work and contains six
+ * registered apps, yet it never appears in the array — the app only ever offered
+ * to register what its scan roots reached, and it does not reach there.
+ *
+ * `stopAt` bounds the walk at `home` so a stray path cannot drag the search up
+ * into `/Users` or `/`.
+ */
+function gatherFacts(oldPaths, opts) {
+  const o = opts || {};
+  const home = path.resolve(requireString(o.home, 'home'));
+  const stopAt = path.resolve(o.stopAt || home);
+  const classifyFn = o.classifyFn || classify;
+  const existsFn = o.existsFn || (p => fs.existsSync(p));
+
+  const list = (oldPaths || []).map(p => {
+    requireString(p, 'registered path');
+    return path.resolve(home, expandTilde(p, home));
+  });
+  const registered = new Set(list);
+
+  const entries = list.map(abs => {
+    const exists = existsFn(abs);
+    return { path: abs, exists, kind: exists ? classifyFn(abs).kind : 'none' };
+  });
+
+  // Unregistered project ancestors — promotion candidates.
+  const ancestors = [];
+  const seen = new Set();
+  for (const abs of list) {
+    let dir = path.dirname(abs);
+    for (;;) {
+      if (!isStrictlyUnder(dir, stopAt)) break;
+      if (!registered.has(dir) && !seen.has(dir)) {
+        seen.add(dir);
+        if (existsFn(dir) && classifyFn(dir).kind === 'project') {
+          ancestors.push({ path: dir, kind: 'project' });
+          break; // nearest qualifying ancestor only
+        }
+      } else if (registered.has(dir)) {
+        break; // an ancestor already in the registry is not a promotion
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+
+  const roots = DISCOVERY_ROOT_NAMES.map(name => {
+    const abs = path.join(home, name);
+    return { name, path: abs, exists: existsFn(abs) };
+  });
+
+  return { home, stopAt, entries, ancestors, roots };
+}
+
+/** A `classify`-shaped function backed by gathered facts instead of the disk. */
+function classifierFromFacts(facts) {
+  const map = new Map();
+  for (const e of (facts.entries || [])) map.set(path.resolve(e.path), e.kind);
+  for (const a of (facts.ancestors || [])) map.set(path.resolve(a.path), a.kind || 'project');
+  return dir => ({ kind: map.get(path.resolve(dir)) || 'none', signals: [], entries: [] });
+}
+
+/**
+ * Pure. Given the legacy array and gathered facts, produce the versioned
+ * registry and a report with one line per input entry.
+ *
+ * Dispositions, in precedence order:
+ *   under the Forge scratch dir → quarantine `scratch`
+ *   missing from disk          → quarantine `touched`, annotated missing
+ *   classified `project`       → active entry
+ *   anything else (`touched`)  → quarantine `touched`
+ *
+ * Then promotion (unregistered project ancestors that contain an active entry
+ * become active workspaces) and root seeding (a discovery-root candidate is kept
+ * only if it exists and something active lives under it).
+ *
+ * No `fs` here, by design and by test.
+ */
+function migrate(oldPaths, facts, opts) {
+  const o = opts || {};
+  const home = path.resolve(requireString(o.home, 'home'));
+  const f = facts || {};
+  const scratch = scratchDir(home);
+
+  const byPath = new Map();
+  for (const e of (f.entries || [])) byPath.set(path.resolve(e.path), e);
+
+  const inputs = (oldPaths || []).map(p => path.resolve(home, expandTilde(requireString(p, 'registered path'), home)));
+
+  const actives = [];   // { abs, promoted }
+  const quarantined = []; // { abs, reason, missing }
+  const lines = [];
+
+  for (const abs of inputs) {
+    const fact = byPath.get(abs) || { exists: false, kind: 'none' };
+    if (isUnderOrEqual(abs, scratch)) {
+      quarantined.push({ abs, reason: 'scratch', missing: !fact.exists });
+      lines.push({ path: abs, disposition: 'quarantine', reason: 'scratch',
+        note: 'diretório de trabalho do próprio Forge, não é projeto do operador' });
+    } else if (!fact.exists) {
+      quarantined.push({ abs, reason: 'touched', missing: true });
+      lines.push({ path: abs, disposition: 'quarantine', reason: 'touched',
+        note: 'ausente do disco — preservado em quarentena, nunca descartado' });
+    } else if (fact.kind === 'project') {
+      actives.push({ abs, promoted: false });
+      lines.push({ path: abs, disposition: 'active', note: 'artefatos de trabalho em .gsd/' });
+    } else {
+      quarantined.push({ abs, reason: 'touched', missing: false });
+      lines.push({ path: abs, disposition: 'quarantine', reason: 'touched',
+        note: '.gsd/ só com scratch de runtime — alguma outra execução tocou aqui' });
+    }
+  }
+
+  // Promotion: an unregistered project that strictly contains an active entry.
+  for (const anc of (f.ancestors || [])) {
+    const abs = path.resolve(anc.path);
+    if (actives.some(a => a.abs === abs)) continue;
+    if (isUnderOrEqual(abs, scratch)) continue;
+    if (!actives.some(a => isStrictlyUnder(a.abs, abs))) continue;
+    actives.push({ abs, promoted: true });
+    lines.push({ path: abs, disposition: 'promoted',
+      note: 'projeto não registrado que contém entradas ativas — promovido a workspace' });
+  }
+
+  // Root seeding: keep only candidates that exist and hold something active.
+  const activeAbs = actives.map(a => a.abs);
+  const keptRoots = [];
+  for (const cand of (f.roots || [])) {
+    const abs = path.resolve(cand.path);
+    if (!cand.exists) continue;
+    if (!activeAbs.some(a => isStrictlyUnder(a, abs))) continue;
+    keptRoots.push({ path: tildify(abs, home), primary: keptRoots.length === 0 });
+  }
+
+  const classifyFn = classifierFromFacts(f);
+  const entries = actives.map(a => {
+    const enc = encodeEntryPath(a.abs, keptRoots, home);
+    const kind = a.promoted ? 'workspace' : deriveEntryKind(a.abs, activeAbs, classifyFn);
+    return { path: enc.path, root: enc.root, kind, repos: [] };
+  });
+
+  const quarantine = quarantined.map(q => {
+    const enc = encodeEntryPath(q.abs, keptRoots, home);
+    const rec = { path: enc.path, root: enc.root, reason: q.reason };
+    if (q.missing) rec.missing = true;
+    return rec;
+  });
+
+  const registry = { version: REGISTRY_VERSION, roots: keptRoots, entries, quarantine };
+
+  const report = {
+    inputCount: inputs.length,          // measured, never a constant
+    activeCount: entries.length,
+    quarantineCount: quarantine.length,
+    promotedCount: actives.filter(a => a.promoted).length,
+    roots: keptRoots.map(r => r.path),
+    rootsConsidered: DISCOVERY_ROOT_NAMES.slice(),
+    lines,
+  };
+
+  return { registry, report };
+}
+
+/** Human-readable report: one line per input entry, never a summary alone. */
+function formatReport(report, opts) {
+  const o = opts || {};
+  const out = [];
+  out.push(`entradas lidas: ${report.inputCount}` + (o.file ? `  (${o.file})` : ''));
+  out.push('');
+  for (const l of report.lines) {
+    const tag = l.disposition === 'active' ? 'ATIVA    '
+      : l.disposition === 'promoted' ? 'PROMOVIDA'
+      : `QUARENT. `;
+    const reason = l.reason ? ` [${l.reason}]` : '';
+    out.push(`  ${tag} ${l.path}${reason}`);
+    if (l.note) out.push(`            ${l.note}`);
+  }
+  out.push('');
+  out.push(`roots semeados: ${report.roots.length ? report.roots.join(', ') : '(nenhum)'}`
+    + `  — candidatos: ${report.rootsConsidered.join(', ')}`);
+  out.push(`ativas: ${report.activeCount}  (promovidas: ${report.promotedCount})  quarentena: ${report.quarantineCount}`);
+  return out.join('\n') + '\n';
+}
+
+/**
+ * Write a registry atomically: temp file in the same directory, then rename.
+ *
+ * Same shape as `forge-runs.writeAtomic`, for the same reason — a crash halfway
+ * through a plain `writeFileSync` leaves a truncated JSON file, and a truncated
+ * registry is exactly the input the app turns into a silent `[]`.
+ */
+function writeRegistry(file, registry) {
+  requireString(file, 'file');
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  const tmp = path.join(dir, `.${base}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + '\n', 'utf8');
+  fs.renameSync(tmp, file);
+  return file;
+}
+
+// ── Repo discovery per workspace ─────────────────────────────────────────────
+//
+// TASK-021's inert route was two faults stacked: `matchDeclaredRepo` compares
+// against `forge-repos.discoverRepos`'s output, and that walk is one level
+// deep ("Walk 1 level deep", `forge-repos.js:67`) — `lookchina/services/freyr`
+// sits two levels down and was never in the list to match against. That is
+// the mechanical second fault behind the hint that, alone, would also have
+// failed.
+//
+// This section does NOT fix that by widening `discoverRepos` — a workspace
+// like `lookchina` holds 31+ git repos at depth <= 2, and turning all of them
+// into isolation worktrees on every run is not a fix, it is a different
+// incident. What it does instead is give the registry's `repos[]` field (S01
+// created it, nothing ever populated it — every live entry carries `repos:
+// []`) real content: an addressing index a resolver can consult by name,
+// entirely separate from what `forge-isolation.js` decides to isolate.
+// `discoverRepos` is untouched by this file.
+
+/**
+ * Directory names never descended while discovering repos under a workspace.
+ * `.git` is redundant with the leading-dot skip below but named explicitly —
+ * a bounded exception list should say what it excludes even when a broader
+ * rule already covers it, so the intent survives someone loosening the dot
+ * rule later. `.gsd` keeps the scan out of Forge's own artifact tree; this
+ * repo's convention (`.gsd/` is never committed, never treated as project
+ * content) extends naturally to "never scanned for nested repos" either.
+ */
+const REPO_SCAN_SKIP_DIRS = new Set(['node_modules', '.git', '.forge-worktrees', '.gsd']);
+
+/**
+ * How many directory levels below the workspace root the scan descends.
+ *
+ * 3 is chosen to comfortably reach the two-level cases this task exists for
+ * (`lookchina/services/freyr`, `lookchina/libs/ui`) with one level of slack
+ * for a monorepo that nests one layer deeper, while staying bounded: an
+ * unbounded walk under a workspace with a deep, repo-free tree (build output,
+ * vendored assets) would cost real wall-clock time for no repos found. A
+ * directory that itself is a repo is never descended past (see the prune in
+ * `discoverWorkspaceRepos`), so depth only matters for the path down to each
+ * repo's own root — not for anything inside it.
+ */
+const REPO_SCAN_MAX_DEPTH = 3;
+
+/** `true` when `dir` is itself a git repo root (dir or file `.git`, the latter for worktrees). */
+function hasGitAt(dir) {
+  const gitPath = path.join(dir, '.git');
+  let stat;
+  try { stat = fs.statSync(gitPath); } catch { return false; }
+  return stat.isDirectory() || stat.isFile();
+}
+
+/**
+ * Discover git repos under `workspaceAbs`, bounded by depth and pruned at
+ * every repo boundary found (a repo nested inside another repo never yields
+ * two entries — the walk stops descending the moment `.git` is seen).
+ *
+ * Returns workspace-relative paths, `.`-separated, sorted — determinism is a
+ * requirement here (the registry diff in `syncWorkspaceRepos` depends on a
+ * stable list), not cosmetics. The workspace itself being a repo is the
+ * single-repo case and is recorded as `"."`.
+ *
+ * Every discovered path is checked with `isStrictlyUnder` (or equality with
+ * the root, for the `.` case) before being returned — the same containment
+ * discipline `encodeEntryPath`/`resolveEntryPath` already apply to anything
+ * this module writes to the registry, reused rather than re-derived here.
+ */
+function discoverWorkspaceRepos(workspaceAbs, opts) {
+  const o = opts || {};
+  requireString(workspaceAbs, 'workspaceAbs');
+  const root = path.resolve(workspaceAbs);
+  const maxDepth = typeof o.maxDepth === 'number' ? o.maxDepth : REPO_SCAN_MAX_DEPTH;
+  const skip = o.skipDirs instanceof Set ? o.skipDirs : REPO_SCAN_SKIP_DIRS;
+
+  const found = [];
+
+  function walk(dir, depth) {
+    if (hasGitAt(dir)) {
+      found.push(dir);
+      return; // prune: a repo's own tree is never descended into
+    }
+    if (depth >= maxDepth) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      if (ent.name.startsWith('.')) continue; // covers .git, .forge-worktrees, .gsd
+      if (skip.has(ent.name)) continue;
+      walk(path.join(dir, ent.name), depth + 1);
+    }
+  }
+
+  walk(root, 0);
+
+  const rel = found.map(abs => {
+    if (abs === root) return '.';
+    if (!isStrictlyUnder(abs, root)) {
+      throw new Error(`forge-workspace: discovered repo "${abs}" escaped workspace "${root}" — refusing to record`);
+    }
+    return path.relative(root, abs).split(path.sep).join('/');
+  });
+
+  return rel.sort();
+}
+
+/**
+ * Pure. Given a normalized+loaded registry and a pre-gathered map of
+ * `workspaceAbs -> repos[]` (built by the caller with `discoverWorkspaceRepos`
+ * for each `kind: workspace` entry), returns `{ registry, report }` — the same
+ * gather-impure/transform-pure/write-separate split `migrate()` established.
+ *
+ * Only `kind: workspace` entries receive a populated `repos[]`; `kind:
+ * project` entries are written back with `repos: []` regardless of what the
+ * caller's map holds for them — the field is a workspace-addressing index,
+ * not a per-project one. No `fs.*` write call appears in this function's
+ * body: the suite scans its source for `fs.write`/`fs.mkdir`/`fs.copy` the
+ * same way S01's suite proves it of `migrate()`.
+ */
+function syncWorkspaceRepos(registry, opts) {
+  const o = opts || {};
+  requireString(o.home, 'home');
+  const raw = o.reposByWorkspace;
+  const reposByWorkspace = raw instanceof Map ? raw : new Map(Object.entries(raw || {}));
+
+  const priorEntries = Array.isArray(registry.entries) ? registry.entries : [];
+
+  const entries = priorEntries.map(e => {
+    const clean = { path: e.path, root: e.root, kind: e.kind, repos: [] };
+    if (e.kind === 'workspace') {
+      const key = e.abs ? path.resolve(e.abs) : null;
+      const found = (key && (reposByWorkspace.get(key) || reposByWorkspace.get(e.abs))) || [];
+      clean.repos = found.slice().sort();
+    }
+    return clean;
+  });
+
+  const report = entries.map((e, i) => {
+    const prior = priorEntries[i] || {};
+    const before = Array.isArray(prior.repos) ? prior.repos : [];
+    const beforeSet = new Set(before);
+    const afterSet = new Set(e.repos);
+    return {
+      path: e.path,
+      kind: e.kind,
+      count: e.repos.length,
+      added: e.repos.filter(r => !beforeSet.has(r)),
+      removed: before.filter(r => !afterSet.has(r)),
+    };
+  });
+
+  // Quarantine is projected through the same clean shape `entries` gets, not
+  // passed through by reference. Two reasons, both learned the hard way:
+  //
+  //   `loadRegistry` attaches a runtime `abs` to every record it hands back.
+  //   Passing those objects straight into `writeRegistry` persisted that
+  //   derived cache into the file — the live registry carried an `abs` on all
+  //   five quarantine rows after the first real `--sync-repos`. A field the
+  //   loader computes must never become a field the file stores, or the two
+  //   disagree the moment `$HOME` or a root moves.
+  //
+  //   More importantly, a `.map()` here is one row out per row in, by
+  //   construction. A filter or a rebuild-from-gathered-set is what turns
+  //   "sync the repo index" into "delete the rows this run could not
+  //   re-derive" — and a quarantine row is by definition not re-derivable
+  //   from a disk walk.
+  const priorQuarantine = Array.isArray(registry.quarantine) ? registry.quarantine : [];
+  const quarantine = priorQuarantine.map(q => {
+    const clean = { path: q.path, root: q.root, reason: q.reason };
+    if (q.missing === true) clean.missing = true;
+    return clean;
+  });
+
+  const out = {
+    version: registry.version,
+    roots: Array.isArray(registry.roots) ? registry.roots : [],
+    entries,
+    quarantine,
+  };
+
+  // Containment guard, not a formality. This function's whole contract is
+  // "populate `repos[]`, change nothing else"; a row count that moved means a
+  // future edit turned a projection into a rebuild. Throwing loses a sync run
+  // — the alternative loses months of registrations the operator cannot
+  // reconstruct, and does it silently. Cheap to hold, catastrophic to omit.
+  if (out.entries.length !== priorEntries.length || out.quarantine.length !== priorQuarantine.length) {
+    throw new Error(
+      `forge-workspace: syncWorkspaceRepos would write ${out.entries.length} entries / ` +
+      `${out.quarantine.length} quarantine records from ${priorEntries.length} / ` +
+      `${priorQuarantine.length} — refusing to write a registry with rows missing`);
+  }
+
+  return { registry: out, report };
+}
+
 module.exports = {
   WORK_ENTRIES,
   RUNTIME_ENTRIES,
@@ -168,22 +1081,218 @@ module.exports = {
   classify,
   isProject,
   resolveOwner,
+  // Hierarchy / role
+  ROLE_KINDS,
+  REGISTRABLE_ROLES,
+  containmentCounts,
+  resolveRole,
+  // Registry
+  REGISTRY_VERSION,
+  REGISTRY_FILENAME,
+  registryPath,
+  encodeEntryPath,
+  // Root helpers — shared with forge-isolation.js's worktree anchoring, which
+  // must apply the SAME containment rule as the codec rather than its own.
+  normalizeRootEntry,
+  resolveRootPath,
+  isStrictlyUnder,
+  resolveEntryPath,
+  deriveEntryKind,
+  normalizeRegistry,
+  loadRegistry,
+  // Migration
+  DISCOVERY_ROOT_NAMES,
+  gatherFacts,
+  migrate,
+  formatReport,
+  writeRegistry,
+  // Repo discovery per workspace
+  REPO_SCAN_MAX_DEPTH,
+  REPO_SCAN_SKIP_DIRS,
+  discoverWorkspaceRepos,
+  syncWorkspaceRepos,
 };
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 if (require.main === module) {
+  const os = require('os');
   const argv = process.argv.slice(2);
   const json = argv.includes('--json');
-  const positional = argv.filter(a => !a.startsWith('--'));
   const ownerFlag = argv.includes('--owner');
+
+  // `--home`/`--file` exist so the suite can drive this CLI against fixtures.
+  // Without them the only way to test the migration would be to run it against
+  // the operator's real registry, which is the one thing this task must not do.
+  const consumed = new Set();
+  function flagValue(name, def) {
+    const i = argv.indexOf(name);
+    if (i < 0) return def;
+    const v = argv[i + 1];
+    if (!v || v.startsWith('--')) {
+      process.stderr.write(`forge-workspace: ${name} exige um valor\n`);
+      process.exit(2);
+    }
+    consumed.add(i + 1);
+    return v;
+  }
+  const home = path.resolve(flagValue('--home', os.homedir()));
+  const regFile = path.resolve(flagValue('--file', registryPath(home)));
+
+  const positional = argv.filter((a, i) => !a.startsWith('--') && !consumed.has(i));
   const target = positional[0] || process.cwd();
 
   if (argv.includes('--help') || argv.includes('-h')) {
     process.stdout.write(
-      'forge-workspace — classify a directory, or resolve the project that owns it\n\n' +
+      'forge-workspace — classify a directory, or inspect/migrate the registry\n\n' +
       'Usage:\n' +
-      '  forge-workspace [dir] [--json]        classify dir (project|touched|none)\n' +
-      '  forge-workspace [dir] --owner [--json]  print the owning project, if any\n');
+      '  forge-workspace [dir] [--json]           classify dir (project|touched|none)\n' +
+      '  forge-workspace [dir] --owner [--json]   print the owning project, if any\n' +
+      '  forge-workspace --registry [--json]      print the registry (both shapes)\n' +
+      '  forge-workspace --migrate [--dry-run]    preview, then migrate legacy → version 1\n\n' +
+      'Options:\n' +
+      '  --home <dir>   home to resolve against (default: os.homedir())\n' +
+      '  --file <path>  registry file (default: <home>/.claude/' + REGISTRY_FILENAME + ')\n');
+    process.exit(0);
+  }
+
+  if (argv.includes('--registry')) {
+    let reg;
+    try {
+      reg = loadRegistry(regFile, { home });
+    } catch (e) {
+      process.stderr.write(e.message + '\n');
+      process.exit(1);
+    }
+    if (!reg) {
+      if (json) process.stdout.write(JSON.stringify({ file: regFile, present: false }) + '\n');
+      else process.stderr.write(`forge-workspace: nenhum registry em ${regFile}\n`);
+      process.exit(1);
+    }
+    if (json) {
+      process.stdout.write(JSON.stringify({
+        file: reg.file,
+        version: reg.version,
+        legacy: reg.legacy,
+        roots: reg.roots,
+        entries: reg.entries.map(e => ({ path: e.path, root: e.root, kind: e.kind, repos: e.repos, abs: e.abs })),
+        quarantine: reg.quarantine.map(q => ({ path: q.path, root: q.root, reason: q.reason, abs: q.abs })),
+      }, null, 2) + '\n');
+    } else {
+      process.stdout.write(`registry: ${reg.file}\n`);
+      process.stdout.write(`version:  ${reg.version}${reg.legacy ? '  (legacy: true — visão normalizada)' : ''}\n`);
+      process.stdout.write(`roots:    ${reg.roots.length ? reg.roots.map(r => r.path + (r.primary ? ' *' : '')).join(', ') : '(nenhum)'}\n`);
+      process.stdout.write(`entries (${reg.entries.length}):\n`);
+      for (const e of reg.entries) process.stdout.write(`  ${e.kind === 'workspace' ? 'workspace' : 'project  '} ${e.abs}\n`);
+      process.stdout.write(`quarantine (${reg.quarantine.length}):\n`);
+      for (const q of reg.quarantine) process.stdout.write(`  ${q.reason.padEnd(9)} ${q.abs}\n`);
+    }
+    process.exit(0);
+  }
+
+  if (argv.includes('--migrate')) {
+    const dryRun = argv.includes('--dry-run');
+    let reg;
+    try {
+      reg = loadRegistry(regFile, { home, recomputeKinds: false });
+    } catch (e) {
+      process.stderr.write(e.message + '\n');
+      process.exit(1);
+    }
+    if (!reg) {
+      process.stderr.write(`forge-workspace: nenhum registry em ${regFile} — nada a migrar\n`);
+      process.exit(1);
+    }
+    if (!reg.legacy) {
+      // Explicit no-op. Not a second migration cycle, and not a write of any
+      // kind — the .bak is not touched either.
+      process.stdout.write(`already migrated, version ${reg.version} — nada a fazer (${regFile})\n`);
+      process.exit(0);
+    }
+
+    const oldPaths = reg.entries.map(e => e.abs);
+    const facts = gatherFacts(oldPaths, { home });
+    const { registry, report } = migrate(oldPaths, facts, { home });
+    process.stdout.write(formatReport(report, { file: regFile }));
+
+    if (dryRun) {
+      process.stdout.write('\n--dry-run: nenhuma escrita realizada.\n');
+      process.exit(0);
+    }
+
+    // Backup first, and prove it landed before touching the original. `cp` is
+    // avoided deliberately: this repo has twice been bitten by an interactive
+    // `cp -i` alias declining an overwrite while the caller reported success.
+    const bak = regFile + '.bak';
+    if (fs.existsSync(bak)) {
+      process.stderr.write(
+        `forge-workspace: ${bak} já existe — recusando sobrescrever a única cópia legada.\n` +
+        '  Se o backup atual já é a cópia que você quer, remova-o ou renomeie-o à mão antes de repetir.\n');
+      process.exit(1);
+    }
+    const original = fs.readFileSync(regFile);
+    fs.copyFileSync(regFile, bak);
+    const fd = fs.openSync(bak, 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    if (!fs.readFileSync(bak).equals(original)) {
+      process.stderr.write(`forge-workspace: backup ${bak} não confere byte a byte — abortando antes de escrever.\n`);
+      process.exit(1);
+    }
+
+    writeRegistry(regFile, registry);
+    process.stdout.write(
+      `\nbackup:   ${bak}\n` +
+      `escrito:  ${regFile}  (version ${registry.version})\n` +
+      `verifique com: node ${path.basename(__filename)} --registry --json\n`);
+    process.exit(0);
+  }
+
+  if (argv.includes('--sync-repos')) {
+    const dryRun = argv.includes('--dry-run');
+    let reg;
+    try {
+      reg = loadRegistry(regFile, { home });
+    } catch (e) {
+      process.stderr.write(e.message + '\n');
+      process.exit(1);
+    }
+    if (!reg) {
+      process.stderr.write(`forge-workspace: nenhum registry em ${regFile} — nada para sincronizar\n`);
+      process.exit(1);
+    }
+
+    // Gather (impure): discover repos for every workspace entry. Never for a
+    // `project` entry — the field is a workspace-addressing index only.
+    const reposByWorkspace = new Map();
+    for (const e of reg.entries) {
+      if (e.kind !== 'workspace') continue;
+      reposByWorkspace.set(path.resolve(e.abs), discoverWorkspaceRepos(e.abs));
+    }
+
+    // Transform (pure).
+    const { registry, report } = syncWorkspaceRepos(reg, { home, reposByWorkspace });
+
+    if (json) {
+      process.stdout.write(JSON.stringify({ file: regFile, dryRun, report }, null, 2) + '\n');
+    } else {
+      process.stdout.write(`registry: ${regFile}\n`);
+      for (const r of report) {
+        process.stdout.write(`  ${r.kind === 'workspace' ? 'workspace' : 'project  '} ${r.path}  repos: ${r.count}\n`);
+        if (r.added.length) process.stdout.write(`      + ${r.added.join(', ')}\n`);
+        if (r.removed.length) process.stdout.write(`      - ${r.removed.join(', ')}\n`);
+      }
+    }
+
+    if (dryRun) {
+      // The `--json` payload above already carries `dryRun: true` — nothing
+      // is appended after it, or a machine reader would have to strip a
+      // trailer to get valid JSON back.
+      if (!json) process.stdout.write('\n--dry-run: nenhuma escrita realizada.\n');
+      process.exit(0);
+    }
+
+    // Write (separate): only reached without --dry-run.
+    writeRegistry(regFile, registry);
+    if (!json) process.stdout.write(`\nescrito: ${regFile}\n`);
     process.exit(0);
   }
 
@@ -198,10 +1307,19 @@ if (require.main === module) {
   }
 
   const r = classify(target);
+  let activeAbs = [];
+  try {
+    const reg = loadRegistry(regFile, { home });
+    if (reg) activeAbs = reg.entries.map(e => e.abs);
+  } catch {
+    activeAbs = [];
+  }
+  const role = resolveRole(target, activeAbs);
   if (json) {
-    process.stdout.write(JSON.stringify({ dir: target, ...r }) + '\n');
+    process.stdout.write(JSON.stringify({ dir: target, ...r, role }) + '\n');
   } else {
-    process.stdout.write(`${r.kind}\t${target}${r.signals.length ? '\t' + r.signals.join(',') : ''}\n`);
+    process.stdout.write(
+      `${r.kind}\t${target}${r.signals.length ? '\t' + r.signals.join(',') : ''}\t${role === null ? '-' : role}\n`);
   }
   process.exit(r.kind === 'project' ? 0 : 1);
 }

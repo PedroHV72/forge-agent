@@ -211,11 +211,19 @@ if [ -n "$ATTACH_RUN" ]; then
   fi
   CODE_DIR="$WORKTREE_DIR"
   BRANCH="$ATTACH_BRANCH"
+  RUN_BRANCH="$ATTACH_BRANCH"   # recorded as the lender's branch — the borrower owns no branch of its own
   echo "⛓ Isolation: worktree emprestado de $ATTACH_RUN → $WORKTREE_DIR (branch $ATTACH_BRANCH)"
 else
 ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$TASK_ID" --cwd "$(pwd)")
 ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
 WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
+# RUN_BRANCH — read back from the setup result, never re-derived as `forge/$TASK_ID`.
+# The attach path above already set `BRANCH="$ATTACH_BRANCH"` (the LENDER's branch,
+# which `forge/{TASK_ID}` would misname); the `r.branch` fallback in the expression
+# below covers that result shape too. Reachable cases: branch/worktree with ≥1 repo
+# ok → the setup's branch; `shared` → `repos: []` → empty → recorded as null; all
+# repos errored → empty → null (the ISO_ERRORS rule below stops anyway).
+RUN_BRANCH=$(node -e "const r=JSON.parse(process.argv[1]);const b=(r.repos||[]).find(x=>x.branch&&x.status!=='error');process.stdout.write((b&&b.branch)||r.branch||'')" "$ISO_RESULT")
 ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
 ELEVATED=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).elevated||false))" "$ISO_RESULT")
 ELEV_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).elevation_reason||'')" "$ISO_RESULT")
@@ -240,7 +248,7 @@ Isolation rules (CRITICAL — the operator configured this; honor it):
 if [ -z "$RESUME_MODE" ]; then
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}" 
   WORKTREES_JSON=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write(JSON.stringify((r.repos||[]).filter(x=>x.worktree&&x.status!=='error').map(x=>({repo:x.path,path:x.worktree}))))" "$ISO_RESULT")
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --attached-to "${ATTACH_RUN:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --attached-to "${ATTACH_RUN:-}" --branch "${RUN_BRANCH:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
   # Regenerate dashboard
   node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
 

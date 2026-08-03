@@ -13,31 +13,114 @@ import ForgeKit
 
 // MARK: - Workspaces
 
-/// Which projects to watch. A plain JSON array of paths, editable by hand.
+/// Which projects to watch. Editable by hand, in either of two shapes — the
+/// legacy flat array of paths, or the versioned object with roots, typed entries
+/// and quarantine. All shape knowledge lives in `WorkspaceRegistry` (ForgeKit,
+/// hence testable); this enum is the file I/O around it and nothing more.
 enum Workspaces {
-    static var file: String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return "\(home)/.claude/forge-gate-workspaces.json"
+    static var home: String { FileManager.default.homeDirectoryForCurrentUser.path }
+
+    static var file: String { "\(home)/.claude/\(WorkspaceRegistry.filename)" }
+
+    static func load() -> [String] { loadOutcome().visible }
+
+    /// Same read as `load()`, but keeps "the file could not be parsed" apart
+    /// from "the file parsed and declares nothing" — the distinction I-20260802223042
+    /// exists to put back on screen. `load()` delegates here so every other
+    /// caller keeps seeing a plain `[String]`.
+    static func loadOutcome() -> (visible: [String], unreadable: Bool) {
+        guard let data = FileManager.default.contents(atPath: file) else {
+            // `contents(atPath:)` returns nil both when the file is absent and
+            // when it exists but could not be read (EACCES, I/O error). Those
+            // are different events — a present-but-unreadable file must fire
+            // the same notice as an unparseable one (R2 review fix, S02-REVIEW),
+            // not render like a fresh install with nothing registered yet.
+            let unreadable = FileManager.default.fileExists(atPath: file)
+            if unreadable {
+                FileHandle.standardError.write(Data(
+                    "Forge: \(file) não pôde ser lido — a lista de projetos NÃO foi alterada. Corrija o arquivo (há backup .bak ao lado após a migração).\n".utf8))
+            }
+            return ([], unreadable)
+        }
+        guard let r = WorkspaceRegistry.resolution(from: data, home: home) else {
+            // Not `[]`. An unreadable registry is an event: returning an empty
+            // list here is what used to make a corrupt file and a fresh install
+            // look identical on screen.
+            FileHandle.standardError.write(Data(
+                "Forge: \(file) não pôde ser lido — a lista de projetos NÃO foi alterada. Corrija o arquivo (há backup .bak ao lado após a migração).\n".utf8))
+            return ([], true)
+        }
+        // "Does not resolve" and "was deleted" both remove a card, so they are
+        // reported apart — only the second is the operator's own doing.
+        for bad in r.rejected {
+            FileHandle.standardError.write(Data(
+                "Forge: entrada ignorada em \(WorkspaceRegistry.filename): \"\(bad.stored)\" — \(bad.reason)\n".utf8))
+        }
+        return (r.paths.filter { FileManager.default.fileExists(atPath: $0) }, false)
     }
 
-    static func load() -> [String] {
-        guard let data = FileManager.default.contents(atPath: file),
-              let list = try? JSONDecoder().decode([String].self, from: data)
-        else { return [] }
-        return list.filter { FileManager.default.fileExists(atPath: $0) }
+    /// Absolute roots the registry declares, resolved against `home` — what
+    /// discovery should scan (see `ProjectDiscovery.scan(declaredRoots:)`).
+    /// `[]` on an absent file, a legacy shape, or an unreadable file — the
+    /// caller falls back to the hardcoded name-list scan in every one of
+    /// those cases, so the unreadable/empty distinction is not needed here.
+    static func declaredRoots() -> [String] {
+        guard let data = FileManager.default.contents(atPath: file) else { return [] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.roots ?? []
+    }
+
+    /// Every record the registry resolves, whether or not its directory still
+    /// exists on disk — the base `add`/`remove` build `newPaths` from, never
+    /// `load()`.
+    ///
+    /// `load()` is filtered to what is visible on screen (R2 review fix,
+    /// S01-REVIEW): a directory that is unmounted or briefly moved still
+    /// resolves fine and simply is not offered by the fileExists filter. Any
+    /// unrelated `save()` recomputes the file from `newPaths` — so building
+    /// `newPaths` from the filtered list would silently delete every record
+    /// currently absent from disk, migration `quarantine[]` included, as a
+    /// side effect of adding or removing something else entirely. The
+    /// `fileExists` check must stay display-only; it must never feed a write.
+    ///
+    /// I-20260803132250: this used to be a comment alone. `add`/`remove` now
+    /// route their mutation through `WorkspaceRegistry.mutatedPaths(allResolved:)`
+    /// (ForgeKit, pure, no `visible` parameter to accidentally pass) — that
+    /// function, not this one, is what `ForgeKitTests` exercises to assert the
+    /// invariant at the call site, since `ForgeKitTests` cannot import this
+    /// `Forge` executable target.
+    /// Paths the registry declares `kind: workspace` — see
+    /// `ProjectOrganiser.containmentHazards`, the only consumer. `[]` on an
+    /// absent, legacy or unreadable file, which is the same conservative answer
+    /// in all three cases: nothing is declared, so nothing is suppressed.
+    static func declaredWorkspaces() -> Set<String> {
+        guard let data = FileManager.default.contents(atPath: file) else { return [] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.declaredWorkspaces ?? []
+    }
+
+    static func loadAllResolved() -> [String] {
+        guard let data = FileManager.default.contents(atPath: file) else { return [] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.paths ?? []
     }
 
     static func save(_ list: [String]) {
-        let unique = Array(Set(list)).sorted()
-        guard let data = try? JSONEncoder().encode(unique) else { return }
+        let original = FileManager.default.contents(atPath: file)
+        // A nil here is a refusal, not a failure to encode: the file on disk is
+        // in a shape we could not parse, and overwriting it would trade the
+        // operator's roots and quarantine for one click.
+        guard let data = WorkspaceRegistry.updatedData(
+            original: original, newPaths: list, home: home) else {
+            FileHandle.standardError.write(Data(
+                "Forge: \(file) está ilegível — recusando sobrescrever para não perder roots/quarentena.\n".utf8))
+            return
+        }
         try? FileManager.default.createDirectory(
             atPath: (file as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true)
         try? data.write(to: URL(fileURLWithPath: file), options: .atomic)
     }
 
-    static func add(_ p: String)    { save(load() + [p]) }
-    static func remove(_ p: String) { save(load().filter { $0 != p }) }
+    static func add(_ p: String)    { save(WorkspaceRegistry.mutatedPaths(allResolved: loadAllResolved(), adding: p)) }
+    static func remove(_ p: String) { save(WorkspaceRegistry.mutatedPaths(allResolved: loadAllResolved(), removing: p)) }
 }
 
 // MARK: - App state
@@ -61,6 +144,17 @@ final class AppState: ObservableObject {
     /// into, which our tooling enrolled as a side effect. Surfaced rather than
     /// filtered away: a misclassification has to cost a click, never a project.
     @Published private(set) var touchedWorkspaces: [String] = []
+
+    /// Paths the registry declares `kind: workspace`. A workspace containing
+    /// its own members is the normal case, so the containment hazard must not
+    /// accuse it (I-20260803154521).
+    @Published private(set) var declaredWorkspaces: Set<String> = []
+
+    /// True exactly when the registry file exists but could not be parsed —
+    /// set by `reloadCheap()` from `Workspaces.loadOutcome()`. The Projects
+    /// screen renders a notice while this is true instead of a silently
+    /// blank list (closes I-20260802223042).
+    @Published private(set) var registryUnreadable = false
 
     /// Raw values of the two `app.*` prefs, read once at init and on explicit
     /// reload only — see `loadAppDefaults()`.
@@ -188,10 +282,29 @@ final class AppState: ObservableObject {
         // pickers and the metrics screen stop offering a repo nobody planned
         // work in — which is the wrong-repo dispatch hazard `WorkspaceDefaults`
         // exists to prevent.
-        let registered = Workspaces.load()
-        let marks = registered.map { ($0, ProjectMarker.classify($0).kind) }
-        workspaces = marks.filter { $0.1 == .project }.map(\.0)
-        touchedWorkspaces = marks.filter { $0.1 != .project }.map(\.0)
+        let outcome = Workspaces.loadOutcome()
+        registryUnreadable = outcome.unreadable
+        // The notice (and its doc comment above) promises the list below was
+        // NOT changed. `WorkspaceReloadDecision.split` (ForgeKit, hence
+        // testable) is what makes that literally true: on `unreadable` it
+        // returns the previous split untouched rather than rebuilding from
+        // `outcome.visible`, which is always `[]` on that path — R1 review fix,
+        // S02-REVIEW.
+        let split = WorkspaceReloadDecision.split(
+            previous: .init(workspaces: workspaces, touchedWorkspaces: touchedWorkspaces),
+            outcome: outcome,
+            isProject: { ProjectMarker.classify($0).kind == .project })
+        workspaces = split.workspaces
+        touchedWorkspaces = split.touchedWorkspaces
+        // Held over on `unreadable` for the same reason the split is: the
+        // notice promises the list below was not changed, and dropping the
+        // declarations would re-accuse a workspace still on screen.
+        if !outcome.unreadable { declaredWorkspaces = Workspaces.declaredWorkspaces() }
+        if outcome.unreadable {
+            watcher?.watch(workspaces)
+            NotificationCenter.default.post(name: Self.didChange, object: nil)
+            return
+        }
 
         var g: [Gate] = [], r: [Run] = []
         for ws in workspaces {
