@@ -820,7 +820,7 @@ struct ProjectCard: View {
     /// the trailing column is the grammar this card already speaks — the
     /// delivery row above puts its age in exactly that position.
     @ViewBuilder private var gitLine: some View {
-        let g = GitGlyph.of(gitField, remote: digest?.remote)
+        let g = GitGlyph.of(gitField, origin: digest?.origin)
         HStack(spacing: 4) {
             // The host mark leads the row, and appears if and only if the
             // remote was MEASURED to be a host a mark exists for. A repository
@@ -828,23 +828,45 @@ struct ProjectCard: View {
             // mark all draw nothing here and say which one they are in the
             // tooltip — a logo is a claim, and this row has already shipped one
             // false claim about the operator's disk.
-            if let hm = g.host.mark, let img = BrandArt.image(hm) {
-                Image(nsImage: img)
-                    .renderingMode(.template).resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 9, height: 9)
-                    .foregroundStyle(.tertiary)
-                    .help(g.host.help)
-                    .accessibilityLabel(g.host.help)
+            if g.segments.isEmpty {
+                if let hm = g.host.mark, let img = BrandArt.image(hm) {
+                    Image(nsImage: img)
+                        .renderingMode(.template).resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 9, height: 9)
+                        .foregroundStyle(.tertiary)
+                        .help(g.host.help)
+                        .accessibilityLabel(g.host.help)
+                }
+                if let symbol = g.symbol {
+                    brandOrSymbol(g.mark, symbol: symbol, size: 9)
+                        .font(.system(size: 9))
+                        .symbolRenderingMode(.hierarchical)
+                }
+                Text(g.text).font(.system(size: 10)).monospaced()
+                    .lineLimit(1).truncationMode(.middle)
+                    .foregroundStyle(gitStyle(g.tone))
+            } else {
+                ForEach(g.segments, id: \.kind) { seg in
+                    HStack(spacing: 3) {
+                        if let symbol = seg.symbol {
+                            brandOrSymbol(seg.mark, symbol: symbol, size: 9)
+                                .font(.system(size: 9))
+                                .symbolRenderingMode(.hierarchical)
+                        }
+                        Text(seg.text).font(.system(size: 10)).monospaced()
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    .foregroundStyle(gitStyle(seg.tone))
+                    .help(seg.help)
+                    .accessibilityLabel(seg.help)
+                    // The branch name is the only segment allowed to give up
+                    // room: the others are short and fixed, and squeezing a
+                    // repository name or a divergence count is how a row loses
+                    // the fact it exists to state.
+                    .layoutPriority(seg.kind == .branch ? 0 : 1)
+                }
             }
-            if let symbol = g.symbol {
-                brandOrSymbol(g.mark, symbol: symbol, size: 9)
-                    .font(.system(size: 9))
-                    .symbolRenderingMode(.hierarchical)
-            }
-            Text(g.text).font(.system(size: 10)).monospaced()
-                .lineLimit(1).truncationMode(.middle)
-                .foregroundStyle(gitStyle(g.tone))
             if let b = g.baseline {
                 Spacer(minLength: 6)
                 HStack(spacing: 2) {

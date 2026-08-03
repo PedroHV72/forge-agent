@@ -184,6 +184,37 @@ public enum GitRemote: Equatable {
     }
 }
 
+/// What one read of `.git/config` learned about `origin`: where it is hosted,
+/// and what the repository is CALLED there.
+///
+/// The two travel together because they come from the same string and the same
+/// read — splitting them into two functions would read the file twice to learn
+/// two halves of one line. They are separate FIELDS, though, and the SSH host
+/// alias is why: `git@github-personal:u/r.git` (a `~/.ssh/config` alias, which
+/// is on the operator's own disk) has an unrecognisable host and a perfectly
+/// good repository name. A type that made the name depend on the host being
+/// recognised would drop the name on exactly the repositories where the folder
+/// name is least likely to match it.
+public struct GitOrigin: Equatable {
+    public let remote: GitRemote
+    /// The repository's name at the remote, or `nil` when NONE was measured —
+    /// no remote, an unreadable config, a URL with no last component.
+    ///
+    /// NEVER the directory name. The card's title already IS the directory
+    /// name, so falling back to it would print one fact twice while claiming
+    /// they are two — the false-claim class this screen has been shedding.
+    public let repo: String?
+
+    public init(remote: GitRemote, repo: String?) {
+        self.remote = remote
+        self.repo = repo
+    }
+
+    /// Nothing was read yet. Distinct from "read, and there is no remote".
+    public static let unmeasured = GitOrigin(
+        remote: .unmeasured("remoto não verificado"), repo: nil)
+}
+
 public enum GitRemoteHost {
 
     /// The `origin` remote of the repository at `path`, read from `.git/config`.
@@ -211,23 +242,74 @@ public enum GitRemoteHost {
 
     public static func origin(at path: String,
                               fileManager fm: FileManager = .default) -> GitRemote {
+        originInfo(at: path, fileManager: fm).remote
+    }
+
+    /// Host AND repository name, from ONE read of `.git/config`.
+    ///
+    /// The name is derived independently of the host: a URL whose host is not
+    /// recognised (`.other`), or not a host at all (a local path), still names a
+    /// repository, and that name is what the row prints. Only a config with no
+    /// `origin` at all yields no name — measured, and there is none.
+    public static func originInfo(at path: String,
+                                  fileManager fm: FileManager = .default) -> GitOrigin {
         guard let dir = GitDefaultBranch.commonDir(repoPath: path, fileManager: fm) else {
-            return .unmeasured("sem .git — hospedagem não verificada")
+            return GitOrigin(remote: .unmeasured("sem .git — hospedagem não verificada"),
+                             repo: nil)
         }
         guard let text = Ledger.readHead(path: dir + "/config", limit: configReadLimit) else {
-            return .unmeasured("config do git ilegível")
+            return GitOrigin(remote: .unmeasured("config do git ilegível"), repo: nil)
         }
         guard let url = originURL(inConfig: text) else {
-            return .absent("sem remoto")
+            return GitOrigin(remote: .absent("sem remoto"), repo: nil)
         }
+        let name = repoName(ofRemoteURL: url)
         guard let host = host(ofRemoteURL: url) else {
-            return .unmeasured("URL de remoto não reconhecida")
+            return GitOrigin(remote: .unmeasured("URL de remoto não reconhecida"), repo: name)
         }
         for kind in GitHostKind.allCases
         where kind.domains.contains(where: { matches(host: host, domain: $0) }) {
-            return .host(kind, host)
+            return GitOrigin(remote: .host(kind, host), repo: name)
         }
-        return .other(host)
+        return GitOrigin(remote: .other(host), repo: name)
+    }
+
+    /// The repository's name in a git remote URL, in every shape git accepts.
+    ///
+    ///     https://github.com/u/r.git          → r
+    ///     ssh://git@github.com:22/u/r.git     → r
+    ///     git@github.com:u/r.git              → r      (scp-like)
+    ///     git@github-personal:u/r.git         → r      (SSH host alias)
+    ///     git@host:r.git                      → r      (no path separator)
+    ///     /Users/x/repo.git                   → repo   (a path is still a name)
+    ///
+    /// Last path component minus a `.git` suffix, with trailing slashes dropped
+    /// first — `https://host/u/r/` names `r`, not the empty string. The host is
+    /// not consulted at all: see `GitOrigin.repo` for why that independence is
+    /// the point rather than an accident.
+    public static func repoName(ofRemoteURL raw: String) -> String? {
+        var s = raw.trimmingCharacters(in: .whitespaces)
+        while s.hasSuffix("/") { s.removeLast() }
+        guard !s.isEmpty else { return nil }
+        // With a scheme, the name may only come from the PATH. Measured on the
+        // way in: without this hop `https://github.com/` yields `github.com` —
+        // the HOST printed where a repository name goes, which is a fabricated
+        // fact wearing a plausible shape.
+        if let scheme = s.range(of: "://") {
+            let rest = s[scheme.upperBound...]
+            guard let slash = rest.firstIndex(of: "/") else { return nil }
+            s = String(rest[rest.index(after: slash)...])
+            guard !s.isEmpty else { return nil }
+        }
+        // The separator is `/` when there is one; otherwise the scp-like colon,
+        // which is the only other thing git puts before a path.
+        if let slash = s.lastIndex(of: "/") {
+            s = String(s[s.index(after: slash)...])
+        } else if let colon = s.lastIndex(of: ":") {
+            s = String(s[s.index(after: colon)...])
+        }
+        if s.hasSuffix(".git") { s = String(s.dropLast(4)) }
+        return s.isEmpty ? nil : s
     }
 
     /// The `url` of `[remote "origin"]`, from git config's INI-ish text.

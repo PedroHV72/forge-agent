@@ -202,9 +202,19 @@ test('o card nunca imprime "sem git" — a ausência medida vem nomeada do Forge
   // repassa o que o digest mediu e não lê `.git/config` por conta própria —
   // senão haveria um segundo leitor de remoto, fora do alcance do ForgeKitTests
   // e livre para desenhar um logo que ninguém mediu.
-  assert(/GitGlyph\.of\(gitField,\s*remote:\s*digest\?\.remote\)/.test(body),
-    'gitLine não repassa mais `digest?.remote` — ou a view parou de informar o host, ou passou ' +
-    'a derivá-lo sozinha; a marca de host é uma AFIRMAÇÃO e tem de vir de uma medição do digest');
+  // Apertou de novo quando a linha ganhou SEGMENTOS: o parâmetro deixou de ser
+  // só o host e passou a ser o `GitOrigin` inteiro (host + NOME do repositório,
+  // de uma leitura só de `.git/config`). O nome do repositório é uma medição
+  // como qualquer outra — se a view pudesse derivá-lo, o candidato óbvio seria
+  // o nome da PASTA, que já é o título do card: dois fatos aparentes, uma
+  // medição só.
+  assert(/GitGlyph\.of\(gitField,\s*origin:\s*digest\?\.origin\)/.test(body),
+    'gitLine não repassa mais `digest?.origin` — ou a view parou de informar host e nome do ' +
+    'repositório, ou passou a derivá-los sozinha; ambos são AFIRMAÇÕES e têm de vir de uma ' +
+    'medição do digest');
+  assert(!/lastPathComponent|URL\(fileURLWithPath/.test(body),
+    'gitLine deriva um nome de caminho — o nome da pasta se passando por nome do repositório é ' +
+    'exatamente a afirmação falsa que esta linha vem removendo');
   assert(!/GitRemoteHost|GitHostKind|\.git\/config/.test(body),
     'gitLine lê o remoto por conta própria — um segundo leitor é como os dois divergem, e este ' +
     'desenha um logo');
@@ -293,6 +303,52 @@ test('a divergência da branch padrão vem pronta do ForgeKit — a view não a 
   assert(/case\s+\.none\b/.test(rule), 'GitBaselineMark.of perdeu o caso .none (não medido)');
   assert(/onDefault/.test(rule),
     'GitBaselineMark.of não distingue mais "você ESTÁ na padrão" de "nivelado com ela"');
+});
+
+test('a linha de git é uma LISTA de segmentos vinda do ForgeKit, não uma string na view', () => {
+  // O pedido do operador: nome do repo ao lado do ícone do host, branch ao lado
+  // do ícone de branch, alterações com cor, e à-frente/atrás com cor. Nada disso
+  // é expressável sobre um `Text` só — a estrutura tem de existir no modelo. E
+  // tem de existir no ForgeKit: `ForgeKitTests` não importa o alvo `Forge`, então
+  // uma linha montada na view seria verificável só olhando para uma tela.
+  const i = code.indexOf('private var gitLine');
+  const end = code.indexOf('private func gitStyle', i);
+  assert(end > i, 'gitLine/gitStyle não encontrados em Projects.swift');
+  const body = code.slice(i, end);
+
+  assert(/ForEach\(g\.segments/.test(body),
+    'gitLine não desenha mais g.segments — a linha voltou a ser um run só, onde nada pode ter ' +
+    'ícone próprio nem cor própria');
+  assert(/Text\(seg\.text\)/.test(body) && /gitStyle\(seg\.tone\)/.test(body),
+    'o segmento perdeu a palavra ou o tom — um par ícone+texto sem uma das duas metades');
+  assert(!/GitRowSegment\.compose\(/.test(body),
+    'gitLine compõe os segmentos sozinha — a regra tem de morar no ForgeKit, onde o ' +
+    'ForgeKitTests alcança');
+  assert(!/\bdirty\b|\bahead\b|\bbehind\b|\bupstream\b/.test(body),
+    'gitLine toca os fatos do git direto — com eles em mãos ela pode desenhar "0 à frente" para ' +
+    'uma branch que nunca teve upstream');
+  assert(/seg\.kind/.test(body),
+    'a view não distingue mais os segmentos por `kind` — se passar a casar por PALAVRA, o ' +
+    'layout quebra na primeira mudança de texto em pt-BR');
+
+  const digest = stripComments(fs.readFileSync(
+    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift'), 'utf8'));
+  const j = digest.indexOf('static func compose(_ s: GitStatusSnapshot');
+  assert(j >= 0, 'GitRowSegment.compose sumiu — a regra de composição da linha não existe mais');
+  const rule = digest.slice(j, j + 3000);
+  for (const [k, why] of [
+    ['.repo', 'o nome do repositório, que é o fato novo desta linha'],
+    ['.branch', 'a branch'],
+    ['.changes', 'as alterações não commitadas'],
+    ['.upstream', 'a divergência do upstream'],
+  ]) {
+    assert(rule.includes('kind: ' + k), `compose não emite mais o segmento ${k}: perdeu ${why}`);
+  }
+  // O caso que não pode calar: sem upstream é um `else`, não uma omissão. Se
+  // virar omissão, ele desenha igual a "em dia" — dois fatos diferentes.
+  assert(/\}\s*else\s*\{[\s\S]{0,400}?kind:\s*\.upstream/.test(rule),
+    'o ramo "sem upstream" sumiu de compose — um fato NÃO medido passou a desenhar como o ' +
+    'zero medido de "em dia com o upstream"');
 });
 
 test('o git é re-perguntado quando falhou, e nunca quando foi medido', () => {

@@ -210,8 +210,157 @@ public enum GitTone: String, Equatable, CaseIterable {
     case behind
     /// Both directions. Neither side is a fast-forward of the other.
     case diverged
-    /// The default branch could not be resolved. NOT "level with main".
+    /// NO COMPARISON IS AVAILABLE. Two situations wear it, and they are the
+    /// same shape: the default branch could not be resolved, and the branch has
+    /// no upstream to be measured against. Neither is "level" — the whole
+    /// reason this token is not `.level` is that a card must never read as
+    /// in-sync with a ref it was never compared to.
     case undetermined
+}
+
+/// One icon-plus-words pair on the git row.
+///
+/// THE ROW HAS A STRUCTURE NOW, NOT A STRING. Until this type existed the row
+/// was one pre-composed line (`GitStatusSnapshot.line`) drawn as a single run,
+/// so nothing inside it could carry its own icon or its own colour — the
+/// operator asked for a mark beside the repository name, a mark beside the
+/// branch, coloured changes and coloured divergence, and none of those were
+/// expressible over one `Text`. The list is composed HERE, in ForgeKit, for the
+/// same reason `GitGlyph` is: `ForgeKitTests` cannot import the `Forge` target,
+/// so a row assembled in the view would be verifiable only by looking at a
+/// screen.
+///
+/// TWO INVARIANTS, both inherited rather than invented:
+///
+///   1. NEVER EMPTY, NEVER BLANK. Every segment has a non-empty `text`, a
+///      non-empty `help`, and something to draw (`mark` or `symbol`). A segment
+///      with nothing to say is ABSENT from the list, never present and empty —
+///      a blank slot is indistinguishable from a rendering bug.
+///
+///   2. AN ABSENT SEGMENT IS NOT A MEASURED ZERO. "clean tree" and "no upstream
+///      configured" are facts, not silences, and they stay interrogable on the
+///      ROW's tooltip (`GitGlyph.help`, which spells both out) even where they
+///      cost no pixels. What must never happen is the opposite direction: an
+///      unmeasured quantity drawn as a measured zero.
+public struct GitRowSegment: Equatable {
+    /// What the segment is about — the stable handle tests and the view use
+    /// instead of matching on wording, which is pt-BR prose and will change.
+    public enum Kind: String, Equatable, CaseIterable {
+        /// The repository's name at its remote. NOT the folder name.
+        case repo
+        /// The checked-out branch.
+        case branch
+        /// Uncommitted work in the tree.
+        case changes
+        /// Divergence from the UPSTREAM — a different ref from the default
+        /// branch, which rides in `GitGlyph.baseline`.
+        case upstream
+    }
+
+    public let kind: Kind
+    /// A vendored mark, drawn in preference to `symbol` when it resolves.
+    public let mark: BrandMark?
+    /// SF Symbol fallback — and the only glyph for segments with no vendored
+    /// art. Never `nil` together with `mark`: a segment always has a mark.
+    public let symbol: String?
+    public let text: String
+    public let tone: GitTone
+    public let help: String
+
+    public init(kind: Kind, mark: BrandMark? = nil, symbol: String?,
+                text: String, tone: GitTone, help: String) {
+        self.kind = kind
+        self.mark = mark
+        self.symbol = symbol
+        self.text = text
+        self.tone = tone
+        self.help = help
+    }
+
+    /// Segment glyphs. Named constants for the same reason `branchSymbol` is: a
+    /// name spelled twice can drift into a blank square in one of them, and the
+    /// harness asserts every one of these resolves against the real symbol set.
+    ///
+    /// `repoSymbol` is the fallback for a repository whose host has no vendored
+    /// mark — and it claims something different from a host logo, which is why
+    /// it is allowed to exist where `GitHostMark` refuses a generic glyph: it
+    /// says "this is the repository's name", not "this is where it is hosted".
+    public static let repoSymbol = "shippingbox"
+    public static let changesSymbol = "pencil"
+    public static let noUpstreamSymbol = "icloud.slash"
+
+    /// THE COMPOSITION RULE for the row, in one place.
+    ///
+    /// Order is fixed and meaningful: where it lives, which branch, what is
+    /// uncommitted, how far from the remote. Divergence from the DEFAULT branch
+    /// is deliberately NOT here — it keeps its trailing column
+    /// (`GitBaselineMark`), because appending it to this list would make it the
+    /// first thing a 27-character branch name truncates away.
+    public static func compose(_ s: GitStatusSnapshot,
+                               origin: GitOrigin?) -> [GitRowSegment] {
+        var out: [GitRowSegment] = []
+
+        // 1. The repository's name at its remote — present only when one was
+        //    MEASURED. A repo with no remote has no name here and gets none
+        //    invented for it from the folder it sits in.
+        if let repo = origin?.repo, !repo.isEmpty {
+            out.append(GitRowSegment(kind: .repo,
+                                     mark: origin?.remote.kind?.mark,
+                                     symbol: repoSymbol,
+                                     text: repo,
+                                     tone: .clean,
+                                     help: "repositório \(repo) — \(GitHostMark.of(origin?.remote).help)"))
+        }
+
+        // 2. The branch. Always present when there is a repository at all —
+        //    this is the segment that makes the row legible as git.
+        out.append(GitRowSegment(kind: .branch,
+                                 mark: GitGlyph.branchMark,
+                                 symbol: GitGlyph.branchSymbol,
+                                 text: s.branch,
+                                 tone: .clean,
+                                 help: "na branch \(s.branch)"))
+
+        // 3. Uncommitted work, and ONLY when there is some. A permanent "limpo"
+        //    segment would add a word to every one of the operator's 14 cards
+        //    to say that nothing happened; the clean case is stated in the row's
+        //    tooltip instead, so it is quiet without being silent.
+        if s.dirty {
+            out.append(GitRowSegment(kind: .changes, symbol: changesSymbol,
+                                     text: "alterações", tone: .dirty,
+                                     help: "há alterações não commitadas nesta árvore"))
+        }
+
+        // 4. Divergence from the upstream.
+        //
+        //    THE ONE CASE THAT MAY NOT BE SILENT: `ahead`/`behind` are jointly
+        //    nil when there is NO upstream, which is not "0 ahead, 0 behind".
+        //    Being level is an absence of work to do and earns no pixels; having
+        //    nothing to compare against is a property of the branch itself, and
+        //    if it drew nothing it would be indistinguishable on screen from
+        //    being in sync. So the level case is omitted and this one is SAID.
+        if let ahead = s.ahead, let behind = s.behind {
+            if ahead > 0 && behind > 0 {
+                out.append(GitRowSegment(kind: .upstream,
+                                         symbol: GitBaselineMark.divergedSymbol,
+                                         text: "\(ahead)↑ \(behind)↓", tone: .diverged,
+                                         help: "\(ahead) à frente e \(behind) atrás do upstream"))
+            } else if ahead > 0 {
+                out.append(GitRowSegment(kind: .upstream, symbol: GitBaselineMark.aheadSymbol,
+                                         text: "\(ahead)", tone: .ahead,
+                                         help: "\(ahead) commit(s) à frente do upstream"))
+            } else if behind > 0 {
+                out.append(GitRowSegment(kind: .upstream, symbol: GitBaselineMark.behindSymbol,
+                                         text: "\(behind)", tone: .behind,
+                                         help: "\(behind) commit(s) atrás do upstream — falta trabalho aqui"))
+            }
+        } else {
+            out.append(GitRowSegment(kind: .upstream, symbol: noUpstreamSymbol,
+                                     text: "sem upstream", tone: .undetermined,
+                                     help: "esta branch não tem upstream — não há com o que comparar"))
+        }
+        return out
+    }
 }
 
 /// The default-branch divergence as a second, trailing mark on the git row.
@@ -402,10 +551,17 @@ public struct GitGlyph: Equatable {
     /// no repository to compare — `absent`, `failed` and `pending` cannot have
     /// drifted from a default branch, because nothing established they have one.
     public let baseline: GitBaselineMark?
+    /// The row broken into icon-plus-words pairs, each with its own tone — the
+    /// structure `text` cannot have, since one string drawn as one run cannot
+    /// colour its middle. EMPTY for every state that is not `.state`: there is
+    /// no repository to have a name, a branch or a divergence, and those states
+    /// keep saying exactly what they said before, in `text`.
+    public let segments: [GitRowSegment]
 
     public init(symbol: String?, text: String, help: String, tone: GitTone,
                 baseline: GitBaselineMark? = nil, mark: BrandMark? = nil,
-                host: GitHostMark = GitHostMark.of(nil)) {
+                host: GitHostMark = GitHostMark.of(nil),
+                segments: [GitRowSegment] = []) {
         self.symbol = symbol
         self.text = text
         self.help = help
@@ -413,6 +569,7 @@ public struct GitGlyph: Equatable {
         self.baseline = baseline
         self.mark = mark
         self.host = host
+        self.segments = segments
     }
 
     /// SF Symbol for a branch. One constant, so the mark cannot be spelled
@@ -441,15 +598,16 @@ public struct GitGlyph: Equatable {
     /// `nil` means the caller has not measured git yet — which the digest
     /// cannot know, because deferring the probe is the CALLER's decision.
     ///
-    /// `remote` is a SECOND deferrable measurement and defaults to `nil`, which
+    /// `origin` is a SECOND deferrable measurement and defaults to `nil`, which
     /// renders as "not verified yet" rather than as "no remote". A caller that
     /// paid for git may or may not have paid for the config read, and those are
-    /// different facts.
-    public static func of(_ field: DigestGitField?, remote: GitRemote? = nil) -> GitGlyph {
+    /// different facts. It carries the host AND the repository name because one
+    /// read of `.git/config` answers both — see `GitOrigin`.
+    public static func of(_ field: DigestGitField?, origin: GitOrigin? = nil) -> GitGlyph {
         // Composed once, for every branch below: the host question has an
         // answer in every state — including "there is no repository to host" —
         // and the tooltip says it in all of them.
-        let host = GitHostMark.of(remote)
+        let host = GitHostMark.of(origin?.remote)
         switch field {
         case .state(let s):
             return GitGlyph(symbol: branchSymbol,
@@ -458,7 +616,8 @@ public struct GitGlyph: Equatable {
                             tone: s.dirty ? .dirty : .clean,
                             baseline: GitBaselineMark.of(s.baseline),
                             mark: branchMark,
-                            host: host)
+                            host: host,
+                            segments: GitRowSegment.compose(s, origin: origin))
         case .absent(let why):
             // No glyph: the sentence IS the whole row, and a mark here would
             // be one more shape competing with the branch mark above it.
@@ -535,22 +694,29 @@ public struct ProjectDigest: Equatable {
     public let identity: DigestText
     public let activity: DigestActivityField
     public let git: DigestGitField
-    /// Where `origin` lives. On the CHEAP path deliberately, unlike `git`: it
-    /// is one head-bounded read of `.git/config` with no process, in the same
-    /// class as the PROJECT.md read (0.29 ms/card), whereas the git status probe
-    /// is ~102 ms and had to be staged off the reload cycle. Splitting it out
-    /// would buy nothing and would give the card a fifth loading state.
-    public let remote: GitRemote
+    /// Where `origin` lives AND what the repository is called there. On the
+    /// CHEAP path deliberately, unlike `git`: it is one head-bounded read of
+    /// `.git/config` with no process, in the same class as the PROJECT.md read
+    /// (0.29 ms/card), whereas the git status probe is ~102 ms and had to be
+    /// staged off the reload cycle. Splitting it out would buy nothing and would
+    /// give the card a fifth loading state — and the repository NAME rides
+    /// along for free, since it is parsed from the URL that read already
+    /// returned.
+    public let origin: GitOrigin
+
+    /// Where the code is hosted. A view onto `origin`, not a second field: two
+    /// stored copies of one measurement is how they would come to disagree.
+    public var remote: GitRemote { origin.remote }
 
     public init(role: ProjectRole, repos: Int?, identity: DigestText,
                 activity: DigestActivityField, git: DigestGitField,
-                remote: GitRemote = .unmeasured("remoto não verificado")) {
+                origin: GitOrigin = .unmeasured) {
         self.role = role
         self.repos = repos
         self.identity = identity
         self.activity = activity
         self.git = git
-        self.remote = remote
+        self.origin = origin
     }
 
     /// `"workspace · 33 repos"`, or just `"workspace"` when the count was
@@ -636,7 +802,7 @@ extension ProjectDigest {
             identity: loadIdentity(path: path, fileManager: fm),
             activity: loadActivity(path: path, fileManager: fm, now: now, calendar: calendar),
             git: loadGit(path: path, probe: probe),
-            remote: GitRemoteHost.origin(at: path, fileManager: fm)
+            origin: GitRemoteHost.originInfo(at: path, fileManager: fm)
         )
     }
 

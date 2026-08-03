@@ -6268,11 +6268,11 @@ test("GitHostMark: o logo aparece se e somente se o host foi MEDIDO") {
 
 test("GitGlyph: o host entra na linha sem desfazer a distinção de quatro estados") {
     let repo = GitStatusSnapshot(branch: "main", dirty: false, ahead: 0, behind: 0)
-    let remoto = GitRemote.host(.github, "github.com")
-    let g = [GitGlyph.of(.state(repo), remote: remoto),
-             GitGlyph.of(.absent("sem git"), remote: remoto),
-             GitGlyph.of(.unavailable("timeout"), remote: remoto),
-             GitGlyph.of(nil, remote: remoto)]
+    let remoto = GitOrigin(remote: .host(.github, "github.com"), repo: "r")
+    let g = [GitGlyph.of(.state(repo), origin: remoto),
+             GitGlyph.of(.absent("sem git"), origin: remoto),
+             GitGlyph.of(.unavailable("timeout"), origin: remoto),
+             GitGlyph.of(nil, origin: remoto)]
     for i in 0..<g.count {
         for j in (i + 1)..<g.count {
             assertFalse(g[i].tone == g[j].tone && g[i].text == g[j].text,
@@ -6311,6 +6311,175 @@ test("ProjectDigest carrega o remoto no caminho BARATO, junto dos outros campos"
     let d = ProjectDigest.load(path: repo, role: .project, repos: nil, git: .none)
     assertEqual(d.remote.kind, .bitbucket, "o remoto não veio no caminho barato")
     assertTrue(d.git.isUnavailable, "a sonda cara não deveria ter rodado")
+}
+
+// MARK: - Segmentos da linha de git: cada fato com seu ícone, sua palavra e sua cor
+
+test("GitRemoteHost.repoName: o nome sai da URL em toda forma que o git aceita") {
+    let casos: [(String, String?)] = [
+        ("https://github.com/u/r.git", "r"),
+        ("https://github.com/u/r", "r"),
+        ("https://github.com/u/r/", "r"),           // barra sobrando não vira vazio
+        ("ssh://git@github.com:22/u/r.git", "r"),
+        ("git@github.com:u/r.git", "r"),            // scp-like: a forma padrão do clone SSH
+        ("git@github-personal:u/r.git", "r"),       // ALIAS de host do ~/.ssh/config
+        ("git@host:r.git", "r"),                    // sem separador de caminho
+        ("/Users/x/repo.git", "repo"),              // caminho local ainda nomeia um repo
+        ("https://github.com/", nil),               // não há último componente
+        ("", nil),
+    ]
+    for (url, esperado) in casos {
+        assertEqual(GitRemoteHost.repoName(ofRemoteURL: url), esperado,
+                    "nome errado para \(url)")
+    }
+    // O nome NÃO depende do host ser reconhecido: o alias de SSH tem host
+    // irreconhecível (`.other`) e nome perfeitamente bom, e é exatamente nele
+    // que o nome da pasta tem menos chance de bater com o do repositório.
+    let alias = GitOrigin(remote: .other("github-personal"),
+                          repo: GitRemoteHost.repoName(ofRemoteURL: "git@github-personal:u/r.git"))
+    assertEqual(alias.repo, "r", "o alias de SSH perdeu o nome do repositório")
+    assertTrue(alias.remote.kind == nil, "um alias de host ganhou o logo de um host medido")
+}
+
+test("GitOrigin: uma leitura de config responde host E nome, e a ausência é nomeada") {
+    let comRemoto = fakeRepo("origin-info-com", [
+        ".git/config": "[remote \"origin\"]\n\turl = git@github.com:mwtelles/forge-agent.git\n",
+    ])
+    let semRemoto = fakeRepo("origin-info-sem", [".git/config": "[core]\n\tbare = false\n"])
+    defer {
+        try? FileManager.default.removeItem(atPath: comRemoto)
+        try? FileManager.default.removeItem(atPath: semRemoto)
+    }
+    let a = GitRemoteHost.originInfo(at: comRemoto)
+    assertEqual(a.remote.kind, .github)
+    assertEqual(a.repo, "forge-agent", "o nome do repositório não veio da mesma leitura")
+
+    // Repositório sem remoto nenhum: NÃO existe nome. E, sobretudo, o nome da
+    // PASTA não é usado como substituto — o título do card já é a pasta, e
+    // imprimi-la duas vezes como se fossem dois fatos é a classe de afirmação
+    // falsa que esta tela vem removendo.
+    let b = GitRemoteHost.originInfo(at: semRemoto)
+    assertTrue(b.repo == nil, "inventou um nome de repositório: \(String(describing: b.repo))")
+    let pasta = URL(fileURLWithPath: semRemoto).lastPathComponent
+    assertFalse(b.repo == pasta, "o nome da pasta se passou por nome do repositório")
+    if case .absent = b.remote {} else { assertTrue(false, "sem remoto virou outra coisa") }
+
+    // `origin(at:)` continua respondendo o mesmo host — uma segunda leitura não
+    // pode discordar da primeira.
+    assertEqual(GitRemoteHost.origin(at: comRemoto), a.remote)
+}
+
+test("GitRowSegment: todo segmento tem ícone, palavra e frase — nenhum vem em branco") {
+    let sujo = GitStatusSnapshot(branch: "feat/x", dirty: true, ahead: 3, behind: 2)
+    let segs = GitRowSegment.compose(sujo, origin: GitOrigin(remote: .host(.github, "github.com"),
+                                                             repo: "forge-agent"))
+    assertEqual(segs.map(\.kind), [.repo, .branch, .changes, .upstream],
+                "a ordem dos segmentos mudou: \(segs.map(\.kind.rawValue))")
+    for s in segs {
+        assertFalse(s.text.isEmpty, "segmento \(s.kind.rawValue) sem palavra — um vazio na linha")
+        assertFalse(s.help.isEmpty, "segmento \(s.kind.rawValue) sem frase — silêncio não interrogável")
+        assertTrue(s.symbol != nil || s.mark != nil,
+                   "segmento \(s.kind.rawValue) sem ícone — o operador pediu ícone E texto")
+    }
+    // O ponto inteiro da estrutura: cada par tem SEU tom. Uma string só,
+    // desenhada num run só, não consegue colorir o meio.
+    assertEqual(segs.first(where: { $0.kind == .changes })?.tone, .dirty)
+    assertEqual(segs.first(where: { $0.kind == .upstream })?.tone, .diverged)
+    assertFalse(segs.first(where: { $0.kind == .branch })?.tone == .dirty,
+                "o nome da branch pegou a cor das alterações — voltou a ser um run só")
+    // O repositório leva a marca do host MEDIDO; a branch leva a marca de branch.
+    assertEqual(segs[0].mark, GitHostKind.github.mark)
+    assertEqual(segs[1].mark, GitGlyph.branchMark)
+    assertEqual(segs[1].symbol, GitGlyph.branchSymbol, "o piso SF Symbol sumiu do segmento de branch")
+}
+
+test("GitRowSegment: 'sem upstream' nunca desenha como '0 à frente, 0 atrás'") {
+    let base = { (a: Int?, b: Int?) in
+        GitRowSegment.compose(GitStatusSnapshot(branch: "main", dirty: false, ahead: a, behind: b),
+                              origin: nil)
+    }
+    let semUpstream = base(nil, nil)     // NÃO medido: não há com o que comparar
+    let emDia = base(0, 0)               // medido: nivelado
+
+    let s = semUpstream.first(where: { $0.kind == .upstream })
+    assertTrue(s != nil, "sem upstream virou silêncio — indistinguível de 'em dia' na tela")
+    assertFalse(s!.text.contains("0"), "um fato NÃO medido foi desenhado como zero: \(s!.text)")
+    assertEqual(s!.tone, .undetermined)
+    // Em dia não gasta pixel — e por isso o de cima não pode gastar zero nenhum.
+    assertTrue(emDia.first(where: { $0.kind == .upstream }) == nil,
+               "'em dia com o upstream' virou um segmento permanente em todo card")
+    // A distinção continua interrogável nas PALAVRAS dos dois casos, que é o
+    // que sobra quando um deles não desenha nada.
+    let hSem = GitStatusSnapshot(branch: "main", dirty: false, ahead: nil, behind: nil).help
+    let hDia = GitStatusSnapshot(branch: "main", dirty: false, ahead: 0, behind: 0).help
+    assertFalse(hSem == hDia, "as duas frases colapsaram numa só: \(hSem)")
+
+    // Direção não pode se inverter em silêncio: à frente e atrás têm símbolo,
+    // tom e frase distintos.
+    let frente = base(3, 0).first(where: { $0.kind == .upstream })!
+    let atras = base(0, 3).first(where: { $0.kind == .upstream })!
+    assertEqual(frente.symbol, GitBaselineMark.aheadSymbol)
+    assertEqual(atras.symbol, GitBaselineMark.behindSymbol)
+    assertEqual(frente.tone, .ahead)
+    assertEqual(atras.tone, .behind, "atrás perdeu o tom acionável — é o que produz worktree stale")
+    assertTrue(atras.help.contains("atrás"), "a frase de 'atrás' não diz atrás: \(atras.help)")
+    assertFalse(frente.help.contains("atrás"), "'à frente' diz atrás na frase: \(frente.help)")
+}
+
+test("GitRowSegment: 'limpo' é quieto e 'alterações' é colorido — e nada é inventado") {
+    let limpo = GitRowSegment.compose(
+        GitStatusSnapshot(branch: "main", dirty: false, ahead: 0, behind: 0), origin: nil)
+    let sujo = GitRowSegment.compose(
+        GitStatusSnapshot(branch: "main", dirty: true, ahead: 0, behind: 0), origin: nil)
+    assertTrue(limpo.first(where: { $0.kind == .changes }) == nil,
+               "um segmento 'limpo' permanente voltou — 14 cards dizendo que nada aconteceu")
+    assertEqual(sujo.first(where: { $0.kind == .changes })?.tone, .dirty)
+    // Sem remoto informado, NÃO nasce segmento de repositório: nome nenhum é
+    // inventado, e o card não afirma hospedagem que ninguém mediu.
+    assertTrue(limpo.first(where: { $0.kind == .repo }) == nil,
+               "apareceu um nome de repositório sem remoto medido")
+    // A branch é o único segmento que existe sempre — é o que faz a linha ser
+    // legível como git.
+    for s in [limpo, sujo] { assertTrue(s.contains(where: { $0.kind == .branch })) }
+}
+
+test("GitRowSegment: os três estados sem repositório não ganham segmento nenhum") {
+    // Segmentos são um refinamento do `.state`. Os outros três continuam dizendo
+    // exatamente o que diziam — se ganhassem segmentos, um diretório que não é
+    // repositório passaria a desenhar como um que é.
+    let origem = GitOrigin(remote: .host(.github, "github.com"), repo: "r")
+    for g in [GitGlyph.of(.absent("sem git"), origin: origem),
+              GitGlyph.of(.unavailable("timeout"), origin: origem),
+              GitGlyph.of(nil, origin: origem)] {
+        assertTrue(g.segments.isEmpty, "um estado sem repositório ganhou segmentos: \(g.text)")
+        assertFalse(g.text.isEmpty, "o texto do estado sem repositório sumiu junto")
+    }
+    let comRepo = GitGlyph.of(.state(GitStatusSnapshot(branch: "main", dirty: false,
+                                                       ahead: 0, behind: 0)), origin: origem)
+    assertFalse(comRepo.segments.isEmpty, "o estado COM repositório perdeu os segmentos")
+    // E o repositório medido aparece pelo NOME, que é o pedido do operador.
+    assertEqual(comRepo.segments.first?.kind, .repo)
+    assertEqual(comRepo.segments.first?.text, "r")
+}
+
+test("GitRowSegment: todo símbolo dos segmentos existe de verdade") {
+    let sujo = GitStatusSnapshot(branch: "main", dirty: true, ahead: nil, behind: nil)
+    var nomes = GitRowSegment.compose(sujo, origin: GitOrigin(remote: .other("git.sr.ht"),
+                                                              repo: "r")).compactMap(\.symbol)
+    // O host sem marca vendorizada cai no símbolo de repositório — é ele que
+    // precisa existir, senão a queda é para um quadrado em branco.
+    nomes += [GitRowSegment.repoSymbol, GitRowSegment.changesSymbol,
+              GitRowSegment.noUpstreamSymbol]
+    assertFalse(nomes.isEmpty, "nenhum símbolo exercitado = teste cego")
+    for n in nomes {
+        assertTrue(NSImage(systemSymbolName: n, accessibilityDescription: nil) != nil,
+                   "SF Symbol inexistente: \(n)")
+    }
+    // Host medido sem marca: nada de logo emprestado, mas o segmento continua
+    // existindo e dizendo o nome do host na frase.
+    let seg = GitRowSegment.compose(sujo, origin: GitOrigin(remote: .other("git.sr.ht"), repo: "r"))[0]
+    assertTrue(seg.mark == nil, "um host sem marca pegou o logo de outro")
+    assertTrue(seg.help.contains("git.sr.ht"), "o nome do host sumiu da frase: \(seg.help)")
 }
 
 print("\n" + String(repeating: "─", count: 60))
