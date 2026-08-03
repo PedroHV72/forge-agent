@@ -145,6 +145,63 @@ function assertWrite(cwd, opts) {
   return { ok: false, message: formatSchemaWarning(res) };
 }
 
+// ── Warning dedupe (T04) ─────────────────────────────────────────────────────
+// One emission per process per cwd. Without this a single `--render` that walks
+// N fragments through N guarded reads would print N identical warnings and bury
+// the signal it exists to raise. The Set lives HERE (not in each of the 4
+// readers) so the four wire the exact same mechanic — forge-projection.renderX
+// calls forge-ledger.listFragments, so a per-file Set would still double-emit.
+// Keyed by path.resolve(cwd): two spellings of the same directory are one key.
+const WARNED_CWDS = new Set();
+
+// ── emitSchemaWarningOnce ────────────────────────────────────────────────────
+// Writes `warning` to stderr at most once per (process, resolved cwd).
+// Returns true when it actually emitted. NEVER throws and never writes to
+// stdout — a read must never fail because a warning could not be printed
+// (stderr closed, EPIPE, unresolvable cwd).
+function emitSchemaWarningOnce(cwd, warning) {
+  if (!warning) return false;
+  try {
+    const key = path.resolve(cwd || process.cwd());
+    if (WARNED_CWDS.has(key)) return false;
+    WARNED_CWDS.add(key);
+    process.stderr.write(`${warning}\n`);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Test-only seam: lets a suite exercise dedupe across scenarios inside one
+// process. Not used by production code.
+function _resetSchemaWarnings() {
+  WARNED_CWDS.clear();
+}
+
+// ── guardReadAndWarn ─────────────────────────────────────────────────────────
+// The single read-side entry point the 4 fragment-store readers call:
+// guardRead + deduped stderr emission in one step. Returns guardRead's shape
+// unchanged ({ ok, partial, warning }) — `partial` stays true on every call,
+// including the ones whose warning was deduped, so envelope marking never
+// depends on emission order. Never throws (fail-open all the way down).
+function guardReadAndWarn(cwd, opts) {
+  const res = guardRead(cwd, opts);
+  if (res.partial) emitSchemaWarningOnce(cwd, res.warning);
+  return res;
+}
+
+// ── assertWriteOrThrow ───────────────────────────────────────────────────────
+// The single write-side entry point. assertWrite returns rather than throws by
+// design (T03 invariant); the fragment-store writers want a throw, because the
+// CLI `catch` blocks already translate a thrown Error into "message on stderr +
+// exit 1". Placed at the TOP of each writeFragment/writeAll so the refusal
+// happens before any bytes reach disk.
+function assertWriteOrThrow(cwd, opts) {
+  const res = assertWrite(cwd, opts);
+  if (!res.ok) throw new Error(res.message);
+  return res;
+}
+
 module.exports = {
   parseSchemaSemver,
   cmpSemver,
@@ -152,6 +209,10 @@ module.exports = {
   guardRead,
   assertWrite,
   formatSchemaWarning,
+  emitSchemaWarningOnce,
+  guardReadAndWarn,
+  assertWriteOrThrow,
+  _resetSchemaWarnings,
 };
 
 // ── CLI ────────────────────────────────────────────────────────────────────
