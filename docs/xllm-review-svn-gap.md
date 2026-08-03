@@ -2,8 +2,12 @@
 
 > **Status:** 🟢 **resolvido** (2026-07-15). Descoberto ao ativar o challenger Codex no repo **WDMA**
 > (working copy **SVN**, sem `.git`). **Issue 2 (adaptador `--skip-git-repo-check`) foi mergeado na PR #42.**
-> **Issue 1 (diff SVN) é corrigido NESTE branch** (`feat/review-svn-diff`): `Step 1` do
-> `shared/forge-review.md` agora detecta o VCS e usa `svn diff` em working copies SVN.
+> **Issue 1 (diff SVN) foi corrigido** (`feat/review-svn-diff`): `Step 1` do
+> `shared/forge-review.md` detecta o VCS em working copies SVN. A **Fase 2**
+> (`feat/review-svn-diff-scoped`) substituiu o `svn diff` cru por `scripts/forge-review-diff.js` —
+> escopo por unidade, arquivos novos incluídos, `--name-only`/`-- <files>` funcionando — e estendeu o
+> ramo SVN ao boundary de **task solta** (`/forge-task` Step 5.5), que era git-only. Ver a seção
+> *Ressalva resolvida* abaixo.
 > **Origem:** sessão `/forge-prefs` — reconfiguração de modelos + tentativa de ligar `review.challenger: codex`.
 
 ## TL;DR
@@ -45,13 +49,29 @@ review gate em geral é um no-op silencioso.
 Serve tanto o review de slice (`forge-auto`/`forge-next`) quanto o de task (`forge-task` Step 5.5),
 pois ambos consomem o `Step 1`.
 
-**Ressalva conhecida (polish futuro):** `svn diff` é **unscoped** — inclui qualquer arquivo versionado
-modificado no working copy, inclusive artefatos de build versionados (ex.: `obj/*.json`, `*.nuget.*`).
-Em git o `.gitignore` os exclui; em SVN eles entram no diff. O adaptador trunca em 4000 linhas, então
-não quebra, mas gera ruído. Refino possível: scoping por path ou respeitar um ignore-list no `Step 1`. **Fora de escopo (follow-up):** o modo **execute** do codex
-(`--mode execute` em `scripts/forge-xllm.js`) e o diff `START_SHA`-based do `forge-task` continuam
-git-only (`git rev-parse`/`git diff --name-status $START_SHA` + reset via `git checkout`/`clean`) —
-rodar TASK via codex em SVN é um item maior, separado deste.
+**✅ Ressalva resolvida (Fase 2).** A ressalva registrada aqui — `svn diff` **unscoped** inclui
+qualquer arquivo modificado no working copy — era maior do que "ruído": numa working copy
+**compartilhada** por mais de um desenvolvedor, o diff carrega o trabalho não-commitado dos colegas
+(medido em campo: 49 arquivos, 8 da unidade), então o challenger gasta orçamento objetando código que
+a unidade não é dona. Somavam-se dois defeitos não registrados na época:
+
+- **Arquivo novo (`?`) não aparece em `svn diff` de jeito nenhum.** Numa slice cujo change inteiro
+  eram dois arquivos novos, o review teria lido quase nada e renderizado **limpo** — o pior resultado
+  possível para um gate.
+- **`svn diff --name-only` não existe**, e três consumidores *anexam* argumentos ao `DIFF_CMD`
+  (`$DIFF_CMD --name-only` no pattern scan e no probe de diff vazio; `{DIFF_CMD} -- <files>` no
+  sharding do Step 2.0). O `DIFF_CMD="svn diff"` desta correção quebrava os três silenciosamente.
+
+Os três são resolvidos por `scripts/forge-review-diff.js`, que é o `DIFF_CMD` do ramo SVN nos **dois**
+boundaries (slice e task): escopa ao manifesto de paths da unidade, reconstrói arquivos novos como
+hunks de adição, e aceita `--name-only` / `-- <files>`. Nunca produz diff vazio por escopo — manifesto
+ausente ou que não casa nada cai no comportamento unscoped e declara isso em `--scope-report`. O
+`forge-cost-policy.js` ganhou `--scope-file` pelo mesmo motivo: sem ele a policy contava os arquivos
+alheios e promovia a review a dialectic/sharding sobre código de outro dono.
+
+**Fora de escopo (follow-up):** o modo **execute** do codex (`--mode execute` em
+`scripts/forge-xllm.js`) continua git-only (`git rev-parse`/`git diff --name-status $START_SHA` +
+reset via `git checkout`/`clean`) — rodar TASK via codex em SVN é um item maior, separado deste.
 
 ## ✅ Issue 2 — `forge-xllm.js` não passa `--skip-git-repo-check` (corrigido nesta PR)
 

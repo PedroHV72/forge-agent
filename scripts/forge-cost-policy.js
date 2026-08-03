@@ -181,6 +181,42 @@ function collectDiff(cwd, base) {
   return { vcs: 'none', base: null, ok: false, entries: [], warning: 'vcs-unavailable' };
 }
 
+/**
+ * Restricts a collected diff to one unit's paths.
+ *
+ * Only SVN needs this. Git scopes itself: the slice branch and `.gitignore`
+ * already exclude other people's work. An SVN working copy has neither, and is
+ * routinely shared, so the raw diff carries colleagues' uncommitted files —
+ * enough of them to push this policy from `flags` to `dialectic` and to shard
+ * the review across challengers reading code the unit does not own.
+ *
+ * Fails open in both empty cases: an unreadable/empty scope file, or one that
+ * matches nothing, leaves the diff untouched rather than shrinking it to zero.
+ * A zero-entry diff would decide `skip` — turning a mis-applied scope into a
+ * silently skipped review, which is the failure this whole layer guards against.
+ */
+function applyScopeFile(diff, scopeFile) {
+  if (!scopeFile) return diff;
+  let wanted;
+  try {
+    wanted = new Set(
+      fs.readFileSync(scopeFile, 'utf8').split(/\r?\n/).map(normalizePath).filter(Boolean)
+    );
+  } catch {
+    return { ...diff, warning: diff.warning || 'scope-file-unreadable' };
+  }
+  if (wanted.size === 0) return { ...diff, warning: diff.warning || 'scope-file-empty' };
+
+  const inScope = entry => {
+    if (wanted.has(entry.file)) return true;
+    for (const declared of wanted) if (entry.file.startsWith(`${declared}/`)) return true;
+    return false;
+  };
+  const entries = diff.entries.filter(inScope);
+  if (entries.length === 0) return { ...diff, warning: diff.warning || 'scope-file-matched-nothing' };
+  return { ...diff, entries, scoped: diff.entries.length - entries.length };
+}
+
 function normalizeReviewConfig(review) {
   const cfg = review && typeof review === 'object' ? review : {};
   const mode = ['enabled', 'disabled'].includes(String(cfg.mode || '').toLowerCase())
@@ -368,6 +404,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--cwd') out.cwd = argv[++i];
     else if (arg === '--base') out.base = argv[++i];
+    else if (arg === '--scope-file') out.scopeFile = argv[++i];
     else if (arg === '--risk') out.risk = argv[++i];
     else if (arg === '--unit-type') out.unitType = argv[++i];
     else if (arg === '--security-present') out.securityPresent = true;
@@ -382,7 +419,7 @@ function parseArgs(argv) {
 function usage() {
   return [
     'Usage:',
-    '  node forge-cost-policy.js review [--cwd <dir>] [--base <git-ref>] [--risk normal|high] [--security-present] [--verification-drift]',
+    '  node forge-cost-policy.js review [--cwd <dir>] [--base <git-ref>] [--scope-file <f>] [--risk normal|high] [--security-present] [--verification-drift]',
     '  <result | node forge-cost-policy.js memory --unit-type <type> [--cwd <dir>] --stdin',
   ].join('\n');
 }
@@ -401,7 +438,7 @@ function runCli(argv) {
 
   const prefs = readPrefs(args.cwd);
   if (args.command === 'review') {
-    const diff = collectDiff(args.cwd, args.base);
+    const diff = applyScopeFile(collectDiff(args.cwd, args.base), args.scopeFile);
     let decision = decideReview({
       review: prefs.review,
       entries: diff.entries,
@@ -427,6 +464,7 @@ function runCli(argv) {
 }
 
 module.exports = {
+  applyScopeFile,
   parseNumstat,
   collectDiff,
   normalizeReviewConfig,

@@ -4,8 +4,8 @@ Authoritative spec for the **review gate**: a two-agent confrontation on a compl
 
 | Consumer | Boundary | DIFF_CMD | Artifact | MODE |
 |----------|----------|----------|----------|------|
-| `forge-auto` / `forge-next` (before `complete-slice`) | per-slice — branch `gsd/{M###}/{S##}` still **unmerged** | git: `git diff {merge-base}...HEAD` · svn: `svn diff` (Step 1, VCS-aware) | `{S##}-REVIEW.md` | `auto` / `interactive` |
-| `forge-task` (Step 5.5) | standalone task | `git diff {START_SHA}..HEAD` (worktree fallback) | `{TASK_ID}-REVIEW.md` | `interactive` |
+| `forge-auto` / `forge-next` (before `complete-slice`) | per-slice — branch `gsd/{M###}/{S##}` still **unmerged** | git: `git diff {merge-base}...HEAD` · svn: `forge-review-diff.js` (Step 1, VCS-aware) | `{S##}-REVIEW.md` | `auto` / `interactive` |
+| `forge-task` (Step 5.5) | standalone task | git: `git diff {START_SHA}..HEAD` (worktree fallback) · svn: `forge-review-diff.js` | `{TASK_ID}-REVIEW.md` | `interactive` |
 
 Steps 2–8 below are boundary-agnostic — only the four bindings above differ. Step 9 (milestone-final triage) applies only to the per-slice boundary. The rest of this doc is written in slice terms (`{S##}-REVIEW.md`); substitute the task bindings when invoked from `forge-task`.
 
@@ -306,13 +306,45 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     DIFF_CMD="git diff HEAD"
   fi
 elif svn info >/dev/null 2>&1; then
-  # svn — no per-slice branch/merge-base; the reviewable change is the uncommitted working copy.
-  DIFF_CMD="svn diff"
+  # svn — scoped to this slice's paths, new files included (M017 Phase 2).
+  DIFF_CMD="node \"$FORGE_SCRIPTS_DIR/forge-review-diff.js\" --cwd \"${CODE_DIR:-$WORKING_DIR}\" --unit-dir \"$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}\""
+  # Only this branch answers --scope-report; asking git would rely on where it
+  # happens to print its usage text.
+  SCOPE_REPORT=$(eval "$DIFF_CMD" --scope-report 2>/dev/null || echo "")
 else
   # unknown VCS (or CLI absent) — degrade to the no-diff path below, never error.
   DIFF_CMD="git diff HEAD"
 fi
 ```
+
+**Why the SVN branch is a program and not `svn diff`.** Three properties the bare command
+cannot deliver, each observed in the field:
+
+- **Scope.** `svn diff` with no paths is the ENTIRE working copy. With no per-slice branch and
+  a working copy shared by several developers at once, it carries their uncommitted work —
+  measured: 49 files, 8 of them the unit's. The challenger then spends its budget objecting to
+  code this slice does not own. `--unit-dir` mines the slice's `T##-PLAN.md`/`*-SUMMARY.md` for
+  declared outputs and intersects them with what actually changed.
+- **New files.** `svn diff` cannot render an unversioned (`?`) file at all. On a slice whose
+  whole change was two new files, the review would have read nothing and rendered CLEAN — the
+  worst outcome a gate has. They are reconstructed as added-file hunks.
+- **Appended arguments.** `$DIFF_CMD --name-only` (Step 1.5/pattern scan) and `{DIFF_CMD} -- <files>`
+  (Step 2.0 sharding) are appended by consumers below. `svn diff --name-only` does not exist, so
+  the previous `DIFF_CMD="svn diff"` broke both of them silently. The program accepts both.
+
+`.gsd/**` is excluded up front (canonical `isGsdPath` predicate) and reported as `gsd_excluded`:
+in an SVN working copy Forge's own plans, summaries and evidence logs sit in the tree as unversioned
+files, so the unscoped diff was handing the challenger its own artifacts to review.
+
+The SVN baseline marker stays intentionally inert: `svnversion` yields `44531:44534M` in a mixed-revision
+working copy, which `svn diff -r` does not accept, and diffing against a recorded revision in a shared
+working copy would import other developers' landed commits. The diff is against BASE.
+
+Scoping never produces an empty diff — an absent or non-matching manifest falls back to the whole
+working copy (previous behavior) and says so in `--scope-report`, captured as `$SCOPE_REPORT` above.
+Disclose it in the artifact, including `excluded`: a review that skipped files must never read as one
+that found nothing. A `reason` of `unscoped:*` means the manifest did not apply and the whole working
+copy was read — the operator has to be able to see that.
 
 If `$DIFF_CMD` still produces no changes → write a minimal `{S##}-REVIEW.md` stating "no diff to review" and proceed. Do not dispatch agents.
 
@@ -327,6 +359,16 @@ never spend an LLM call deciding whether to spend an LLM call.
 REVIEW_CODE_DIR="${CODE_DIR:-$WORKING_DIR}"
 POLICY_ARGS=(review --cwd "$REVIEW_CODE_DIR" --risk "${SLICE_RISK:-normal}")
 [ -n "${BASE:-}" ] && POLICY_ARGS+=(--base "$BASE")
+# SVN only: the policy must count the SCOPED diff. Left unscoped it reads the whole
+# shared working copy, so a colleague's uncommitted files decide this slice's review
+# budget — promoting to dialectic and sharding challengers across code the unit does
+# not own. Fails open: the flag is added only when the scope list was produced.
+if [ -n "${SCOPE_REPORT:-}" ]; then
+  mkdir -p "$WORKING_DIR/.gsd/forge"
+  REVIEW_SCOPE_FILE="$WORKING_DIR/.gsd/forge/review-scope-{S##}.txt"
+  eval "$DIFF_CMD" --name-only > "$REVIEW_SCOPE_FILE" 2>/dev/null \
+    && POLICY_ARGS+=(--scope-file "$REVIEW_SCOPE_FILE")
+fi
 compgen -G "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/tasks/*/*-SECURITY.md" >/dev/null && POLICY_ARGS+=(--security-present)
 grep -Eq 'substantive:[[:space:]]*(false|✗)|wired:[[:space:]]*(false|✗)' \
   "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/{S##}-VERIFICATION.md" 2>/dev/null \
@@ -747,6 +789,13 @@ The artifact is the **dialogue**, not a flag dump. Auditable, durable with the m
 
 ## Pattern hits (scan determinístico)
 - `path:line` — pattern `{p}` — <context>   ← optional; deterministic grep, same patterns as forge-completer step 4a
+
+## Escopo do diff (SVN)                      ← only when `$SCOPE_REPORT` is non-empty (SVN boundary)
+- **Baseline:** BASE (marker inerte — ver Step 1)
+- **Critério:** {reason}
+- **Revisados:** {scoped, one per line}
+- **Fora do escopo:** {excluded, one per line — "(nenhum)" when empty}
+- **Artefatos `.gsd/` omitidos:** {gsd_excluded}
 ```
 
 Omit any section with zero items — **exceto** o bloco de indisponibilidade do caminho `review-agent-unavailable`, que é obrigatório sempre que um agente não pôde ser ouvido e nunca pode ser lido como aprovação (ver **§ Agent unavailability (review-agent-unavailable)**).
