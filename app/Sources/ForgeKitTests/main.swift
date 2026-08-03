@@ -8,6 +8,11 @@
 
 import Foundation
 import ForgeKit
+// Only for asserting that the SF Symbol names ForgeKit hands the view actually
+// resolve. ForgeKit itself carries no AppKit/SwiftUI — a symbol name is data,
+// but an INVALID one renders as a blank square, and checking that is the one
+// thing that needs the real symbol set rather than the type system.
+import AppKit
 
 var passed = 0
 var failed = 0
@@ -5405,6 +5410,213 @@ test("identityLimit não corta as descrições reais que o card existe para most
     let cut = ProjectDigest.identityLine(fromProjectDoc: "# t\n\n\(runaway)\n").display
     assertTrue(cut.hasSuffix("…"))
     assertLessOrEqual(cut.count, ProjectDigest.identityLimit + 1)
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ProjectStack — o que o projeto é construído com, e o ícone que diz isso
+//
+// O caso que governa esta seção é `forge-agent`: seu único sinal de stack é
+// `app/Package.swift`, UM NÍVEL ABAIXO da raiz. Um detector que só olha a raiz
+// responde "sem stack" para o próprio repositório de onde este código sai — e
+// errar com confiança sobre o projeto mais visível do operador é exatamente a
+// falha que a milestone anterior existiu para acabar. Por isso a forma do
+// forge-agent é fixture, não nota de rodapé.
+
+func stackTree(_ tag: String, _ files: [String]) -> String {
+    let tmp = NSTemporaryDirectory() + "forge-stack-\(tag)-\(UUID().uuidString.prefix(8))"
+    let fm = FileManager.default
+    for f in files {
+        let full = tmp + "/" + f
+        try? fm.createDirectory(atPath: (full as NSString).deletingLastPathComponent,
+                                withIntermediateDirectories: true)
+        fm.createFile(atPath: full, contents: Data("{}".utf8))
+    }
+    try? fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+    return tmp
+}
+
+test("ProjectStack: a forma do forge-agent — assinatura um nível abaixo — é detectada") {
+    // A raiz do forge-agent não tem NENHUMA assinatura. Só `app/Package.swift`.
+    let tmp = stackTree("forgeagent", ["app/Package.swift", "scripts/forge-ids.js",
+                                       "README.md", ".gsd/PROJECT.md"])
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let d = ProjectStack.detect(path: tmp)
+    assertEqual(d.primary, .swift, "assinatura em app/ não pode passar por 'sem stack'")
+
+    // E o ícone que sai disso é o do Swift, não o de papel-neutro do role.
+    let g = StackGlyph.of(d, role: .project)
+    assertEqual(g.symbol, "swift")
+    assertTrue(g.isStack, "stack medida tem de se declarar medida")
+
+    // MORDIDA PROVADA: sem a descida de um nível, este mesmo diretório vira
+    // `.none`. É o teste falhando de propósito contra a implementação ingênua.
+    let raso = ProjectStack.signatures(in: tmp, fileManager: .default)
+    assertTrue(raso.isEmpty, "a raiz sozinha não tem nada — é por isso que a profundidade existe")
+}
+
+test("ProjectStack: a forma do message — stack inteira em subpastas irmãs") {
+    let tmp = stackTree("message", ["docker-compose.yml",
+                                    "platform-backend/package.json",
+                                    "platform-frontend/next.config.ts",
+                                    "platform-frontend/package.json"])
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let d = ProjectStack.detect(path: tmp)
+    assertEqual(d.kinds, [.next, .node, .docker], "união raiz+nível-1, ordenada por especificidade")
+    // Um projeto com três assinaturas não é três projetos: um glifo só.
+    assertEqual(StackGlyph.of(d, role: .project).symbol, "triangle")
+}
+
+test("ProjectStack: framework ganha do runtime, e ambos ganham do empacotamento") {
+    // freyr é um serviço Node que POR ACASO envia em container — não é um
+    // "projeto Docker". feirao-do-lu é Next, não Next+Node+Docker.
+    let freyr = stackTree("freyr", ["package.json", "Dockerfile", "docker-compose.yml"])
+    let feirao = stackTree("feirao", ["package.json", "next.config.ts", "docker-compose.yml"])
+    defer {
+        try? FileManager.default.removeItem(atPath: freyr)
+        try? FileManager.default.removeItem(atPath: feirao)
+    }
+    assertEqual(ProjectStack.detect(path: freyr).primary, .node)
+    assertEqual(ProjectStack.detect(path: feirao).primary, .next)
+
+    // A precedência é total e sem empates — senão o primário de um conjunto
+    // dependeria da ordem de iteração de um Set.
+    let specs = StackKind.allCases.map(\.specificity)
+    assertEqual(Set(specs).count, StackKind.allCases.count, "especificidade tem de ser única")
+}
+
+test("ProjectStack: detectar nada é uma ausência NOMEADA, nunca um slot vazio") {
+    let tmp = stackTree("vazio", ["README.md", "docs/guia.md"])
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let d = ProjectStack.detect(path: tmp)
+    guard case .none(let why) = d else {
+        return assertTrue(false, "diretório legível sem assinatura é .none, não .unmeasured")
+    }
+    assertFalse(why.isEmpty)
+
+    // O card cai no role — que é a única coisa que continua certamente
+    // verdadeira — e nunca desenha vazio.
+    let g = StackGlyph.of(d, role: .workspace)
+    assertEqual(g.symbol, "square.stack.3d.up")
+    assertFalse(g.isStack, "role não é stack medida e não pode se passar por uma")
+    assertFalse(g.help.isEmpty, "ausência sem frase = silêncio indistinguível de detector quebrado")
+}
+
+test("ProjectStack: 'não medido' é visivelmente diferente de 'medido, e não há'") {
+    // Esta é a distinção que a milestone anterior custou três rodadas para
+    // firmar. Um diretório ILEGÍVEL não é um projeto sem stack.
+    let ilegivel = StackDetection.unmeasured("diretório ilegível — stack não verificada")
+    let vazio = StackDetection.none("stack não detectada")
+
+    let gi = StackGlyph.of(ilegivel, role: .project)
+    let gv = StackGlyph.of(vazio, role: .project)
+
+    assertFalse(gi.symbol == gv.symbol, "os dois estados NÃO podem desenhar o mesmo glifo")
+    assertEqual(gi.symbol, "questionmark.square.dashed")
+    assertTrue(ilegivel.isUnmeasured)
+    assertFalse(vazio.isUnmeasured, "uma ausência medida não convida a nova tentativa")
+    assertFalse(gi.help.isEmpty)
+}
+
+test("ProjectStack: diretório inexistente não é medição — é .unmeasured") {
+    let d = ProjectStack.detect(path: "/nao/existe/em/lugar/nenhum-\(UUID().uuidString)")
+    assertTrue(d.isUnmeasured, "não conseguir ler não é um fato sobre a stack do projeto")
+    assertTrue(d.kinds.isEmpty)
+}
+
+test("ProjectStack: node_modules e saídas de build nunca são evidência") {
+    // node_modules tem milhares de package.json e nenhum diz o que ESTE
+    // projeto é. `.build` guarda Package.swift de dependências do SwiftPM —
+    // descer ali reportaria a stack dos outros como sendo a nossa.
+    let tmp = stackTree("outputs", ["README.md",
+                                    "node_modules/package.json",
+                                    ".build/checkouts/Package.swift",
+                                    "dist/go.mod",
+                                    "vendor/Cargo.toml"])
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let d = ProjectStack.detect(path: tmp)
+    assertTrue(d.kinds.isEmpty, "stack de dependência não é stack do projeto: \(d.kinds)")
+    guard case .none = d else { return assertTrue(false, "deveria ser ausência medida") }
+}
+
+test("ProjectStack: tsconfig.json não é assinatura — presente em quase tudo, não distingue nada") {
+    let tmp = stackTree("tsonly", ["tsconfig.json"])
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    assertTrue(ProjectStack.detect(path: tmp).kinds.isEmpty,
+               "um sinal que todo card mostra é a pasta azul genérica outra vez")
+}
+
+test("ProjectStack: todo símbolo que o card pode desenhar existe de verdade") {
+    // Um nome de SF Symbol inválido renderiza como um quadrado em branco — ou
+    // seja, exatamente o slot vazio que este arquivo inteiro existe para
+    // substituir. Só dá para checar isto com AppKit, e é barato.
+    var nomes = StackKind.allCases.map(\.symbolName)
+    nomes += ProjectRole.allCases.map(\.symbolName)
+    nomes += [StackGlyph.of(.unmeasured("x"), role: .project).symbol, "circle.dashed"]
+    for n in nomes {
+        assertTrue(NSImage(systemSymbolName: n, accessibilityDescription: nil) != nil,
+                   "SF Symbol inexistente: \(n)")
+    }
+    // E os glifos de stack são distintos entre si: a forma é o que separa,
+    // porque o ícone tem 30 pt num canto e vai ser varrido, não lido.
+    assertEqual(Set(StackKind.allCases.map(\.symbolName)).count, StackKind.allCases.count)
+}
+
+test("ProjectStack: a regra de composição — stack ganha do role, role é o piso") {
+    // Role JÁ está escrito em texto logo abaixo do nome (`roleLine`). Stack não
+    // está em lugar nenhum do card. Mostrar stack acrescenta um fato; mostrar
+    // role duplica um.
+    let comStack = StackDetection.detected([.node])
+    assertEqual(StackGlyph.of(comStack, role: .workspace).symbol, "hexagon",
+                "um workspace COM stack de raiz mostra a stack — roleLine já diz 'workspace'")
+    assertEqual(StackGlyph.of(.none("x"), role: .workspace).symbol, "square.stack.3d.up",
+                "sem stack, o role é a única coisa certamente verdadeira que resta")
+    assertEqual(StackGlyph.of(.none("x"), role: .folder).symbol, "folder")
+}
+
+test("ProjectStack: o tooltip preserva tudo que foi detectado, o glifo colapsa em um") {
+    let g = StackGlyph.of(.detected([.next, .node, .docker]), role: .project)
+    assertEqual(g.symbol, "triangle")
+    for esperado in ["Next.js", "Node", "Docker"] {
+        assertTrue(g.help.contains(esperado), "tooltip perdeu \(esperado): \(g.help)")
+    }
+    // Com uma só, o tooltip não inventa uma lista de um item.
+    assertEqual(StackGlyph.of(.detected([.swift]), role: .project).help, "Swift")
+}
+
+test("ProjectStack.detect é puro e injetável — nada aqui lê o $HOME real") {
+    // Mesma razão do ProjectDigest: `swift run ForgeKitTests` vê o home REAL
+    // quando lançado à mão e um isolado sob `run-tests.js`, então uma leitura
+    // ambiente passa num caminho de lançamento e mente no outro.
+    let tmp = stackTree("puro", ["go.mod"])
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    assertEqual(ProjectStack.detect(path: tmp, fileManager: FileManager()).primary, .go)
+}
+
+test("ProjectStack: o custo é limitado por construção, não por cache") {
+    // O limite existe para que o custo não dependa de quantas pastas alguém
+    // guarda na raiz. Com 200 subpastas, apenas `subdirectoryLimit` são
+    // examinadas — e a assinatura fora do corte não é encontrada, que é o
+    // comportamento declarado, não um acidente.
+    var files: [String] = []
+    for i in 0..<200 { files.append(String(format: "d%03d/leia.md", i)) }
+    files.append("z999-fora-do-corte/go.mod")
+    let tmp = stackTree("cap", files)
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    assertEqual(ProjectStack.subdirectoryLimit, 24)
+    let d = ProjectStack.detect(path: tmp)
+    assertTrue(d.kinds.isEmpty, "assinatura além do teto não é varrida — custo é limitado")
+
+    // E dentro do teto ela É achada: o teto corta a cauda patológica, não a
+    // funcionalidade.
+    let dentro = stackTree("cap2", ["a-primeira/go.mod", "b/leia.md"])
+    defer { try? FileManager.default.removeItem(atPath: dentro) }
+    assertEqual(ProjectStack.detect(path: dentro).primary, .go)
 }
 
 print("\n" + String(repeating: "─", count: 60))

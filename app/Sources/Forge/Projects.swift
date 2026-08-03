@@ -43,9 +43,13 @@ struct ProjectStatus: Codable {
 
 // MARK: - Folder appearance
 
-/// Uses the folder's real Finder icon and colour tags, so a project looks in
-/// the app exactly as it does in Finder — including custom icons and tags the
-/// user set themselves.
+/// Finder's own view of a folder: its icon and its colour tags.
+///
+/// `tagColors` is still what project cards use for the dots beside the name —
+/// a tag is information the operator put there deliberately. `icon` no longer
+/// feeds the project card, which now draws what the project is built with
+/// (see `ProjectCard.projectIcon`); it remains for the worktree rows, which
+/// are plain folders with nothing to detect.
 enum FolderLook {
     static func icon(for path: String) -> NSImage {
         let img = NSWorkspace.shared.icon(forFile: path)
@@ -540,6 +544,12 @@ struct ProjectCard: View {
     /// is rendered as exactly that; a blank line would be indistinguishable
     /// from a repo with no branch.
     @State private var gitField: DigestGitField?
+    /// What the project is built with — the icon's meaning. Held in `@State`
+    /// rather than computed in `body` because `hovering` is also `@State`, so
+    /// the body re-renders on every mouse-over; a `detect()` call there would
+    /// put a filesystem walk behind cursor movement. Measured at 0.27-0.46 ms,
+    /// it is cheap enough for the reload path but not for the pointer.
+    @State private var stack: StackDetection?
     @State private var loading = false
     @State private var showLauncher = false
     @State private var launchTarget: String?
@@ -623,10 +633,7 @@ struct ProjectCard: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            // The real Finder icon, so a folder with a custom icon looks the
-            // same here as it does in Finder.
-            Image(nsImage: FolderLook.icon(for: path))
-                .resizable().frame(width: 30, height: 30)
+            projectIcon
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
@@ -670,6 +677,42 @@ struct ProjectCard: View {
                 .help("Atualizar estado")
             }
         }
+    }
+
+    /// The icon, which now says what the project is BUILT WITH.
+    ///
+    /// It used to be `FolderLook.icon(for:)` — the folder's real Finder icon,
+    /// which is the right call for a folder that HAS a custom icon. Measured
+    /// on the operator's registry: none of the 14 registered projects does, so
+    /// `NSWorkspace` returned the same generic blue folder fourteen times and
+    /// the largest element on every card carried no information whatsoever.
+    ///
+    /// DECLARED COST of the swap, since it is a real loss and not a free win:
+    /// a folder with a custom Finder icon will no longer show it here. That
+    /// path is not preserved because it currently applies to zero projects,
+    /// and guarding it would mean shipping a branch that nothing on this
+    /// machine can exercise. If the operator ever sets one, restoring it is a
+    /// one-line `if` in front of this view — and `FolderLook.icon` is kept for
+    /// the worktree rows below, which are still plain folders.
+    ///
+    /// Finder colour TAGS are untouched and still render as dots beside the
+    /// name: those carry real information whenever the operator has set them,
+    /// which is exactly what the folder icon did not.
+    @ViewBuilder private var projectIcon: some View {
+        let glyph = stack.map { StackGlyph.of($0, role: role) }
+        Image(systemName: glyph?.symbol ?? "circle.dashed")
+            .font(.system(size: 22, weight: .regular))
+            .symbolRenderingMode(.hierarchical)
+            // Three tones for three kinds of claim, so the glyph's confidence
+            // is legible before the tooltip is read: a measured stack is
+            // stated plainly, a role fallback is quieter, and the state before
+            // detection has finished is quieter still rather than absent.
+            .foregroundStyle(glyph == nil ? AnyShapeStyle(.quaternary)
+                             : glyph!.isStack ? AnyShapeStyle(Color.accentColor)
+                                              : AnyShapeStyle(.tertiary))
+            .frame(width: 30, height: 30)
+            .help(glyph?.help ?? "detectando stack…")
+            .accessibilityLabel(glyph?.help ?? "detectando stack")
     }
 
     /// What the project IS, what it last delivered, and where its tree stands.
@@ -864,9 +907,16 @@ struct ProjectCard: View {
         // The cheap half of the digest first: file reads only, measured at
         // 0.77 ms/card with `git: .none`. Painted before anything spawns a
         // process, so the card says what the project IS immediately.
-        digest = await Task.detached(priority: .userInitiated) {
-            ProjectDigest.load(path: p, role: r, repos: repos, git: .none)
+        // Stack rides the same cheap pass: measured at 0.27-0.46 ms/card across
+        // the operator's real 14 (3.7-6.5 ms for the whole screen), which at its
+        // worst is ~6% of ONE git probe, so it needs no staging of its own. It is
+        // off the main actor purely because it touches the filesystem.
+        let both = await Task.detached(priority: .userInitiated) {
+            (ProjectDigest.load(path: p, role: r, repos: repos, git: .none),
+             ProjectStack.detect(path: p))
         }.value
+        digest = both.0
+        stack = both.1
 
         // git is cheap; forge-status spawns node, so both go off the main actor.
         let trees = await Task.detached(priority: .utility) { Git.checkouts(at: p) }.value
