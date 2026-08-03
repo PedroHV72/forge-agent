@@ -96,19 +96,24 @@ function checkProjectionVersioned(cwd) {
   }
 
   if (vcs === 'svn') {
-    // SVN support: check svn status for each path
+    // SVN support: `svn info` per path (exit code = "is it versioned?")
     const tracked = [];
     for (const projPath of PROJECTION_IGNORE_PATHS) {
       const absPath = path.join(dir, projPath);
       if (!fs.existsSync(absPath)) continue;
       try {
-        const out = execFileSync('svn', ['status', absPath], { encoding: 'utf8' }).trim();
-        // If svn status shows no '?' prefix, the file is tracked
-        if (out && !out.startsWith('?')) {
-          tracked.push(projPath);
-        }
+        // `svn info` answers "is this under version control?" directly: exit 0 = versioned,
+        // non-zero (E200009 / W155010) = not. `svn status` cannot answer it — it reports
+        // CHANGES, and got this check wrong in BOTH directions:
+        //   - false POSITIVE: a correctly-ignored monolith prints 'I' (svn:ignore hit) when the
+        //     target is passed explicitly, never '?', so `!out.startsWith('?')` flagged every
+        //     properly-configured working copy as broken;
+        //   - false NEGATIVE: a genuinely versioned monolith with no local edits prints NOTHING,
+        //     so the empty-output guard silently cleared the very case this check exists to catch.
+        execFileSync('svn', ['info', absPath], { stdio: 'ignore' });
+        tracked.push(projPath); // exit 0 → under version control
       } catch (_) {
-        // not versioned or svn error — treat as not tracked
+        // svn info exited non-zero → not versioned (or svn unavailable) → not tracked.
       }
     }
     if (tracked.length === 0) {

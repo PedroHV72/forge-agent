@@ -280,12 +280,24 @@ If repo_path unknown → `[SKIP] execute bash install.sh`.
 | File | Check | Fix |
 |------|-------|-----|
 | `.gsd/DECISIONS.md` | exists + has `\| # \| When \| Scope...` header | create or fix header (preserve data rows) |
-| `.gsd/AUTO-MEMORY.md` | first line starts with `<!-- gsd-auto-memory \|` | create or prepend header |
+| `.gsd/AUTO-MEMORY.md` | see note below — depends on the schema | create or prepend header (pre-fragment-store only) |
 | `.gsd/CODING-STANDARDS.md` | exists | create via forge-init auto-detection (never overwrite) |
 | `<milestone-id>-ROADMAP.md` | contains `## Boundary Map` | append stub `## Boundary Map\n<!-- forge-planner preencherá -->` |
 | `.gsd/forge/events.jsonl` | each non-empty line starts with `{` and ends with `}` | rewrite keeping only valid lines |
 
-AUTO-MEMORY header:
+**AUTO-MEMORY — check only applies to the pre-fragment-store schema.** Read
+`.gsd/SCHEMA-VERSION` first:
+
+- **`fragment-store@1.0.0` (or newer)** → `.gsd/AUTO-MEMORY.md` is a GENERATED projection of
+  `.gsd/memory/*.md`, and `forge-projection.js` writes it with a `# Forge Auto-Memory` heading —
+  not the legacy HTML comment. Report `⏭ AUTO-MEMORY é projeção gerada (fragment-store) — header
+  legado não se aplica` and **never** prepend a header: the next `--regen-projection` would
+  overwrite it anyway, and in a repo where the monolith is ignored the write is pure noise.
+  If the file is missing, that is also fine — it is a cache; regenerate with
+  `node scripts/forge-doctor.js --regen-projection --cwd .`.
+- **No `.gsd/SCHEMA-VERSION` (legacy monolith)** → apply the original check: first line must start
+  with `<!-- gsd-auto-memory |`; create or prepend this header:
+
 ```
 <!-- gsd-auto-memory | project: NAME | extraction_count: 0 -->
 <!-- ranked by: confidence × (1 + hits × 0.1) | cap: 50 active -->
