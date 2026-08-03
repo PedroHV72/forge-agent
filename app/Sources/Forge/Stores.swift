@@ -97,6 +97,16 @@ enum Workspaces {
         return WorkspaceRegistry.resolution(from: data, home: home)?.declaredWorkspaces ?? []
     }
 
+    /// How many repos each active entry declares, keyed by absolute path.
+    /// A path is absent when its `repos[]` is empty — "never measured", never
+    /// "owns zero"; `WorkspaceRegistry.repoCounts` documents why that
+    /// distinction is load-bearing. `[:]` on an absent, legacy or unreadable
+    /// file, all three of which mean the same thing here: nothing measured.
+    static func repoCounts() -> [String: Int] {
+        guard let data = FileManager.default.contents(atPath: file) else { return [:] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.repoCounts ?? [:]
+    }
+
     static func loadAllResolved() -> [String] {
         guard let data = FileManager.default.contents(atPath: file) else { return [] }
         return WorkspaceRegistry.resolution(from: data, home: home)?.paths ?? []
@@ -149,6 +159,11 @@ final class AppState: ObservableObject {
     /// its own members is the normal case, so the containment hazard must not
     /// accuse it (I-20260803154521).
     @Published private(set) var declaredWorkspaces: Set<String> = []
+
+    /// Declared repo count per project, for the card's `"workspace · 33 repos"`
+    /// line. A missing key means unmeasured and the card stays silent about
+    /// repos — see `WorkspaceRegistry.repoCounts`.
+    @Published private(set) var repoCounts: [String: Int] = [:]
 
     /// True exactly when the registry file exists but could not be parsed —
     /// set by `reloadCheap()` from `Workspaces.loadOutcome()`. The Projects
@@ -299,7 +314,10 @@ final class AppState: ObservableObject {
         // Held over on `unreadable` for the same reason the split is: the
         // notice promises the list below was not changed, and dropping the
         // declarations would re-accuse a workspace still on screen.
-        if !outcome.unreadable { declaredWorkspaces = Workspaces.declaredWorkspaces() }
+        if !outcome.unreadable {
+            declaredWorkspaces = Workspaces.declaredWorkspaces()
+            repoCounts = Workspaces.repoCounts()
+        }
         if outcome.unreadable {
             watcher?.watch(workspaces)
             NotificationCenter.default.post(name: Self.didChange, object: nil)

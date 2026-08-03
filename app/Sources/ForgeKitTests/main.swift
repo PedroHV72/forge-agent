@@ -5098,6 +5098,137 @@ test("ProjectDigest.load é injetável de ponta a ponta — nada aqui lê o $HOM
     assertEqual(d.git.stateValue?.line, "main · limpo · ↑3")
 }
 
+// ---------------------------------------------------------------------------
+// ProjectAttention — o que uma pasta fechada diz do que esconde, e a ordem
+// única em que lista e árvore são desenhadas
+// ---------------------------------------------------------------------------
+
+/// WS é workspace (contém os outros); apps/ é uma pasta sintetizada.
+private let attnProjects = ["/h/WS", "/h/WS/apps/alfa", "/h/WS/apps/zulu"]
+
+private func attnTree() -> [ProjectTreeNode] {
+    ProjectTree.build(projects: attnProjects, roots: [], home: "/h")
+}
+
+private func attnNode(_ nodes: [ProjectTreeNode], _ path: String) -> ProjectTreeNode? {
+    for n in nodes {
+        if n.path == path { return n }
+        if let hit = attnNode(n.children, path) { return hit }
+    }
+    return nil
+}
+
+test("ProjectRollup: um run três níveis abaixo continua visível na pasta fechada") {
+    let tree = attnTree()
+    let attention: (String) -> ProjectAttention = { p in
+        p == "/h/WS/apps/zulu" ? ProjectAttention(questions: 0, runs: 1) : .none
+    }
+    let ws = attnNode(tree, "/h/WS")!
+    let apps = attnNode(tree, "/h/WS/apps")!
+
+    assertEqual(ProjectTreeAttention.rollup(apps, attention: attention).runs, 1,
+                "a pasta que contém o run tem de contá-lo")
+    assertEqual(ProjectTreeAttention.rollup(ws, attention: attention).runs, 1,
+                "o rollup é transitivo — o avô conta o neto")
+    assertTrue(ProjectTreeAttention.rollup(ws, attention: attention).needsAttention)
+
+    // A regressão que isso trava: o header antigo só somava `pending`, então
+    // colapsar a pasta apagava o run da tela inteira.
+    assertTrue(ProjectTreeAttention.rollup(apps, attention: attention).summary.contains("1 run"),
+               "o resumo da pasta fechada precisa dizer o run: \(ProjectTreeAttention.rollup(apps, attention: attention).summary)")
+}
+
+test("ProjectRollup: a pasta conta a si mesma só quando é projeto registrável") {
+    let tree = attnTree()
+    let ws = attnNode(tree, "/h/WS")!
+    let apps = attnNode(tree, "/h/WS/apps")!
+    // WS é um projeto E contém dois: 3. `apps` é sintetizada: só os dois.
+    assertEqual(ProjectTreeAttention.rollup(ws, attention: { _ in .none }).projects, 3)
+    assertEqual(ProjectTreeAttention.rollup(apps, attention: { _ in .none }).projects, 2)
+}
+
+test("ProjectRollup.summary: zero nenhum é impresso, e a linha nunca sai vazia") {
+    let quiet = ProjectRollup(projects: 5, questions: 0, runs: 0, dirty: 0, dirtyUnmeasured: 5)
+    assertEqual(quiet.summary, "5 projetos", "\"0 perguntas\" é exatamente o que essa mudança removeu")
+    assertFalse(quiet.summary.contains("0 "))
+    assertFalse(quiet.summary.isEmpty)
+    assertFalse(quiet.needsAttention)
+
+    let loud = ProjectRollup(projects: 1, questions: 1, runs: 2, dirty: 1, dirtyUnmeasured: 0)
+    assertEqual(loud.summary, "1 projeto · 1 pergunta · 2 runs · 1 com alterações")
+}
+
+test("ProjectRollup: git não medido não vira \"limpo\"") {
+    let unknown = ProjectTreeAttention.single(ProjectAttention(dirty: nil))
+    let clean = ProjectTreeAttention.single(ProjectAttention(dirty: false))
+    assertEqual(unknown.dirty, 0)
+    assertEqual(unknown.dirtyUnmeasured, 1, "nil é \"nunca medido\", como repoCounts")
+    assertEqual(clean.dirty, 0)
+    assertEqual(clean.dirtyUnmeasured, 0)
+    assertTrue(unknown != clean, "medido-limpo e não-medido não podem colapsar num só valor")
+    assertFalse(unknown.summary.contains("alterações"),
+                "sem medição a pasta cala sobre sujeira em vez de afirmar zero")
+}
+
+test("ProjectTreeAttention: lista e árvore usam UM comparador — atenção antes do nome") {
+    let attention: (String) -> ProjectAttention = { p in
+        p == "/h/WS/apps/zulu" ? ProjectAttention(questions: 2) : .none
+    }
+    // Plano: zulu passa alfa por causa da pergunta, contra a ordem alfabética.
+    let flat = ProjectTreeAttention.ordered(paths: ["/h/WS/apps/alfa", "/h/WS/apps/zulu"],
+                                            attention: attention)
+    assertEqual(flat.first, "/h/WS/apps/zulu")
+    // Árvore: os mesmos dois nós, mesma resposta.
+    let apps = attnNode(attnTree(), "/h/WS/apps")!
+    let nodes = ProjectTreeAttention.ordered(apps.children, attention: attention)
+    assertEqual(nodes.first?.path, "/h/WS/apps/zulu",
+                "a árvore ordenava por caminho enquanto a lista ordenava por atenção")
+    assertEqual(nodes.map(\.path), flat, "os dois modos não podem discordar de quem vem primeiro")
+
+    // Sem sinal nenhum: nome, e o caminho como desempate estável.
+    let quiet = ProjectTreeAttention.ordered(paths: ["/h/WS/apps/zulu", "/h/WS/apps/alfa"],
+                                             attention: { _ in .none })
+    assertEqual(quiet, ["/h/WS/apps/alfa", "/h/WS/apps/zulu"])
+}
+
+test("ProjectTreeAttention: uma pasta silenciosa afunda abaixo da que esconde uma pergunta") {
+    // `zzz` vem depois de `aaa` por nome, mas esconde uma pergunta.
+    let tree = ProjectTree.build(projects: ["/h/aaa/p1", "/h/zzz/p2"], roots: ["/h"], home: "/h")
+    let root = tree.first!
+    let ordered = ProjectTreeAttention.ordered(root.children, attention: { p in
+        p == "/h/zzz/p2" ? ProjectAttention(questions: 1) : .none
+    })
+    assertEqual(ordered.first?.path, "/h/zzz",
+                "a ordem responde \"para onde eu vou agora?\", não \"como se soletra?\"")
+}
+
+test("ProjectWeight: peso vem do papel, não da profundidade") {
+    assertEqual(ProjectWeight.of(role: .workspace, depth: 3), .workspace,
+                "um workspace fundo continua workspace")
+    assertEqual(ProjectWeight.of(role: .project, depth: 0), .project)
+    assertEqual(ProjectWeight.of(role: .folder, depth: 0), .root, "pasta no topo é root declarado")
+    assertEqual(ProjectWeight.of(role: .folder, depth: 2), .folder)
+
+    // A hierarquia é a propriedade — não os quatro literais.
+    assertTrue(ProjectWeight.workspace.opacity > ProjectWeight.project.opacity)
+    assertTrue(ProjectWeight.project.opacity > ProjectWeight.root.opacity)
+    assertTrue(ProjectWeight.root.opacity > ProjectWeight.folder.opacity)
+    assertTrue(ProjectWeight.workspace.titleSize > ProjectWeight.project.titleSize)
+    assertTrue(ProjectWeight.project.titleSize > ProjectWeight.folder.titleSize)
+    assertTrue(ProjectWeight.workspace.isBold)
+    assertFalse(ProjectWeight.folder.isBold)
+}
+
+test("CollapseStore: o que ficou fechado volta fechado, e o vazio não vira caminho") {
+    let set: Set<String> = ["/h/WS/apps", "/h/outro"]
+    assertEqual(CollapseStore.decode(CollapseStore.encode(set)), set)
+    assertEqual(CollapseStore.decode(""), [], "defaults virgem é conjunto vazio, não [\"\"]")
+    assertEqual(CollapseStore.decode("\n\n/h/a\n"), ["/h/a"])
+    // Ordenado: um conjunto inalterado não reescreve os defaults embaralhado.
+    assertEqual(CollapseStore.encode(["/h/b", "/h/a"]), "/h/a\n/h/b")
+    assertEqual(CollapseStore.encode([]), "")
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

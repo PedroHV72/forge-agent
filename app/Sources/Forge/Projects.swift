@@ -84,25 +84,36 @@ struct ProjectsView: View {
     @State private var showDiscovery = false
     @State private var dropTargeted = false
     @AppStorage("projectsGrouping") private var groupingRaw = ProjectGrouping.byFolder.rawValue
-    @State private var collapsed: Set<String> = []
+    /// Which folders are closed, across launches. Newline-joined paths — the
+    /// codec is `CollapseStore`, in ForgeKit, so it can be tested; the raw
+    /// string lives here because `@AppStorage` cannot hold a `Set`.
+    @AppStorage("projectsCollapsed") private var collapsedRaw = ""
+
+    private var collapsed: Binding<Set<String>> {
+        Binding(get: { CollapseStore.decode(collapsedRaw) },
+                set: { collapsedRaw = CollapseStore.encode($0) })
+    }
 
     private var grouping: ProjectGrouping {
         ProjectGrouping(rawValue: groupingRaw) ?? .byFolder
     }
 
+    /// Live signals for one project. Cheap by construction: both fields come
+    /// from lists `reloadCheap` already read. `dirty` is left unmeasured — git
+    /// costs ~102 ms per project (`ProjectDigest`) and this runs for every node
+    /// on every reorder; the cards fill their own git off the reload path.
+    private func attention(_ path: String) -> ProjectAttention {
+        ProjectAttention(questions: state.pending.filter { $0.cwd == path }.count,
+                         runs: state.liveRuns.filter { $0.cwd == path }.count,
+                         dirty: nil)
+    }
+
     /// Projects needing attention first: questions, then active runs, then name.
-    /// The order answers "where do I go now?" without reading every card.
+    /// The order answers "where do I go now?" without reading every card — and
+    /// is the SAME comparator the tree sorts with, so flipping the segmented
+    /// control cannot change which project is first.
     private func ordered(_ list: [String]) -> [String] {
-        list.sorted { a, b in
-            let ga = state.pending.filter { $0.cwd == a }.count
-            let gb = state.pending.filter { $0.cwd == b }.count
-            if ga != gb { return ga > gb }
-            let ra = state.liveRuns.filter { $0.cwd == a }.count
-            let rb = state.liveRuns.filter { $0.cwd == b }.count
-            if ra != rb { return ra > rb }
-            return ProjectOrganiser.name(a)
-                .localizedCaseInsensitiveCompare(ProjectOrganiser.name(b)) == .orderedAscending
-        }
+        ProjectTreeAttention.ordered(paths: list, attention: attention)
     }
 
     private var containment: [String: Int] {
@@ -124,22 +135,26 @@ struct ProjectsView: View {
 
                 switch grouping {
                 case .flat:
+                    let roles = ProjectMarker.roles(state.workspaces)
                     LazyVGrid(columns: columns, alignment: .leading, spacing: 14) {
                         ForEach(ordered(state.workspaces), id: \.self) { ws in
                             ProjectCard(path: ws, state: state,
-                                        contains: containment[ws] ?? 0)
+                                        contains: containment[ws] ?? 0,
+                                        role: roles[ws] ?? .project)
                         }
                     }
                 case .byFolder:
                     let allTree = ProjectTree.build(projects: state.workspaces,
                                                     roots: Workspaces.declaredRoots(),
                                                     home: home)
-                    let tree = ordered(allTree.map(\.path))
-                        .compactMap { path in allTree.first { $0.path == path } }
+                    // Ordered by what each node HIDES, not by its own path: a
+                    // folder with a question three levels down outranks a quiet
+                    // one whose name sorts earlier.
+                    let tree = ProjectTreeAttention.ordered(allTree, attention: attention)
                     ForEach(tree) { node in
                         ProjectTreeRow(node: node, depth: 0, state: state,
-                                      containment: containment, ordered: ordered,
-                                      collapsed: $collapsed, columns: columns)
+                                      containment: containment, attention: attention,
+                                      collapsed: collapsed, columns: columns)
                     }
                 }
 
@@ -355,28 +370,37 @@ struct ProjectTreeRow: View {
     let depth: Int
     @ObservedObject var state: AppState
     let containment: [String: Int]
-    let ordered: ([String]) -> [String]
+    let attention: (String) -> ProjectAttention
     @Binding var collapsed: Set<String>
     let columns: [GridItem]
 
     private var isCollapsed: Bool { collapsed.contains(node.path) }
 
+    /// What this folder is hiding, transitively. Computed for the header only,
+    /// and only from state the reload already holds.
+    private var rollup: ProjectRollup {
+        ProjectTreeAttention.rollup(node, attention: attention)
+    }
+
+    private var weight: ProjectWeight {
+        ProjectWeight.of(role: node.role, depth: depth)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if node.role.isRegistrable {
                 ProjectCard(path: node.path, state: state,
-                           contains: containment[node.path] ?? 0)
+                           contains: containment[node.path] ?? 0,
+                           role: node.role, weight: weight)
                     .padding(.leading, CGFloat(depth) * 14)
             } else {
                 header
             }
 
             if !node.children.isEmpty && !isCollapsed {
-                let ordered = ordered(node.children.map(\.path))
-                    .compactMap { path in node.children.first { $0.path == path } }
-                ForEach(ordered) { child in
+                ForEach(ProjectTreeAttention.ordered(node.children, attention: attention)) { child in
                     ProjectTreeRow(node: child, depth: depth + 1, state: state,
-                                  containment: containment, ordered: self.ordered,
+                                  containment: containment, attention: attention,
                                   collapsed: $collapsed, columns: columns)
                 }
             }
@@ -384,6 +408,9 @@ struct ProjectTreeRow: View {
         .padding(.bottom, node.role.isRegistrable ? 0 : 4)
     }
 
+    /// A folder header, drawn light — it is a path component, not a
+    /// destination. `ProjectWeight` decides how light; the row does not infer
+    /// prominence from its own indentation.
     @ViewBuilder private var header: some View {
         Button {
             withAnimation(.easeInOut(duration: 0.15)) {
@@ -391,40 +418,45 @@ struct ProjectTreeRow: View {
                 else { collapsed.insert(node.path) }
             }
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                    .font(.system(size: 9))
-                Image(systemName: "folder").font(.caption)
-                Text(node.title).font(.callout).bold()
-                Text("\(node.projectCount)")
-                    .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
-                // Attention rolls up transitively: a collapsed folder still says
-                // whether something inside — at any depth — needs you.
-                let pending = descendantPaths(node)
-                    .flatMap { ws in state.pending.filter { $0.cwd == ws } }.count
-                if pending > 0 {
-                    Text("\(pending)")
-                        .font(.caption2).monospacedDigit()
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(Color.accentOrange.opacity(0.22), in: Capsule())
-                        .foregroundStyle(Color.accentOrange)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 9))
+                    Image(systemName: "folder").font(.caption)
+                    Text(node.title)
+                        .font(.system(size: weight.titleSize,
+                                      weight: weight.isBold ? .bold : .regular))
+                    // Attention rolls up transitively: a collapsed folder still
+                    // says whether something inside — at any depth — needs you.
+                    // A run underneath used to disappear entirely on collapse.
+                    if rollup.questions > 0 {
+                        Text("\(rollup.questions)")
+                            .font(.caption2).monospacedDigit()
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.accentOrange.opacity(0.22), in: Capsule())
+                            .foregroundStyle(Color.accentOrange)
+                    }
+                    if rollup.runs > 0 {
+                        Circle().fill(Color.green).frame(width: 6, height: 6)
+                            .help("\(rollup.runs) run(s) em execução aqui dentro")
+                    }
+                    Spacer()
                 }
-                Spacer()
+                // The contents, spelled out. Shown while collapsed because that
+                // is when the folder is the only thing on screen standing for
+                // them; while open the cards themselves say it.
+                if isCollapsed {
+                    Text(rollup.summary)
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .padding(.leading, 21)
+                }
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain).foregroundStyle(.secondary)
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .opacity(weight.opacity)
         .padding(.leading, CGFloat(depth) * 14)
-    }
-
-    /// Registrable paths under `node`, at any depth — used for the pending
-    /// rollup, which must count grandchildren, not just direct children.
-    private func descendantPaths(_ node: ProjectTreeNode) -> [String] {
-        node.children.flatMap { child -> [String] in
-            child.role.isRegistrable
-                ? [child.path] + descendantPaths(child)
-                : descendantPaths(child)
-        }
     }
 }
 
@@ -480,10 +512,21 @@ struct ProjectCard: View {
     @ObservedObject var state: AppState
     /// How many other registered projects live inside this one.
     var contains: Int = 0
+    /// What this directory IS, from `ProjectMarker.roles` / the tree — never
+    /// inferred here from the path.
+    var role: ProjectRole = .project
+    var weight: ProjectWeight = .project
 
     @State private var status: ProjectStatus?
     @State private var checkouts: [Checkout] = []
     @State private var openItems = 0
+    /// Everything the card says about the project except git — loaded with
+    /// `git: .none`, which `ProjectDigest` measured at 0.77 ms/card.
+    @State private var digest: ProjectDigest?
+    /// Git, staged OFF the reload path. `nil` here means "not measured yet" and
+    /// is rendered as exactly that; a blank line would be indistinguishable
+    /// from a repo with no branch.
+    @State private var gitField: DigestGitField?
     @State private var loading = false
     @State private var showLauncher = false
     @State private var launchTarget: String?
@@ -524,7 +567,9 @@ struct ProjectCard: View {
                     .font(.caption2).foregroundStyle(.orange)
             }
 
-            stats
+            digestLines
+
+            signals
 
             if let m = status?.milestone, let id = m.id {
                 VStack(alignment: .leading, spacing: 2) {
@@ -572,7 +617,16 @@ struct ProjectCard: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
-                    Text(name).font(.headline).lineLimit(1)
+                    Text(name)
+                        .font(.system(size: weight.titleSize,
+                                      weight: weight.isBold ? .bold : .semibold))
+                        .lineLimit(1)
+                    // A run in progress, said with a dot instead of "1 run".
+                    if !runsHere.isEmpty {
+                        Circle().fill(Color.green).frame(width: 6, height: 6)
+                            .help(runsHere.count == 1 ? "1 run em execução"
+                                                      : "\(runsHere.count) runs em execução")
+                    }
                     if contains > 0 {
                         Text("⊃ \(contains)")
                             .font(.system(size: 9)).foregroundStyle(Color.accentOrange)
@@ -582,8 +636,16 @@ struct ProjectCard: View {
                         Circle().fill(c).frame(width: 7, height: 7)
                     }
                 }
-                Text(abbreviatedPath).font(.system(size: 9))
-                    .foregroundStyle(.tertiary).lineLimit(1).truncationMode(.head)
+                HStack(spacing: 5) {
+                    // "workspace · 33 repos", or just "workspace" when the
+                    // registry never measured the repos — `roleLine` is silent
+                    // rather than printing a measured-looking zero for the most
+                    // repo-dense project registered.
+                    Text(digest?.roleLine ?? role.label)
+                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                    Text(abbreviatedPath).font(.system(size: 9))
+                        .foregroundStyle(.tertiary).lineLimit(1).truncationMode(.head)
+                }
             }
             Spacer()
             if loading { ProgressView().controlSize(.small).scaleEffect(0.7) }
@@ -597,12 +659,92 @@ struct ProjectCard: View {
         }
     }
 
-    private var stats: some View {
-        HStack(spacing: 14) {
-            Stat(value: gatesHere.count, label: "pergunta", accent: !gatesHere.isEmpty)
-            Stat(value: runsHere.count, label: "run", accent: false)
-            Stat(value: sessionsHere.count, label: "sessão", accent: false)
-            Stat(value: openItems, label: "item", pluralLabel: "itens", accent: false)
+    /// What the project IS, what it last delivered, and where its tree stands.
+    ///
+    /// This replaced four counters — questions, runs, sessions, items — that on
+    /// the operator's real machine read "0 · 0 · 0 · 0" for every project on
+    /// screen. Correct and useless: the card spent its whole area asserting
+    /// absence. The live signal it dropped is not gone, it moved to `signals`
+    /// and to the run dot in `header`, where it costs nothing when there is
+    /// nothing to say.
+    ///
+    /// Every absence is a sentence, never a blank line — `DigestText` /
+    /// `DigestActivityField` carry their own wording so the card cannot invent
+    /// a different one. The only state this view names itself is git-not-yet-
+    /// measured, which the digest cannot know about because it is the caller
+    /// who decided to defer it.
+    @ViewBuilder private var digestLines: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if let d = digest {
+                Text(d.identity.display)
+                    .font(.caption)
+                    .foregroundStyle(d.identity.isPresent ? .secondary : .tertiary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Image(systemName: "arrow.turn.down.right").font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                    switch d.activity {
+                    case .entry(let e):
+                        Text(e.title).font(.caption2).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.tail)
+                        Spacer(minLength: 6)
+                        // An inferred date is a weaker claim than one the
+                        // ledger stated, and says so instead of passing for it.
+                        Text(e.ageInferred ? "~\(e.age)" : e.age)
+                            .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
+                            .help(e.ageInferred
+                                  ? "Data inferida do arquivo — o fragmento não tem completed_at"
+                                  : "Do completed_at do ledger")
+                    case .absent(let why):
+                        Text(why).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                        Spacer(minLength: 6)
+                    }
+                }
+
+                gitLine
+            } else {
+                Text("lendo…").font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    @ViewBuilder private var gitLine: some View {
+        switch gitField {
+        case .state(let s):
+            Text(s.line)
+                .font(.system(size: 10)).monospaced()
+                .foregroundStyle(s.dirty ? Color.accentOrange : Color.secondary.opacity(0.7))
+                .lineLimit(1)
+        case .absent(let why):
+            Text(why).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
+        case .none:
+            // Named, not blank: git is ~102 ms per card and is deliberately not
+            // on the reload path, so this state is normal and must read as
+            // "not yet" rather than as an empty row.
+            Text("git…").font(.system(size: 10)).foregroundStyle(.quaternary)
+        }
+    }
+
+    /// Live counts, and ONLY when there are any.
+    ///
+    /// The zero is the thing being removed here, not the count. A project with
+    /// two open questions still shouts; a quiet one draws nothing at all
+    /// instead of four greyed zeros. Runs are not in this row — an active run
+    /// is the green dot in `header`, which is legible without reading a number.
+    @ViewBuilder private var signals: some View {
+        if !gatesHere.isEmpty || openItems > 0 || !sessionsHere.isEmpty {
+            HStack(spacing: 14) {
+                if !gatesHere.isEmpty {
+                    Stat(value: gatesHere.count, label: "pergunta", accent: true)
+                }
+                if !sessionsHere.isEmpty {
+                    Stat(value: sessionsHere.count, label: "sessão", accent: false)
+                }
+                if openItems > 0 {
+                    Stat(value: openItems, label: "item", pluralLabel: "itens", accent: false)
+                }
+            }
         }
     }
 
@@ -693,10 +835,29 @@ struct ProjectCard: View {
         loading = true
         defer { loading = false }
         let p = path
+        let r = role
+        let repos = state.repoCounts[p]
+
+        // The cheap half of the digest first: file reads only, measured at
+        // 0.77 ms/card with `git: .none`. Painted before anything spawns a
+        // process, so the card says what the project IS immediately.
+        digest = await Task.detached(priority: .userInitiated) {
+            ProjectDigest.load(path: p, role: r, repos: repos, git: .none)
+        }.value
 
         // git is cheap; forge-status spawns node, so both go off the main actor.
         let trees = await Task.detached(priority: .utility) { Git.checkouts(at: p) }.value
         checkouts = trees
+
+        // Git is ~102 ms per card and the screen reloads every 15 s plus on
+        // FSEvents — 20 projects would be ~2 s of blocking git per reload. So
+        // it is filled in AFTER the cheap fields are on screen and never on
+        // `reloadCheap`'s path. Not cached either: the mtimes that would key a
+        // cache (.git/HEAD, .git/index) do not move when an untracked file
+        // appears, so a cached "limpo" can be wrong about a dirty tree.
+        gitField = await Task.detached(priority: .utility) {
+            ProjectDigest.loadGit(path: p, probe: .system)
+        }.value
 
         guard hasGsd else { return }
         status = await Task.detached(priority: .utility) {

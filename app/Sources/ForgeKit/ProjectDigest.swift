@@ -366,7 +366,11 @@ extension ProjectDigest {
 
     // MARK: Git
 
-    static func loadGit(path: String, probe: GitProbe) -> DigestGitField {
+    /// The git field alone — for a caller that painted the cheap fields with
+    /// `git: .none` and is now filling this one in off the reload path. Public
+    /// so that caller does not have to re-derive the `"sem git"` wording, which
+    /// would be a second place for it to be different.
+    public static func loadGit(path: String, probe: GitProbe) -> DigestGitField {
         guard let snapshot = probe.snapshot(path) else { return .absent("sem git") }
         return .state(snapshot)
     }
