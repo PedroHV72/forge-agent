@@ -29,8 +29,21 @@ function testNonOwnerAndABA() {
     const two = filelock.acquireFileLock(cwd, target, 'two', 's', { ttlMs: 10, now: () => 100 });
     assert(two.acquired && two.stolen);
     assert.strictEqual(filelock.releaseFileLock(cwd, target, 'one', one.owner_token, one.generation), false);
-    assert.strictEqual(filelock.checkFileLock(cwd, target).holder.generation, two.generation);
+    const publicCheck = filelock.checkFileLock(cwd, target);
+    assert.strictEqual(publicCheck.holder.generation, undefined, 'status must not disclose generation');
+    assert.strictEqual(publicCheck.holder.owner_token, undefined, 'status must not disclose owner token');
+    const privateCheck = filelock.checkFileLock(cwd, target, { ownerToken: two.owner_token, generation: two.generation });
+    assert.strictEqual(privateCheck.holder.generation, two.generation, 'owner-scoped proof remains available to the holder');
     assert.strictEqual(filelock.releaseFileLock(cwd, target, 'two', two.owner_token, two.generation), true);
+  } finally { remove(cwd); }
+}
+function testCanonicalPathIdentity() {
+  const cwd = temporary();
+  try {
+    const first = filelock.acquireFileLock(cwd, './src/foo.js', 'run-a', 's-a');
+    const denied = filelock.acquireFileLock(cwd, 'src\\foo.js', 'run-b', 's-b');
+    assert.strictEqual(denied.acquired, false, 'separator aliases must share one lock');
+    assert.strictEqual(filelock.releaseFileLock(cwd, './src/foo.js', 'run-a', first.owner_token, first.generation), true);
   } finally { remove(cwd); }
 }
 function testFreshOtherOwnerIsBusy() {
@@ -48,6 +61,7 @@ function main() {
   testOwnerScopedLifecycle();
   testNonOwnerAndABA();
   testFreshOtherOwnerIsBusy();
+  testCanonicalPathIdentity();
   console.log('forge-filelock tests passed');
 }
 try { main(); } catch (error) { console.error(error.stack || error); process.exitCode = 1; }

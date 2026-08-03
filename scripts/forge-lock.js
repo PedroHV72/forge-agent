@@ -32,8 +32,9 @@ function removeTree(dir) { try { fs.rmSync(dir, { recursive: true, force: true, 
 // old release callback fail before any directory is renamed, avoiding ABA.
 function stealIfStale(lockDir, ttlMs, now) {
   const meta = readMetadata(lockDir);
+  const persistedTtl = meta && Number.isFinite(Number(meta.ttl_ms)) ? Number(meta.ttl_ms) : ttlMs;
   const age = meta && Number.isFinite(meta.renewed_at) ? now - meta.renewed_at : lockAge(lockDir, now);
-  if (age === null || age <= ttlMs) return false;
+  if (age === null || age <= persistedTtl) return false;
   if (meta && meta.owner_token) {
     try { fs.renameSync(markerPath(lockDir, meta.owner_token), markerPath(lockDir, `${meta.owner_token}.stale`)); }
     catch { return false; }
@@ -110,6 +111,9 @@ function renewHandle(handle, opts) {
   try { writeAtomic(metaPath(handle.lockDir), renewed); handle.metadata = renewed; return { ok: true, reason: 'renewed', metadata: renewed }; }
   catch { return { ok: false, reason: 'already_released' }; }
 }
+function assertOwned(handle) {
+  return sameOwner(readMetadata(handle.lockDir), handle) && fs.existsSync(markerPath(handle.lockDir, handle.ownerToken));
+}
 function releaseHandle(handle) {
   const meta = readMetadata(handle.lockDir);
   if (!sameOwner(meta, handle)) return { ok: false, reason: 'owner_mismatch' };
@@ -130,4 +134,4 @@ function status(cwd, name, opts) { const dir = lockPath(cwd, name); if (!fs.exis
 function parseArgs(argv) { const out = {}; for (let i = 0; i < argv.length; i++) if (argv[i].startsWith('--')) { const k = argv[i].slice(2), n = argv[i + 1]; out[k] = n && !n.startsWith('--') ? (i++, n) : true; } return out; }
 async function cliMain() { const args = parseArgs(process.argv.slice(2)), cwd = args.cwd || process.cwd(); try { if (args.acquire || args['try-acquire']) { const fn = args.acquire ? acquire : tryAcquireSync; const h = await fn(cwd, args.acquire || args['try-acquire'], { ttlMs: args.ttl && Number(args.ttl), holderRunId: args.holder, retries: args.retries && Number(args.retries) }); if (!h) { process.stderr.write('busy\n'); process.exitCode = 1; return; } process.stdout.write(JSON.stringify({ lockDir: h.lockDir, metadata: h.metadata }) + '\n'); } else if (args.release) { const ok = releaseSync(cwd, args.release, args.token, args.generation); process.stdout.write(ok ? 'released\n' : 'not held (token obrigatório)\n'); process.exitCode = ok ? 0 : 1; } else if (args.status) process.stdout.write(JSON.stringify(status(cwd, args.status), null, 2) + '\n'); else { process.stderr.write('forge-lock: comando inválido\n'); process.exitCode = 2; } } catch (e) { process.stderr.write(`forge-lock error: ${e.message}\n`); process.exitCode = 1; } }
 if (require.main === module) cliMain();
-module.exports = { acquire, acquireSync, tryAcquireSync, releaseSync, releaseHandle, renewHandle, status, locksDir, lockPath, metaPath, stealIfStale, DEFAULT_TTL_MS };
+module.exports = { acquire, acquireSync, tryAcquireSync, releaseSync, releaseHandle, renewHandle, assertOwned, status, locksDir, lockPath, metaPath, stealIfStale, DEFAULT_TTL_MS };

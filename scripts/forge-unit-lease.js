@@ -58,7 +58,10 @@ function normalizeUnitKey(unit) {
   return value;
 }
 function leasesDir(cwd) { return path.join(cwd, '.gsd', 'forge', 'leases'); }
-function leaseFile(cwd, unit) { return path.join(leasesDir(cwd), `${encode(normalizeUnitKey(unit))}.json`); }
+// A digest, rather than case-sensitive base64url, is the physical identity.
+// Windows and default macOS filesystems may fold filename case, so two unit
+// keys that differ only by an encoded character must never share a record.
+function leaseFile(cwd, unit) { return path.join(leasesDir(cwd), `${digest(normalizeUnitKey(unit))}.json`); }
 function mutexName(unit) { return `unit-lease-${digest(normalizeUnitKey(unit)).slice(0, 48)}`; }
 function temporaryPrefix(file) { return `.${path.basename(file)}.`; }
 
@@ -83,11 +86,16 @@ function quarantine(file, label) {
   try { fs.renameSync(file, target); return target; } catch { return null; }
 }
 function removeQuarantine(file) { try { fs.unlinkSync(file); } catch { /* diagnostic debris is harmless */ } }
-function publish(file, record, options) {
+function publish(file, record, options, guard) {
   const temporary = path.join(path.dirname(file), `${temporaryPrefix(file)}${process.pid}.${crypto.randomUUID()}.tmp`);
+  if (guard && !mutex.assertOwned(guard)) throw Object.assign(new Error('forge-unit-lease: guard perdido'), { code: 'GUARD_LOST' });
   fail(options, 'before-write');
   fs.writeFileSync(temporary, JSON.stringify(record, null, 2) + '\n', 'utf8');
   fail(options, 'after-write-before-rename');
+  if (guard && !mutex.assertOwned(guard)) {
+    try { fs.unlinkSync(temporary); } catch { /* next recovery cleans it */ }
+    throw Object.assign(new Error('forge-unit-lease: guard perdido'), { code: 'GUARD_LOST' });
+  }
   fs.renameSync(temporary, file);
   fail(options, 'after-rename');
 }
@@ -128,7 +136,12 @@ function withGuard(cwd, unit, fn) {
   let handle;
   try { handle = mutex.acquireSync(cwd, mutexName(unit), { ttlMs: 5_000, retries: 80 }); }
   catch (error) { if (error.code === 'LOCK_BUSY') return result(false, 'guard-busy'); throw error; }
-  try { return fn(); } finally { handle.release(); }
+  let output; let thrown;
+  try { output = fn(handle); } catch (error) { thrown = error; }
+  const released = handle.release();
+  if (thrown) throw thrown;
+  if (!released.ok) return result(false, 'guard-busy');
+  return output;
 }
 function normalizedOptions(options) {
   const input = options || {};
@@ -183,7 +196,7 @@ function recoverInside(file, unit, now) {
 function acquire(cwd, unitInput, options) {
   const unit = normalizeUnitKey(unitInput); const values = normalizedOptions(options); const file = leaseFile(cwd, unit);
   fs.mkdirSync(leasesDir(cwd), { recursive: true });
-  return withGuard(cwd, unit, () => {
+  return withGuard(cwd, unit, guard => {
     clearTemporaryFiles(file);
     let read = readLease(file);
     if (read.record && validRecord(read.record, unit) && sameOwner(read.record, values.ownerToken, read.record.generation)) {
@@ -206,7 +219,7 @@ function acquire(cwd, unitInput, options) {
     const generation = tokenOf(values.raw);
     if (!ownerToken || !generation || ownerToken === generation) throw new Error('forge-unit-lease: token inválido');
     const record = makeRecord(unit, { ...values, ownerToken, generation });
-    publish(file, record, values.raw);
+    publish(file, record, values.raw, guard);
     return result(true, 'acquired', { owner_token: ownerToken, generation, lease: publicLease(record, values.now), recovered });
   });
 }
@@ -221,12 +234,12 @@ function observe(cwd, unitInput, options) {
 
 function heartbeat(cwd, unitInput, ownerToken, generation, options) {
   const unit = normalizeUnitKey(unitInput); const values = normalizedOptions(options); const token = opaque(ownerToken, 'owner_token', true); const gen = opaque(generation, 'generation', true); const file = leaseFile(cwd, unit);
-  return withGuard(cwd, unit, () => {
+  return withGuard(cwd, unit, guard => {
     clearTemporaryFiles(file); const read = readLease(file);
     if (!read.record) return result(false, 'already-released');
     if (!validRecord(read.record, unit) || !sameOwner(read.record, token, gen)) return result(false, 'owner-mismatch');
     const next = { ...read.record, heartbeat_at: values.now, expires_at: values.now + values.ttlMs, grace_ms: values.graceMs };
-    publish(file, next, values.raw);
+    publish(file, next, values.raw, guard);
     return result(true, 'renewed', { generation: gen, lease: publicLease(next, values.now) });
   });
 }

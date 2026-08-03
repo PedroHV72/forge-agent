@@ -159,6 +159,7 @@ function testUnicodePathsHaveOneLogicalLeaseFile() {
     assert.strictEqual(competing.reason, 'lease-active');
     assert.strictEqual(lease.leaseFile(cwd, decomposed), lease.leaseFile(cwd, composed));
     assert(!path.basename(lease.leaseFile(cwd, composed)).includes('測試'));
+    assert.notStrictEqual(lease.leaseFile(cwd, 'execute-task/AG'), lease.leaseFile(cwd, 'execute-task/Aa'), 'physical filenames must not fold encoded case');
     assert.strictEqual(lease.release(cwd, composed, acquired.owner_token, acquired.generation).reason, 'released');
   });
 }
