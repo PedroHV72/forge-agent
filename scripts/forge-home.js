@@ -28,14 +28,19 @@ function platformOf(options) {
     : process.platform;
 }
 
+function environmentOf(options) {
+  return options && options.env ? options.env : process.env;
+}
+
 /** Resolve the operator home without invoking a shell or expanding ~. */
 function resolveUserHome(options) {
   const opts = options || {};
   if (opts.userHome) return absolute(opts.userHome, 'userHome');
   const platform = platformOf(opts);
+  const env = environmentOf(opts);
   const names = platform === 'win32' ? ['USERPROFILE', 'HOME'] : ['HOME', 'USERPROFILE'];
   for (const name of names) {
-    const value = nonEmpty(opts.env && opts.env[name]) || nonEmpty(process.env[name]);
+    const value = nonEmpty(env[name]);
     if (value) return absolute(value, name);
   }
   return absolute(os.homedir(), 'home');
@@ -48,7 +53,7 @@ function resolveUserHome(options) {
  */
 function resolveForgeHome(options) {
   const opts = options || {};
-  const configured = nonEmpty(opts.forgeHome) || nonEmpty(opts.env && opts.env.FORGE_HOME) || nonEmpty(process.env.FORGE_HOME);
+  const configured = nonEmpty(opts.forgeHome) || nonEmpty(environmentOf(opts).FORGE_HOME);
   return configured ? absolute(configured, 'FORGE_HOME') : path.join(resolveUserHome(opts), '.forge-agent');
 }
 

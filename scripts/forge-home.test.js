@@ -30,6 +30,20 @@ try {
     assert.strictEqual(resolved, path.resolve(forge));
   });
 
+  test('injected env is isolated from the process environment', () => {
+    const previous = process.env.FORGE_HOME;
+    process.env.FORGE_HOME = path.join(root, 'real-process-home');
+    try {
+      assert.strictEqual(
+        home.resolveForgeHome({ env: { HOME: user, USERPROFILE: user } }),
+        path.join(path.resolve(user), '.forge-agent'),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOME;
+      else process.env.FORGE_HOME = previous;
+    }
+  });
+
   for (const platform of ['win32', 'darwin', 'linux']) {
     test(`${platform} home precedence is deterministic`, () => {
       const expected = platform === 'win32' ? path.join(root, 'Windows User') : path.join(root, 'Posix User');
