@@ -127,10 +127,30 @@ function readPathsFile(file) {
 
 const PLAN_LIST_KEYS = ['expected_output', 'writes', 'artifacts', 'key_files'];
 
+const INDENT_OF = line => /^[ \t]*/.exec(line)[0].length;
+
+function stripQuotes(value) {
+  return String(value || '').trim().replace(/^["']|["']$/g, '').trim();
+}
+
+/**
+ * Resolves one block-list item to the path it declares. Items come in two
+ * shapes: a bare scalar (`- src/a.ts`) and a mapping whose `path:` names the
+ * file (`must_haves.artifacts[]`). A mapping led by any other key is metadata
+ * (min_lines, provides, …); returning its value would inject a garbage entry
+ * into the manifest, so it contributes nothing.
+ */
+function itemDeclaredPath(raw) {
+  const mapping = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/.exec(raw);
+  if (!mapping) return stripQuotes(raw);
+  return /^(path|file)$/i.test(mapping[1]) ? stripQuotes(mapping[2]) : '';
+}
+
 /**
  * Pulls declared output paths out of a unit's plan/summary frontmatter. A
- * hand-rolled reader for the one shape these files use (`key:` followed by
- * `  - "value"` lines, or an inline `[a, b]`) — the repo has no YAML dependency
+ * hand-rolled reader for the shapes these files use (`key:` followed by
+ * `  - "value"` lines, by `  - path: "value"` entries carrying their own
+ * nested keys, or an inline `[a, b]`) — the repo has no YAML dependency
  * and this must never throw on a malformed plan: a manifest that cannot be read
  * degrades to "no manifest", which degrades to unscoped, which is visible.
  */
@@ -152,13 +172,23 @@ function readDeclaredPaths(text) {
       out.push(normalize(inline.replace(/^["']|["']$/g, '')));
       continue;
     }
+    // Block list. An entry may be a mapping (`- path: "x"` + `  min_lines: 40`),
+    // so a non-item line indented DEEPER than the items is a nested key of the
+    // current entry, not the end of the list — treating it as the end drops
+    // every remaining entry silently, which is under-inclusion, the one
+    // direction this reader cannot afford.
+    let itemIndent = null;
     for (let j = i + 1; j < lines.length; j++) {
-      const item = /^\s*-\s+(.+?)\s*$/.exec(lines[j]);
+      const item = /^([ \t]*)-\s+(.+?)\s*$/.exec(lines[j]);
       if (!item) {
         if (/^\s*$/.test(lines[j])) continue;
+        if (itemIndent !== null && INDENT_OF(lines[j]) > itemIndent) continue;
         break;
       }
-      const value = item[1].replace(/^["']|["']$/g, '').trim();
+      if (itemIndent === null) itemIndent = item[1].length;
+      else if (item[1].length < itemIndent) break; // dedent — this list ended
+      else if (item[1].length > itemIndent) continue; // a list nested under an entry's own key
+      const value = itemDeclaredPath(item[2]);
       if (value) out.push(normalize(value));
     }
   }
@@ -238,6 +268,13 @@ function expandUntracked(cwd, entries) {
 function withinManifest(candidate, manifest) {
   if (manifest.has(candidate)) return true;
   // A manifest entry may name a directory; everything under it belongs to the unit.
+  //
+  // Trade-off, deliberate: a coarse entry (`src`) pulls in whatever else lives
+  // under it — including another owner's work — while `reason` still reports
+  // `manifest`, so the disclosure reads as correctly scoped when it is merely
+  // wide. Accepted because over-inclusion only costs review budget, and because
+  // declared outputs are files in every plan on disk; if directory entries ever
+  // become common, the reason label is what has to earn a `manifest:coarse`.
   for (const declared of manifest) {
     if (declared && candidate.startsWith(`${declared}/`)) return true;
   }

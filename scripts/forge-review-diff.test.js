@@ -168,6 +168,51 @@ test('manifest reader tolerates the plan shapes actually on disk', () => {
   assert.deepStrictEqual(engine.readDeclaredPaths(''), []);
 });
 
+test('manifest reader reads the object form of must_haves.artifacts, whole', () => {
+  // The shape every T##-PLAN.md in this repo writes. The nested keys of an
+  // entry used to end the list at the first one — so `artifacts` contributed
+  // one quote-mangled string and silently dropped every entry after it. That
+  // is under-inclusion, the direction the manifest comment calls out by name.
+  const declared = engine.readDeclaredPaths([
+    '---',
+    'expected_output:',
+    '  - scripts/foo.js',
+    'must_haves:',
+    '  truths:',
+    '    - "a behaviour, not a path"',
+    '  artifacts:',
+    '    - path: "scripts/bar.js"',
+    '      provides: "does the thing"',
+    '      min_lines: 40',
+    '      stub_patterns: ["TODO", "FIXME"]',
+    '    - path: scripts/baz.js',
+    '      min_lines: 10',
+    '      stub_patterns:',
+    '        - "throw new Error\\\\(\'not implemented\'\\\\)"',
+    '  key_links:',
+    '    - "docs/x.md#L1 — prose"',
+    '---',
+  ].join('\n'));
+  assert.deepStrictEqual(declared.sort(), ['scripts/bar.js', 'scripts/baz.js', 'scripts/foo.js']);
+});
+
+test('an entry\'s metadata keys never become manifest paths, and the list still ends', () => {
+  const declared = engine.readDeclaredPaths([
+    'artifacts:',
+    '  - path: scripts/only.js',
+    '    min_lines: 40',
+    'writes:',
+    '  - scripts/after.js',
+    'key_files:',
+    '  - scripts/summary.js',
+  ].join('\n'));
+  assert.deepStrictEqual(declared.sort(), ['scripts/after.js', 'scripts/only.js', 'scripts/summary.js'],
+    'a sibling key at the list indent ends the list; metadata deeper than it does not');
+  for (const entry of declared) {
+    assert.ok(!/[:"']/.test(entry), `manifest entry is not a path: ${entry}`);
+  }
+});
+
 test('argv batching stays under the Windows command-line ceiling', () => {
   const many = Array.from({ length: 500 }, (_, i) => `src/some/fairly/long/path/file-${i}.ts`);
   const batches = engine.batched(many);
