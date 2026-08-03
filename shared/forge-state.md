@@ -546,6 +546,7 @@ intent
   → event-published
   → boundary-pending
   → state-published
+  → lease-release-pending
   → lease-released
   → boundary-ready
   → committed
@@ -561,9 +562,13 @@ The recorded `before` and `after` snapshots contain logical STATE checksums.
 Runtime/session fields are excluded from the logical projection, while the
 durable transaction can retain host/runtime audit data. A crash before a
 phase marker leaves an earlier phase and `resume` replays the missing
-publication. A crash after publication sees the existing idempotent artifact
-and advances without duplication. Orphan temporary files are ignored and
-removed by the underlying writer on the next mutation.
+publication. Before releasing a terminal-action lease, the controller
+durably records `lease-release-pending`; if the process then dies, recovery
+either proves the original owner and releases it or observes that the marked
+release already removed the lease. It never infers authorization from a
+missing lease for earlier phases. A crash after publication sees the existing
+idempotent artifact and advances without duplication. Orphan temporary files
+are ignored and removed by the underlying writer on the next mutation.
 
 ### Transition and result rules
 
