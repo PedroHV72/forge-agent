@@ -205,17 +205,21 @@ check('o mapeamento MetricsStore.Window -> ProgressWindow cobre os quatro casos,
 
 // ------------------------------------------- F: zero seções novas (#11)
 
-check('o enum Section em Views.swift continua com 13 casos (#11)', () => {
+check('o enum Section em Views.swift continua com 12 casos (#11)', () => {
   // Count only. The strong proof — the ORDERED list of rawValue, which
   // detects a RENAME that a count alone would miss — already lives in
   // forge-app-sidebar.test.js (guard D31, MEM004) and is intentionally not
   // duplicated here.
+  //
+  // Foi 13 até "Início" ser removida (a tela virou um espelho pior de Terminal
+  // e Runs; ver D31). O critério #11 desta fatia é "não ABRIR seção nova", e
+  // continua valendo: 12 é o novo teto, e qualquer soma quebra aqui.
   const src = stripLineComments(read(viewsSwift));
   const decl = bodyOf(src, 'enum Section: String, CaseIterable, Identifiable');
   const cases = decl.match(/^\s*case \w+ = "([^"]*)"/gm) || [];
   assert(
-    cases.length === 13,
-    `esperados 13 casos em Section (${REL_VIEWS}), encontrados ${cases.length} — esta fatia não `
+    cases.length === 12,
+    `esperados 12 casos em Section (${REL_VIEWS}), encontrados ${cases.length} — esta fatia não `
       + 'abre nenhuma seção nova na sidebar (critério #11); o rename é coberto separadamente pelo '
       + 'guard D31 de forge-app-sidebar.test.js'
   );

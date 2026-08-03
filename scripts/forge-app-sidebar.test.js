@@ -151,7 +151,9 @@ check('badge(for:) não tem mais caso .updates (D27)', () => {
 check('badge(for:) mantém os quatro casos que contam coisa de verdade', () => {
   const views = stripLineComments(read(viewsSwift));
   const body = bodyOf(views, 'private func badge(for');
-  for (const c of ['.now', '.runs', '.terminal', '.projects']) {
+  // `.now` left the enum with the Início screen; the gate count it carried
+  // moved onto `.terminal`, which is where the banner now lives.
+  for (const c of ['.runs', '.terminal', '.projects']) {
     assert(
       body.includes(`case ${c}:`),
       `\`case ${c}:\` desapareceu de badge(for:) — a ausência da D27 estaria sendo `
@@ -183,7 +185,7 @@ check('sidebarList tem exatamente um Divider(), depois de .runs (D29)', () => {
   assert(
     atRuns < atDivider,
     'o Divider() aparece antes de `.runs`: a D29 fecha o bloco de trabalho '
-      + '(Início, Terminal, Projetos, Itens, Runs), então a régua vem depois de Runs'
+      + '(Terminal, Projetos, Itens, Runs), então a régua vem depois de Runs'
   );
 });
 
@@ -230,15 +232,21 @@ check('Section.title cobre todos os casos e items le "Tarefas"', () => {
     'o rawValue de items mudou — isso invalida o lastSection gravado, que e justamente o que title evita');
 });
 
-check('Section continua com 13 casos e nenhum rawValue mudou (D31)', () => {
+check('Section tem 12 casos e nenhum rawValue mudou (D31)', () => {
   // R1: contar `case \w+ = "` só prova a CONTAGEM — um rename mantém 13 casos e
   // passaria mesmo assim, degradando silenciosamente toda seleção salva em
   // `UserDefaults("lastSection")` (Stores.swift persiste `section?.rawValue` e
-  // valida o restore contra `Section.allCases.map(\.rawValue)`) para o fallback
-  // `.now`. A lista explícita e ORDENADA é o que de fato ancora "nenhum
-  // rawValue mudou".
+  // valida o restore contra `Section.allCases.map(\.rawValue)`) para o fallback.
+  // A lista explícita e ORDENADA é o que de fato ancora "nenhum rawValue mudou".
+  //
+  // "Início" saiu daqui por REMOÇÃO DELIBERADA da seção, não por renome: a tela
+  // não tinha mais conteúdo próprio (composer foi para Terminal, tirinhas de run
+  // eram um RunsView pior, e o banner de gates foi junto para Terminal). O
+  // fallback passou a ser `.terminal` — quem tinha "Início" salvo cai na tela
+  // que a absorveu. Este guard segue proibindo renome e remoção silenciosa: para
+  // mexer de novo é preciso editar esta lista e dizer por quê.
   const EXPECTED_RAW_VALUES = [
-    'Início', 'Terminal', 'Projetos', 'Itens', 'Runs',
+    'Terminal', 'Projetos', 'Itens', 'Runs',
     'Contas', 'Métricas', 'Modelos', 'Segredos', 'Preferências',
     'Histórico', 'Atualizações', 'Exemplos',
   ];
@@ -247,15 +255,38 @@ check('Section continua com 13 casos e nenhum rawValue mudou (D31)', () => {
   const cases = decl.match(/^\s*case \w+ = "([^"]*)"/gm) || [];
   const rawValues = cases.map((c) => c.match(/=\s*"([^"]*)"/)[1]);
   assert(
-    rawValues.length === 13,
-    `esperados 13 casos em Section, encontrados ${rawValues.length} — a D29 não renomeia `
+    rawValues.length === 12,
+    `esperados 12 casos em Section, encontrados ${rawValues.length} — a D29 não renomeia `
       + 'nem remove seção nenhuma (D31)'
+  );
+  assert(
+    !rawValues.includes('Início'),
+    '"Início" voltou para Section sem que este guard fosse atualizado — se a seção '
+      + 'está voltando de verdade, diga aqui por quê; se não, é rawValue órfão'
   );
   assert(
     JSON.stringify(rawValues) === JSON.stringify(EXPECTED_RAW_VALUES),
     'um ou mais rawValue de Section mudaram (D31): '
       + `esperado ${JSON.stringify(EXPECTED_RAW_VALUES)}, encontrado ${JSON.stringify(rawValues)} — `
-      + 'isso rebaixa silenciosamente qualquer seleção salva de sidebar para o fallback `.now`'
+      + 'isso rebaixa silenciosamente qualquer seleção salva de sidebar para o fallback'
+  );
+});
+
+check('o fallback do lastSection aponta para uma seção que existe (D31)', () => {
+  // O buraco que a remoção de "Início" abriria: `SectionRestore` valida contra
+  // `allCases`, mas o FALLBACK é uma constante escrita à mão. Um fallback
+  // apontando para um caso removido não compila hoje — e um apontando para um
+  // caso que existe mas não é a tela certa passa batido, então ele é fixado.
+  const stores = stripLineComments(read(storesSwift));
+  assert(
+    /fallback:\s*Section\.terminal\.rawValue/.test(stores),
+    'o fallback de lastSection não é mais `Section.terminal.rawValue` — depois que '
+      + 'Início saiu, é a tela que absorveu o conteúdo dela, e portanto onde quem '
+      + 'tinha "Início" salvo tem que aterrissar'
+  );
+  assert(
+    !/Section\.now/.test(stores),
+    'Stores.swift ainda menciona Section.now — a seção foi removida do enum'
   );
 });
 

@@ -16,7 +16,13 @@ import ForgeKit
 // MARK: - Shell
 
 enum Section: String, CaseIterable, Identifiable {
-    case now = "Início"
+    // "Início" was removed, not renamed. It had no content of its own left:
+    // the composer moved into Terminal (where sessions are actually started),
+    // the run strips were a thinner RunsView, and the gate banner — the one
+    // thing that WAS unique — moved to Terminal too. A screen whose every part
+    // is a worse copy of another screen is a screen to delete. `Stores.swift`
+    // falls back to `.terminal`, so anyone whose saved section was "Início"
+    // lands on the screen that absorbed it rather than nowhere.
     case terminal = "Terminal"
     case projects = "Projetos"
     case items = "Itens"
@@ -50,7 +56,6 @@ enum Section: String, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
-        case .now:      return "bolt.fill"
         case .terminal: return "terminal"
         case .projects: return "folder"
         case .items:    return "tray.full"
@@ -96,8 +101,7 @@ struct RootView: View {
             sidebarList
         } detail: {
             Group {
-                switch state.section ?? .now {
-                case .now:      NowView(state: state)
+                switch state.section ?? .terminal {
                 case .terminal: TerminalsView(state: state)
                 case .projects: ProjectsView(state: state)
                 case .items:    ItemsView(state: state)
@@ -130,19 +134,24 @@ struct RootView: View {
                         Text(s.title)
                         Spacer()
                         if let n = badge(for: s) {
+                            // Orange meant "this is asking you something", not
+                            // "this is the first row". It followed the gate
+                            // count out of Início and into Terminal instead of
+                            // staying behind as decoration on whichever row
+                            // happened to be at the top.
+                            let urgent = isUrgent(s)
                             Text("\(n)")
                                 .font(.caption2).monospacedDigit()
-                                .foregroundStyle(s == .now ? .white : .secondary)
+                                .foregroundStyle(urgent ? .white : .secondary)
                                 .padding(.horizontal, 6).padding(.vertical, 1)
-                                .background(s == .now ? AnyShapeStyle(Color.accentOrange)
-                                                      : AnyShapeStyle(.quaternary),
+                                .background(urgent ? AnyShapeStyle(Color.accentOrange)
+                                                   : AnyShapeStyle(.quaternary),
                                             in: Capsule())
                         }
                     }
                 } icon: {
                     Image(systemName: s.icon)
-                        .foregroundStyle(s == .now && !state.pending.isEmpty
-                                         ? Color.accentOrange : Color.secondary)
+                        .foregroundStyle(isUrgent(s) ? Color.accentOrange : Color.secondary)
                 }
                 .tag(s)
 
@@ -166,11 +175,21 @@ struct RootView: View {
     /// Updates has no case here (D27): the numeral it used to show was always
     /// `1`, so it counted nothing — it was a dot wearing a number. One signal
     /// belongs in one place, and that place is the footer, next to the version.
+    /// Whether this row's badge is counting something that wants an answer.
+    private func isUrgent(_ s: Section) -> Bool {
+        s == .terminal && !state.pending.isEmpty
+    }
+
     private func badge(for s: Section) -> Int? {
         switch s {
-        case .now:      return state.pending.isEmpty ? nil : state.pending.count
         case .runs:     return state.liveRuns.isEmpty ? nil : state.liveRuns.count
-        case .terminal: return state.sessions.isEmpty ? nil : state.sessions.count
+        // Two things can be counted here and urgency wins: a pending gate is
+        // asking you something, a running session merely exists. The count only
+        // ever means "gates" while there are gates, and the banner at the top of
+        // the screen says which — the badge is never the only telling.
+        case .terminal:
+            if !state.pending.isEmpty { return state.pending.count }
+            return state.sessions.isEmpty ? nil : state.sessions.count
         case .projects: return state.workspaces.isEmpty ? nil : state.workspaces.count
         // Open only (`ItemBoard.openCount`): a badge counting done and dropped
         // would grow forever and stop meaning "there is work here".
@@ -372,359 +391,6 @@ func pickWorkspace(_ state: AppState) {
 /// The composer works like the Claude Code prompt rather than a form: one line,
 /// `/` completes Forge commands, `@` completes projects. Dropdowns for mode and
 /// project were a translation of the terminal into a form; this is the terminal.
-struct NowView: View {
-    @ObservedObject var state: AppState
-    @State private var text = ""
-    @State private var commands: [SlashCommand] = []
-    @State private var project = ""
-    @State private var account = ""
-    @State private var highlighted = 0
-    @FocusState private var focused: Bool
-
-    /// Rows currently offered, as a flat list — the menu shows either commands
-    /// or projects, never both, so one index addresses whichever is up.
-    private var menuCount: Int { max(matchingCommands.count, matchingProjects.count) }
-
-
-    private var completion: CompletionContext {
-        ComposerParser.context(in: text, caret: text.endIndex)
-    }
-
-    private var matchingCommands: [SlashCommand] {
-        guard case .command(let q, _) = completion else { return [] }
-        return Array(ComposerParser.filter(commands, query: q).prefix(8))
-    }
-
-    private var matchingProjects: [String] {
-        guard case .project(let q, _) = completion else { return [] }
-        return Array(ComposerParser.filterProjects(state.workspaces, query: q).prefix(8))
-    }
-
-    private var showingMenu: Bool { !matchingCommands.isEmpty || !matchingProjects.isEmpty }
-
-    /// No implicit fallback. Defaulting to the first workspace meant a line
-    /// typed without a project silently ran in whichever one sorted first —
-    /// a wrong-repo dispatch that looks exactly like a right one.
-    ///
-    /// `project` itself may start out preselected via `state.preselection`
-    /// (a configured default, or the last-used project) on `.onAppear` — that
-    /// is a choice the operator made or a place they already were, never a
-    /// guess. `state.workspaces.first` is still never consulted here.
-    private var resolvedProject: String { project }
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                if !state.pending.isEmpty { gateBanner }
-                composer
-                if !state.liveRuns.isEmpty {
-                    SectionTitle("Rodando")
-                    ForEach(state.liveRuns) { r in RunStrip(run: r, state: state) }
-                }
-                if state.workspaces.isEmpty { emptyWorkspaces }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(18)
-        }
-        .navigationTitle("Início")
-        .onAppear {
-            if commands.isEmpty { commands = CommandCatalog.load() }
-            // Guarded on `project.isEmpty` so a re-appear (e.g. returning from
-            // another tab) never overwrites a project the user already chose.
-            if project.isEmpty, let w = state.preselection.workspace { project = w }
-            focused = true
-        }
-    }
-
-    // MARK: Composer
-
-    private var composer: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // PromptEditor zeroes the text container insets, so the first
-            // glyph sits at the view origin and a plain Text beside it lands on
-            // the same line — no baseline guessing, and it holds at any font
-            // size. See PromptEditor.swift for why TextEditor could not.
-            HStack(alignment: .top, spacing: 9) {
-                Text(">")
-                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color.accentOrange)
-
-                ZStack(alignment: .topLeading) {
-                    if text.isEmpty {
-                        Text("Pergunte algo, ou digite / para um comando e @ para um projeto")
-                            .font(.system(size: 15))
-                            .foregroundStyle(.tertiary)
-                            .allowsHitTesting(false)
-                    }
-                    PromptEditor(
-                        text: $text,
-                        onKey: { handleKey($0) },
-                        onSubmit: { submit() })
-                    .frame(minHeight: 20, maxHeight: 150)
-                    .onChange(of: text) { _ in highlighted = 0 }
-                }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-
-                Button { submit() } label: {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 22))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(canSubmit ? Color.accentOrange : Color.secondary.opacity(0.35))
-                .disabled(!canSubmit)
-                .keyboardShortcut(.return, modifiers: .command)
-                .help(canSubmit ? "↩ para enviar · ⇧↩ para nova linha"
-                                : "Escolha um projeto com @ antes de enviar")
-                // Nudge the icon onto the text line: a symbol is taller than
-                // the glyphs it sits beside.
-                .offset(y: -3)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 14)
-
-            if showingMenu {
-                Divider()
-                completionMenu
-            }
-
-            Divider()
-            footerBar
-        }
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(focused ? Color.accentOrange.opacity(0.35) : .clear))
-    }
-
-    private var canSubmit: Bool {
-        !resolvedProject.isEmpty && !text.trimmingCharacters(in: .whitespaces).isEmpty
-    }
-
-    /// Suggestions, styled like the Claude Code menu: name, then what it does.
-    private var completionMenu: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(matchingCommands.enumerated()), id: \.element.id) { idx, cmd in
-                completionRow(icon: cmd.source == .skill ? "sparkle" : "terminal",
-                              title: cmd.slash,
-                              subtitle: cmd.description,
-                              selected: idx == highlighted) {
-                    accept(cmd.slash)
-                }
-            }
-            ForEach(Array(matchingProjects.enumerated()), id: \.element) { idx, path in
-                completionRow(icon: "folder",
-                              title: "@" + ProjectOrganiser.name(path),
-                              subtitle: ProjectOrganiser.abbreviate(
-                                path, home: FileManager.default.homeDirectoryForCurrentUser.path),
-                              selected: idx == highlighted) {
-                    project = path
-                    acceptProject(path)
-                }
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func completionRow(icon: String, title: String, subtitle: String,
-                               selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Image(systemName: icon)
-                    .font(.system(size: 12))
-                    .foregroundStyle(selected ? Color.accentOrange : .secondary)
-                    .frame(width: 18, alignment: .center)
-                    // An SF Symbol has no text baseline of its own; nudge it
-                    // onto the one the labels share.
-                    .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 4 }
-                Text(title)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(.primary)
-                Text(subtitle)
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.tail)
-                Spacer(minLength: 0)
-                if selected {
-                    Text("⇥").font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .padding(.horizontal, 16).padding(.vertical, 9)
-            .background(selected ? AnyShapeStyle(Color.accentOrange.opacity(0.13))
-                                 : AnyShapeStyle(.clear))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    /// Context bar: where this will run, and on which account. Shown as text
-    /// rather than dropdowns — @ sets the project, and the account is a rare
-    /// override that does not deserve a permanent control.
-    private var footerBar: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: resolvedProject.isEmpty ? "folder.badge.questionmark" : "folder")
-                .font(.system(size: 11))
-                .foregroundStyle(resolvedProject.isEmpty ? AnyShapeStyle(Color.accentOrange)
-                                                         : AnyShapeStyle(.tertiary))
-            if resolvedProject.isEmpty {
-                Text("escolha um projeto com @")
-                    .font(.caption).foregroundStyle(Color.accentOrange)
-            } else {
-                Text(ProjectOrganiser.name(resolvedProject))
-                    .font(.caption).foregroundStyle(.secondary)
-                    .help(resolvedProject)
-                Button {
-                    project = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill").font(.system(size: 9))
-                }
-                .buttonStyle(.plain).foregroundStyle(.tertiary)
-                .help("Limpar o projeto")
-            }
-
-            if let c = ComposerParser.split(text).command {
-                Text("· /\(c)").font(.caption).foregroundStyle(Color.accentOrange)
-            }
-
-            Spacer()
-
-            Menu {
-                Button("conta padrão") { account = "" }
-                ForEach(state.accounts.filter(\.has_token)) { a in
-                    Button(a.name) { account = a.name }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "person.crop.circle").font(.system(size: 11))
-                    Text(account.isEmpty ? "conta padrão" : account).font(.caption)
-                }
-                .foregroundStyle(.secondary)
-            }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-
-            HStack(spacing: 3) {
-                Text("↩").font(.system(size: 11, design: .monospaced))
-                Text("enviar").font(.system(size: 10))
-                Text("·").foregroundStyle(.quaternary)
-                Text("⇧↩").font(.system(size: 11, design: .monospaced))
-                Text("nova linha").font(.system(size: 10))
-            }
-            .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 16).padding(.vertical, 10)
-    }
-
-    // MARK: Keyboard
-
-    /// Called by the editor before it treats a key as editing. Returning true
-    /// consumes it. Scoped to the menu being open, so ordinary typing, caret
-    /// movement and newlines behave normally the rest of the time — which a
-    /// global event monitor could not promise.
-    private func handleKey(_ action: PromptEditor.KeyAction) -> Bool {
-        // With the menu open, the keys drive the menu.
-        if showingMenu {
-            switch action {
-            case .up:
-                highlighted = max(0, highlighted - 1)
-            case .down:
-                highlighted = min(menuCount - 1, highlighted + 1)
-            case .tab, .enter:
-                acceptHighlighted()
-            case .shiftEnter:
-                return false        // still a newline
-            case .escape:
-                // End the token rather than clearing the line: what was typed
-                // so far is still what the user meant.
-                text += " "
-            }
-            return true
-        }
-
-        // Menu closed: Enter sends, Shift+Enter breaks the line. That is the
-        // convention in Claude Code and every chat input, and it is why ⌘↩ read
-        // as an odd requirement rather than a shortcut.
-        if action == .enter {
-            submit()
-            return true
-        }
-        return false
-    }
-
-    private func acceptHighlighted() {
-        if !matchingCommands.isEmpty, highlighted < matchingCommands.count {
-            accept(matchingCommands[highlighted].slash)
-        } else if !matchingProjects.isEmpty, highlighted < matchingProjects.count {
-            let path = matchingProjects[highlighted]
-            project = path
-            acceptProject(path)
-        }
-    }
-
-    // MARK: Actions
-
-    private func accept(_ replacement: String) {
-        guard case .command(_, let range) = completion else { return }
-        let (newText, _) = ComposerParser.complete(text, range: range, with: replacement)
-        text = newText
-    }
-
-    /// A project mention selects the target and leaves the text clean — it is
-    /// context for the session, not part of the prompt.
-    private func acceptProject(_ path: String) {
-        guard case .project(_, let range) = completion else { return }
-        var out = text
-        out.replaceSubrange(range, with: "")
-        text = out.trimmingCharacters(in: .whitespaces)
-    }
-
-    /// Turn the line into a session. A leading slash command is passed through
-    /// as-is, so anything Forge gains tomorrow works here without a code change;
-    /// plain text opens a conversation.
-    private func submit() {
-        guard canSubmit else { return }
-        let line = text.trimmingCharacters(in: .whitespaces)
-        state.newSessionRaw(cwd: resolvedProject, prompt: line, account: account)
-        // Record where work actually happened, so the next launch preselects
-        // it as the last-used default — the second-choice tier in `preselection`.
-        state.rememberWorkspace(resolvedProject)
-        text = ""
-        // newSessionRaw already focused the new session; nothing further to do
-        // here. Creating a terminal and leaving the operator on this screen —
-        // with only a toast to explain it — was the original complaint.
-    }
-
-    // MARK: Gate banner
-
-    /// Questions are the exception, so they get a banner rather than the page.
-    private var gateBanner: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "bolt.fill").foregroundStyle(Color.accentOrange)
-                Text(state.pending.count == 1
-                     ? "1 run está esperando você"
-                     : "\(state.pending.count) runs estão esperando você")
-                    .font(.callout).bold()
-                Spacer()
-            }
-            ForEach(state.pending) { gate in GateCard(gate: gate, state: state) }
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.accentOrange.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14)
-            .strokeBorder(Color.accentOrange.opacity(0.3)))
-    }
-
-    private var emptyWorkspaces: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Nenhum projeto observado", systemImage: "folder.badge.questionmark")
-                .font(.callout)
-            Text("Adicione a pasta de um projeto que usa o Forge para começar.")
-                .font(.caption).foregroundStyle(.secondary)
-            Button("Adicionar projeto…") { pickWorkspace(state) }.controlSize(.small)
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
-    }
-}
-
 struct GateCard: View {
     let gate: Gate
     @ObservedObject var state: AppState
@@ -1053,11 +719,22 @@ struct RunCard: View {
                 .controlSize(.small)
                 .help(paused ? "Remove o pedido de pausa"
                              : "Para ao fim da unidade atual, não no meio")
-            Button("Abrir terminal") { state.resume(run) }
-                .controlSize(.small)
+            if let here = state.session(for: run) {
+                Button("Ir para o terminal") { state.focus(here) }
+                    .controlSize(.small)
+                    .help("Esta run já tem uma aba aberta no app")
+            } else {
+                Button("Abrir aqui") { state.resume(run) }
+                    .controlSize(.small)
+                    .help("Abre uma aba com /forge-auto \(run.id) neste projeto")
+            }
             Button("Ver pasta") { ForgeCore.reveal(run.cwd) }
                 .controlSize(.small)
             Spacer()
+            if state.session(for: run) == nil {
+                Text("sem terminal aqui").font(.caption2).foregroundStyle(.tertiary)
+                    .help("A run está viva no disco — o processo que a conduz não é uma aba deste app")
+            }
             if let iso = run.isolation_mode {
                 Text(iso).font(.caption2).foregroundStyle(.tertiary)
                     .help("Modo de isolamento deste run")

@@ -147,16 +147,47 @@ check('WorkspaceDefaults.swift exists and defines preselect + sessionRoot', () =
   assert(src.includes('sessionRoot'), 'WorkspaceDefaults.swift does not mention "sessionRoot"');
 });
 
-check('Views.swift and TerminalView.swift consume the AppState preselection API', () => {
-  const viewsPath = path.join(appSourcesDir, 'Forge', 'Views.swift');
-  const terminalViewPath = path.join(appSourcesDir, 'Forge', 'TerminalView.swift');
-  assert(fs.existsSync(viewsPath), `not found: ${path.relative(repoRoot, viewsPath)}`);
-  assert(fs.existsSync(terminalViewPath), `not found: ${path.relative(repoRoot, terminalViewPath)}`);
-  const viewsSrc = fs.readFileSync(viewsPath, 'utf8');
-  const terminalViewSrc = fs.readFileSync(terminalViewPath, 'utf8');
-  assert(viewsSrc.includes('preselection'), 'Views.swift does not reference "preselection" — resolver may be unwired');
-  assert(terminalViewSrc.includes('preselection'),
-    'TerminalView.swift does not reference "preselection" — resolver may be unwired');
+check('the composer and the launcher consume the AppState preselection API', () => {
+  // Both consumers moved when TerminalView.swift was split and the composer
+  // was lifted out of Views.swift into a view both screens share. What this
+  // guard is about is unchanged: the resolver must have a real reader, or a
+  // configured default workspace silently stops preselecting anything.
+  const composerPath = path.join(appSourcesDir, 'Forge', 'SessionComposer.swift');
+  const launcherPath = path.join(appSourcesDir, 'Forge', 'TerminalLauncher.swift');
+  assert(fs.existsSync(composerPath), `not found: ${path.relative(repoRoot, composerPath)}`);
+  assert(fs.existsSync(launcherPath), `not found: ${path.relative(repoRoot, launcherPath)}`);
+  const composerSrc = fs.readFileSync(composerPath, 'utf8');
+  const launcherSrc = fs.readFileSync(launcherPath, 'utf8');
+  assert(composerSrc.includes('preselection'),
+    'SessionComposer.swift does not reference "preselection" — resolver may be unwired');
+  assert(launcherSrc.includes('preselection'),
+    'TerminalLauncher.swift does not reference "preselection" — resolver may be unwired');
+});
+
+// The other half of b992edf: the session root IS a sanctioned cwd — for a
+// shell or a plain conversation. It must never become the cwd of a `/forge-*`
+// dispatch, which is the exact class of wrong-repo dispatch that commit
+// removed. The composer now falls back to the root, so the split has to be
+// pinned where it lives.
+check('the composer requires a project for slash commands, and only for those', () => {
+  const composerPath = path.join(appSourcesDir, 'Forge', 'SessionComposer.swift');
+  const src = fs.readFileSync(composerPath, 'utf8');
+
+  assert(/private var needsProject: Bool/.test(src),
+    'SessionComposer lost `needsProject` — without it either every session demands a '
+    + 'project (no root-dir shell) or none does (a /forge-* dispatch into the root)');
+  assert(/ComposerParser\.split\(text\)\.command != nil/.test(src),
+    '`needsProject` no longer keys on there being a slash command — that predicate IS '
+    + 'the b992edf boundary');
+  assert(/if needsProject && resolvedProject\.isEmpty \{ return false \}/.test(src),
+    'canSubmit stopped refusing a slash command with no project — b992edf');
+  assert(/resolvedProject\.isEmpty \? state\.resolvedSessionRoot : resolvedProject/.test(src),
+    'the project-less cwd is no longer `resolvedSessionRoot` — the only sanctioned '
+    + 'non-project directory');
+  assert(/if !resolvedProject\.isEmpty \{ state\.rememberWorkspace/.test(src),
+    'rememberWorkspace is no longer guarded — writing the session root as the '
+    + 'last-used workspace makes the fallback directory masquerade as a chosen project '
+    + 'and preselects it from then on');
 });
 
 check('Stores.swift references WorkspaceDefaults', () => {

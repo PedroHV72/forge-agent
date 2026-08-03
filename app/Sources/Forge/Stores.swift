@@ -147,6 +147,12 @@ final class AppState: ObservableObject {
     @Published private(set) var runs: [Run] = []
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var activeAccount: String?
+
+    /// Where `activeAccount` came from. Never collapsed into the name: a label
+    /// that cannot say why it believes something is a label that cannot be
+    /// checked.
+    enum AccountSource { case environment, registry, unknown }
+    @Published private(set) var activeAccountSource: AccountSource = .unknown
     @Published private(set) var usage: [String: AccountUsage] = [:]
     @Published private(set) var workspaces: [String] = []
 
@@ -194,7 +200,7 @@ final class AppState: ObservableObject {
     @Published var section: Section? = Section(rawValue: SectionRestore.resolve(
         rawValue: UserDefaults.standard.string(forKey: "lastSection"),
         valid: Section.allCases.map(\.rawValue),
-        fallback: Section.now.rawValue)) ?? .now {
+        fallback: Section.terminal.rawValue)) ?? .terminal {
         didSet {
             UserDefaults.standard.set(section?.rawValue ?? "", forKey: "lastSection")
         }
@@ -209,6 +215,49 @@ final class AppState: ObservableObject {
     func focus(_ s: TerminalSession?) {
         if let s { focusedSession = s.id }
         section = .terminal
+    }
+
+    /// Whether the inline command bar is floating over the terminal.
+    ///
+    /// ⌘T raises it instead of opening a modal sheet. The old sheet asked
+    /// "what do you want to do?" before letting you do anything, and the
+    /// answer was almost always "just give me a terminal" — which is now
+    /// Enter on an empty line.
+    @Published var showComposer = false
+
+    /// The advanced sheet (⌘⇧N). Still the only place that can pick among
+    /// several active runs, which the one-line command bar cannot express.
+    @Published var showLauncherSheet = false
+
+    /// The session the terminal screen is actually showing, resolved the same
+    /// way the view resolves it — so a shortcut can never act on a session the
+    /// operator is not looking at.
+    var visibleSession: TerminalSession? {
+        let id = TerminalFocus.resolve(selection: focusedSession, among: sessions.map(\.id))
+        return sessions.first { $0.id == id }
+    }
+
+    /// ⌘W. Confirms exactly like the button does — a keystroke must not be a
+    /// cheaper way to kill a running unit than clicking.
+    func closeVisibleSession() {
+        guard let s = visibleSession else { return }
+        _ = closeSession(s, confirm: true)
+    }
+
+    /// ⌘1…⌘9. Out-of-range is a no-op, not a clamp: ⌘5 with three tabs open
+    /// means nothing, and jumping to the last one would be a surprise.
+    func focusSession(at index: Int) {
+        guard sessions.indices.contains(index) else { return }
+        focusedSession = sessions[index].id
+    }
+
+    /// ⌘⇧[ / ⌘⇧]. Wraps, like every tabbed app.
+    func cycleSession(by delta: Int) {
+        guard !sessions.isEmpty,
+              let current = visibleSession,
+              let idx = sessions.firstIndex(where: { $0.id == current.id }) else { return }
+        let next = (idx + delta + sessions.count) % sessions.count
+        focusedSession = sessions[next].id
     }
 
     /// Rich per-project status from forge-status.js, keyed by cwd. Spawns node,
@@ -466,7 +515,31 @@ final class AppState: ObservableObject {
             AccountsPayload.self, "forge-accounts.js", ["--list", "--json"])
         else { return }
         accounts = payload.accounts
-        activeAccount = payload.env_active ?? payload.active
+        // Two different facts wear the same name, and which one it is changes
+        // what the operator should do about it:
+        //
+        //   env_active — this app process carries FORGE_ACCOUNT and (crucially)
+        //     ANTHROPIC_AUTH_TOKEN, inherited from whatever launched it. The
+        //     shell-init `claude()` function goes INERT when a token is already
+        //     set without `--account`, so every bare `claude` in a session
+        //     spawned here runs on that account, outranking the registry.
+        //   active — the forge-accounts default, which is what applies when the
+        //     app was launched clean (from the Dock, say).
+        //
+        // env wins because it is what actually happens. Recording WHICH it was
+        // is the point: "vh, herdada do ambiente" and "vh, padrão do registro"
+        // look identical on screen and mean different things when the default
+        // says lookchina.
+        if let env = payload.env_active {
+            activeAccount = env
+            activeAccountSource = .environment
+        } else if let reg = payload.active {
+            activeAccount = reg
+            activeAccountSource = .registry
+        } else {
+            activeAccount = nil
+            activeAccountSource = .unknown
+        }
     }
 
     /// Costs a real API call per account — only ever on explicit request.
@@ -684,11 +757,30 @@ final class AppState: ObservableObject {
     /// Resume an existing run in an in-app terminal. /forge-auto takes the run
     /// id and picks up from disk state.
     func resume(_ run: Run) {
+        // `--account` was missing here while the session was still LABELLED
+        // with the run's account: the tab named one account and the shell ran
+        // on whatever the default was. Every other creation path passes the
+        // flag; this one is the odd one out, and the label made the mismatch
+        // invisible.
+        let acct = run.account ?? ""
+        let claudeArgs = acct.isEmpty ? "" : " --account \(shq(acct))"
         sessions.append(TerminalSession(
             cwd: run.cwd, title: "\(run.projectName) · auto",
-            bootstrap: "claude \(shq("/forge-auto \(run.id)"))",
+            bootstrap: "claude\(claudeArgs) \(shq("/forge-auto \(run.id)"))",
             runId: run.id, account: run.account))
         focus(sessions.last)
+    }
+
+    /// The session in THIS app driving `run`, if there is one.
+    ///
+    /// Runs live on disk and outlive every process: one started in Terminal.app,
+    /// by `bin/forge-run` headless, or before this app was last quit is active
+    /// and has no session here. That is the normal case, not the exception —
+    /// which is why "open a terminal for it" and "go to its terminal" are two
+    /// different actions rather than one button that sometimes opens a second
+    /// session onto the same run.
+    func session(for run: Run) -> TerminalSession? {
+        sessions.first { $0.runId == run.id && $0.cwd == run.cwd }
     }
 
     /// The sandbox is registered like any other project so examples show up

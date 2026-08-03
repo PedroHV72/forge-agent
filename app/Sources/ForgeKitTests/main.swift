@@ -6643,6 +6643,139 @@ test("TouchedRow: todo símbolo da seção existe de verdade") {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// TerminalZoom / TerminalInput — zoom e entrada de imagem no terminal
+// ─────────────────────────────────────────────────────────────
+
+print("\nTerminalZoom (o tamanho do texto do terminal)")
+
+test("TerminalZoom: os dois extremos são presos, não expandidos") {
+    assertEqual(TerminalZoom.clamp(2), TerminalZoom.minimum)
+    assertEqual(TerminalZoom.clamp(400), TerminalZoom.maximum)
+    assertEqual(TerminalZoom.clamp(14), 14)
+}
+
+test("TerminalZoom: ⌘+ e ⌘− arredondam antes de passar") {
+    // Depois de uma pinça o tamanho é fracionário. O teclado é o controle que
+    // devolve o valor para número inteiro — senão 13.4 vira 14.4 e 12.4.
+    assertEqual(TerminalZoom.stepped(13.4, by: 1), 14)
+    assertEqual(TerminalZoom.stepped(13.4, by: -1), 12)
+    assertEqual(TerminalZoom.stepped(12, by: 1), 13)
+}
+
+test("TerminalZoom: o passo nunca escapa do intervalo") {
+    assertEqual(TerminalZoom.stepped(TerminalZoom.maximum, by: 1), TerminalZoom.maximum)
+    assertEqual(TerminalZoom.stepped(TerminalZoom.minimum, by: -1), TerminalZoom.minimum)
+}
+
+test("TerminalZoom: a pinça é um delta que compõe, não uma escala absoluta") {
+    // NSEvent.magnification vem como fração pequena por evento; dois eventos
+    // seguidos têm que somar na direção dos dedos.
+    let umPasso = TerminalZoom.pinched(12, magnification: 0.1)
+    assertGreater(umPasso, 12)
+    assertGreater(TerminalZoom.pinched(umPasso, magnification: 0.1), umPasso)
+    assertTrue(TerminalZoom.pinched(12, magnification: -0.1) < 12,
+               "pinça negativa tem que diminuir")
+}
+
+test("TerminalZoom: chave ausente lê 0 e NÃO vira um terminal invisível") {
+    // UserDefaults.double devolve 0 para chave que nunca foi escrita — o valor
+    // é indistinguível de um tamanho gravado, e prendê-lo no mínimo seria
+    // aceitar corrupção como preferência.
+    assertEqual(TerminalZoom.restored(fromStored: 0), TerminalZoom.standard)
+    assertEqual(TerminalZoom.restored(fromStored: 3000), TerminalZoom.standard)
+    assertEqual(TerminalZoom.restored(fromStored: -5), TerminalZoom.standard)
+    assertEqual(TerminalZoom.restored(fromStored: 16), 16, "um valor legítimo tem que sobreviver")
+}
+
+test("TerminalZoom: o rótulo mostra ponto inteiro") {
+    assertEqual(TerminalZoom.label(13.4), "13 pt")
+    assertEqual(TerminalZoom.label(12), "12 pt")
+}
+
+print("\nTerminalInput (o que é digitado quando chega arquivo ou imagem)")
+
+test("TerminalInput: caminho sem nada de especial fica intacto") {
+    // A forma que os docs do Claude Code mostram. Envolver em aspas seria
+    // ruído dentro do prompt do próprio Claude.
+    assertEqual(TerminalInput.escapedPath("/Users/x/foto.png"), "/Users/x/foto.png")
+}
+
+test("TerminalInput: espaço é escapado com barra, no estilo do Terminal.app") {
+    assertEqual(TerminalInput.escapedPath("/Users/x/Screen Shot.png"),
+                "/Users/x/Screen\\ Shot.png")
+}
+
+test("TerminalInput: a própria barra é escapada antes de tudo") {
+    assertEqual(TerminalInput.escapedPath("/a\\b"), "/a\\\\b")
+}
+
+test("TerminalInput: metacaracteres de shell não sobrevivem crus") {
+    for c in ["$", "&", ";", "|", "(", ")", "*", "?", "'", "\""] {
+        let saida = TerminalInput.escapedPath("/a\(c)b")
+        assertEqual(saida, "/a\\\(c)b", "metacaractere \(c) passou sem escape")
+    }
+}
+
+test("TerminalInput: vários arquivos viram uma linha com espaço no fim") {
+    // O espaço final é o que deixa soltar dois arquivos em sequência e
+    // continuar digitando sem colar no caminho.
+    assertEqual(TerminalInput.insertion(forPaths: ["/a.png", "/b c.png"]),
+                "/a.png /b\\ c.png ")
+}
+
+test("TerminalInput: nada para inserir devolve nil, não string vazia") {
+    // nil é o sinal que faz o ⌘V cair no colar de texto normal. Uma string
+    // vazia seria \"inseri nada com sucesso\" e engoliria o colar.
+    assertTrue(TerminalInput.insertion(forPaths: []) == nil)
+    assertTrue(TerminalInput.insertion(forPaths: ["", "   "]) == nil)
+}
+
+test("TerminalInput: dois colares no mesmo segundo não colidem") {
+    // Colisão sobrescreveria a primeira imagem com a segunda enquanto o
+    // primeiro caminho segue na tela apontando para a figura errada.
+    let base = Date(timeIntervalSince1970: 1_770_000_000)
+    let a = TerminalInput.pastedImageName(at: base)
+    let b = TerminalInput.pastedImageName(at: base.addingTimeInterval(0.4))
+    assertTrue(a != b, "nomes iguais dentro do mesmo segundo: \(a)")
+    assertEqual(TerminalInput.pastedImageName(at: base), a, "mesma data, mesmo nome")
+    assertTrue(a.hasSuffix(".png"), "extensão perdida: \(a)")
+}
+
+test("TerminalInput: a limpeza só apaga o que está mesmo velho") {
+    let agora = Date(timeIntervalSince1970: 1_770_000_000)
+    let velho = agora.addingTimeInterval(-TerminalInput.imageTTL - 60)
+    let novo = agora.addingTimeInterval(-60)
+    let apagar = TerminalInput.staleImages(
+        [("velho.png", velho), ("novo.png", novo)],
+        now: agora, ttl: TerminalInput.imageTTL)
+    assertEqual(apagar, ["velho.png"])
+}
+
+test("TerminalInput: lista vazia não apaga nada") {
+    assertEqual(TerminalInput.staleImages([], now: Date(), ttl: 1).count, 0)
+}
+
+print("\nTerminalRegistry.entries (o zoom alcança as abas fora da tela)")
+
+test("TerminalRegistry: entries devolve todo terminal vivo") {
+    // SwiftUI só reconstrói a aba visível. Sem esse acessor, mudar o zoom
+    // deixaria as outras no tamanho antigo até alguém olhar para elas.
+    let registry = TerminalRegistry<FakeTerminal>()
+    let a = UUID(), b = UUID()
+    registry.adopt(a) { FakeTerminal(tag: "a") }
+    registry.adopt(b) { FakeTerminal(tag: "b") }
+    assertEqual(Set(registry.entries.map(\.tag)), Set(["a", "b"]))
+}
+
+test("TerminalRegistry: entries some junto com a sessão fechada") {
+    let registry = TerminalRegistry<FakeTerminal>()
+    let a = UUID()
+    registry.adopt(a) { FakeTerminal(tag: "a") }
+    _ = registry.discard(a)
+    assertEqual(registry.entries.count, 0)
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

@@ -33,6 +33,72 @@ struct ForgeApp: App {
                 Button("Adicionar projeto…") { pickWorkspace(state) }
                     .keyboardShortcut("o", modifiers: .command)
             }
+            // Terminal zoom. SwiftTerm ships zoomIn/zoomOut/zoomReset as empty
+            // stubs, so these shortcuts are the feature, not a binding to one.
+            // Disabled with no session open on purpose: the setting would
+            // still be stored, but pressing ⌘= and seeing nothing change reads
+            // as a broken shortcut rather than as a saved preference.
+            CommandGroup(after: .toolbar) {
+                Button("Aumentar texto do terminal") { TerminalViewStore.shared.zoomIn() }
+                    .keyboardShortcut("=", modifiers: .command)
+                    .disabled(state.sessions.isEmpty || !TerminalViewStore.shared.canZoomIn)
+                Button("Diminuir texto do terminal") { TerminalViewStore.shared.zoomOut() }
+                    .keyboardShortcut("-", modifiers: .command)
+                    .disabled(state.sessions.isEmpty || !TerminalViewStore.shared.canZoomOut)
+                Button("Tamanho padrão do terminal") { TerminalViewStore.shared.zoomReset() }
+                    .keyboardShortcut("0", modifiers: .command)
+                    .disabled(state.sessions.isEmpty)
+                Divider()
+            }
+            // Session navigation. The tab tooltip promised ⌘T long before any
+            // binding existed — a promise the menu bar now keeps.
+            CommandMenu("Sessão") {
+                Button("Nova sessão") {
+                    state.section = .terminal
+                    state.showComposer = true
+                }
+                .keyboardShortcut("t", modifiers: .command)
+
+                Button("Nova sessão avançada…") {
+                    state.section = .terminal
+                    state.showComposer = false
+                    state.showLauncherSheet = true
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+
+                // ⌘W closes the SESSION, as in every terminal app. Disabled
+                // with none open so the standard Close Window is still
+                // reachable — trapping the operator in a window they cannot
+                // close would be a worse bug than a missing shortcut.
+                Button("Encerrar sessão") { state.closeVisibleSession() }
+                    .keyboardShortcut("w", modifiers: .command)
+                    .disabled(state.sessions.isEmpty)
+
+                Divider()
+
+                Button("Buscar no terminal") {
+                    TerminalViewStore.shared.showFindBar(for: state.visibleSession?.id)
+                }
+                .keyboardShortcut("f", modifiers: .command)
+                .disabled(state.sessions.isEmpty)
+
+                Divider()
+
+                Button("Próxima sessão") { state.cycleSession(by: 1) }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                    .disabled(state.sessions.count < 2)
+                Button("Sessão anterior") { state.cycleSession(by: -1) }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                    .disabled(state.sessions.count < 2)
+
+                // ⌘1…⌘9, built from the live tab list so the menu names the
+                // session each digit actually goes to.
+                Divider()
+                ForEach(Array(state.sessions.prefix(9).enumerated()), id: \.element.id) { idx, s in
+                    Button(s.tabLabel) { state.focusSession(at: idx) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(idx + 1)")), modifiers: .command)
+                }
+            }
         }
     }
 }

@@ -86,6 +86,15 @@ public final class TerminalRegistry<Entry: AnyObject> {
 
     public var count: Int { slots.count }
     public var ids: Set<UUID> { Set(slots.keys) }
+
+    /// Every live terminal, in no defined order.
+    ///
+    /// Exists for settings that are a property of the app rather than of one
+    /// session — zoom is the first: changing it has to reach the terminals that
+    /// are alive but off screen, and SwiftUI only ever rebuilds the visible
+    /// one. Order is undefined because every caller here is applying the same
+    /// change to all of them.
+    public var entries: [Entry] { slots.values.map(\.entry) }
 }
 
 // MARK: - Teardown policy
