@@ -9,6 +9,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, 'forge-tokens.js');
+const { truncateAtSectionBoundary } = require('./forge-tokens.js');
 let passed = 0;
 let failed = 0;
 
@@ -111,6 +112,81 @@ test('stdin mode retains the structured JSON contract', () => {
     chars: 11,
     method: 'heuristic',
   });
+});
+
+// ── truncateAtSectionBoundary(content, budgetChars, opts) — marker + budget ceiling ──
+
+function multiSectionContent(n) {
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    out += `## Section ${i}\ncontent for section ${i} with some padding text here\n`;
+  }
+  return out;
+}
+
+test('with opts.source, marker names the source pointer', () => {
+  const content = multiSectionContent(20);
+  const result = truncateAtSectionBoundary(content, 200, { source: '.gsd/CODING-STANDARDS.md § Lint' });
+  assert.match(result, /\[\.\.\.truncated \d+ sections — see \.gsd\/CODING-STANDARDS\.md § Lint\]$/);
+});
+
+test('without opts.source, marker is byte-identical to the historical format', () => {
+  const content = multiSectionContent(20);
+  const result = truncateAtSectionBoundary(content, 200);
+  assert.match(result, /\n\n\[\.\.\.truncated \d+ sections\]$/);
+  // The exact literal string the self-test and legacy prefix-based callers depend on.
+  const droppedMatch = result.match(/\[\.\.\.truncated (\d+) sections\]$/);
+  assert.ok(droppedMatch, 'marker must match legacy literal shape');
+});
+
+test('result never exceeds budgetChars across a sweep of small budgets, with and without source', () => {
+  const content = multiSectionContent(30);
+  const budgets = [10, 20, 40, 80];
+  const sources = [undefined, '.gsd/CODING-STANDARDS.md § Somewhat Long Section Name'];
+  for (const budgetChars of budgets) {
+    for (const source of sources) {
+      const opts = source !== undefined ? { source } : undefined;
+      const result = truncateAtSectionBoundary(content, budgetChars, opts);
+      assert.ok(
+        result.length <= budgetChars,
+        `budget=${budgetChars} source=${source}: result.length=${result.length} exceeds budgetChars`
+      );
+    }
+  }
+});
+
+test('an absurdly long opts.source never blows the budget', () => {
+  const content = multiSectionContent(10);
+  const absurdSource = 'x'.repeat(5000);
+  const result = truncateAtSectionBoundary(content, 100, { source: absurdSource });
+  assert.ok(result.length <= 100, `result.length=${result.length} exceeds budget 100`);
+});
+
+test('opts.mandatory still throws with the same message, before any marker calculation', () => {
+  assert.throws(
+    () => truncateAtSectionBoundary('x'.repeat(1000), 100, { mandatory: true, label: 'test-label' }),
+    /Context budget exceeded for mandatory section test-label/
+  );
+});
+
+test('opts.mandatory throws even when opts.source is also present', () => {
+  assert.throws(
+    () => truncateAtSectionBoundary('x'.repeat(1000), 100, { mandatory: true, label: 'test-label', source: 'foo.md' }),
+    /Context budget exceeded for mandatory section test-label/
+  );
+});
+
+test('content that fits returns verbatim, unaffected by opts.source', () => {
+  const content = 'short content that fits easily';
+  const result = truncateAtSectionBoundary(content, 1000, { source: 'irrelevant.md' });
+  assert.strictEqual(result, content);
+});
+
+test('fallback mid-content branch (zero boundaries) also respects opts.source and the budget ceiling', () => {
+  const content = 'a'.repeat(500); // no "## " boundaries at all -> fallback branch
+  const result = truncateAtSectionBoundary(content, 60, { source: 'fallback-source.md' });
+  assert.ok(result.length <= 60, `result.length=${result.length} exceeds budget 60`);
+  assert.match(result, /\[\.\.\.truncated 1 sections/);
 });
 
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
