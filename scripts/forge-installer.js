@@ -136,7 +136,15 @@ function install(input = {}) {
   if (coreAlready && !options.update && !options.dryRun) {
     return { ok: true, changed: false, already_installed: true, runtime, forge_home: paths.forgeHome, selected, backup: null, plan: [{ op: 'skip', reason: 'already-installed', destination: paths.forgeHome }] };
   }
-  if (options.update && coreAlready) backupExisting(coreFiles.map((item) => path.join(paths.forgeHome, item)), backupRoot, plan, options);
+  if (options.update && coreAlready) {
+    backupExisting(coreFiles.map((item) => path.join(paths.forgeHome, item)), backupRoot, plan, options);
+    for (const host of selected) {
+      const home = paths.runtimeHomes[host];
+      for (const directory of ['agents', 'commands', 'skills', path.join('templates', 'dispatch')]) {
+        backupExisting([path.join(home, directory)], path.join(backupRoot, 'adapters', host), plan, options);
+      }
+    }
+  }
 
   // Shared core is copied exactly once into Forge home. Existing prefs are
   // deliberately outside this managed list and are never overwritten.
@@ -150,7 +158,9 @@ function install(input = {}) {
   if (!exists(versionFile) || options.update) writeText(versionFile, `${VERSION}\n`, plan, options);
   const prefs = path.join(paths.forgeHome, 'forge-agent-prefs.jsonc');
   const legacyPrefs = path.join(paths.claudeHome, 'forge-agent-prefs.jsonc');
-  if (!exists(prefs) && exists(legacyPrefs)) copyFile(legacyPrefs, prefs, plan, options);
+  // Claude legacy state is an input only when Claude is selected. Codex-only
+  // must not even read the unselected Claude home.
+  if (selected.includes('claude') && !exists(prefs) && exists(legacyPrefs)) copyFile(legacyPrefs, prefs, plan, options);
   if (!exists(prefs)) {
     const schema = JSON.parse(fs.readFileSync(path.join(repo, 'forge-prefs.schema.json'), 'utf8'));
     const { generateScaffold } = require('./forge-prefs-scaffold');

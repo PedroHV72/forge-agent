@@ -47,3 +47,20 @@ copiar arquivos, escrever manifestos ou modificar homes. O manifesto registra
 quais arquivos pertencem ao core e a cada adapter para permitir auditoria e
 rollback manual.
 
+## Diagnóstico e matriz offline
+
+Antes de instalar um host específico, o diagnóstico opcional pode ser
+executado sem rede ou login:
+
+```text
+node scripts/forge-capabilities.js --detect --runtime claude --json
+node scripts/forge-doctor.js --check capabilities --runtime codex --json
+```
+
+`--runtime claude`, `codex` e `both` são vetores independentes. A suíte
+`forge-installer.test.js` usa homes temporários com sentinelas, fake CLIs Node,
+CRLF/Unicode e uma fixture Claude 3.1.4; `forge-install-templates.test.js`
+valida o inventário de dispatch e os wrappers Bash/PowerShell. Os testes
+marcam explicitamente PowerShell ou Bash como skip somente quando o shell não
+está disponível. Nenhum caso depende de WSL, GNU, conta paga ou rede.
+
