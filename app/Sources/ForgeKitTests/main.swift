@@ -5619,6 +5619,85 @@ test("ProjectStack: o custo é limitado por construção, não por cache") {
     assertEqual(ProjectStack.detect(path: dentro).primary, .go)
 }
 
+// MARK: - GitGlyph: o ícone não pode desfazer a distinção de três casos
+
+test("GitGlyph: os quatro estados do card continuam distinguíveis DEPOIS do ícone") {
+    // Esta é a razão de o tipo existir. `383412d` consertou um card que
+    // imprimia "sem git" para dois repositórios REAIS — a causa raiz foi
+    // starvation do pool cooperativo, mas o que levou isso à tela como uma
+    // afirmação falsa CONFIANTE foi um tipo que confundia dois fatos. Um ícone
+    // ingênuo ("mostra o glifo de git quando há git") transforma três em dois
+    // outra vez, agora na camada de desenho.
+    let repo = GitStatusSnapshot(branch: "main", dirty: false, ahead: 0, behind: 0)
+    let g = [GitGlyph.of(.state(repo)),          // medido: há repositório
+             GitGlyph.of(.absent("sem git")),    // medido: NÃO há repositório
+             GitGlyph.of(.unavailable("timeout")), // não medido
+             GitGlyph.of(nil)]                   // ainda não perguntado
+
+    // Nenhum par empata em NADA que a tela mostre. Tom e texto separam os
+    // quatro; se um dia um par colidir nos dois, os estados viraram um só.
+    for i in 0..<g.count {
+        for j in (i + 1)..<g.count {
+            assertFalse(g[i].tone == g[j].tone && g[i].text == g[j].text,
+                        "estados \(i) e \(j) desenham igual — três fatos viraram dois")
+        }
+    }
+    // E o glifo de branch é EVIDÊNCIA, não decoração: aparece se e somente se
+    // git foi medido e encontrou repositório. Um diretório que não é repo, e um
+    // cujo git nunca respondeu, não podem desenhar uma branch.
+    assertEqual(g[0].symbol, GitGlyph.branchSymbol)
+    assertTrue(g[1].symbol == nil, "'sem git' desenhando branch é a mentira de volta")
+    assertTrue(g[3].symbol == nil, "não medido desenhando branch afirma o que ninguém mediu")
+    assertFalse(g[2].symbol == GitGlyph.branchSymbol,
+                "uma medição que falhou não pode se passar por um repositório")
+    // Nenhuma linha em branco, nunca — silêncio é indistinguível de bug.
+    for x in g { assertFalse(x.text.isEmpty); assertFalse(x.help.isEmpty) }
+}
+
+test("GitGlyph: os quatro casos REAIS do disco do operador") {
+    // feirao-do-lu, fenrir, forge-agent e lookchina, como estão medidos hoje.
+    let feirao = GitGlyph.of(.state(GitStatusSnapshot(branch: "main", dirty: true,
+                                                      ahead: 0, behind: 0)))
+    let fenrir = GitGlyph.of(.state(GitStatusSnapshot(branch: "main", dirty: false,
+                                                      ahead: 0, behind: 0)))
+    let forge = GitGlyph.of(.state(GitStatusSnapshot(branch: "feat/projects-screen-richer",
+                                                     dirty: false, ahead: nil, behind: nil)))
+    let look = GitGlyph.of(.absent("sem git"))
+
+    // Os três repositórios mostram a MESMA marca de branch — ela diz "isto é
+    // git", não "isto é este git" — e se separam por texto e por tom.
+    for r in [feirao, fenrir, forge] { assertEqual(r.symbol, GitGlyph.branchSymbol) }
+    assertEqual(feirao.tone, .dirty, "árvore suja é o único tom de alerta da linha")
+    assertEqual(fenrir.tone, .clean)
+    assertEqual(forge.tone, .clean)
+    assertEqual(look.tone, .absent)
+
+    // O texto não muda: o ícone ACOMPANHA a linha, não a substitui. "sem
+    // upstream" continua dito por extenso, porque um segmento omitido é
+    // indistinguível de "em dia" e são fatos diferentes.
+    assertEqual(forge.text, "feat/projects-screen-richer · limpo · sem upstream")
+    assertEqual(feirao.text, "main · alterações")
+    assertTrue(forge.help.contains("sem upstream"), "help: \(forge.help)")
+    assertTrue(fenrir.help.contains("em dia"), "ahead=0/behind=0 é 'em dia', não 'sem upstream'")
+}
+
+test("GitGlyph: todo símbolo que a linha de git pode desenhar existe de verdade") {
+    // Um nome de SF Symbol inválido renderiza como um quadrado em branco — a
+    // mesma falha vazia que este trabalho inteiro existe para remover.
+    let repo = GitStatusSnapshot(branch: "main", dirty: false, ahead: nil, behind: nil)
+    let simbolos = [GitGlyph.of(.state(repo)), GitGlyph.of(.absent("x")),
+                    GitGlyph.of(.unavailable("x")), GitGlyph.of(nil)]
+        .compactMap(\.symbol)
+    assertFalse(simbolos.isEmpty, "nenhum símbolo exercitado = teste cego")
+    for n in simbolos {
+        assertTrue(NSImage(systemSymbolName: n, accessibilityDescription: nil) != nil,
+                   "SF Symbol inexistente: \(n)")
+    }
+    // Só os nomes que o desenho realmente usa são introduzidos — nenhum glifo
+    // não exercitado a mais do que o desenho precisa.
+    assertEqual(Set(simbolos).count, 2, "símbolos em uso: \(simbolos)")
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

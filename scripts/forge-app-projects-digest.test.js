@@ -180,14 +180,48 @@ test('o card nunca imprime "sem git" — a ausência medida vem nomeada do Forge
     'Projects.swift escreve a string "sem git" — a view voltou a decidir sozinha o que é ' +
     'ausência de repositório; essa frase pertence a ProjectDigest.loadGit(.notARepository)');
 
+  // A distinção MUDOU DE LUGAR, não afrouxou: quando a linha de git ganhou
+  // ícone, a regra de composição desceu para `GitGlyph.of` no ForgeKit — onde
+  // `ForgeKitTests` alcança e prova o comportamento, em vez de um regex sobre a
+  // view provar a forma. Estes asserts seguem a lógica até lá e acrescentam o
+  // que antes não dava para exigir: que a view não possa mais re-derivar nada.
   const i = code.indexOf('private var gitLine');
   assert(i >= 0, 'gitLine não encontrado em Projects.swift');
-  const body = code.slice(i, i + 1200);
-  assert(/case\s+\.unavailable\(let\s+\w+\)/.test(body),
-    'gitLine não distingue mais `.unavailable` — uma medição que falhou volta a cair no mesmo ' +
-    'ramo da ausência medida, que é exatamente o bug');
-  assert(/case\s+\.none/.test(body),
-    'gitLine perdeu o estado "ainda não medido" — o primeiro paint volta a renderizar vazio');
+  // Só o corpo do `gitLine`: o `gitStyle` logo abaixo abre o enum de TOM, que
+  // é outro tipo — incluí-lo faria este assert acusar a tradução tom→cor, que é
+  // exatamente o que a view ainda pode fazer.
+  const end = code.indexOf('private func gitStyle', i);
+  assert(end > i, 'gitStyle não encontrado depois de gitLine — a fatia abaixo perdeu o fim');
+  const body = code.slice(i, end);
+  assert(/GitGlyph\.of\(gitField\)/.test(body),
+    'gitLine não delega mais a GitGlyph.of — a regra de composição da linha de git voltou ' +
+    'para dentro da view, fora do alcance do ForgeKitTests');
+  assert(!/case\s+\.(state|absent|unavailable)\b/.test(body),
+    'gitLine voltou a abrir o DigestGitField sozinha — com o campo em mãos ela pode desenhar ' +
+    'branch para um diretório que não é repositório, que é exatamente o bug');
+  assert(!/Image\(systemName:\s*"/.test(body),
+    'gitLine desenha um símbolo LITERAL — todo glifo desta linha tem de vir do GitGlyph, senão ' +
+    'existe um nome de SF Symbol que o harness nunca valida (e um inválido é um quadrado branco)');
+
+  const digest = stripComments(fs.readFileSync(
+    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift'), 'utf8'));
+  const j = digest.indexOf('static func of(_ field: DigestGitField?)');
+  assert(j >= 0, 'GitGlyph.of não encontrado — a regra de composição da linha de git sumiu');
+  const rule = digest.slice(j, j + 1400);
+  for (const [caso, porque] of [
+    ['.state', 'o estado medido com repositório'],
+    ['.absent', 'a ausência MEDIDA — a única que pode ler "sem git"'],
+    ['.unavailable', 'a medição que FALHOU, que não é uma ausência'],
+    ['.none', 'o "ainda não perguntado" — git roda fora do ciclo de recarga'],
+  ]) {
+    assert(new RegExp(`case\\s+\\${caso}\\b`).test(rule),
+      `GitGlyph.of não distingue mais ${caso}: perdeu ${porque}`);
+  }
+  for (const tom of ['.clean', '.dirty', '.absent', '.failed', '.pending']) {
+    // `tone: X`, ou os dois ramos do ternário limpo/sujo (`? .dirty : .clean`).
+    assert(new RegExp(`(tone:|\\?|:)\\s*\\${tom}\\b`).test(rule),
+      `GitGlyph.of não emite mais o tom ${tom} — dois estados passaram a desenhar igual`);
+  }
 });
 
 test('o git é re-perguntado quando falhou, e nunca quando foi medido', () => {

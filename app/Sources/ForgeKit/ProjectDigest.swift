@@ -173,6 +173,128 @@ public enum DigestGitField: Equatable {
     }
 }
 
+// MARK: - Git glyph
+
+/// How confident the git line is, as a token the view turns into a colour.
+///
+/// Five tones for four states plus dirtiness, and the split matters: `absent`,
+/// `failed` and `pending` are three DIFFERENT things the card can be saying,
+/// and the whole reason `DigestGitField` has three cases is that two of them
+/// once rendered identically and put a false claim on the operator's screen.
+/// The tone is emitted here rather than re-derived in the view, so there is one
+/// place where "measured, and there is none" can be told from "not measured".
+public enum GitTone: String, Equatable, CaseIterable {
+    /// Repository, tree clean.
+    case clean
+    /// Repository, uncommitted changes.
+    case dirty
+    /// MEASURED: this directory is not a repository.
+    case absent
+    /// Git was asked and did not answer. Not an absence.
+    case failed
+    /// Not asked yet — git is ~102 ms/card and is off the reload path.
+    case pending
+}
+
+/// The git line a card should draw: an optional glyph, the text, the tone, and
+/// the sentence explaining all three.
+///
+/// Data, not SwiftUI, for the same reason `StackGlyph` is: the `Forge` target
+/// is not importable from a test target on this machine, so anything expressed
+/// as a `View` would be verifiable only by looking at a screen — and this line
+/// is exactly the one that shipped a confident false claim once already.
+///
+/// ONE GLYPH, NOT TWO. The ask was an icon for "has git" and an icon for the
+/// branch. Those are the same fact: a branch exists if and only if a repository
+/// does, so drawing both would put two glyphs in front of one claim on a line
+/// that already sits under a stack glyph, a role line, an identity line and a
+/// last-delivery line. `arrow.triangle.branch` sits immediately before the
+/// branch NAME, which is `line`'s first segment — so it labels the name it
+/// precedes and simultaneously marks the row as git.
+///
+/// AND ONLY THERE. `absent` and `pending` deliberately return no symbol. A
+/// glyph next to "sem git" or "git…" would decorate a word rather than replace
+/// one, and — the load-bearing half — a glyph on every state would make the
+/// four states differ only by which glyph, when what must never happen is a
+/// non-repository or an unmeasured card reading like a repository on `main`.
+/// With this rule the glyph is itself evidence: a branch mark appears on a card
+/// if and only if git was measured and found a repository. `failed` keeps its
+/// warning triangle, which cannot be mistaken for a branch at any size.
+public struct GitGlyph: Equatable {
+    /// SF Symbol name, or `nil` for the states that deliberately draw none.
+    /// Every non-nil value is asserted to resolve against the real symbol set
+    /// by the harness — an invalid name renders as a blank square, which is the
+    /// empty slot this work exists to remove.
+    public let symbol: String?
+    /// What the row prints. Never empty.
+    public let text: String
+    /// What the row is claiming, in pt-BR, for `.help()`. Never empty.
+    public let help: String
+    public let tone: GitTone
+
+    public init(symbol: String?, text: String, help: String, tone: GitTone) {
+        self.symbol = symbol
+        self.text = text
+        self.help = help
+        self.tone = tone
+    }
+
+    /// SF Symbol for a branch. One constant, so the mark cannot be spelled
+    /// differently in a second place and drift into a blank square.
+    public static let branchSymbol = "arrow.triangle.branch"
+
+    /// THE COMPOSITION RULE, in one place.
+    ///
+    /// `nil` means the caller has not measured git yet — which the digest
+    /// cannot know, because deferring the probe is the CALLER's decision.
+    public static func of(_ field: DigestGitField?) -> GitGlyph {
+        switch field {
+        case .state(let s):
+            return GitGlyph(symbol: branchSymbol,
+                            text: s.line,
+                            help: s.help,
+                            tone: s.dirty ? .dirty : .clean)
+        case .absent(let why):
+            // No glyph: the sentence IS the whole row, and a mark here would
+            // be one more shape competing with the branch mark above it.
+            return GitGlyph(symbol: nil, text: why,
+                            help: "git respondeu: não há repositório aqui",
+                            tone: .absent)
+        case .unavailable(let why):
+            // Never "sem git". Git was asked and did not answer, which is a
+            // different fact from there being no repository, and the reason it
+            // arrived with is kept on hover.
+            return GitGlyph(symbol: "exclamationmark.triangle",
+                            text: "git não respondeu", help: why, tone: .failed)
+        case .none:
+            return GitGlyph(symbol: nil, text: "git…",
+                            help: "git ainda não consultado — a sonda roda fora do ciclo de recarga",
+                            tone: .pending)
+        }
+    }
+}
+
+public extension GitStatusSnapshot {
+    /// The line spelled out as a sentence, for the tooltip.
+    ///
+    /// Says the upstream case in words rather than by the ABSENCE of a
+    /// segment, for the same reason `line` does: an omitted segment is
+    /// indistinguishable from "in sync", and those are different facts.
+    var help: String {
+        var s = "branch \(branch) — \(dirty ? "com alterações não commitadas" : "árvore limpa")"
+        if let ahead, let behind {
+            if ahead == 0 && behind == 0 {
+                s += " — em dia com o upstream"
+            } else {
+                s += " — \(ahead) à frente, \(behind) atrás do upstream"
+            }
+        } else {
+            s += " — sem upstream configurado"
+        }
+        return s
+    }
+}
+
 /// The pt-BR word for a role on a card. Lives here, not on `ProjectRole` in
 /// `ProjectMarker.swift`, because that type is the tree's structural
 /// vocabulary and has no other presentation concern — the digest is what puts

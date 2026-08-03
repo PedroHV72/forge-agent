@@ -765,30 +765,38 @@ struct ProjectCard: View {
         }
     }
 
+    /// The git row. Which glyph, which words and which tone are decided by
+    /// `GitGlyph.of` in ForgeKit — where `ForgeKitTests` can reach them —
+    /// exactly as `projectIcon` defers to `StackGlyph.of`. This view only maps
+    /// the tone token to a colour.
+    ///
+    /// The branch mark appears if and only if `tone` is `.clean` or `.dirty`,
+    /// i.e. only when git was measured and found a repository. A card that is
+    /// not a repository, and a card whose git has not been measured, therefore
+    /// cannot draw a branch — the distinction the three-case `DigestGitField`
+    /// exists to protect is carried by the glyph too, not only by the wording.
     @ViewBuilder private var gitLine: some View {
-        switch gitField {
-        case .state(let s):
-            Text(s.line)
-                .font(.system(size: 10)).monospaced()
-                .foregroundStyle(s.dirty ? Color.accentOrange : Color.secondary.opacity(0.7))
-                .lineLimit(1)
-        case .absent(let why):
-            Text(why).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
-        case .unavailable(let why):
-            // Never "sem git": git was asked and did not answer, which is a
-            // different fact from there being no repository. Said as a failure,
-            // with the reason on hover, so the card is never caught claiming a
-            // measurement it does not have.
-            HStack(spacing: 4) {
-                Image(systemName: "exclamationmark.triangle").font(.system(size: 8))
-                Text("git não respondeu").font(.system(size: 10))
+        let g = GitGlyph.of(gitField)
+        HStack(spacing: 4) {
+            if let symbol = g.symbol {
+                Image(systemName: symbol).font(.system(size: 9))
+                    .symbolRenderingMode(.hierarchical)
             }
-            .foregroundStyle(.tertiary).help(why)
-        case .none:
-            // Named, not blank: git is ~102 ms per card and is deliberately not
-            // on the reload path, so this state is normal and must read as
-            // "not yet" rather than as an empty row.
-            Text("git…").font(.system(size: 10)).foregroundStyle(.quaternary)
+            Text(g.text).font(.system(size: 10)).monospaced().lineLimit(1)
+        }
+        .foregroundStyle(gitStyle(g.tone))
+        .help(g.help)
+        .accessibilityLabel(g.help)
+    }
+
+    /// Tone token → colour. The one place the view is allowed an opinion about
+    /// git, and it has no access to the field to second-guess the token with.
+    private func gitStyle(_ tone: GitTone) -> AnyShapeStyle {
+        switch tone {
+        case .dirty: return AnyShapeStyle(Color.accentOrange)
+        case .clean: return AnyShapeStyle(Color.secondary.opacity(0.7))
+        case .absent, .failed: return AnyShapeStyle(.tertiary)
+        case .pending: return AnyShapeStyle(.quaternary)
         }
     }
 
