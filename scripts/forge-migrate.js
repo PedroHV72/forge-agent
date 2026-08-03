@@ -386,7 +386,10 @@ function migrateAll(cwd, opts = {}) {
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
-module.exports = { migrateAll };
+// readSchemaVersion is additionally exported for scripts/forge-schema-guard.js
+// (M-S01 T03), which reads .gsd/SCHEMA-VERSION via this single source of
+// truth instead of reimplementing file reading.
+module.exports = { migrateAll, readSchemaVersion };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 function printUsage() {
