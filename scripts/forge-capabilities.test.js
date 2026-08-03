@@ -23,7 +23,7 @@ function fixture() {
     $defs: { host: { enum: ['claude', 'codex'] } },
   };
   const capability = (id, kind, probe) => ({
-    capability_id: id, kind, owner: 'test-owner', required: true,
+    capability_id: id, kind, owner: 'test-owner', required: true, classification: 'conditional',
     hosts: { claude: 'implemented', codex: 'planned' }, probe: { kind: 'filesystem', path: probe },
   });
   const catalog = {
@@ -82,6 +82,17 @@ test('audit rejects duplicate probe paths', () => {
 test('audit rejects an invalid host classification', () => {
   const data = fixture();
   try { data.catalog.capabilities[0].hosts.codex = 'green'; has(api.validateCatalog(data.catalog, data.schema), 'invalid codex classification'); } finally { data.cleanup(); }
+});
+test('schema definitions do not contain duplicate keys', () => {
+  const schemaText = fs.readFileSync(path.join(path.resolve(__dirname, '..'), 'schemas', 'forge-capabilities.schema.json'), 'utf8');
+  assert.strictEqual((schemaText.match(/"reason_code"\s*:/g) || []).length, 1);
+});
+test('audit rejects a missing or invalid explicit classification', () => {
+  const data = fixture();
+  try {
+    delete data.catalog.capabilities[0].classification;
+    has(api.validateCatalog(data.catalog, data.schema), 'classification must be one of');
+  } finally { data.cleanup(); }
 });
 test('audit rejects unknown host keys', () => {
   const data = fixture();
@@ -214,6 +225,29 @@ test('classifies missing, unsupported, and invalid CLI probes with stable codes'
     const missingReport = api.detect(base, { runtime: 'claude', binaries: { claude: path.join(root, 'absent') } });
     assert.strictEqual(missingReport.probes.claude.status, 'missing');
     assert.strictEqual(missingReport.probes.claude.reason_code, 'missing');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Windows .cmd shims keep argv and Unicode paths without shell fallback', () => {
+  if (process.platform !== 'win32') return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cap-cmd-Ω-'));
+  const shim = path.join(root, 'fake cli Ω.cmd');
+  fs.writeFileSync(shim, '@echo off\r\nif "%1"=="--version" (echo 3.2.0) else (echo help)\r\n', 'utf8');
+  try {
+    const report = api.detect(path.resolve(__dirname, '..'), { runtime: 'claude', binaries: { claude: shim } });
+    assert.strictEqual(report.probes.claude.status, 'available');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('POSIX non-executable probe reports permission-denied', () => {
+  if (process.platform === 'win32') return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cap-noexec-'));
+  const file = path.join(root, 'fake-cli');
+  fs.writeFileSync(file, '#!/bin/sh\necho 3.2.0\n', 'utf8');
+  fs.chmodSync(file, 0o644);
+  try {
+    const report = api.detect(path.resolve(__dirname, '..'), { runtime: 'claude', binaries: { claude: file } });
+    assert.strictEqual(report.probes.claude.reason_code, 'permission-denied');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -128,8 +128,8 @@ function validateCatalog(catalog, schema) {
         if (!AVAILABILITY.includes(status)) issue(issues, `${id}: invalid ${platform} classification ${JSON.stringify(status)}`);
       }
     }
-    if (capability.classification !== undefined && !CLASSIFICATIONS.includes(capability.classification)) {
-      issue(issues, `${id}: invalid classification ${JSON.stringify(capability.classification)}`);
+    if (!CLASSIFICATIONS.includes(capability.classification)) {
+      issue(issues, `${id}: classification must be one of ${CLASSIFICATIONS.join(', ')}`);
     }
   }
   if (catalog.reason_codes !== undefined) {
@@ -280,7 +280,10 @@ function resolveExecutable(command, options = {}) {
   for (const candidate of candidates) {
     try {
       if (fs.statSync(candidate).isFile()) {
-        if (platform === 'win32' || (fs.statSync(candidate).mode & 0o111) !== 0 || isPathCommand(command)) return path.resolve(candidate);
+        if (platform === 'win32' || (fs.statSync(candidate).mode & 0o111) !== 0) return path.resolve(candidate);
+        // Return an existing non-executable POSIX file so spawnSync can
+        // surface EACCES as a stable permission-denied diagnostic.
+        if (platform !== 'win32') return path.resolve(candidate);
       }
     } catch (_) { /* continue */ }
   }
@@ -294,7 +297,12 @@ function outputOf(result) {
 function invoke(executable, args, options = {}) {
   let result;
   try {
-    result = spawnSync(executable, args, {
+    const windowsShim = (options.platform || process.platform) === 'win32' && /\.(?:cmd|bat)$/i.test(executable);
+    const command = windowsShim ? ((options.env || process.env).ComSpec || 'cmd.exe') : executable;
+    const commandArgs = windowsShim
+      ? ['/d', '/c', executable, ...args]
+      : args;
+    result = spawnSync(command, commandArgs, {
       cwd: options.cwd,
       env: options.env || process.env,
       shell: false,

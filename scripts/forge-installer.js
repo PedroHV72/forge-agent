@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
+const { detect: detectCapabilities } = require('./forge-capabilities');
 
 const RUNTIMES = Object.freeze(['claude', 'codex', 'both']);
 const VERSION = '3.1.4';
@@ -95,6 +96,34 @@ function copyIfMissing(source, destination, plan, options) {
   return true;
 }
 
+function readJsonIfPresent(file) {
+  if (!exists(file)) return null;
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return null; }
+}
+
+function projectionComplete(paths, host) {
+  const manifestFile = path.join(paths.adapters[host], 'manifest.json');
+  const manifest = readJsonIfPresent(manifestFile);
+  if (!manifest || manifest.runtime !== host || !Array.isArray(manifest.files)) return false;
+  return manifest.files.every((relative) => exists(path.join(paths.runtimeHomes[host], relative)));
+}
+
+function capabilityReport(repo, runtime, options) {
+  if (options.skipCapabilityCheck) return null;
+  return detectCapabilities(repo, {
+    runtime,
+    binaries: options.binaries,
+    env: options.env,
+    timeout: options.capabilityTimeout,
+  });
+}
+
+function backupId(options) {
+  if (options.dryRun) return `backup-${VERSION}-dry-run`;
+  const suffix = `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
+  return `backup-${VERSION}-${suffix}`;
+}
+
 function backupExisting(paths, backupRoot, plan, options) {
   const files = [];
   for (const root of paths) {
@@ -125,16 +154,23 @@ function install(input = {}) {
   });
   const plan = [];
   const selected = selectedRuntimes(runtime);
-  const backupName = `backup-${VERSION}-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}`;
+  const capabilities = capabilityReport(repo, runtime, options);
+  if (capabilities && !capabilities.ok && !options.dryRun) {
+    const failures = capabilities.required_failures.join(', ');
+    throw new Error(`capability obrigatória ausente para ${runtime}: ${failures || 'diagnóstico inconclusivo'}`);
+  }
+  const backupName = backupId(options);
   const backupRoot = path.join(paths.forgeHome, 'backups', backupName);
   const coreFiles = [];
   for (const item of MANAGED_CORE) {
     const source = path.join(repo, item);
     if (exists(source)) coreFiles.push(item);
   }
-  const coreAlready = exists(paths.forgeHome) && coreFiles.some((item) => exists(path.join(paths.forgeHome, item)));
-  if (coreAlready && !options.update && !options.dryRun) {
-    return { ok: true, changed: false, already_installed: true, runtime, forge_home: paths.forgeHome, selected, backup: null, plan: [{ op: 'skip', reason: 'already-installed', destination: paths.forgeHome }] };
+  const coreAlready = exists(paths.forgeHome) && coreFiles.length > 0 && coreFiles.every((item) => exists(path.join(paths.forgeHome, item)));
+  const installComplete = coreAlready && exists(paths.shared.version) && exists(paths.shared.prefs)
+    && selected.every((host) => projectionComplete(paths, host));
+  if (installComplete && !options.update && !options.dryRun) {
+    return { ok: true, changed: false, already_installed: true, runtime, forge_home: paths.forgeHome, selected, backup: null, capabilities, plan: [{ op: 'skip', reason: 'already-installed', destination: paths.forgeHome }] };
   }
   if (options.update && coreAlready) {
     backupExisting(coreFiles.map((item) => path.join(paths.forgeHome, item)), backupRoot, plan, options);
@@ -170,7 +206,8 @@ function install(input = {}) {
 
   // Migrate a legacy Claude global preference only as a read-preserving input.
   const source = adapterSources(repo);
-  const adapterManifest = {};
+  const existingManifest = readJsonIfPresent(paths.shared.manifest) || {};
+  const adapterManifest = { ...(existingManifest.adapters || {}) };
   for (const host of selected) {
     const home = paths.runtimeHomes[host];
     const root = path.join(paths.adapters[host]);
@@ -182,13 +219,18 @@ function install(input = {}) {
     adapterManifest[host] = { home, files: entries.sort() };
     writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files: entries.sort() }, null, 2) + '\n', plan, options);
   }
-  const manifest = { version: VERSION, runtime, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
+  const installedHosts = Object.keys(adapterManifest).sort();
+  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
   writeText(paths.shared.manifest, JSON.stringify(manifest, null, 2) + '\n', plan, options);
-  return { ok: true, changed: plan.some((entry) => entry.op === 'copy' || entry.op === 'write'), dry_run: Boolean(options.dryRun), runtime, selected, forge_home: paths.forgeHome, runtime_homes: Object.fromEntries(selected.map((host) => [host, paths.runtimeHomes[host]])), backup: options.update && coreAlready ? backupRoot : null, plan, manifest };
+  return { ok: true, changed: plan.some((entry) => entry.op === 'copy' || entry.op === 'write'), dry_run: Boolean(options.dryRun), runtime, selected, forge_home: paths.forgeHome, runtime_homes: Object.fromEntries(selected.map((host) => [host, paths.runtimeHomes[host]])), backup: options.update && coreAlready ? backupRoot : null, capabilities, plan, manifest };
 }
 
 function render(report) {
   const lines = [`Forge Agent Installer ${VERSION}`, `runtime: ${report.runtime}`, `Forge home: ${report.forge_home}`];
+  if (report.capabilities) {
+    const state = report.capabilities.ok ? 'ok' : `failed (${report.capabilities.required_failures.join(', ') || 'inconclusive'})`;
+    lines.push(`Capabilities: ${state}`);
+  }
   if (report.already_installed) lines.push('Already installed; use --update to replace managed files.');
   if (report.dry_run) lines.push(`Dry-run: ${report.plan.length} operation(s), no files written.`);
   else lines.push(`${report.changed ? 'Installed' : 'No changes'}; ${report.plan.length} operation(s).`);

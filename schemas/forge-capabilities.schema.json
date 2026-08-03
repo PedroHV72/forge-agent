@@ -28,7 +28,6 @@
     "kind": { "type": "string", "enum": ["skill", "agent", "command", "hook", "headless", "mcp", "statusline", "accounts", "app", "runtime"] },
     "classification": { "type": "string", "enum": ["common", "conditional", "unavailable"] },
     "reason_code": { "type": "string", "enum": ["available", "missing", "unsupported", "inconclusive", "permission-denied", "not-selected", "invalid-output", "exit-nonzero", "minimum-version"] },
-    "reason_code": { "type": "string", "enum": ["available", "missing", "unsupported", "inconclusive", "permission-denied", "not-selected", "invalid-output", "exit-nonzero", "minimum-version"] },
     "probe": {
       "type": "object",
       "required": ["kind", "path"],

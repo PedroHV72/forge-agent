@@ -15,7 +15,7 @@ function fixture() {
   const forgeHome = path.join(root, 'Forge Home');
   const claudeHome = path.join(root, 'Claude Home');
   const codexHome = path.join(root, 'Codex Home');
-  const options = { repo: path.resolve(__dirname, '..'), forgeHome, claudeHome, codexHome };
+  const options = { repo: path.resolve(__dirname, '..'), forgeHome, claudeHome, codexHome, skipCapabilityCheck: true };
   return { root, forgeHome, claudeHome, codexHome, options, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 function files(root) { return fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }).map((entry) => entry.name).sort() : []; }
@@ -98,6 +98,19 @@ test('legacy Claude preference migrates without removing source', () => {
   } finally { data.cleanup(); }
 });
 
+test('switching from Claude-only to both fills the missing Codex projection', () => {
+  const data = fixture();
+  try {
+    installer.install({ ...data.options, runtime: 'claude' });
+    assert.strictEqual(fs.existsSync(path.join(data.codexHome, 'agents')), false);
+    const report = installer.install({ ...data.options, runtime: 'both' });
+    assert.strictEqual(report.already_installed, undefined);
+    assert.strictEqual(fs.existsSync(path.join(data.codexHome, 'agents')), true);
+    const manifest = JSON.parse(fs.readFileSync(path.join(data.forgeHome, 'manifest.json'), 'utf8'));
+    assert.deepStrictEqual(Object.keys(manifest.adapters).sort(), ['claude', 'codex']);
+  } finally { data.cleanup(); }
+});
+
 test('sentinels prove the non-selected home remains byte-identical', () => {
   const data = fixture();
   try {
@@ -124,6 +137,17 @@ test('repeating a selected install is byte-idempotent', () => {
     assert.strictEqual(second.already_installed, true);
     for (const [file, bytes] of Object.entries(snapshot)) assert.deepStrictEqual(fs.readFileSync(file), bytes);
     assert.strictEqual(first.runtime, second.runtime);
+  } finally { data.cleanup(); }
+});
+
+test('update dry-run keeps a deterministic non-colliding backup plan', () => {
+  const data = fixture();
+  try {
+    installer.install({ ...data.options, runtime: 'claude' });
+    const left = installer.install({ ...data.options, runtime: 'claude', update: true, dryRun: true });
+    const right = installer.install({ ...data.options, runtime: 'claude', update: true, dryRun: true });
+    assert.strictEqual(JSON.stringify(left.plan), JSON.stringify(right.plan));
+    assert.match(left.backup || '', /dry-run/);
   } finally { data.cleanup(); }
 });
 
@@ -160,6 +184,14 @@ test('capability diagnostics remain selected-host local and offline', () => {
     assert.strictEqual(report.probes.codex.status, 'available');
     assert.strictEqual(report.probes.claude.reason_code, 'not-selected');
   } finally { fs.rmSync(fakeRoot, { recursive: true, force: true }); }
+});
+
+test('selected runtime capability failure is fail-closed before writes', () => {
+  const data = fixture();
+  try {
+    assert.throws(() => installer.install({ ...data.options, skipCapabilityCheck: false, runtime: 'codex', binaries: { codex: path.join(data.root, 'missing-codex') } }), /capability obrigatória/);
+    assert.strictEqual(fs.existsSync(data.forgeHome), false);
+  } finally { data.cleanup(); }
 });
 
 test('Claude 3.1.4 fixture is versioned with prefs, Markdown, hooks, templates and .gsd', () => {

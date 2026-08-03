@@ -49,8 +49,10 @@ rollback manual.
 
 ## Diagnóstico e matriz offline
 
-Antes de instalar um host específico, o diagnóstico opcional pode ser
-executado sem rede ou login:
+Uma instalação real valida fail-closed a capability obrigatória do host
+selecionado antes da primeira escrita. O `--dry-run` não bloqueia por ausência
+do CLI: apenas inclui o diagnóstico no plano, sem escrever nada. O diagnóstico
+explícito também pode ser executado sem rede ou login:
 
 ```text
 node scripts/forge-capabilities.js --detect --runtime claude --json
