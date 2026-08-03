@@ -6482,6 +6482,167 @@ test("GitRowSegment: todo símbolo dos segmentos existe de verdade") {
     assertTrue(seg.help.contains("git.sr.ht"), "o nome do host sumiu da frase: \(seg.help)")
 }
 
+// MARK: - TouchedRow
+
+/// A directory with a `.gsd/` holding `entries`, plus an optional `.git`.
+func touchedTree(_ tag: String, gsd: [String], git: Bool = false) -> String {
+    let tmp = NSTemporaryDirectory() + "forge-touched-\(tag)-\(UUID().uuidString.prefix(8))"
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: tmp + "/.gsd", withIntermediateDirectories: true)
+    for e in gsd { fm.createFile(atPath: tmp + "/.gsd/" + e, contents: Data("x".utf8)) }
+    if git { try? fm.createDirectory(atPath: tmp + "/.git", withIntermediateDirectories: true) }
+    return tmp
+}
+
+test("TouchedRow: a linha diz o NOME da pasta, não só um pedaço do caminho") {
+    // O defeito que originou este tipo: a linha imprimia apenas o caminho
+    // abreviado, truncado no meio, então o que sobrava na tela era um trecho de
+    // um ancestral e nada que identificasse a pasta.
+    let r = TouchedRow.load(path: "/Users/x/Development/asgard", home: "/Users/x")
+    assertEqual(r.name, "asgard")
+    assertEqual(r.location, "~/Development")
+    assertFalse(r.name.isEmpty)
+    assertFalse(r.location.isEmpty)
+}
+
+test("TouchedRow: nome e local nunca ficam vazios, nem para caminhos degenerados") {
+    for p in ["/", "/tmp/", "x"] {
+        let r = TouchedRow.load(path: p, home: "/Users/x")
+        assertFalse(r.name.isEmpty, "nome vazio para \(p) — o slot em branco de volta")
+        assertFalse(r.location.isEmpty, "local vazio para \(p)")
+    }
+}
+
+test("TouchedRow: .gsd/ vazio e .gsd/ ilegível são fatos DIFERENTES") {
+    let vazio = touchedTree("vazio", gsd: [])
+    defer { try? FileManager.default.removeItem(atPath: vazio) }
+    let v = TouchedRow.load(path: vazio, home: "/Users/x").facts[0]
+    assertEqual(v.kind, .contents)
+    assertEqual(v.text, ".gsd/ vazio")
+    assertTrue(v.measured, "diretório vazio FOI medido — cinza diria que não deu para saber")
+
+    // Sem .gsd/ nenhum: leitura falha. Nunca pode virar "vazio".
+    let semGsd = NSTemporaryDirectory() + "forge-touched-nao-existe-\(UUID().uuidString.prefix(8))"
+    let a = TouchedRow.load(path: semGsd, home: "/Users/x").facts[0]
+    assertFalse(a.measured, "falha de leitura marcada como medida")
+    assertFalse(a.text == ".gsd/ vazio",
+                "não conseguir ler virou 'não tem nada' — a afirmação falsa confiante")
+    assertFalse(a.text.isEmpty)
+}
+
+test("TouchedRow: o conteúdo do .gsd/ é NOMEADO — é a prova da classificação") {
+    let dir = touchedTree("scratch", gsd: ["forge", "STATE.md"])
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let f = TouchedRow.load(path: dir, home: "/Users/x").facts[0]
+    assertTrue(f.text.contains("forge"), "o que está dentro sumiu: \(f.text)")
+    assertTrue(f.text.contains("STATE.md"), "o que está dentro sumiu: \(f.text)")
+    assertTrue(f.measured)
+}
+
+test("TouchedRow: excesso de entradas é contado, nunca descartado em silêncio") {
+    let dir = touchedTree("muitos", gsd: ["a", "b", "c", "d", "e"])
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let f = TouchedRow.load(path: dir, home: "/Users/x").facts[0]
+    assertTrue(f.text.contains("+2"), "duas entradas sumiram sem serem contadas: \(f.text)")
+}
+
+test("TouchedRow: a idade responde 'sucata antiga ou coisa viva'") {
+    let dir = touchedTree("idade", gsd: ["forge"])
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let hoje = TouchedRow.load(path: dir, home: "/Users/x").facts[1]
+    assertEqual(hoje.kind, .age)
+    assertTrue(hoje.measured)
+    assertTrue(hoje.text.contains("hoje"), "acabou de ser criado e não diz 'hoje': \(hoje.text)")
+
+    // Um `now` no futuro é a mesma coisa que um .gsd/ velho.
+    let velho = TouchedRow.load(path: dir, home: "/Users/x",
+                                now: Date().addingTimeInterval(60 * 60 * 24 * 40)).facts[1]
+    assertTrue(velho.text.contains("mes"), "40 dias não viraram meses: \(velho.text)")
+}
+
+test("TouchedRow: idade não medida é dita, não inventada") {
+    let f = TouchedRow.load(path: NSTemporaryDirectory() + "nada-\(UUID().uuidString.prefix(8))",
+                            home: "/Users/x").facts[1]
+    assertFalse(f.measured)
+    assertFalse(f.text.isEmpty)
+    assertFalse(f.text.contains("hoje"), "ausência de medida virou 'hoje'")
+}
+
+test("TouchedRow: 'é repositório' e 'não é' são os dois medidos") {
+    let comGit = touchedTree("comgit", gsd: ["forge"], git: true)
+    let semGit = touchedTree("semgit", gsd: ["forge"])
+    defer {
+        try? FileManager.default.removeItem(atPath: comGit)
+        try? FileManager.default.removeItem(atPath: semGit)
+    }
+    let a = TouchedRow.load(path: comGit, home: "/Users/x").facts[2]
+    let b = TouchedRow.load(path: semGit, home: "/Users/x").facts[2]
+    assertEqual(a.kind, .repo)
+    assertEqual(a.text, "repositório git")
+    assertEqual(b.text, "sem repositório git")
+    assertTrue(a.measured && b.measured, "ambos foram medidos — nenhum é 'não deu para saber'")
+    // E NENHUM dos dois afirma branch: isto é um stat, não um `git status`.
+    assertFalse(a.symbol == GitGlyph.branchSymbol,
+                "a marca de branch é reservada a um git status medido")
+}
+
+test("TouchedRow: os três fatos, sempre, nessa ordem, nunca em branco") {
+    let dir = touchedTree("ordem", gsd: ["forge"])
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let r = TouchedRow.load(path: dir, home: "/Users/x")
+    assertEqual(r.facts.map(\.kind), [.contents, .age, .repo])
+    for f in r.facts {
+        assertFalse(f.text.isEmpty, "fato \(f.kind) em branco")
+        assertFalse(f.symbol.isEmpty, "fato \(f.kind) sem símbolo")
+    }
+}
+
+test("TouchedRow: o botão promete LISTA, não disco — a claim mais perigosa da seção") {
+    // `state.removeWorkspace` tira uma entrada do registro e não apaga um byte.
+    // O operador pediu o ícone e a cor de excluir; a palavra tem que carregar o
+    // objeto certo, ou a lata de lixo vermelha vira afirmação falsa sobre os
+    // arquivos dele.
+    assertEqual(TouchedRow.removeLabel, "Remover da lista")
+    let proibidas = ["excluir", "apagar", "deletar"]
+    for p in proibidas {
+        assertFalse(TouchedRow.removeLabel.lowercased().contains(p),
+                    "o rótulo promete destruir o disco: \(TouchedRow.removeLabel)")
+    }
+    let ajuda = TouchedRow.removeHelp("asgard")
+    assertTrue(ajuda.contains("asgard"), "a ajuda não diz de qual pasta fala")
+    assertTrue(ajuda.lowercased().contains("disco"),
+               "a ajuda não desfaz o que o ícone de lixeira afirma: \(ajuda)")
+    assertTrue(TouchedRow.removeFootnote.lowercased().contains("disco"),
+               "a nota sob a lista não diz o que NÃO acontece")
+}
+
+test("TouchedRow: a explicação da seção é duas frases, uma ideia cada") {
+    for s in [TouchedRow.sectionTitle, TouchedRow.sectionSummary, TouchedRow.sectionWhy] {
+        assertFalse(s.isEmpty)
+    }
+    assertTrue(TouchedRow.sectionSummary.contains(".gsd/"),
+               "o resumo não diz o que essas pastas são")
+    assertTrue(TouchedRow.sectionWhy.contains("não cria mais")
+               || TouchedRow.sectionWhy.contains("Não cria mais"),
+               "o 'porquê' não diz que a causa acabou — a lista pareceria crescer para sempre")
+}
+
+test("TouchedRow: todo símbolo da seção existe de verdade") {
+    // Um nome inválido renderiza como quadrado em branco. A task anterior
+    // embarcou `cloud.slash`, que não existe.
+    let dir = touchedTree("simbolos", gsd: ["forge"], git: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    var nomes = TouchedRow.load(path: dir, home: "/Users/x").facts.map(\.symbol)
+    nomes += [TouchedRow.sectionSymbol, TouchedRow.removeSymbol,
+              TouchedRow.contentsSymbol, TouchedRow.ageSymbol, TouchedRow.repoSymbol,
+              "folder"]
+    assertFalse(nomes.isEmpty, "nenhum símbolo exercitado = teste cego")
+    for n in nomes {
+        assertTrue(NSImage(systemSymbolName: n, accessibilityDescription: nil) != nil,
+                   "SF Symbol inexistente: \(n)")
+    }
+}
+
 print("\n" + String(repeating: "─", count: 60))
 print("  \(passed) passed, \(failed) failed")
 if failed > 0 {

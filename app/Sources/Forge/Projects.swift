@@ -87,6 +87,10 @@ struct ProjectsView: View {
     @State private var scanning = false
     @State private var showDiscovery = false
     @State private var dropTargeted = false
+    /// Evidence rows for `state.touchedWorkspaces`, refreshed only when that
+    /// list changes — see `touchedNotice` for why this is not computed in
+    /// `body`.
+    @State private var touchedRows: [TouchedRow] = []
     @AppStorage("projectsGrouping") private var groupingRaw = ProjectGrouping.byFolder.rawValue
     /// Which folders are closed, across launches. Newline-joined paths — the
     /// codec is `CollapseStore`, in ForgeKit, so it can be tested; the raw
@@ -170,6 +174,14 @@ struct ProjectsView: View {
             .padding(18)
         }
         .navigationTitle("Projetos")
+        .task(id: state.touchedWorkspaces) {
+            let paths = state.touchedWorkspaces
+            let h = home
+            let rows = await Task.detached(priority: .utility) {
+                TouchedRow.load(paths: paths, home: h)
+            }.value
+            touchedRows = rows
+        }
         .overlay {
             if dropTargeted {
                 RoundedRectangle(cornerRadius: 12)
@@ -293,33 +305,93 @@ struct ProjectsView: View {
     /// the operator is the one who knows whether a repo is a project that lost
     /// its artifacts or a repo a run merely walked through — hiding these would
     /// look exactly like a detector that had broken.
+    ///
+    /// Each row now carries the EVIDENCE for the decision it asks for — what is
+    /// inside the `.gsd/`, when it was last touched, whether it is a repository
+    /// — composed in `TouchedRow` (ForgeKit) so the wording and the states are
+    /// testable. This view only lays them out.
+    ///
+    /// `touchedRows` is `@State` filled by the `.task` below rather than
+    /// computed here: `body` re-evaluates on every 15 s reload and on every
+    /// FSEvent, and `TouchedRow.load` does real syscalls per entry. Cheap is
+    /// not free, and this screen has a standing rule about the reload path.
     @ViewBuilder private var touchedNotice: some View {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 6) {
-                Image(systemName: "circle.dashed").font(.caption)
-                Text("Tocados por outro projeto").font(.callout).bold()
+                Image(systemName: TouchedRow.sectionSymbol)
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(TouchedRow.sectionTitle).font(.callout).bold()
                 Text("\(state.touchedWorkspaces.count)")
-                    .font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
+                    .font(.caption2).monospacedDigit()
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.secondary)
             }
-            Text("Têm .gsd/ mas nada de trabalho dentro. O Forge criava essa pasta em todo repositório que uma run encostava; não cria mais.")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(TouchedRow.sectionSummary)
+                Text(TouchedRow.sectionWhy).foregroundStyle(.tertiary)
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
 
-            ForEach(state.touchedWorkspaces, id: \.self) { p in
-                HStack(spacing: 8) {
-                    Text(ProjectOrganiser.abbreviate(p, home: home))
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer(minLength: 8)
-                    Button("Remover") { state.removeWorkspace(p) }
-                        .controlSize(.small).buttonStyle(.borderless)
+            VStack(spacing: 0) {
+                ForEach(Array(touchedRows.enumerated()), id: \.element.id) { i, row in
+                    if i > 0 { Divider().opacity(0.4) }
+                    touchedRowView(row)
                 }
             }
+            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+
+            Text(TouchedRow.removeFootnote)
+                .font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(Color.secondary.opacity(0.18)))
+    }
+
+    /// One touched directory: name, where it lives, the evidence, the action.
+    ///
+    /// The button is `role: .destructive` — SwiftUI's own destructive treatment,
+    /// not a hand-rolled red — and `.tint(.red)` is what carries that colour
+    /// into a borderless control, where the role alone does not tint. Its label
+    /// says "lista", never "excluir": `removeWorkspace` drops a registry entry
+    /// and touches no file. See `TouchedRow` for why there is no confirmation.
+    @ViewBuilder private func touchedRowView(_ row: TouchedRow) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "folder")
+                .font(.callout).foregroundStyle(.tertiary)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(row.name).font(.callout).lineLimit(1)
+                Text(row.location)
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.head)
+                HStack(spacing: 10) {
+                    ForEach(row.facts, id: \.kind) { fact in
+                        HStack(spacing: 3) {
+                            Image(systemName: fact.symbol).font(.caption2)
+                            Text(fact.text).lineLimit(1)
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(fact.measured ? AnyShapeStyle(.secondary)
+                                                       : AnyShapeStyle(.tertiary))
+                    }
+                }
+                .padding(.top, 1)
+            }
+            Spacer(minLength: 10)
+            Button(role: .destructive) {
+                state.removeWorkspace(row.path)
+            } label: {
+                Label(TouchedRow.removeLabel, systemImage: TouchedRow.removeSymbol)
+            }
+            .controlSize(.small).buttonStyle(.borderless).tint(.red)
+            .help(TouchedRow.removeHelp(row.name))
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
     }
 
     private func scan() {
