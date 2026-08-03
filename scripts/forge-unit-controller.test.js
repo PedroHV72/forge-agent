@@ -95,6 +95,57 @@ function testCrashRecoveryIdempotency() {
   } finally { cleanup(fixture.cwd); }
 }
 
+function testRecoveryRequiresLeaseAndUsesReleaseMarker() {
+  {
+    const fixture = setup();
+    try {
+      let now = 1000;
+      assert.throws(() => controller.begin(fixture.cwd, request(fixture, {
+        idempotency_key: 'lease-required-after-crash', ttl_ms: 10, grace_ms: 5,
+      }), { prefsReader, now: () => now, failpoint: point => point === 'after-intent' }), error => error.code === 'CONTROLLER_FAILPOINT');
+      const pending = controller.pendingTransactions(fixture.cwd)[0];
+      assert(pending && pending.phase === 'intent');
+      now = 1016; // expiry (1010) + grace (5), strictly beyond recovery edge
+      const recoveredLease = lease.recover(fixture.cwd, request(fixture).unit, { now });
+      assert.strictEqual(recoveredLease.reason, 'recovered');
+      assert.throws(() => controller.resume(fixture.cwd, {
+        idempotency_key: 'lease-required-after-crash', owner_token: 'owner-a', generation: pending.lease_generation,
+      }, { prefsReader, now: () => now }), error => error.code === 'lease-required');
+    } finally { cleanup(fixture.cwd); }
+  }
+  {
+    const fixture = setup();
+    try {
+      const begin = controller.begin(fixture.cwd, request(fixture), { prefsReader });
+      assert.throws(() => controller.complete(fixture.cwd, request(fixture, {
+        owner_token: begin.owner_token, generation: begin.generation,
+        result: { status: 'succeeded' },
+      }), { prefsReader, failpoint: point => point === 'after-lease-release-pending' }), error => error.code === 'CONTROLLER_FAILPOINT');
+      const pending = controller.pendingTransactions(fixture.cwd)[0];
+      assert.strictEqual(pending.phase, 'lease-release-pending');
+      const resumed = controller.resume(fixture.cwd, {
+        idempotency_key: pending.idempotency_key, owner_token: begin.owner_token, generation: begin.generation,
+      }, { prefsReader });
+      assert.strictEqual(resumed.results[0].transaction.phase, 'committed');
+      assert.strictEqual(lease.observe(fixture.cwd, request(fixture).unit).lease, null);
+    } finally { cleanup(fixture.cwd); }
+  }
+  {
+    const fixture = setup();
+    try {
+      const begin = controller.begin(fixture.cwd, request(fixture), { prefsReader });
+      assert.throws(() => controller.complete(fixture.cwd, request(fixture, {
+        owner_token: begin.owner_token, generation: begin.generation,
+        result: { status: 'succeeded' },
+      }), { prefsReader, failpoint: point => point === 'after-lease-released' }), error => error.code === 'CONTROLLER_FAILPOINT');
+      const pending = controller.pendingTransactions(fixture.cwd)[0];
+      assert.strictEqual(pending.phase, 'lease-released');
+      const resumed = controller.resume(fixture.cwd, { idempotency_key: pending.idempotency_key }, { prefsReader });
+      assert.strictEqual(resumed.results[0].transaction.phase, 'committed');
+    } finally { cleanup(fixture.cwd); }
+  }
+}
+
 function testResultAndEventAreSinglePublication() {
   const fixture = setup();
   try {
@@ -143,6 +194,7 @@ function main() {
   test('lease negative and boundary deny', testLeaseNegativeAndBoundaryDeny);
   test('pause and failure boundaries', testPauseAndFailureBoundaries);
   test('crash recovery and idempotency', testCrashRecoveryIdempotency);
+  test('recovery requires lease and release marker is durable', testRecoveryRequiresLeaseAndUsesReleaseMarker);
   test('single result and event publication', testResultAndEventAreSinglePublication);
   test('legacy fixture remains readable', testLegacyFixtureRemainsReadable);
   test('Claude/Codex logical projection is neutral', testProviderProjectionIsNeutral);

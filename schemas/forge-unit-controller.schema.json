@@ -54,6 +54,7 @@
         "event-published",
         "boundary-pending",
         "state-published",
+        "lease-release-pending",
         "lease-released",
         "boundary-ready",
         "committed"

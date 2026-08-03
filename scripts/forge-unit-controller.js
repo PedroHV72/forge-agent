@@ -36,7 +36,7 @@ const BOUNDARY_KINDS = Object.freeze(['completed', 'paused', 'failed-persisted',
 const ACTIONS = Object.freeze(['begin', 'running', 'persist-result', 'complete', 'pause', 'fail', 'expired-safe']);
 const PHASES = Object.freeze([
   'intent', 'result-published', 'event-published', 'boundary-pending',
-  'state-published', 'lease-released', 'boundary-ready', 'committed',
+  'state-published', 'lease-release-pending', 'lease-released', 'boundary-ready', 'committed',
 ]);
 const REASON_CODES = Object.freeze([
   'selected', 'no-next-unit', 'prefs-invalid', 'transaction-pending',
@@ -471,6 +471,13 @@ function runTransaction(cwd, transaction, ownerToken, generation, options) {
   const phases = new Set(PHASES);
   if (!phases.has(transaction.phase)) throw new ControllerError('invalid-request', `fase de transação desconhecida: ${transaction.phase}`);
   if (transaction.phase === 'committed') return { ok: true, reason: 'already-committed', transaction: publicTransaction(transaction) };
+  // Every phase that can still publish result/event/boundary/STATE is guarded
+  // by the exact lease generation.  A recovered or missing lease must never
+  // be treated as implicit authorization to finish an old transaction.
+  const leaseRequiredPhases = new Set(['intent', 'result-published', 'event-published', 'boundary-pending', 'state-published']);
+  if (leaseRequiredPhases.has(transaction.phase)) {
+    assertLease(cwd, transaction.unit.key, ownerToken, generation);
+  }
   if (transaction.phase === 'intent') {
     publishResult(cwd, transaction.result);
     setPhase(cwd, transaction, 'result-published', options);
@@ -489,12 +496,21 @@ function runTransaction(cwd, transaction, ownerToken, generation, options) {
   }
   if (transaction.phase === 'state-published') {
     if (transaction.boundary) {
-      const observed = forgeLease.observe(cwd, transaction.unit.key, options || {});
-      if (observed.lease) {
-        assertLease(cwd, transaction.unit.key, ownerToken, generation);
-        const released = forgeLease.release(cwd, transaction.unit.key, ownerToken, generation);
-        if (!released.ok) throw new ControllerError('lease-owner-mismatch', `release negado: ${released.reason}`);
-      }
+      // Record the release intent before touching the lease.  If the process
+      // dies after the owner-scoped release but before the next transaction
+      // checkpoint, recovery can safely observe the durable marker and finish
+      // the boundary without guessing whether a lease was already removed.
+      setPhase(cwd, transaction, 'lease-release-pending', options);
+    } else {
+      setPhase(cwd, transaction, 'lease-released', options);
+    }
+  }
+  if (transaction.phase === 'lease-release-pending') {
+    const observed = forgeLease.observe(cwd, transaction.unit.key, options || {});
+    if (observed.lease) {
+      assertLease(cwd, transaction.unit.key, ownerToken, generation);
+      const released = forgeLease.release(cwd, transaction.unit.key, ownerToken, generation);
+      if (!released.ok) throw new ControllerError('lease-owner-mismatch', `release negado: ${released.reason}`);
     }
     setPhase(cwd, transaction, 'lease-released', options);
   }
