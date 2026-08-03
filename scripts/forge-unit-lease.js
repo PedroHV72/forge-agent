@@ -132,9 +132,10 @@ function validRecord(record, unit) {
     Number.isFinite(record.expires_at) && Number.isFinite(record.grace_ms);
 }
 function result(ok, reason, extra) { return Object.assign({ ok, reason }, extra || {}); }
-function withGuard(cwd, unit, fn) {
+function withGuard(cwd, unit, fn, guardOptions) {
   let handle;
-  try { handle = mutex.acquireSync(cwd, mutexName(unit), { ttlMs: 5_000, retries: 80 }); }
+  guardOptions = guardOptions || {};
+  try { handle = mutex.acquireSync(cwd, mutexName(unit), { ttlMs: 5_000, retries: 80, allowStaleRecovery: guardOptions.allowStaleRecovery === true }); }
   catch (error) { if (error.code === 'LOCK_BUSY') return result(false, 'guard-busy'); throw error; }
   let output; let thrown;
   try { output = fn(handle); } catch (error) { thrown = error; }
@@ -260,7 +261,10 @@ function release(cwd, unitInput, ownerToken, generation) {
 function recover(cwd, unitInput, options) {
   const unit = normalizeUnitKey(unitInput); const now = nowOf(options || {}); const file = leaseFile(cwd, unit);
   fs.mkdirSync(leasesDir(cwd), { recursive: true });
-  return withGuard(cwd, unit, () => { clearTemporaryFiles(file); return recoverInside(file, unit, now); });
+  // Explicit recovery is the only path allowed to reclaim a stale short
+  // mutex. Normal lease mutation never steals an expiring guard, so a paused
+  // publisher cannot race a successor's publication.
+  return withGuard(cwd, unit, guard => { clearTemporaryFiles(file); return recoverInside(file, unit, now); }, { allowStaleRecovery: true });
 }
 
 function parseArgs(argv) { const args = {}; for (let index = 0; index < argv.length; index++) if (argv[index].startsWith('--')) { const key = argv[index].slice(2); const value = argv[index + 1]; args[key] = value && !value.startsWith('--') ? (index++, value) : true; } return args; }

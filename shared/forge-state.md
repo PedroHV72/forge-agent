@@ -497,7 +497,10 @@ decision and can be retried by the caller.
 read to authorize acquisition, renewal, release, or recovery. `forge-filelock`
 protects a named edited path and does not create a unit lease. `forge-lock`
 protects only the few filesystem operations necessary to change a lease. The
-unit lease is the sole proof that a worker may execute that unit.
+unit lease is the sole proof that a worker may execute that unit. Normal lease
+mutations do not steal an expiring short mutex; only the explicit lease
+`recover` operation may reclaim a stale guard. This fencing rule prevents a
+paused publisher from resuming after a successor has taken over the guard.
 
 Tests use `process.execPath`, argument arrays, `shell:false`, a filesystem
 barrier, a temporary directory containing spaces and Unicode, and real Claude

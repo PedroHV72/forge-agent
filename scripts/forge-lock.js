@@ -72,7 +72,7 @@ async function acquire(cwd, name, opts) {
     try { return create(cwd, name, { ...opts, ttlMs }); }
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      if (stealIfStale(dir, ttlMs, nowOf(opts))) { attempt--; continue; }
+      if (opts.allowStaleRecovery !== false && stealIfStale(dir, ttlMs, nowOf(opts))) { attempt--; continue; }
       if (attempt + 1 < retries) await sleep(jitter(backoffMin, backoffMax));
     }
   }
@@ -83,7 +83,7 @@ function tryAcquireSync(cwd, name, opts) {
   opts = opts || {}; validateName(name); const ttlMs = positive(opts.ttlMs, DEFAULT_TTL_MS, 'ttl');
   fs.mkdirSync(locksDir(cwd), { recursive: true }); const dir = lockPath(cwd, name);
   try { return create(cwd, name, { ...opts, ttlMs }); }
-  catch (error) { if (error.code !== 'EEXIST') throw error; if (stealIfStale(dir, ttlMs, nowOf(opts))) { try { return create(cwd, name, { ...opts, ttlMs }); } catch { } } return null; }
+  catch (error) { if (error.code !== 'EEXIST') throw error; if (opts.allowStaleRecovery !== false && stealIfStale(dir, ttlMs, nowOf(opts))) { try { return create(cwd, name, { ...opts, ttlMs }); } catch { } } return null; }
 }
 // Synchronous consumers (the state/run registries predate promises) still need
 // the same owner-scoped mutex. Atomics.wait is available in Node on every host
