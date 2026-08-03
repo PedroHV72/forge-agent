@@ -83,6 +83,30 @@ function truncationMarker(droppedCount, opts) {
 }
 
 /**
+ * True when the budget cannot hold even the shortest (source-less) marker for
+ * this dropped count. In that case emitting any marker would slice it into an
+ * unterminated fragment.
+ *
+ * @param {number} budgetChars
+ * @param {number} droppedCount
+ * @returns {boolean}
+ */
+function tooSmallForMarker(budgetChars, droppedCount) {
+  return truncationMarker(droppedCount, {}).length > budgetChars;
+}
+
+/**
+ * Terminal degradation of the marker ladder: a single ellipsis, or the empty
+ * string when the budget is 0. Mirrors scripts/forge-prompt.js:181.
+ *
+ * @param {number} budgetChars
+ * @returns {string}
+ */
+function ellipsisFor(budgetChars) {
+  return budgetChars <= 0 ? '' : '…';
+}
+
+/**
  * Truncate content at markdown section boundaries to fit within a character budget.
  *
  * Algorithm:
@@ -157,6 +181,13 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
 
   // Step 6: success path — we kept at least some sections and dropped some
   if (droppedCount > 0 && kept > 0) {
+    // Guard: a budget too small for even the shortest marker must never emit a
+    // sliced (unterminated) marker. Mirror forge-prompt.js:181 — degrade to the
+    // silent ellipsis instead. The `[...truncated ` prefix contract in
+    // shared/forge-dispatch.md only admits complete markers.
+    if (tooSmallForMarker(budgetChars, droppedCount)) {
+      return ellipsisFor(budgetChars);
+    }
     let keptText = prefix + parts.slice(0, kept).join('');
     let marker = truncationMarker(droppedCount, opts);
 
@@ -187,6 +218,12 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
   if (fallbackMarker.length >= budgetChars && opts.source) {
     // Source pointer alone doesn't fit — degrade to the shorter marker.
     fallbackMarker = truncationMarker(1, {});
+  }
+  // Same guard as step 6: below the shortest marker there is no room for any
+  // complete marker, with or without opts.source. Emit the ellipsis, never a
+  // sliced `[...tru` fragment.
+  if (tooSmallForMarker(budgetChars, 1)) {
+    return ellipsisFor(budgetChars);
   }
   const cutAt = Math.max(0, budgetChars - fallbackMarker.length);
   return clampToBudget(content.substring(0, cutAt) + fallbackMarker, budgetChars);

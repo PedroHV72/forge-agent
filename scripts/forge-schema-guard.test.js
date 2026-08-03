@@ -267,6 +267,34 @@ test('CLI with no args exits 2', () => {
   assert(result.status === 2, `expected exit 2 when --check is missing, got ${result.status}`);
 });
 
+// R3/R5 (review-fix S01): the CLI contract in the file header promises exit 2 for
+// every invalid invocation. Unknown flags alongside --check, and a valueless
+// --cwd (which would silently inspect a different repo), must not exit 0.
+test('CLI --check --bogus exits 2 (unknown flag is not ignored)', () => {
+  const result = spawnSync(process.execPath, [CLI_PATH, '--check', '--bogus'], { encoding: 'utf8' });
+  assert(result.status === 2, `expected exit 2 for unknown flag, got ${result.status}`);
+});
+
+test('CLI --check --cwd (no value) exits 2 instead of falling back to process.cwd()', () => {
+  const result = spawnSync(process.execPath, [CLI_PATH, '--check', '--cwd'], { encoding: 'utf8' });
+  assert(result.status === 2, `expected exit 2 for valueless --cwd, got ${result.status}`);
+  assert(result.stdout.trim() === '', 'no success JSON should be printed for an invalid invocation');
+});
+
+test('CLI --check with a positional argument exits 2', () => {
+  const dir = makeRepo('cli-positional', 'fragment-store@1.0.0');
+  const result = spawnSync(process.execPath, [CLI_PATH, '--check', dir], { encoding: 'utf8' });
+  assert(result.status === 2, `expected exit 2 for positional arg, got ${result.status}`);
+});
+
+test('CLI valid forms still exit 0 (--check alone, and --check --cwd <dir>)', () => {
+  const dir = makeRepo('cli-valid-forms', 'fragment-store@1.0.0');
+  const bare = spawnSync(process.execPath, [CLI_PATH, '--check'], { encoding: 'utf8' });
+  assert(bare.status === 0, `expected exit 0 for --check alone, got ${bare.status}: ${bare.stderr}`);
+  const withCwd = spawnSync(process.execPath, [CLI_PATH, '--check', '--cwd', dir], { encoding: 'utf8' });
+  assert(withCwd.status === 0, `expected exit 0 for --check --cwd <dir>, got ${withCwd.status}`);
+});
+
 // ── Summary ────────────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

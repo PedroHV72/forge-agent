@@ -189,5 +189,40 @@ test('fallback mid-content branch (zero boundaries) also respects opts.source an
   assert.match(result, /\[\.\.\.truncated 1 sections/);
 });
 
+// R3 (review-fix S01): a budget smaller than the shortest marker must degrade to
+// the silent ellipsis. Slicing the marker produced `[...tru` — an unterminated
+// fragment that violates the `[...truncated ` prefix contract in
+// shared/forge-dispatch.md § Truncation markers.
+test('tiny budgets never emit a partial truncation marker (with and without opts.source)', () => {
+  const withBoundaries = '## A\n' + 'a'.repeat(200) + '\n## B\n' + 'b'.repeat(200);
+  const noBoundaries = 'a'.repeat(500);
+  for (const content of [withBoundaries, noBoundaries]) {
+    for (const opts of [{}, { source: 'some/long/source/path.md' }]) {
+      for (let budget = 0; budget <= 28; budget++) {
+        const result = truncateAtSectionBoundary(content, budget, opts);
+        assert.ok(result.length <= budget, `budget=${budget} exceeded: got ${result.length}`);
+        const idx = result.indexOf('[...tru');
+        if (idx !== -1) {
+          assert.ok(
+            /\[\.\.\.truncated \d+ sections( — see [^\]]*)?\]/.test(result),
+            `budget=${budget} source=${!!opts.source} emitted an unterminated marker: ${JSON.stringify(result)}`
+          );
+        } else {
+          assert.ok(
+            result === '' || result === '…',
+            `budget=${budget} should degrade to '' or '…', got ${JSON.stringify(result)}`
+          );
+        }
+      }
+    }
+  }
+});
+
+test('budget 0 yields the empty string, budget 1 yields the ellipsis', () => {
+  const content = 'a'.repeat(500);
+  assert.strictEqual(truncateAtSectionBoundary(content, 0, {}), '');
+  assert.strictEqual(truncateAtSectionBoundary(content, 1, { source: 'x.md' }), '…');
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

@@ -230,9 +230,28 @@ function parseArgs(argv) {
   return out;
 }
 
+/**
+ * Validate the parsed argv shape against the documented CLI contract. Anything
+ * else — unknown flag, positional argument, valueless `--cwd` — is exit 2. A
+ * valueless `--cwd` must never silently fall back to process.cwd(): that would
+ * inspect a different repository than the operator typed while reporting
+ * success.
+ *
+ * @param {object} args
+ * @returns {boolean}
+ */
+function validArgs(args) {
+  if (!args || args._.length !== 0) return false;
+  const keys = Object.keys(args).filter(k => k !== '_');
+  if (keys.some(k => k !== 'check' && k !== 'cwd')) return false;
+  if (args.check !== true) return false;
+  if ('cwd' in args && (typeof args.cwd !== 'string' || args.cwd === '')) return false;
+  return true;
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args.check !== true || args._.length !== 0) {
+  if (!validArgs(args)) {
     process.stderr.write('forge-schema-guard: --check [--cwd <dir>] is required\n');
     return 2;
   }
