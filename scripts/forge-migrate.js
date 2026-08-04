@@ -2,11 +2,16 @@
 // forge-migrate — Consolidated migration orchestrator for Forge Agent fragment stores.
 //
 // Runs the three migrators (ledger, decisions, memory) in order. For each:
-//   0. Already-migrated shortcut: when .gsd/SCHEMA-VERSION has a compatible
-//      (not newer) major version
+//   0. Already-migrated shortcut: when .gsd/SCHEMA-VERSION is stamped with any
+//      version that is NOT NEWER than CURRENT_SCHEMA (including several majors
+//      behind — there is no "one major back" cutoff)
 //      AND the store's fragments are populated, the monolith on disk is a REGENERATED
 //      projection cache — NOT a legacy pre-migration monolith. Skip backup + migrate so
 //      the cache is never retired to .bak (reports skipped_reason: 'already-migrated').
+//      This guards against a major-version bump turning a regenerated projection
+//      into a discarded .bak (see docs/fragment-store-migration-bugs.md:94).
+//      If the guard module can't be loaded/parsed, the check falls back to strict
+//      equality — a MORE restrictive check, never more permissive.
 //   1. Otherwise: renames the legacy monolith to <name>.bak (preserves existing .bak).
 //   2. Invokes the migrator's migrate() export.
 //   3. Verifies: renders via forge-projection and diffs against .bak content.
