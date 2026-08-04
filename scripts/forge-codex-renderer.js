@@ -7,8 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
 const sourceManifest = require('./forge-source-manifest');
+const { VERSION } = require('./forge-version');
 
-const VERSION = '3.1.4';
 const RUNTIME = 'codex';
 const ORIGIN = '<!-- forge-source:codex -->';
 const TOML_ORIGIN = '# forge-source:codex';

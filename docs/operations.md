@@ -89,7 +89,8 @@ bash ./install.sh --runtime codex --update
 
 Antes de escrever, o updater exige backup dos arquivos gerenciados. Preferências
 em `FORGE_HOME`, configuração do operador, `.gsd` do projeto e fontes legadas
-Claude 3.1.4 permanecem byte-idênticas. Para conferir o pacote de release:
+Fontes legadas Claude 3.1.4 permanecem byte-idênticas; o pacote atual é 4.2.0.
+Para conferir o pacote de release:
 
 ```powershell
 node scripts/forge-package.js --output '.\forge-release' --json

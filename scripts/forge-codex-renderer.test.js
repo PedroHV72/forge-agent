@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 const assert = require('assert'); const fs = require('fs'); const os = require('os'); const path = require('path'); const renderer = require('./forge-codex-renderer');
-const root = path.resolve(__dirname, '..'); const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-codex-Ω-'));
+const root = path.resolve(__dirname, '..'); const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-codex-Ω-')); const versionPattern = renderer.VERSION.replace(/\./g, '\\.');
 try {
   const project = path.join(temp, 'project Ω'); const codex = path.join(temp, 'Codex Home Ω'); const forge = path.join(temp, 'Forge Home Ω'); fs.mkdirSync(project, { recursive: true });
   const report = renderer.render({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge });
   assert.strictEqual(report.runtime, 'codex'); assert(report.artifacts.some((item) => item.destination.endsWith(path.join('project Ω', 'AGENTS.md')))); assert(report.artifacts.some((item) => item.destination.endsWith(path.join('Codex Home Ω', 'agents', 'forge-executor.toml')))); assert(report.artifacts.every((item) => !item.destination.includes('.claude'))); assert(report.artifacts.every((item) => !item.content.includes('\r')));
   const agent = report.artifacts.find((item) => item.destination.endsWith(path.join('agents', 'forge-executor.toml')));
-  assert.match(agent.content, /^# forge-source:codex-agent-forge-executor version=3\.1\.4/m);
+  assert.match(agent.content, new RegExp(`^# forge-source:codex-agent-forge-executor version=${versionPattern}$`, 'm'));
   assert.match(agent.content, /^name = "forge-executor"$/m);
   assert.match(agent.content, /^sandbox_mode = "workspace-write"$/m);
   assert.match(agent.content, /developer_instructions = """[\s\S]+"""/);
@@ -20,7 +20,7 @@ try {
   assert(fs.existsSync(path.join(codex, 'commands', 'forge.md')));
   assert(fs.existsSync(path.join(codex, 'templates', 'dispatch', 'execute-task.md')));
   assert(!fs.readFileSync(path.join(codex, 'config.toml'), 'utf8').startsWith('<!--'));
-  assert.match(fs.readFileSync(path.join(codex, 'config.toml'), 'utf8'), /^# forge-source:codex-config version=3\.1\.4/m);
+  assert.match(fs.readFileSync(path.join(codex, 'config.toml'), 'utf8'), new RegExp(`^# forge-source:codex-config version=${versionPattern}$`, 'm'));
   const reportCapabilities = JSON.parse(fs.readFileSync(path.join(forge, 'adapters', 'codex', 'capabilities.json'), 'utf8'));
   assert(reportCapabilities.surfaces.some((surface) => surface.source_id === 'hooks' && surface.status === 'planned'));
   const second = renderer.write({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge }); assert.strictEqual(second.written.length, 0); assert(second.preserved.every((item) => item.reason === 'already-current'));

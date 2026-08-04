@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { detect: detectCapabilities } = require('./forge-capabilities.js');
 const { resolveForgeHome, resolveRuntimeHome } = require('./forge-home.js');
+const { LEGACY_VERSION } = require('./forge-version.js');
 
 const PROTOCOL_VERSION = '1.0.0';
 const RUNTIMES = ['claude', 'codex', 'both'];
@@ -58,7 +59,7 @@ function detectInstallation(options = {}) {
       : [path.join('agents', 'forge-executor.toml'), path.join('skills', 'forge-doctor', 'SKILL.md')];
     if (markers.some((marker) => exists(path.join(home, marker), io))) {
       installed.push(host);
-      if (host === 'claude') legacy = { runtime: 'claude', release: '3.1.4-compatible', preserve: markers };
+      if (host === 'claude') legacy = { runtime: 'claude', release: `${LEGACY_VERSION}-compatible`, preserve: markers };
     }
   }
   return { source: installed.length ? 'selected-legacy-home' : 'none', forge_home: forgeHome, manifest: null, installed, runtime: runtimeFromHosts(installed), legacy };

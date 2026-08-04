@@ -8,8 +8,8 @@ const os = require('os');
 const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
 const sourceManifest = require('./forge-source-manifest');
+const { VERSION } = require('./forge-version');
 
-const VERSION = '3.1.4';
 const RUNTIME = 'claude';
 const ORIGIN_PREFIX = '<!-- forge-source:';
 const ORIGIN_SUFFIX = ' -->';

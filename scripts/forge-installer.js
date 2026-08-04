@@ -10,9 +10,9 @@ const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
 const { detect: detectCapabilities } = require('./forge-capabilities');
 const { generate: generateProjections } = require('./forge-generate');
+const { VERSION } = require('./forge-version');
 
 const RUNTIMES = Object.freeze(['claude', 'codex', 'both']);
-const VERSION = '3.1.4';
 const MANAGED_CORE = Object.freeze([
   'scripts', 'schemas', 'forge-capabilities.json', 'forge-prefs.schema.json',
 ]);
