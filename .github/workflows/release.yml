@@ -23,6 +23,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run deterministic offline release gate
+        run: node scripts/forge-release-gate.js --report "${{ runner.temp }}/forge-release-report.json"
+
       - name: Fetch tags
         run: git fetch --tags --force
 

@@ -11,6 +11,7 @@
     "forge-installer.test.js",
     "forge-update.test.js",
     "forge-package.test.js",
-    "forge-operations-doc.test.js"
+    "forge-operations-doc.test.js",
+    "forge-release-gate.test.js"
   ]
 }
