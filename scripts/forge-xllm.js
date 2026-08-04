@@ -36,15 +36,15 @@
  * The orchestrator owns fallback behavior, not this adapter.
  *
  * Execute-mode contract (LOCKED — M005-CONTEXT / S01):
- *  - START_SHA ownership: the CALLER captures its own START_SHA BEFORE invoking the
- *    adapter and OWNS the post-failure reset (`git checkout {START_SHA} -- . && git
- *    clean -fd`, done in S02). The adapter exposes `start_sha` in the result JSON for
- *    audit ONLY — it NEVER resets, cleans, checks out, commits, or runs ANY git write.
+ *  - START_SHA ownership: the adapter captures START_SHA and the pre-dirty snapshot as
+ *    one attempt record before invoking the worker. The caller owns any post-failure
+ *    surgical reset. The adapter NEVER resets, cleans, checks out, commits, or runs a
+ *    git write.
  *  - no-commit invariant: if codex moves HEAD (commits) despite the prompt prohibition,
  *    the adapter detects HEAD ≠ START_SHA post-run and exits 2.
  *  - no-.gsd/ invariant: the prompt forbids touching `.gsd/**`; if derived changes still
- *    touch `.gsd/`, the adapter emits a stderr WARNING (advisory) — the orchestrator's
- *    file audit is the real safety net (S02).
+ *    touch `.gsd/`, the adapter fails the dispatch. The orchestrator's file audit remains
+ *    the final safety net.
  *  - workspace network is DISABLED under workspace-write: execute tasks must be
  *    self-contained (no installs / no network fetches). Documented limitation.
  *  - `--plan` / `--result-file` come SOLELY from the orchestrator (same trust class as
@@ -75,7 +75,6 @@ const crypto = require('crypto');
 const { spawnSync, spawn, execSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
 const {
-  captureSnapshot,
   captureAttemptSnapshot,
   parseSvnBaseline,
 } = require('./forge-surgical-reset.js');
@@ -1252,7 +1251,7 @@ function gitBuffer(cwd, args, what) {
 const VCS_OPTS = { env: buildSidecarEnv(), maxBuffer: MAX_BUFFER, copyOriginDeleted: false };
 
 /** Snapshot every pre-dispatch dirty path, including protected `.gsd/**` paths.
- * The public `pre_dirty` result still comes from captureSnapshot (which intentionally
+ * The public `pre_dirty` result comes from captureAttemptSnapshot (which intentionally
  * excludes orchestrator state); this richer private snapshot exists solely to compute
  * the sidecar's end-state delta and protected-path violations without false positives. */
 function captureDirtySnapshot(cwd, vcsName = 'git') {
@@ -1326,7 +1325,8 @@ function readWorkersTimeout(baseDir) {
 
 /**
  * Construct the environment for a sidecar process. `minimal` is an allowlist minus
- * a credential denylist; `inherit` is a byte-identical shallow copy without a denylist.
+ * a credential denylist; `inherit` starts from a shallow copy but applies the same
+ * credential denylist before the child is spawned.
  * macOS probe (2026-07-19): Codex ChatGPT keychain auth works with the minimal base.
  * @param {'minimal'|'inherit'} [policy]
  * @param {NodeJS.ProcessEnv} [sourceEnv]
@@ -1550,7 +1550,7 @@ function gitRead(gitArgs, cwd, what) {
  *
  * Dirty tree (M013 S01): the pre-existing dirty guard was relaxed from refuse→snapshot —
  * runExecute NO LONGER throws on a pre-existing dirty tree. It captures a pre-dispatch
- * snapshot via forge-surgical-reset.captureSnapshot and exposes it as `pre_dirty` in the
+ * attempt record via forge-surgical-reset.captureAttemptSnapshot and exposes it as `pre_dirty` in the
  * result JSON (AUDIT ONLY; empty [] on a clean tree — the sole delta vs the prior contract).
  * The adapter still NEVER resets: the authoritative snapshot that drives the post-failure
  * surgical reset lives in the orchestrator's state file (T03/T04).
@@ -1595,7 +1595,8 @@ async function runExecute(opts) {
 
   // Pre-dispatch dirty SNAPSHOT (refuse→snapshot, M013 S01): the adapter no longer
   // refuses on a pre-existing dirty tree (auto_commit:false leaves prior work uncommitted).
-  // Instead it captures the pre-dispatch snapshot via forge-surgical-reset.captureSnapshot
+  // Instead it captures START_SHA and the pre-dispatch snapshot atomically via
+  // forge-surgical-reset.captureAttemptSnapshot
   // ([{path,hash}], .gsd/** excluded; empty on a clean tree) and proceeds with the dispatch.
   // This snapshot is AUDIT ONLY — exposed as `pre_dirty` in the result JSON for the
   // orchestrator to cross-check. The AUTHORITATIVE snapshot that drives the post-failure

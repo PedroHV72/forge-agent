@@ -15,5 +15,10 @@ process.stdin.on('end', () => {
     if (request.pid_file) fs.writeFileSync(request.pid_file, String(child.pid));
     setInterval(() => {}, 1000); return;
   }
-  if (output) fs.writeFileSync(output, JSON.stringify({ args, input }));
+  if (output) fs.writeFileSync(output, JSON.stringify({
+    args,
+    input,
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+      /^(?:FORGE_XLLM_CODEX_BIN|OPENAI_API_KEY|GEMINI_API_KEY|ANTHROPIC_TOKEN|FORGE_ACCOUNT|CODEX_HOME|SESSION_TOKEN)$/.test(key))),
+  }));
 });

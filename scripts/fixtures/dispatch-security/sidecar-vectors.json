@@ -1,5 +1,5 @@
 {
   "platforms": ["win32", "darwin", "linux"],
-  "tokens": ["plain", "space value", "quote\"value", "%PATH%", "amp&value", "semi;value", "Unicode Ω ç"],
+  "tokens": ["plain", "space value", "quote\"value", "%PATH%", "amp&value", "semi;value", "Unicode Ω ç", "line\r\nvalue"],
   "forbidden_env": ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_TOKEN", "FORGE_ACCOUNT", "CODEX_HOME", "SESSION_TOKEN"]
 }
