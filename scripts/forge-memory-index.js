@@ -69,8 +69,14 @@ const CITATION_REGEXES = [
     // repair). Only a candidate that actually contains a literal ".." path
     // segment is traversal-shaped; `filter` (applied below, in the main loop)
     // restricts extraction to that case, so the span is retained ONLY to
-    // report the containment rejection and must never become a filesystem
-    // probe.
+    // report the containment rejection.
+    //
+    // S06 R6: the invariant that actually holds is CONTAINMENT, not "no disk
+    // access" — a retained span whose `..` segments stay inside the root (e.g.
+    // `scripts/../scripts/foo`) does reach realpathSync/existsSync in
+    // resolveCitation, and that is fine. What can never happen is a probe
+    // OUTSIDE the root: `resolveCitation` rejects with `outside-root` before any
+    // disk call, and re-checks containment on the REAL paths afterwards.
     regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-@]+(?:/(?:[\\w.\\-@]+|\\.{1,2}))+)(?![`\\w])', 'g'),
     description: 'Caminho solto sem extensao contendo segmento ".." mantido para reportar traversal.',
     filter: (candidatePath) => candidatePath.split('/').includes('..'),
@@ -82,8 +88,18 @@ const CITATION_REGEXES = [
     // or reporting a misleading generic not-found result. Version MUST be
     // digit-led (`wdma@1.2.0`) — an unanchored `[\w-]+` after `@` also matches
     // ordinary prose ("dev@empresa e mais"), see T01 repair.
-    regex: new RegExp('(?<![`\\w./\\-@])([\\w-]+@\\d[\\w.\\-]*)(?![`\\w])', 'g'),
-    description: 'Referencia nome@versao (versao iniciada por digito), enumerada como pacote/diretorio.',
+    //
+    // S06 R10: the digit anchor alone still matched prose handles with a year
+    // ("suporte@2024"), so the version MUST also carry at least one dot
+    // (`\d[\w-]*(?:\.[\w-]+)+`) — a real version always does.
+    // S06 R1: a versioned path (`services@1.2.0/src/index.js`) is already read
+    // whole by `bare-path`; without a trailing guard the same span was ALSO
+    // counted here, manufacturing a permanently-UNRESOLVED phantom citation
+    // that inflated the published citations_total denominator. `/` and `@` join
+    // the trailing guard, and `(?!\.[\w\-])` blocks the backtracking escape in
+    // which the version group gives back its last `.N` to satisfy the guard.
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w-]+@\\d[\\w\\-]*(?:\\.[\\w\\-]+)+)(?![`\\w/@])(?!\\.[\\w\\-])', 'g'),
+    description: 'Referencia nome@versao (versao iniciada por digito, com ponto), enumerada como pacote/diretorio.',
   },
 ];
 
@@ -91,6 +107,31 @@ const CITATION_REGEXES = [
 // per-token, never a whole-text greedy match (avoids catastrophic over-match
 // across unrelated backticks elsewhere in the sentence).
 const EXT_SUFFIX_RE = new RegExp('\\.' + CODE_EXT + '[)\\],.;:!?]*$');
+
+// Uses the extractor's CODE_EXT vocabulary as the sole source of truth for
+// the missed-extractor bucket (T02 plan: "fonte única obrigatória"). The
+// consequence is stated where it is published: a file mention whose extension
+// is outside CODE_EXT is invisible to BOTH the extractor and this detector, so
+// it lands in bucket (a) — see the (a) label in renderIndex, which does not
+// claim that bucket is defect-free.
+//
+// S06 R7: the token IS copied into the index verbatim — it is rendered in the
+// defect table and emitted whole under `coverage` by `--json`. The 120-char cap
+// is a SIGNAL BUDGET (enough to identify the shape of the missed mention), not
+// a privacy guarantee. What bounds exposure is the `\S+` match: a token never
+// spans whitespace, so it cannot carry a prose fragment. It CAN still be a UNC
+// path or an identifying URL — that is the real exposure, and it is the reason
+// this index is not published without being read first. The token is never
+// probed on disk.
+function findSampleFileToken(text) {
+  if (typeof text !== 'string') return null;
+  const tokenRe = /\S+/g;
+  let match;
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (EXT_SUFFIX_RE.test(match[0])) return match[0].slice(0, 120);
+  }
+  return null;
+}
 
 // ── findDynamicCandidates ────────────────────────────────────────────────────
 // Token-bounded scan (never a single greedy regex over the whole text) for
@@ -456,6 +497,7 @@ function buildFileIndex(cwd, opts) {
   const resolvedCitations = []; // { citation, resolution }
   const factsWithoutCitation = []; // { mem_id, storage_key }
   const factsUnresolvedOnly = []; // { mem_id, storage_key }
+  const factClassifications = []; // { mem_id, storage_key, bucket, sample_token? }
 
   for (const { fact, fragment } of allFacts) {
     const memId = fact && fact.mem_id ? fact.mem_id : null;
@@ -464,7 +506,12 @@ function buildFileIndex(cwd, opts) {
     const citations = extractCitations(fact && fact.text);
 
     if (citations.length === 0) {
-      factsWithoutCitation.push({ mem_id: memId, storage_key: storageKey });
+      const sampleToken = findSampleFileToken(fact && fact.text);
+      const record = { mem_id: memId, storage_key: storageKey };
+      factsWithoutCitation.push(record);
+      factClassifications.push(sampleToken
+        ? { mem_id: memId, storage_key: storageKey, bucket: 'missed_by_extractor', sample_token: sampleToken }
+        : { mem_id: memId, storage_key: storageKey, bucket: 'no_file_mention' });
       continue;
     }
 
@@ -502,7 +549,11 @@ function buildFileIndex(cwd, opts) {
     }
 
     if (!anyResolved) {
-      factsUnresolvedOnly.push({ mem_id: memId, storage_key: storageKey });
+      const record = { mem_id: memId, storage_key: storageKey };
+      factsUnresolvedOnly.push(record);
+      factClassifications.push({ mem_id: memId, storage_key: storageKey, bucket: 'unresolved_only' });
+    } else {
+      factClassifications.push({ mem_id: memId, storage_key: storageKey, bucket: 'with_resolved' });
     }
   }
 
@@ -565,9 +616,11 @@ function buildFileIndex(cwd, opts) {
   const coverage = {
     fragments_read: fragments.length - unreadableFragments.length,
     facts_total: allFacts.length,
-    facts_with_resolved: allFacts.length - factsWithoutCitation.length - factsUnresolvedOnly.length,
+    facts_with_resolved: factClassifications.filter((f) => f.bucket === 'with_resolved').length,
     facts_unresolved_only: factsUnresolvedOnly,
     facts_without_citation: factsWithoutCitation,
+    facts_no_file_mention: factClassifications.filter((f) => f.bucket === 'no_file_mention'),
+    facts_missed_by_extractor: factClassifications.filter((f) => f.bucket === 'missed_by_extractor'),
     files_indexed: entries.length,
     citations_total: citationsTotal,
     citations_resolved: citationsResolved,
@@ -672,6 +725,12 @@ function renderIndex(result, opts) {
   lines.push(`- fragments_read: ${coverage.fragments_read || 0}`);
   lines.push(`- facts_total: ${coverage.facts_total || 0}`);
   lines.push(`- facts_with_resolved: ${coverage.facts_with_resolved || 0}`);
+  const noFileMention = Array.isArray(coverage.facts_no_file_mention) ? coverage.facts_no_file_mention : [];
+  const missedByExtractor = Array.isArray(coverage.facts_missed_by_extractor) ? coverage.facts_missed_by_extractor : [];
+  const unresolvedOnly = Array.isArray(coverage.facts_unresolved_only) ? coverage.facts_unresolved_only : [];
+  lines.push(`- (a) fatos sem menção reconhecida pelo vocabulário atual do extrator: ${noFileMention.length} — parte desconhecida. Este balde absorve tanto fatos que realmente não citam arquivo quanto menções cujo sufixo está fora de \`CODE_EXT\`; não há medição que separe as duas populações, portanto ele NÃO pode ser declarado livre de defeito.`);
+  lines.push(`- (b) fatos com forma de arquivo não capturada: ${missedByExtractor.length} — é defeito real do extrator e requer investigação.`);
+  lines.push(`- (c) fatos com citações extraídas, mas nenhuma resolvida: ${unresolvedOnly.length} — a citação existe, porém não foi localizada.`);
   lines.push(`- citations_total: ${coverage.citations_total || 0}`);
   lines.push(`- citations_resolved: ${coverage.citations_resolved || 0}`);
   lines.push(`- files_indexed: ${coverage.files_indexed || 0}`);
@@ -695,7 +754,6 @@ function renderIndex(result, opts) {
 
   lines.push('### Fatos com apenas citações irresolúveis');
   lines.push('');
-  const unresolvedOnly = Array.isArray(coverage.facts_unresolved_only) ? coverage.facts_unresolved_only : [];
   if (unresolvedOnly.length === 0) {
     lines.push('_Nenhum fato com apenas citações irresolúveis._');
   } else {
@@ -703,14 +761,38 @@ function renderIndex(result, opts) {
   }
   lines.push('');
 
+  lines.push('### Fatos com forma de arquivo não capturada pelo extrator (defeito)');
+  lines.push('');
+  if (missedByExtractor.length === 0) {
+    lines.push('_Nenhum fato neste balde._');
+  } else {
+    lines.push('| mem_id | storage_key | token de amostra |');
+    lines.push('|---|---|---|');
+    for (const f of missedByExtractor) {
+      lines.push(`| ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} | ${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'} | ${f.sample_token ? codeCell(f.sample_token) : '(nenhum)'} |`);
+    }
+  }
+  lines.push('');
+
+  lines.push('### Fatos sem menção reconhecida pelo vocabulário do extrator (parte desconhecida)');
+  lines.push('');
+  if (noFileMention.length === 0) {
+    lines.push('_Nenhum fato neste balde._');
+  } else {
+    for (const f of noFileMention) lines.push(`- ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} (${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'})`);
+  }
+  lines.push('');
+
+  // S06 R9: this legacy bucket is reconstituted EXACTLY by the two sections
+  // above ((a) + (b)), so enumerating it again printed every no-citation fact
+  // twice — 421 duplicated lines on the real store, in a report whose whole
+  // purpose is legibility. The COUNT stays (it anchors the identity proof and
+  // the "Antes" column of the diagnostic doc); only the listing is dropped.
+  // The `facts_without_citation` FIELD is untouched in the JSON envelope.
+  const withoutCitation = Array.isArray(coverage.facts_without_citation) ? coverage.facts_without_citation : [];
   lines.push('### Fatos sem nenhuma citação');
   lines.push('');
-  const withoutCitation = Array.isArray(coverage.facts_without_citation) ? coverage.facts_without_citation : [];
-  if (withoutCitation.length === 0) {
-    lines.push('_Nenhum fato sem citação._');
-  } else {
-    for (const f of withoutCitation) lines.push(`- ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} (${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'})`);
-  }
+  lines.push(`- facts_without_citation: ${withoutCitation.length} — este balde é a soma exata de (a) + (b); a enumeração está nas duas seções acima e não é repetida aqui.`);
   lines.push('');
 
   lines.push('### Fragmentos ilegíveis');
@@ -853,6 +935,9 @@ function runCli(argv) {
           fragments_read: result.coverage.fragments_read,
           facts_total: result.coverage.facts_total,
           facts_with_resolved: result.coverage.facts_with_resolved,
+          facts_no_file_mention: Array.isArray(result.coverage.facts_no_file_mention) ? result.coverage.facts_no_file_mention.length : 0,
+          facts_missed_by_extractor: Array.isArray(result.coverage.facts_missed_by_extractor) ? result.coverage.facts_missed_by_extractor.length : 0,
+          facts_unresolved_only: Array.isArray(result.coverage.facts_unresolved_only) ? result.coverage.facts_unresolved_only.length : 0,
           citations_total: result.coverage.citations_total,
           citations_resolved: result.coverage.citations_resolved,
         },

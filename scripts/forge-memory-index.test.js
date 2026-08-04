@@ -263,6 +263,17 @@ test('expanded extension scan remains linear on pathological input', () => {
   assert(Date.now() - started < 1000, 'expanded regex scan must remain trivial');
 });
 
+// S06 R11: the case above contains no `/`, so it never ENTERS the only new
+// construct with backtracking ambiguity — `bare-path-traversal`'s nested
+// alternation `(?:/(?:[\w.\-@]+|\.{1,2}))+`. A slash-dense input is what
+// actually exercises the guard this section exists to provide.
+test('expanded extension scan remains linear on slash-dense traversal input', () => {
+  const started = Date.now();
+  const cites = extractCitations('ver ' + '../'.repeat(3000) + ' agora');
+  assert(Array.isArray(cites), 'slash-dense input must return an array');
+  assert(Date.now() - started < 1000, 'nested traversal alternation must not backtrack catastrophically');
+});
+
 // ── Section 1B: extensionless prose must not be extracted (T01 repair) ──────
 // Measured against the real WDMA store: an unfiltered `bare-path-traversal`
 // plus an unanchored `package-ref` inflated citations_total 3.1x (311 -> 972)
@@ -504,6 +515,67 @@ test('facts_with_resolved + facts_unresolved_only.length + facts_without_citatio
   }
 });
 
+// ── Section 6b: three coverage buckets (IN-17) ─────────────────────────────
+console.log('\nSection 6b: three labelled coverage buckets and identities\n');
+
+test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, and resolved facts', () => {
+  const root = mkStore(
+    [
+      { unitId: 'T01', text: 'Only architecture prose; no file is mentioned.', mem_id: 'mem-a' },
+      { unitId: 'T01', text: 'A token with only e.g and payload.side is ordinary prose.', mem_id: 'mem-eg' },
+      { unitId: 'T01', text: 'The malformed file-shaped token .tsx was not captured.', mem_id: 'mem-b|pipe' },
+      { unitId: 'T01', text: 'Only scripts/missing.js is mentioned.', mem_id: 'mem-c' },
+      { unitId: 'T01', text: 'Resolved in scripts/forge-alpha.js.', mem_id: 'mem-resolved' },
+    ],
+    ['scripts/forge-alpha.js'],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const coverage = result.coverage;
+    assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-a'), 'expected bucket (a)');
+    assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-eg'), 'e.g/payload.side must be bucket (a)');
+    assert(!coverage.facts_missed_by_extractor.some((f) => f.mem_id === 'mem-eg'), 'e.g/payload.side must not be bucket (b)');
+    const missed = coverage.facts_missed_by_extractor.find((f) => f.mem_id === 'mem-b|pipe');
+    assert(missed, 'expected bucket (b) enumeration');
+    assertEq(missed.storage_key, 'T01', 'bucket (b) must enumerate storage_key');
+    assertEq(missed.sample_token, '.tsx', 'bucket (b) must carry only a bounded sample token');
+    assert(coverage.facts_unresolved_only.some((f) => f.mem_id === 'mem-c'), 'expected bucket (c)');
+
+    assertEq(
+      coverage.facts_total,
+      coverage.facts_with_resolved + coverage.facts_no_file_mention.length + coverage.facts_missed_by_extractor.length + coverage.facts_unresolved_only.length,
+      'the four fact classifications must reconstruct facts_total',
+    );
+    assertEq(
+      coverage.facts_no_file_mention.length + coverage.facts_missed_by_extractor.length,
+      coverage.facts_without_citation.length,
+      'the split must reconstruct the additive legacy facts_without_citation bucket',
+    );
+
+    const md = renderIndex(result, {});
+    assert(md.includes('(a) fatos sem menção de arquivo'), 'renderer must label bucket (a) and its reason');
+    assert(md.includes('(b) fatos com forma de arquivo não capturada'), 'renderer must label bucket (b) and its reason');
+    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida'), 'renderer must label bucket (c) and its reason');
+    assert(md.includes('`mem-b\\|pipe`'), 'renderer must escape untrusted mem_id in the defect table');
+    assert(md.includes('`T01`'), 'renderer must enumerate untrusted storage_key in the defect table');
+    assert(md.includes('`.tsx`'), 'renderer must escape and render the sample token');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('IN-17: empty store still renders all three labelled buckets at zero', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-index-test-'));
+  try {
+    const md = renderIndex(buildFileIndex(root, {}), {});
+    assert(md.includes('(a) fatos sem menção de arquivo: 0'), 'bucket (a) must render at zero');
+    assert(md.includes('(b) fatos com forma de arquivo não capturada: 0'), 'bucket (b) must render at zero');
+    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida: 0'), 'bucket (c) must render at zero');
+  } finally {
+    cleanup(root);
+  }
+});
+
 // ── Section 7: empty store ───────────────────────────────────────────────────
 console.log('\nSection 7: empty store — coverage section still renders\n');
 
@@ -716,6 +788,9 @@ test('CLI: --json --cwd <fixture> exits 0 with one-line parseable JSON on stdout
     let parsed;
     assert((() => { parsed = JSON.parse(stdoutLines[0]); return true; })(), 'stdout line must be valid JSON');
     assert(typeof parsed.coverage === 'object', 'expected a coverage object in the JSON envelope');
+    assert(typeof parsed.counts.facts_no_file_mention === 'number', 'expected additive bucket (a) count in JSON');
+    assert(typeof parsed.counts.facts_missed_by_extractor === 'number', 'expected additive bucket (b) count in JSON');
+    assert(typeof parsed.counts.facts_unresolved_only === 'number', 'expected additive bucket (c) count in JSON');
   } finally {
     cleanup(root);
   }
