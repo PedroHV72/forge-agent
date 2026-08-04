@@ -64,7 +64,10 @@ function treeSnapshot(root) {
 }
 
 function writeLedger(cwd, id, completedAt) {
-  const dir = path.join(cwd, '.gsd', 'forge', 'ledger');
+  // forge-ledger owns the canonical fragment store at .gsd/ledger. Keeping
+  // this fixture on that real path exercises epoch-group discovery instead of
+  // accidentally testing an obsolete, unenumerated directory.
+  const dir = path.join(cwd, '.gsd', 'ledger');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, `${id}.md`), [
     '---',
@@ -153,7 +156,7 @@ test('sem VCS, --force aplica e informa que prosseguiu forçado', () => {
     const result = runScript(cwd, ['--apply', '--yes', '--force']);
     assert.strictEqual(result.status, 0, result.stderr);
     assert.match(result.stdout, /prosseguiu forçado/);
-    assert(fs.existsSync(path.join(cwd, '.gsd', 'forge', 'ledger', '2025-Q1.md')));
+    assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
   } finally { cleanup(cwd); }
 });
 
@@ -188,8 +191,8 @@ if (gitAvailable()) {
     try {
       const result = runScript(cwd, ['--apply', '--yes']);
       assert.strictEqual(result.status, 0, result.stderr);
-      assert(fs.existsSync(path.join(cwd, '.gsd', 'forge', 'ledger', '2025-Q1.md')));
-      assert(!fs.existsSync(path.join(cwd, '.gsd', 'forge', 'ledger', 'M-20250101000000-alpha.md')));
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'M-20250101000000-alpha.md')));
       assert.match(result.stdout, /arquivos: \d+ → \d+/);
       assert.match(result.stdout, /pastas: \d+ → \d+/);
     } finally { cleanup(cwd); }
