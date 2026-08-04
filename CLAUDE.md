@@ -542,6 +542,48 @@ Duas runs concorrentes podiam mexer no mesmo arquivo e ninguém sabia disso até
 - **Última entrega:** S07 (Semente do sinal de integração) — `forge-touch.js` (registro git-derivado por run), `forge-overlap.js` (comparação com censo e piso anti-silêncio), `forge-doctor --check run-overlap` + wiring advisory no `forge-auto`/`forge-next`, e Section 89 do smoke com bite provado nas duas direções. Baselines: **407 Swift** (`ForgeKitTests`), **78 JS suites** (`run-tests.js`), **2039 passed** (`forge-smoke.js`).
 - **Próxima ação:** Triagem final da milestone e `complete-milestone`. Follow-ups declinados que sobrevivem à triagem: `I-20260802213721`, `I-20260803025613`, `I-20260803040737`, `I-20260803042519`, `I-20260803051841`, `I-20260803060030`.
 
+### `forge-sweep-project` ganha journal de desfazer — o container já era o journal de conteúdo (S08)
+A premissa que destrava a slice: `ungroup()` (`scripts/forge-epoch-group.js:397`) já reconstitui cada
+membro byte a byte a partir de `unit.id`+`unit.content` — o container **é** o journal de conteúdo,
+provado por dois testes (incl. BOM/CRLF). Nenhuma task de S08 duplica bytes de fragmento em lugar
+nenhum. O que faltava: (1) `ungroup` **recuperável** após falha parcial — resolvido tornando-o
+idempotente (destino já existente com bytes **idênticos**, `Buffer.compare === 0`, conta como
+restaurado via campo aditivo `alreadyPresent`, nunca lança; bytes **diferentes** continuam lançando,
+o invariante loose-vence-agrupado da S03 R3 fica intacto). A alternativa — staging + promoção
+atômica — foi rejeitada: não existe rename multi-arquivo atômico no Windows, e um diretório de
+staging sob `.gsd/` recriaria a própria patologia de limpeza que pretendia evitar. (2) registro
+persistido de **ponteiros**, nunca conteúdo (W3): `scripts/forge-sweep-journal.js`, JSONL
+append-only em `.gsd/forge/sweep-journal.jsonl` (mesmo idioma do `events.jsonl`) — caminhos de
+container (relativos POSIX), timestamps, operação, fase e sha256 **advisory** do container
+(detecta divergência, não é segunda fonte de bytes). (3) fundamento de elegibilidade nomeado
+`tool-undo`, que estende `createEligibility` (S05) para aceitar alvos `untracked`/`ignored` (diretos
+ou por ancestral — exatamente o caso do S05 R3: `.gitignore` cobrindo `.gsd/`) quando o journal
+existe; `modified`/`added`/`deleted` continuam recusando sempre — estado sujo de arquivo rastreado
+sinaliza edição humana em curso, hazard que o undo não endereça (undo devolve bytes pré-apply, o
+problema é atropelar a edição). O ramo sem-VCS fica inalterado (herdada 7, travada). (4) semântica
+de falha do registro: append de *intent* pré-apply é obrigatório; se falhar **e** qualquer alvo
+aceito tiver `basis: 'tool-undo'` → aplicação inteira **recusada** (exit 1, motivo nomeado, zero
+mutação) — nunca degrada para "prossegue" (B2); se falhar com todos os alvos `basis: 'vcs'` → warn
+em stderr e prossegue (a garantia desses alvos é o VCS, não o journal). (5) superfície de CLI
+`--undo <container>`, restaurando via `ungroup`, resolvido estritamente contra containers
+registrados no journal — nunca um caminho arbitrário do operador. D11 permanece intacta: a CLI
+segue sem nenhum caminho para ativar wrappers, então o journal nunca registra container de
+wrapper — mas `ungroup` teve os **dois** ramos consertados (store e wrapper), porque é chamável
+como biblioteca sobre containers de wrapper. **Resolve a substância do S05 R3** (o comando deixa de
+ser inerte no caso `.gsd/`-ignorado) sem alargar `--force` nem reabrir as duas variantes já
+rejeitadas — o item R3 permanece formalmente aberto para o operador fechar na triagem final, junto
+com R9/R13/R16 (S05) e R3/R4 (S06). S08 não é coberta por nenhum critério `IN-` do SCOPE original —
+foi acrescentada após o review, por decisão do operador em 2026-08-04, com origem em S05 R3.
+
+## Estado atual
+
+- **Milestone ativo:** **M-20260804003633-forge-sweep-project-pr2** (PR 2 — fatias mutantes: agrupar época, empacotar o comando, medir antes de limpar, journal de desfazer), com **S08 entregue** (journal de desfazer — ver decisão acima). Empilhada sobre o branch da PR 1 (`forge/M-20260803205433-sweep-project-stratify`, tip `78bf210`), **não** sobre `master`.
+- **Fase:** T06/S08 (verificação final refeita) em execução. Slices fechadas: **S03** (formato agrupado por época + os 4 leitores + bump `fragment-store@2.0.0` no mesmo commit), **S05** (registro de operações `forge-sweep-project` + gate de elegibilidade VCS fail-closed + D11 fechada), **S06** (dogfood do índice da PR 1: extração de citações ampliada e denominador em três baldes rotulados com identidade de soma travada por fato), **S07** (primeira verificação final e preparo da PR, superseded por S08), **S08** (journal de desfazer — ungroup recuperável, journal de ponteiros, basis `tool-undo`, `--undo`). **S04 foi cortada pelo próprio gate** com veredicto `NO-TARGET` — a assinatura de D9 casou 0 fatos em 707 no store real do WDMA e T02/T03 daquela slice nunca foram despachadas; sobrou o detector read-only `scripts/forge-legacy-residue.js`. **Seis objeções de review seguem abertas** (S05 R3/R9/R13/R16 e S06 R3/R4) — S08 resolveu a substância do R3, mas o item segue aberto para fechamento formal do operador na triagem final — esta milestone **não** está com o review limpo.
+- **Última entrega neste branch:** 30 commits em `forge/M-20260804003633-forge-sweep-project-pr2` (`git rev-list --count 78bf210..HEAD` = 30, medido nesta task, contando o commit deste fecho) — não mergeados, não pushados. Baseline medida por esta task (T06/S08) no `CODE_DIR`, no HEAD pós-T05: `node scripts/run-tests.js` → **5 de 77 suítes vermelhas**, exatamente as 5 herdadas da PR 1 (`forge-app-items`, `forge-install-templates`, `forge-route-audit`, `forge-surgical-reset-guard`, `forge-vcs`, CRLF do Windows, fora de escopo por D10) — **zero divergência** contra a baseline (76→77 suítes é a chegada de `forge-sweep-journal.test.js`). `node scripts/forge-smoke.js` → **1979 asserções no total, 1964 passed / 15 failed nas duas rodadas desta task** (determinístico, mesmo conjunto de 15 nomes nas duas execuções) — dentro da faixa 15–20 que a S07 já havia medido e reconciliado aritmeticamente (1964+15 = 1959+20 = 1979); as 15 falhas continuam as mesmas dependentes de ambiente (symlink sem privilégio, `svn` ausente do `PATH`, quoting de path do Windows). **Nenhuma regressão atribuível a S08.**
+- **Próxima ação:** Operador. (1) Triar as 6 objeções abertas do review (S05 R3 já resolvido em substância pela S08); (2) decidir sobre a **S09 já planejada** (nota abaixo); (3) abrir a PR do branch desta milestone contra `vh2224/forge-agent`, **declarando a dependência da PR 1** — nem push nem `gh pr create` foram executados, o comando fica transcrito no artefato (`S08-PR-BODY.md`, supersedendo `S07-PR-BODY.md`). Pendência anterior segue adiada: **M017** (Suporte a SVN no sidecar multi-LLM, Fase 1) + **TASK-020**, rebasados sobre `origin/master` @ v3.1.1, decisão de ramo ainda não tomada. Antes de retomar qualquer trabalho, rodar `/forge-update` para sincronizar as cópias instaladas em `~/.claude`.
+- **S09 já decidida, ainda por planejar/executar:** remove o eixo de calendário (trimestre) inteiramente e o substitui por varreduras sob demanda nomeadas `sweep-project-NN` sequencial — decisão registrada em `.gsd/decisions/M-20260804003633-forge-sweep-project-pr2.md` (2026-08-04). Vai entrar nesta mesma PR; o `S08-PR-BODY.md` já nomeia a supersessão futura que isso implica.
+- **Suítes e baselines:** `run-tests.js` **77 suítes, 5 vermelhas (pré-existentes)**; `forge-smoke.js` **1979 asserções, 15 falhas medidas nesta task (determinístico em 2 rodadas), dentro da faixa 15–20 já reconciliada pela S07** (SVN/symlink/quoting de path do Windows). Reconciliação de processo: a redação de IN-20 ("suíte roda uma única vez, no fim, com tudo verde") **não** descreve esta milestone — a **D12** passou a rodar a suíte também em cada `complete-slice`, e verde total nunca houve nem foi reivindicado.
+
 ## GSD — Início de sessão obrigatório (dogfood)
 
 Ao iniciar qualquer sessão de trabalho GSD neste projeto, leia em ordem:

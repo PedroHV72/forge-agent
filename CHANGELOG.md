@@ -91,6 +91,33 @@
   A scanner failure now reports `store_error` and returns a distinct non-verdict, so an
   unreadable store can never be rendered byte-identically to a clean one. See
   **Not shipped** below for why it is the only thing S04 delivered.
+- **`forge-sweep-project` can undo its own grouping — a journal, not a copy of the
+  bytes.** `ungroup()` (`scripts/forge-epoch-group.js`) already reconstitutes every
+  member byte-for-byte from `unit.id`/`unit.content`; the container was always the
+  content journal. What was missing was recoverability after a partial failure and a
+  record of which containers exist to undo. `ungroup` is now idempotent: a destination
+  that already exists with **identical** bytes (`Buffer.compare === 0`) is treated as
+  restored (`alreadyPresent: true`) instead of throwing, so re-running `ungroup` after a
+  half-finished restore is the retry path; a destination with **different** bytes still
+  throws — loose-beats-grouped stays intact. Both `ungroup` branches (store containers
+  and wrapper-dir containers) got the fix, because `ungroup` is callable as a library
+  over either. `scripts/forge-sweep-journal.js` is a new append-only, pointer-only JSONL
+  log (`.gsd/forge/sweep-journal.jsonl`, same idiom as `events.jsonl`): container paths
+  (relative POSIX), timestamps, operation, phase and an advisory sha256 of the
+  container — **never** member bytes, so the journal cannot diverge from the container
+  it points at. `agrupar-epocas-seladas` now carries a named eligibility basis surfaced
+  in the CLI preview: `tool-undo` (untracked/ignored targets, direct or via an ignored
+  ancestor — exactly the `.gsd/`-in-`.gitignore` case) alongside the existing `vcs`
+  basis; `modified`/`added`/`deleted` targets are still refused outright, unchanged,
+  because dirty tracked state signals an in-flight edit that undo does not address. The
+  apply path appends a pre-mutation *intent* record before touching disk; if that append
+  fails and any accepted target carries a `tool-undo` basis, the **entire apply is
+  refused** (exit 1, zero mutation) rather than silently proceeding without a recovery
+  record — the same fail-closed posture as the eligibility gate itself. If the append
+  fails and every accepted target is `basis: 'vcs'`, the apply proceeds with a stderr
+  warning (that class's guarantee is the VCS, not the journal). The CLI gained `--undo
+  <container>`, restoring a container's members via `ungroup`, resolved strictly from
+  journal-recorded containers.
 
 ### Changed
 
@@ -166,15 +193,17 @@
 **Open review items.** This entry does not describe a clean branch. Six dialectic-review
 objections are **open and pending operator triage**: S05 R3 (the CLI is inert on `.gsd/` in
 this repository, and both proposed remediations weaken the eligibility gate that was just
-built — a product decision, not a mechanical repair), S05 R9 (the fail-closed test sits
-behind `if (gitAvailable())` with no mock and no hard fail), S05 R13 (`shell:false` in
-`optionsFor()` is outside the literal scope of the plan), S05 R16 (wrapper targets vanish
-from `skipped` while the gate is closed, and silence is indistinguishable from a broken
-detector), S06 R3 (`facts_missed_by_extractor` counts only **total** loss — a fact with
-three citations of which one resolves is never enumerated as missed, so the published `5`
-reads as a defect count without that qualifier) and S06 R4 (`package-ref` and `dynamic` fall
-into the bucket rendered as "could not be located" although they are, by design, not files
-at all).
+built — a product decision, not a mechanical repair; **S08's undo journal resolves the
+substance** — the command is no longer inert on the `.gsd/`-ignored case once a tool-undo
+guarantee exists — but the item is left open for the operator to close formally rather
+than closed unilaterally here), S05 R9 (the fail-closed test sits behind `if
+(gitAvailable())` with no mock and no hard fail), S05 R13 (`shell:false` in `optionsFor()`
+is outside the literal scope of the plan), S05 R16 (wrapper targets vanish from `skipped`
+while the gate is closed, and silence is indistinguishable from a broken detector), S06 R3
+(`facts_missed_by_extractor` counts only **total** loss — a fact with three citations of
+which one resolves is never enumerated as missed, so the published `5` reads as a defect
+count without that qualifier) and S06 R4 (`package-ref` and `dynamic` fall into the bucket
+rendered as "could not be located" although they are, by design, not files at all).
 
 ## v4.1.0 — What a project is, and what the screen may claim about it
 
