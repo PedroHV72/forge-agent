@@ -87,6 +87,31 @@ function safeJoin(root, relative) {
   return resolved;
 }
 
+function isWithin(root, target) {
+  const base = path.resolve(root);
+  const candidate = path.resolve(target);
+  const relative = path.relative(base, candidate);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function backupRelative(root, destination) {
+  const scopes = [
+    ['project', root.projectRoot],
+    ['claude', root.claudeHome],
+    ['forge', root.forgeHome],
+  ];
+  for (const [name, base] of scopes) {
+    if (isWithin(base, destination)) {
+      const relative = path.relative(path.resolve(base), path.resolve(destination)).replace(/\\/g, '/');
+      return `${name}/${relative || path.basename(destination)}`;
+    }
+  }
+  // A caller may deliberately project into an external absolute directory.
+  // Keep the backup inside backupDir without interpreting repo-relative `..`.
+  const digest = Buffer.from(path.resolve(destination), 'utf8').toString('hex');
+  return `external/${digest}${path.extname(destination)}`;
+}
+
 function roots(options) {
   const repo = path.resolve(options.repo || path.resolve(__dirname, '..'));
   const paths = resolveForgePaths({
@@ -159,6 +184,7 @@ function render(options = {}) {
           source: relativeInput,
           destination,
           relative: path.relative(root.repo, destination).replace(/\\/g, '/'),
+          backup_relative: backupRelative(root, destination),
           content,
           bytes: Buffer.byteLength(content),
           newline: 'lf',
@@ -189,7 +215,7 @@ function write(options = {}) {
     }
     if (options.dryRun) { written.push({ ...artifact, dry_run: true }); continue; }
     if (current !== null && backupRoot) {
-      const backup = safeJoin(backupRoot, artifact.relative);
+      const backup = safeJoin(backupRoot, artifact.backup_relative);
       fs.mkdirSync(path.dirname(backup), { recursive: true });
       fs.writeFileSync(backup, current, 'utf8');
     }

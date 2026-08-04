@@ -2,6 +2,7 @@
 'use strict';
 
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -48,6 +49,8 @@ try {
     const targetFound = matching.some((item) => item.destination.endsWith(suffix)
       || item.destination.includes(`${path.sep}${suffix}${path.sep}`));
     assert(targetFound, `golden target missing: ${surface.target}`);
+    const payload = matching.sort((a, b) => a.source.localeCompare(b.source)).map((item) => `${item.source}\0${item.content}`).join('\0');
+    assert.strictEqual(crypto.createHash('sha256').update(payload, 'utf8').digest('hex'), surface.sha256, `golden bytes drifted: ${surface.source_id}`);
   }
 
   // Markdown receives a safe origin marker; JSONC and CommonJS stay parseable/textual.
@@ -77,6 +80,20 @@ try {
   const repeat = renderer.write(options);
   assert.strictEqual(repeat.written.length, 0);
   assert(repeat.preserved.every((item) => item.reason === 'already-current'));
+
+  // Backup paths remain safe when repository and user homes live on different
+  // roots (a common Windows/macOS setup), and never escape backupDir.
+  const externalProject = path.join(os.tmpdir(), `forge-external-project-${process.pid}`);
+  const externalBackup = path.join(os.tmpdir(), `forge-external-backup-${process.pid}`);
+  fs.mkdirSync(externalProject, { recursive: true });
+  const externalOptions = { repo: root, projectRoot: externalProject, claudeHome: path.join(os.tmpdir(), `forge-external-claude-${process.pid}`), forgeHome: path.join(os.tmpdir(), `forge-external-forge-${process.pid}`) };
+  renderer.write(externalOptions);
+  fs.writeFileSync(path.join(externalProject, 'CLAUDE.md'), '<!-- forge-source:operator -->\nold\n');
+  const externalUpdate = renderer.write({ ...externalOptions, backupDir: externalBackup });
+  assert(externalUpdate.written.length > 0);
+  assert(fs.readdirSync(externalBackup).length > 0);
+  fs.rmSync(externalProject, { recursive: true, force: true });
+  fs.rmSync(externalBackup, { recursive: true, force: true });
 
   // A user-owned settings file and project .gsd remain byte-identical.
   fs.writeFileSync(path.join(claudeHome, 'settings.json'), '{\n  "operator": true\n}\n');

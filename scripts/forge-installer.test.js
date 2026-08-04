@@ -15,8 +15,9 @@ function fixture() {
   const forgeHome = path.join(root, 'Forge Home');
   const claudeHome = path.join(root, 'Claude Home');
   const codexHome = path.join(root, 'Codex Home');
-  const options = { repo: path.resolve(__dirname, '..'), forgeHome, claudeHome, codexHome, skipCapabilityCheck: true };
-  return { root, forgeHome, claudeHome, codexHome, options, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+  const projectRoot = path.join(root, 'Project Root');
+  const options = { repo: path.resolve(__dirname, '..'), forgeHome, claudeHome, codexHome, projectRoot, skipCapabilityCheck: true };
+  return { root, forgeHome, claudeHome, codexHome, projectRoot, options, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 function files(root) { return fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }).map((entry) => entry.name).sort() : []; }
 
@@ -46,6 +47,7 @@ test('Claude-only writes shared core once and only Claude projection', () => {
     assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'forge-capabilities.json')), true);
     assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'manifest.json')), true);
     assert.strictEqual(fs.existsSync(path.join(data.claudeHome, 'agents')), true);
+    assert.strictEqual(fs.existsSync(path.join(data.projectRoot, 'CLAUDE.md')), true);
     assert.strictEqual(fs.existsSync(data.codexHome), false);
     const manifest = JSON.parse(fs.readFileSync(path.join(data.forgeHome, 'manifest.json'), 'utf8'));
     assert.deepStrictEqual(Object.keys(manifest.adapters), ['claude']);
@@ -58,6 +60,7 @@ test('Codex-only does not read or write Claude home and both keeps one core', ()
     const report = installer.install({ ...data.options, runtime: 'codex' });
     assert.strictEqual(report.ok, true);
     assert.strictEqual(fs.existsSync(data.claudeHome), false);
+    assert.strictEqual(fs.existsSync(path.join(data.projectRoot, 'AGENTS.md')), true);
     assert.strictEqual(fs.existsSync(path.join(data.codexHome, 'agents')), true);
     const both = installer.install({ ...data.options, runtime: 'both', update: true });
     assert.strictEqual(both.ok, true);
@@ -132,7 +135,7 @@ test('repeating a selected install is byte-idempotent', () => {
   try {
     const first = installer.install({ ...data.options, runtime: 'both' });
     const snapshot = {};
-    for (const file of [path.join(data.forgeHome, 'VERSION'), path.join(data.forgeHome, 'manifest.json'), path.join(data.claudeHome, 'agents', 'forge-executor.md'), path.join(data.codexHome, 'agents', 'forge-executor.md')]) snapshot[file] = fs.readFileSync(file);
+    for (const file of [path.join(data.forgeHome, 'VERSION'), path.join(data.forgeHome, 'manifest.json'), path.join(data.claudeHome, 'agents', 'forge-executor.md'), path.join(data.codexHome, 'agents', 'forge-executor.toml')]) snapshot[file] = fs.readFileSync(file);
     const second = installer.install({ ...data.options, runtime: 'both' });
     assert.strictEqual(second.already_installed, true);
     for (const [file, bytes] of Object.entries(snapshot)) assert.deepStrictEqual(fs.readFileSync(file), bytes);

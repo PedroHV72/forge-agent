@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
 const { detect: detectCapabilities } = require('./forge-capabilities');
+const { generate: generateProjections } = require('./forge-generate');
 
 const RUNTIMES = Object.freeze(['claude', 'codex', 'both']);
 const VERSION = '3.1.4';
@@ -29,6 +30,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     else if (arg === '--forge-home') result.forgeHome = path.resolve(argv[++i] || '');
     else if (arg === '--claude-home') result.claudeHome = path.resolve(argv[++i] || '');
     else if (arg === '--codex-home') result.codexHome = path.resolve(argv[++i] || '');
+    else if (arg === '--project-root') result.projectRoot = path.resolve(argv[++i] || '');
     else if (arg === '--help' || arg === '-h') result.help = true;
     else throw new Error(`opção desconhecida: ${arg}`);
   }
@@ -101,11 +103,14 @@ function readJsonIfPresent(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return null; }
 }
 
-function projectionComplete(paths, host) {
+function projectionComplete(paths, host, projectRoot) {
   const manifestFile = path.join(paths.adapters[host], 'manifest.json');
   const manifest = readJsonIfPresent(manifestFile);
   if (!manifest || manifest.runtime !== host || !Array.isArray(manifest.files)) return false;
-  return manifest.files.every((relative) => exists(path.join(paths.runtimeHomes[host], relative)));
+  const homeComplete = manifest.files.every((relative) => exists(path.join(paths.runtimeHomes[host], relative)));
+  const projectComplete = !Array.isArray(manifest.project_files)
+    || manifest.project_files.every((relative) => exists(path.join(projectRoot, relative)));
+  return homeComplete && projectComplete;
 }
 
 function capabilityReport(repo, runtime, options) {
@@ -161,6 +166,7 @@ function install(input = {}) {
   }
   const backupName = backupId(options);
   const backupRoot = path.join(paths.forgeHome, 'backups', backupName);
+  const projectRoot = path.resolve(options.projectRoot || repo);
   const coreFiles = [];
   for (const item of MANAGED_CORE) {
     const source = path.join(repo, item);
@@ -168,7 +174,7 @@ function install(input = {}) {
   }
   const coreAlready = exists(paths.forgeHome) && coreFiles.length > 0 && coreFiles.every((item) => exists(path.join(paths.forgeHome, item)));
   const installComplete = coreAlready && exists(paths.shared.version) && exists(paths.shared.prefs)
-    && selected.every((host) => projectionComplete(paths, host));
+    && selected.every((host) => projectionComplete(paths, host, projectRoot));
   if (installComplete && !options.update && !options.dryRun) {
     return { ok: true, changed: false, already_installed: true, runtime, forge_home: paths.forgeHome, selected, backup: null, capabilities, plan: [{ op: 'skip', reason: 'already-installed', destination: paths.forgeHome }] };
   }
@@ -179,7 +185,9 @@ function install(input = {}) {
       for (const directory of ['agents', 'commands', 'skills', path.join('templates', 'dispatch')]) {
         backupExisting([path.join(home, directory)], path.join(backupRoot, 'adapters', host), plan, options);
       }
+      backupExisting([path.join(home, 'config.toml')], path.join(backupRoot, 'adapters', host), plan, options);
     }
+    backupExisting([path.join(projectRoot, 'CLAUDE.md'), path.join(projectRoot, 'AGENTS.md')], path.join(backupRoot, 'project'), plan, options);
   }
 
   // Shared core is copied exactly once into Forge home. Existing prefs are
@@ -204,23 +212,36 @@ function install(input = {}) {
     writeText(prefs, generateScaffold(schema, { schemaRef: 'schemas/forge-prefs.schema.json' }), plan, options);
   }
 
-  // Migrate a legacy Claude global preference only as a read-preserving input.
-  const source = adapterSources(repo);
+  // All host projections are rendered from the canonical source manifest.
+  // The installer does not keep a second, host-specific copy strategy.
+  const generated = generateProjections({
+    repo,
+    runtime,
+    projectRoot,
+    claudeHome: paths.runtimeHomes.claude,
+    codexHome: paths.runtimeHomes.codex,
+    forgeHome: paths.forgeHome,
+    dryRun: options.dryRun,
+    update: options.update,
+  });
   const existingManifest = readJsonIfPresent(paths.shared.manifest) || {};
   const adapterManifest = { ...(existingManifest.adapters || {}) };
   for (const host of selected) {
     const home = paths.runtimeHomes[host];
     const root = path.join(paths.adapters[host]);
-    const entries = [];
-    for (const file of source.agents) { const dest = path.join(home, 'agents', path.basename(file)); copyFile(file, dest, plan, options); entries.push(path.relative(home, dest).replace(/\\/g, '/')); }
-    for (const file of source.commands) { const dest = path.join(home, 'commands', path.basename(file)); copyFile(file, dest, plan, options); entries.push(path.relative(home, dest).replace(/\\/g, '/')); }
-    for (const file of source.skills) { const relative = path.relative(path.join(repo, 'skills'), file); const dest = path.join(home, 'skills', relative); copyFile(file, dest, plan, options); entries.push(path.relative(home, dest).replace(/\\/g, '/')); }
-    for (const file of source.dispatch) { const dest = path.join(home, 'templates', 'dispatch', path.basename(file)); copyFile(file, dest, plan, options); entries.push(path.relative(home, dest).replace(/\\/g, '/')); }
-    adapterManifest[host] = { home, files: entries.sort() };
-    writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files: entries.sort() }, null, 2) + '\n', plan, options);
+    const report = generated.reports[host];
+    const artifacts = report ? [...report.written, ...report.preserved] : [];
+    const inside = (base, destination) => {
+      const relative = path.relative(base, destination);
+      return relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    };
+    const files = [...new Set(artifacts.filter((item) => inside(home, item.destination)).map((item) => path.relative(home, item.destination).replace(/\\/g, '/')))].sort();
+    const projectFiles = [...new Set(artifacts.filter((item) => inside(projectRoot, item.destination)).map((item) => path.relative(projectRoot, item.destination).replace(/\\/g, '/')))].sort();
+    adapterManifest[host] = { home, project_root: projectRoot, files, project_files: projectFiles };
+    writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files, project_files: projectFiles }, null, 2) + '\n', plan, options);
   }
   const installedHosts = Object.keys(adapterManifest).sort();
-  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
+  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
   writeText(paths.shared.manifest, JSON.stringify(manifest, null, 2) + '\n', plan, options);
   return { ok: true, changed: plan.some((entry) => entry.op === 'copy' || entry.op === 'write'), dry_run: Boolean(options.dryRun), runtime, selected, forge_home: paths.forgeHome, runtime_homes: Object.fromEntries(selected.map((host) => [host, paths.runtimeHomes[host]])), backup: options.update && coreAlready ? backupRoot : null, capabilities, plan, manifest };
 }
@@ -241,7 +262,7 @@ function render(report) {
 function run(argv = process.argv.slice(2), write = process.stdout.write.bind(process.stdout), errorWrite = process.stderr.write.bind(process.stderr)) {
   let options;
   try { options = parseArgs(argv); } catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 2; }
-  if (options.help) { write('Usage: install.{sh,ps1} --runtime claude|codex|both [--update] [--dry-run] [--no-model-probe]\n'); return 0; }
+  if (options.help) { write('Usage: install.{sh,ps1} --runtime claude|codex|both [--project-root DIR] [--update] [--dry-run] [--no-model-probe]\n'); return 0; }
   try { const report = install(options); if (options.dryRun || report.ok) write(render(report)); return report.ok ? 0 : 1; }
   catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 1; }
 }

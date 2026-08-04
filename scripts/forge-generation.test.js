@@ -9,5 +9,25 @@ try {
   const second = generation.generate({ repo: root, runtime: 'both', projectRoot: project, claudeHome, codexHome, forgeHome }); assert.strictEqual(second.changed, false); assert(second.reports.claude.preserved.length > 0); assert(second.reports.codex.preserved.length > 0);
   const sentinel = path.join(claudeHome, 'operator.txt'); fs.writeFileSync(sentinel, 'keep\r\n'); generation.generate({ repo: root, runtime: 'codex', projectRoot: project, claudeHome, codexHome, forgeHome }); assert.strictEqual(fs.readFileSync(sentinel, 'utf8'), 'keep\r\n');
   assert.strictEqual(fs.existsSync(path.join(temp, '.claude')), false); assert.strictEqual(fs.existsSync(path.join(temp, '.codex')), false);
+  // Exercise path/home resolution for all supported hosts even when the
+  // release gate itself runs on only one operating system.
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const matrixRoot = path.join(temp, `matrix-${platform}`);
+    const matrixProject = path.join(matrixRoot, 'project with spaces Ω');
+    const matrixClaude = path.join(matrixRoot, 'Claude Home');
+    const matrixCodex = path.join(matrixRoot, 'Codex Home');
+    const matrixForge = path.join(matrixRoot, 'Forge Home');
+    fs.mkdirSync(matrixProject, { recursive: true });
+    const matrix = generation.generate({ repo: root, runtime: 'both', platform, projectRoot: matrixProject, claudeHome: matrixClaude, codexHome: matrixCodex, forgeHome: matrixForge });
+    assert.strictEqual(matrix.changed, true, `${platform} first run changed`);
+    assert(fs.existsSync(path.join(matrixProject, 'CLAUDE.md')));
+    assert(fs.existsSync(path.join(matrixProject, 'AGENTS.md')));
+    assert(fs.existsSync(path.join(matrixClaude, 'agents', 'forge-executor.md')));
+    assert(fs.existsSync(path.join(matrixCodex, 'agents', 'forge-executor.toml')));
+    const repeatMatrix = generation.generate({ repo: root, runtime: 'both', platform, projectRoot: matrixProject, claudeHome: matrixClaude, codexHome: matrixCodex, forgeHome: matrixForge });
+    assert.strictEqual(repeatMatrix.changed, false, `${platform} second run idempotent`);
+    assert.strictEqual(fs.existsSync(path.join(matrixRoot, '.claude')), false);
+    assert.strictEqual(fs.existsSync(path.join(matrixRoot, '.codex')), false);
+  }
   console.log('forge-generation tests passed');
 } finally { fs.rmSync(temp, { recursive: true, force: true }); }
