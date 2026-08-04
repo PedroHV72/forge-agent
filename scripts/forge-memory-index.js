@@ -18,7 +18,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { listFragments, parseFragment } = require('./forge-memory');
+const { listFragments, parseFragment, memoryDir } = require('./forge-memory');
 const { guardReadAndWarn } = require('./forge-schema-guard');
 
 // T02 default artifact path — LOCKED with T03 so the two never diverge.
@@ -308,6 +308,40 @@ function summarizeFact(fact, opts) {
   return sentence;
 }
 
+// ── listSkippedFragmentFiles ──────────────────────────────────────────────────
+// Dogfood fix (real store, 144 files on disk → 116 returned): `listFragments`
+// silently drops every `.md` in `.gsd/memory/` whose name does not parse as a
+// valid storage key. 19% of that store was absent from the index and mentioned
+// NOWHERE — exactly the failure class invariant #1 exists to forbid.
+//
+// This function only REPORTS the gap; it never closes it. `listFragments`
+// behavior is deliberately untouched (it is consumed system-wide).
+//
+// Compares by FILENAME ON DISK, never by re-reading through the store API:
+// listFragments can return an entry (`legacy-orphan`) that readFragment then
+// rejects by throwing, so a re-read would turn a report into a crash path.
+// Total try/catch: an absent/unreadable memory dir yields [] exactly as before.
+function listSkippedFragmentFiles(cwd, fragments) {
+  try {
+    const dir = memoryDir(cwd);
+    const onDisk = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.md'))
+      .map((e) => e.name);
+
+    const returned = new Set(
+      (Array.isArray(fragments) ? fragments : [])
+        .map((f) => (f && typeof f.path === 'string' ? path.basename(f.path) : null))
+        .filter((n) => n !== null)
+    );
+
+    return onDisk
+      .filter((name) => !returned.has(name))
+      .sort((a, b) => a.localeCompare(b, 'en')); // determinism: byte-identical reruns
+  } catch (_) {
+    return [];
+  }
+}
+
 // ── buildFileIndex ────────────────────────────────────────────────────────────
 // Orchestrator: reads all memory fragments via listFragments/parseFragment,
 // extracts + resolves citations per fact, and aggregates entries by resolved
@@ -356,6 +390,10 @@ function buildFileIndex(cwd, opts) {
     fragments = [];
     fragmentListingFailed = (e && e.message) ? e.message : 'list-error';
   }
+
+  // Files present in .gsd/memory/ that the store did NOT hand back — see
+  // listSkippedFragmentFiles. Their facts are absent from this index.
+  const fragmentsSkippedByStore = listSkippedFragmentFiles(cwd, fragments);
 
   for (const fragment of fragments) {
     let parsed;
@@ -501,6 +539,10 @@ function buildFileIndex(cwd, opts) {
     citations_resolved: citationsResolved,
     unresolved,
     unreadable_fragments: unreadableFragments,
+    // Additive (dogfood fix): fragment FILES the store dropped before we ever
+    // saw them. Distinct from unreadable_fragments (which the store returned
+    // and we failed to read). Never feeds the citation sum invariant.
+    fragments_skipped_by_store: fragmentsSkippedByStore,
     scan_capped: fileIndex.capped,
     guard_unavailable: guardUnavailable,
     fragment_listing_failed: fragmentListingFailed,
@@ -644,6 +686,21 @@ function renderIndex(result, opts) {
     lines.push('_Nenhum fragmento ilegível._');
   } else {
     for (const u of unreadable) lines.push(`- ${codeCell(u.storageKey || u.path)} — ${prose(u.reason)}`);
+  }
+  lines.push('');
+
+  lines.push('### Fragmentos descartados pelo store');
+  lines.push('');
+  const skipped = Array.isArray(coverage.fragments_skipped_by_store) ? coverage.fragments_skipped_by_store : [];
+  if (skipped.length === 0) {
+    lines.push('_Nenhum arquivo de `.gsd/memory/` foi descartado pelo store._');
+  } else {
+    lines.push(`⚠️ ${skipped.length} arquivo(s) em \`.gsd/memory/\` não foram devolvidos pelo store (nome não parseável como storage key). **Os fatos desses fragmentos estão AUSENTES deste índice.**`);
+    lines.push('');
+    lines.push('| arquivo |');
+    lines.push('|---|');
+    // Filenames are uncontrolled input — same table-cell escaping as R6.
+    for (const name of skipped) lines.push(`| ${codeCell(name)} |`);
   }
   lines.push('');
 

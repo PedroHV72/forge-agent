@@ -764,6 +764,84 @@ test('a nonexistent citation is still not-found, never a realpath ENOENT throw',
   }
 });
 
+// ── Section N: fragments the store drops (dogfood defect) ────────────────────
+// Measured on a real store: 144 `.md` files on disk, listFragments returned 116,
+// and the 28 dropped files were mentioned NOWHERE in the artifact. The synthetic
+// fixtures never caught it because they only ever build well-formed unit IDs.
+console.log('\nSection N: fragments skipped by the store\n');
+
+test('a .md file the store drops is enumerated in coverage AND in the artifact', () => {
+  const root = mkStore(
+    [{ unitId: 'TASK-001', text: 'Ver `scripts/forge-alpha.js` para o fix.', mem_id: 'MEM-SK1' }],
+    ['scripts/forge-alpha.js']
+  );
+  try {
+    // Filenames observed verbatim in the real store — not parseable as storage keys.
+    const dropped = ['S02-T01.md', 'S01-T01.md'];
+    for (const name of dropped) {
+      fs.writeFileSync(path.join(root, '.gsd', 'memory', name), '# orphan fragment\n', 'utf8');
+    }
+
+    const result = buildFileIndex(root, {});
+    assertEq(
+      result.coverage.fragments_skipped_by_store,
+      ['S01-T01.md', 'S02-T01.md'],
+      'dropped files must be enumerated, sorted (determinism)'
+    );
+
+    const md = renderIndex(result, {});
+    assert(md.includes('### Fragmentos descartados pelo store'), 'expected the skipped-fragments section');
+    for (const name of dropped) {
+      assert(md.includes('`' + name + '`'), `expected ${name} rendered in the artifact`);
+    }
+    assert(md.includes('AUSENTES deste índice'), 'expected the consequence to be legible in the artifact');
+
+    // The well-formed fragment still indexed — the report never suppresses coverage.
+    assert(
+      result.entries.some((e) => e.file === 'scripts/forge-alpha.js'),
+      'the well-formed fragment must still be indexed'
+    );
+
+    // Citation sum invariant untouched by the new field.
+    const sumUnresolved = result.coverage.unresolved.reduce((n, u) => n + u.count, 0);
+    assertEq(
+      result.coverage.citations_resolved + sumUnresolved,
+      result.coverage.citations_total,
+      'sum invariant must survive the new fragment-level field'
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('a clean store still renders the skipped section explicitly (empty, never omitted)', () => {
+  const root = mkStore(
+    [{ unitId: 'TASK-001', text: 'Ver `scripts/forge-alpha.js`.', mem_id: 'MEM-SK2' }],
+    ['scripts/forge-alpha.js']
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    assertEq(result.coverage.fragments_skipped_by_store, [], 'a clean store skips nothing');
+    const md = renderIndex(result, {});
+    assert(md.includes('### Fragmentos descartados pelo store'), 'section is unconditional');
+    assert(md.includes('_Nenhum arquivo de `.gsd/memory/` foi descartado pelo store._'), 'empty state must be stated, not omitted');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('absent .gsd/memory keeps working — the report never becomes a crash path', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mi-skip-absent-'));
+  try {
+    const result = buildFileIndex(root, {});
+    assertEq(result.coverage.fragments_skipped_by_store, [], 'no memory dir → empty list, no throw');
+    const md = renderIndex(result, {});
+    assert(md.includes('### Fragmentos descartados pelo store'), 'section still rendered without a memory dir');
+  } finally {
+    cleanup(root);
+  }
+});
+
 // ── Summary ────────────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {
