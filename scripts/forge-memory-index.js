@@ -18,7 +18,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { listFragments, parseFragment, memoryDir } = require('./forge-memory');
+const { listFragments, parseFragment, memoryDir, readFragmentText } = require('./forge-memory');
 const { guardReadAndWarn } = require('./forge-schema-guard');
 
 // T02 default artifact path — LOCKED with T03 so the two never diverge.
@@ -398,7 +398,7 @@ function buildFileIndex(cwd, opts) {
   for (const fragment of fragments) {
     let parsed;
     try {
-      const text = fs.readFileSync(fragment.path, 'utf8');
+      const text = readFragmentText(cwd, fragment);
       parsed = parseFragment(text);
     } catch (e) {
       unreadableFragments.push({
