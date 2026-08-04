@@ -595,6 +595,68 @@ test('listExistingIds: a corrupt container never throws and keeps loose ids', ()
   } finally { fsLocal.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// The try used to wrap the WHOLE per-directory loop, so a throw on container k
+// dropped the grouped ids of k+1..n. Under ids.format: sequential a dropped id
+// is re-minted over a live unit. The trigger is an unreadable sniff falling
+// through to the filename heuristic, which classifies `2026-Q1.md` as a
+// container and makes readGroupedUnits throw on that very file.
+test('listExistingIds: one unreadable container never hides the next one', () => {
+  const fsLocal = require('fs');
+  const osLocal = require('os');
+  const pathLocal = require('path');
+  const groupLocal = require('./forge-grouped-file.js');
+  const dir = fsLocal.mkdtempSync(pathLocal.join(osLocal.tmpdir(), 'forge-ids-unreadable-'));
+  const realSniff = groupLocal.readSniffBuffer;
+  const realRead = groupLocal.readGroupedUnits;
+  try {
+    const milestones = pathLocal.join(dir, '.gsd', 'milestones');
+    fsLocal.mkdirSync(milestones, { recursive: true });
+    // Q1 is unreadable (EACCES-shaped); Q2 is a perfectly good container.
+    fsLocal.writeFileSync(pathLocal.join(milestones, '2026-Q1.md'), 'unreadable\n');
+    fsLocal.writeFileSync(pathLocal.join(milestones, '2026-Q2.md'), groupLocal.serializeGroup({
+      epoch: '2026-Q2', units: [{ id: 'M0042', content: Buffer.from('later\n') }],
+    }).buffer);
+    groupLocal.readSniffBuffer = filePath =>
+      (filePath.endsWith('2026-Q1.md') ? null : realSniff(filePath));
+    groupLocal.readGroupedUnits = filePath => {
+      if (filePath.endsWith('2026-Q1.md')) throw new Error('EACCES');
+      return realRead(filePath);
+    };
+    const listed = ids.listExistingIds(dir, 'milestone');
+    assert(listed.includes('M0042'), 'the container after the unreadable one is still enumerated');
+  } finally {
+    groupLocal.readSniffBuffer = realSniff;
+    groupLocal.readGroupedUnits = realRead;
+    fsLocal.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// An unreadable sniff means "unknown", not "container": passing null through to
+// isGroupedFile falls back to the filename heuristic and reads it as one.
+test('listExistingIds: an unreadable sniff is not classified by filename', () => {
+  const fsLocal = require('fs');
+  const osLocal = require('os');
+  const pathLocal = require('path');
+  const groupLocal = require('./forge-grouped-file.js');
+  const dir = fsLocal.mkdtempSync(pathLocal.join(osLocal.tmpdir(), 'forge-ids-sniff-null-'));
+  const realSniff = groupLocal.readSniffBuffer;
+  let readAttempts = 0;
+  const realRead = groupLocal.readGroupedUnits;
+  try {
+    const milestones = pathLocal.join(dir, '.gsd', 'milestones');
+    fsLocal.mkdirSync(milestones, { recursive: true });
+    fsLocal.writeFileSync(pathLocal.join(milestones, '2026-Q1.md'), 'unreadable\n');
+    groupLocal.readSniffBuffer = () => null;
+    groupLocal.readGroupedUnits = filePath => { readAttempts += 1; return realRead(filePath); };
+    ids.listExistingIds(dir, 'milestone');
+    assertEq(readAttempts, 0);
+  } finally {
+    groupLocal.readSniffBuffer = realSniff;
+    groupLocal.readGroupedUnits = realRead;
+    fsLocal.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 // timestampOf coverage: compact and dashed forms share the production ID grammar.
 console.log('timestampOf');

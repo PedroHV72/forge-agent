@@ -143,6 +143,31 @@ test('an invalid grouped storage key is discarded with a container warning', () 
   assert.ok(captured.output.includes('discarded'));
 });
 
+// An unreadable container used to be pushed as a LOOSE fragment named after
+// its epoch, and the second loop then skipped it: every unit inside vanished
+// with nothing on stderr, while a mere parse error two lines below did warn.
+test('an unreadable container warns instead of listing itself as a loose fragment', () => {
+  const { cwd } = fixture();
+  groupEntries(cwd, [{ unitId: 'S01', opts: { milestoneId: MILESTONE } }], '2026-Q1');
+  const realReadFileSync = fs.readFileSync;
+  fs.readFileSync = (target, ...rest) => {
+    if (typeof target === 'string' && target.endsWith('2026-Q1.md')) {
+      const error = new Error('EACCES: permission denied');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return realReadFileSync(target, ...rest);
+  };
+  let listed;
+  let captured;
+  try { captured = captureStderr(() => { listed = memory.listFragments(cwd); }); }
+  finally { fs.readFileSync = realReadFileSync; }
+  assert.ok(!listed.some(entry => String(entry.storageKey || '').includes('2026-Q1')),
+    'the container is not listed as a loose fragment named after its epoch');
+  assert.ok(/container-unreadable/.test(captured.output),
+    `expected a warning, got: ${JSON.stringify(captured.output)}`);
+});
+
 test('grouped envelopes preserve storage key, unit id, milestone id, and epoch', () => {
   const { cwd } = fixture();
   groupEntries(cwd, [{ unitId: 'T01', opts: { milestoneId: MILESTONE } }], '2026-Q5');

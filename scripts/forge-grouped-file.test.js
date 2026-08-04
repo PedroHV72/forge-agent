@@ -156,6 +156,52 @@ test('reports an end marker with a divergent id without returning that payload',
   assert.strictEqual(parsed.units.length, 0);
 });
 
+// R1: markers were written latin1 and read back with the high bit stripped, so
+// a non-ASCII id never matched its own end marker and the container parsed as
+// ZERO units — after apply() had already deleted the sources.
+test('round-trips a non-ASCII unit id byte for byte', () => {
+  const id = 'M-20260101000000-x~NOTAS-revisão.md';
+  const original = Buffer.from('corpo com acentuação\n', 'utf8');
+  const grouped = serializeGroup({ epoch: '2026-Q1', units: [{ id, content: original }] });
+  assert.strictEqual(grouped.skipped.length, 0);
+  const parsed = parseGroup(grouped.buffer);
+  assert.deepStrictEqual(parsed.errors, []);
+  assert.strictEqual(parsed.units.length, 1);
+  assert.strictEqual(parsed.units[0].id, id);
+  assertBufferEqual(parsed.units[0].content, original);
+});
+
+test('declares bytes= as a byte count, not a character count', () => {
+  const original = Buffer.from('ação', 'utf8'); // 6 bytes, 4 characters
+  const grouped = serializeGroup({ epoch: '2026-Q1', units: [{ id: 'acentuado-é', content: original }] });
+  assert.ok(grouped.buffer.toString('utf8').includes(`bytes=${original.length}`));
+  assert.strictEqual(original.length, 6);
+  assertBufferEqual(parseGroup(grouped.buffer).units[0].content, original);
+});
+
+test('refuses an id that does not survive a UTF-8 round-trip', () => {
+  const grouped = serializeGroup({
+    epoch: '2026-Q1',
+    units: [unit('\ud800-lone', 'body', 'lone.md'), unit('ok', 'body')],
+  });
+  assert.deepStrictEqual(grouped.skipped, [{ path: 'lone.md', reason: 'id-not-utf8' }]);
+  assert.strictEqual(parseGroup(grouped.buffer).units.length, 1);
+});
+
+// R8: every parse error branch breaks, so truncation returned a short unit list
+// that readers presented as the whole store.
+test('reports a member count that disagrees with the declared one', () => {
+  const grouped = serializeGroup({ epoch: '2026-Q1', units: [unit('a', 'A'), unit('b', 'B')] });
+  const truncated = grouped.buffer.subarray(0, grouped.buffer.length - 4);
+  const parsed = parseGroup(truncated);
+  assert.ok(parsed.errors.some(error => error.reason === 'unit-count-mismatch'),
+    `expected unit-count-mismatch, got ${JSON.stringify(parsed.errors)}`);
+});
+
+test('does not report a count mismatch for an intact container', () => {
+  assert.deepStrictEqual(parseGroup(validGroup().buffer).errors, []);
+});
+
 test('recognizes epoch-named containers and rejects ordinary fragments', () => {
   assert.strictEqual(isGroupedFile('2026-Q1.md'), true);
   assert.strictEqual(isGroupedFile('M-20260101000000-foo.md'), false);

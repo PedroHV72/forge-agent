@@ -331,10 +331,68 @@ test('wrapper apply is idempotent after the first plan is consumed', () => {
     write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'live');
     const firstPlan = group.plan(cwd);
     const first = group.apply(cwd, firstPlan);
+    // Captured BEFORE the second apply — comparing a post-apply read against
+    // itself was 0 unconditionally and proved nothing about stability.
+    const afterFirst = fs.readFileSync(first.written[0]);
     const second = group.apply(cwd, group.plan(cwd));
     assert.equal(second.written.length, 0);
     assert.equal(group.plan(cwd).targets.length, 0);
-    assert.equal(Buffer.compare(fs.readFileSync(first.written[0]), fs.readFileSync(first.written[0])), 0);
+    assert.equal(Buffer.compare(afterFirst, fs.readFileSync(first.written[0])), 0,
+      'the container bytes are untouched by a second apply');
+  } finally { remove(cwd); }
+});
+
+// R2: the marker id is `dirId~fileName` and the split takes the FIRST `~`, so
+// grouping `foo~bar/PLAN.md` would restore it to `foo/bar~PLAN.md` — a silent
+// relocation, invisible because the original is deleted first.
+test('never groups a wrapper whose directory name contains the reserved separator', () => {
+  const cwd = tmp();
+  try {
+    const source = write(cwd, '.gsd/tasks/T-20260101000000-one~sub/PLAN.md', 'payload');
+    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
+    const planned = group.plan(cwd);
+    assert.equal(planned.targets.length, 0, 'the ~ wrapper is not a grouping target');
+    assert(planned.skipped.some(item => /separador reservado/.test(item.reason)),
+      `expected a reserved-separator reason, got ${JSON.stringify(planned.skipped)}`);
+    group.apply(cwd, planned);
+    assert(fs.existsSync(source), 'the wrapper file is left exactly where it was');
+  } finally { remove(cwd); }
+});
+
+// R6: splitWrapperMarkerId requires .md, so apply() rejected a non-.md member
+// by discarding the ENTIRE epoch target under a misleading reason.
+test('skips only the non-.md wrapper and still groups its epoch siblings', () => {
+  const cwd = tmp();
+  try {
+    const stray = write(cwd, '.gsd/tasks/T-20260102000000-two/notes.txt', 'not markdown');
+    const groupable = write(cwd, '.gsd/tasks/T-20260101000000-one/PLAN.md', 'payload');
+    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
+    const planned = group.plan(cwd);
+    assert.equal(planned.targets.length, 1, 'the epoch survives one ineligible wrapper');
+    assert.equal(planned.targets[0].members.length, 1);
+    assert(planned.skipped.some(item => /não é \.md/.test(item.reason)),
+      `expected a non-.md reason, got ${JSON.stringify(planned.skipped)}`);
+    const applied = group.apply(cwd, planned);
+    assert.equal(applied.written.length, 1, 'the .md sibling is grouped');
+    assert(!fs.existsSync(groupable));
+    assert(fs.existsSync(stray), 'the non-.md wrapper is untouched');
+  } finally { remove(cwd); }
+});
+
+// R3: the wrapper branch guards the destination and throws; the store branch
+// wrote straight over it. By the loose-wins invariant the clobbered file is the
+// canonical one.
+test('refuses to restore a store member over an existing loose file', () => {
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/ledger/M-20260101000000-old.md', ledger('M-20260101000000-old', '2026-01-01', 'grouped body'));
+    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01'));
+    const applied = group.apply(cwd, group.plan(cwd));
+    const container = applied.written.find(item => item.includes(`${path.sep}ledger${path.sep}`));
+    const canonical = write(cwd, '.gsd/ledger/M-20260101000000-old.md', 'loose wins — do not clobber');
+    assert.throws(() => group.ungroup(cwd, container), /destination already exists/);
+    assert.equal(fs.readFileSync(canonical, 'utf8'), 'loose wins — do not clobber');
+    assert(fs.existsSync(container), 'the container is not consumed by a refused ungroup');
   } finally { remove(cwd); }
 });
 

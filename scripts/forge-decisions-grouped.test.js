@@ -122,6 +122,31 @@ test('every grouped decision envelope points at the physical container', () => {
   }
 });
 
+// An unreadable container used to be pushed as a LOOSE fragment named after
+// its epoch, and the second loop then skipped it: every unit inside vanished
+// with nothing on stderr, while a mere parse error two lines below did warn.
+test('an unreadable container warns instead of listing itself as a loose fragment', () => {
+  const { cwd } = fixture();
+  groupEntries(cwd, ['M001', 'M002'], '2026-Q1');
+  const realReadFileSync = fs.readFileSync;
+  fs.readFileSync = (target, ...rest) => {
+    if (typeof target === 'string' && target.endsWith('2026-Q1.md')) {
+      const error = new Error('EACCES: permission denied');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return realReadFileSync(target, ...rest);
+  };
+  let listed;
+  let output;
+  try { output = captureStderr(() => { listed = decisions.listFragments(cwd); }); }
+  finally { fs.readFileSync = realReadFileSync; }
+  assert.ok(!listed.some(entry => entry.unitId === '2026-Q1'),
+    'the container is not listed as a loose fragment named after its epoch');
+  assert.ok(/container-unreadable/.test(output), `expected a warning, got: ${JSON.stringify(output)}`);
+  assert.ok(listed.some(entry => entry.unitId === 'M003'), 'readable neighbours are unaffected');
+});
+
 test('loose decision text remains the complete original fragment', () => {
   const { cwd } = fixture();
   const entry = decisions.listFragments(cwd).find(item => item.unitId === 'M003');

@@ -794,6 +794,12 @@ function listFragments(cwd, opts) {
     // still returned and the read error stays with the consumer, one unit at a
     // time, as it did before grouping existed. See readSniffBuffer.
     const buffer = readSniffBuffer(filePath);
+    // Unreadable AND epoch-shaped: pushing it as a loose fragment named
+    // `2026-Q1` would make every unit inside it vanish with nothing on stderr.
+    if (buffer === null && isGroupedFile(file.name)) {
+      process.stderr.write(`[forge-memory] warn: container ${file.name}: container-unreadable — unidades não listadas\n`);
+      continue;
+    }
     if (buffer !== null && isGroupedFile(file.name, buffer)) continue;
     const parsed = parseStorageKey(file.name.slice(0, -3));
     if (!parsed) continue;

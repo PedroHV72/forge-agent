@@ -127,6 +127,31 @@ test('loose read text remains the complete original fragment', () => {
   assert.ok(text.includes('body-M003'));
 });
 
+// An unreadable container used to be pushed as a LOOSE fragment named after
+// its epoch, and the second loop then skipped it: every unit inside vanished
+// with nothing on stderr, while a mere parse error two lines below did warn.
+test('an unreadable container warns instead of listing itself as a loose fragment', () => {
+  const { cwd } = fixture();
+  groupEntries(cwd, ['M001', 'M002'], '2026-Q1');
+  const realReadFileSync = fs.readFileSync;
+  fs.readFileSync = (target, ...rest) => {
+    if (typeof target === 'string' && target.endsWith('2026-Q1.md')) {
+      const error = new Error('EACCES: permission denied');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return realReadFileSync(target, ...rest);
+  };
+  let listed;
+  let output;
+  try { output = captureStderr(() => { listed = ledger.listFragments(cwd); }); }
+  finally { fs.readFileSync = realReadFileSync; }
+  assert.ok(!listed.some(entry => entry.id === '2026-Q1'),
+    'the container is not listed as a loose fragment named after its epoch');
+  assert.ok(/container-unreadable/.test(output), `expected a warning, got: ${JSON.stringify(output)}`);
+  assert.ok(listed.some(entry => entry.id === 'M003'), 'readable neighbours are unaffected');
+});
+
 test('list ordering remains deterministic by id', () => {
   const { cwd } = fixture();
   assert.deepStrictEqual(ledger.listFragments(cwd).map(entry => entry.id), ['M001', 'M002', 'M003']);

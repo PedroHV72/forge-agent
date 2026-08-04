@@ -21,12 +21,25 @@ function hasPayloadDelimiter(content) {
   return content.indexOf(PAYLOAD_DELIMITER) !== -1;
 }
 
+// Markers are UTF-8 on BOTH sides. A wrapper marker id embeds an arbitrary
+// on-disk filename, which cannot be constrained to ASCII. Encoding with 'ascii'
+// (latin1 on encode, high bit stripped on decode) was asymmetric: an id written
+// one way read back mangled, markerEnd never matched, and parseGroup returned
+// zero units for the whole container. bytes= stays a BYTE count either way —
+// it is Buffer.length, never String.length.
 function markerStart(id, bytes) {
-  return Buffer.from(`<!-- forge:unit id=${id} bytes=${bytes} -->\n`, 'ascii');
+  return Buffer.from(`<!-- forge:unit id=${id} bytes=${bytes} -->\n`, 'utf8');
 }
 
 function markerEnd(id) {
-  return Buffer.from(`\n<!-- forge:endunit id=${id} -->\n`, 'ascii');
+  return Buffer.from(`\n<!-- forge:endunit id=${id} -->\n`, 'utf8');
+}
+
+// An id that does not survive a UTF-8 round-trip (a lone surrogate) would be
+// written mangled and could never be matched back. Refuse it at write time
+// rather than produce a container whose members are unreachable.
+function utf8RoundTrips(id) {
+  return Buffer.from(id, 'utf8').toString('utf8') === id;
 }
 
 function serializeGroup({ epoch, units } = {}) {
@@ -41,6 +54,10 @@ function serializeGroup({ epoch, units } = {}) {
     }
     if (typeof unit.id !== 'string' || !unit.id || /[\s>]/.test(unit.id)) {
       skipped.push({ path: unit.path, reason: 'invalid-id' });
+      continue;
+    }
+    if (!utf8RoundTrips(unit.id)) {
+      skipped.push({ path: unit.path, reason: 'id-not-utf8' });
       continue;
     }
     if (hasPayloadDelimiter(content)) {
@@ -97,7 +114,9 @@ function parseFrontmatter(buffer, errors) {
 function parseStartAt(buffer, offset) {
   const end = buffer.indexOf(Buffer.from('\n', 'ascii'), offset);
   if (end === -1) return null;
-  const line = buffer.subarray(offset, end + 1).toString('ascii');
+  // utf8, symmetrically with markerStart. Scanning for 0x0A above is still
+  // safe: no UTF-8 continuation byte can be 0x0A.
+  const line = buffer.subarray(offset, end + 1).toString('utf8');
   const match = UNIT_START_RE.exec(line);
   if (!match) return null;
   return { id: match[1], bytes: Number(match[2]), next: end + 1 };
@@ -141,6 +160,12 @@ function parseGroup(value) {
     }
     units.push({ id: start.id, content: Buffer.from(buffer.subarray(start.next, payloadEnd)) });
     offset = markerEndOffset;
+  }
+  // Every error branch above breaks, so a container damaged at member 3 of 40
+  // parses as 2 units. Without this check readers list those 2 as the entire
+  // store — silent truncation. grouped_units is what the writer declared.
+  if (frontmatter.fields.grouped_units !== String(units.length)) {
+    errors.push({ id: null, reason: 'unit-count-mismatch' });
   }
   return result;
 }

@@ -254,15 +254,22 @@ function listExistingIds(cwd, kind) {
     try {
       const entries = fs.readdirSync(d, { withFileTypes: true });
       out.push(...entries.map(entry => entry.name));
-      // Grouped containers are an optional storage detail.  Keep this whole
-      // reader local and fail-open: creation must retain loose IDs even when
-      // one container or its format module is unavailable/corrupt.
-      try {
-        const grouped = require('./forge-grouped-file');
-        for (const entry of entries) {
+      // Grouped containers are an optional storage detail.  Keep this reader
+      // local and fail-open: creation must retain loose IDs even when one
+      // container or its format module is unavailable/corrupt.  The try is PER
+      // FILE — wrapping the whole loop meant a throw on container k dropped the
+      // ids of k+1..n, and under ids.format: sequential a dropped id gets
+      // re-minted over a live unit.
+      for (const entry of entries) {
+        try {
           if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+          const grouped = require('./forge-grouped-file');
           const filePath = path.join(d, entry.name);
           const sniff = grouped.readSniffBuffer(filePath);
+          // An unreadable file is not a container.  Passing null through would
+          // fall back to the filename heuristic, classify `2026-Q1.md` as one,
+          // and make readGroupedUnits throw on that very file.
+          if (sniff === null) continue;
           if (!grouped.isGroupedFile(entry.name, sniff)) continue;
           const parsed = grouped.readGroupedUnits(filePath);
           if (parsed.errors.length) continue;
@@ -271,8 +278,8 @@ function listExistingIds(cwd, kind) {
             const marker = String(unit.id || '');
             out.push(marker.includes('~') ? marker.slice(0, marker.indexOf('~')) : marker);
           }
-        }
-      } catch { /* optional grouped reader: preserve loose enumeration */ }
+        } catch { /* one bad container never drops the remaining files */ }
+      }
     } catch { /* directory absent or unreadable — preserve loose behavior */ }
   }
   return out;

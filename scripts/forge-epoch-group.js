@@ -188,6 +188,14 @@ function plan(cwd, opts = {}) {
     for (const entry of entries(parent)) {
       if (!entry.isDirectory()) continue;
       const wrapperPath = path.join(parent, entry.name);
+      // `~` separates dirId from fileName in the marker id and split takes the
+      // FIRST one, so `foo~bar/PLAN.md` would restore to `foo/bar~PLAN.md` —
+      // a silent relocation the ungroup existence guard cannot catch, since
+      // the original was already removed. Never group such a wrapper.
+      if (/~/.test(entry.name)) {
+        skip(skipped, wrapperPath, 'separador reservado no nome do invólucro');
+        continue;
+      }
       // Keep the runtime structural decision owned by forge-epoch; the map is
       // only the filename projection supplied by listWrapperDirs.
       const wrapper = isWrapperDir(wrapperPath) ? eligible.get(wrapperPath) : null;
@@ -200,6 +208,13 @@ function plan(cwd, opts = {}) {
         continue;
       }
       const filePath = wrapper.file;
+      // splitWrapperMarkerId requires .md, so a non-.md member would only be
+      // rejected in apply() — where it sets invalid and discards the ENTIRE
+      // epoch target under a misleading reason. Reject it here, alone.
+      if (!filePath.endsWith('.md')) {
+        skip(skipped, wrapperPath, 'arquivo do invólucro não é .md');
+        continue;
+      }
       let content;
       try { content = fs.readFileSync(filePath); }
       catch (error) { skip(skipped, wrapperPath, 'falha de leitura'); continue; }
@@ -353,6 +368,9 @@ function ungroup(cwd, containerPath) {
     if (!safeMemberId(unit.id)) throw new Error(`invalid grouped unit id: ${unit.id}`);
     const destination = path.join(store.dir(cwd), `${unit.id}.md`);
     if (!isDirectChild(store.dir(cwd), destination)) throw new Error('grouped member escapes store');
+    // Mirrors the wrapper branch. By the loose-wins invariant the file already
+    // there is the canonical one, so restoring must never overwrite it.
+    if (fs.existsSync(destination)) throw new Error(`destination already exists: ${destination}`);
     fs.writeFileSync(destination, unit.content);
     restored.push(destination);
   }
