@@ -185,7 +185,7 @@ test('--fix --migrate runs the migration and THEN stamps SCHEMA-VERSION', () => 
     assert(r.status === 0, `expected exit 0, got ${r.status} — ${r.out}`);
     const schemaPath = path.join(tmp, '.gsd', 'SCHEMA-VERSION');
     assert(fs.existsSync(schemaPath), 'SCHEMA-VERSION should be created');
-    assert(fs.readFileSync(schemaPath, 'utf8').trim() === 'fragment-store@1.0.0', 'wrong schema version');
+    assert(fs.readFileSync(schemaPath, 'utf8').trim() === require('./forge-doctor').CURRENT_SCHEMA, 'wrong schema version');
     // Fragments populated + monolith backed up to .bak
     const ledgerFrags = fs.existsSync(path.join(tmp, '.gsd', 'ledger'))
       ? fs.readdirSync(path.join(tmp, '.gsd', 'ledger')).filter(f => f.endsWith('.md'))
@@ -315,7 +315,7 @@ test('validateIgnore does NOT report wholesale-covered children as missing', () 
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// Migrator regression suite (forge-migrate fragment-store@1.0.0 bugs):
+// Migrator regression suite (forge-migrate legacy-schema bugs):
 //   BUG 1 — dashed milestone IDs (M-YYYYMMDD-HHMMSS) dropped by the migrator.
 //   BUG 2 — AUTO-MEMORY.md not migrated when entries carry a `score:` token
 //           (regex mismatch) → memory written:0, .gsd/memory/ empty.
@@ -456,7 +456,7 @@ test('migrateAll migrates dashed/compact/legacy ledger IDs and all memories', ()
 console.log('\nBUG 4 — SessionStart schema-mismatch guard');
 
 const HOOK = path.resolve(__dirname, 'forge-hook.js');
-const CURRENT_SCHEMA = require('./forge-doctor').CURRENT_SCHEMA; // 'fragment-store@1.0.0'
+const CURRENT_SCHEMA = require('./forge-doctor').CURRENT_SCHEMA;
 
 function runHook(cwd, source) {
   // Returns { stdout, parsed } — parsed is hookSpecificOutput JSON or null.
