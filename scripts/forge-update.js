@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+'use strict';
+
+const path = require('path');
+const maintenance = require('./forge-maintenance.js');
+const installer = require('./forge-installer.js');
+
+function parseArgs(argv = process.argv.slice(2)) {
+  const options = { repo: path.resolve(__dirname, '..'), apply: false, json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--runtime') options.runtime = argv[++i] || '';
+    else if (arg === '--repo') options.repo = path.resolve(argv[++i] || '');
+    else if (arg === '--forge-home') options.forgeHome = path.resolve(argv[++i] || '');
+    else if (arg === '--claude-home') options.claudeHome = path.resolve(argv[++i] || '');
+    else if (arg === '--codex-home') options.codexHome = path.resolve(argv[++i] || '');
+    else if (arg === '--project-root') options.projectRoot = path.resolve(argv[++i] || '');
+    else if (arg === '--apply') options.apply = true;
+    else if (arg === '--dry-run') options.apply = false;
+    else if (arg === '--json') options.json = true;
+    else if (arg === '--no-model-probe') options.noModelProbe = true;
+    else if (arg === '--help' || arg === '-h') options.help = true;
+    else throw new Error(`opção desconhecida: ${arg}`);
+  }
+  if (options.runtime) maintenance.selectedRuntimes(options.runtime);
+  return options;
+}
+
+function update(input = {}, dependencies = {}) {
+  const plan = maintenance.planUpdate(input);
+  if (!input.apply) return { ...plan, applied: false };
+  const install = dependencies.install || installer.install;
+  const installed = install({
+    repo: input.repo,
+    runtime: plan.runtime,
+    update: true,
+    forgeHome: input.forgeHome,
+    claudeHome: input.claudeHome,
+    codexHome: input.codexHome,
+    projectRoot: input.projectRoot,
+    env: input.env,
+    userHome: input.userHome,
+    platform: input.platform,
+    binaries: input.binaries,
+    noModelProbe: input.noModelProbe,
+    skipCapabilityCheck: input.skipCapabilityCheck,
+  });
+  return { ...plan, applied: true, changed: installed.changed, backup: installed.backup, installer: installed };
+}
+
+function render(report) {
+  const lines = [
+    `Forge update ${report.applied ? 'applied' : 'plan'}`,
+    `runtime: ${report.runtime}`,
+    `installation: ${report.installation_source}`,
+    `backup: ${report.backup_required ? 'required-before-write' : 'not-required'}`,
+  ];
+  if (report.legacy_migration) lines.push(`legacy migration: ${report.legacy_migration.release} (${report.legacy_migration.runtime})`);
+  if (report.applied) lines.push(report.changed ? 'managed files updated' : 'no managed-file changes');
+  else lines.push('no files written; pass --apply to update');
+  return `${lines.join('\n')}\n`;
+}
+
+function run(argv = process.argv.slice(2), write = process.stdout.write.bind(process.stdout), errorWrite = process.stderr.write.bind(process.stderr)) {
+  try {
+    const options = parseArgs(argv);
+    if (options.help) {
+      write('Usage: forge-update.js [--runtime claude|codex|both] [--apply|--dry-run] [--repo DIR] [--json]\n');
+      return 0;
+    }
+    const report = update(options);
+    write(options.json ? `${JSON.stringify(report, null, 2)}\n` : render(report));
+    return report.ok ? 0 : 1;
+  } catch (error) {
+    errorWrite(`forge-update: ${error.message}\n`);
+    return 1;
+  }
+}
+
+module.exports = { parseArgs, update, render, run };
+if (require.main === module) process.exitCode = run();

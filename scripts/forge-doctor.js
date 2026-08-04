@@ -28,6 +28,7 @@ const { execFileSync } = require('child_process');
 const { PROJECTION_IGNORE_PATHS, detectVcs } = require('./forge-ignore');
 const { audit: auditReview } = require('./forge-review-audit');
 const { detect: detectCapabilities } = require('./forge-capabilities');
+const maintenance = require('./forge-maintenance');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const CURRENT_SCHEMA = 'fragment-store@1.0.0';
@@ -262,19 +263,25 @@ function checkPlanRepoDeclared(cwd) {
  * stable reason code for every probe.
  */
 function checkCapabilities(cwd, options = {}) {
-  const report = detectCapabilities(cwd, options);
-  const failures = report.required_failures.map((id) => {
-    const probe = report.probes[id];
-    return { id, status: probe.status, reason_code: probe.reason_code };
+  const legacy = detectCapabilities(cwd, options);
+  const report = maintenance.diagnose({ ...options, repo: options.repo || path.resolve(__dirname, '..'), cwd, runtime: options.runtime || 'claude' });
+  // Keep the public failure/warning projections byte-compatible with the
+  // legacy capability detector; the richer maintenance diagnostics remain
+  // additive in `diagnostics`.
+  const failures = (report.required_failures || []).map((id) => {
+    const probe = report.probes && report.probes[id];
+    return { id, status: probe && probe.status, reason_code: probe && probe.reason_code };
   });
-  const warnings = Object.keys(report.probes).sort()
-    .map((id) => report.probes[id])
-    .filter((probe) => probe.reason_code === 'not-selected' || (probe.status !== 'available' && !report.required_failures.includes(probe.id)))
+  const warnings = Object.keys(report.probes || {}).sort().map((id) => report.probes[id])
+    .filter((probe) => probe.reason_code === 'not-selected' || (probe.status !== 'available' && !(report.required_failures || []).includes(probe.id)))
     .map((probe) => ({ id: probe.id, status: probe.status, reason_code: probe.reason_code }));
   const message = report.ok
-    ? `Capabilities ${report.runtime}: required probes available.`
-    : `Capabilities ${report.runtime}: required probe failure (${failures.map((entry) => `${entry.id}:${entry.reason_code}`).join(', ')}).`;
-  return { check: 'capabilities', ok: report.ok, runtime: report.runtime, probes: report.probes, failures, warnings, message };
+    ? `Capabilities ${report.runtime}: required capabilities available (${warnings.length} conditional warning(s)).`
+    : `Capabilities ${report.runtime}: ${failures.length} required failure(s); see reason_code.`;
+  return { check: 'capabilities', ok: report.ok, protocol_version: report.protocol_version, runtime: report.runtime,
+    // Preserve the 3.1.4 probe projection for existing doctor consumers while
+    // exposing the new provider-neutral diagnostics alongside it.
+    probes: report.probes || {}, diagnostics: report.diagnostics || [], failures, warnings, message };
 }
 
 // ── module.exports ────────────────────────────────────────────────────────────
@@ -285,6 +292,7 @@ module.exports = {
   checkProjectionVersioned,
   checkPlanRepoDeclared,
   checkCapabilities,
+  runCheck,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
