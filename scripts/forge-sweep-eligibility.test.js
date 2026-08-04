@@ -230,4 +230,118 @@ if (gitAvailable()) {
   skip('casos com repositório Git real');
 }
 
+// --- B2: named tool-undo basis -------------------------------------------
+// These use injected detectVcs/workingStatus (like the status-failure test
+// above) rather than a real git fixture: full control over statuses without
+// needing a git binary, and this file is written-not-run per Step 5.
+
+function eligibilityWithStatuses(cwd, entries, opts = {}) {
+  return createEligibility(cwd, {
+    detectVcs: () => 'git',
+    workingStatus: () => ({ ok: true, entries }),
+    ...opts,
+  });
+}
+
+function workspaceCwd() {
+  return path.join(path.parse(process.cwd()).root, 'forge', 'workspace');
+}
+
+test('sem opts.toolUndo, o filtro recusa igual ao atual (regressão byte-idêntica)', () => {
+  const cwd = workspaceCwd();
+  const eligibility = eligibilityWithStatuses(cwd, [{ path: '.gsd', kind: 'ignored' }]);
+  const result = eligibility.filter(target(cwd, [path.join('.gsd', 'forge', 'ledger.md')]));
+  assert.strictEqual(result.eligible, false);
+  assert.match(result.reason, /sob \.gsd, ignorado pelo VCS/);
+  assert.strictEqual(result.basis, undefined);
+});
+
+test('toolUndo disponível promove alvo untracked direto para basis tool-undo', () => {
+  const cwd = workspaceCwd();
+  const eligibility = eligibilityWithStatuses(cwd, [{ path: 'novo.md', kind: 'untracked' }], {
+    toolUndo: { available: true },
+  });
+  const result = eligibility.filter(target(cwd, ['novo.md']));
+  assert.strictEqual(result.eligible, true);
+  assert.strictEqual(result.basis, 'tool-undo');
+  assert.match(result.note, /não versionado/);
+  assert.match(result.note, /elegível por undo de ferramenta/);
+});
+
+test('toolUndo disponível promove alvo sob ancestral ignorado', () => {
+  const cwd = workspaceCwd();
+  const eligibility = eligibilityWithStatuses(cwd, [{ path: 'pasta', kind: 'ignored' }], {
+    toolUndo: { available: true },
+  });
+  const result = eligibility.filter(target(cwd, [path.join('pasta', 'arquivo.md')]));
+  assert.strictEqual(result.eligible, true);
+  assert.strictEqual(result.basis, 'tool-undo');
+  assert.match(result.note, /sob pasta, ignorado pelo VCS/);
+});
+
+test('caminho limpo com toolUndo ativo reporta basis vcs', () => {
+  const cwd = workspaceCwd();
+  const eligibility = eligibilityWithStatuses(cwd, [], { toolUndo: { available: true } });
+  const result = eligibility.filter(target(cwd, ['limpo.md']));
+  assert.deepStrictEqual(result, { eligible: true, basis: 'vcs' });
+});
+
+test('estados de arquivo rastreado sujo recusam mesmo com toolUndo disponível (DS8-2)', () => {
+  const cwd = workspaceCwd();
+  for (const kind of ['modified', 'added', 'deleted']) {
+    const eligibility = eligibilityWithStatuses(cwd, [{ path: 'sujo.md', kind }], {
+      toolUndo: { available: true },
+    });
+    const result = eligibility.filter(target(cwd, ['sujo.md']));
+    assert.strictEqual(result.eligible, false, `kind ${kind} não deveria promover`);
+    assert.strictEqual(result.basis, undefined);
+  }
+});
+
+test('toolUndo com available:false recusa exatamente como o default (B2)', () => {
+  const cwd = workspaceCwd();
+  const entries = [{ path: 'novo.md', kind: 'untracked' }];
+  const withFalse = eligibilityWithStatuses(cwd, entries, { toolUndo: { available: false } });
+  const withoutOpt = eligibilityWithStatuses(cwd, entries);
+  const candidate = target(cwd, ['novo.md']);
+  assert.deepStrictEqual(withFalse.filter(candidate), withoutOpt.filter(candidate));
+  assert.strictEqual(withFalse.filter(candidate).eligible, false);
+});
+
+test("toolUndo.available string/numérico não ativa (comparação estrita, MEM001)", () => {
+  const cwd = workspaceCwd();
+  for (const bogus of ['true', 1]) {
+    const eligibility = eligibilityWithStatuses(cwd, [{ path: 'novo.md', kind: 'untracked' }], {
+      toolUndo: { available: bogus },
+    });
+    const result = eligibility.filter(target(cwd, ['novo.md']));
+    assert.strictEqual(result.eligible, false, `available:${JSON.stringify(bogus)} não deveria ativar`);
+    assert.strictEqual(result.basis, undefined);
+  }
+});
+
+test('ramo sem VCS ignora toolUndo por completo (herdada 7 travada)', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-no-vcs-tool-undo-'));
+  try {
+    const withToolUndo = createEligibility(cwd, { toolUndo: { available: true } });
+    const without = createEligibility(cwd);
+    const candidate = target(cwd, ['limpo.md']);
+    assert.deepStrictEqual(withToolUndo.filter(candidate), without.filter(candidate));
+    assert.strictEqual(withToolUndo.filter(candidate).eligible, false);
+    assert.strictEqual(withToolUndo.vcs, 'none');
+  } finally { cleanup(cwd); }
+});
+
+test('classifyPath expõe kind/via aditivos sem alterar a string reason', () => {
+  const cwd = workspaceCwd();
+  const direct = classifyPath(cwd, path.join(cwd, 'novo.md'), new Map([['novo.md', 'untracked']]));
+  assert.strictEqual(direct.kind, 'untracked');
+  assert.strictEqual(direct.via, 'direct');
+  assert.strictEqual(direct.reason, 'novo.md — não versionado');
+  const ancestor = classifyPath(cwd, path.join(cwd, 'pasta', 'arquivo.md'), new Map([['pasta', 'ignored']]));
+  assert.strictEqual(ancestor.kind, 'ignored');
+  assert.strictEqual(ancestor.via, 'ancestor');
+  assert.strictEqual(ancestor.reason, 'pasta/arquivo.md — sob pasta, ignorado pelo VCS');
+});
+
 process.stdout.write(`forge-sweep-eligibility: ${passed} passed, ${skipped} skipped\n`);

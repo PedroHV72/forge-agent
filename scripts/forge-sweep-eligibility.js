@@ -52,14 +52,28 @@ function containingRefusal(relPath, statuses) {
   return null;
 }
 
-/** Exported small seam so path normalisation can be checked independently. */
+/**
+ * Exported small seam so path normalisation can be checked independently.
+ * A refusal carries two additive fields consumed only by the tool-undo
+ * promotion in `createEligibility`: `kind` (the raw VCS state, matching a
+ * `REASONS` key) and `via` (`'direct'` when the path itself matched a status
+ * entry, `'ancestor'` when a containing directory did). Neither field changes
+ * the `reason` string — the CLI's `isVcsQueryFailure` predicate and existing
+ * tests key off that string, not off these fields.
+ */
 function classifyPath(cwd, candidate, statuses) {
   const normalised = toRelativePosix(cwd, candidate);
   if (!normalised.ok) return { eligible: false, reason: normalised.error };
   if (statuses.has(normalised.path)) {
     const kind = statuses.get(normalised.path);
     const reason = REASONS[kind] || 'estado do VCS desconhecido';
-    return { eligible: false, path: normalised.path, reason: `${normalised.path} — ${reason}` };
+    return {
+      eligible: false,
+      path: normalised.path,
+      reason: `${normalised.path} — ${reason}`,
+      kind,
+      via: 'direct',
+    };
   }
   const containing = containingRefusal(normalised.path, statuses);
   if (containing) {
@@ -68,6 +82,8 @@ function classifyPath(cwd, candidate, statuses) {
       eligible: false,
       path: normalised.path,
       reason: `${normalised.path} — sob ${containing.ancestor}, ${reason}`,
+      kind: containing.kind,
+      via: 'ancestor',
     };
   }
   return { eligible: true, path: normalised.path };
@@ -117,6 +133,12 @@ function createEligibility(cwd, opts = {}) {
   const vcs = detect(cwd);
   const forced = vcs === 'none' && opts.force === true;
   const skipped = [];
+  // B2 named fundament: absent opts.toolUndo, or any value whose `available`
+  // is not the boolean `true`, must never promote a refusal. The strict
+  // comparison is the repo's idiom for destructive gates (MEM001) — a
+  // serialized `'true'` or truthy `1` stays inert here, same as `force`
+  // above and `includeWrapperDirs` elsewhere.
+  const toolUndoActive = !!(opts.toolUndo && opts.toolUndo.available === true);
 
   // A no-VCS working tree has no recovery route.  The strict comparison keeps
   // serialized strings and numeric values from weakening this destructive gate.
@@ -146,13 +168,25 @@ function createEligibility(cwd, opts = {}) {
   }
   const statuses = mapped.statuses;
   const filter = (target) => {
+    // A dirty tracked file (added/modified/deleted, DS8-2) refuses
+    // unconditionally: tool-undo restores pre-apply bytes, but the hazard it
+    // would trample is a human edit in progress, which restoring bytes does
+    // not address. Only untracked/ignored (direct or ancestor) are
+    // promotable — CONTAINING_REASONS already names exactly that set.
+    let promotedNote = null;
     for (const itemPath of targetPaths(target)) {
       const result = classifyPath(cwd, itemPath, statuses);
       if (!result.eligible) {
+        if (toolUndoActive && result.kind && CONTAINING_REASONS.has(result.kind)) {
+          promotedNote = `${result.reason}; elegível por undo de ferramenta`;
+          continue;
+        }
         skipped.push({ path: itemPath, reason: result.reason });
         return result;
       }
     }
+    if (promotedNote) return { eligible: true, basis: 'tool-undo', note: promotedNote };
+    if (toolUndoActive) return { eligible: true, basis: 'vcs' };
     return { eligible: true };
   };
   return { vcs, forced: false, filter, skipped };

@@ -150,6 +150,76 @@ function testFilteredPlanKeepsExistingSkippedItems() {
   assert.strictEqual(appliedPlan.skipped.length, 4);
 }
 
+// B2: the basis annotation is generic over the filter's decision shape —
+// this seam has zero knowledge of tool-undo/vcs, only of `decision.basis`.
+
+function testBasisSurfacedInPreview() {
+  const registry = createRegistry();
+  registry.register(operation('withbasis'));
+  const result = registry.run({}, {
+    filter: target => target.containerPath.endsWith('-a.md')
+      ? { eligible: true, basis: 'tool-undo', note: 'ignorado pelo VCS; elegível por undo de ferramenta' }
+      : { eligible: true, basis: 'vcs' },
+    confirm: () => true,
+  });
+  const text = formatPreview(result.preview);
+  assert(text.includes('/tmp/withbasis-a.md — 1 membro(s) — elegível por undo de ferramenta'));
+  assert(text.includes('ignorado pelo VCS; elegível por undo de ferramenta'));
+  assert(text.includes('/tmp/withbasis-b.md — 2 membro(s) — elegível por VCS'));
+  const entry = result.preview.operations[0];
+  assert.strictEqual(entry.bases.length, 2);
+  assert.strictEqual(entry.bases[0].basis, 'tool-undo');
+  assert.strictEqual(entry.bases[1].basis, 'vcs');
+}
+
+function testFakeOperationWithoutBasisStaysLegacy() {
+  // The S05 seam test: a filter that reports plain `{ eligible: true }`
+  // (no basis) must produce byte-identical preview lines and leave
+  // `bases` empty — proof the annotation never touches operation code.
+  const registry = createRegistry();
+  const fake = operation('legacy-seam');
+  registry.register(fake);
+  const preview = applyFilter(registry.preview({ cwd: '/tmp' }), () => ({ eligible: true }));
+  const text = formatPreview(preview);
+  assert(text.includes('alvo: /tmp/legacy-seam-a.md — 1 membro(s)\n'));
+  assert(!text.includes('elegível por'));
+  assert.deepStrictEqual(preview.operations[0].bases, []);
+}
+
+function applyFilter(preview, filter) {
+  // Local re-import of the registry's own applyFilter is unavailable (not
+  // exported); exercise the same path through a single-operation run
+  // instead, matching how production code reaches it.
+  const registry = createRegistry();
+  for (const entry of preview.operations) {
+    registry.register({
+      name: entry.name,
+      description: entry.description,
+      plan: () => ({ targets: entry.targets, skipped: entry.skipped }),
+      apply: () => ({}),
+    });
+  }
+  const result = registry.run({}, { filter, confirm: () => true });
+  return result.preview;
+}
+
+function testMixedTargetsOnlyBasisEntriesGetSuffix() {
+  // One accepted target reports a basis, the other reports none — the
+  // second must render the legacy line, proving the suffix is per-target.
+  const registry = createRegistry();
+  registry.register(operation('mixed'));
+  const result = registry.run({}, {
+    filter: target => target.containerPath.endsWith('-a.md')
+      ? { eligible: true, basis: 'vcs' }
+      : { eligible: true },
+    confirm: () => true,
+  });
+  const text = formatPreview(result.preview);
+  assert(text.includes('/tmp/mixed-a.md — 1 membro(s) — elegível por VCS'));
+  assert(text.includes('/tmp/mixed-b.md — 2 membro(s)\n'));
+  assert(!text.includes('/tmp/mixed-b.md — 2 membro(s) — elegível'));
+}
+
 testRegistrationAndSeam();
 testTwoOperationsPreserveOrder();
 testDryRun();
@@ -160,3 +230,6 @@ testApplyFailureIsolation();
 testHygiene();
 testFormattingDetails();
 testFilteredPlanKeepsExistingSkippedItems();
+testBasisSurfacedInPreview();
+testFakeOperationWithoutBasisStaysLegacy();
+testMixedTargetsOnlyBasisEntriesGetSuffix();

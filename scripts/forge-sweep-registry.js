@@ -28,6 +28,10 @@ function normalizePlan(operation, value) {
     description: operation.description,
     targets: Array.isArray(plan.targets) ? plan.targets.slice() : [],
     skipped: Array.isArray(plan.skipped) ? plan.skipped.slice() : [],
+    // Additive: populated only by applyFilter when a filter decision reports
+    // a `basis`. No operation ever supplies this itself — it is generic
+    // metadata about the filter's decision, not about the operation.
+    bases: [],
     error: null,
   };
 }
@@ -83,6 +87,7 @@ function createRegistry() {
     for (const entry of preview.operations) {
       if (entry.error) continue;
       const accepted = [];
+      if (!Array.isArray(entry.bases)) entry.bases = [];
       for (const target of entry.targets) {
         let decision;
         try {
@@ -97,6 +102,17 @@ function createRegistry() {
           });
         } else {
           accepted.push(target);
+          // Generic over any decision shape: an accepted decision without a
+          // `basis` field (e.g. the S05 fake-operation seam's `{ eligible:
+          // true }`) leaves `bases` untouched — no operation-specific code
+          // enters this seam.
+          if (decision && decision.basis) {
+            entry.bases.push({
+              path: target.path || target.containerPath || String(target),
+              basis: decision.basis,
+              note: decision.note || null,
+            });
+          }
         }
       }
       entry.targets = accepted;
@@ -144,10 +160,24 @@ function formatPreview(preview) {
   for (const operation of (preview && preview.operations) || []) {
     lines.push(`\n${operation.name}: ${operation.description}`);
     if (operation.error) lines.push(`falha: ${operation.error}`);
+    const bases = Array.isArray(operation.bases) ? operation.bases : [];
     for (const target of operation.targets || []) {
       const identity = target.containerPath || target.path || target.name || 'alvo sem identificação';
       const count = Array.isArray(target.members) ? target.members.length : 0;
-      lines.push(`alvo: ${identity} — ${count} membro(s)`);
+      // Same fallback order applyFilter used to key `bases` — deliberately
+      // distinct from `identity` above, which favours containerPath for
+      // display. A target absent from `bases` (no basis was reported for
+      // it) keeps the legacy line byte-identical.
+      const matchKey = target.path || target.containerPath || String(target);
+      const basisEntry = bases.find(item => item.path === matchKey);
+      let line = `alvo: ${identity} — ${count} membro(s)`;
+      if (basisEntry) {
+        line += basisEntry.basis === 'tool-undo'
+          ? ' — elegível por undo de ferramenta'
+          : ' — elegível por VCS';
+      }
+      lines.push(line);
+      if (basisEntry && basisEntry.note) lines.push(`  ${basisEntry.note}`);
     }
     if (operation.skipped && operation.skipped.length) {
       lines.push('Pulados:');
