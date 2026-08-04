@@ -40,7 +40,7 @@ function isGsdPath(p) {
 }
 
 function optionsFor(opts) {
-  const out = { encoding: 'buffer', maxBuffer: opts.maxBuffer == null ? DEFAULT_MAX_BUFFER : opts.maxBuffer };
+  const out = { encoding: 'buffer', maxBuffer: opts.maxBuffer == null ? DEFAULT_MAX_BUFFER : opts.maxBuffer, shell: false };
   // Do not turn an absent env into {}; spawnSync must retain process.env exactly.
   if (opts.env !== undefined) out.env = opts.env;
   return out;
@@ -572,6 +572,65 @@ function restoreAndRemove(cwd, baseline, target, opts = {}) {
     : { vcs, ok: false, restored: result.restored, removed: result.removed, error: result.error };
 }
 
+/*
+ * Read the working-copy status for consumers that need a per-path safety
+ * decision. This is deliberately separate from captureDirty(): the latter
+ * carries hashes for reset recovery, whereas this envelope retains the raw
+ * status category needed for an operator-facing refusal reason.
+ */
+function workingStatus(cwd, opts = {}) {
+  const vcs = opts.vcs === undefined ? detectVcs(cwd) : opts.vcs;
+  if (vcs === 'git') {
+    // -z is load-bearing: parsePorcelainZ is the only parser used here and
+    // preserves paths containing spaces, quotes, or newlines. -uall prevents
+    // directory-collapse from making a dirty descendant look absent.
+    const result = git(cwd, ['status', '--porcelain', '-uall', '-z', '--ignored'], opts);
+    if (result.status !== 0) return { vcs, ok: false, entries: [], error: stderrOf(result, 'git status failed') };
+    try {
+      const entries = [];
+      for (const entry of parsePorcelainZ(result.stdout)) {
+        const xy = entry.xy;
+        let kind = null;
+        if (xy === '??') kind = 'untracked';
+        else if (xy === '!!') kind = 'ignored';
+        else if (xy.includes('A')) kind = 'added';
+        else if (xy.includes('D')) kind = 'deleted';
+        else if (/[MRCU]/.test(xy)) kind = 'modified';
+        else return { vcs, ok: false, entries: [], error: `git-status-unhandled:${xy}` };
+        entries.push({ path: entry.path, code: xy, kind });
+        // A rename/copy affects both spellings; checking either target member
+        // must therefore fail closed instead of treating its old spelling clean.
+        if (entry.origPath) entries.push({ path: entry.origPath, code: xy, kind });
+      }
+      return { vcs, ok: true, entries };
+    } catch (error) {
+      return { vcs, ok: false, entries: [], error: `git-status-parse-failed:${error.message}` };
+    }
+  }
+  if (vcs === 'svn') {
+    const status = svnStatusEntries(cwd, opts);
+    if (!status.ok) return { vcs, ok: false, entries: [], error: status.error };
+    const entries = [];
+    for (const entry of status.entries) {
+      let kind = null;
+      // Do not use mapSvnItem here: it deliberately collapses added and
+      // unversioned into A, but this reporting boundary must distinguish them.
+      if (entry.item === 'unversioned') kind = 'untracked';
+      else if (entry.item === 'ignored') kind = 'ignored';
+      else if (entry.item === 'added') kind = 'added';
+      else if (entry.item === 'deleted' || entry.item === 'missing') kind = 'deleted';
+      else if (entry.item === 'modified' || entry.item === 'replaced') kind = 'modified';
+      else if (entry.item === 'normal' && entry.props !== 'none') kind = 'modified';
+      else if (entry.item !== 'normal' && entry.item !== 'external') {
+        return { vcs, ok: false, entries: [], error: `svn-status-unhandled:${entry.item}` };
+      }
+      if (kind) entries.push({ path: entry.path, code: entry.item, kind });
+    }
+    return { vcs, ok: true, entries };
+  }
+  return unsupported(vcs, { entries: [] });
+}
+
 module.exports = {
   detectVcs,
   baselineId,
@@ -581,6 +640,7 @@ module.exports = {
   captureDirty,
   postChanges,
   restoreAndRemove,
+  workingStatus,
   parsePorcelainZ,
   parseNameStatusZ,
   parseSvnStatusXml,
