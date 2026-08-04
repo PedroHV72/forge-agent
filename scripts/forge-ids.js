@@ -143,6 +143,11 @@ function nextSequentialTaskId(existingIds) {
 }
 
 // ── classify ─────────────────────────────────────────────────────────────────
+// Timestamp prefixes are shared by classify, isValid, prefixGlob, and
+// timestampOf so ID recognition remains centralized in this module.
+const COMPACT_TIMESTAMP_RE = /^[MTI]-(\d{14})(-|$)/;
+const DASHED_TIMESTAMP_RE = /^(?:M|T|TASK)-(\d{8})-(\d{6})(-|$)/i;
+
 // Returns 'timestamp' for new-style IDs, 'legacy' otherwise.
 // Conservative default: unknown patterns classified as 'legacy' so S02 can
 // handle errors via isValid() rather than crashing on unexpected input.
@@ -151,11 +156,11 @@ function classify(id) {
   const s = String(id);
   // I- (item) participates in the compact form only — the dashed regex below
   // deliberately stays M|T|TASK.
-  if (/^[MTI]-\d{14}(-|$)/.test(s)) return 'timestamp';
+  if (COMPACT_TIMESTAMP_RE.test(s)) return 'timestamp';
   // Dashed timestamp form: M-YYYYMMDD-HHMMSS / T-… / TASK-… (date and time
   // separated by a hyphen). Observed in the wild alongside the compact 14-digit
   // form — both encode a creation timestamp, so both classify as 'timestamp'.
-  if (/^(?:M|T|TASK)-\d{8}-\d{6}(-|$)/i.test(s)) return 'timestamp';
+  if (DASHED_TIMESTAMP_RE.test(s)) return 'timestamp';
   // Legacy patterns: M005, M123, TASK-001, task-fix-foo, etc.
   if (/^M\d+$/i.test(s)) return 'legacy';
   if (/^TASK-\d+$/i.test(s)) return 'legacy';
@@ -181,6 +186,17 @@ function isValid(id) {
   if (/^TASK-\d+$/i.test(s)) return true;
   if (/^task-[a-z0-9-]+$/.test(s)) return true;
   return false;
+}
+
+// Return the creation timestamp encoded by a recognized timestamp ID.
+// Legacy sequential IDs intentionally have no timestamp and return null.
+function timestampOf(id) {
+  if (typeof id !== 'string') return null;
+  let match = id.match(COMPACT_TIMESTAMP_RE);
+  if (match) return match[1];
+  match = id.match(DASHED_TIMESTAMP_RE);
+  if (match) return `${match[1]}${match[2]}`;
+  return null;
 }
 
 // ── prefixGlob ───────────────────────────────────────────────────────────────
@@ -269,6 +285,7 @@ module.exports = {
   nextSequentialTaskId,
   classify,
   isValid,
+  timestampOf,
   prefixGlob,
   entityKind,
   readIdFormat,

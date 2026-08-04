@@ -523,6 +523,25 @@ test('resolveTaskId: sequential with no tasks dir → TASK-001', () => {
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────
+// timestampOf coverage: compact and dashed forms share the production ID grammar.
+console.log('timestampOf');
+test('timestampOf: compact form', () =>
+  assertEq(ids.timestampOf('M-20260214112233-feature'), '20260214112233'));
+test('timestampOf: compact form without slug', () =>
+  assertEq(ids.timestampOf('T-20260214112233'), '20260214112233'));
+test('timestampOf: dashed form', () =>
+  assertEq(ids.timestampOf('M-20260214-112233-feature'), '20260214112233'));
+test('timestampOf: dashed TASK form', () =>
+  assertEq(ids.timestampOf('TASK-20260214-112233-fix'), '20260214112233'));
+test('timestampOf: legacy IDs return null', () => {
+  assertEq(ids.timestampOf('M005'), null);
+  assertEq(ids.timestampOf('TASK-001'), null);
+});
+test('timestampOf: malformed and non-string IDs return null', () => {
+  assertEq(ids.timestampOf('M-2026021411223-short'), null);
+  assertEq(ids.timestampOf(null), null);
+});
+
 console.log(`\n=== Result: ${passed} passed, ${failed} failed ===`);
 
 if (failed > 0) {
