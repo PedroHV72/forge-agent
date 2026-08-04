@@ -1,0 +1,202 @@
+#!/usr/bin/env node
+'use strict';
+
+// Provider-neutral authority for the small shared workflow boundary. Provider
+// adapters only present this JSON result; they do not decide state transitions.
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const forgeState = require('./forge-state.js');
+const forgeStatus = require('./forge-status.js');
+const forgeController = require('./forge-unit-controller.js');
+const forgeRuntime = require('./forge-runtime.js');
+
+const PROTOCOL_VERSION = '1.0.0';
+const OPERATIONS = Object.freeze(['init', 'status', 'next']);
+const OUTCOMES = Object.freeze(['needs_input', 'completed', 'blocked', 'no_work', 'failed']);
+const REASON_CODES = Object.freeze([
+  'initialized', 'already-initialized', 'status-ready', 'selected', 'unit-selected',
+  'no-next-unit', 'needs-input', 'needs-input-boundary', 'not-initialized',
+  'prefs-invalid', 'lease-active', 'transaction-pending', 'invalid-request', 'failed',
+]);
+
+function own(value, key) { return Object.prototype.hasOwnProperty.call(value || {}, key); }
+function object(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw error('invalid-request', `${label} deve ser objeto`);
+  return value;
+}
+function error(code, message) { const value = new Error(message); value.code = code; return value; }
+function normalizeHost(value) { return forgeRuntime.normalizeHostRuntime(value || 'claude'); }
+function normalizeInput(value) {
+  const input = object(value || {}, 'input');
+  const output = {
+    cwd: path.resolve(input.cwd || process.cwd()),
+    milestone: input.milestone || null,
+    host_runtime: normalizeHost(input.host_runtime || input.hostRuntime),
+    owner_token: input.owner_token || input.ownerToken || 'forge-orchestrate',
+    session: typeof input.session === 'string' ? input.session : null,
+    idempotency_key: input.idempotency_key || input.idempotencyKey || null,
+    project: typeof input.project === 'string' ? input.project : null,
+    description: typeof input.description === 'string' ? input.description : null,
+    needs_input: input.needs_input === true,
+    response: own(input, 'response') ? input.response : undefined,
+    boundary: input.boundary || null,
+    inventory: input.inventory || null,
+    prefsReader: typeof input.prefsReader === 'function' ? input.prefsReader : undefined,
+  };
+  if (output.milestone !== null && (typeof output.milestone !== 'string' || !output.milestone.trim())) throw error('invalid-request', 'milestone inválido');
+  return output;
+}
+function stable(value) {
+  if (Array.isArray(value)) return value.map(stable);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+}
+function checksum(value) { return crypto.createHash('sha256').update(JSON.stringify(stable(value))).digest('hex'); }
+function unit(value) {
+  if (!value) return null;
+  return { type: value.type, id: value.id, key: value.key || `${value.type}/${value.id}` };
+}
+function base(operation, outcome, reason, input) {
+  return { protocol_version: PROTOCOL_VERSION, operation, outcome, reason_code: reason, milestone: input.milestone, unit: null, state: null, events: [], boundary: null };
+}
+function publicState(value) {
+  if (!value) return null;
+  return {
+    milestone: value.milestone,
+    phase: value.phase || 'idle',
+    active_slice: value.active_slice || '—',
+    active_task: value.active_task || '—',
+    auto_mode: value.auto_mode || 'off',
+    next_action: value.next_action || '',
+  };
+}
+function init(inputValue) {
+  const input = normalizeInput(inputValue);
+  if (!input.milestone) throw error('invalid-request', 'milestone é obrigatório para init');
+  const milestoneDir = path.join(input.cwd, '.gsd', 'milestones', input.milestone);
+  const stateFile = forgeState.statePath(input.cwd, input.milestone);
+  const existing = forgeState.read(input.cwd, input.milestone);
+  if (!existing) {
+    fs.mkdirSync(milestoneDir, { recursive: true });
+    forgeState.write(input.cwd, {
+      milestone: input.milestone,
+      kind: 'milestone',
+      phase: 'idle',
+      active_slice: '—',
+      active_task: '—',
+      auto_mode: 'off',
+      next_action: 'plan-milestone',
+      host_runtime: input.host_runtime,
+    });
+  }
+  const result = base('init', 'completed', 'initialized', input);
+  result.state = publicState(forgeState.read(input.cwd, input.milestone));
+  result.events = [{ event: 'initialized', milestone: input.milestone, reason_code: 'initialized' }];
+  result.details = { state_file: path.relative(input.cwd, stateFile).split(path.sep).join('/') };
+  return result;
+}
+function status(inputValue) {
+  const input = normalizeInput(inputValue);
+  const model = forgeStatus.collect(input.cwd, { milestoneId: input.milestone || undefined });
+  const result = base('status', 'completed', 'status-ready', input);
+  result.milestone = model.runs.focused || input.milestone || null;
+  result.state = model.milestone ? {
+    milestone: model.milestone.id,
+    phase: model.milestone.phase,
+    active_slice: model.milestone.active_slice,
+    active_task: model.milestone.active_task,
+    progress: model.milestone.progress,
+  } : null;
+  result.details = {
+    runs: (model.runs.active || []).map((run) => ({ id: run.id, kind: run.kind, phase: run.phase, stale: run.stale })),
+    autonomous_tasks: (model.autonomous_tasks || []).map((task) => ({ id: task.id, status: task.status })),
+  };
+  result.warnings = model.warnings || [];
+  if (!result.state && !result.milestone) { result.outcome = 'no_work'; result.reason_code = 'no-next-unit'; }
+  return result;
+}
+function next(inputValue, options) {
+  const input = normalizeInput(inputValue);
+  if (!input.milestone) throw error('invalid-request', 'milestone é obrigatório para next');
+  if (input.response !== undefined && !input.boundary) {
+    const result = base('next', 'blocked', 'needs-input-boundary', input);
+    return result;
+  }
+  if (input.inventory && input.inventory.milestone_complete === true) {
+    const result = base('next', 'no_work', 'no-next-unit', input);
+    result.state = publicState(forgeState.read(input.cwd, input.milestone));
+    return result;
+  }
+  let selection;
+  try {
+    selection = forgeController.select(input.cwd, { milestone: input.milestone, inventory: input.inventory || undefined }, { prefsReader: input.prefsReader });
+  } catch (cause) {
+    if (cause && cause.code === 'CONTROLLER_FAILPOINT') throw cause;
+    const code = cause.code || 'failed';
+    const result = base('next', code === 'prefs-invalid' ? 'blocked' : 'failed', code, input);
+    return result;
+  }
+  if (!selection.ok) {
+    const result = base('next', 'no_work', selection.reason || 'no-next-unit', input);
+    result.state = publicState(forgeState.read(input.cwd, input.milestone));
+    return result;
+  }
+  const selectedUnit = unit(selection.unit);
+  const key = input.idempotency_key || `forge-orchestrate-next:${input.milestone}:${selectedUnit.key}`;
+  const request = { milestone: input.milestone, unit: selectedUnit, host_runtime: input.host_runtime, owner_token: input.owner_token, session: input.session, idempotency_key: key };
+  const txOptions = { ...(options || {}), prefsReader: input.prefsReader };
+  try {
+    // Recovery is explicit and uses the durable S02 transaction record. It is
+    // harmless when no transaction exists and makes crash retry deterministic.
+    forgeController.resume(input.cwd, { idempotency_key: key, owner_token: input.owner_token }, txOptions);
+    const begun = forgeController.begin(input.cwd, request, txOptions);
+    const result = base('next', input.needs_input ? 'needs_input' : 'completed', input.needs_input ? 'needs-input' : 'unit-selected', input);
+    result.unit = selectedUnit;
+    result.state = publicState(forgeState.read(input.cwd, input.milestone));
+    result.events = [{ event: 'unit-began', action: 'begin', unit: selectedUnit.key, milestone: input.milestone, reason_code: 'selected' }];
+    result.details = { transaction: begun.transaction ? { idempotency_key: begun.transaction.idempotency_key, phase: begun.transaction.phase } : null, selection_reason: selection.reason };
+    return result;
+  } catch (cause) {
+    if (cause && cause.code === 'CONTROLLER_FAILPOINT') throw cause;
+    const code = cause.code || 'failed';
+    const result = base('next', code === 'lease-active' || code === 'transaction-pending' || code === 'prefs-invalid' ? 'blocked' : 'failed', code, input);
+    result.unit = selectedUnit;
+    return result;
+  }
+}
+function run(operation, input, options) {
+  if (!OPERATIONS.includes(operation)) throw error('invalid-request', `operation inválida: ${operation}`);
+  if (operation === 'init') return init(input);
+  if (operation === 'status') return status(input);
+  return next(input, options);
+}
+function parseArgs(argv) {
+  const args = {};
+  for (let index = 0; index < argv.length; index++) {
+    const value = argv[index];
+    if (!value.startsWith('--')) continue;
+    const key = value.slice(2);
+    const nextValue = argv[index + 1];
+    args[key] = nextValue && !nextValue.startsWith('--') ? (index++, nextValue) : true;
+  }
+  return args;
+}
+function main(argv = process.argv.slice(2), output = process.stdout.write.bind(process.stdout), errorOutput = process.stderr.write.bind(process.stderr)) {
+  try {
+    const args = parseArgs(argv);
+    const operation = args.init ? 'init' : args.status ? 'status' : args.next ? 'next' : null;
+    if (!operation) throw error('invalid-request', 'use --init, --status ou --next');
+    const payload = args.json ? JSON.parse(args.json) : {};
+    if (args.cwd) payload.cwd = args.cwd;
+    if (args.milestone) payload.milestone = args.milestone;
+    const result = run(operation, payload);
+    output(`${JSON.stringify(result)}\n`);
+    return 0;
+  } catch (cause) {
+    errorOutput(`forge-orchestrate: ${cause.code || 'failed'}: ${cause.message}\n`);
+    return 1;
+  }
+}
+if (require.main === module) process.exitCode = main();
+module.exports = { PROTOCOL_VERSION, OPERATIONS, OUTCOMES, REASON_CODES, normalizeInput, normalizeHost, init, status, next, run, parseArgs, main, checksum };
