@@ -26,6 +26,10 @@ try {
     assert(fs.existsSync(path.join(matrixCodex, 'agents', 'forge-executor.toml')));
     const repeatMatrix = generation.generate({ repo: root, runtime: 'both', platform, projectRoot: matrixProject, claudeHome: matrixClaude, codexHome: matrixCodex, forgeHome: matrixForge });
     assert.strictEqual(repeatMatrix.changed, false, `${platform} second run idempotent`);
+    const inferredHome = path.join(matrixRoot, 'inferred user home');
+    const inferred = generation.generate({ repo: root, runtime: 'both', platform, userHome: inferredHome, env: {}, projectRoot: path.join(matrixRoot, 'inferred project') });
+    assert(inferred.reports.claude.claude_home.endsWith(`${path.sep}.claude`));
+    assert(inferred.reports.codex.codex_home.endsWith(`${path.sep}.codex`));
     assert.strictEqual(fs.existsSync(path.join(matrixRoot, '.claude')), false);
     assert.strictEqual(fs.existsSync(path.join(matrixRoot, '.codex')), false);
   }

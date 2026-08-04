@@ -114,6 +114,19 @@ test('switching from Claude-only to both fills the missing Codex projection', ()
   } finally { data.cleanup(); }
 });
 
+test('user-owned project projection is reported as a conflict and never marked complete', () => {
+  const data = fixture();
+  try {
+    fs.mkdirSync(data.projectRoot, { recursive: true });
+    fs.writeFileSync(path.join(data.projectRoot, 'AGENTS.md'), '# operator-owned\n');
+    const first = installer.install({ ...data.options, runtime: 'codex' });
+    assert(first.manifest.adapters.codex.conflicts.length > 0);
+    const second = installer.install({ ...data.options, runtime: 'codex' });
+    assert.strictEqual(second.already_installed, undefined);
+    assert.match(fs.readFileSync(path.join(data.projectRoot, 'AGENTS.md'), 'utf8'), /operator-owned/);
+  } finally { data.cleanup(); }
+});
+
 test('sentinels prove the non-selected home remains byte-identical', () => {
   const data = fixture();
   try {

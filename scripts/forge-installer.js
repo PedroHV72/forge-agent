@@ -107,6 +107,7 @@ function projectionComplete(paths, host, projectRoot) {
   const manifestFile = path.join(paths.adapters[host], 'manifest.json');
   const manifest = readJsonIfPresent(manifestFile);
   if (!manifest || manifest.runtime !== host || !Array.isArray(manifest.files)) return false;
+  if (Array.isArray(manifest.conflicts) && manifest.conflicts.length > 0) return false;
   const homeComplete = manifest.files.every((relative) => exists(path.join(paths.runtimeHomes[host], relative)));
   const projectComplete = !Array.isArray(manifest.project_files)
     || manifest.project_files.every((relative) => exists(path.join(projectRoot, relative)));
@@ -166,7 +167,7 @@ function install(input = {}) {
   }
   const backupName = backupId(options);
   const backupRoot = path.join(paths.forgeHome, 'backups', backupName);
-  const projectRoot = path.resolve(options.projectRoot || repo);
+  const projectRoot = path.resolve(options.projectRoot || options.cwd || process.cwd());
   const coreFiles = [];
   for (const item of MANAGED_CORE) {
     const source = path.join(repo, item);
@@ -187,7 +188,10 @@ function install(input = {}) {
       }
       backupExisting([path.join(home, 'config.toml')], path.join(backupRoot, 'adapters', host), plan, options);
     }
-    backupExisting([path.join(projectRoot, 'CLAUDE.md'), path.join(projectRoot, 'AGENTS.md')], path.join(backupRoot, 'project'), plan, options);
+    const projectFiles = [];
+    if (selected.includes('claude')) projectFiles.push(path.join(projectRoot, 'CLAUDE.md'));
+    if (selected.includes('codex')) projectFiles.push(path.join(projectRoot, 'AGENTS.md'));
+    backupExisting(projectFiles, path.join(backupRoot, 'project'), plan, options);
   }
 
   // Shared core is copied exactly once into Forge home. Existing prefs are
@@ -235,10 +239,13 @@ function install(input = {}) {
       const relative = path.relative(base, destination);
       return relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
     };
-    const files = [...new Set(artifacts.filter((item) => inside(home, item.destination)).map((item) => path.relative(home, item.destination).replace(/\\/g, '/')))].sort();
-    const projectFiles = [...new Set(artifacts.filter((item) => inside(projectRoot, item.destination)).map((item) => path.relative(projectRoot, item.destination).replace(/\\/g, '/')))].sort();
-    adapterManifest[host] = { home, project_root: projectRoot, files, project_files: projectFiles };
-    writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files, project_files: projectFiles }, null, 2) + '\n', plan, options);
+    const conflicts = report ? report.conflicts || [] : [];
+    const conflictDestinations = new Set(conflicts.map((item) => path.resolve(item.destination)));
+    const managed = artifacts.filter((item) => !conflictDestinations.has(path.resolve(item.destination)));
+    const files = [...new Set(managed.filter((item) => inside(home, item.destination)).map((item) => path.relative(home, item.destination).replace(/\\/g, '/')))].sort();
+    const projectFiles = [...new Set(managed.filter((item) => inside(projectRoot, item.destination)).map((item) => path.relative(projectRoot, item.destination).replace(/\\/g, '/')))].sort();
+    adapterManifest[host] = { home, project_root: projectRoot, files, project_files: projectFiles, conflicts };
+    writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files, project_files: projectFiles, conflicts }, null, 2) + '\n', plan, options);
   }
   const installedHosts = Object.keys(adapterManifest).sort();
   const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };

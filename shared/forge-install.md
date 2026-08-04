@@ -9,16 +9,18 @@ invocado pelo core.
 
 ```text
 # macOS/Linux/Git Bash
-bash ./install.sh --runtime claude|codex|both [--update] [--dry-run]
+bash ./install.sh --runtime claude|codex|both [--project-root DIR] [--update] [--dry-run]
 
 # Windows PowerShell
-.\install.ps1 -Runtime claude|codex|both [-Update] [-DryRun]
+.\install.ps1 -Runtime claude|codex|both [-ProjectRoot DIR] [-Update] [-DryRun]
 ```
 
 `claude` é o default legado quando `--runtime`/`-Runtime` é omitido. Um valor
 desconhecido falha antes de qualquer escrita. `--no-model-probe` permanece
 aceito por compatibilidade, mas a instalação não faz chamadas de rede ou
 probes de login; `--with-app` é reservado para o app opcional.
+`--project-root`/`-ProjectRoot` define explicitamente onde `CLAUDE.md` e
+`AGENTS.md` serão projetados; sem ele, o diretório de trabalho atual é usado.
 
 ## Árvore e isolamento
 

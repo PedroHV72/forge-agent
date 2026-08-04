@@ -16,7 +16,8 @@ param(
   [switch]$WithApp,
   [string]$ForgeHome,
   [string]$ClaudeHome,
-  [string]$CodexHome
+  [string]$CodexHome,
+  [string]$ProjectRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,6 +34,7 @@ if ($ForgeHome) {
 }
 if ($ClaudeHome) { $nodeArgs += @('--claude-home', $ClaudeHome) }
 if ($CodexHome) { $nodeArgs += @('--codex-home', $CodexHome) }
+if ($ProjectRoot) { $nodeArgs += @('--project-root', $ProjectRoot) }
 
 & node (Join-Path $repo 'scripts/forge-installer.js') @nodeArgs
 exit $LASTEXITCODE

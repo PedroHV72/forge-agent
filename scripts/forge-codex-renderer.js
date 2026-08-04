@@ -52,22 +52,39 @@ function codexSources(manifest) {
     return !state || !['unavailable', 'planned'].includes(state.status);
   });
 }
+function tomlMultiline(value) {
+  return norm(value).replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
+}
 function render(options = {}) {
   const root = roots(options); const manifest = manifestFor(root, options); const sources = codexSources(manifest); const artifacts = [];
   const add = (sourceId, source, destination, content, kind) => artifacts.push({ source_id: sourceId, source, destination, content: norm(content), newline: 'lf', kind });
   const common = sources.filter((source) => ['agents', 'commands', 'skills', 'dispatch-templates'].includes(source.source_id));
   const agents = sources.find((source) => source.source_id === 'agents');
   const agentFiles = agents ? walk(path.join(root.repo, agents.inputs[0])).filter((file) => file.endsWith('.md')) : [];
-  const instructions = [ORIGIN, `# Forge Agent ${VERSION} — Codex host`, '', 'Estas instruções são geradas a partir das fontes canônicas do Forge.', '', '## Superfícies comuns', ...common.map((source) => `- ${source.source_id}: ${source.capability}`), '', '## Agentes customizados', ...agentFiles.map((file) => `- ${path.basename(file, '.md')}: .codex/agents/${path.basename(file, '.md')}.toml`), ''].join('\n');
+  const instructions = [ORIGIN, `# Forge Agent ${VERSION} — Codex host`, '', 'Estas instruções são geradas a partir das fontes canônicas do Forge.', '', '## Superfícies comuns', ...common.map((source) => `- ${source.source_id}: ${source.capability}`), '', '## Agentes customizados', ...agentFiles.map((file) => `- ${path.basename(file, '.md')}: .codex/agents/${path.basename(file, '.md')}.toml`), '', '## Skills e comandos', '- Conteúdo canônico materializado em `$CODEX_HOME/skills`, `$CODEX_HOME/commands` e `$CODEX_HOME/templates/dispatch`.', ''].join('\n');
   add('codex-instructions', 'AGENTS.md', path.join(root.projectRoot, 'AGENTS.md'), instructions, 'instructions');
   for (const file of agentFiles) {
     const name = path.basename(file, '.md');
-    const config = [tomlOrigin(`agent-${name}`), `name = "${name}"`, `description = "Forge ${name.replace(/^forge-/, '')} worker"`, 'sandbox = "workspace-write"', 'role = "operator"', 'capability = "common"', 'instructions = """', 'Read AGENTS.md before acting.', 'Preserve .gsd auditability and report verification results.', '"""', ''].join('\n');
+    const source = fs.readFileSync(file, 'utf8');
+    const config = [tomlOrigin(`agent-${name}`), `name = "${name}"`, `description = "Forge ${name.replace(/^forge-/, '')} worker"`, 'sandbox_mode = "workspace-write"', 'developer_instructions = """', tomlMultiline(source), '"""', ''].join('\n');
     add('agents', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'agents', `${name}.toml`), config, 'agent');
+  }
+  const commandSource = sources.find((source) => source.source_id === 'commands');
+  if (commandSource) for (const file of walk(path.join(root.repo, commandSource.inputs[0])).filter((item) => item.endsWith('.md'))) {
+    add('commands', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'commands', path.basename(file)), `${ORIGIN}\n\n${norm(fs.readFileSync(file, 'utf8'))}`, 'command');
+  }
+  const skillsSource = sources.find((source) => source.source_id === 'skills');
+  if (skillsSource) for (const file of walk(path.join(root.repo, skillsSource.inputs[0])).filter((item) => /SKILL\.md$/i.test(item))) {
+    const relative = path.relative(path.join(root.repo, skillsSource.inputs[0]), file);
+    add('skills', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'skills', relative), `${ORIGIN}\n\n${norm(fs.readFileSync(file, 'utf8'))}`, 'skill');
+  }
+  const dispatchSource = sources.find((source) => source.source_id === 'dispatch-templates');
+  if (dispatchSource) for (const file of walk(path.join(root.repo, dispatchSource.inputs[0])).filter((item) => item.endsWith('.md'))) {
+    add('dispatch-templates', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'templates', 'dispatch', path.basename(file)), `${ORIGIN}\n\n${norm(fs.readFileSync(file, 'utf8'))}`, 'dispatch');
   }
   const config = `${tomlOrigin('config')}\n[forge]\nversion = "${VERSION}"\nhost_runtime = "codex"\nsource_manifest = "forge-source-manifest.json"\n`;
   add('codex-config', 'config.toml', path.join(root.codexHome, 'config.toml'), config, 'config');
-  const capabilities = { version: VERSION, runtime: RUNTIME, generated: true, surfaces: codexSources(manifest).map((source) => ({ source_id: source.source_id, status: source.conditional && source.conditional.codex ? source.conditional.codex.status : 'common' })) };
+  const capabilities = { version: VERSION, runtime: RUNTIME, generated: true, surfaces: manifest.sources.map((source) => ({ source_id: source.source_id, status: source.conditional && source.conditional.codex ? source.conditional.codex.status : 'common' })) };
   add('codex-capabilities', 'forge-codex-capabilities.json', path.join(root.forgeHome, 'adapters', 'codex', 'capabilities.json'), `${JSON.stringify(capabilities, null, 2)}\n`, 'capabilities');
   artifacts.sort((a, b) => a.destination.localeCompare(b.destination));
   return { runtime: RUNTIME, version: VERSION, repo: root.repo, forge_home: root.forgeHome, codex_home: root.codexHome, project_root: root.projectRoot, artifacts };

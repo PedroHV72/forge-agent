@@ -42,6 +42,7 @@ test('both wrappers delegate runtime/update/dry-run to the shared Node core', ()
   assert.match(powershell, /ValidateSet\('claude', 'codex', 'both'\)/);
   assert.match(powershell, /-DryRun/);
   assert.match(powershell, /forge-installer\.js/);
+  assert.match(powershell, /ProjectRoot/);
 });
 
 test('core dry-run is deterministic and reports only selected adapter', () => {
