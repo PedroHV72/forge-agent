@@ -195,28 +195,63 @@ function listEntries(cwd) {
 }
 
 // latestUndoable(cwd) → { ok, entry|null }
-// Walks entries newest-first; the first apply-done record whose containers
-// ALL (a) resolve safely inside a known store, and (b) still exist on disk,
-// wins. Records with an unsafe/escaping path are treated the same as
-// records with a missing container — skipped, never trusted.
+//
+// Walks the journal newest-first, grouping records by id. For each id (most
+// recent occurrence first, each id considered once):
+//   - an id with a matching `undo-done` record is fully processed — skipped.
+//   - the best available source record is preferred: `apply-done` (has the
+//     advisory sha256) over a bare `apply-intent` (R2 fallback — covers the
+//     case where `appendOutcome(apply-done)` itself failed to write, e.g.
+//     disk full right after a successful apply; the intent still proves what
+//     was accepted and, combined with the existence check below, what
+//     actually landed on disk).
+//   - containers are filtered individually: unsafe/escaping paths and
+//     containers that no longer exist (already restored by a prior partial
+//     `--undo`, or never written) are dropped rather than voiding the whole
+//     record (R1 — a record survives partial undo with only the remaining
+//     containers offered up for retry).
+//   - a record with zero surviving containers is skipped entirely (nothing
+//     left to retry); the walk continues to older ids.
 function latestUndoable(cwd) {
   const listed = listEntries(cwd);
   if (!listed.ok) return listed;
   const entries = listed.entries;
+
+  const undoneIds = new Set();
+  const byId = new Map();
+  for (const entry of entries) {
+    if (!entry || !entry.id) continue;
+    if (entry.phase === 'undo-done') { undoneIds.add(entry.id); continue; }
+    if (entry.phase !== 'apply-done' && entry.phase !== 'apply-intent') continue;
+    if (!byId.has(entry.id)) byId.set(entry.id, {});
+    const rec = byId.get(entry.id);
+    if (entry.phase === 'apply-done') rec.applyDone = entry;
+    else rec.applyIntent = entry;
+  }
+
+  const seenIds = new Set();
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
-    if (!entry || entry.phase !== 'apply-done') continue;
-    const containers = Array.isArray(entry.containers) ? entry.containers : [];
+    if (!entry || !entry.id) continue;
+    if (entry.phase !== 'apply-done' && entry.phase !== 'apply-intent') continue;
+    if (seenIds.has(entry.id)) continue;
+    seenIds.add(entry.id);
+    if (undoneIds.has(entry.id)) continue;
+
+    const rec = byId.get(entry.id) || {};
+    const source = rec.applyDone || rec.applyIntent;
+    if (!source) continue;
+    const containers = Array.isArray(source.containers) ? source.containers : [];
     if (containers.length === 0) continue;
-    let allSafeAndPresent = true;
+
+    const surviving = [];
     for (const container of containers) {
       const resolved = safeContainerPath(cwd, container);
-      if (!resolved || !fs.existsSync(resolved)) {
-        allSafeAndPresent = false;
-        break;
-      }
+      if (resolved && fs.existsSync(resolved)) surviving.push(container);
     }
-    if (allSafeAndPresent) return { ok: true, entry };
+    if (surviving.length === 0) continue;
+
+    return { ok: true, entry: Object.assign({}, source, { containers: surviving }) };
   }
   return { ok: true, entry: null };
 }

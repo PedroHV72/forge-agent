@@ -503,6 +503,65 @@ test('regressão: sem VCS, --force ainda é exigido e aplica normalmente (journa
   } finally { cleanup(cwd); }
 });
 
+async function testOutcomeAppendFailureKeepsJournalRecordedTruthful() {
+  // R2 regression: appendOutcome(apply-done) failing must not leave
+  // journal.recorded === true off a bare intent id (forge-sweep-project.js
+  // ~line 481-492). Mocks the journal seam directly (in-process, same
+  // pattern as testVcsQueryFailureExitsOne) since spawnSync fixtures can't
+  // inject a mid-run write failure timed after the intent but before the
+  // outcome append.
+  if (!gitAvailable()) {
+    skipped += 1;
+    process.stdout.write('  - falha ao gravar outcome (apply-done) mantém journal.recorded truthful (git indisponível no PATH)\n');
+    return;
+  }
+  const journalSeam = require('./forge-sweep-journal');
+  const { main } = require('./forge-sweep-project');
+  const cwd = fixtureIgnoredGsd();
+  const realAppendOutcome = journalSeam.appendOutcome;
+  const stdoutWrite = process.stdout.write;
+  let capturedOut = '';
+  try {
+    journalSeam.appendOutcome = (targetCwd, opts) => {
+      if (opts && opts.phase === 'apply-done') {
+        return { ok: false, error: 'disco cheio (simulado)' };
+      }
+      return realAppendOutcome(targetCwd, opts);
+    };
+    process.stdout.write = chunk => { capturedOut += chunk; return true; };
+    const code = await main(['--cwd', cwd, '--json', '--apply', '--yes']);
+    process.stdout.write = stdoutWrite;
+    assert.strictEqual(code, 0, 'apply-done outcome failure is advisory-only and must not affect exit code');
+    const payload = JSON.parse(capturedOut);
+    assert.strictEqual(payload.applied, true, 'the mutation itself still succeeded');
+    assert.strictEqual(typeof payload.journal.id, 'string', 'an intent id was still minted');
+    assert.strictEqual(
+      payload.journal.recorded, false,
+      'journal.recorded must go false when the apply-done outcome append fails — the id alone is not proof undo is discoverable'
+    );
+
+    // Confirm undo is STILL discoverable through the surviving intent —
+    // this is the R2 fix in forge-sweep-journal.js's latestUndoable, not a
+    // second bug. The truthful envelope above and a working --undo below
+    // are two halves of the same fix and must both hold.
+    const listed = journalSeam.listEntries(cwd);
+    assert.strictEqual(listed.ok, true);
+    const phases = listed.entries.map(e => e.phase);
+    assert.deepStrictEqual(phases, ['apply-intent'], 'only the intent should have landed — outcome append was made to fail');
+    const undoable = journalSeam.latestUndoable(cwd);
+    assert.strictEqual(undoable.ok, true);
+    assert(undoable.entry !== null, 'the intent-only record must still resolve as undoable (R2 fallback)');
+    assert.strictEqual(undoable.entry.id, payload.journal.id);
+
+    passed += 1;
+    process.stdout.write('  ✓ falha ao gravar outcome (apply-done) mantém journal.recorded truthful e undo ainda descobrível via intent\n');
+  } finally {
+    process.stdout.write = stdoutWrite;
+    journalSeam.appendOutcome = realAppendOutcome;
+    cleanup(cwd);
+  }
+}
+
 async function testVcsQueryFailureExitsOne() {
   // Runs in-process because the failure must be injected into the same seam
   // the CLI consumes.  Asserting exit 1 here is what a rename of the refusal
@@ -532,9 +591,11 @@ async function testVcsQueryFailureExitsOne() {
   }
 }
 
-testVcsQueryFailureExitsOne().then(() => {
-  process.stdout.write(`forge-sweep-project: ${passed} passed, ${skipped} skipped\n`);
-}).catch(error => {
-  process.stderr.write(`${error && error.stack ? error.stack : error}\n`);
-  process.exitCode = 1;
-});
+testOutcomeAppendFailureKeepsJournalRecordedTruthful()
+  .then(() => testVcsQueryFailureExitsOne())
+  .then(() => {
+    process.stdout.write(`forge-sweep-project: ${passed} passed, ${skipped} skipped\n`);
+  }).catch(error => {
+    process.stderr.write(`${error && error.stack ? error.stack : error}\n`);
+    process.exitCode = 1;
+  });

@@ -143,6 +143,77 @@ test('(d) latestUndoable falls back to older entry when newest container is gone
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
+test('(R1) latestUndoable returns the surviving subset after a partial undo, not null', () => {
+  const ROOT = freshFixture();
+  const cA = makeLedgerContainer(ROOT, 'MPARTIAL-A');
+  const cB = makeLedgerContainer(ROOT, 'MPARTIAL-B');
+  const intent = appendIntent(ROOT, { operation: 'group', containers: [cA, cB] });
+  appendOutcome(ROOT, { id: intent.id, phase: 'apply-done', written: [cA, cB] });
+
+  // Simulate a partial --undo: container A ungrouped successfully (its
+  // container is unlinked once every unit restores), container B conflicted
+  // and survives untouched. Because errors.length !== 0 in that run, no
+  // undo-done was ever appended (mirrors forge-sweep-project.js:340-345).
+  fs.rmSync(path.join(ROOT, cA));
+
+  const result = latestUndoable(ROOT);
+  assert(result.ok === true, 'latestUndoable should succeed');
+  assert(result.entry !== null, 'a record with one surviving container must still be undoable, not skipped');
+  assert(result.entry.id === intent.id, 'the same record should be offered for retry');
+  assert(
+    Array.isArray(result.entry.containers) && result.entry.containers.length === 1 && result.entry.containers[0] === cB,
+    `containers should be narrowed to the surviving subset only, got ${JSON.stringify(result.entry && result.entry.containers)}`
+  );
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
+
+test('(R1) latestUndoable never resurrects a fully undone record (matching undo-done excludes it)', () => {
+  const ROOT = freshFixture();
+  const cA = makeLedgerContainer(ROOT, 'MDONE-A');
+  const intent = appendIntent(ROOT, { operation: 'group', containers: [cA] });
+  appendOutcome(ROOT, { id: intent.id, phase: 'apply-done', written: [cA] });
+  // Full undo: container restored (unlinked) and undo-done recorded.
+  fs.rmSync(path.join(ROOT, cA));
+  appendOutcome(ROOT, { id: intent.id, phase: 'undo-done', written: [] });
+
+  const result = latestUndoable(ROOT);
+  assert(result.ok === true, 'latestUndoable should succeed');
+  assert(result.entry === null, 'a record with a matching undo-done must never be offered again');
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
+
+test('(R2) latestUndoable falls back to a bare apply-intent when the apply-done outcome append never landed', () => {
+  const ROOT = freshFixture();
+  const cA = makeLedgerContainer(ROOT, 'MINTENTONLY-A');
+  // Only the intent is written — simulates appendOutcome(apply-done) failing
+  // right after the mutation succeeded (forge-sweep-project.js:487-489: warn
+  // only, journal line never lands). The container is real and present.
+  const intent = appendIntent(ROOT, { operation: 'group', containers: [cA] });
+
+  const result = latestUndoable(ROOT);
+  assert(result.ok === true, 'latestUndoable should succeed');
+  assert(result.entry !== null, 'a validated apply-intent with no matching outcome must still be undoable');
+  assert(result.entry.id === intent.id, 'should resolve to the intent record');
+  assert(
+    Array.isArray(result.entry.containers) && result.entry.containers.length === 1 && result.entry.containers[0] === cA,
+    'intent-fallback entry should carry the intent containers'
+  );
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
+
+test('(R2) latestUndoable prefers apply-done (with sha256) over the sibling apply-intent when both exist', () => {
+  const ROOT = freshFixture();
+  const cA = makeLedgerContainer(ROOT, 'MPREFER-A');
+  const intent = appendIntent(ROOT, { operation: 'group', containers: [cA] });
+  appendOutcome(ROOT, { id: intent.id, phase: 'apply-done', written: [cA], sha256: { [cA]: 'deadbeef' } });
+
+  const result = latestUndoable(ROOT);
+  assert(result.ok === true, 'latestUndoable should succeed');
+  assert(result.entry && result.entry.id === intent.id, 'should resolve to the shared id');
+  assert(result.entry.sha256 && result.entry.sha256[cA] === 'deadbeef', 'refined apply-done record (with sha256) should win over the bare intent');
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
+
 test('journal empty/absent → latestUndoable returns entry:null, ok:true', () => {
   const ROOT = freshFixture();
   const result = latestUndoable(ROOT);

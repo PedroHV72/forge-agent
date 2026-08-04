@@ -470,6 +470,12 @@ async function main(argv) {
       },
     });
 
+    // R2 fix: `recorded` must reflect whether undo is actually discoverable,
+    // not merely whether a journal id was minted. An apply-intent id is
+    // truthy on its own (it is the fallback `latestUndoable` now resolves
+    // through — see forge-sweep-journal.js), so start optimistic and only
+    // flip to false when the apply-done outcome append itself fails.
+    let journalOutcomeFailed = false;
     if (result.applied && journalId) {
       const written = [];
       for (const entry of result.results || []) {
@@ -477,7 +483,11 @@ async function main(argv) {
       }
       // Advisory outcome: the containers are already durable at this point —
       // the container is the source of truth for undo, not this record — so
-      // a failure here only warns, it never affects the exit code (Design).
+      // a failure here never affects the exit code (Design). It DOES,
+      // however, need to be reflected in journalInfo.recorded below — the
+      // intent record survives and `latestUndoable` still resolves through
+      // it, but the caller-facing envelope must not overstate what actually
+      // landed durably in this run.
       const outcomeResult = journal.appendOutcome(cwd, {
         id: journalId,
         phase: 'apply-done',
@@ -485,11 +495,12 @@ async function main(argv) {
         sha256: sha256OfContainers(cwd, written),
       });
       if (!outcomeResult.ok) {
+        journalOutcomeFailed = true;
         process.stderr.write(`aviso: falha ao registrar outcome no journal: ${outcomeResult.error}\n`);
       }
     }
 
-    const journalInfo = { id: journalId, recorded: Boolean(journalId) };
+    const journalInfo = { id: journalId, recorded: Boolean(journalId) && !journalOutcomeFailed };
     const applyLines = countReport(result);
     if (options.json) {
       const payload = reportPayload(result, eligibility, messages.concat(applyLines), journalInfo);
