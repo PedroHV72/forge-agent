@@ -5,7 +5,10 @@ const path = require('path');
 
 const { timestampOf } = require('./forge-ids.js');
 
-// YYYY-QN is deliberately strict and lexicographically sortable.
+// LEGACY, READ-ONLY: recognizes YYYY-QN quarter containers written by PR 1.
+// No code in this file generates this label anymore — the calendar axis is
+// gone. The sole consumer is forge-grouped-file.js, which composes this RE
+// with its own scan RE to keep recognizing pre-existing legacy containers.
 const EPOCH_LABEL_RE = /^\d{4}-Q[1-4]$/;
 
 function dateFrom14(value) {
@@ -36,41 +39,19 @@ function asDate(dateish) {
   return null;
 }
 
-function epochOf(dateish) {
-  const date = asDate(dateish);
-  if (!date) return null;
-  const quarter = Math.floor(date.getUTCMonth() / 3) + 1;
-  return `${String(date.getUTCFullYear()).padStart(4, '0')}-Q${quarter}`;
-}
-
-function compareEpochs(a, b) {
-  if (a === b) return 0;
-  if (!EPOCH_LABEL_RE.test(a) || !EPOCH_LABEL_RE.test(b)) return 0;
-  return a < b ? -1 : 1;
-}
-
-function sealedEpochs(labels) {
-  const valid = [...new Set(labels || [])].filter(label => EPOCH_LABEL_RE.test(label));
-  if (valid.length === 0) return { current: null, sealed: [] };
-  const current = valid.reduce((greatest, label) =>
-    compareEpochs(label, greatest) > 0 ? label : greatest);
-  const sealed = valid.filter(label => compareEpochs(label, current) < 0).sort();
-  return { current, sealed };
-}
-
-function epochOfUnit(unit) {
+function dateOfUnit(unit) {
   const value = unit || {};
-  const fromId = epochOf(timestampOf(value.id));
-  if (fromId) return { epoch: fromId, source: 'id' };
-  const fromHint = epochOf(value.dateHint);
-  if (fromHint) return { epoch: fromHint, source: 'hint' };
+  const fromId = asDate(timestampOf(value.id));
+  if (fromId) return { date: fromId, source: 'id' };
+  const fromHint = asDate(value.dateHint);
+  if (fromHint) return { date: fromHint, source: 'hint' };
   if (value.path) {
     try {
-      const fromMtime = epochOf(fs.statSync(value.path).mtime);
-      if (fromMtime) return { epoch: fromMtime, source: 'mtime' };
+      const fromMtime = asDate(fs.statSync(value.path).mtime);
+      if (fromMtime) return { date: fromMtime, source: 'mtime' };
     } catch { /* unavailable path is an unresolved link in the chain */ }
   }
-  return { epoch: null, source: null };
+  return { date: null, source: null };
 }
 
 function readEntries(dirPath) {
@@ -100,10 +81,7 @@ function listWrapperDirs(parentDir) {
 
 module.exports = {
   EPOCH_LABEL_RE,
-  epochOf,
-  compareEpochs,
-  sealedEpochs,
-  epochOfUnit,
+  dateOfUnit,
   isWrapperDir,
   listWrapperDirs,
 };
