@@ -1,0 +1,16 @@
+{
+  // Forge owns only this hook entry. Operator settings remain user-owned.
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/scripts/forge-hook.js\""
+          }
+        ]
+      }
+    ]
+  }
+}
