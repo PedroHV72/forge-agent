@@ -250,6 +250,142 @@ if (gitAvailable()) {
   skip('casos com repositório Git real');
 }
 
+// ── T04: journal wiring on the apply path (S08 B2 / DS8-3) ─────────────────
+
+function journalFile(cwd) {
+  return path.join(cwd, '.gsd', 'forge', 'sweep-journal.jsonl');
+}
+
+function readJournalEntries(cwd) {
+  const raw = fs.readFileSync(journalFile(cwd), 'utf8');
+  return raw.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+}
+
+// R3 fixture: `.gsd/` is committed to the repo as ignored (via .gitignore),
+// so the ledger fragments read as `ignorado pelo VCS` — the exact class T03
+// promotes to `basis: 'tool-undo'`. The wrapper pair still needs a sealed
+// (older) and a current (newer) epoch, same rule as `fixture()`.
+function fixtureIgnoredGsd() {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-project-r3-'));
+  git(cwd, ['init', '-q']);
+  git(cwd, ['config', 'user.name', 'Forge Test']);
+  git(cwd, ['config', 'user.email', 'forge@example.invalid']);
+  fs.writeFileSync(path.join(cwd, '.gitignore'), '.gsd/\n');
+  fs.writeFileSync(path.join(cwd, 'README.md'), 'fixture\n');
+  git(cwd, ['add', '.gitignore', 'README.md']);
+  git(cwd, ['commit', '-qm', 'fixture inicial']);
+  writeLedger(cwd, 'M-20250101000000-alpha', '2025-01-01T00:00:00Z');
+  writeLedger(cwd, 'M-20250401000000-beta', '2025-04-01T00:00:00Z');
+  return cwd;
+}
+
+// Same fragments, but `.gsd/` is committed and clean — the target classifies
+// as tracked-clean, not ignored, so the accepted basis is 'vcs' rather than
+// 'tool-undo' (DS8-3's "warn, don't refuse" branch).
+function fixtureTrackedGsd() {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-project-vcs-'));
+  git(cwd, ['init', '-q']);
+  git(cwd, ['config', 'user.name', 'Forge Test']);
+  git(cwd, ['config', 'user.email', 'forge@example.invalid']);
+  writeLedger(cwd, 'M-20250101000000-alpha', '2025-01-01T00:00:00Z');
+  writeLedger(cwd, 'M-20250401000000-beta', '2025-04-01T00:00:00Z');
+  git(cwd, ['add', '.']);
+  git(cwd, ['commit', '-qm', 'fixture inicial']);
+  return cwd;
+}
+
+// The T02 lever: `.gsd/forge` pre-created as a plain FILE makes every probe/
+// append against the journal fail with the exact same error, for the whole
+// life of the process — see forge-sweep-journal.test.js scenario (b).
+function blockJournal(cwd) {
+  fs.mkdirSync(path.join(cwd, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.gsd', 'forge'), 'não é um diretório');
+}
+
+if (gitAvailable()) {
+  test('R3: dry-run nomeia o basis tool-undo e --apply --yes sem --force escreve o container', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      const dry = runScript(cwd, []);
+      assert.strictEqual(dry.status, 0, dry.stderr);
+      assert.match(dry.stdout, /elegível por undo de ferramenta/);
+
+      const apply = runScript(cwd, ['--apply', '--yes']);
+      assert.strictEqual(apply.status, 0, apply.stderr);
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'M-20250101000000-alpha.md')));
+
+      const entries = readJournalEntries(cwd);
+      const phases = entries.map(entry => entry.phase);
+      assert.deepStrictEqual(phases, ['apply-intent', 'apply-done']);
+      for (const entry of entries) {
+        assert.deepStrictEqual(entry.containers, ['.gsd/ledger/2025-Q1.md']);
+      }
+      assert(entries[1].sha256 && typeof entries[1].sha256['.gsd/ledger/2025-Q1.md'] === 'string');
+      assert.strictEqual(entries[1].sha256['.gsd/ledger/2025-Q1.md'].length, 64);
+    } finally { cleanup(cwd); }
+  });
+
+  test('B2: journal bloqueado com alvo tool-undo recusa a aplicação inteira sem mutar o store', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      blockJournal(cwd);
+      const before = treeSnapshot(path.join(cwd, '.gsd', 'ledger'));
+      const apply = runScript(cwd, ['--apply', '--yes']);
+      assert.strictEqual(apply.status, 1);
+      assert.match(apply.stdout + apply.stderr, /registro de undo indisponível/);
+      const after = treeSnapshot(path.join(cwd, '.gsd', 'ledger'));
+      assert.deepStrictEqual(after, before, 'zero mutação: a árvore do store precisa ficar byte-idêntica');
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+    } finally { cleanup(cwd); }
+  });
+
+  test('DS8-3: .gsd/ commitado e limpo (basis vcs) com journal bloqueado prossegue com warn', () => {
+    const cwd = fixtureTrackedGsd();
+    try {
+      blockJournal(cwd);
+      const apply = runScript(cwd, ['--apply', '--yes']);
+      assert.strictEqual(apply.status, 0, apply.stderr);
+      assert.match(apply.stderr, /registro de undo indisponível/);
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+    } finally { cleanup(cwd); }
+  });
+
+  test('--json --apply --yes no fixture R3 emite um único documento JSON com journal.recorded true', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      const apply = runScript(cwd, ['--json', '--apply', '--yes']);
+      assert.strictEqual(apply.status, 0, apply.stderr);
+      const payload = JSON.parse(apply.stdout);
+      assert.strictEqual(payload.applied, true);
+      assert.strictEqual(payload.journal.recorded, true);
+      assert.strictEqual(typeof payload.journal.id, 'string');
+    } finally { cleanup(cwd); }
+  });
+} else {
+  skip('casos de journal com repositório Git real (B2/DS8-3/R3)');
+}
+
+test('regressão: sem VCS a recusa não toca o journal (herdada 7 travada)', () => {
+  const cwd = fixture(false);
+  try {
+    const result = runScript(cwd, ['--apply', '--yes']);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /sem VCS — não há como desfazer/);
+    assert(!fs.existsSync(journalFile(cwd)), 'nenhum journal deveria existir quando 0 alvos são aceitos');
+  } finally { cleanup(cwd); }
+});
+
+test('regressão: sem VCS, --force ainda é exigido e aplica normalmente (journal aditivo, não observado no contrato)', () => {
+  const cwd = fixture(false);
+  try {
+    const result = runScript(cwd, ['--apply', '--yes', '--force']);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /prosseguiu forçado/);
+    assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+  } finally { cleanup(cwd); }
+});
+
 async function testVcsQueryFailureExitsOne() {
   // Runs in-process because the failure must be injected into the same seam
   // the CLI consumes.  Asserting exit 1 here is what a rename of the refusal
