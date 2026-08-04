@@ -113,8 +113,22 @@ function skip(skipped, itemPath, reason) {
 
 function plan(cwd, opts = {}) {
   const dryRun = opts.dryRun === undefined ? true : Boolean(opts.dryRun);
+  const includeWrapperDirs = opts.includeWrapperDirs === true;
   const targets = [];
   const skipped = [];
+
+  // The default plan is intentionally limited to the three fragment stores.
+  // This preserves the existing planner contract for callers that do not know
+  // about wrapper containers yet, while keeping explicit wrapper plans valid.
+  // The strict option check above is part of that boundary: serialized values
+  // such as "false" and numeric truthy values must remain opt-out values.
+  // Keeping this decision at enumeration time also keeps `skipped` quiet for
+  // wrappers the caller did not request. `apply()` still accepts an explicit
+  // wrapper target because descriptor() resolves both target lists below.
+  // `ungroup()` likewise remains able to discover wrapper containers through
+  // ALL_TARGETS, preserving the reversible path for deliberate callers.
+  // No target shape or return field changes are needed for this gate.
+  // Callers can therefore opt in without adapting apply/ungroup payloads.
 
   for (const store of STORE_TARGETS) {
     const dir = store.dir(cwd);
@@ -179,7 +193,9 @@ function plan(cwd, opts = {}) {
     }
   }
 
-  for (const store of WRAPPER_TARGETS) {
+  // Wrapper targets delete directories whose readers still expect loose entries.
+  // D11 keeps that destructive format transition behind an explicit opt-in.
+  if (includeWrapperDirs) for (const store of WRAPPER_TARGETS) {
     const parent = store.parent(cwd);
     // Use the shared enumerator for eligible wrappers; inspect all dirs below
     // to report why rejected wrappers were skipped rather than hiding them.

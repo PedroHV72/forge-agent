@@ -225,6 +225,39 @@ test('the plan defaults to dry-run metadata and never writes implicitly', () => 
   } finally { remove(cwd); }
 });
 
+test('the default plan gates wrapper directories until explicitly enabled', () => {
+  // This assertion is intentionally about the returned targets, not about
+  // the implementation flag. It fails if wrappers leak back into default
+  // enumeration even when the option name or its implementation changes.
+  const cwd = tmp();
+  try {
+    seedAllStores(cwd);
+    write(cwd, '.gsd/milestones/M-20260101000000-old/PLAN.md', 'old milestone');
+    write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'current milestone');
+    write(cwd, '.gsd/tasks/T-20260101000000-old/PLAN.md', 'old task');
+    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'current task');
+
+    const planned = group.plan(cwd);
+    assert(planned.targets.some(target => target.store === 'ledger'));
+    assert(planned.targets.some(target => target.store === 'decisions'));
+    assert(planned.targets.some(target => target.store === 'memory'));
+    assert(planned.targets.every(target =>
+      target.store !== 'milestone-wrappers' && target.store !== 'task-wrappers'));
+    assert(planned.targets.length > 0, 'the default assertion must not pass by vacuity');
+    assert(planned.skipped.every(item =>
+      !/[\\/]\.gsd[\\/](milestones|tasks)[\\/]/.test(item.path)));
+
+    const explicitlyEnabled = group.plan(cwd, { includeWrapperDirs: true });
+    assert(explicitlyEnabled.targets.some(target => target.store === 'milestone-wrappers'));
+    assert(explicitlyEnabled.targets.some(target => target.store === 'task-wrappers'));
+    assert.equal(explicitlyEnabled.targets.filter(target =>
+      target.store.endsWith('-wrappers')).length, 2);
+    const stringFalse = group.plan(cwd, { includeWrapperDirs: 'false' });
+    assert(stringFalse.targets.every(target =>
+      target.store !== 'milestone-wrappers' && target.store !== 'task-wrappers'));
+  } finally { remove(cwd); }
+});
+
 // Wrapper-directory contract: only the structural predicate from forge-epoch
 // makes a directory eligible.  The fixture deliberately mixes valid, active,
 // multi-file, and nested wrappers so enumeration also proves its diagnostics.
@@ -258,7 +291,7 @@ test('wrapper dirs plan only eligible sealed milestone/task directories', () => 
     fs.mkdirSync(path.join(cwd, '.gsd/milestones/M-20260105000000-nested', 'slices'));
     write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'current');
     write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'current');
-    const planned = group.plan(cwd);
+    const planned = group.plan(cwd, { includeWrapperDirs: true });
     // One container per store, and the three eligible sealed wrappers land in
     // them: two milestones in 2026-Q1, one task in 2026-Q1.
     assert.equal(planned.targets.length, 2);
@@ -280,7 +313,7 @@ test('wrapper apply is in-place, removes dirs, and never creates archive', () =>
   try {
     const original = write(cwd, '.gsd/milestones/M-20260101000000-one/STATE.md', Buffer.from('bom\r\nconteúdo', 'utf8'));
     write(cwd, '.gsd/milestones/M-20260401000000-current/STATE.md', 'live');
-    const planned = group.plan(cwd);
+    const planned = group.plan(cwd, { includeWrapperDirs: true });
     const result = group.apply(cwd, planned);
     assert.equal(result.written.length, 1);
     assert(!fs.existsSync(path.dirname(original)));
@@ -305,7 +338,7 @@ test('wrapper ungroup restores original filename and bytes exactly', () => {
     // The tasks store needs its own current-epoch occupant for 2026-Q1 to be
     // sealed there — sealedness is per store. See the eligibility test above.
     write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
-    const plan = group.plan(cwd);
+    const plan = group.plan(cwd, { includeWrapperDirs: true });
     const applied = group.apply(cwd, plan);
     assert.equal(applied.written.length, 1, 'the sealed task wrapper produced a container');
     assert(!fs.existsSync(source), 'the wrapper file is gone once grouped');
@@ -329,14 +362,14 @@ test('wrapper apply is idempotent after the first plan is consumed', () => {
   try {
     write(cwd, '.gsd/milestones/M-20260101000000-one/PLAN.md', 'one');
     write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'live');
-    const firstPlan = group.plan(cwd);
+    const firstPlan = group.plan(cwd, { includeWrapperDirs: true });
     const first = group.apply(cwd, firstPlan);
     // Captured BEFORE the second apply — comparing a post-apply read against
     // itself was 0 unconditionally and proved nothing about stability.
     const afterFirst = fs.readFileSync(first.written[0]);
-    const second = group.apply(cwd, group.plan(cwd));
+    const second = group.apply(cwd, group.plan(cwd, { includeWrapperDirs: true }));
     assert.equal(second.written.length, 0);
-    assert.equal(group.plan(cwd).targets.length, 0);
+    assert.equal(group.plan(cwd, { includeWrapperDirs: true }).targets.length, 0);
     assert.equal(Buffer.compare(afterFirst, fs.readFileSync(first.written[0])), 0,
       'the container bytes are untouched by a second apply');
   } finally { remove(cwd); }
@@ -350,7 +383,7 @@ test('never groups a wrapper whose directory name contains the reserved separato
   try {
     const source = write(cwd, '.gsd/tasks/T-20260101000000-one~sub/PLAN.md', 'payload');
     write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
-    const planned = group.plan(cwd);
+    const planned = group.plan(cwd, { includeWrapperDirs: true });
     assert.equal(planned.targets.length, 0, 'the ~ wrapper is not a grouping target');
     assert(planned.skipped.some(item => /separador reservado/.test(item.reason)),
       `expected a reserved-separator reason, got ${JSON.stringify(planned.skipped)}`);
@@ -367,7 +400,7 @@ test('skips only the non-.md wrapper and still groups its epoch siblings', () =>
     const stray = write(cwd, '.gsd/tasks/T-20260102000000-two/notes.txt', 'not markdown');
     const groupable = write(cwd, '.gsd/tasks/T-20260101000000-one/PLAN.md', 'payload');
     write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
-    const planned = group.plan(cwd);
+    const planned = group.plan(cwd, { includeWrapperDirs: true });
     assert.equal(planned.targets.length, 1, 'the epoch survives one ineligible wrapper');
     assert.equal(planned.targets[0].members.length, 1);
     assert(planned.skipped.some(item => /não é \.md/.test(item.reason)),
