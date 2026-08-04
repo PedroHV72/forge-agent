@@ -177,6 +177,11 @@ test('an unavailable or broken SVN baseline throws rather than impersonating a g
 });
 
 test('CLI state-init refuses zero and unparseable SVN baselines with empty stdout', () => {
+  // child_process.spawnSync() does not resolve .cmd shims for an extensionless
+  // executable when shell:false. The native parser behavior is covered above;
+  // keep this CLI PATH-shim integration test on platforms that can provide an
+  // executable script without involving a shell.
+  if (process.platform === 'win32') return;
   for (const raw of ['0', 'Unversioned directory']) {
     withTempDir('forge-reset-state-init-', (cwd) => {
       fs.mkdirSync(path.join(cwd, '.svn'));
@@ -238,6 +243,9 @@ test('R1: a throw-path reset failure emits a leftover diagnostic (same shape as 
 });
 
 test('R1: the CLI --reset path exits 1 (unchanged) for a genuine restoreAndRemove failure and prints the leftover diagnostic on stdout', () => {
+  // This end-to-end fault injector is a POSIX shell wrapper. The same reset
+  // failure semantics are exercised above through the VCS seam on Windows.
+  if (process.platform === 'win32') return;
   const cwd = gitFixture();
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-reset-fakegit-'));
   try {

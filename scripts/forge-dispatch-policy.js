@@ -73,7 +73,8 @@ function base(input, normalized, decision, reason) {
     required_capabilities: normalized.required_capabilities || [],
     sandbox_mode: decision === 'allow' ? normalized.sandbox_mode : 'read-only',
     permissions: {
-      workspace_write: decision === 'allow' && ['write', 'apply', 'spawn'].includes(normalized.operation),
+      workspace_write: decision === 'allow' && (['write', 'apply'].includes(normalized.operation)
+        || (normalized.operation === 'spawn' && normalized.sandbox_mode === 'workspace-write')),
       apply: decision === 'allow' && normalized.operation === 'apply',
       spawn: decision === 'allow' && normalized.operation === 'spawn',
       execution_lease: decision === 'allow' && Boolean(policy && policy.execution_lease),
@@ -112,7 +113,7 @@ function decide(input = {}) {
   const minimumSandbox = normalized.operation === 'read' ? 'read-only' : 'workspace-write';
   normalized.sandbox_mode = input.sandbox_mode || minimumSandbox;
   if (!['read-only', 'workspace-write'].includes(normalized.sandbox_mode) || (policy.max_sandbox === 'read-only' && normalized.sandbox_mode !== 'read-only')) return deny(input, normalized, 'sandbox-escalation-denied');
-  if (normalized.operation !== 'read' && normalized.sandbox_mode !== 'workspace-write') return deny(input, normalized, 'role-permission-denied');
+  if (['write', 'apply'].includes(normalized.operation) && normalized.sandbox_mode !== 'workspace-write') return deny(input, normalized, 'role-permission-denied');
   if (normalized.operation === 'spawn') {
     if (!input.workspace_root || !input.spawn_cwd) return deny(input, normalized, 'target-required');
     if (!inside(input.workspace_root, input.spawn_cwd)) return deny(input, normalized, 'target-outside-workspace');

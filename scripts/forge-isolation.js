@@ -599,6 +599,25 @@ function parseArgs(argv) {
   return args;
 }
 
+function canonicalDirectory(value) {
+  if (typeof value !== 'string' || !value) return null;
+  try { return fs.realpathSync.native(path.resolve(value)); } catch { return null; }
+}
+
+/** Pure/read-only dispatch boundary for a declared single-repo CODE_DIR. */
+function validateCodeDirBoundary(input = {}) {
+  const workspace = canonicalDirectory(input.workspaceRoot);
+  const codeDir = canonicalDirectory(input.codeDir);
+  const declared = canonicalDirectory(input.declaredCodeDir);
+  const reposList = Array.isArray(input.repoRoots) ? input.repoRoots.map(canonicalDirectory).filter(Boolean) : [];
+  if (!workspace || !codeDir || !declared) return { ok: false, reason_code: 'code-dir-undeclared' };
+  if (reposList.length !== 1) return { ok: false, reason_code: 'multirepo-refused' };
+  const relative = path.relative(workspace, codeDir);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return { ok: false, reason_code: 'code-dir-outside-workspace' };
+  if (codeDir !== declared || codeDir !== reposList[0]) return { ok: false, reason_code: 'code-dir-undeclared' };
+  return { ok: true, reason_code: 'code-dir-verified', code_dir: codeDir, workspace_root: workspace };
+}
+
 function cliMain() {
   const args = parseArgs(process.argv.slice(2));
   const cwd  = args.cwd || process.cwd();
@@ -654,4 +673,5 @@ module.exports = {
   resolveBranchName, gitDefaultBranch, gitCurrentBranch,
   gitHasOriginRemote, fetchDefaultBranch,
   resolvePackageManager, installWorktreeDeps, WORKTREE_INSTALL_TIMEOUT_MS,
+  validateCodeDirBoundary,
 };

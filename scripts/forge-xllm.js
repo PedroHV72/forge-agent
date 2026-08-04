@@ -76,8 +76,10 @@ const { spawnSync, spawn, execSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
 const {
   captureSnapshot,
+  captureAttemptSnapshot,
   parseSvnBaseline,
 } = require('./forge-surgical-reset.js');
+const dispatchPolicy = require('./forge-dispatch-policy.js');
 const vcs = require('./forge-vcs.js');
 const { classifyError, isTransient } = require('./forge-classify-error.js');
 const { countTokens, truncateAtSectionBoundary } = require('./forge-tokens.js');
@@ -740,6 +742,7 @@ function invokeCodex(opts) {
 
     const { cmd, prefixArgs } = resolveCodexCommand();
     const res = spawnSync(cmd, [...prefixArgs, ...args], {
+      shell: false,
       input: prompt,
       timeout: timeoutSecs * 1000,
       killSignal: 'SIGKILL',
@@ -871,6 +874,7 @@ function invokeCodexDetached(opts) {
       // POSIX → { cmd: 'codex', prefixArgs: [] } (byte-identical to a bare spawn).
       const { cmd, prefixArgs } = resolveCodexCommand();
       child = spawn(cmd, [...prefixArgs, ...args], {
+        shell: false,
         detached: true,
         // stdin = pipe (prompt transport), stdout ignored (result via -o file), stderr piped.
         stdio: ['pipe', 'ignore', 'pipe'],
@@ -917,23 +921,18 @@ function invokeCodexDetached(opts) {
     // grandchildren orphaned (codex#7852). Use `taskkill /T /F` to kill the tree.
     timeoutTimer = setTimeout(() => {
       timedOut = true;
-      if (process.platform === 'win32') {
-        try {
-          spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { shell: false });
-        } catch { /* best-effort */ }
-      } else {
-        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group gone */ }
-      }
-      try { child.kill('SIGKILL'); } catch { /* already dead */ }
+      terminateOwnedProcessTree(child);
     }, timeoutSecs * 1000);
 
     child.on('close', (code, signal) => {
       if (timedOut) {
-        settle(reject, new Error(`codex killed after exceeding timeout (${timeoutSecs}s)`));
+        const error = new Error(`codex killed after exceeding timeout (${timeoutSecs}s)`);
+        error.code = 'process-timeout'; settle(reject, error);
         return;
       }
       if (signal) {
-        settle(reject, new Error(`codex terminated by signal ${signal}`));
+        const error = new Error(`codex terminated by signal ${signal}`);
+        error.code = 'process-terminated'; settle(reject, error);
         return;
       }
       if (code !== 0) {
@@ -1140,6 +1139,7 @@ function invokeAgy(opts) {
     }
     const res = spawnSync(cmd, [...prefixArgs, ...args], {
       cwd,
+      shell: false,
       // agy's own --print-timeout fires first and lets it exit cleanly; the spawn
       // timeout is a 5s-grace hard backstop for a hung process (the non-TTY hang).
       timeout: timeoutSecs * 1000 + 5000,
@@ -1334,11 +1334,8 @@ function readWorkersTimeout(baseDir) {
  * @returns {NodeJS.ProcessEnv}
  */
 function buildSidecarEnv(policy = 'minimal', sourceEnv = process.env, platform = process.platform) {
-  if (policy === 'inherit') return { ...sourceEnv };
-
   const common = [
-    'PATH', 'HOME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'CODEX_HOME',
-    'OPENAI_API_KEY', 'GEMINI_API_KEY', 'ANTIGRAVITY_API_KEY', 'HTTP_PROXY',
+    'PATH', 'HOME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'HTTP_PROXY',
     'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
   ];
   const platformKeys = platform === 'win32'
@@ -1346,17 +1343,52 @@ function buildSidecarEnv(policy = 'minimal', sourceEnv = process.env, platform =
     : platform === 'linux'
       ? ['DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME']
       : [];
-  const env = {};
-  for (const key of [...common, ...platformKeys]) {
-    if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
-  }
-  for (const [key, value] of Object.entries(sourceEnv)) {
-    if (key.startsWith('FORGE_') && value !== undefined) env[key] = value;
-  }
+  const env = policy === 'inherit' ? { ...sourceEnv } : {};
+  if (policy !== 'inherit') for (const key of [...common, ...platformKeys]) if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
+  // Test/embedding binary overrides are routing inputs, not credentials.
+  for (const key of ['FORGE_XLLM_CODEX_BIN', 'FORGE_XLLM_AGY_BIN']) if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
   for (const key of Object.keys(env)) {
-    if (/(^|_)(AWS_|AZURE_|GCP_|DATABASE_|ANTHROPIC_|CLAUDE_)/.test(key)) delete env[key];
+    if (key === 'CODEX_HOME' || /(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|AUTH|COOKIE|SESSION|^AWS_|^AZURE_|^GCP_|^ANTHROPIC_|^CLAUDE_|^OPENAI_|^GEMINI_|^ANTIGRAVITY_|^FORGE_ACCOUNT$)/i.test(key)) delete env[key];
   }
   return env;
+}
+
+function boundaryError(code, message) { const error = new Error(message); error.code = code; return error; }
+
+/** Kill only the process tree rooted at the ChildProcess object created here. */
+function terminateOwnedProcessTree(child, platform = process.platform, runner = spawnSync) {
+  if (!child || !Number.isInteger(child.pid) || child.pid <= 0) return { ok: false, reason_code: 'process-termination-invalid-owner' };
+  let treeKilled = false;
+  if (platform === 'win32') {
+    try { const result = runner('taskkill', ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore' }); treeKilled = !result.error && result.status === 0; } catch {}
+  } else {
+    try { process.kill(-child.pid, 'SIGKILL'); treeKilled = true; } catch {}
+  }
+  try { child.kill('SIGKILL'); treeKilled = true; } catch {}
+  return { ok: treeKilled, reason_code: treeKilled ? 'process-tree-terminated' : 'process-termination-failed' };
+}
+
+function authorizeSidecar(mode, opts = {}) {
+  const readOnly = mode !== 'execute';
+  const workerEngine = opts.engine || 'codex';
+  const decision = dispatchPolicy.decide({
+    role: readOnly ? 'orchestrator' : 'worker',
+    host_runtime: opts.hostRuntime || 'claude', worker_engine: workerEngine,
+    worker_mode: 'sidecar', sidecar_declared: true, operation: 'spawn',
+    sandbox_mode: readOnly ? 'read-only' : 'workspace-write',
+    required_capabilities: readOnly ? ['process.spawn'] : ['process.spawn', 'workspace.write'],
+    available_capabilities: readOnly ? ['process.spawn'] : ['process.spawn', 'workspace.write'],
+    workspace_root: opts.workspaceRoot || opts.cwd, spawn_cwd: opts.cwd,
+  });
+  if (decision.decision !== 'allow' || decision.grants.length !== 0 || decision.permissions.credential_env !== false) {
+    throw boundaryError(decision.reason_code || 'role-permission-denied', `sidecar policy denied: ${decision.reason_code}`);
+  }
+  return decision;
+}
+
+function assertUntrustedOutputBarrier(value) {
+  if (dispatchPolicy.containsControlData(value)) throw boundaryError('untrusted-output-barrier', 'sidecar output contains dispatch control data');
+  return value;
 }
 
 /** Read sidecars.env_policy from the merged prefs cascade, or null when invalid. */
@@ -1384,6 +1416,7 @@ function runChallenge(opts) {
   const timeoutSecs = opts.timeoutSecs || DEFAULT_TIMEOUT_SECS;
   const engine = opts.engine || 'codex';
   if (!opts.diffCmd) throw new Error('challenge mode requires --diff-cmd');
+  authorizeSidecar('challenge', { ...opts, cwd, engine });
 
   const diffText = acquireDiff(opts.diffCmd, cwd);
   const prompt = buildChallengePrompt(diffText);
@@ -1393,6 +1426,7 @@ function runChallenge(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error(`no parseable JSON block found in ${engine} output`);
+  assertUntrustedOutputBarrier(parsed);
   if (!validateObjections(parsed)) throw new Error(`${engine} output failed objections validation`);
 
   return normalizeChallenge(parsed);
@@ -1414,6 +1448,7 @@ function runRebuttal(opts) {
   const timeoutSecs = opts.timeoutSecs || DEFAULT_TIMEOUT_SECS;
   const engine = opts.engine || 'codex';
   if (!opts.inputFile) throw new Error('rebuttal mode requires --input <file>');
+  authorizeSidecar('rebuttal', { ...opts, cwd, engine });
 
   let inputText;
   try {
@@ -1434,6 +1469,7 @@ function runRebuttal(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error(`no parseable JSON block found in ${engine} output`);
+  assertUntrustedOutputBarrier(parsed);
   if (!validateVerdicts(parsed)) throw new Error(`${engine} output failed verdicts validation`);
 
   return normalizeRebuttal(parsed);
@@ -1536,6 +1572,7 @@ async function runExecute(opts) {
 
   if (!opts.planFile) throw new Error('execute mode requires --plan <file>');
   if (!opts.resultFile) throw new Error('execute mode requires --result-file <path>');
+  authorizeSidecar('execute', { ...opts, cwd, engine: opts.engine || 'codex' });
 
   // Validate the result channel before the first heartbeat write. This resolves the
   // real parent and rejects symlink/junction tricks, including case-folded Windows
@@ -1563,7 +1600,8 @@ async function runExecute(opts) {
   // This snapshot is AUDIT ONLY — exposed as `pre_dirty` in the result JSON for the
   // orchestrator to cross-check. The AUTHORITATIVE snapshot that drives the post-failure
   // surgical reset lives in the orchestrator's state file (T03/T04); the adapter NEVER resets.
-  const preDirty = captureSnapshot(cwd, vcsName);
+  const attemptSnapshot = captureAttemptSnapshot(cwd, { attemptId: dispatchId, vcsName });
+  const preDirty = attemptSnapshot.pre_dirty;
   const preDirtyAll = captureDirtySnapshot(cwd, vcsName);
 
   let securityText = '';
@@ -1575,16 +1613,7 @@ async function runExecute(opts) {
   if (contextText.trim()) contextText = truncateAtSectionBoundary(contextText, CONTEXT_BUDGET_CHARS);
   else contextText = '';
 
-  let startSha;
-  if (vcsName === 'svn') {
-    const baseline = vcs.baselineId(cwd, { ...VCS_OPTS, vcs: 'svn' });
-    if (!baseline.ok) throw new Error(baseline.error);
-    const parsedBaseline = parseSvnBaseline(baseline.id);
-    if (!parsedBaseline.ok) throw new Error(parsedBaseline.error);
-    startSha = parsedBaseline.range;
-  } else {
-    startSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
-  }
+  const startSha = attemptSnapshot.start_sha;
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const prompt = buildExecutePrompt(planText, { securityText, contextText });
@@ -1669,6 +1698,7 @@ async function runExecute(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error('no parseable JSON block found in codex output');
+  assertUntrustedOutputBarrier(parsed);
   if (!validateExecuteResult(parsed)) throw new Error('codex output failed execute-result validation');
 
   const derived = deriveFilesChanged(cwd, preDirtyAll, startSha, vcsName);
@@ -1734,6 +1764,7 @@ async function runPlan(opts) {
 
   if (!opts.planContextFile) throw new Error('plan mode requires --plan-context <file>');
   if (!opts.resultFile) throw new Error('plan mode requires --result-file <path>');
+  authorizeSidecar('plan', { ...opts, cwd, engine: opts.engine || 'codex' });
 
   const resultFile = validateResultFileTarget(opts.resultFile, cwd);
 
@@ -1814,6 +1845,7 @@ async function runPlan(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error('no parseable JSON block found in codex output');
+  assertUntrustedOutputBarrier(parsed);
   if (!validatePlanResult(parsed)) throw new Error('codex output failed plan-result validation');
 
   // In-sidecar must_haves validation (ENFORCING gate — S03 requirement #1). Every
@@ -1877,7 +1909,11 @@ module.exports = {
   readResultTelemetry,
   readWorkersTimeout,
   readSidecarsEnvPolicy,
- buildSidecarEnv,
+  buildSidecarEnv,
+  authorizeSidecar,
+  assertUntrustedOutputBarrier,
+  terminateOwnedProcessTree,
+  invokeCodexDetached,
   buildExecutePrompt,
   codexSandboxArgs,
   assertSafeForCmdShell,
