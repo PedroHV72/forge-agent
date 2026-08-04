@@ -46,6 +46,13 @@ const WRAPPER_DIR_READERS = Object.freeze([
     why: 'After listing the roots, listExistingIds explicitly recognizes grouped containers and adds each parsed unit id (or wrapper marker left side).',
   },
   {
+    file: 'forge-smoke.js',
+    dirs: Object.freeze(['.gsd/milestones']),
+    evidence: 'forge-smoke.js:278,306,323,356,364,370 â€” fs.mkdirSync/fs.writeFileSync create deterministic fixture paths; :5043 enumerates only walk(path.join(gsd, \'forge\')).',
+    verdict: 'safe-by-construction',
+    why: 'The specific snapshotForge filter walks only path.join(gsd, \'forge\'); milestone occurrences are deterministic fixture construction, so no third-party wrapper root is enumerated.',
+  },
+  {
     file: 'forge-memory-migrate.js',
     dirs: Object.freeze(['.gsd/milestones']),
     evidence: 'forge-memory-migrate.js:184-204 — fs.readdirSync(milestonesDir) and stat.isDirectory() select milestone directories.',

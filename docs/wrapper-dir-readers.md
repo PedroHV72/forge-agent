@@ -32,6 +32,7 @@ can say why their constrained path is safe.
 | forge-doctor.js | milestones, tasks | L172; L208-213 recursive roots | breaks | It does not parse grouped files. |
 | forge-epoch-group.js | milestones, tasks | L202-205 wrapper parent scan | safe-by-construction | `entry.isDirectory()` skips existing epoch files. |
 | forge-ids.js | milestones, tasks | L249-280 `listExistingIds` | learned | It reads grouped members with `forge-grouped-file`. |
+| forge-smoke.js | milestones | L278/L306/L323/L356/L364/L370 fixtures; L5043 | safe-by-construction | Milestone paths are deterministic fixture construction; `snapshotForge` walks only `.gsd/forge`. |
 | forge-memory-migrate.js | milestones | L184-204 milestone directory scan | breaks | It only follows loose directories and slices. |
 | forge-runs.js | milestones | L49 lists `runsDir` | safe-by-construction | `.json` filter is scoped to `.gsd/forge/runs`. |
 | forge-route-audit.js | milestones | L20/L31 identity prose | safe-by-construction | It has no `readdirSync` enumeration. |

@@ -13,6 +13,7 @@ const {
 } = require('./forge-wrapper-readers');
 
 const SCRIPTS_DIR = __dirname;
+const INVENTORY_SOURCE_FILE = 'forge-wrapper-readers.js';
 const ROOT_DIR_PATTERN = /path\.join\([\s\S]{0,160}?['"]\.gsd['"][\s\S]{0,80}?['"](?:milestones|tasks)['"]|\.gsd[\\/]\s*(?:milestones|tasks)/;
 const ENUMERATION_PATTERN = /(?:fs\.)?readdirSync\s*\(/;
 const D11_NAMED_READERS = Object.freeze([
@@ -33,6 +34,12 @@ function scriptFiles() {
     .sort();
 }
 
+function isInventorySource(file) {
+  // The registry quotes the scan vocabulary as data. Exclude only this exact
+  // source file; a name or pattern rule here could hide a real future reader.
+  return file === INVENTORY_SOURCE_FILE;
+}
+
 function hasDirectRootEnumeration(source) {
   if (!ENUMERATION_PATTERN.test(source)) return false;
   return ROOT_DIR_PATTERN.test(source);
@@ -48,6 +55,7 @@ function hasD11ReaderShape(file, source) {
 
 function scanWrapperDirReaders() {
   return scriptFiles().filter(file => {
+    if (isInventorySource(file)) return false;
     const source = sourceOf(file);
     return hasDirectRootEnumeration(source) || hasD11ReaderShape(file, source);
   });
@@ -78,7 +86,7 @@ function testEntriesRemainConcreteAndClosed() {
     assert(typeof reader.evidence === 'string' && reader.evidence.trim(), `missing evidence for ${reader.file}`);
     assert(typeof reader.why === 'string' && reader.why.trim(), `missing why for ${reader.file}`);
     if (reader.verdict === 'safe-by-construction') {
-      assert(/filter|no .*readdir|never enumerat|specific/i.test(reader.why), `safe reader lacks named filter: ${reader.file}`);
+      assert(/filter|no (?:.*readdir|directory enumeration)|never enumerat|specific/i.test(reader.why), `safe reader lacks named filter: ${reader.file}`);
     }
   }
 }
@@ -98,11 +106,18 @@ function testRegistryIsFrozenData() {
   }
 }
 
+function testSelfExclusionCannotHideAnotherReader() {
+  assert.strictEqual(isInventorySource(INVENTORY_SOURCE_FILE), true, 'registry source must be excluded exactly');
+  assert.strictEqual(isInventorySource('forge-smoke.js'), false, 'self exclusion must not hide a real reader');
+  assert.strictEqual(isInventorySource('forge-wrapper-readers-copy.js'), false, 'self exclusion must be exact, not a filename pattern');
+}
+
 function run() {
   testCoverageIsMeasuredBothWays();
   testEntriesRemainConcreteAndClosed();
   testD11FloorAndUnlearnedProjection();
   testRegistryIsFrozenData();
+  testSelfExclusionCannotHideAnotherReader();
   process.stdout.write('forge-wrapper-readers.test.js: ok\n');
 }
 
