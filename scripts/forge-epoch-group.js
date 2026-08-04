@@ -1,14 +1,23 @@
 'use strict';
 
-// Groups sealed fragment-store epochs in place.  This module is deliberately a
+// Groups sealed fragment-store units in place. This module is deliberately a
 // small filesystem engine: it neither prompts nor examines version-control
-// state.  Callers decide whether a returned plan should be applied.
+// state. Callers decide whether a returned plan should be applied.
+//
+// The calendar axis is gone (S09). Selection now asks forge-sweep-sealed's
+// sealedBy() for a verdict per member — this module owns none of the
+// eligibility criteria itself; it only enumerates candidates, applies the
+// structural guards that have nothing to do with closure proof (readability,
+// already-grouped, id shape, delimiter-in-payload), and obeys the verdict.
+// The container name comes from a single sweep number computed once per plan
+// (DS9-3) via forge-sweep-sealed's nextSweepNumber/containerName.
 
 const fs = require('fs');
 const path = require('path');
 
-const { epochOfUnit, sealedEpochs, isWrapperDir, listWrapperDirs } = require('./forge-epoch');
+const { dateOfUnit, isWrapperDir, listWrapperDirs } = require('./forge-epoch');
 const { serializeGroup, parseGroup, isGroupedFile } = require('./forge-grouped-file');
+const sealed = require('./forge-sweep-sealed');
 const ledger = require('./forge-ledger');
 const decisions = require('./forge-decisions');
 const memory = require('./forge-memory');
@@ -22,8 +31,33 @@ function fileId(fileName) {
   return path.basename(fileName, '.md');
 }
 
-// Store-specific date hints are the second link in epochOfUnit's chain, after
-// the timestamp encoded in a unit id.  Keeping these descriptors declarative
+// dateOnly renders dateOfUnit's Date (UTC-based no matter which link in its
+// chain resolved it — id-timestamp and mtime both come out as instants) as
+// the YYYY-MM-DD string T03's serializeGroup expects for a range endpoint. A
+// null/invalid Date is not an error here: DS9-5 made "no derivable date" a
+// non-disqualifying outcome, so the member simply contributes nothing.
+function dateOnly(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+// The min/max of every member's derived date, in a single plan target — the
+// "faixa" a sweep container carries because the number alone does not situate
+// it in time. Members without a date simply do not participate.
+function dateRangeOf(members) {
+  const dates = (Array.isArray(members) ? members : [])
+    .map(member => member && member.date)
+    .filter(date => typeof date === 'string' && date);
+  if (!dates.length) return undefined;
+  dates.sort();
+  return { from: dates[0], to: dates[dates.length - 1] };
+}
+
+// Store-specific date hints are the second link in dateOfUnit's chain, after
+// the timestamp encoded in a unit id. Keeping these descriptors declarative
 // makes all three stores pass through exactly the same planner.
 const STORE_TARGETS = [
   {
@@ -48,7 +82,7 @@ const STORE_TARGETS = [
 
 // Wrapper stores are intentionally separate from fragment stores: their
 // parent is the original .gsd directory, so grouping never creates archive or
-// sibling directories.  The marker id is `dir~filename`; the left side keeps
+// sibling directories. The marker id is `dir~filename`; the left side keeps
 // the Forge identity while the right side preserves the original filename.
 const WRAPPER_TARGETS = [
   { name: 'milestone-wrappers', parent: cwd => path.join(cwd, '.gsd', 'milestones') },
@@ -130,6 +164,18 @@ function plan(cwd, opts = {}) {
   // No target shape or return field changes are needed for this gate.
   // Callers can therefore opt in without adapting apply/ungroup payloads.
 
+  // DS9-3: one sweep number for the WHOLE plan, computed over every directory
+  // this plan could touch — never per store. Computing it later or per-store
+  // would let the same sweep land as -03 in one store and -01 in another,
+  // and the S08 journal (one intent line per apply, many containers) would
+  // point at numbers that no longer correspond to each other.
+  const storeDirs = STORE_TARGETS.map(store => store.dir(cwd));
+  const wrapperDirs = includeWrapperDirs ? WRAPPER_TARGETS.map(store => store.parent(cwd)) : [];
+  const sweepNumber = sealed.nextSweepNumber([...storeDirs, ...wrapperDirs]);
+  const label = sealed.containerName(sweepNumber);
+  // Loaded once per plan (not per member) — sealedBy's proof (a) consults it.
+  const ctx = { ledgerIds: sealed.loadLedgerIds(cwd) };
+
   for (const store of STORE_TARGETS) {
     const dir = store.dir(cwd);
     const loose = [];
@@ -148,12 +194,6 @@ function plan(cwd, opts = {}) {
         continue;
       }
       const id = store.idOf(entry.name);
-      if (store.name === 'memory' && id === 'legacy-orphan') {
-        // This block-format compatibility entry is intentionally not a unit
-        // payload; grouping it would make forge-projection parse the container.
-        skip(skipped, filePath, 'legacy-orphan não é agrupável');
-        continue;
-      }
       if (!safeMemberId(id)) {
         skip(skipped, filePath, 'identificador inválido');
         continue;
@@ -167,30 +207,25 @@ function plan(cwd, opts = {}) {
       catch (error) {
         warn(`cannot derive date hint for ${filePath}: ${error.message}`);
       }
-      const resolved = epochOfUnit({ id, dateHint, path: filePath });
-      if (!resolved.epoch) {
-        skip(skipped, filePath, 'época indeterminada');
+      // sealedBy is the ENTIRE eligibility criterion (DS9-6: legacy-orphan is
+      // its concern now, not an `if (store.name === 'memory')` here). Date is
+      // never asked about grouping — only about the range (DS9-5).
+      const verdict = sealed.sealedBy({ id }, ctx);
+      if (!verdict.groupable) {
+        skip(skipped, filePath, verdict.reason);
         continue;
       }
-      loose.push({ id, path: filePath, epoch: resolved.epoch });
+      const derived = dateOfUnit({ id, dateHint, path: filePath });
+      loose.push({ id, path: filePath, date: dateOnly(derived.date) });
     }
 
-    const epochSet = sealedEpochs(loose.map(member => member.epoch));
-    for (const member of loose) {
-      if (member.epoch === epochSet.current) {
-        skip(skipped, member.path, 'época corrente — não selada');
-      }
+    if (!loose.length) continue;
+    const containerPath = path.join(dir, `${label}.md`);
+    if (fs.existsSync(containerPath)) {
+      for (const member of loose) skip(skipped, member.path, 'container já agrupado');
+      continue;
     }
-    for (const epoch of epochSet.sealed) {
-      const members = loose.filter(member => member.epoch === epoch)
-        .map(member => ({ id: member.id, path: member.path }));
-      const containerPath = path.join(dir, `${epoch}.md`);
-      if (fs.existsSync(containerPath)) {
-        for (const member of members) skip(skipped, member.path, 'container já agrupado');
-        continue;
-      }
-      targets.push({ store: store.name, epoch, containerPath, members });
-    }
+    targets.push({ store: store.name, label, containerPath, members: loose });
   }
 
   // Wrapper targets delete directories whose readers still expect loose entries.
@@ -226,7 +261,7 @@ function plan(cwd, opts = {}) {
       const filePath = wrapper.file;
       // splitWrapperMarkerId requires .md, so a non-.md member would only be
       // rejected in apply() — where it sets invalid and discards the ENTIRE
-      // epoch target under a misleading reason. Reject it here, alone.
+      // target under a misleading reason. Reject it here, alone.
       if (!filePath.endsWith('.md')) {
         skip(skipped, wrapperPath, 'arquivo do invólucro não é .md');
         continue;
@@ -238,28 +273,27 @@ function plan(cwd, opts = {}) {
       if (content.indexOf(Buffer.from('<!-- forge:', 'ascii')) !== -1) {
         skip(skipped, wrapperPath, 'delimitador no conteúdo'); continue;
       }
-      const resolved = epochOfUnit({ id: entry.name, path: filePath });
-      if (!resolved.epoch) { skip(skipped, wrapperPath, 'época indeterminada'); continue; }
-      units.push({ id: entry.name, path: wrapperPath, filePath, fileName: path.basename(filePath), epoch: resolved.epoch });
+      // The wrapper's OWNING id (entry.name — e.g. `M-...` or `T-...`) is what
+      // sealedBy judges; DS9-6 says the wrapper branch inherits the same
+      // criterion "for free" — no separate wrapper-shaped verdict exists.
+      const verdict = sealed.sealedBy({ id: entry.name }, ctx);
+      if (!verdict.groupable) { skip(skipped, wrapperPath, verdict.reason); continue; }
+      const derived = dateOfUnit({ id: entry.name, path: filePath });
+      units.push({
+        id: wrapperMarkerId(entry.name, path.basename(filePath)),
+        path: filePath,
+        wrapperPath,
+        fileName: path.basename(filePath),
+        date: dateOnly(derived.date),
+      });
     }
-    const epochSet = sealedEpochs(units.map(unit => unit.epoch));
-    for (const unit of units) {
-      if (unit.epoch === epochSet.current) {
-        skip(skipped, unit.path, 'época corrente — não selada');
-      }
+    if (!units.length) continue;
+    const containerPath = path.join(parent, `${label}.md`);
+    if (fs.existsSync(containerPath)) {
+      for (const unit of units) skip(skipped, unit.wrapperPath, 'container já agrupado');
+      continue;
     }
-    for (const epoch of epochSet.sealed) {
-      const members = units.filter(unit => unit.epoch === epoch).map(unit => ({
-        id: wrapperMarkerId(unit.id, unit.fileName), path: unit.filePath,
-        wrapperPath: unit.path, wrapperId: unit.id, fileName: unit.fileName,
-      }));
-      const containerPath = path.join(parent, `${epoch}.md`);
-      if (fs.existsSync(containerPath)) {
-        for (const member of members) skip(skipped, member.wrapperPath, 'container já agrupado');
-      } else if (members.length) {
-        targets.push({ store: store.name, epoch, containerPath, members });
-      }
-    }
+    targets.push({ store: store.name, label, containerPath, members: units });
   }
   return { targets, skipped, dryRun };
 }
@@ -310,7 +344,7 @@ function apply(cwd, groupingPlan, opts = {}) {
       }
     }
     if (invalid || units.length !== members.length) continue;
-    const serialized = serializeGroup({ epoch: target.epoch, units });
+    const serialized = serializeGroup({ label: target.label, dateRange: dateRangeOf(members), units });
     if (serialized.skipped.length) {
       for (const item of serialized.skipped) skip(skipped, item.path, 'membro recusado pelo formato');
       continue;

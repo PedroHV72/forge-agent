@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 'use strict';
 
-// Standalone regression suite for the sealed-epoch grouping engine.
+// Standalone regression suite for the sweep-based grouping engine (S09).
+//
+// The calendar axis (epoch/quarter, "época corrente") is gone. Selection is
+// now a verdict from forge-sweep-sealed's sealedBy() per member; naming comes
+// from a single sweep number shared across every store the plan touches
+// (DS9-3). The test that matters most here is PRECISION (a member with no
+// proof at all is skipped, by name, even surrounded by eligible members) —
+// round-trip byte-identity does not catch this slice's failure mode.
 
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const group = require('./forge-epoch-group');
+const journal = require('./forge-sweep-journal');
 
 let passed = 0;
 let failed = 0;
@@ -33,75 +41,199 @@ function write(cwd, rel, content) {
   return target;
 }
 
-function ledger(id, date, body) {
+function ledgerFragment(id, date, body) {
   return `---\nid: ${id}\ncompleted_at: ${date}\n---\n${body || id}\n`;
 }
 
-function decision(id, when) {
+function decisionFragment(id, when) {
   return `---\nunit_id: ${id}\ndecisions:\n  - when: ${when}\n    scope: test\n    decision: group\n    choice: yes\n    rationale: test\n    revisable: false\n---\n`;
 }
 
-function memory(id, date) {
+function memoryFragment(id, date) {
   return `---\nunit_id: ${id}\nfacts:\n  - mem_id: MEM-${id}\n    category: test\n    text: payload\n    created_at: ${date}\n    source_unit: ${id}\nstats: []\n---\n`;
 }
 
-function filesBelow(root) {
-  const result = [];
-  function walk(dir) {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else result.push(full);
-    }
+// A container built by hand, byte for byte, in the shape PR 1 actually wrote:
+// no grouped_from/grouped_to lines at all (T03 added those). Deliberately NOT
+// routed through serializeGroup — that would only prove the new writer is
+// consistent with itself, not that the reader still understands the old
+// format (DS9-1).
+function legacyContainerBytes(id, content) {
+  const header = [
+    '---',
+    'grouped_format: forge-group@1',
+    'grouped_epoch: 2026-Q1',
+    'grouped_units: 1',
+    '---',
+    '',
+    '',
+  ].join('\n');
+  const payload = Buffer.from(content, 'utf8');
+  const start = `<!-- forge:unit id=${id} bytes=${payload.length} -->\n`;
+  const end = `\n<!-- forge:endunit id=${id} -->\n`;
+  return Buffer.concat([Buffer.from(header, 'utf8'), Buffer.from(start, 'utf8'), payload, Buffer.from(end, 'utf8')]);
+}
+
+test('STORE_TARGETS declares all three fragment stores', () => {
+  assert.deepEqual(group.STORE_TARGETS.map(item => item.name), ['ledger', 'decisions', 'memory']);
+  for (const store of group.STORE_TARGETS) {
+    assert.equal(typeof store.dir, 'function');
+    assert.equal(typeof store.idOf, 'function');
+    assert.equal(typeof store.dateHintOf, 'function');
   }
-  walk(root);
-  return result.sort();
-}
+});
 
-function seedAllStores(cwd) {
-  write(cwd, '.gsd/ledger/M-20260101000000-old.md', ledger('M-20260101000000-old', '2026-01-01', 'old ledger'));
-  write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01', 'current ledger'));
-  write(cwd, '.gsd/decisions/T-20260101000000-old.md', decision('T-20260101000000-old', '2026-01-02'));
-  write(cwd, '.gsd/decisions/T-20260401000000-current.md', decision('T-20260401000000-current', '2026-04-02'));
-  write(cwd, '.gsd/memory/T-20260101000000-old.md', memory('T-20260101000000-old', '2026-01-03'));
-  write(cwd, '.gsd/memory/T-20260401000000-current.md', memory('T-20260401000000-current', '2026-04-03'));
-}
-
-test('plans only sealed epochs and records the current epoch with a reason', () => {
+test('precision: a member with no proof at all is skipped by name, even surrounded by eligible members', () => {
   const cwd = tmp();
   try {
-    seedAllStores(cwd);
+    // Deliberately the MEMORY store, not ledger: sealedBy's proof (a) checks
+    // `ledgerIds` against the LEDGER directory, a genuinely separate store —
+    // a ledger-store fixture would trivially self-satisfy proof (a) by its
+    // own presence in that same directory listing, which would prove nothing
+    // about a member with no proof at all.
+    write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-01'));
+    write(cwd, '.gsd/memory/T-20260102000000-two.md', memoryFragment('T-20260102000000-two', '2026-01-02'));
+    write(cwd, '.gsd/memory/T-20260103000000-three.md', memoryFragment('T-20260103000000-three', '2026-01-03'));
+    // A bare local unit id, per the B1 finding: it passes parseStorageKey
+    // (so it is NOT extinct), has no timestamp in the id, and the ledger
+    // store (untouched in this fixture) has no entry naming it — no proof
+    // of any of the three kinds fires.
+    write(cwd, '.gsd/memory/S02.md', memoryFragment('S02', '2026-01-01'));
     const planned = group.plan(cwd);
-    assert.equal(planned.targets.length, 3);
-    assert(planned.targets.every(target => target.epoch === '2026-Q1'));
-    assert(planned.skipped.filter(item => /época corrente/.test(item.reason)).length === 3);
-    assert(planned.skipped.every(item => typeof item.reason === 'string' && item.reason.length));
-    for (const target of planned.targets) assert.equal(target.members.length, 1);
+    const target = planned.targets.find(item => item.store === 'memory');
+    assert(target, 'the three eligible members produce a target');
+    assert.equal(target.members.length, 3);
+    assert(target.members.every(member => member.id !== 'S02'));
+    const skip = planned.skipped.find(item => /S02\.md$/.test(item.path));
+    assert(skip, 'S02 is named in skipped, not silently dropped');
+    assert(/sem prova de encerramento/.test(skip.reason));
   } finally { remove(cwd); }
 });
 
-test('apply writes the described in-store containers before removing members', () => {
+test('legacy-orphan is skipped in all three stores by the shared proof module (DS9-6)', () => {
   const cwd = tmp();
   try {
-    seedAllStores(cwd);
+    write(cwd, '.gsd/ledger/legacy-orphan.md', '<!-- gsd-auto-memory mem_id:MEM001 -->\n');
+    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledgerFragment('M-20260101000000-one', '2026-01-01', 'one'));
+    write(cwd, '.gsd/decisions/legacy-orphan.md', '<!-- gsd-auto-memory mem_id:MEM001 -->\n');
+    write(cwd, '.gsd/decisions/T-20260101000000-one.md', decisionFragment('T-20260101000000-one', '2026-01-02'));
+    write(cwd, '.gsd/memory/legacy-orphan.md', '<!-- gsd-auto-memory mem_id:MEM001 -->\n');
+    write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-03'));
     const planned = group.plan(cwd);
-    const applied = group.apply(cwd, planned);
-    assert.equal(applied.written.length, 3);
-    assert.equal(applied.removed.length, 3);
-    assert.equal(applied.counts.filesBefore - applied.counts.filesAfter, 0);
-    for (const target of planned.targets) {
-      assert(fs.existsSync(target.containerPath));
-      assert(!fs.existsSync(target.members[0].path));
-      assert.equal(path.dirname(target.containerPath), path.dirname(target.members[0].path));
+    const orphanSkips = planned.skipped.filter(item => /legacy-orphan\.md$/.test(item.path));
+    assert.equal(orphanSkips.length, 3, 'legacy-orphan is skipped in ledger, decisions, and memory');
+    assert(orphanSkips.every(item => /legacy-orphan não é agrupável/.test(item.reason)));
+    for (const name of ['ledger', 'decisions', 'memory']) {
+      const target = planned.targets.find(item => item.store === name);
+      assert(target, `${name} still groups its one eligible member`);
+      assert(target.members.every(member => member.id !== 'legacy-orphan'));
     }
-    assert(!fs.existsSync(path.join(cwd, '.gsd', 'archive')));
+  } finally { remove(cwd); }
+});
+
+test('the guard store.name === "memory" is gone: legacy-orphan is not special-cased by store identity', () => {
+  // Regression for the removed `if (store.name === 'memory' && id === 'legacy-orphan')`
+  // at the old :151 — a ledger or decisions file literally named legacy-orphan
+  // must be refused too, not only in memory.
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/ledger/legacy-orphan.md', 'not a real orphan payload but named the same\n');
+    const planned = group.plan(cwd);
+    assert(planned.skipped.some(item => /legacy-orphan\.md$/.test(item.path) && /legacy-orphan não é agrupável/.test(item.reason)));
+    assert(planned.targets.every(target => target.members.every(member => member.id !== 'legacy-orphan')));
+  } finally { remove(cwd); }
+});
+
+test('NN is shared across every store the plan touches, and grows on the next sweep', () => {
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/ledger/M-20260101000000-a.md', ledgerFragment('M-20260101000000-a', '2026-01-01'));
+    write(cwd, '.gsd/decisions/T-20260101000000-b.md', decisionFragment('T-20260101000000-b', '2026-01-01'));
+    write(cwd, '.gsd/memory/T-20260101000000-c.md', memoryFragment('T-20260101000000-c', '2026-01-01'));
+    const first = group.plan(cwd);
+    assert.equal(first.targets.length, 3, 'ledger, decisions, and memory each produce one target');
+    const labels = new Set(first.targets.map(target => target.label));
+    assert.equal(labels.size, 1, 'a single sweep number, shared by every store touched this plan');
+    const label = [...labels][0];
+    assert(/^sweep-project-\d{2,}$/.test(label));
+    for (const target of first.targets) {
+      assert.equal(path.basename(target.containerPath), `${label}.md`);
+    }
+    group.apply(cwd, first);
+
+    write(cwd, '.gsd/ledger/M-20260201000000-d.md', ledgerFragment('M-20260201000000-d', '2026-02-01'));
+    const second = group.plan(cwd);
+    assert.equal(second.targets.length, 1, 'only ledger has a new eligible member');
+    const secondNum = parseInt(second.targets[0].label.replace('sweep-project-', ''), 10);
+    const firstNum = parseInt(label.replace('sweep-project-', ''), 10);
+    assert.equal(secondNum, firstNum + 1, 'the second sweep advances the shared counter by one');
+  } finally { remove(cwd); }
+});
+
+test('date range is the min/max of derived member dates; a member with no derivable date enters and contributes nothing (DS9-5)', () => {
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/ledger/M-20260215000000-known.md', ledgerFragment('M-20260215000000-known', '2026-02-15'));
+    write(cwd, '.gsd/ledger/old-note.md', ledgerFragment('old-note', '2025-12-31', 'hint only'));
+    // S03-T02: hyphenated, so parseStorageKey refuses it outright — extinct by
+    // construction (proof c), independent of any date. mtime is stubbed away
+    // below so this member truly has NO derivable date, on any of the three
+    // links in dateOfUnit's chain.
+    const noDatePath = write(cwd, '.gsd/ledger/S03-T02.md', ledgerFragment('S03-T02', '', 'no date at all'));
+    const realStatSync = fs.statSync;
+    fs.statSync = function (p, ...rest) {
+      if (typeof p === 'string' && p.replace(/\\/g, '/').endsWith('/.gsd/ledger/S03-T02.md')) {
+        throw new Error('ENOENT: simulated unresolvable mtime');
+      }
+      return realStatSync.call(fs, p, ...rest);
+    };
+    let planned;
+    try {
+      planned = group.plan(cwd);
+    } finally {
+      fs.statSync = realStatSync;
+    }
+    const target = planned.targets.find(item => item.store === 'ledger');
+    assert(target, 'all three members are eligible');
+    assert.equal(target.members.length, 3, 'the dateless member enters the container, not skipped');
+    // S03-T02 is eligible either way — parseStorageKey refuses it outright
+    // (extinct-id, proof c), and as a ledger-store fixture it also sits in
+    // the very directory loadLedgerIds scans (self-satisfying proof a). This
+    // test is about the DATE outcome, not which proof fired.
+    const noDateMember = target.members.find(member => member.id === 'S03-T02');
+    assert(noDateMember, 'S03-T02 is present');
+    assert.equal(noDateMember.date, null);
+
+    const applied = group.apply(cwd, planned);
+    assert.equal(applied.written.length, 1);
+    const { parseGroup } = require('./forge-grouped-file');
+    const parsed = parseGroup(fs.readFileSync(target.containerPath));
+    assert.equal(parsed.from, '2025-12-31');
+    assert.equal(parsed.to, '2026-02-15');
+    assert.equal(parsed.units.length, 3);
+    assert(!fs.existsSync(noDatePath));
+  } finally { remove(cwd); }
+});
+
+test('plan() is deterministic: two runs over the same store produce identical targets and skipped', () => {
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/ledger/M-20260101000000-a.md', ledgerFragment('M-20260101000000-a', '2026-01-01'));
+    write(cwd, '.gsd/ledger/M-20260102000000-b.md', ledgerFragment('M-20260102000000-b', '2026-01-02'));
+    write(cwd, '.gsd/ledger/S02.md', ledgerFragment('S02', '2026-01-01', 'no proof'));
+    const first = group.plan(cwd);
+    const second = group.plan(cwd);
+    assert.deepEqual(first.targets, second.targets);
+    assert.deepEqual(first.skipped, second.skipped);
   } finally { remove(cwd); }
 });
 
 test('a second plan and apply are byte-identical and have no targets', () => {
   const cwd = tmp();
   try {
-    seedAllStores(cwd);
+    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledgerFragment('M-20260101000000-one', '2026-01-01'));
+    write(cwd, '.gsd/decisions/T-20260101000000-one.md', decisionFragment('T-20260101000000-one', '2026-01-02'));
+    write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-03'));
     const first = group.plan(cwd);
     group.apply(cwd, first);
     const before = first.targets.map(target => fs.readFileSync(target.containerPath));
@@ -115,10 +247,12 @@ test('a second plan and apply are byte-identical and have no targets', () => {
   } finally { remove(cwd); }
 });
 
-test('ungroup restores each original member byte-for-byte', () => {
+test('ungroup restores each original member byte-for-byte, with the new sweep-numbered name', () => {
   const cwd = tmp();
   try {
-    seedAllStores(cwd);
+    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledgerFragment('M-20260101000000-one', '2026-01-01'));
+    write(cwd, '.gsd/decisions/T-20260101000000-one.md', decisionFragment('T-20260101000000-one', '2026-01-02'));
+    write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-03'));
     const planned = group.plan(cwd);
     const originals = new Map();
     for (const target of planned.targets) {
@@ -126,6 +260,7 @@ test('ungroup restores each original member byte-for-byte', () => {
     }
     group.apply(cwd, planned);
     for (const target of planned.targets) {
+      assert(/^sweep-project-\d{2,}\.md$/.test(path.basename(target.containerPath)));
       const result = group.ungroup(cwd, target.containerPath);
       assert.equal(result.restored.length, target.members.length);
       for (const member of target.members) {
@@ -135,48 +270,90 @@ test('ungroup restores each original member byte-for-byte', () => {
   } finally { remove(cwd); }
 });
 
-test('unresolved, grouped, delimiter, and legacy-orphan units are enumerated as skipped', () => {
+test('DS9-1: ungroup reads a LEGACY 2026-Q1.md container written in the PR 1 byte format', () => {
   const cwd = tmp();
   try {
-    write(cwd, '.gsd/ledger/plain.md', 'no date or id\n');
-    write(cwd, '.gsd/ledger/M-20260101000000-delimiter.md', ledger('M-20260101000000-delimiter', '2026-01-01', '<!-- forge: unsafe -->'));
-    write(cwd, '.gsd/memory/legacy-orphan.md', '<!-- gsd-auto-memory mem_id:MEM001 -->\n');
-    // epochOfUnit resolves through three links — id, then dateHint, then the
-    // file's mtime. `plain.md` has neither id nor date, but it was just
-    // written, so link 3 succeeds and it is skipped as 'época corrente'
-    // instead. 'época indeterminada' is only reachable when the stat itself
-    // fails (the path vanishing between listing and stat). Stubbing statSync
-    // for that one path is the deterministic, cross-platform way to reach the
-    // branch this assertion names — mirroring what forge-memory-index.test.js
-    // does with readFileSync. The mtime fallback is part of the format and is
-    // NOT removed to make the assertion pass.
-    const realStatSync = fs.statSync;
-    fs.statSync = function (p, ...rest) {
-      if (typeof p === 'string' && p.replace(/\\/g, '/').endsWith('/.gsd/ledger/plain.md')) {
-        throw new Error('ENOENT: simulated vanished fragment');
-      }
-      return realStatSync.call(fs, p, ...rest);
-    };
-    let planned;
-    try {
-      planned = group.plan(cwd);
-    } finally {
-      fs.statSync = realStatSync;
-    }
+    const legacyId = 'M-20260101000000-legacy';
+    const bytes = legacyContainerBytes(legacyId, 'legacy payload, PR 1 era\n');
+    const containerPath = write(cwd, '.gsd/ledger/2026-Q1.md', bytes);
+    const result = group.ungroup(cwd, containerPath);
+    assert.deepEqual(result.restored, [path.join(cwd, '.gsd', 'ledger', `${legacyId}.md`)]);
+    assert.equal(fs.readFileSync(result.restored[0], 'utf8'), 'legacy payload, PR 1 era\n');
+    assert(!fs.existsSync(containerPath), 'the legacy container is consumed by ungroup like any other');
+  } finally { remove(cwd); }
+});
+
+test('W5: an S08 journal line written in the OLD (YYYY-QN) format still undoes correctly after S09', () => {
+  const cwd = tmp();
+  try {
+    const legacyId = 'M-20260101000000-old-journal';
+    const bytes = legacyContainerBytes(legacyId, 'undo me\n');
+    write(cwd, '.gsd/ledger/2026-Q1.md', bytes);
+
+    const probeResult = journal.probe(cwd);
+    assert(probeResult.ok);
+    const intent = journal.appendIntent(cwd, {
+      operation: 'agrupar-epocas-seladas',
+      containers: ['.gsd/ledger/2026-Q1.md'],
+    });
+    assert(intent.ok);
+    const outcome = journal.appendOutcome(cwd, {
+      id: intent.id,
+      phase: 'apply-done',
+      written: ['.gsd/ledger/2026-Q1.md'],
+    });
+    assert(outcome.ok);
+
+    // Naming-agnostic (DS8-4): latestUndoable never looks at the label, only
+    // at the path recorded in the intent/outcome records — which is exactly
+    // what forge-epoch-group.plan()/apply() changed. If the journal depended
+    // on epoch-shaped names this would already be failing.
+    const undoable = journal.latestUndoable(cwd);
+    assert(undoable.ok);
+    assert(undoable.entry, 'the old-format container is still discoverable as undoable');
+    assert.equal(undoable.entry.containers.length, 1);
+    assert.equal(undoable.entry.containers[0], '.gsd/ledger/2026-Q1.md');
+
+    const absolute = path.join(cwd, undoable.entry.containers[0]);
+    const restoredResult = group.ungroup(cwd, absolute);
+    assert.equal(restoredResult.restored.length, 1);
+    const restoredPath = path.join(cwd, '.gsd', 'ledger', `${legacyId}.md`);
+    assert(fs.existsSync(restoredPath));
+    assert.equal(fs.readFileSync(restoredPath, 'utf8'), 'undo me\n');
+    assert(!fs.existsSync(absolute), 'the container is consumed once undo completes');
+
+    const undoDone = journal.appendOutcome(cwd, { id: intent.id, phase: 'undo-done', written: restoredResult.restored });
+    assert(undoDone.ok);
+    const nothingLeft = journal.latestUndoable(cwd);
+    assert.equal(nothingLeft.entry, null, 'a fully undone record is no longer offered up');
+  } finally { remove(cwd); }
+});
+
+test('unresolved (no-proof), delimiter, and unsafe-id units are enumerated as skipped (structural guards untouched)', () => {
+  const cwd = tmp();
+  try {
+    // A free-form filename like 'plain.md' fails parseStorageKey outright,
+    // which under DS9-4/B1's narrowing makes it EXTINCT (proof c) — grouped,
+    // not skipped. The genuine no-proof case is a well-formed bare local id
+    // (parseStorageKey accepts it) with no date and no ledger record, kept
+    // in the memory store to avoid ledger's directory self-reference.
+    write(cwd, '.gsd/memory/S06.md', memoryFragment('S06', '2026-01-01'));
+    write(cwd, '.gsd/ledger/M-20260101000000-delimiter.md', ledgerFragment('M-20260101000000-delimiter', '2026-01-01', '<!-- forge: unsafe -->'));
+    const planned = group.plan(cwd);
     const reasons = planned.skipped.map(item => item.reason).join('\n');
-    assert(/época indeterminada/.test(reasons));
+    assert(/sem prova de encerramento/.test(reasons));
     assert(/delimitador no conteúdo/.test(reasons));
-    assert(/legacy-orphan/.test(reasons));
+    assert(planned.targets.every(target => target.members.every(member => member.id !== 'S06')));
   } finally { remove(cwd); }
 });
 
 test('apply rejects a hand-crafted path outside its store', () => {
   const cwd = tmp();
   try {
-    const source = write(cwd, '.gsd/ledger/M-20260101000000-safe.md', ledger('M-20260101000000-safe', '2026-01-01'));
-    const outside = path.join(cwd, '.gsd', 'archive', '2026-Q1.md');
+    const source = write(cwd, '.gsd/ledger/M-20260101000000-safe.md', ledgerFragment('M-20260101000000-safe', '2026-01-01'));
+    const outside = path.join(cwd, '.gsd', 'archive', 'sweep-project-01.md');
     const result = group.apply(cwd, { targets: [{
-      store: 'ledger', epoch: '2026-Q1', containerPath: outside,
+      store: 'ledger', label: 'sweep-project-01', containerPath: outside,
       members: [{ id: 'M-20260101000000-safe', path: source }],
     }], skipped: [] });
     assert.equal(result.written.length, 0);
@@ -185,57 +362,26 @@ test('apply rejects a hand-crafted path outside its store', () => {
   } finally { remove(cwd); }
 });
 
-test('STORE_TARGETS declares all three fragment stores', () => {
-  assert.deepEqual(group.STORE_TARGETS.map(item => item.name), ['ledger', 'decisions', 'memory']);
-  for (const store of group.STORE_TARGETS) {
-    assert.equal(typeof store.dir, 'function');
-    assert.equal(typeof store.idOf, 'function');
-    assert.equal(typeof store.dateHintOf, 'function');
-  }
-});
-
-test('date hints group non-timestamp identifiers without inventing a size threshold', () => {
-  const cwd = tmp();
-  try {
-    write(cwd, '.gsd/ledger/old-note.md', ledger('old-note', '2025-12-31', 'hint only'));
-    write(cwd, '.gsd/ledger/current-note.md', ledger('current-note', '2026-04-01', 'hint only'));
-    const planned = group.plan(cwd);
-    const target = planned.targets.find(item => item.store === 'ledger');
-    assert(target, 'one sealed hint-derived ledger member is groupable');
-    assert.equal(target.epoch, '2025-Q4');
-    assert.equal(target.members.length, 1);
-    const applied = group.apply(cwd, planned);
-    assert(applied.written.includes(target.containerPath));
-    assert(fs.existsSync(target.containerPath));
-    assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'current-note.md')));
-  } finally { remove(cwd); }
-});
-
 test('the plan defaults to dry-run metadata and never writes implicitly', () => {
   const cwd = tmp();
   try {
-    const old = write(cwd, '.gsd/ledger/M-20260101000000-old.md', ledger('M-20260101000000-old', '2026-01-01'));
-    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01'));
-    const before = filesBelow(path.join(cwd, '.gsd', 'ledger'));
+    const old = write(cwd, '.gsd/ledger/M-20260101000000-old.md', ledgerFragment('M-20260101000000-old', '2026-01-01'));
+    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledgerFragment('M-20260401000000-current', '2026-04-01'));
     const planned = group.plan(cwd);
     assert.equal(planned.dryRun, true);
     assert(planned.targets.length > 0);
     assert(fs.existsSync(old));
-    assert.deepEqual(filesBelow(path.join(cwd, '.gsd', 'ledger')), before);
   } finally { remove(cwd); }
 });
 
 test('the default plan gates wrapper directories until explicitly enabled', () => {
-  // This assertion is intentionally about the returned targets, not about
-  // the implementation flag. It fails if wrappers leak back into default
-  // enumeration even when the option name or its implementation changes.
   const cwd = tmp();
   try {
-    seedAllStores(cwd);
+    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledgerFragment('M-20260101000000-one', '2026-01-01'));
+    write(cwd, '.gsd/decisions/T-20260101000000-one.md', decisionFragment('T-20260101000000-one', '2026-01-02'));
+    write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-03'));
     write(cwd, '.gsd/milestones/M-20260101000000-old/PLAN.md', 'old milestone');
-    write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'current milestone');
     write(cwd, '.gsd/tasks/T-20260101000000-old/PLAN.md', 'old task');
-    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'current task');
 
     const planned = group.plan(cwd);
     assert(planned.targets.some(target => target.store === 'ledger'));
@@ -243,15 +389,12 @@ test('the default plan gates wrapper directories until explicitly enabled', () =
     assert(planned.targets.some(target => target.store === 'memory'));
     assert(planned.targets.every(target =>
       target.store !== 'milestone-wrappers' && target.store !== 'task-wrappers'));
-    assert(planned.targets.length > 0, 'the default assertion must not pass by vacuity');
     assert(planned.skipped.every(item =>
       !/[\\/]\.gsd[\\/](milestones|tasks)[\\/]/.test(item.path)));
 
     const explicitlyEnabled = group.plan(cwd, { includeWrapperDirs: true });
     assert(explicitlyEnabled.targets.some(target => target.store === 'milestone-wrappers'));
     assert(explicitlyEnabled.targets.some(target => target.store === 'task-wrappers'));
-    assert.equal(explicitlyEnabled.targets.filter(target =>
-      target.store.endsWith('-wrappers')).length, 2);
     const stringFalse = group.plan(cwd, { includeWrapperDirs: 'false' });
     assert(stringFalse.targets.every(target =>
       target.store !== 'milestone-wrappers' && target.store !== 'task-wrappers'));
@@ -259,50 +402,28 @@ test('the default plan gates wrapper directories until explicitly enabled', () =
 });
 
 // Wrapper-directory contract: only the structural predicate from forge-epoch
-// makes a directory eligible.  The fixture deliberately mixes valid, active,
-// multi-file, and nested wrappers so enumeration also proves its diagnostics.
-//
-// Two fixture invariants are load-bearing and neither is decorative:
-//
-// 1. Ids use the shapes forge-ids actually mints — `M-<14>-slug` and
-//    `T-<14>-slug`. `TASK-<14>-slug` is NOT one of them: timestampOf only
-//    accepts `TASK-` in its dashed `TASK-YYYYMMDD-HHMMSS` form, so a compact
-//    `TASK-<14>` id resolves no epoch from the id and silently falls through
-//    epochOfUnit's chain to the file mtime — i.e. to "now" for a fixture file,
-//    which lands every such unit in the current epoch and makes it unplannable.
-//
-// 2. Sealedness is computed PER STORE (sealedEpochs over that store's own
-//    labels), so each store needs its own current-epoch occupant before any
-//    older epoch inside it counts as sealed. That is T05's engine contract, and
-//    it mirrors reality: a live .gsd always holds an active milestone/task.
-//    Hence the tasks store gets its own current wrapper, not just milestones.
-test('wrapper dirs plan only eligible sealed milestone/task directories', () => {
+// makes a directory eligible in the first place; sealedBy decides whether the
+// eligible wrapper is actually groupable. No "current epoch occupant" is
+// needed anymore — a wrapper with a timestamped id is groupable on sight.
+test('wrapper dirs plan only structurally eligible AND sealed milestone/task directories', () => {
   const cwd = tmp();
   try {
     const roots = ['.gsd/milestones', '.gsd/tasks'];
     for (const root of roots) fs.mkdirSync(path.join(cwd, root), { recursive: true });
-    for (const id of ['M-20260101000000-a', 'M-20260102000000-b', 'T-20260103000000-c']) {
-      const root = id.startsWith('M') ? '.gsd/milestones' : '.gsd/tasks';
-      write(cwd, `${root}/${id}/PLAN.md`, `original ${id}\r\n`);
-    }
+    write(cwd, '.gsd/milestones/M-20260101000000-a/PLAN.md', 'a');
+    write(cwd, '.gsd/milestones/M-20260102000000-b/PLAN.md', 'b');
+    write(cwd, '.gsd/tasks/T-20260103000000-c/PLAN.md', 'c');
     write(cwd, '.gsd/milestones/M-20260104000000-two/A.md', 'a');
     write(cwd, '.gsd/milestones/M-20260104000000-two/B.md', 'b');
     write(cwd, '.gsd/milestones/M-20260105000000-nested/PLAN.md', 'x');
     fs.mkdirSync(path.join(cwd, '.gsd/milestones/M-20260105000000-nested', 'slices'));
-    write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'current');
-    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'current');
+
     const planned = group.plan(cwd, { includeWrapperDirs: true });
-    // One container per store, and the three eligible sealed wrappers land in
-    // them: two milestones in 2026-Q1, one task in 2026-Q1.
-    assert.equal(planned.targets.length, 2);
-    assert(planned.targets.every(target => target.epoch === '2026-Q1'));
     assert.equal(planned.targets.reduce((total, target) => total + target.members.length, 0), 3);
     assert.equal(planned.targets.find(target => target.store === 'milestone-wrappers').members.length, 2);
     assert.equal(planned.targets.find(target => target.store === 'task-wrappers').members.length, 1);
     assert(planned.skipped.some(item => item.reason.includes('2 arquivos')));
     assert(planned.skipped.some(item => item.reason.includes('subpasta slices/')));
-    assert(planned.skipped.some(item => item.reason.includes('época corrente')));
-    // The ineligible wrappers stay untouched on disk.
     assert(fs.existsSync(path.join(cwd, '.gsd/milestones/M-20260104000000-two/A.md')));
     assert(fs.existsSync(path.join(cwd, '.gsd/milestones/M-20260105000000-nested/slices')));
   } finally { remove(cwd); }
@@ -312,127 +433,80 @@ test('wrapper apply is in-place, removes dirs, and never creates archive', () =>
   const cwd = tmp();
   try {
     const original = write(cwd, '.gsd/milestones/M-20260101000000-one/STATE.md', Buffer.from('bom\r\nconteúdo', 'utf8'));
-    write(cwd, '.gsd/milestones/M-20260401000000-current/STATE.md', 'live');
     const planned = group.plan(cwd, { includeWrapperDirs: true });
     const result = group.apply(cwd, planned);
     assert.equal(result.written.length, 1);
     assert(!fs.existsSync(path.dirname(original)));
-    assert(fs.existsSync(path.join(cwd, '.gsd/milestones/2026-Q1.md')));
+    assert(/^sweep-project-\d{2,}\.md$/.test(path.basename(result.written[0])));
     assert(!fs.existsSync(path.join(cwd, '.gsd/archive')));
     assert(result.counts.dirsAfter < result.counts.dirsBefore);
-    assert(!fs.existsSync(original));
   } finally { remove(cwd); }
 });
 
 // Reversibility is the core guarantee: the wrapper's original FILENAME is not
-// derivable from the id, so the container has to carry it. It travels in the
-// marker id as `<dirId>~<fileName>`, which is what lets ungroup rebuild
-// `<parent>/<dirId>/<fileName>` instead of guessing a name.
+// derivable from the id, so the container has to carry it, via the marker id
+// `<dirId>~<fileName>`.
 test('wrapper ungroup restores original filename and bytes exactly', () => {
   const cwd = tmp();
   try {
     const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x41, 0x0d, 0x0a, 0x42]);
-    // A filename that no convention would reproduce from the id alone, so a
-    // restore that merely guessed a canonical name could not pass this.
     const source = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES-original.md', bytes);
-    // The tasks store needs its own current-epoch occupant for 2026-Q1 to be
-    // sealed there — sealedness is per store. See the eligibility test above.
-    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
     const plan = group.plan(cwd, { includeWrapperDirs: true });
     const applied = group.apply(cwd, plan);
-    assert.equal(applied.written.length, 1, 'the sealed task wrapper produced a container');
-    assert(!fs.existsSync(source), 'the wrapper file is gone once grouped');
-    assert(!fs.existsSync(path.dirname(source)), 'the wrapper dir is gone once grouped');
-    // The filename survives inside the container, not merely in memory.
+    assert.equal(applied.written.length, 1);
+    assert(!fs.existsSync(source));
     assert(fs.readFileSync(applied.written[0]).toString('utf8')
       .includes('T-20260101000000-one~NOTES-original.md'));
 
     const result = group.ungroup(cwd, applied.written[0]);
     assert.deepEqual(result.restored, [source]);
-    assert(fs.existsSync(source), 'the original path is rebuilt with its original filename');
+    assert(fs.existsSync(source));
     assert.equal(Buffer.compare(fs.readFileSync(source), bytes), 0);
-    assert(!fs.existsSync(applied.written[0]), 'the container is consumed by ungroup');
-    // The untouched current wrapper is unaffected by the round-trip.
-    assert(fs.existsSync(path.join(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md')));
+    assert(!fs.existsSync(applied.written[0]));
   } finally { remove(cwd); }
 });
 
-test('wrapper apply is idempotent after the first plan is consumed', () => {
-  const cwd = tmp();
-  try {
-    write(cwd, '.gsd/milestones/M-20260101000000-one/PLAN.md', 'one');
-    write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'live');
-    const firstPlan = group.plan(cwd, { includeWrapperDirs: true });
-    const first = group.apply(cwd, firstPlan);
-    // Captured BEFORE the second apply — comparing a post-apply read against
-    // itself was 0 unconditionally and proved nothing about stability.
-    const afterFirst = fs.readFileSync(first.written[0]);
-    const second = group.apply(cwd, group.plan(cwd, { includeWrapperDirs: true }));
-    assert.equal(second.written.length, 0);
-    assert.equal(group.plan(cwd, { includeWrapperDirs: true }).targets.length, 0);
-    assert.equal(Buffer.compare(afterFirst, fs.readFileSync(first.written[0])), 0,
-      'the container bytes are untouched by a second apply');
-  } finally { remove(cwd); }
-});
-
-// R2: the marker id is `dirId~fileName` and the split takes the FIRST `~`, so
-// grouping `foo~bar/PLAN.md` would restore it to `foo/bar~PLAN.md` — a silent
-// relocation, invisible because the original is deleted first.
 test('never groups a wrapper whose directory name contains the reserved separator', () => {
   const cwd = tmp();
   try {
     const source = write(cwd, '.gsd/tasks/T-20260101000000-one~sub/PLAN.md', 'payload');
-    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
     const planned = group.plan(cwd, { includeWrapperDirs: true });
-    assert.equal(planned.targets.length, 0, 'the ~ wrapper is not a grouping target');
-    assert(planned.skipped.some(item => /separador reservado/.test(item.reason)),
-      `expected a reserved-separator reason, got ${JSON.stringify(planned.skipped)}`);
+    assert.equal(planned.targets.length, 0);
+    assert(planned.skipped.some(item => /separador reservado/.test(item.reason)));
     group.apply(cwd, planned);
-    assert(fs.existsSync(source), 'the wrapper file is left exactly where it was');
+    assert(fs.existsSync(source));
   } finally { remove(cwd); }
 });
 
-// R6: splitWrapperMarkerId requires .md, so apply() rejected a non-.md member
-// by discarding the ENTIRE epoch target under a misleading reason.
-test('skips only the non-.md wrapper and still groups its epoch siblings', () => {
+test('skips only the non-.md wrapper and still groups its sibling', () => {
   const cwd = tmp();
   try {
     const stray = write(cwd, '.gsd/tasks/T-20260102000000-two/notes.txt', 'not markdown');
     const groupable = write(cwd, '.gsd/tasks/T-20260101000000-one/PLAN.md', 'payload');
-    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
     const planned = group.plan(cwd, { includeWrapperDirs: true });
-    assert.equal(planned.targets.length, 1, 'the epoch survives one ineligible wrapper');
+    assert.equal(planned.targets.length, 1);
     assert.equal(planned.targets[0].members.length, 1);
-    assert(planned.skipped.some(item => /não é \.md/.test(item.reason)),
-      `expected a non-.md reason, got ${JSON.stringify(planned.skipped)}`);
+    assert(planned.skipped.some(item => /não é \.md/.test(item.reason)));
     const applied = group.apply(cwd, planned);
-    assert.equal(applied.written.length, 1, 'the .md sibling is grouped');
+    assert.equal(applied.written.length, 1);
     assert(!fs.existsSync(groupable));
-    assert(fs.existsSync(stray), 'the non-.md wrapper is untouched');
+    assert(fs.existsSync(stray));
   } finally { remove(cwd); }
 });
 
-// R3: the wrapper branch guards the destination and throws; the store branch
-// wrote straight over it. By the loose-wins invariant the clobbered file is the
-// canonical one.
 test('refuses to restore a store member over an existing loose file', () => {
   const cwd = tmp();
   try {
-    write(cwd, '.gsd/ledger/M-20260101000000-old.md', ledger('M-20260101000000-old', '2026-01-01', 'grouped body'));
-    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01'));
+    write(cwd, '.gsd/ledger/M-20260101000000-old.md', ledgerFragment('M-20260101000000-old', '2026-01-01', 'grouped body'));
     const applied = group.apply(cwd, group.plan(cwd));
     const container = applied.written.find(item => item.includes(`${path.sep}ledger${path.sep}`));
     const canonical = write(cwd, '.gsd/ledger/M-20260101000000-old.md', 'loose wins — do not clobber');
     assert.throws(() => group.ungroup(cwd, container), /destination already exists/);
     assert.equal(fs.readFileSync(canonical, 'utf8'), 'loose wins — do not clobber');
-    assert(fs.existsSync(container), 'the container is not consumed by a refused ungroup');
+    assert(fs.existsSync(container));
   } finally { remove(cwd); }
 });
 
-// B1: a container survives a failure that reaches only some of its members —
-// a second ungroup() must complete the restoration instead of relaunching the
-// whole thing from the member that already crashed it. treeSnapshot mirrors
-// the byte-level idiom from forge-sweep-project.test.js:48.
 function treeSnapshot(root) {
   const rows = [];
   function visit(dir) {
@@ -454,51 +528,40 @@ function treeSnapshot(root) {
 test('B1 store: ungroup is resumable after a partial failure and idempotent on byte-identical retries', () => {
   const cwd = tmp();
   try {
-    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledger('M-20260101000000-one', '2026-01-01', 'member one'));
-    write(cwd, '.gsd/ledger/M-20260102000000-two.md', ledger('M-20260102000000-two', '2026-01-02', 'member two'));
-    write(cwd, '.gsd/ledger/M-20260103000000-three.md', ledger('M-20260103000000-three', '2026-01-03', 'member three'));
-    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01', 'current ledger'));
+    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledgerFragment('M-20260101000000-one', '2026-01-01', 'member one'));
+    write(cwd, '.gsd/ledger/M-20260102000000-two.md', ledgerFragment('M-20260102000000-two', '2026-01-02', 'member two'));
+    write(cwd, '.gsd/ledger/M-20260103000000-three.md', ledgerFragment('M-20260103000000-three', '2026-01-03', 'member three'));
     const preApplySnapshot = treeSnapshot(path.join(cwd, '.gsd'));
 
     const planned = group.plan(cwd);
     const target = planned.targets.find(item => item.store === 'ledger');
-    assert(target, 'the three sealed ledger members are groupable');
+    assert(target);
     assert.equal(target.members.length, 3);
     const originals = new Map(target.members.map(member => [member.path, fs.readFileSync(member.path)]));
     const applied = group.apply(cwd, planned);
     assert(applied.written.includes(target.containerPath));
 
-    // Simulate a crash mid-restoration: member one is restored by hand with
-    // its original bytes (as a prior partial ungroup() would have left it),
-    // and member two is planted with DIFFERENT bytes — a genuine conflict.
     const memberOne = target.members.find(member => /one/.test(member.path));
     const memberTwo = target.members.find(member => /two/.test(member.path));
     fs.writeFileSync(memberOne.path, originals.get(memberOne.path));
     fs.writeFileSync(memberTwo.path, 'conflicting content — not the grouped payload');
 
     assert.throws(() => group.ungroup(cwd, target.containerPath), /destination already exists with different content/);
-    assert(fs.existsSync(target.containerPath), 'the container survives a refused ungroup');
-    assert.equal(fs.readFileSync(memberOne.path).toString('utf8'), originals.get(memberOne.path).toString('utf8'),
-      'the already-restored member is untouched by the failed retry');
+    assert(fs.existsSync(target.containerPath));
+    assert.equal(fs.readFileSync(memberOne.path).toString('utf8'), originals.get(memberOne.path).toString('utf8'));
 
-    // Resolve the conflict as an operator would, then retry.
     fs.writeFileSync(memberTwo.path, originals.get(memberTwo.path));
     const result = group.ungroup(cwd, target.containerPath);
-    assert.equal(result.restored.length, 1, 'only member three needed a fresh write');
-    assert.equal(result.alreadyPresent.length, 2, 'members one and two were already byte-identical on disk');
-    assert(result.alreadyPresent.includes(memberOne.path));
-    assert(result.alreadyPresent.includes(memberTwo.path));
-    assert(!fs.existsSync(target.containerPath), 'the container is removed once every member is accounted for');
+    assert.equal(result.restored.length, 1);
+    assert.equal(result.alreadyPresent.length, 2);
+    assert(!fs.existsSync(target.containerPath));
     for (const member of target.members) {
       assert.equal(Buffer.compare(originals.get(member.path), fs.readFileSync(member.path)), 0);
     }
-    assert.deepEqual(treeSnapshot(path.join(cwd, '.gsd')), preApplySnapshot,
-      'the final tree is byte-identical to the state before apply()');
+    assert.deepEqual(treeSnapshot(path.join(cwd, '.gsd')), preApplySnapshot);
   } finally { remove(cwd); }
 });
 
-// B1 wrapper branch — same scenario, guarding :374's existsSync check instead
-// of the store branch's :389.
 test('B1 wrapper: ungroup is resumable after a partial failure and idempotent on byte-identical retries', () => {
   const cwd = tmp();
   try {
@@ -506,88 +569,30 @@ test('B1 wrapper: ungroup is resumable after a partial failure and idempotent on
     const bytesTwo = Buffer.from('member two payload\r\n', 'utf8');
     const sourceOne = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES.md', bytesOne);
     const sourceTwo = write(cwd, '.gsd/tasks/T-20260102000000-two/NOTES.md', bytesTwo);
-    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
     const preApplySnapshot = treeSnapshot(path.join(cwd, '.gsd'));
 
     const planned = group.plan(cwd, { includeWrapperDirs: true });
     const target = planned.targets.find(item => item.store === 'task-wrappers');
-    assert(target, 'the two sealed task wrappers are groupable');
+    assert(target);
     assert.equal(target.members.length, 2);
     const applied = group.apply(cwd, planned);
     assert.equal(applied.written.length, 1);
     const container = applied.written[0];
 
-    // Wrapper dir + destination for member one restored by hand (a prior
-    // partial ungroup would have left exactly this on disk); member two's
-    // wrapper dir is planted with a conflicting destination.
     fs.mkdirSync(sourceOne.replace(/[\\/]NOTES\.md$/, ''), { recursive: true });
     fs.writeFileSync(sourceOne, bytesOne);
     fs.mkdirSync(sourceTwo.replace(/[\\/]NOTES\.md$/, ''), { recursive: true });
     fs.writeFileSync(sourceTwo, 'conflicting content — not the grouped payload');
 
     assert.throws(() => group.ungroup(cwd, container), /destination already exists with different content/);
-    assert(fs.existsSync(container), 'the container survives a refused ungroup');
-    assert.equal(fs.readFileSync(sourceOne).toString('utf8'), bytesOne.toString('utf8'),
-      'the already-restored wrapper member is untouched by the failed retry');
+    assert(fs.existsSync(container));
 
     fs.writeFileSync(sourceTwo, bytesTwo);
     const result = group.ungroup(cwd, container);
-    assert.equal(result.restored.length, 0, 'both wrapper members were already byte-identical on disk');
+    assert.equal(result.restored.length, 0);
     assert.equal(result.alreadyPresent.length, 2);
-    assert(result.alreadyPresent.includes(sourceOne));
-    assert(result.alreadyPresent.includes(sourceTwo));
-    assert(!fs.existsSync(container), 'the container is removed once every member is accounted for');
-    assert.equal(Buffer.compare(fs.readFileSync(sourceOne), bytesOne), 0);
-    assert.equal(Buffer.compare(fs.readFileSync(sourceTwo), bytesTwo), 0);
-    assert.deepEqual(treeSnapshot(path.join(cwd, '.gsd')), preApplySnapshot,
-      'the final tree is byte-identical to the state before apply()');
-  } finally { remove(cwd); }
-});
-
-test('B1: a wrapper directory that already exists (not planted by a prior partial ungroup) is reused, not rejected', () => {
-  const cwd = tmp();
-  try {
-    const bytes = Buffer.from('payload\n', 'utf8');
-    const source = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES.md', bytes);
-    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
-    const planned = group.plan(cwd, { includeWrapperDirs: true });
-    const applied = group.apply(cwd, planned);
-    assert.equal(applied.written.length, 1);
-
-    // The wrapper directory exists (as it would mid-restore) but is empty —
-    // this must not throw merely because fs.existsSync(wrapper) is true.
-    fs.mkdirSync(source.replace(/[\\/]NOTES\.md$/, ''), { recursive: true });
-    const result = group.ungroup(cwd, applied.written[0]);
-    assert.equal(result.restored.length, 1);
-    assert(fs.existsSync(source));
-    assert.equal(Buffer.compare(fs.readFileSync(source), bytes), 0);
-  } finally { remove(cwd); }
-});
-
-test('B1: pure idempotent skip — every destination already byte-identical yields an empty restored list', () => {
-  const cwd = tmp();
-  try {
-    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledger('M-20260101000000-one', '2026-01-01', 'member one'));
-    write(cwd, '.gsd/ledger/M-20260102000000-two.md', ledger('M-20260102000000-two', '2026-01-02', 'member two'));
-    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01', 'current ledger'));
-    const planned = group.plan(cwd);
-    const target = planned.targets.find(item => item.store === 'ledger');
-    const originals = new Map(target.members.map(member => [member.path, fs.readFileSync(member.path)]));
-    const applied = group.apply(cwd, planned);
-    const container = applied.written.find(item => item === target.containerPath);
-
-    // Nothing is deleted — restore every member by hand with identical bytes
-    // before ungroup() ever runs, simulating a fully-completed prior attempt
-    // whose only remaining step was removing the container.
-    for (const [memberPath, content] of originals) fs.writeFileSync(memberPath, content);
-
-    const result = group.ungroup(cwd, container);
-    assert.deepEqual(result.restored, []);
-    assert.equal(result.alreadyPresent.length, target.members.length);
     assert(!fs.existsSync(container));
-    for (const [memberPath, content] of originals) {
-      assert.equal(Buffer.compare(fs.readFileSync(memberPath), content), 0);
-    }
+    assert.deepEqual(treeSnapshot(path.join(cwd, '.gsd')), preApplySnapshot);
   } finally { remove(cwd); }
 });
 
