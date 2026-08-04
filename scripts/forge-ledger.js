@@ -29,10 +29,25 @@ const fs = require('fs');
 const path = require('path');
 const { isValid, entityKind } = require('./forge-ids');
 const { parseScalar, serializeScalar, writeAtomic } = require('./forge-yaml-safe');
+const { isGroupedFile, readGroupedUnits, unitTextOf } = require('./forge-grouped-file');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const LEDGER_DIR = '.gsd/ledger';
+
+// Grouped containers are a read format only. listFragments exposes one
+// envelope per unit and preserves the physical container path for provenance.
+// The grouped and epoch fields are additive metadata for existing consumers.
+// A container parse error is reported on stderr with its source filename and
+// member id, allowing callers to retain healthy units during partial reads.
+// Loose files are discovered first so the loose representation is canonical.
+// readFragment deliberately checks the canonical loose path first, then
+// reuses listFragments for the grouped fallback rather than duplicating the
+// directory scan. writeFragment never accepts a container path as a target.
+// This keeps reads additive while preserving the established write contract.
+//
+// The helper module owns marker parsing, byte bounds, and epoch extraction.
+// This store only maps those parsed units into ledger-shaped envelopes.
 
 // ── Schema guard seam (M-S01 T04) ────────────────────────────────────────────
 // Lazy require, deliberately: forge-schema-guard → forge-migrate →
@@ -260,9 +275,10 @@ function serializeFrontmatter(entry) {
 // Returns { path: string, created: boolean }
 // created: false if file existed and content is identical (idempotent).
 function writeFragment(cwd, entry, opts) {
-  opts = opts || {};
   // Refuse before any validation or serialization — nothing reaches disk.
+  // Grouped containers are never edited; this always writes fragmentPath().
   assertWriteHere(cwd);
+  opts = opts || {};
   if (!entry || !entry.id) {
     throw new Error('entry.id is required');
   }
@@ -307,9 +323,18 @@ function readFragment(cwd, id) {
     throw e; // propagate invalid id error
   }
 
-  if (!fs.existsSync(fpath)) return null;
-  const text = fs.readFileSync(fpath, 'utf8');
-  return parseFragment(text);
+  if (fs.existsSync(fpath)) return parseFragment(fs.readFileSync(fpath, 'utf8'));
+  const entry = listFragments(cwd).find(item => item.id === id);
+  return entry ? parseFragment(readFragmentText(cwd, entry)) : null;
+}
+
+function readFragmentText(cwd, entry) {
+  if (!entry || !entry.path) throw new Error('fragment entry is required');
+  if (!entry.grouped) return fs.readFileSync(entry.path, 'utf8');
+  const parsed = readGroupedUnits(entry.path);
+  const unit = parsed.units.find(item => item.id === entry.id);
+  if (!unit) throw new Error(`Grouped ledger unit not found: ${entry.id}`);
+  return unitTextOf(unit.content);
 }
 
 // ── listFragments ─────────────────────────────────────────────────────────────
@@ -321,14 +346,34 @@ function listFragments(cwd) {
   const dir = ledgerDir(cwd);
   if (!fs.existsSync(dir)) return [];
 
-  const files = fs.readdirSync(dir);
-  const fragments = files
-    .filter(f => f.endsWith('.md'))
-    .map(f => ({
-      id: f.slice(0, -3), // strip .md
-      path: path.join(dir, f),
-    }))
-    .sort((a, b) => a.id.localeCompare(b.id));
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.md'));
+  const looseIds = new Set();
+  const fragments = [];
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const buffer = fs.readFileSync(filePath);
+    if (isGroupedFile(file, buffer)) continue;
+    const id = file.slice(0, -3);
+    looseIds.add(id);
+    fragments.push({ id, path: filePath, grouped: false, epoch: null });
+  }
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const buffer = fs.readFileSync(filePath);
+    if (!isGroupedFile(file, buffer)) continue;
+    const parsed = readGroupedUnits(filePath);
+    for (const error of parsed.errors) {
+      process.stderr.write(`[forge-ledger] warn: container ${file} id ${error.id || '<unknown>'}: ${error.reason}\n`);
+    }
+    for (const unit of parsed.units) {
+      if (looseIds.has(unit.id)) {
+        process.stderr.write(`[forge-ledger] warn: unidade ${unit.id} existe solta e em ${file} — usando a solta\n`);
+        continue;
+      }
+      fragments.push({ id: unit.id, path: filePath, grouped: true, epoch: parsed.epoch });
+    }
+  }
+  fragments.sort((a, b) => a.id.localeCompare(b.id));
 
   return fragments;
 }
@@ -608,6 +653,7 @@ module.exports = {
   fragmentPath,
   writeFragment,
   readFragment,
+  readFragmentText,
   listFragments,
   parseFragment,
 };

@@ -1,0 +1,133 @@
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { serializeGroup } = require('./forge-grouped-file');
+const decisions = require('./forge-decisions');
+
+let passed = 0;
+let failed = 0;
+const failures = [];
+
+function test(name, fn) {
+  try { fn(); passed++; console.log(`  ✓ ${name}`); }
+  catch (error) { failed++; failures.push({ name, error }); console.log(`  ✗ ${name}`); }
+}
+
+function fixture() {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-decisions-grouped-'));
+  fs.mkdirSync(decisions.decisionsDir(cwd), { recursive: true });
+  const entries = ['M001', 'M002', 'M003'].map((unit_id, index) => ({
+    unit_id,
+    decisions: [{ when: `2026-01-0${index + 1}`, scope: 'test', decision: `Decision ${index}`, choice: 'keep', rationale: 'fixture', revisable: 'yes' }],
+    body: `body-${unit_id}`,
+  }));
+  for (const entry of entries) decisions.writeFragment(cwd, entry);
+  return { cwd, entries };
+}
+
+function groupEntries(cwd, ids, epoch) {
+  const units = ids.map(unitId => ({
+    id: unitId,
+    content: fs.readFileSync(decisions.fragmentPath(cwd, unitId)),
+  }));
+  const result = serializeGroup({ epoch, units });
+  const container = path.join(decisions.decisionsDir(cwd), `${epoch}.md`);
+  fs.writeFileSync(container, result.buffer);
+  for (const unitId of ids) fs.unlinkSync(decisions.fragmentPath(cwd, unitId));
+  return container;
+}
+
+function captureStderr(fn) {
+  let output = '';
+  const original = process.stderr.write;
+  process.stderr.write = value => { output += String(value); return true; };
+  try { fn(); } finally { process.stderr.write = original; }
+  return output;
+}
+
+test('grouped decisions preserve the loose unit count', () => {
+  const { cwd } = fixture();
+  const before = decisions.listFragments(cwd);
+  groupEntries(cwd, ['M001', 'M002'], '2026-Q1');
+  const after = decisions.listFragments(cwd);
+  assert.strictEqual(before.length, 3);
+  assert.strictEqual(after.length, before.length);
+  assert.ok(after.every(entry => typeof entry.grouped === 'boolean'));
+  assert.ok(after.every(entry => typeof entry.epoch === 'string' || entry.epoch === null));
+  assert.ok(after.every(entry => fs.existsSync(entry.path)));
+});
+
+test('readFragment and readFragmentText return one grouped decision fragment', () => {
+  const { cwd } = fixture();
+  groupEntries(cwd, ['M001', 'M002'], '2026-Q1');
+  const listed = decisions.listFragments(cwd).find(entry => entry.unitId === 'M001');
+  assert.strictEqual(listed.grouped, true);
+  const text = decisions.readFragmentText(cwd, listed);
+  assert.ok(text.includes('unit_id: M001'));
+  assert.deepStrictEqual(decisions.readFragment(cwd, 'M001'), decisions.parseFragment(text));
+});
+
+test('loose decision duplicate wins and is warned', () => {
+  const { cwd } = fixture();
+  const original = fs.readFileSync(decisions.fragmentPath(cwd, 'M001'));
+  const container = path.join(decisions.decisionsDir(cwd), '2026-Q2.md');
+  fs.writeFileSync(container, serializeGroup({ epoch: '2026-Q2', units: [{ id: 'M001', content: original }] }).buffer);
+  const warning = captureStderr(() => {
+    const list = decisions.listFragments(cwd).filter(entry => entry.unitId === 'M001');
+    assert.strictEqual(list.length, 1);
+    assert.strictEqual(list[0].grouped, false);
+  });
+  assert.ok(warning.includes('M001'));
+  assert.ok(warning.includes('usando a solta'));
+});
+
+test('loose entries carry null epoch while members carry the container epoch', () => {
+  const { cwd } = fixture();
+  groupEntries(cwd, ['M001'], '2026-Q9');
+  const list = decisions.listFragments(cwd);
+  assert.strictEqual(list.find(entry => entry.unitId === 'M001').epoch, '2026-Q9');
+  assert.strictEqual(list.find(entry => entry.unitId === 'M002').epoch, null);
+});
+
+test('readFragment preserves invalid-id behavior', () => {
+  const { cwd } = fixture();
+  assert.throws(() => decisions.readFragment(cwd, 'not-an-id'), /Invalid unit ID/);
+});
+
+test('member text is not the container frontmatter', () => {
+  const { cwd } = fixture();
+  const container = groupEntries(cwd, ['M001', 'M002'], '2026-Q1');
+  const entry = decisions.listFragments(cwd).find(item => item.unitId === 'M002');
+  const text = decisions.readFragmentText(cwd, entry);
+  assert.ok(text.includes('unit_id: M002'));
+  assert.ok(!text.includes('grouped_format: forge-group@1'));
+  assert.ok(fs.readFileSync(container, 'utf8').includes('grouped_format: forge-group@1'));
+});
+
+test('every grouped decision envelope points at the physical container', () => {
+  const { cwd } = fixture();
+  const container = groupEntries(cwd, ['M001', 'M002'], '2026-Q1');
+  for (const entry of decisions.listFragments(cwd).filter(item => item.grouped)) {
+    assert.strictEqual(entry.path, container);
+    assert.ok(fs.statSync(entry.path).isFile());
+  }
+});
+
+test('loose decision text remains the complete original fragment', () => {
+  const { cwd } = fixture();
+  const entry = decisions.listFragments(cwd).find(item => item.unitId === 'M003');
+  const text = decisions.readFragmentText(cwd, entry);
+  assert.ok(text.startsWith('---'));
+  assert.ok(text.includes('unit_id: M003'));
+  assert.ok(text.includes('Decision 2'));
+});
+
+if (failed) {
+  for (const failure of failures) console.error(`- ${failure.name}: ${failure.error.message}`);
+  process.exitCode = 1;
+} else {
+  console.log(`\n${passed} grouped decisions tests passed`);
+}
