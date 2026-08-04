@@ -11,6 +11,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const cliPath = path.join(__dirname, 'forge-sweep-project.js');
+const epochGroup = require('./forge-epoch-group');
 const { buildRegistry } = require('./forge-sweep-project');
 
 let passed = 0;
@@ -79,11 +80,25 @@ function writeLedger(cwd, id, completedAt) {
   ].join('\n'));
 }
 
+// The wrapper ids must produce a SEALED epoch, or the D11 gate reads as held
+// while protecting nothing.  sealedEpochs() calls the highest epoch present
+// "current", so one wrapper per root is never eligible however it is dated:
+// each root needs an older wrapper plus a newer one to seal it.
+const WRAPPER_IDS = Object.freeze({
+  milestones: Object.freeze(['M-20250101000000-wrapper', 'M-20250401000000-wrapper']),
+  tasks: Object.freeze(['T-20250101000000-wrapper', 'T-20250401000000-wrapper']),
+});
+
+function wrapperPaths(cwd, root) {
+  return WRAPPER_IDS[root].map(id => path.join(cwd, '.gsd', root, id, 'PLAN.md'));
+}
+
 function writeWrappers(cwd) {
   for (const root of ['milestones', 'tasks']) {
-    const wrapper = path.join(cwd, '.gsd', root, 'eligible-wrapper');
-    fs.mkdirSync(wrapper, { recursive: true });
-    fs.writeFileSync(path.join(wrapper, 'PLAN.md'), `wrapper ${root}\n`);
+    for (const file of wrapperPaths(cwd, root)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `wrapper ${path.basename(path.dirname(file))}\n`);
+    }
   }
 }
 
@@ -107,10 +122,11 @@ function cleanup(cwd) {
 }
 
 function wrapperBytes(cwd) {
-  return ['milestones', 'tasks'].map(root => ({
-    root,
-    bytes: fs.readFileSync(path.join(cwd, '.gsd', root, 'eligible-wrapper', 'PLAN.md')),
-  }));
+  const rows = [];
+  for (const root of ['milestones', 'tasks']) {
+    for (const file of wrapperPaths(cwd, root)) rows.push({ file, bytes: fs.readFileSync(file) });
+  }
+  return rows;
 }
 
 test('o registro contém apenas a operação número um', () => {
@@ -121,8 +137,9 @@ test('o registro contém apenas a operação número um', () => {
 
 test('fonte não oferece porta para wrappers além do comentário D11', () => {
   const source = fs.readFileSync(cliPath, 'utf8');
-  const mentions = source.match(/includeWrapperDirs/g) || [];
-  assert.strictEqual(mentions.length, 1);
+  // Counting mentions passes if someone opens the opt-in AND deletes the D11
+  // comment.  Ban the option being passed at all, comment or no comment.
+  assert.doesNotMatch(source, /includeWrapperDirs\s*:/);
   assert.doesNotMatch(source, /process\.env|\.env\b|config(?:uration)?/i);
   assert.doesNotMatch(source, /--(?:wrapper|wrappers)/i);
 });
@@ -135,6 +152,16 @@ test('argumentos inválidos retornam 2 e ajuda retorna 0', () => {
     const help = runScript(cwd, ['--help']);
     assert.strictEqual(help.status, 0);
     assert.match(help.stdout, /Uso:/);
+  } finally { cleanup(cwd); }
+});
+
+test('--json --apply sem --yes é argumento inválido', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-json-'));
+  try {
+    const result = runScript(cwd, ['--json', '--apply']);
+    assert.strictEqual(result.status, 2);
+    assert.match(result.stderr, /--json --apply exige --yes/);
+    assert.strictEqual(result.stdout, '');
   } finally { cleanup(cwd); }
 });
 
@@ -206,17 +233,55 @@ if (gitAvailable()) {
         const result = runScript(cwd, args);
         assert.strictEqual(result.status, 0, result.stderr);
         for (const item of original) {
-          const file = path.join(cwd, '.gsd', item.root, 'eligible-wrapper', 'PLAN.md');
-          assert(fs.existsSync(file), `${item.root} wrapper desapareceu`);
-          assert.deepStrictEqual(fs.readFileSync(file), item.bytes);
+          assert(fs.existsSync(item.file), `invólucro desapareceu: ${item.file}`);
+          assert.deepStrictEqual(fs.readFileSync(item.file), item.bytes);
         }
       }
       const preview = buildRegistry().preview({ cwd });
       assert(!preview.operations[0].targets.some(target => /-wrappers$/.test(target.store)));
+      // Non-vacuity: the same fixture DOES yield wrapper targets once the
+      // opt-in is passed, so the assertions above measure the closed gate.
+      const openedUp = epochGroup.plan(cwd, { includeWrapperDirs: true });
+      assert(openedUp.targets.some(target => target.store === 'milestone-wrappers'),
+        'fixture vácua: o opt-in não produz alvo de invólucro');
     } finally { cleanup(cwd); }
   });
 } else {
   skip('casos com repositório Git real');
 }
 
-process.stdout.write(`forge-sweep-project: ${passed} passed, ${skipped} skipped\n`);
+async function testVcsQueryFailureExitsOne() {
+  // Runs in-process because the failure must be injected into the same seam
+  // the CLI consumes.  Asserting exit 1 here is what a rename of the refusal
+  // sentence would break, back when the code matched that string literally.
+  const vcsSeam = require('./forge-vcs');
+  const { main } = require('./forge-sweep-project');
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-vcsfail-'));
+  writeLedger(cwd, 'M-20250101000000-alpha', '2025-01-01T00:00:00Z');
+  writeLedger(cwd, 'M-20250401000000-beta', '2025-04-01T00:00:00Z');
+  const realDetect = vcsSeam.detectVcs;
+  const realStatus = vcsSeam.workingStatus;
+  const stdoutWrite = process.stdout.write;
+  try {
+    vcsSeam.detectVcs = () => 'git';
+    vcsSeam.workingStatus = () => ({ vcs: 'git', ok: false, entries: [], error: 'status indisponível' });
+    process.stdout.write = () => true;
+    const code = await main(['--cwd', cwd]);
+    process.stdout.write = stdoutWrite;
+    assert.strictEqual(code, 1, 'falha de consulta ao VCS precisa sair com 1');
+    passed += 1;
+    process.stdout.write('  ✓ falha ao consultar o VCS sai com código 1\n');
+  } finally {
+    process.stdout.write = stdoutWrite;
+    vcsSeam.detectVcs = realDetect;
+    vcsSeam.workingStatus = realStatus;
+    cleanup(cwd);
+  }
+}
+
+testVcsQueryFailureExitsOne().then(() => {
+  process.stdout.write(`forge-sweep-project: ${passed} passed, ${skipped} skipped\n`);
+}).catch(error => {
+  process.stderr.write(`${error && error.stack ? error.stack : error}\n`);
+  process.exitCode = 1;
+});

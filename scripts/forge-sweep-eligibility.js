@@ -6,6 +6,18 @@
 const path = require('path');
 const vcsSeam = require('./forge-vcs');
 
+// The CLI maps a policy refusal to exit 1 by identity, not by re-spelling this
+// operator-facing pt-BR sentence at the call site.
+const VCS_QUERY_FAILURE_PREFIX = 'falha ao consultar estado do VCS:';
+
+function isVcsQueryFailure(reason) {
+  return typeof reason === 'string' && reason.startsWith(VCS_QUERY_FAILURE_PREFIX);
+}
+
+// An ancestor in one of these states makes every descendant unrecoverable,
+// whether or not the VCS enumerated the descendant itself.
+const CONTAINING_REASONS = new Set(['untracked', 'ignored']);
+
 const REASONS = {
   untracked: 'não versionado',
   ignored: 'ignorado pelo VCS',
@@ -24,25 +36,52 @@ function toRelativePosix(cwd, candidate) {
   return { ok: true, path: rel.split(path.sep).join('/') };
 }
 
+/**
+ * Walk from the path up to the cwd looking for a containing untracked or
+ * ignored directory.  `git status -uall --ignored` enumerates descendants, so
+ * this is redundant there; `svn status` does not, so relying on the per-path
+ * record alone would let a path under an unversioned directory read as clean.
+ */
+function containingRefusal(relPath, statuses) {
+  const parts = relPath.split('/');
+  for (let depth = parts.length - 1; depth > 0; depth -= 1) {
+    const ancestor = parts.slice(0, depth).join('/');
+    const kind = statuses.get(ancestor);
+    if (kind && CONTAINING_REASONS.has(kind)) return { ancestor, kind };
+  }
+  return null;
+}
+
 /** Exported small seam so path normalisation can be checked independently. */
 function classifyPath(cwd, candidate, statuses) {
   const normalised = toRelativePosix(cwd, candidate);
   if (!normalised.ok) return { eligible: false, reason: normalised.error };
-  if (!statuses.has(normalised.path)) return { eligible: true, path: normalised.path };
-  const kind = statuses.get(normalised.path);
-  const reason = REASONS[kind] || 'estado do VCS desconhecido';
-  return { eligible: false, path: normalised.path, reason: `${normalised.path} — ${reason}` };
+  if (statuses.has(normalised.path)) {
+    const kind = statuses.get(normalised.path);
+    const reason = REASONS[kind] || 'estado do VCS desconhecido';
+    return { eligible: false, path: normalised.path, reason: `${normalised.path} — ${reason}` };
+  }
+  const containing = containingRefusal(normalised.path, statuses);
+  if (containing) {
+    const reason = REASONS[containing.kind] || 'estado do VCS desconhecido';
+    return {
+      eligible: false,
+      path: normalised.path,
+      reason: `${normalised.path} — sob ${containing.ancestor}, ${reason}`,
+    };
+  }
+  return { eligible: true, path: normalised.path };
 }
 
 function targetPaths(target) {
   const paths = [];
   if (target && Array.isArray(target.members)) {
     for (const member of target.members) {
-      if (member && member.path) paths[paths.length] = member.path;
-      if (member && member.wrapperPath) paths[paths.length] = member.wrapperPath;
+      if (member && member.path) paths.push(member.path);
+      if (member && member.wrapperPath) paths.push(member.wrapperPath);
     }
   }
-  if (target && target.containerPath) paths[paths.length] = target.containerPath;
+  if (target && target.containerPath) paths.push(target.containerPath);
   return paths;
 }
 
@@ -67,7 +106,7 @@ function statusMap(entries) {
 function rejectedFilter(skipped, error) {
   return (target) => {
     const result = { eligible: false, reason: error };
-    skipped[skipped.length] = { path: target && target.containerPath, reason: result.reason };
+    skipped.push({ path: target && target.containerPath, reason: result.reason });
     return result;
   };
 }
@@ -85,7 +124,7 @@ function createEligibility(cwd, opts = {}) {
     const filter = (target) => {
       if (forced) return { eligible: true };
       const result = { eligible: false, reason: 'sem VCS — não há como desfazer' };
-      skipped[skipped.length] = { path: target && target.containerPath, reason: result.reason };
+      skipped.push({ path: target && target.containerPath, reason: result.reason });
       return result;
     };
     return { vcs, forced, filter, skipped };
@@ -95,14 +134,14 @@ function createEligibility(cwd, opts = {}) {
   // spawn another status command or turn a query failure into an empty map.
   const status = query(cwd, { ...opts, vcs });
   if (!status || status.ok !== true) {
-    const error = (status && status.error) || 'falha ao consultar estado do VCS';
-    const filter = rejectedFilter(skipped, `falha ao consultar estado do VCS: ${error}`);
+    const error = (status && status.error) || 'motivo não informado';
+    const filter = rejectedFilter(skipped, `${VCS_QUERY_FAILURE_PREFIX} ${error}`);
     return { vcs, forced: false, filter, skipped };
   }
 
   const mapped = statusMap(status.entries);
   if (!mapped.ok) {
-    const filter = rejectedFilter(skipped, `falha ao consultar estado do VCS: ${mapped.error}`);
+    const filter = rejectedFilter(skipped, `${VCS_QUERY_FAILURE_PREFIX} ${mapped.error}`);
     return { vcs, forced: false, filter, skipped };
   }
   const statuses = mapped.statuses;
@@ -110,7 +149,7 @@ function createEligibility(cwd, opts = {}) {
     for (const itemPath of targetPaths(target)) {
       const result = classifyPath(cwd, itemPath, statuses);
       if (!result.eligible) {
-        skipped[skipped.length] = { path: itemPath, reason: result.reason };
+        skipped.push({ path: itemPath, reason: result.reason });
         return result;
       }
     }
@@ -122,4 +161,6 @@ function createEligibility(cwd, opts = {}) {
 module.exports = {
   createEligibility,
   classifyPath,
+  isVcsQueryFailure,
+  VCS_QUERY_FAILURE_PREFIX,
 };

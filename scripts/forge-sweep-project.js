@@ -11,7 +11,7 @@ const readline = require('readline');
 
 const epochGroup = require('./forge-epoch-group');
 const { createRegistry, formatPreview } = require('./forge-sweep-registry');
-const { createEligibility } = require('./forge-sweep-eligibility');
+const { createEligibility, isVcsQueryFailure } = require('./forge-sweep-eligibility');
 
 const USAGE = [
   'Uso: node scripts/forge-sweep-project.js [opções]',
@@ -58,6 +58,9 @@ function parseArgs(argv) {
   }
   if (options.yes && !options.apply) throw new Error('--yes exige --apply');
   if (options.force && !options.apply) throw new Error('--force exige --apply');
+  // An interactive prompt would have to share stdout with the report, breaking
+  // the single-JSON-document invariant; require the non-interactive path.
+  if (options.json && options.apply && !options.yes) throw new Error('--json --apply exige --yes');
   return options;
 }
 
@@ -84,9 +87,9 @@ function resultErrors(result) {
 function eligibilityError(result) {
   for (const operation of result.preview.operations) {
     for (const item of operation.skipped || []) {
-      if (typeof item.reason === 'string' && item.reason.startsWith('falha ao consultar estado do VCS:')) {
-        return item.reason;
-      }
+      // The policy module owns this sentence; matching it by predicate keeps a
+      // rename from silently degrading the exit code that automation reads.
+      if (isVcsQueryFailure(item.reason)) return item.reason;
     }
   }
   return null;
@@ -135,6 +138,9 @@ function askForConfirmation() {
   // main's TTY branch first creates a dry preview and asks before its apply run.
   return new Promise(resolve => {
     const terminal = readline.createInterface({ input: process.stdin, output: process.stderr });
+    // EOF closes the interface without ever calling back; refuse rather than
+    // leave the promise pending forever.
+    terminal.on('close', () => resolve(false));
     terminal.question('Confirmar aplicação? Digite "sim": ', answer => {
       terminal.close();
       resolve(answer.trim().toLowerCase() === 'sim');
@@ -142,10 +148,32 @@ function askForConfirmation() {
   });
 }
 
-function statusLines(eligibility) {
-  if (eligibility.vcs !== 'none') return [];
+function statusLines(eligibility, options) {
+  if (eligibility.vcs !== 'none') {
+    // --force only relaxes the no-VCS refusal.  Saying so beats letting the
+    // operator believe the flag took effect on a VCS-backed refusal.
+    return options && options.force ? [`--force ignorado: repositório sob ${eligibility.vcs}`] : [];
+  }
   if (eligibility.forced) return ['sem VCS — não há como desfazer', 'prosseguiu forçado'];
   return ['sem VCS — não há como desfazer', '0 elegíveis'];
+}
+
+/**
+ * Identity of an approved plan: the container each target writes plus the ids
+ * of the members it absorbs.  The apply run replans from scratch, so this is
+ * what the operator actually agreed to move.
+ */
+function planFingerprint(preview) {
+  const rows = [];
+  for (const operation of (preview && preview.operations) || []) {
+    for (const target of operation.targets || []) {
+      const members = (Array.isArray(target.members) ? target.members : [])
+        .map(member => String((member && (member.id || member.path)) || ''))
+        .sort();
+      rows.push(`${operation.name}\0${target.containerPath || target.path || ''}\0${members.join(',')}`);
+    }
+  }
+  return rows.sort().join('\n');
 }
 
 async function main(argv) {
@@ -165,7 +193,7 @@ async function main(argv) {
     const ctx = { cwd };
     const eligibility = createEligibility(cwd, { force: options.force });
     const registry = buildRegistry();
-    const messages = statusLines(eligibility);
+    const messages = statusLines(eligibility, options);
 
     if (!options.apply) {
       const result = registry.run(ctx, { filter: eligibility.filter });
@@ -180,9 +208,11 @@ async function main(argv) {
       return resultErrors(result).length || eligibilityError(result) ? 1 : 0;
     }
 
+    let approvedFingerprint = null;
     if (!options.yes) {
       const preview = registry.run(ctx, { filter: eligibility.filter });
       if (!options.json) writeReport(options, preview, eligibility, messages);
+      approvedFingerprint = planFingerprint(preview.preview);
       if (!(await askForConfirmation())) {
         if (options.json) {
           process.stdout.write(`${JSON.stringify(reportPayload(preview, eligibility, messages.concat('aplicação não confirmada')), null, 2)}\n`);
@@ -197,6 +227,12 @@ async function main(argv) {
     const result = registry.run(ctx, {
       filter: eligibility.filter,
       confirm: (preview) => {
+        // The apply run replans from scratch, so what the operator approved is
+        // not necessarily what would be written.  Refuse on any divergence.
+        if (approvedFingerprint !== null && planFingerprint(preview) !== approvedFingerprint) {
+          messages.push('plano mudou desde a confirmação');
+          return false;
+        }
         if (!previewWasWritten) {
           // In JSON mode the final envelope retains the preview and result in
           // one valid document.  The registry has still completed previewing
@@ -212,6 +248,8 @@ async function main(argv) {
       const payload = reportPayload(result, eligibility, messages.concat(applyLines));
       process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     } else {
+      // A refusal inside confirm leaves nothing to count; surface why.
+      if (!result.applied) process.stdout.write('plano mudou desde a confirmação\n');
       for (const line of applyLines) process.stdout.write(`${line}\n`);
     }
     const errors = resultErrors(result);

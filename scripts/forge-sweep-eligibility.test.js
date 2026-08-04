@@ -145,10 +145,40 @@ test('normaliza o caminho local antes da comparação e recusa fora do cwd', () 
   assert.deepStrictEqual(outside, { eligible: false, reason: 'caminho fora do cwd' });
 });
 
-test('a fonte da política não contém verbos destrutivos de VCS', () => {
+test('a fonte da política não invoca comandos destrutivos de VCS', () => {
+  // Anchored on command form, not on bare words: the previous version matched
+  // Array.prototype.push and pressured the module into paths[paths.length]=…,
+  // dictating non-idiomatic style to satisfy itself.
   const source = fs.readFileSync(path.join(__dirname, 'forge-sweep-eligibility.js'), 'utf8');
-  assert.doesNotMatch(source, /\b(commit|push|revert|checkout|stash|reset)\b/);
-  assert.doesNotMatch(source, /git add/);
+  assert.doesNotMatch(source, /\bgit\s+(commit|push|revert|checkout|stash|reset|add|clean|rm)\b/);
+  assert.doesNotMatch(source, /\bsvn\s+(commit|revert|delete|rm|cleanup)\b/);
+  assert.doesNotMatch(source, /['"](commit|revert|checkout|stash|reset|clean)['"]/);
+  // The guard must remain able to see a real invocation in both spellings:
+  // a shell command line, and a verb in an argv array.
+  assert.match('run(cwd, `git reset --hard`)', /\bgit\s+(commit|push|revert|checkout|stash|reset|add|clean|rm)\b/);
+  assert.match('spawnSync("git", ["reset", "--hard"])', /['"](commit|revert|checkout|stash|reset|clean)['"]/);
+  // …and must not fire on the idiomatic array append it used to forbid.
+  assert.doesNotMatch('paths.push(member.path);', /\bgit\s+(commit|push|revert|checkout|stash|reset|add|clean|rm)\b/);
+  assert(source.includes('paths.push('), 'o módulo deve poder usar .push() idiomático');
+});
+
+test('ancestral não versionado ou ignorado recusa o descendente', () => {
+  // git -uall --ignored enumerates descendants; svn status does not, so the
+  // per-path record alone would read a path under an unversioned directory as
+  // clean.  Failing closed on any ancestor is what equalises the two.
+  const cwd = path.join(path.parse(process.cwd()).root, 'forge', 'workspace');
+  for (const kind of ['untracked', 'ignored']) {
+    const statuses = new Map([['pasta', kind]]);
+    const deep = classifyPath(cwd, path.join(cwd, 'pasta', 'sub', 'arquivo.md'), statuses);
+    assert.strictEqual(deep.eligible, false, `descendente de ancestral ${kind} passou`);
+    assert.match(deep.reason, /sob pasta/);
+  }
+  // A modified ancestor does not hide descendants, so it must not propagate.
+  const modified = new Map([['pasta', 'modified']]);
+  assert.strictEqual(classifyPath(cwd, path.join(cwd, 'pasta', 'arquivo.md'), modified).eligible, true);
+  // A sibling prefix is not an ancestor.
+  const sibling = new Map([['pas', 'untracked']]);
+  assert.strictEqual(classifyPath(cwd, path.join(cwd, 'pasta', 'arquivo.md'), sibling).eligible, true);
 });
 
 if (gitAvailable()) {

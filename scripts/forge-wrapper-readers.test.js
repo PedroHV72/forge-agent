@@ -14,7 +14,10 @@ const {
 
 const SCRIPTS_DIR = __dirname;
 const INVENTORY_SOURCE_FILE = 'forge-wrapper-readers.js';
-const ROOT_DIR_PATTERN = /path\.join\([\s\S]{0,160}?['"]\.gsd['"][\s\S]{0,80}?['"](?:milestones|tasks)['"]|\.gsd[\\/]\s*(?:milestones|tasks)/;
+// The trigger is deliberately coarse: any enumeration in a file that also
+// names a wrapper root.  A proximity pattern let path.join(gsdDir,'milestones')
+// escape, and this scan is what unlocks a destructive opt-in.
+const ROOT_DIR_PATTERN = /['"]milestones['"]|['"]tasks['"]/;
 const ENUMERATION_PATTERN = /(?:fs\.)?readdirSync\s*\(/;
 const D11_NAMED_READERS = Object.freeze([
   'forge-dashboard.js', 'forge-runs.js', 'forge-state.js', 'forge-verifier.js',
@@ -100,10 +103,26 @@ function testD11FloorAndUnlearnedProjection() {
 
 function testRegistryIsFrozenData() {
   assert(Object.isFrozen(WRAPPER_DIR_READERS), 'registry array must be frozen');
-  assert(Object.isFrozen(VERDICTS), 'verdict set must be frozen');
+  assert(Object.isFrozen(VERDICTS), 'verdict vocabulary must be frozen');
   for (const reader of WRAPPER_DIR_READERS) {
+    assert(Object.isFrozen(reader), `entry must be frozen: ${reader.file}`);
     assert(Object.isFrozen(reader.dirs), `dirs must be frozen: ${reader.file}`);
   }
+}
+
+function testMutationAttemptsDoNotChangeTheCriterion() {
+  // Behavioural, not structural: freezing the array still left every entry
+  // mutable, and Object.freeze over a Set never blocked .add().
+  const before = unlearnedReaders().length;
+  const entry = WRAPPER_DIR_READERS[1];
+  const originalVerdict = entry.verdict;
+  try { entry.verdict = 'learned'; } catch (error) { /* strict mode throws; either way the value must hold */ }
+  assert.strictEqual(entry.verdict, originalVerdict, 'a verdict was mutated in runtime');
+  assert.strictEqual(unlearnedReaders().length, before, 'the opt-in criterion moved after a mutation attempt');
+
+  assert.strictEqual(typeof VERDICTS.add, 'undefined', 'VERDICTS must not expose a mutator');
+  try { VERDICTS.add('bogus'); } catch (error) { /* expected: not a function */ }
+  assert.strictEqual(VERDICTS.has('bogus'), false, 'the verdict vocabulary accepted a new value');
 }
 
 function testSelfExclusionCannotHideAnotherReader() {
@@ -117,6 +136,7 @@ function run() {
   testEntriesRemainConcreteAndClosed();
   testD11FloorAndUnlearnedProjection();
   testRegistryIsFrozenData();
+  testMutationAttemptsDoNotChangeTheCriterion();
   testSelfExclusionCannotHideAnotherReader();
   process.stdout.write('forge-wrapper-readers.test.js: ok\n');
 }

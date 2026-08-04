@@ -303,7 +303,12 @@ function svnHashPath(cwd, relPath) {
 function svnStatusEntries(cwd, opts) {
   const guard = svnWcRootGuard(cwd);
   if (!guard.ok) return guard;
-  const result = svnRun(cwd, ['status', '--xml', '--ignore-externals'], opts);
+  // `--no-ignore` is opt-in: captureDirty/postChanges drop `ignored` in
+  // mapSvnItem anyway, so asking for it there would only cost a larger scan.
+  // workingStatus does need it — its refusal reason distinguishes `ignored`.
+  const args = ['status', '--xml', '--ignore-externals'];
+  if (opts && opts.noIgnore === true) args.push('--no-ignore');
+  const result = svnRun(cwd, args, opts);
   if (result.status !== 0) return { ok: false, error: 'svn-status-failed' };
   return parseSvnStatusXml(result.stdout);
 }
@@ -611,7 +616,9 @@ function workingStatus(cwd, opts = {}) {
     }
   }
   if (vcs === 'svn') {
-    const status = svnStatusEntries(cwd, opts);
+    // noIgnore mirrors the git branch's --ignored: without it `ignored` below
+    // is unreachable and an ignored path would read as absent, hence eligible.
+    const status = svnStatusEntries(cwd, { ...opts, noIgnore: true });
     if (!status.ok) return { vcs, ok: false, entries: [], error: status.error };
     const entries = [];
     for (const entry of status.entries) {

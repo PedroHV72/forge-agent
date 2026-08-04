@@ -3,12 +3,16 @@
 // This is deliberately a data module.  The companion test owns filesystem
 // discovery, so loading this registry never reads a project or spawns a tool.
 
-const VERDICTS = Object.freeze(new Set([
-  'learned',
-  'breaks',
-  'safe-by-construction',
-]));
+// Object.freeze over a Set does not stop .add(); this criterion gates a
+// destructive opt-in, so the vocabulary is a frozen array with a has() view.
+const VERDICT_NAMES = Object.freeze(['learned', 'breaks', 'safe-by-construction']);
+const VERDICTS = Object.freeze({
+  has: value => VERDICT_NAMES.includes(value),
+  values: () => VERDICT_NAMES,
+});
 
+// Freezing the array alone leaves every entry mutable: WRAPPER_DIR_READERS[1]
+// .verdict = 'learned' silently shrinks unlearnedReaders().  Freeze each one.
 const WRAPPER_DIR_READERS = Object.freeze([
   {
     file: 'forge-dashboard.js',
@@ -67,6 +71,13 @@ const WRAPPER_DIR_READERS = Object.freeze([
     why: 'The specific f.endsWith(\'.json\') filter is applied to .gsd/forge/runs, not to .gsd/milestones, so wrapper containers are never inputs to this enumeration.',
   },
   {
+    file: 'forge-parallelism.js',
+    dirs: Object.freeze(['.gsd/tasks']),
+    evidence: 'forge-parallelism.js:165-172 — discoverTasks joins path.join(sliceDir, \'tasks\') and fs.readdirSync(tasksRoot), then filters entries with /^T\\d+(\\.\\d+)?$/.',
+    verdict: 'safe-by-construction',
+    why: 'The specific caller-supplied sliceDir plus the /^T\\d+/ name filter confine this enumeration to a slice-local tasks directory; it never enumerates the .gsd/tasks or .gsd/milestones wrapper roots.',
+  },
+  {
     file: 'forge-route-audit.js',
     dirs: Object.freeze(['.gsd/milestones']),
     evidence: 'forge-route-audit.js:20,31 — milestone mentions are route-identity documentation; the module has no fs.readdirSync call.',
@@ -108,10 +119,10 @@ const WRAPPER_DIR_READERS = Object.freeze([
     verdict: 'safe-by-construction',
     why: 'The specific /^T\\d{2}$/ task-name filter applies only after the selected slice/tasks path; it never enumerates .gsd/milestones or .gsd/tasks roots.',
   },
-]);
+].map(Object.freeze));
 
 function unlearnedReaders() {
   return WRAPPER_DIR_READERS.filter(reader => reader.verdict === 'breaks');
 }
 
-module.exports = { VERDICTS, WRAPPER_DIR_READERS, unlearnedReaders };
+module.exports = { VERDICTS, VERDICT_NAMES, WRAPPER_DIR_READERS, unlearnedReaders };
