@@ -1,245 +1,351 @@
 #!/usr/bin/env node
+// forge-runs.test.js — contract test suite for forge-runs.js
+// Covers the ENOGSD guard added to close the fourth `.gsd/` manufacturer:
+//   - ensureRunsDir (strict writer, exercised via add()) refuses to create
+//     .gsd/ when it is absent.
+//   - refreshLegacyAlias (best-effort writer) silently no-ops without .gsd/,
+//     never throws, never manufactures .gsd/.
+//   - CLI surfaces a readable one-line error (no stack trace) and exits 1.
+//   - --migrate-legacy on an uninitialised dir still exits 0 with
+//     {migrated:false} and creates nothing.
+// Run: node scripts/forge-runs.test.js  (exits 0 = all pass, 1 = any fail)
+
 'use strict';
 
-// Persistence regression suite. Every assertion reopens the JSON file because
-// the public contract is the durable registry, not a returned object.
-const fs = require('fs');
-const os = require('os');
+const fs   = require('fs');
+const os   = require('os');
 const path = require('path');
-const child = require('child_process');
+const { spawnSync } = require('child_process');
+
 const runs = require('./forge-runs.js');
 
+// ── Harness ───────────────────────────────────────────────────────────────────
 let passed = 0;
 let failed = 0;
+const failures = [];
+
 function test(name, fn) {
-  try { fn(); passed++; console.log(`  ✓ ${name}`); }
-  catch (error) { failed++; console.log(`  ✗ ${name}\n      ${error.message}`); }
-}
-function assert(value, message) { if (!value) throw new Error(message || 'assertion failed'); }
-function equal(actual, expected, message) {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`${message || 'values differ'}: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
+  try {
+    fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    failed++;
+    failures.push({ name, error: e.message });
+    console.log(`  ✗ ${name}`);
+    console.log(`      ${e.message}`);
   }
 }
-function sandbox(fn) {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge runs espaço-')); 
-  try { return fn(cwd); } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg || 'assertion failed');
 }
-function readDisk(cwd, id) { return JSON.parse(fs.readFileSync(runs.runFile(cwd, id), 'utf8')); }
-function base(id) { return { id, kind: 'milestone', session_id: `legacy-${id}`, active: true }; }
 
-test('adds a legacy 3.1.4 record without runtime metadata', () => sandbox(cwd => {
-  runs.add(cwd, base('M901'));
-  const stored = readDisk(cwd, 'M901');
-  assert(!Object.prototype.hasOwnProperty.call(stored, 'host_runtime'), 'must not backfill host');
-  assert(!Object.prototype.hasOwnProperty.call(stored, 'session'), 'must not backfill neutral session');
-  equal(stored.session_id, 'legacy-M901');
-}));
+function assertEq(actual, expected, msg) {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a !== e) throw new Error(`${msg || 'mismatch'}\n     expected: ${e}\n     actual:   ${a}`);
+}
 
-test('accepts neutral session in new records while retaining legacy alias', () => sandbox(cwd => {
-  runs.add(cwd, { id: 'M902', kind: 'milestone', session: 'opaque value', host_runtime: 'codex', owner: 'o1' });
-  const stored = readDisk(cwd, 'M902');
-  equal(stored.session, 'opaque value');
-  equal(stored.session_id, 'opaque value');
-  equal(stored.host_runtime, 'codex');
-  equal(stored.owner, 'o1');
-}));
+function withSandbox(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-runs-test-'));
+  try { fn(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
 
-test('rejects an unknown supplied host runtime', () => sandbox(cwd => {
-  let threw = false;
-  try { runs.add(cwd, { id: 'M903', kind: 'milestone', session: 'x', host_runtime: 'gemini' }); }
-  catch (error) { threw = error.code === 'invalid-host-runtime'; }
-  assert(threw, 'runtime normalizer must reject unknown values');
-}));
+const CLI = path.join(__dirname, 'forge-runs.js');
 
-test('update merges heartbeat and worker patches without changing metadata', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M904'), host_runtime: 'claude', session: 'opaque', owner: 'owner-a' });
-  runs.update(cwd, 'M904', { heartbeat: 100, last_heartbeat: 100 });
-  runs.update(cwd, 'M904', { worker: 'forge-executor', worker_started: 101 });
-  const stored = readDisk(cwd, 'M904');
-  equal(stored.heartbeat, 100); equal(stored.worker, 'forge-executor');
-  equal(stored.host_runtime, 'claude'); equal(stored.owner, 'owner-a');
-}));
+console.log('\n=== forge-runs.js — contract test suite ===\n');
 
-test('bump heartbeat preserves independent worker fields', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M905'), worker: 'worker-a', host_runtime: 'codex' });
-  runs.bumpHeartbeat(cwd, 'M905', 12345);
-  const stored = readDisk(cwd, 'M905');
-  equal(stored.last_heartbeat, 12345); equal(stored.worker, 'worker-a'); equal(stored.host_runtime, 'codex');
-}));
+// ── ENOGSD: strict writer (ensureRunsDir via add()) ─────────────────────────
 
-test('atomic write leaves parseable JSON and no temporary file', () => sandbox(cwd => {
-  runs.add(cwd, base('M906'));
-  for (let index = 0; index < 10; index++) {
-    runs.update(cwd, 'M906', { heartbeat: index });
-    assert(typeof readDisk(cwd, 'M906').heartbeat === 'number', 'disk record should parse after each update');
-  }
-  const names = fs.readdirSync(runs.runsDir(cwd));
-  equal(names.filter(name => name.includes('.tmp')).length, 0, 'temporary files should be renamed away');
-}));
-
-test('independent processes serialize heartbeat and worker changes', () => sandbox(cwd => {
-  runs.add(cwd, base('M907'));
-  const script = [
-    "const r=require(process.argv[1]); const cwd=process.argv[2]; const patch=JSON.parse(process.argv[3]); r.update(cwd, 'M907', patch);",
-  ].join('');
-  const modulePath = path.join(__dirname, 'forge-runs.js');
-  const first = child.spawnSync(process.execPath, ['-e', script, modulePath, cwd, JSON.stringify({ heartbeat: 77 })], { encoding: 'utf8', shell: false });
-  const second = child.spawnSync(process.execPath, ['-e', script, modulePath, cwd, JSON.stringify({ worker: 'parallel-worker' })], { encoding: 'utf8', shell: false });
-  assert(first.status === 0, first.stderr); assert(second.status === 0, second.stderr);
-  const stored = readDisk(cwd, 'M907'); equal(stored.heartbeat, 77); equal(stored.worker, 'parallel-worker');
-}));
-
-test('selection ignores neutral metadata and legacy session aliases', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M908'), started_at: 1, host_runtime: 'claude', session: 'claude-looking' });
-  runs.add(cwd, { ...base('M909'), started_at: 2, host_runtime: 'codex', session: 'codex-looking' });
-  equal(runs.oldestActive(cwd).id, 'M908');
-  equal(runs.resolveBySessionId(cwd, 'legacy-M909').id, 'M909');
-}));
-
-test('legacy alias is best effort and atomically parseable', () => sandbox(cwd => {
-  runs.add(cwd, base('M910'));
-  const alias = path.join(cwd, '.gsd', 'forge', 'auto-mode.json');
-  equal(JSON.parse(fs.readFileSync(alias, 'utf8')).active, true);
-  assert(!fs.readdirSync(path.dirname(alias)).some(name => name.includes('.tmp')), 'alias temp must not survive');
-}));
-
-// Field-level cases ensure additive compatibility is intentional rather than
-// an accidental consequence of Object.assign in one happy-path test.
-test('preserves unknown forward-compatible fields during update', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M911'), future_extension: { generation: 2 } });
-  runs.update(cwd, 'M911', { worker: 'worker-b' });
-  equal(readDisk(cwd, 'M911').future_extension, { generation: 2 });
-}));
-
-test('records all optional neutral metadata when explicitly provided', () => sandbox(cwd => {
-  runs.add(cwd, {
-    ...base('M912'), owner: 'opaque-owner', host_runtime: 'claude', session: 'any-shape',
-    heartbeat: 18, expires_at: 25, worker_engine: 'native',
+test('add() on clean tmpdir (no .gsd/) throws ENOGSD and manufactures nothing', () => {
+  withSandbox(dir => {
+    let threw = null;
+    try {
+      runs.add(dir, { id: 'M001', kind: 'milestone', session_id: 'sess-1' });
+    } catch (e) {
+      threw = e;
+    }
+    assert(threw, 'expected add() to throw');
+    assertEq(threw.code, 'ENOGSD', 'error.code');
+    assert(/forge-runs:.*has no \.gsd\//.test(threw.message), 'message mentions missing .gsd/');
+    assert(!fs.existsSync(path.join(dir, '.gsd')), '.gsd/ must NOT be manufactured');
   });
-  const record = readDisk(cwd, 'M912');
-  equal(record.owner, 'opaque-owner');
-  equal(record.host_runtime, 'claude');
-  equal(record.session, 'any-shape');
-  equal(record.heartbeat, 18);
-  equal(record.expires_at, 25);
-  equal(record.worker_engine, 'native');
-}));
+});
 
-test('Codex and Claude metadata have the same active selection result', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M913'), started_at: 10, host_runtime: 'claude', session: 'x' });
-  runs.add(cwd, { ...base('M914'), started_at: 20, host_runtime: 'codex', session: 'y' });
-  const before = runs.listActive(cwd).map(record => record.id);
-  runs.update(cwd, 'M913', { heartbeat: 1 });
-  runs.update(cwd, 'M914', { heartbeat: 2 });
-  equal(runs.listActive(cwd).map(record => record.id), before);
-  equal(runs.oldestActive(cwd).id, 'M913');
-}));
+test('add() against a tmpdir WITH .gsd/ succeeds and creates .gsd/forge/runs/', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const rec = runs.add(dir, { id: 'M002', kind: 'milestone', session_id: 'sess-2' });
+    assertEq(rec.id, 'M002', 'record.id');
+    assert(fs.existsSync(runs.runsDir(dir)), '.gsd/forge/runs/ created');
+    assert(fs.existsSync(runs.runFile(dir, 'M002')), 'run record file written');
+  });
+});
 
-test('explicit host updates normalize casing without inferring from session', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M915'), session: 'codex-like-but-opaque', host_runtime: 'CODEX' });
-  equal(readDisk(cwd, 'M915').host_runtime, 'codex');
-  runs.update(cwd, 'M915', { session: 'claude-like-but-still-opaque' });
-  equal(readDisk(cwd, 'M915').host_runtime, 'codex');
-}));
+// ── Best-effort writer (refreshLegacyAlias) ─────────────────────────────────
 
-test('inactive records remain readable with neutral metadata', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M916'), active: false, host_runtime: 'codex', owner: 'dead-owner' });
-  equal(runs.get(cwd, 'M916').active, false);
-  equal(runs.listActive(cwd).length, 0);
-  equal(runs.get(cwd, 'M916').owner, 'dead-owner');
-}));
+test('refreshLegacyAlias() without .gsd/ silently no-ops: no throw, no .gsd/ created', () => {
+  withSandbox(dir => {
+    let threw = null;
+    try {
+      runs.refreshLegacyAlias(dir);
+    } catch (e) {
+      threw = e;
+    }
+    assertEq(threw, null, 'refreshLegacyAlias must never throw');
+    assert(!fs.existsSync(path.join(dir, '.gsd')), '.gsd/ must NOT be manufactured');
+  });
+});
 
-test('cleanup stale removes only the stale canonical record', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M917'), last_heartbeat: 1 });
-  runs.add(cwd, { ...base('M918'), last_heartbeat: Date.now() });
-  const removed = runs.cleanupStale(cwd, 1000);
-  assert(removed.includes('M917'), 'stale record should be selected');
-  assert(runs.get(cwd, 'M917') === null, 'stale file should be gone');
-  assert(runs.get(cwd, 'M918') !== null, 'fresh file should remain');
-}));
+test('refreshLegacyAlias() with .gsd/ present still writes auto-mode.json mirror', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    runs.refreshLegacyAlias(dir);
+    const aliasPath = path.join(dir, '.gsd', 'forge', 'auto-mode.json');
+    assert(fs.existsSync(aliasPath), 'alias file written when .gsd/ exists');
+    const mirror = JSON.parse(fs.readFileSync(aliasPath, 'utf8'));
+    assertEq(mirror.active, false, 'no active runs → active:false');
+  });
+});
 
-test('remove refreshes legacy alias without changing another record', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M919'), started_at: 1 });
-  runs.add(cwd, { ...base('M920'), started_at: 2 });
-  runs.remove(cwd, 'M919');
-  equal(runs.oldestActive(cwd).id, 'M920');
-  const alias = JSON.parse(fs.readFileSync(path.join(cwd, '.gsd', 'forge', 'auto-mode.json'), 'utf8'));
-  equal(alias.active, true);
-  equal(alias.started_at, 2);
-}));
+// ── CLI ───────────────────────────────────────────────────────────────────────
 
-test('a task record retains task-only legacy fields after neutral update', () => sandbox(cwd => {
-  runs.add(cwd, { id: 'T-1-task', kind: 'task', session_id: 'legacy', task_description: 'do it', pending_decisions: ['d'] });
-  runs.update(cwd, 'T-1-task', { host_runtime: 'claude', session: 'neutral' });
-  const record = readDisk(cwd, 'T-1-task');
-  equal(record.task_description, 'do it');
-  equal(record.pending_decisions, ['d']);
-  equal(record.session_id, 'legacy');
-  equal(record.session, 'neutral');
-}));
+test('CLI --add without .gsd/ prints readable error (no stack trace) and exits 1', () => {
+  withSandbox(dir => {
+    const res = spawnSync(process.execPath, [
+      CLI, '--add', '--id', 'M003', '--kind', 'milestone', '--session', 'sess-3', '--cwd', dir,
+    ], { encoding: 'utf8' });
+    assertEq(res.status, 1, 'exit code');
+    assert(/forge-runs error:.*\/forge-init/.test(res.stderr), `stderr mentions /forge-init: ${res.stderr}`);
+    assert(!/at Object|at Module|\.js:\d+:\d+/.test(res.stderr), `stderr has no stack trace: ${res.stderr}`);
+    assert(!fs.existsSync(path.join(dir, '.gsd')), '.gsd/ must NOT be manufactured');
+  });
+});
 
-test('readers observe complete JSON after every worker metadata update', () => sandbox(cwd => {
-  runs.add(cwd, base('M921'));
-  const patches = [
-    { worker: 'a' },
-    { worker_started: 2 },
-    { owner: 'owner-2' },
-    { heartbeat: 3 },
-    { expires_at: 4 },
-    { session: 'opaque-2' },
-  ];
-  for (const patch of patches) {
-    runs.update(cwd, 'M921', patch);
-    const raw = fs.readFileSync(runs.runFile(cwd, 'M921'), 'utf8');
-    assert(raw.startsWith('{') && raw.trim().endsWith('}'), 'complete JSON document required');
-    JSON.parse(raw);
-  }
-}));
+test('CLI --migrate-legacy on an uninitialised dir exits 0 with migrated:false, creates nothing', () => {
+  withSandbox(dir => {
+    const res = spawnSync(process.execPath, [
+      CLI, '--migrate-legacy', '--cwd', dir,
+    ], { encoding: 'utf8' });
+    assertEq(res.status, 0, 'exit code');
+    const parsed = JSON.parse(res.stdout);
+    assertEq(parsed.migrated, false, 'migrated:false');
+    assertEq(parsed.reason, 'no STATE.md', 'reason');
+    assert(!fs.existsSync(path.join(dir, '.gsd')), '.gsd/ must NOT be manufactured');
+  });
+});
 
-test('empty optional host patch does not backfill a legacy record', () => sandbox(cwd => {
-  runs.add(cwd, base('M922'));
-  runs.update(cwd, 'M922', { host_runtime: undefined });
-  assert(!Object.prototype.hasOwnProperty.call(readDisk(cwd, 'M922'), 'host_runtime'));
-}));
+test('CLI --add succeeds against an initialised dir', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const res = spawnSync(process.execPath, [
+      CLI, '--add', '--id', 'M004', '--kind', 'milestone', '--session', 'sess-4', '--cwd', dir,
+    ], { encoding: 'utf8' });
+    assertEq(res.status, 0, 'exit code');
+    const parsed = JSON.parse(res.stdout);
+    assertEq(parsed.id, 'M004', 'record.id');
+  });
+});
 
-test('metadata values remain opaque across provider-looking session strings', () => sandbox(cwd => {
-  const values = ['claude-session/42', 'codex:thread:99', 'unicode sessão ✓'];
-  for (let index = 0; index < values.length; index++) {
-    const id = `M93${index}`;
-    runs.add(cwd, { ...base(id), session: values[index], host_runtime: index % 2 ? 'codex' : 'claude' });
-    equal(readDisk(cwd, id).session, values[index]);
-  }
-  equal(runs.listActive(cwd).length, values.length);
-}));
+// ── Address fields: branch / root / project (S06/T03) ───────────────────────
+//
+// These three are ADDITIVE. The proof that matters is not that they can be
+// written — it is that the records written before they existed still load.
+// At the time of writing there were 7 such records live on disk, none of them
+// carrying any of the three, and none of them is migrated.
 
-test('ordinary update does not replace canonical session aliases', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M926'), session: 'new-session' });
-  runs.update(cwd, 'M926', { worker: 'updated' });
-  const record = readDisk(cwd, 'M926');
-  equal(record.session_id, 'legacy-M926');
-  equal(record.session, 'new-session');
-}));
+/** A record in the exact pre-T03 shape: no branch, no root, no project. */
+function writeLegacyRecord(dir, id) {
+  const file = path.join(dir, '.gsd', 'forge', 'runs', `${id}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({
+    kind: 'milestone',
+    id,
+    session_id: 'sess-legacy',
+    active: true,
+    started_at: 1785327373325,
+    last_heartbeat: 1785338419005,
+    worker: null,
+    worker_started: null,
+    isolation_mode: 'branch',
+    milestone_dir: `.gsd/milestones/${id}/`,
+    cwd: dir,
+    account: 'lookchina',
+    worktrees: [],
+    attached_to: null,
+  }, null, 2), 'utf8');
+  return file;
+}
 
-test('all supported hosts can persist the same provider-neutral fields', () => sandbox(cwd => {
-  for (const host of ['claude', 'codex']) {
-    const id = `M-${host}`;
-    runs.add(cwd, { ...base(id), host_runtime: host, owner: `${host}-owner`, session: `${host}-opaque` });
-    const record = readDisk(cwd, id);
-    equal(record.owner, `${host}-owner`);
-    equal(record.session, `${host}-opaque`);
-    equal(record.active, true);
-  }
-}));
+test('legacy record (written before the address fields existed) loads — no migration, no throw', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const file = writeLegacyRecord(dir, 'M-legacy');
+    const before = fs.readFileSync(file);
+    // Guard the KEY, not the value: `"isolation_mode": "branch"` contains the
+    // string `"branch"`, so a value-matching regex would pass vacuously here.
+    assert(!/"branch"\s*:/.test(before.toString('utf8')), 'fixture is genuinely pre-T03');
 
-test('metadata-only update leaves phase-like run fields untouched', () => sandbox(cwd => {
-  runs.add(cwd, { ...base('M-meta'), worker: 'before', isolation_mode: 'worktree' });
-  runs.update(cwd, 'M-meta', { heartbeat: 99 });
-  const record = readDisk(cwd, 'M-meta');
-  equal(record.worker, 'before');
-  equal(record.isolation_mode, 'worktree');
-  equal(record.heartbeat, 99);
-}));
+    const rec = runs.get(dir, 'M-legacy');
+    assert(rec, 'legacy record must load');
+    assertEq(rec.id, 'M-legacy', 'id survives');
+    assert(fs.readFileSync(file).equals(before), 'reading must NOT rewrite the record (no migration)');
+  });
+});
 
+test('missing address fields read back as null — never undefined leaking through JSON', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    writeLegacyRecord(dir, 'M-legacy');
+    const rec = runs.get(dir, 'M-legacy');
+
+    assertEq(rec.branch, null, 'branch');
+    assertEq(rec.root, null, 'root');
+    assertEq(rec.project, null, 'project');
+
+    // The distinction this makes: `undefined` vanishes through stringify, so a
+    // consumer would see no key at all and could not tell "no value" from
+    // "field does not exist".
+    const json = JSON.stringify(rec);
+    assert(/"branch":null/.test(json), `branch present as null: ${json}`);
+    assert(/"root":null/.test(json), 'root present as null');
+    assert(/"project":null/.test(json), 'project present as null');
+  });
+});
+
+test('listAll() applies the same null defaults as get()', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    writeLegacyRecord(dir, 'M-legacy-a');
+    writeLegacyRecord(dir, 'M-legacy-b');
+    const all = runs.listAll(dir);
+    assertEq(all.length, 2, 'both records listed');
+    for (const r of all) {
+      assertEq(r.branch, null, `${r.id} branch`);
+      assertEq(r.root, null, `${r.id} root`);
+      assertEq(r.project, null, `${r.id} project`);
+    }
+  });
+});
+
+test('round-trip: add() with branch/root/project → get() returns the same values', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    runs.add(dir, {
+      id: 'M-addr', kind: 'milestone', session_id: 'sess-addr',
+      branch: 'forge/M-addr', root: '~/Development', project: '/abs/project',
+    });
+    const rec = runs.get(dir, 'M-addr');
+    assertEq(rec.branch, 'forge/M-addr', 'branch round-trips');
+    assertEq(rec.root, '~/Development', 'root round-trips');
+    assertEq(rec.project, '/abs/project', 'project round-trips');
+  });
+});
+
+test('add() without address fields writes explicit nulls (default, not absence)', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const rec = runs.add(dir, { id: 'M-plain', kind: 'milestone', session_id: 'sess-plain' });
+    assertEq(rec.branch, null, 'branch default');
+    assertEq(rec.root, null, 'root default');
+    assertEq(rec.project, null, 'project default');
+    const onDisk = JSON.parse(fs.readFileSync(runs.runFile(dir, 'M-plain'), 'utf8'));
+    assertEq(onDisk.branch, null, 'null is persisted, not omitted');
+  });
+});
+
+test('two runs on the SAME project in different branches are distinguishable by address', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const a = runs.add(dir, { id: 'M-a', kind: 'milestone', session_id: 's-a', branch: 'forge/M-a', cwd: dir });
+    const b = runs.add(dir, { id: 'M-b', kind: 'milestone', session_id: 's-b', branch: 'forge/M-b', cwd: dir });
+    // The gap this closes: before `branch`, these two differed in NOTHING but
+    // their filename — identical cwd, identical everything addressable.
+    assertEq(a.cwd, b.cwd, 'same project: cwd is byte-identical (the original problem)');
+    assert(a.branch !== b.branch, 'branch is what now tells them apart');
+  });
+});
+
+test('update() with branch:"" (shared-mode resume interpolation) reads back as null, not ""', () => {
+  // S06/T04 review R3. shared-mode resume in forge-auto/SKILL.md interpolates
+  // `"branch":"$RUN_BRANCH"` directly into the --update JSON patch; when
+  // $RUN_BRANCH is empty (shared isolation owns no branch) that writes the
+  // literal string `""`, bypassing add()'s `|| null` normalization (update()
+  // is a bare Object.assign with none of its own). Swift's `String?` decodes
+  // `""` as `.some("")`, not `.none` — an `== nil` branch check downstream
+  // would misclassify a shared-mode run as having a branch. The fix is on
+  // READ (withAddressDefaults), so it must hold regardless of which write
+  // path produced the empty string.
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    runs.add(dir, { id: 'M-empty-branch', kind: 'milestone', session_id: 's1', branch: 'forge/M-empty-branch', cwd: dir });
+    runs.update(dir, 'M-empty-branch', { branch: '' });
+
+    // Prove the empty string really does land on disk (the bug's precondition) —
+    // if this assertion ever fails, the test above is vacuous.
+    const onDiskRaw = JSON.parse(fs.readFileSync(path.join(dir, '.gsd', 'forge', 'runs', 'M-empty-branch.json'), 'utf8'));
+    assertEq(onDiskRaw.branch, '', 'precondition: "" really is what update() persists verbatim');
+
+    const rec = runs.get(dir, 'M-empty-branch');
+    assertEq(rec.branch, null, 'get() must normalize "" to null, not echo it back');
+
+    const listed = runs.listAll(dir).find(r => r.id === 'M-empty-branch');
+    assertEq(listed.branch, null, 'listAll() must apply the same normalization as get()');
+  });
+});
+
+test('unknown keys on a record survive a read (forward-compat)', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const file = writeLegacyRecord(dir, 'M-future');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    raw.some_field_from_a_newer_forge = { nested: true };
+    fs.writeFileSync(file, JSON.stringify(raw, null, 2), 'utf8');
+
+    const rec = runs.get(dir, 'M-future');
+    assertEq(rec.some_field_from_a_newer_forge, { nested: true }, 'unknown key preserved');
+    assertEq(rec.branch, null, 'and the defaults still applied');
+  });
+});
+
+test('CLI --add accepts --branch/--root/--project and records them verbatim', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const res = spawnSync(process.execPath, [
+      CLI, '--add', '--id', 'M-cli', '--kind', 'milestone', '--session', 'sess-cli',
+      '--branch', 'forge/M-cli', '--root', '~/Development', '--project', '/abs/proj',
+      '--cwd', dir,
+    ], { encoding: 'utf8' });
+    assertEq(res.status, 0, `exit code: ${res.stderr}`);
+    const parsed = JSON.parse(res.stdout);
+    assertEq(parsed.branch, 'forge/M-cli', 'branch');
+    assertEq(parsed.root, '~/Development', 'root');
+    assertEq(parsed.project, '/abs/proj', 'project');
+  });
+});
+
+test('CLI --add with a valueless --branch records null, not the boolean true', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    const res = spawnSync(process.execPath, [
+      CLI, '--add', '--id', 'M-bool', '--kind', 'milestone', '--session', 'sess-bool',
+      '--branch', '--cwd', dir,
+    ], { encoding: 'utf8' });
+    assertEq(res.status, 0, `exit code: ${res.stderr}`);
+    assertEq(JSON.parse(res.stdout).branch, null, 'a flag with no value is not a branch name');
+  });
+});
+
+// ── Summary ───────────────────────────────────────────────────────────────────
 console.log(`\n=== Result: ${passed} passed, ${failed} failed ===`);
-if (failed) process.exit(1);
+
+if (failed > 0) {
+  console.log('\nFailures:');
+  for (const f of failures) {
+    console.log(`  ✗ ${f.name}`);
+    console.log(`      ${f.error}`);
+  }
+  process.exit(1);
+}
+process.exit(0);

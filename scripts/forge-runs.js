@@ -34,7 +34,23 @@ function runsDir(cwd) {
   return path.join(cwd, '.gsd', 'forge', 'runs');
 }
 
+/**
+ * Create `.gsd/forge/runs/` — but only inside a directory that already has `.gsd/`.
+ *
+ * Fourth `.gsd/` manufacturer closed (see forge-lock.js:33-56 for the canonical
+ * pattern and the camada-2 escape of 96b6e8c this mirrors). A bare
+ * `mkdirSync(..., { recursive: true })` here would enroll any directory as a
+ * Forge project the moment a run is registered against it. Creating `.gsd/` is
+ * `/forge-init`'s job and nothing else's.
+ */
 function ensureRunsDir(cwd) {
+  const gsd = path.join(cwd, '.gsd');
+  if (!fs.existsSync(gsd)) {
+    const err = new Error(
+      `forge-runs: ${cwd} has no .gsd/ — refusing to create one (run /forge-init first)`);
+    err.code = 'ENOGSD';
+    throw err;
+  }
   const dir = runsDir(cwd);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
@@ -45,6 +61,48 @@ function runFile(cwd, id) {
 }
 
 // ── Read ────────────────────────────────────────────────────────────────────
+
+/**
+ * The run's ADDRESS fields — `branch`, `root`, `project` — defaulted to `null`
+ * on read.
+ *
+ * They are additive: every record written before they existed (all 7 live ones
+ * at the time of writing) is missing all three, and nothing migrates them. The
+ * defaulting happens HERE, on read, rather than by rewriting files, so a record
+ * on disk stays byte-identical until something has a real reason to write it.
+ *
+ * `null` and not `undefined` deliberately. `undefined` disappears through
+ * `JSON.stringify` — a caller serialising a legacy record would emit an object
+ * with no `branch` key at all, indistinguishable from "this run has no branch
+ * field concept", which is the silence-vs-absence confusion this milestone
+ * keeps paying for. `null` says "known field, no value".
+ *
+ * `''` (empty string) is normalized to `null` here too, not just `undefined`.
+ * (S06/T04 review R3.) The `shared`-mode resume path in forge-auto/SKILL.md
+ * interpolates an empty `$RUN_BRANCH` straight into a JSON patch string
+ * (`"branch":"$RUN_BRANCH"` -> `"branch":""`), bypassing `add()`'s `|| null`
+ * normalization entirely — `update()` is a bare `Object.assign` with no
+ * normalization of its own. Without this, `''` would round-trip on disk as
+ * `''`, and Swift's `public let branch: String?` decodes `""` as `.some("")`,
+ * not `.none` — an `== nil` check on the client would misclassify a
+ * shared-mode run as having a branch. Normalizing on READ (here, for both
+ * `get()` and `listAll()`) converges both write paths (the interpolated
+ * resume patch AND any future caller) without requiring every writer to
+ * remember to normalize — the same reasoning that already justified doing
+ * this for `undefined` instead of fixing every call site.
+ *
+ * Unknown keys are preserved untouched (spread first): a record written by a
+ * newer Forge must survive a round-trip through an older reader.
+ */
+function withAddressDefaults(rec) {
+  if (!rec || typeof rec !== 'object') return rec;
+  return Object.assign({}, rec, {
+    branch:  (rec.branch  === undefined || rec.branch  === '') ? null : rec.branch,
+    root:    (rec.root    === undefined || rec.root    === '') ? null : rec.root,
+    project: (rec.project === undefined || rec.project === '') ? null : rec.project,
+  });
+}
+
 function listAll(cwd) {
   const dir = runsDir(cwd);
   if (!fs.existsSync(dir)) return [];
@@ -54,7 +112,8 @@ function listAll(cwd) {
       try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); }
       catch { return null; }
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .map(withAddressDefaults);
 }
 
 function listActive(cwd) {
@@ -64,7 +123,7 @@ function listActive(cwd) {
 function get(cwd, id) {
   const f = runFile(cwd, id);
   if (!fs.existsSync(f)) return null;
-  try { return JSON.parse(fs.readFileSync(f, 'utf8')); }
+  try { return withAddressDefaults(JSON.parse(fs.readFileSync(f, 'utf8'))); }
   catch { return null; }
 }
 
@@ -89,9 +148,6 @@ function writeAtomic(filePath, record) {
   fs.renameSync(tmp, filePath);
 }
 
-// Preserve a deliberately small, explicit metadata boundary. These values are
-// correlation/liveness data only: run selection continues to use active and
-// started_at, and lease code owns any later expiry interpretation.
 function normalizeMetadataPatch(patch) {
   const next = Object.assign({}, patch || {});
   if (Object.prototype.hasOwnProperty.call(next, 'host_runtime')) {
@@ -130,6 +186,20 @@ function add(cwd, record) {
     milestone_dir: record.milestone_dir || (record.kind === 'milestone' ? `.gsd/milestones/${record.id}/` : null),
     cwd: record.cwd || cwd,
     account: record.account || null,   // which Claude account is driving this run (display/audit)
+    // ── Address fields (S06/T03) ────────────────────────────────────────────
+    // What makes a run ADDRESSABLE rather than merely present. Before these,
+    // two runs on the same project in different branches had byte-identical
+    // `cwd` and nothing else to tell them apart — they were distinguishable
+    // only by the accident of differing filenames, which is not an address.
+    //
+    // `add()` records what it is GIVEN and derives nothing. Derivation is
+    // forge-run-address.js's job, and keeping the two apart is what lets the
+    // resolver treat a recorded value as authoritative (precedence: record
+    // beats derivation) without the record having quietly been a derivation
+    // all along.
+    branch:  record.branch  || null,   // git branch this run owns (`forge/{id}` under branch/worktree)
+    root:    record.root    || null,   // declared root containing this run's project
+    project: record.project || null,   // owning project (the nearest `.gsd/` — resolveOwner)
     // Additive fields keep older registry records readable without migration.
     worktrees: Array.isArray(record.worktrees) ? record.worktrees : [],
     attached_to: record.attached_to || null,
@@ -186,14 +256,12 @@ function cleanupStale(cwd, thresholdMs) {
   return removed;
 }
 
-// Records read by older tools may not have a neutral session or host metadata.
-// Read operations intentionally return those records unchanged: normalizing on
-// read would turn a harmless inspection into a schema migration. Writers only
-// add metadata a caller explicitly supplies, and selection remains based on
-// `active` plus the existing timestamps regardless of host/session values.
-
 // ── Legacy alias (auto-mode.json mirror of oldest active) ───────────────────
 function refreshLegacyAlias(cwd) {
+  // Best-effort mirror: silently no-op without .gsd/ rather than manufacture it.
+  // Unlike ensureRunsDir this must never throw — remove()/cleanupStale() call it
+  // from paths that must not hard-fail (skills chain these with `|| true`).
+  if (!fs.existsSync(path.join(cwd, '.gsd'))) return;
   const aliasPath = path.join(cwd, '.gsd', 'forge', ALIAS_FILE);
   const oldest = oldestActive(cwd);
   let mirror;
@@ -302,7 +370,10 @@ Flags:
   --list                   list all runs (active + inactive)
   --list-active            list only active runs
   --get <id>               get single run record
-  --add --id <id> --kind <milestone|task> --session <id> [--account <name>] [--worktrees <json>] [--attached-to <run-id>]  create
+  --add --id <id> --kind <milestone|task> --session <id> [--account <name>] [--worktrees <json>] [--attached-to <run-id>]
+        [--branch <git-branch>] [--root <root>] [--project <path>]          create
+                           (address fields are recorded as given — never derived here;
+                            see forge-run-address.js --address for resolution)
   --update <id> --json <patch-json>                       update fields
   --remove <id>            delete record
   --bump <id>              bump last_heartbeat to now
@@ -348,6 +419,10 @@ Flags:
         account: (typeof args.account === 'string') ? args.account : (process.env.FORGE_ACCOUNT || null),
         worktrees,
         attached_to: (typeof args['attached-to'] === 'string') ? args['attached-to'] : null,
+        // `--branch` with no value parses as boolean true; only a real string is a value.
+        branch:  (typeof args.branch  === 'string') ? args.branch  : null,
+        root:    (typeof args.root    === 'string') ? args.root    : null,
+        project: (typeof args.project === 'string') ? args.project : null,
         cwd,
       });
       process.stdout.write(JSON.stringify(r, null, 2) + '\n');
@@ -393,6 +468,7 @@ module.exports = {
   bumpHeartbeat, cleanupStale,
   resolveBySessionId, oldestActive,
   refreshLegacyAlias, migrateLegacyState,
+  withAddressDefaults,
   runsDir, runFile, writeAtomic, withRunLock, normalizeMetadataPatch,
   STALE_THRESHOLD_MS,
   ACTIVE_THRESHOLD_MS,

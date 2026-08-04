@@ -17,7 +17,41 @@ final class UpdateStore: ObservableObject {
 
     @Published private(set) var installed: String?
     @Published private(set) var latest: String?
+
+    /// The version of the binary THIS PROCESS is, stamped into the bundle at
+    /// build time by `app/build.sh` (D25). Never re-read: it cannot change while
+    /// the process lives, which is the whole point of it.
+    ///
+    /// `nil` means "not stamped", and the sentinel is the ABSENCE of the key —
+    /// `VersionFooter.stamped` owns that decision and documents why it is not a
+    /// comparison against `0.1.0`. Two ways to legitimately land here: a bundle
+    /// built before the stamping existed, and `swift run Forge`, where there is
+    /// no bundle at all and `infoDictionary` is an empty dictionary.
+    private(set) var running: String? = VersionFooter.stamped(
+        Bundle.main.object(forInfoDictionaryKey: "ForgeGitDescribe") as? String)
+
+    /// The repo's describe, FULL — no `--abbrev=0`, unlike `installed`.
+    ///
+    /// The two are not interchangeable and neither replaces the other:
+    /// `installed` is a tag, compared semantically against the remote's tag to
+    /// decide whether an update exists; this one carries the commit count and the
+    /// sha, which is the only way "you committed but did not rebuild" is
+    /// detectable at all (comparing abbreviated tags says "in sync" across six
+    /// commits).
+    @Published private(set) var repoDescribe: String?
     @Published private(set) var releases: [Release] = []
+
+    #if DEBUG
+    /// True only for stores built by `staged(...)` (canvas previews). `load()`
+    /// no-ops on them (R7): without this, `UpdatesView.onAppear` would overwrite
+    /// the staged `installed`/`repoDescribe`/`releases` with live git/CHANGELOG
+    /// data on the one machine that has a canvas AND `ForgeCore.repoPath`
+    /// configured — the developer's — silently clobbering fixtures like
+    /// `previewLongReleases` that exist specifically to show a state real data
+    /// would never produce. Production stores are never staged, so `load()`
+    /// behaves exactly as before for them.
+    private(set) var isStagedPreview = false
+    #endif
     @Published private(set) var checking = false
     @Published private(set) var checkedAt: Date?
     @Published private(set) var lastError: String?
@@ -44,11 +78,15 @@ final class UpdateStore: ObservableObject {
     private var repo: String? { ForgeCore.repoPath }
 
     func load() {
+        #if DEBUG
+        guard !isStagedPreview else { return }
+        #endif
         guard let repo else {
             lastError = "repo do Forge não encontrado nas preferências"
             return
         }
         installed = git(["describe", "--tags", "--abbrev=0"], at: repo)
+        repoDescribe = git(["describe", "--tags"], at: repo)
         if let text = try? String(contentsOfFile: "\(repo)/CHANGELOG.md", encoding: .utf8) {
             releases = ChangelogParser.parse(text)
         }
@@ -77,41 +115,162 @@ final class UpdateStore: ObservableObject {
         }
     }
 
-    /// Run install.sh --update --with-app. Opens a terminal rather than running
-    /// headless: the installer prints what it backs up and can ask, and a silent
-    /// upgrade of the tool you are standing on is not something to hide.
+    /// Current installer step, in Portuguese, or nil when nothing is running.
+    @Published private(set) var phase: String?
+
+    /// Raw installer output, capped: this is a log to glance at, not a transcript
+    /// to keep. The tail is what explains a failure.
+    @Published private(set) var log: [String] = []
+
+    /// Why the update refused to start, plus a command the operator can run to
+    /// see the same thing themselves. Set only by the git precheck.
+    @Published private(set) var blockedMessage: String?
+    @Published private(set) var blockedCommand: String?
+
+    /// Run the installer headless, streaming its output. The ONE execution path
+    /// behind both `runUpdate()` and `runReinstall()` — the two differ only in
+    /// the command `InstallerCommand` composes and in whether the git precheck
+    /// applies, so duplicating this body would let them drift apart in behaviour
+    /// nobody is watching.
     ///
-    /// `--with-app` is not optional here even though it is opt-in on the command
-    /// line. The app build is gated behind that flag, so an update launched FROM
-    /// the app that omitted it would refresh every agent, skill and script and
-    /// leave the one binary the user is looking at on the old version — the update
-    /// would appear to have worked while the app stayed exactly as it was.
-    func runUpdate() {
-        guard let repo else { return }
+    /// No Terminal window: under `--update` the installer cannot ask anything.
+    /// Its four interactive reads are all behind `if ! $UPDATE && [ -t 0 ]` — a
+    /// double guard — and neither install.sh nor app/build.sh calls `sudo`, so a
+    /// headless run has nothing to block on. What the Terminal really provided
+    /// was visible progress, and that is now this app's own job.
+    ///
+    /// The command itself — and why `--with-app` is mandatory here, and why the
+    /// reinstall mode never pulls — lives in `InstallerCommand` in ForgeKit,
+    /// where it is unit-tested. This function does not compose shell strings.
+    private func runInstaller(mode: InstallerCommand.Mode) {
+        guard let repo else {
+            // Reachable since v3.2.0: "Reinstalar" renders even with no version
+            // resolved, so a click with no stored repo used to do nothing at all
+            // — no bar, no error.
+            lastError = "não encontrei o repo do Forge nas preferências"
+            return
+        }
+        blockedMessage = nil
+        blockedCommand = nil
+
+        // Check before starting, not after: `git pull --ff-only` failing halfway
+        // means the operator watched a progress bar for something that could
+        // never have begun. Only the pulling mode can hit it — so only `.update`
+        // pays for the git probes at all. `.reinstall` skips them entirely: not
+        // just `pulls: false` at the call site, but no `git` subprocess spawned,
+        // matching the "no git, no network" contract on `runReinstall()`.
+        if mode == .update {
+            let ahead = Int(Self.git(["rev-list", "--count", "origin/HEAD..HEAD"], at: repo) ?? "") ?? 0
+            if let blocker = UpdatePrecheck.evaluate(dirty: Git.isDirty(at: repo),
+                                                    ahead: ahead,
+                                                    pulls: true) {
+                blockedMessage = UpdatePrecheck.message(for: blocker)
+                blockedCommand = UpdatePrecheck.manualCommand(repo: repo)
+                return
+            }
+        }
+
         updating = true
-        let cmd = "git -C \(ForgeCore.shellQuote(repo)) pull --ff-only && "
-            + "bash \(ForgeCore.shellQuote("\(repo)/install.sh")) --update --with-app"
-        let r = ForgeCore.openTerminal(cwd: repo, command: cmd, title: "Atualizando o Forge")
-        updating = false
-        if !r.ok { lastError = r.stderr }
-        // Replacing the bundle does not replace the running process: this
-        // instance keeps executing the code it launched with until it is
-        // restarted. Say so rather than letting a stale window look updated.
-        else { needsRelaunch = true }
+        phase = "preparando"
+        log = []
+        lastError = nil
+        needsRelaunch = false
+
+        let cmd = InstallerCommand.build(repo: repo, mode: mode)
+        var tracker = InstallerPhaseTracker()
+
+        let process = ForgeCore.stream(cwd: repo, command: cmd, onLine: { line in
+            MainActor.assumeIsolated {
+                let store = UpdateStore.shared
+                switch tracker.consume(line) {
+                case .phase(let p):    store.phase = InstallerLabels.label(for: p)
+                case .finished(let l): store.phase = l
+                case .detail:          break
+                }
+                store.appendLog(line)
+            }
+        }, onExit: { code in
+            MainActor.assumeIsolated { UpdateStore.shared.finishUpdate(exitCode: code) }
+        })
+
+        // `Process.run()` can throw before `onExit` ever fires — e.g. the
+        // stored repo directory has vanished, so `currentDirectoryURL` is
+        // invalid. Without this, `updating` stays true forever: a permanent
+        // spinner and a disabled "Atualizar" button with no way out.
+        guard process != nil else {
+            updating = false
+            phase = nil
+            lastError = "não consegui iniciar o instalador (o diretório do repo existe?)"
+            return
+        }
     }
 
-    /// Set once an update has been launched — the new bundle is on disk but this
-    /// process is still the old one.
+    /// Pull the newest release and install it, app included.
+    func runUpdate() { runInstaller(mode: .update) }
+
+    /// Reinstall from the repo exactly as it is on disk — no git, no network.
+    func runReinstall() { runInstaller(mode: .reinstall) }
+
+    /// The installer is gone; the exit code decides everything.
+    ///
+    /// Separate from `runUpdate()` on purpose. `needsRelaunch` is set HERE and
+    /// nowhere else: the old code set it as soon as a Terminal had been opened,
+    /// so the button showed up while the build was still running and clicking it
+    /// killed the installer. Replacing the bundle does not replace the running
+    /// process, so the affordance is real — just not before this point.
+    private func finishUpdate(exitCode: Int32) {
+        updating = false
+        if UpdateOutcome.canRelaunch(exitCode: exitCode) {
+            // A successful update just pulled the repo: `repoDescribe` (and
+            // `installed`) are still whatever `load()` last saw BEFORE the pull,
+            // so without this refresh the still-running old process would keep
+            // comparing its `running` stamp against a stale `repoDescribe` and
+            // read "in sync" at the exact moment the running-vs-repo divergence
+            // becomes real (R6) — the entire reason the footer exists (D25).
+            load()
+            needsRelaunch = true
+        } else {
+            lastError = UpdateOutcome.failureMessage(exitCode: exitCode, lastLines: log)
+        }
+    }
+
+    private func appendLog(_ line: String) {
+        log.append(line)
+        if log.count > 500 { log.removeFirst(log.count - 500) }
+    }
+
+    /// Set once an update has FINISHED successfully — the new bundle is on disk
+    /// but this process is still the old one.
     @Published var needsRelaunch = false
 
-    /// Relaunch into the freshly installed bundle. `open -n` starts the new copy
-    /// before this one exits, so the user never faces an empty screen.
+    /// True between asking to relaunch and actually terminating, so the quit
+    /// handler knows to start the new copy.
+    @Published private(set) var relaunchPending = false
+
+    /// Ask to relaunch. The new copy is NOT started here: `terminate(nil)` runs
+    /// `applicationShouldTerminate`, which may still be cancelled — starting it
+    /// first would leave two instances behind a cancelled alert.
     func relaunch() {
+        relaunchPending = true
+        NSApplication.shared.terminate(nil)
+    }
+
+    /// Called when the live-session alert is cancelled: the user explicitly
+    /// declined to quit, so a later ordinary Quit must not relaunch on their
+    /// behalf. Without this, `relaunchPending` stayed true forever after a
+    /// single cancel.
+    func cancelRelaunch() {
+        relaunchPending = false
+    }
+
+    /// Start the replacement instance. Called by `applicationShouldTerminate`
+    /// once the quit is certain. `open -n` starts the new copy before this one
+    /// exits, so the user never faces an empty screen.
+    func launchNewInstance() {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         p.arguments = ["-n", Bundle.main.bundlePath]
         try? p.run()
-        NSApplication.shared.terminate(nil)
     }
 
     /// Announce a newly available version once. Uses the same notifier as
@@ -155,20 +314,51 @@ final class UpdateStore: ObservableObject {
 // MARK: - View
 
 struct UpdatesView: View {
-    @StateObject private var store = UpdateStore.shared
+    @StateObject private var store: UpdateStore
     @ObservedObject var state: AppState
+
+    /// Folded by default: the phase label is the answer, the log is the appeal.
+    @State private var logExpanded = false
+
+    /// The release list is short at rest (D30) and expands in place. The cut is
+    /// the historical tail only — `ReleaseWindow` pins the installed version, the
+    /// available one and anything unreleased, so nothing the operator needs can
+    /// fall behind the control.
+    @State private var showAllReleases = false
+
+    /// The store is injectable so a canvas preview can stage the states this
+    /// screen has — up to date, update available, installing, relaunch pending,
+    /// blocked. None of them is reachable through the singleton: every field
+    /// that selects a state is `@Published private(set)`, and the real ones are
+    /// only set by git and by the installer.
+    ///
+    /// Production passes nothing and gets `.shared`, so the running app still
+    /// has exactly one store, held for the view's lifetime exactly as before.
+    ///
+    /// `nil` rather than `store: UpdateStore = .shared`: a default argument
+    /// expression is evaluated in a nonisolated context, and `shared` is
+    /// main-actor-isolated, which costs a concurrency warning. Resolving it
+    /// inside `StateObject`'s main-actor autoclosure puts the reference back
+    /// exactly where the property initializer had it — hence no new warning.
+    init(state: AppState, store: UpdateStore? = nil) {
+        self.state = state
+        _store = StateObject(wrappedValue: store ?? UpdateStore.shared)
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 versionCard
+                if let msg = store.blockedMessage { blockedCard(msg) }
+                if store.updating || !store.log.isEmpty { progressCard }
                 if let err = store.lastError {
                     Label(err, systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.orange)
                 }
-                ForEach(store.releases.prefix(12)) { r in
+                ForEach(releaseWindow.visible) { r in
                     ReleaseCard(release: r, installed: store.installed)
                 }
+                showMoreControl
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
@@ -187,18 +377,49 @@ struct UpdatesView: View {
         }
     }
 
+    /// Which release notes are on screen (D30).
+    ///
+    /// Every rule lives in `ReleaseWindow` in ForgeKit, which is testable; this
+    /// property is only the wiring. It replaced a twelve-item prefix that cut the list
+    /// by position with no notion of which cards must not be cut — with a short
+    /// list that becomes visible, which is why the limit is a NAMED constant and
+    /// not a literal here: the number `5` was never validated against a live
+    /// list, so it has to be changeable in one place.
+    private var releaseWindow: ReleaseWindow.Window {
+        ReleaseWindow.visible(releases: store.releases,
+                              installed: store.installed,
+                              latest: store.latest,
+                              limit: showAllReleases ? .max : ReleaseWindow.restingLimit)
+    }
+
+    /// Reveals the tail in place. Absent when there is no tail — a control that
+    /// says "show more 0" is worse than no control.
+    @ViewBuilder private var showMoreControl: some View {
+        let hidden = releaseWindow.hiddenCount
+        if hidden > 0 || showAllReleases {
+            Button(hidden > 0 ? ReleaseWindow.moreLabel(hiddenCount: hidden)
+                              : ReleaseWindow.lessLabel) {
+                withAnimation(.easeInOut(duration: 0.15)) { showAllReleases.toggle() }
+            }
+            .buttonStyle(.plain)
+            .controlSize(.small)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The icon column this card used to open with — a filled disc with a glyph
+    /// centred in it — is gone (D28). It was the single largest piece of
+    /// decoration on the screen and it carried no information the card did not
+    /// already state twice: the headline says "Atualização disponível: vX" in
+    /// words, and the orange `strokeBorder` below already exercises the file's
+    /// visual rule 1 (orange = needs you) at the card's own boundary.
+    ///
+    /// The action slot is untouched, deliberately: its three states and the
+    /// "Atualizar" + "Reinstalar" coexistence were bought with a review
+    /// objection in a sibling task and are not this subtraction's business.
     private var versionCard: some View {
         HStack(spacing: 16) {
-            ZStack {
-                Circle()
-                    .fill(store.updateAvailable ? Color.accentOrange.opacity(0.15)
-                                                : Color.secondary.opacity(0.12))
-                    .frame(width: 54, height: 54)
-                Image(systemName: store.updateAvailable ? "arrow.down.circle.fill" : "checkmark.circle")
-                    .font(.system(size: 24))
-                    .foregroundStyle(store.updateAvailable ? Color.accentOrange : .secondary)
-            }
-
             VStack(alignment: .leading, spacing: 3) {
                 if store.updateAvailable, let latest = store.latest {
                     Text("Atualização disponível: \(latest)").font(.headline)
@@ -216,13 +437,37 @@ struct UpdatesView: View {
             // Relaunch wins the slot: once the installer has run, the useful
             // action is no longer "update" — it is picking up what was installed.
             if store.needsRelaunch {
-                Button("Reabrir na nova versão") { store.relaunch() }
-                    .controlSize(.large)
-                    .help("Esta janela ainda roda o binário antigo até reabrir")
-            } else if store.updateAvailable {
-                Button("Atualizar") { store.runUpdate() }
-                    .controlSize(.large)
-                    .help("Abre um terminal rodando install.sh --update --with-app")
+                VStack(alignment: .trailing, spacing: 3) {
+                    Button("Reabrir na nova versão") { store.relaunch() }
+                        .controlSize(.large)
+                    // Text, not a confirmation: terminate(nil) already raises the
+                    // live-session alert in applicationShouldTerminate, and asking
+                    // twice for the same thing is worse than asking once.
+                    Text(relaunchCaption)
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                // Both can render together on purpose: an available-but-blocked
+                // update (local commits ahead of origin, or a dirty tree) is
+                // exactly the state "Reinstalar" exists to unblock. Hiding it
+                // whenever "Atualizar" shows would hide it in the one state it
+                // matters most — so needsRelaunch still wins the whole slot, but
+                // updateAvailable no longer keeps Reinstalar off-screen.
+                VStack(alignment: .trailing, spacing: 6) {
+                    if store.updateAvailable {
+                        Button("Atualizar") { store.runUpdate() }
+                            .controlSize(.large)
+                            .disabled(store.updating)
+                            .help("Roda install.sh --update --with-app aqui, mostrando o progresso")
+                    }
+                    Button("Reinstalar") { store.runReinstall() }
+                        .controlSize(.small)
+                        .disabled(store.updating)
+                        .help("Roda install.sh --update --with-app nesta cópia do repo, "
+                              + "sem git pull: reaplica agentes, skills e scripts e recompila o app")
+                }
             }
         }
         .padding(16)
@@ -230,6 +475,102 @@ struct UpdatesView: View {
         .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14)
             .strokeBorder(store.updateAvailable ? Color.accentOrange.opacity(0.4) : .clear))
+    }
+
+    /// What the relaunch actually costs, said before it happens: the live
+    /// sessions it ends, and — when this bundle is not the one that was just
+    /// installed — which copy will reopen.
+    private var relaunchCaption: String {
+        var parts = ["esta janela ainda roda o binário antigo"]
+        let live = state.sessions.filter(\.isRunning).count
+        if live > 0 {
+            parts.append(live == 1 ? "1 sessão em execução será encerrada"
+                                   : "\(live) sessões em execução serão encerradas")
+        }
+        if let note = RelaunchTarget.divergenceNote(for: Bundle.main.bundlePath) {
+            parts.append(note)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Progress while the installer runs — and after, since the log is the only
+    /// place a failure explains itself.
+    ///
+    /// Deliberately built from views this file already renders (ProgressView,
+    /// Text, the ReleaseCard chevrons): app/build.sh does `rm -rf
+    /// /Applications/Forge.app` mid-update, so anything loaded lazily during that
+    /// window can fail to load at all.
+    private var progressCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                if store.updating { ProgressView().controlSize(.small) }
+                else {
+                    Image(systemName: store.lastError == nil
+                          ? "checkmark.circle" : "exclamationmark.triangle")
+                        .foregroundStyle(store.lastError == nil ? .secondary : Color.accentOrange)
+                }
+                // No percentage: the swift build alone dominates wall clock, so
+                // any number here would be invented.
+                Text(store.phase ?? "preparando").font(.callout)
+                Spacer()
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { logExpanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: logExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                    Text("Saída do instalador (\(store.log.count) linhas)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if logExpanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(Array(store.log.suffix(200).enumerated()), id: \.offset) { _, l in
+                            Text(l)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .frame(height: 220)
+            }
+        }
+        .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// The refusal to start, and why it is protection rather than a limitation.
+    private func blockedCard(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(Color.accentOrange)
+                Text("A atualização não começou").font(.headline)
+                Spacer()
+            }
+            Text(message).font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let cmd = store.blockedCommand {
+                Text(cmd).font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                Button("Copiar comando") { state.copyToPasteboard(cmd, label: "comando") }
+                    .controlSize(.small)
+            }
+        }
+        .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -370,3 +711,50 @@ struct ChangelogEntryView: View {
             ?? AttributedString(s)
     }
 }
+
+// MARK: - Preview staging
+
+#if DEBUG
+extension UpdateStore {
+    /// A detached store with its fields set, for canvas previews only.
+    ///
+    /// It lives in THIS file on purpose: the fields that select a state are
+    /// `@Published private(set)`, and `private` in Swift reaches the enclosing
+    /// declaration and its extensions *in the same file*. A factory anywhere
+    /// else would have forced those setters open for production callers too —
+    /// a permanent cost paid for a preview-only need.
+    ///
+    /// `UpdateStore()` does no work (no git, no network, no timer), so a second
+    /// instance is inert; `shared` stays the only store the app itself uses.
+    static func staged(installed: String? = "v3.3.0",
+                       latest: String? = nil,
+                       releases: [Release] = [],
+                       checkedAt: Date? = Date(),
+                       updating: Bool = false,
+                       phase: String? = nil,
+                       log: [String] = [],
+                       blockedMessage: String? = nil,
+                       blockedCommand: String? = nil,
+                       lastError: String? = nil,
+                       needsRelaunch: Bool = false,
+                       running: String? = nil,
+                       repoDescribe: String? = nil) -> UpdateStore {
+        let s = UpdateStore()
+        s.isStagedPreview = true
+        s.installed = installed
+        s.running = running
+        s.repoDescribe = repoDescribe
+        s.latest = latest
+        s.releases = releases
+        s.checkedAt = checkedAt
+        s.updating = updating
+        s.phase = phase
+        s.log = log
+        s.blockedMessage = blockedMessage
+        s.blockedCommand = blockedCommand
+        s.lastError = lastError
+        s.needsRelaunch = needsRelaunch
+        return s
+    }
+}
+#endif

@@ -30,7 +30,13 @@ const path = require('path');
 
 const repoRoot = path.resolve(__dirname, '..');
 const appSourcesDir = path.join(repoRoot, 'app', 'Sources');
-const terminalViewPath = path.join(appSourcesDir, 'Forge', 'TerminalView.swift');
+// TerminalView.swift was split by responsibility (session lifetime / SwiftUI
+// bridge / screen chrome / launcher). The guards below follow the code to its
+// new home rather than the old filename — a guard that reads a file nobody
+// writes any more is the inert-green failure this repo keeps paying for.
+const terminalHostPath = path.join(appSourcesDir, 'Forge', 'TerminalHost.swift');
+const terminalSessionPath = path.join(appSourcesDir, 'Forge', 'TerminalSession.swift');
+const forgeTerminalPath = path.join(appSourcesDir, 'Forge', 'ForgeTerminalView.swift');
 const storesPath = path.join(appSourcesDir, 'Forge', 'Stores.swift');
 const viewsPath = path.join(appSourcesDir, 'Forge', 'Views.swift');
 const registryCorePath = path.join(appSourcesDir, 'ForgeKit', 'TerminalRegistryCore.swift');
@@ -99,7 +105,8 @@ function functionBody(filePath, signature) {
 // --- files exist -----------------------------------------------------------
 
 check('os arquivos do fix existem', () => {
-  for (const p of [terminalViewPath, storesPath, viewsPath, registryCorePath]) {
+  for (const p of [terminalHostPath, terminalSessionPath, forgeTerminalPath,
+                   storesPath, viewsPath, registryCorePath]) {
     assert(fs.existsSync(p), `arquivo ausente: ${path.relative(repoRoot, p)}`);
   }
 });
@@ -107,8 +114,11 @@ check('os arquivos do fix existem', () => {
 // --- 1. makeNSView must not build/spawn a terminal -------------------------
 
 check('makeNSView não constrói um LocalProcessTerminalView nem inicia processo', () => {
-  const { code } = functionBody(terminalViewPath, 'func makeNSView(');
-  const forbidden = ['LocalProcessTerminalView(frame', '.startProcess('];
+  const { code } = functionBody(terminalHostPath, 'func makeNSView(');
+  // `ForgeTerminalView(frame` is not redundant with the SwiftTerm name: the
+  // emulator is now a subclass, so a naive makeNSView would construct THAT and
+  // this guard would have stayed green while the original bug walked back in.
+  const forbidden = ['LocalProcessTerminalView(frame', 'ForgeTerminalView(frame', '.startProcess('];
   const hits = forbidden.filter(p => code.includes(p));
   assert(
     hits.length === 0,
@@ -118,7 +128,7 @@ check('makeNSView não constrói um LocalProcessTerminalView nem inicia processo
 });
 
 check('makeNSView pega a instância viva no registry, chaveada pela sessão', () => {
-  const { code } = functionBody(terminalViewPath, 'func makeNSView(');
+  const { code } = functionBody(terminalHostPath, 'func makeNSView(');
   assert(code.includes('TerminalViewStore.shared'),
     'makeNSView não consulta o TerminalViewStore — a sessão deixa de ser a dona do terminal');
   assert(/instance\(for:\s*session\)/.test(code),
@@ -137,12 +147,71 @@ check('o guard morde: um makeNSView ingênuo é detectado, e a menção em comen
   const realSpawn = '        view.startProcess(executable: shell, args: ["-l"])';
   assert(stripLineComments(realSpawn).includes('.startProcess('),
     'o matcher não pegou um startProcess real');
+  // Controle positivo do rename: se o matcher só conhecesse o nome do
+  // SwiftTerm, a subclasse passaria batida.
+  const subclassLine = '        let view = ForgeTerminalView(frame: .zero)';
+  assert(stripLineComments(subclassLine).includes('ForgeTerminalView(frame'),
+    'o matcher não pegaria a construção da subclasse — guard vazio depois do rename');
+});
+
+// --- 1b. quem constrói o terminal é o store, e uma vez só ------------------
+
+check('o terminal é construído no store, com o cwd passado ao spawn', () => {
+  const { code } = functionBody(terminalSessionPath, 'private func make(for session:');
+  assert(/ForgeTerminalView\(frame:/.test(code),
+    'o store deixou de construir o terminal — ninguém mais é dono do processo');
+  assert(/currentDirectory:\s*session\.cwd/.test(code),
+    'o spawn não recebe currentDirectory — voltou a trocar o cwd do processo inteiro, ' +
+      'o que reroteia todo caminho relativo do app enquanto durar');
+  assert(!/changeCurrentDirectoryPath/.test(code),
+    'changeCurrentDirectoryPath voltou — é exatamente o hack que currentDirectory: substitui');
+});
+
+// --- 1c. zoom: idempotência não é detalhe, é o que preserva a seleção ------
+
+check('applyFontSize sai cedo quando o tamanho não mudou', () => {
+  const { code } = functionBody(forgeTerminalPath, 'func applyFontSize(');
+  assert(/guard[\s\S]*return\s*\}/.test(code),
+    'applyFontSize perdeu o guard de saída antecipada — o setter de font do SwiftTerm ' +
+      'chama selectNone(), então reatribuir a cada rebuild do SwiftUI apaga a seleção do operador');
+  assert(/font\.pointSize/.test(code),
+    'o guard não compara com o tamanho atual da fonte — não tem como ser idempotente');
+});
+
+check('o zoom alcança as abas fora da tela, não só a visível', () => {
+  const { code } = functionBody(terminalSessionPath, 'func setFontSize(');
+  assert(/registry\.entries/.test(code),
+    'setFontSize não percorre os terminais vivos — SwiftUI só reconstrói a aba visível, ' +
+      'então as outras ficariam no tamanho antigo');
+  assert(/UserDefaults\.standard\.set/.test(code),
+    'o tamanho não é persistido — o zoom morreria a cada relançamento');
+});
+
+// --- 1d. drop/paste de imagem: hover não pode escrever em disco -----------
+
+check('draggingEntered só inspeciona — nunca escreve a imagem em disco', () => {
+  const { code } = functionBody(forgeTerminalPath, 'override func draggingEntered(');
+  assert(/canInsert\(/.test(code),
+    'draggingEntered não usa o predicado barato');
+  assert(!/insertionText\(/.test(code) && !/PastedImages\.write/.test(code),
+    'draggingEntered passou a resolver o texto de inserção — passar o mouse por cima ' +
+      'do terminal deixaria arquivos no disco sem nenhum drop ter acontecido');
+});
+
+check('⌘V continua colando texto quando é texto', () => {
+  const { code } = functionBody(forgeTerminalPath, 'override func paste(');
+  assert(/super\.paste\(/.test(code),
+    'paste não cai mais no colar de texto do SwiftTerm — colar texto comum quebraria');
+  const reader = functionBody(forgeTerminalPath, 'static func read(');
+  assert(/plainText\(pb\) == nil/.test(reader.code),
+    'insertionText deixou de exigir ausência de texto antes de tratar a área como imagem — ' +
+      'copiar texto de um app que também publica imagem viraria um caminho de arquivo');
 });
 
 // --- 2. bootstrap guard must not live on the Coordinator -------------------
 
 check('o Coordinator não guarda estado de bootstrap (o flag é por sessão, não por view)', () => {
-  const { code } = functionBody(terminalViewPath, 'final class Coordinator');
+  const { code } = functionBody(terminalHostPath, 'final class Coordinator');
   assert(!/didBootstrap/.test(code),
     'o guard de bootstrap voltou para o Coordinator — SwiftUI recria o Coordinator a cada ' +
       'navegação, então a primeira mensagem seria reenviada');
@@ -151,7 +220,7 @@ check('o Coordinator não guarda estado de bootstrap (o flag é por sessão, nã
 });
 
 check('o bootstrap é reivindicado uma vez por id de sessão', () => {
-  const { code } = functionBody(terminalViewPath, 'func makeNSView(');
+  const { code } = functionBody(terminalHostPath, 'func makeNSView(');
   assert(/claimBootstrap\(for:\s*session\.id\)/.test(code),
     'makeNSView não reivindica o bootstrap por session.id — nada impede o replay');
 
@@ -175,7 +244,7 @@ check('o guard morde: um didBootstrap real no Coordinator é detectado, comentá
 // --- 3. view teardown must not kill the process ----------------------------
 
 check('dismantleNSView não encerra o processo', () => {
-  const { code } = functionBody(terminalViewPath, 'static func dismantleNSView(');
+  const { code } = functionBody(terminalHostPath, 'static func dismantleNSView(');
   assert(!/\.terminate\(\)/.test(code),
     'dismantleNSView voltou a matar o PTY — sair da tela encerraria a sessão');
   assert(/viewDismantled/.test(code),
@@ -245,7 +314,8 @@ check('o guard morde: um @State privado de seção seria detectado', () => {
 check('nenhuma API acima do baseline macOS 13 nos arquivos tocados', () => {
   const forbidden = ['.onKeyPress', '.draggable(', '.dropDestination(', '.scrollPosition('];
   const hits = [];
-  for (const file of [terminalViewPath, storesPath, viewsPath, registryCorePath]) {
+  for (const file of [terminalHostPath, terminalSessionPath, forgeTerminalPath,
+                      storesPath, viewsPath, registryCorePath]) {
     readLines(file).forEach((line, i) => {
       const code = stripLineComments(line);
       for (const p of forbidden) {

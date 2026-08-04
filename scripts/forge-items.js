@@ -18,11 +18,14 @@
 //   listItems(cwd, filter)             → Array<object>  // sorted by id asc
 //   updateItem(cwd, idOrPrefix, patch) → { id, path, item }
 //   setStatus(cwd, idOrPrefix, status) → { id, path, item }
+//   setPriority(cwd, idOrPrefix, prio) → { id, path, item }
+//   labelsToArray(scalar)              → string[]  // ONLY for the --list --json edge
 //   promoteItem(cwd, idOrPrefix, targetId) → { id, path, item }
 //   resolveItemId(cwd, prefix)         → string   // unique prefix → full ID
 //
 // CLI:
-//   --add/--list/--read/--update/--set-status/--promote/--validate/--resolve
+//   --add/--list/--read/--update/--set-status/--set-priority/--promote
+//   --validate/--resolve
 //   --smoke-regression, --help — see cliMain() below for the full surface.
 //
 // Exit codes:
@@ -51,15 +54,33 @@ const ITEMS_DIR = '.gsd/items';
 // addItem, updateItem, setStatus and validateItem all reference it.
 const STATUSES = Object.freeze(['inbox', 'triaged', 'doing', 'done', 'dropped']);
 
+// The closed priority set, in the same mould as STATUSES: this frozen constant is
+// the ONLY place the set exists — validateItem and setPriority both reference it,
+// so no write path can ever accept a value the others reject.
+const PRIORITIES = Object.freeze(['p0', 'p1', 'p2', 'p3']);
+
 // Provenance regimes. `auto` items must carry a `source`; `human` items need not.
 const ORIGINS = Object.freeze(['human', 'auto']);
 
 // Frozen key order for diff stability. Unknown keys are emitted after these,
 // sorted alphabetically, so third-party additions never reshuffle the core block.
+//
+// `closed_at` sits right after `updated` because it is the other timestamp of the
+// lifecycle. Inserting a key in the MIDDLE of this list does NOT reorder legacy
+// fragments that lack it: serializeItem walks `KEY_ORDER.filter(k => k in item)`,
+// so an absent key is simply skipped and every surviving key keeps its relative
+// position. That is a property, not a hope — section 8 of forge-items.test.js
+// round-trips real pre-closed_at fragments byte-for-byte and would fail here.
 const KEY_ORDER = Object.freeze([
-  'id', 'title', 'status', 'origin', 'created', 'updated',
+  'id', 'title', 'status', 'priority', 'labels', 'blocked_by', 'origin', 'created', 'updated', 'closed_at',
   'source', 'file', 'sha', 'milestone', 'promoted_to',
 ]);
+
+// The subset of STATUSES that counts as "closed" for `closed_at` stamping.
+// `dropped` IS stamped: the field records WHEN an item left the open board, not
+// whether it was a delivery. Excluding dropped items from a throughput count is
+// a reporting decision made where the count is computed, not here.
+const CLOSED_STATUSES = Object.freeze(new Set(['done', 'dropped']));
 
 // ── itemsDir ──────────────────────────────────────────────────────────────────
 // Absolute path to the items directory for a given cwd. Every filesystem path in
@@ -136,6 +157,47 @@ function serializeItem(item) {
   return `---\n${lines.join('\n')}\n---\n${body}`;
 }
 
+// ── normalizeLabels ───────────────────────────────────────────────────────────
+// Joins an array of labels into the comma-separated SCALAR that is the only
+// encoding this store ever writes to disk.
+//
+// The split does NOT belong in parseItem, and the array does NOT belong in
+// serializeItem. A YAML list on disk is a proven silent data loss here: the
+// `- bug` continuation lines fail parseItem's `^key: value` regex and are
+// skipped, leaving `labels: ""`, which serializeItem then drops entirely — the
+// key vanishes on the next write with no error and no exit code. So the array
+// exists only at the two boundaries: joined on the way IN (here, called from
+// addItem/updateItem so library callers are covered too, not just CLI stdin),
+// split on the way OUT (labelsToArray, only in --list --json).
+function normalizeLabels(value) {
+  if (!Array.isArray(value)) return value; // strings pass through untouched
+  return value.map(String).map(s => s.trim()).filter(Boolean).join(', ');
+}
+
+// `blocked_by` is the SAME encoding problem as `labels` — a list of short tokens
+// that must live on disk as one scalar line — so it reuses the same pair of
+// boundary functions rather than growing a second, subtly different one. A YAML
+// list here would be silently dropped by parseItem exactly as it is for labels.
+const normalizeBlockedBy = normalizeLabels;
+
+// ── labelsToArray ─────────────────────────────────────────────────────────────
+// The read side of the same boundary: scalar → array. Absent/empty yields [],
+// so a consumer can iterate unconditionally without a presence check.
+function labelsToArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null) return [];
+  return String(value).split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// ── toJsonShape ───────────────────────────────────────────────────────────────
+// Shallow clone with `labels` widened to an array. Applied ONLY to the
+// `--list --json` output — `--read`, listItems() and readItem() all keep the raw
+// store shape, so the on-disk encoding stays the single source of truth and no
+// caller can accidentally write an array back.
+function toJsonShape(item) {
+  return { ...item, labels: labelsToArray(item.labels), blocked_by: labelsToArray(item.blocked_by) };
+}
+
 // ── validateItem ──────────────────────────────────────────────────────────────
 // Structural validation. Dual-regime provenance: an `auto` item requires a
 // non-empty `source`; a `human` item does not.
@@ -167,12 +229,33 @@ function validateItem(item) {
     errors.push('origin "auto" requires a non-empty source (e.g. review/S02/R1)');
   }
 
+  // priority is optional, but when present it is a closed set — same regime as
+  // status. Checked here so EVERY write path (addItem, updateItem, --add,
+  // --update, setPriority) rejects a bad value before anything reaches disk.
+  if (item.priority !== undefined && item.priority !== null && item.priority !== '') {
+    if (!PRIORITIES.includes(item.priority)) {
+      errors.push(`priority must be one of ${PRIORITIES.join(', ')}; got "${item.priority}"`);
+    }
+  }
+
   if (item.promoted_to !== undefined && item.promoted_to !== null && item.promoted_to !== '') {
     if (!isValidPromotionTarget(item.promoted_to)) {
       errors.push(
         `promoted_to must be a valid milestone or task ID; got "${item.promoted_to}"`
       );
     }
+  }
+
+  // closed_at is a measurement of WHEN status transitioned to a closed state,
+  // never an estimate a caller can forge on an open item. A stamp present on
+  // an item whose status is not done/dropped would poison any "closed in a
+  // window" count downstream. Replacing the stamp on an already-closed item
+  // (backfill/date-correction) remains allowed — this only rejects the
+  // combination of a stamp with a non-closed status.
+  if (item.closed_at && !CLOSED_STATUSES.has(item.status)) {
+    errors.push(
+      `closed_at requires status to be one of ${[...CLOSED_STATUSES].join(', ')}; got status "${item.status}"`
+    );
   }
 
   return { valid: errors.length === 0, errors };
@@ -245,6 +328,20 @@ function addItem(cwd, fields, opts) {
     updated: now,
   };
 
+  // Array → scalar BEFORE validation and before disk. Doing it here rather than
+  // in the CLI covers library callers as well.
+  if ('labels' in item) item.labels = normalizeLabels(item.labels);
+  if ('blocked_by' in item) item.blocked_by = normalizeBlockedBy(item.blocked_by);
+
+  // An item born closed (imported backlog, an item logged only once it was
+  // already resolved) never passes through updateItem's transition, so it would
+  // otherwise be invisible to any closed-in-window count. Stamp it at creation —
+  // an explicit closed_at in `fields` still wins, which is how a backfill
+  // preserves the real historical date.
+  if (CLOSED_STATUSES.has(item.status) && !item.closed_at) {
+    item.closed_at = now;
+  }
+
   const { valid, errors } = validateItem(item);
   if (!valid) {
     throw new Error(`Invalid item: ${errors.join('; ')}`);
@@ -315,6 +412,41 @@ function updateItem(cwd, idOrPrefix, patch, opts) {
     updated: new Date().toISOString(),
   };
 
+  // Same array → scalar join as addItem, applied post-merge so a patch carrying
+  // an array is normalized while an untouched stored scalar passes through.
+  if ('labels' in merged) merged.labels = normalizeLabels(merged.labels);
+  if ('blocked_by' in merged) merged.blocked_by = normalizeBlockedBy(merged.blocked_by);
+
+  // ── closed_at, keyed on the TRANSITION ──────────────────────────────────────
+  // Derived from existing.status → merged.status, never from the patch. That is
+  // what makes `--update` on a done item leave closed_at untouched while still
+  // bumping `updated`: a title patch does not change the status, so no branch
+  // below fires. It also means every writer funnels through one rule —
+  // setStatus, --update {status} and any future caller all land here.
+  //
+  // Why this field exists: `updated` bumps on ANY mutation, so counting items
+  // closed in a window from `updated` yields a number that shifts retroactively
+  // when someone edits an old item. `closed_at` is what makes that count a
+  // measurement instead of an estimate.
+  const wasClosed = CLOSED_STATUSES.has(existing.status);
+  const isClosed = CLOSED_STATUSES.has(merged.status);
+  if (isClosed && !merged.closed_at) {
+    // Only stamp when there is no stamp yet. done → done (the documented no-op)
+    // and done → dropped therefore preserve the ORIGINAL closing time; the item
+    // closed once, and re-touching it must not rewrite history.
+    merged.closed_at = new Date().toISOString();
+  } else if (!isClosed && wasClosed) {
+    // Reopening removes the key. `null` — not `delete` — because serializeItem
+    // already skips undefined/null/'' when emitting keys, so null IS the
+    // module's established "omit this key" signal. A `delete` would work today
+    // and diverge the moment the serializer changes; there is no reason to have
+    // two mechanisms for one meaning.
+    merged.closed_at = null;
+  }
+  // Deliberately NOT validated as un-patchable: a user could pass closed_at in a
+  // patch, but the transition rules above dominate every case that matters, and
+  // rejecting the key is a contract change outside this task's scope.
+
   const { valid, errors } = validateItem(merged);
   if (!valid) {
     throw new Error(`Invalid item after update: ${errors.join('; ')}`);
@@ -340,6 +472,20 @@ function setStatus(cwd, idOrPrefix, status, opts) {
   return updateItem(cwd, idOrPrefix, { status }, opts);
 }
 
+// ── setPriority ───────────────────────────────────────────────────────────────
+// Exact mirror of setStatus: throws on any value outside the closed PRIORITIES
+// set BEFORE touching disk. Validating after writing would still exit non-zero
+// while leaving a mutated fragment behind — the acceptance criterion is that
+// `git status --porcelain .gsd/items/` stays empty after a rejected attempt.
+function setPriority(cwd, idOrPrefix, priority, opts) {
+  if (!PRIORITIES.includes(priority)) {
+    throw new Error(
+      `Invalid priority "${priority}". Allowed: ${PRIORITIES.join(', ')}.`
+    );
+  }
+  return updateItem(cwd, idOrPrefix, { priority }, opts);
+}
+
 // ── promoteItem ───────────────────────────────────────────────────────────────
 // Links an item to the milestone or task it became. Does NOT change status —
 // callers decide separately via setStatus.
@@ -356,16 +502,22 @@ function promoteItem(cwd, idOrPrefix, targetId, opts) {
 module.exports = {
   ITEMS_DIR,
   STATUSES,
+  PRIORITIES,
   itemsDir,
   itemPath,
   parseItem,
   serializeItem,
   validateItem,
+  normalizeLabels,
+  labelsToArray,
+  normalizeBlockedBy,
+  toJsonShape,
   addItem,
   readItem,
   listItems,
   updateItem,
   setStatus,
+  setPriority,
   promoteItem,
   resolveItemId,
 };
@@ -390,6 +542,9 @@ Commands:
   --update <id|prefix> [--cwd <dir>]       Patch item from stdin JSON
   --set-status <id|prefix> <status> [--cwd <dir>]
                                             Set status (closed set); invalid → exit 1
+  --set-priority <id|prefix> <priority> [--cwd <dir>]
+                                            Set priority (closed set); invalid → exit 1
+                                            (rejected before the fragment is touched)
   --promote <id|prefix> <target-id> [--cwd <dir>]
                                             Set promoted_to (milestone or task ID)
   --validate <id|prefix> [--cwd <dir>]     Print { id, valid, errors }; exit 1 if invalid
@@ -397,8 +552,9 @@ Commands:
   --smoke-regression                       Run inline regression smoke test (exit 0 = PASS)
   --help, -h                               Show this help
 
-Statuses: ${STATUSES.join(', ')}
-Origins:  ${ORIGINS.join(', ')}
+Statuses:   ${STATUSES.join(', ')}
+Priorities: ${PRIORITIES.join(', ')}
+Origins:    ${ORIGINS.join(', ')}
 
 Options:
   --cwd <dir>   Working directory (default: process.cwd())
@@ -487,7 +643,9 @@ function cliMain(argv) {
       process.exit(1);
     }
     if (asJson) {
-      console.log(JSON.stringify(result));
+      // The ONE place the scalar widens to an array — the app is the only
+      // consumer of that shape (--read stays raw, S01-PLAN Nota 1).
+      console.log(JSON.stringify(result.map(toJsonShape)));
     } else {
       for (const it of result) {
         console.log(`${it.id} ${it.status} ${it.title}`);
@@ -543,6 +701,24 @@ function cliMain(argv) {
     let result;
     try {
       result = setStatus(cwd, id, status);
+    } catch (e) {
+      process.stderr.write(`${e.message}\n`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify(result));
+    process.exit(0);
+  }
+
+  if (cmd === '--set-priority') {
+    const id = argv[1];
+    const priority = argv[2];
+    if (!id || !priority) {
+      process.stderr.write('--set-priority requires an item ID/prefix and a priority\n');
+      process.exit(2);
+    }
+    let result;
+    try {
+      result = setPriority(cwd, id, priority);
     } catch (e) {
       process.stderr.write(`${e.message}\n`);
       process.exit(1);

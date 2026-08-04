@@ -1095,6 +1095,15 @@ When the dispatched chain member resolves to `engine == codex` **and** the unit 
 CD_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-code-dir.js" --resolve \
   --iso-result "$ISO_RESULT" --plan "$WORKING_DIR/$PLAN_PATH" --cwd "$WORKING_DIR")
 # exit 0 → status ok|shared · 4 → cross-repo · 5 → undeclared
+# Durable hint (canonical): shell state does NOT survive a Bash-tool boundary, so $CODE_DIR_HINT is
+# JSON-encoded HERE — the same fence that produces $CD_JSON — and persisted to a per-workspace file
+# the fallback emitters re-read. The file (not $XLLM_STATE) is the carrier because the two refusal
+# paths that produce a hint skip state allocation entirely, so no state file exists to hold it.
+CODE_DIR_HINT_FILE="$WORKING_DIR/.gsd/forge/code-dir-hint.json"
+mkdir -p "$WORKING_DIR/.gsd/forge/"; printf '""' > "$CODE_DIR_HINT_FILE"   # reset per unit — never inherit a prior unit's hint
+HINT_JSON=$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]||""))' "$CODE_DIR_HINT")
+[ -n "$HINT_JSON" ] || HINT_JSON='""'   # an empty substitution would emit `"hint":}` and readEvents would discard the whole event
+printf '%s' "$HINT_JSON" > "$CODE_DIR_HINT_FILE"
 ```
 
 Verdicts: `ok` → `CODE_DIR` is the resolved worktree (**both engines** get it — strictly better than the blind pick, byte-identical in a single-repo workspace, which short-circuits without reading the plan). `cross-repo` → `REASON="sidecar-multirepo-unsupported"`. `undeclared` → `REASON="sidecar-code-dir-undeclared"`. On either refusal, **skip steps 1–4 entirely** (no `START_SHA` capture, no state or result-file allocation, no sidecar launch) and go straight to Fallback — identical control flow to `sidecar-cap-exceeded`, and refused **before** any `--cwd` reaches `forge-surgical-reset.js`. One visible warning line names the ambiguity and the repos touched.
@@ -1106,6 +1115,12 @@ For multiple usable repos, precedence is fixed: P0 one usable repo short-circuit
 `multi_repo_root` is **empty for a single-repo workspace**, where the bootstrap value is already correct and its parent is not a git repository at all; that case is byte-identical to before. `code_dir` itself stays empty on refusal — it is the sidecar's field and the sidecar still has no answer. The refusal **never** blanks `WORKTREE_DIR` — an empty `WORKTREE_DIR` is the orchestrator's "every repo failed" STOP signal and must not be confused with a sidecar refusal.
 
 **The refusal explains itself (`hint`).** The reason code names the resolver, but the cause is almost always in the PLAN — a unit whose frontmatter carries no `repo:` in a multi-repo workspace. So the resolver also emits `hint`: one actionable pt-BR sentence (which field is missing or wrong, the exact form to write, and `/forge-doctor` to list every affected plan), which the three mirrors append to the single warning line. The prose lives in `forge-code-dir.js` alone — a message copied into three mirrors is a message that drifts. `hint` is **purely informational and additive**: the verdict, status and exit code are unchanged (same refusal, better explanation), and nothing — not `hint`, not `/forge-doctor --fix` — ever writes `repo:` automatically, because the resolver TRUSTS a declaration (P4 returns before the probe) and a guessed value would be worse than an absent one.
+
+**A declaration that names a repo the isolation cannot see (`repo:` × registry index).** The three historical matching strategies (absolute path, cwd-relative path, bare basename) all search the isolation result's worktree list, which comes from `forge-repos.discoverRepos` — a walk that goes **one level** below the workspace. A repo nested deeper (`lookchina/services/freyr`) can therefore never appear in the list being searched, so a **correct** declaration reads back as `declared_repo_status: unknown` and the unit falls to Claude (TASK-021). The resolver now consults a fourth source when — and only when — those three strategies have already failed: the name→path index `scripts/forge-repo-index.js` builds from the workspace registry. Order is fixed: an isolated repo always wins, so the index can turn an `unknown` into an answer and can never change an answer that already worked.
+
+The index enters `resolveCodeDir` by **injection** (`repoIndex`), so the purity contract above is unchanged — the registry read lives at the CLI boundary, inside `cliMain`. Because all three orchestrator mirrors reach the resolver through `--resolve`, and the CLI builds the index by default, **no file under `skills/` changes**; `--no-repo-index` turns it off, and `--home` / `--registry-file` point it at a fixture. A registry that is absent, unreadable or malformed **degrades** to the previous behaviour — an addressing improvement must never take down a dispatch that used to work.
+
+This fixes ADDRESSING, not isolation scoping. When the name resolves but that repo has **no worktree in the current run**, the refusal stands, unchanged in every observable way: the same `undeclared` reason code named in the verdict list above, the same `status`, the same exit code **5**. No status and no exit code is added — an unseen value would break the three mirrors in silence, which is the failure class this work exists to end. Only the `hint` changes, to one that names the resolved absolute path and says what is actually missing (scope, not the name), so the operator does not "fix" a declaration that was never wrong. Two additive fields carry the evidence: `declared_repo_path` (the resolved absolute path) and `declared_repo_source: 'repo-index'` (provenance on a successful match); both default to `''`, so existing readers are byte-identical.
 
 **1. Capture `START_SHA` + the pre-dirty snapshot in ONE atomic write, via the surgical-reset helper.** BEFORE anything else, delegate state init to `forge-surgical-reset.js` — it captures `START_SHA` **and** snapshots whatever is already dirty in `$CODE_DIR` (as `{path, hash}` pairs, `.gsd/**` excluded) in the SAME write, and persists both to a state file whose name carries the attempt number `N = SIDECAR_ATTEMPT` — **never overwriting a prior attempt's file** (audit preserved, post-compact recovery unambiguous):
 
@@ -1530,17 +1545,19 @@ Triggers (`reason` value):
 2. **Echo** the degradation (Portuguese UX): `⚠ worker: codex indisponível (<reason>) — usando forge-executor`.
 3. **Append** the event (additive fields; `<ISO>` from bash, never from inside a script). The `unit` reflects the dispatched unit — `execute-task/{T##}` on Branch C, `plan-slice/{S##}` on Branch D:
    ```json
-   {"ts":"<ISO>","event":"worker-engine-fallback","milestone":"{M###}","slice":"{S##}","unit":"execute-task/{T##}","reason":"<reason>"}
+   {"ts":"<ISO>","event":"worker-engine-fallback","milestone":"{M###}","slice":"{S##}","unit":"execute-task/{T##}","reason":"<reason>","hint":"<json opcional>"}
    ```
    ```bash
-   # execute-task (Branch C):
-   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"execute-task/%s","reason":"%s"}\n' \
-     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{M###}" "{S##}" "{T##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
-   # plan-slice (Branch D):
-   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"plan-slice/%s","reason":"%s"}\n' \
-     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{M###}" "{S##}" "{S##}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+   # execute-task (Branch C) — re-read the hint persisted by § 0.5; a shell var never reaches here.
+   HINT_JSON=$(cat "${CODE_DIR_HINT_FILE:-$WORKING_DIR/.gsd/forge/code-dir-hint.json}" 2>/dev/null); [ -n "$HINT_JSON" ] || HINT_JSON='""'
+   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"execute-task/%s","reason":"%s","hint":%s}\n' \
+     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{M###}" "{S##}" "{T##}" "$REASON" "$HINT_JSON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+   # plan-slice (Branch D) — same durable re-read; Branch D never assigns $CODE_DIR_HINT at all.
+   HINT_JSON=$(cat "${CODE_DIR_HINT_FILE:-$WORKING_DIR/.gsd/forge/code-dir-hint.json}" 2>/dev/null); [ -n "$HINT_JSON" ] || HINT_JSON='""'
+   printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"%s","slice":"%s","unit":"plan-slice/%s","reason":"%s","hint":%s}\n' \
+     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{M###}" "{S##}" "{S##}" "$REASON" "$HINT_JSON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
    ```
-4. **Dispatch a single Claude worker** for the same unit — `forge-executor` on Branch C, `forge-planner` on Branch D. This Claude dispatch **now runs the Tier Resolution and Effort Resolution** that were skipped on the codex path (they only ever run on the Claude branch). No re-resolution of engine — the fallback is unconditionally Claude.
+4. **Dispatch a single Claude worker** for the same unit — `forge-executor` on Branch C, `forge-planner` on Branch D. This Claude dispatch **now runs the Tier Resolution and Effort Resolution** that were skipped on the codex path (they only ever run on the Claude branch). No re-resolution of engine — the fallback is unconditionally Claude. A política canônica é sempre emitir `hint`: ele é `""` quando vazio, e o detector nunca o reconstrói.
 
 > **Not a 4th recovery layer.** `worker-engine-fallback` is part of the dispatch (Step 4), NOT an extension of the Failure Taxonomy nor the Retry Handler — those layers are mutually exclusive (MEM001). It fires once, in-band, at dispatch time; the Retry Handler and blocker taxonomy operate on the *result* of whichever engine ultimately ran.
 

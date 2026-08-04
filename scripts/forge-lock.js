@@ -12,6 +12,15 @@ const DEFAULT_BACKOFF_MIN = 100;
 const DEFAULT_BACKOFF_MAX = 300;
 
 function locksDir(cwd) { return path.join(cwd, '.gsd', '.locks'); }
+function ensureLocksDir(cwd) {
+  const gsd = path.join(cwd, '.gsd');
+  if (!fs.existsSync(gsd)) {
+    const error = new Error(`forge-lock: ${cwd} has no .gsd/ — refusing to create one (run /forge-init first)`);
+    error.code = 'ENOGSD';
+    throw error;
+  }
+  fs.mkdirSync(locksDir(cwd), { recursive: true });
+}
 function lockPath(cwd, name) { return path.join(locksDir(cwd), validateName(name).replace(/[^\w.-]/g, '_')); }
 function metaPath(lockDir) { return path.join(lockDir, 'metadata.json'); }
 function markerPath(lockDir, token) { return path.join(lockDir, `owner-${token}`); }
@@ -67,7 +76,7 @@ async function acquire(cwd, name, opts) {
   const retries = positive(opts.retries, DEFAULT_RETRIES, 'retries');
   const backoffMin = positive(opts.backoffMin, DEFAULT_BACKOFF_MIN, 'backoff');
   const backoffMax = positive(opts.backoffMax, DEFAULT_BACKOFF_MAX, 'backoff');
-  fs.mkdirSync(locksDir(cwd), { recursive: true }); const dir = lockPath(cwd, name);
+  ensureLocksDir(cwd); const dir = lockPath(cwd, name);
   for (let attempt = 0; attempt < retries; attempt++) {
     try { return create(cwd, name, { ...opts, ttlMs }); }
     catch (error) {
@@ -81,7 +90,8 @@ async function acquire(cwd, name, opts) {
 }
 function tryAcquireSync(cwd, name, opts) {
   opts = opts || {}; validateName(name); const ttlMs = positive(opts.ttlMs, DEFAULT_TTL_MS, 'ttl');
-  fs.mkdirSync(locksDir(cwd), { recursive: true }); const dir = lockPath(cwd, name);
+  try { ensureLocksDir(cwd); } catch (error) { if (error.code === 'ENOGSD') return null; throw error; }
+  const dir = lockPath(cwd, name);
   try { return create(cwd, name, { ...opts, ttlMs }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; if (opts.allowStaleRecovery !== false && stealIfStale(dir, ttlMs, nowOf(opts))) { try { return create(cwd, name, { ...opts, ttlMs }); } catch { } } return null; }
 }

@@ -226,11 +226,19 @@ if [ -n "$ATTACH_RUN" ]; then
   fi
   CODE_DIR="$WORKTREE_DIR"
   BRANCH="$ATTACH_BRANCH"
+  RUN_BRANCH="$ATTACH_BRANCH"   # recorded as the lender's branch — the borrower owns no branch of its own
   echo "⛓ Isolation: worktree emprestado de $ATTACH_RUN → $WORKTREE_DIR (branch $ATTACH_BRANCH)"
 else
 ISO_RESULT=$(node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --setup --run "$TASK_ID" --cwd "$(pwd)")
 ISOLATION_MODE=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).mode)||'shared')" "$ISO_RESULT")
 WORKTREE_DIR=$(node -e "const r=JSON.parse(process.argv[1]);const w=(r.repos||[]).find(x=>x.worktree&&x.status!=='error');process.stdout.write(w?w.worktree:'')" "$ISO_RESULT")
+# RUN_BRANCH — read back from the setup result, never re-derived as `forge/$TASK_ID`.
+# The attach path above already set `BRANCH="$ATTACH_BRANCH"` (the LENDER's branch,
+# which `forge/{TASK_ID}` would misname); the `r.branch` fallback in the expression
+# below covers that result shape too. Reachable cases: branch/worktree with ≥1 repo
+# ok → the setup's branch; `shared` → `repos: []` → empty → recorded as null; all
+# repos errored → empty → null (the ISO_ERRORS rule below stops anyway).
+RUN_BRANCH=$(node -e "const r=JSON.parse(process.argv[1]);const b=(r.repos||[]).find(x=>x.branch&&x.status!=='error');process.stdout.write((b&&b.branch)||r.branch||'')" "$ISO_RESULT")
 ISO_ERRORS=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write((r.repos||[]).filter(x=>x.status==='error').map(x=>x.path+': '+x.error).join('; '))" "$ISO_RESULT")
 ELEVATED=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1]).elevated||false))" "$ISO_RESULT")
 ELEV_REASON=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).elevation_reason||'')" "$ISO_RESULT")
@@ -255,7 +263,7 @@ Isolation rules (CRITICAL — the operator configured this; honor it):
 if [ -z "$RESUME_MODE" ]; then
   SESSION_ID="${CLAUDE_SESSION_ID:-$(node -e "process.stdout.write(require('crypto').randomBytes(8).toString('hex'))")}" 
   WORKTREES_JSON=$(node -e "const r=JSON.parse(process.argv[1]);process.stdout.write(JSON.stringify((r.repos||[]).filter(x=>x.worktree&&x.status!=='error').map(x=>({repo:x.path,path:x.worktree}))))" "$ISO_RESULT")
-  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --attached-to "${ATTACH_RUN:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --add --id "$TASK_ID" --kind task --session "$SESSION_ID" --isolation-mode "$ISOLATION_MODE" --account "${FORGE_ACCOUNT:-}" --worktrees "$WORKTREES_JSON" --attached-to "${ATTACH_RUN:-}" --branch "${RUN_BRANCH:-}" --cwd "$(pwd)" --task-description "$TASK_DESCRIPTION" > /dev/null
   # Regenerate dashboard
   node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "$(pwd)" --holder "task:$TASK_ID" > /dev/null || true
 
@@ -890,6 +898,8 @@ SIDECAR_MODEL=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).sideca
 **Per-unit `CODE_DIR` resolution (multi-repo precondition)** — executable mirror of `shared/forge-dispatch.md § Sidecar dispatch state machine step 0.5` (contract prose lives there, never restated here). Runs HERE because `$PLAN_PATH` is only known now — the bootstrap `WORKTREE_DIR` above is derived before any plan exists and stays untouched:
 ```bash
 UNIT_CODE_DIR=""; CODE_DIR_STATUS="shared"; CODE_DIR_REASON=""; CODE_DIR_MULTI_ROOT=""; CODE_DIR_HINT=""
+CODE_DIR_HINT_FILE="$WORKING_DIR/.gsd/forge/code-dir-hint.json"
+mkdir -p "$WORKING_DIR/.gsd/forge/"; printf '""' > "$CODE_DIR_HINT_FILE"   # reset per unit — never inherit a prior unit's hint
 if [ "$ISOLATION_MODE" = "worktree" ] && [ -n "$PLAN_PATH" ] && [ -n "$ISO_RESULT" ]; then
   CD_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-code-dir.js" --resolve \
     --iso-result "$ISO_RESULT" --plan "$WORKING_DIR/$PLAN_PATH" --cwd "$WORKING_DIR" --run "$TASK_ID"); CD_RC=$?
@@ -899,6 +909,11 @@ if [ "$ISOLATION_MODE" = "worktree" ] && [ -n "$PLAN_PATH" ] && [ -n "$ISO_RESUL
   CODE_DIR_REASON=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).reason)||'')" "$CD_JSON")
   CODE_DIR_MULTI_ROOT=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).multi_repo_root)||'')" "$CD_JSON")
   CODE_DIR_HINT=$(node -e "process.stdout.write((JSON.parse(process.argv[1]).hint)||'')" "$CD_JSON")
+  # Durable hint (shared/forge-dispatch.md § 0.5): shell state does NOT survive a Bash-tool boundary,
+  # so the hint is JSON-encoded HERE and persisted for the worker-engine-fallback emitters to re-read.
+  HINT_JSON=$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]||""))' "$CODE_DIR_HINT")
+  [ -n "$HINT_JSON" ] || HINT_JSON='""'   # empty substitution would emit `"hint":}` — readEvents would drop the whole event
+  printf '%s' "$HINT_JSON" > "$CODE_DIR_HINT_FILE"
   [ "$CD_RC" -eq 0 ] || echo "⚠ CODE_DIR ambíguo ($CODE_DIR_STATUS): $(node -e "process.stdout.write(((JSON.parse(process.argv[1]).repos_touched)||[]).join(', '))" "$CD_JSON") — sidecar recusado, executor Claude segue em ${CODE_DIR_MULTI_ROOT:-$WORKTREE_DIR}${CODE_DIR_HINT:+ — $CODE_DIR_HINT}"
   [ "$CODE_DIR_STATUS" = "ok" ] && [ -n "$UNIT_CODE_DIR" ] && CODE_DIR="$UNIT_CODE_DIR"
   # Refusal in a MULTI-repo workspace: the sidecar needs one git repo, the Claude
@@ -1052,8 +1067,9 @@ fi
 fi
 echo "⚠ worker: codex indisponível ($REASON) — usando forge-executor"
 mkdir -p "$WORKING_DIR/.gsd/forge/"
-printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"","slice":"","unit":"execute-task/%s","reason":"%s"}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{TASK_ID}" "$REASON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+HINT_JSON=$(cat "${CODE_DIR_HINT_FILE:-$WORKING_DIR/.gsd/forge/code-dir-hint.json}" 2>/dev/null); [ -n "$HINT_JSON" ] || HINT_JSON='""'
+printf '{"ts":"%s","event":"worker-engine-fallback","milestone":"","slice":"","unit":"execute-task/%s","reason":"%s","hint":%s}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{TASK_ID}" "$REASON" "$HINT_JSON" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 # CRITICAL, per-dispatch + evidence-based fallback discipline: shared/forge-dispatch.md § Engine Fallback Discipline
 ```
 Then set `ENGINE=claude` and `DISPATCH_ENGINE=claude` and dispatch the single `forge-executor` Claude worker via the machinery below. No re-resolution of engine (fallback is unconditionally Claude); no retry.

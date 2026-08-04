@@ -1,0 +1,154 @@
+// ProjectMarker — what makes a directory a Forge project.
+//
+// `ProjectDiscovery` used to answer that with "it contains .gsd/", which was
+// true of far more directories than anyone intended: our own tooling wrote
+// that marker. `forge-verify.js` created `.gsd/forge/` in every repo it ran
+// commands in, and `forge-lock.js` created `.gsd/.locks/` wherever it was
+// invoked. Measured on the author's machine: 5 of 18 registered projects were
+// repos those two lines enrolled — `asgard`, `saga` and `skuld` contained
+// nothing but the events file the verifier wrote — plus a `~/Development/.gsd`
+// sitting one level above every real project, which is precisely the
+// containment hazard `ProjectGrouping` warns about.
+//
+// So presence of `.gsd/` proves a tool ran here. Only *work artifacts* prove
+// work lives here. Three states, because two would have to lie about one of
+// them:
+//
+//   project — holds at least one work artifact (milestones/, tasks/, items/,
+//             a ledger, memory, a hand-written STATE.md, …).
+//   touched — `.gsd/` exists but holds only runtime scratch (forge/, .locks/,
+//             a dashboard-generated STATE.md), or nothing at all. A repo some
+//             other project reached into: real, worth showing, not a project.
+//   none    — no `.gsd/`.
+//
+// `touched` must never mean "hidden". A wrong call has to cost a click, not a
+// project — callers show these with an action to register them. Silence would
+// be indistinguishable from a broken detector, which is the failure this whole
+// file exists to end.
+//
+// The JS side of the same rule is `scripts/forge-workspace.js`. The two lists
+// are kept in step by `scripts/forge-app-workspace-marker.test.js`.
+
+import Foundation
+
+public enum ProjectMarkerKind: String, Sendable, Equatable {
+    case project
+    case touched
+    case none
+}
+
+public struct ProjectMarkerResult: Sendable, Equatable {
+    public let kind: ProjectMarkerKind
+    /// The artifacts that carried the decision, so a classification can be
+    /// argued with rather than merely obeyed.
+    public let signals: [String]
+
+    public init(kind: ProjectMarkerKind, signals: [String]) {
+        self.kind = kind
+        self.signals = signals
+    }
+}
+
+/// How a directory sits relative to the projects registered alongside it.
+///
+/// A workspace is a project that contains other projects — `lookchina` owns its
+/// `apps/` and `services/` repos and carries the standards and memory they
+/// share. It is not a separate kind of thing on disk (it has its own
+/// milestones and tasks like any project); it is a *position*, which is why it
+/// is derived from the set rather than read from the filesystem.
+///
+/// `folder` is the path component in between: `lookchina/apps` holds five
+/// projects and is not one. Before it had a name the tree either hid those
+/// levels or pretended they were projects; naming it lets the hierarchy be
+/// drawn honestly.
+///
+/// The JS half of this list is `ROLE_KINDS` / `REGISTRABLE_ROLES` in
+/// `scripts/forge-workspace.js`, kept in step by
+/// `scripts/forge-app-workspace-marker.test.js`.
+public enum ProjectRole: String, Sendable, Equatable, CaseIterable {
+    case workspace
+    case project
+    case folder
+
+    /// A `folder` is a *synthesised display node* — it exists only because a
+    /// project lives below it, has no `.gsd/` and no state of its own, and so
+    /// can never be written to the registry, launched, or drawn as a card.
+    /// Every other role is a real directory the operator registered.
+    public var isRegistrable: Bool { self != .folder }
+}
+
+public enum ProjectMarker {
+
+    /// Entries inside `.gsd/` that prove work happened here. Directories count
+    /// even when empty: `/forge-init` scaffolds them, and having been
+    /// initialised is itself the claim being tested.
+    public static let workEntries: [String] = [
+        // Fragment stores and their legacy single-file forms.
+        "milestones", "tasks", "items", "ledger", "LEDGER.md",
+        "decisions", "DECISIONS.md", "memory", "AUTO-MEMORY.md",
+        "checker-memory", "CHECKER-MEMORY.md",
+        // Project-level statements of intent and standards.
+        "PROJECT.md", "REQUIREMENTS.md", "CODING-STANDARDS.md", "KNOWLEDGE.md",
+        // Written by /forge-init — the cleanest "initialised here" signal.
+        "SCHEMA-VERSION",
+        // Operator-authored configuration.
+        //
+        // The legacy prefs filenames are deliberately absent: `forge-prefs.js`
+        // is the sole production holder of those literals (dual-read boundary,
+        // guarded by forge-smoke.js Section 39), and as evidence they are
+        // redundant — a project old enough to carry them also carries
+        // milestones and decisions.
+        "forge-prefs.jsonc",
+    ]
+
+    /// Header `forge-dashboard.js` stamps on every file it writes.
+    public static let dashboardMarker = "AUTO-GENERATED by scripts/forge-dashboard.js"
+
+    public static func classify(_ dir: String, fm: FileManager = .default) -> ProjectMarkerResult {
+        let gsd = (dir as NSString).appendingPathComponent(".gsd")
+        guard let entries = try? fm.contentsOfDirectory(atPath: gsd) else {
+            return ProjectMarkerResult(kind: .none, signals: [])
+        }
+
+        let present = Set(entries)
+        var signals = workEntries.filter { present.contains($0) }
+
+        if present.contains("STATE.md"),
+           !stateIsGenerated((gsd as NSString).appendingPathComponent("STATE.md")) {
+            signals.append("STATE.md")
+        }
+
+        return ProjectMarkerResult(kind: signals.isEmpty ? .touched : .project,
+                                   signals: signals)
+    }
+
+    public static func isProject(_ dir: String) -> Bool {
+        classify(dir).kind == .project
+    }
+
+    /// A dashboard-rendered STATE.md is runtime output, not work — regenerating
+    /// the dashboard from a directory is exactly how the phantom markers came
+    /// to exist. A hand-written STATE.md is the orchestrator's record of a real
+    /// run, and does count.
+    ///
+    /// An unreadable file resolves to "generated": it cannot support a claim.
+    static func stateIsGenerated(_ path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return true }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 200),
+              let text = String(data: head, encoding: .utf8) else { return true }
+        return text.contains(dashboardMarker)
+    }
+
+    /// Role of every path in `projects`, which are assumed already classified
+    /// as projects. Containment is what makes a workspace, so this is derived
+    /// from the set — the same relation `ProjectOrganiser.containment` counts.
+    public static func roles(_ projects: [String]) -> [String: ProjectRole] {
+        let contains = ProjectOrganiser.containment(projects)
+        var out: [String: ProjectRole] = [:]
+        for p in projects {
+            out[p] = (contains[p] ?? 0) > 0 ? .workspace : .project
+        }
+        return out
+    }
+}

@@ -77,7 +77,7 @@ $ARGUMENTS
 
 3. **Update `S##-PLAN.md`** — add `- [ ] **T##: Title**` entry
 
-4. **Update STATE.md** if this task is now the active one — Read it first before writing
+4. **If this task is now the active one**, write `.gsd/milestones/<id>/<id>-STATE.md` (per-run state, via `scripts/forge-state.js` — never hand-edit the root `.gsd/STATE.md`, which is a generated dashboard) to point at it, then run `node scripts/forge-dashboard.js --cwd .` to regenerate the dashboard.
 
 5. Report: task ID, goal, must-haves count, estimated complexity
 

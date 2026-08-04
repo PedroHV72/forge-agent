@@ -13,31 +13,124 @@ import ForgeKit
 
 // MARK: - Workspaces
 
-/// Which projects to watch. A plain JSON array of paths, editable by hand.
+/// Which projects to watch. Editable by hand, in either of two shapes — the
+/// legacy flat array of paths, or the versioned object with roots, typed entries
+/// and quarantine. All shape knowledge lives in `WorkspaceRegistry` (ForgeKit,
+/// hence testable); this enum is the file I/O around it and nothing more.
 enum Workspaces {
-    static var file: String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return "\(home)/.claude/forge-gate-workspaces.json"
+    static var home: String { FileManager.default.homeDirectoryForCurrentUser.path }
+
+    static var file: String { "\(home)/.claude/\(WorkspaceRegistry.filename)" }
+
+    static func load() -> [String] { loadOutcome().visible }
+
+    /// Same read as `load()`, but keeps "the file could not be parsed" apart
+    /// from "the file parsed and declares nothing" — the distinction I-20260802223042
+    /// exists to put back on screen. `load()` delegates here so every other
+    /// caller keeps seeing a plain `[String]`.
+    static func loadOutcome() -> (visible: [String], unreadable: Bool) {
+        guard let data = FileManager.default.contents(atPath: file) else {
+            // `contents(atPath:)` returns nil both when the file is absent and
+            // when it exists but could not be read (EACCES, I/O error). Those
+            // are different events — a present-but-unreadable file must fire
+            // the same notice as an unparseable one (R2 review fix, S02-REVIEW),
+            // not render like a fresh install with nothing registered yet.
+            let unreadable = FileManager.default.fileExists(atPath: file)
+            if unreadable {
+                FileHandle.standardError.write(Data(
+                    "Forge: \(file) não pôde ser lido — a lista de projetos NÃO foi alterada. Corrija o arquivo (há backup .bak ao lado após a migração).\n".utf8))
+            }
+            return ([], unreadable)
+        }
+        guard let r = WorkspaceRegistry.resolution(from: data, home: home) else {
+            // Not `[]`. An unreadable registry is an event: returning an empty
+            // list here is what used to make a corrupt file and a fresh install
+            // look identical on screen.
+            FileHandle.standardError.write(Data(
+                "Forge: \(file) não pôde ser lido — a lista de projetos NÃO foi alterada. Corrija o arquivo (há backup .bak ao lado após a migração).\n".utf8))
+            return ([], true)
+        }
+        // "Does not resolve" and "was deleted" both remove a card, so they are
+        // reported apart — only the second is the operator's own doing.
+        for bad in r.rejected {
+            FileHandle.standardError.write(Data(
+                "Forge: entrada ignorada em \(WorkspaceRegistry.filename): \"\(bad.stored)\" — \(bad.reason)\n".utf8))
+        }
+        return (r.paths.filter { FileManager.default.fileExists(atPath: $0) }, false)
     }
 
-    static func load() -> [String] {
-        guard let data = FileManager.default.contents(atPath: file),
-              let list = try? JSONDecoder().decode([String].self, from: data)
-        else { return [] }
-        return list.filter { FileManager.default.fileExists(atPath: $0) }
+    /// Absolute roots the registry declares, resolved against `home` — what
+    /// discovery should scan (see `ProjectDiscovery.scan(declaredRoots:)`).
+    /// `[]` on an absent file, a legacy shape, or an unreadable file — the
+    /// caller falls back to the hardcoded name-list scan in every one of
+    /// those cases, so the unreadable/empty distinction is not needed here.
+    static func declaredRoots() -> [String] {
+        guard let data = FileManager.default.contents(atPath: file) else { return [] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.roots ?? []
+    }
+
+    /// Every record the registry resolves, whether or not its directory still
+    /// exists on disk — the base `add`/`remove` build `newPaths` from, never
+    /// `load()`.
+    ///
+    /// `load()` is filtered to what is visible on screen (R2 review fix,
+    /// S01-REVIEW): a directory that is unmounted or briefly moved still
+    /// resolves fine and simply is not offered by the fileExists filter. Any
+    /// unrelated `save()` recomputes the file from `newPaths` — so building
+    /// `newPaths` from the filtered list would silently delete every record
+    /// currently absent from disk, migration `quarantine[]` included, as a
+    /// side effect of adding or removing something else entirely. The
+    /// `fileExists` check must stay display-only; it must never feed a write.
+    ///
+    /// I-20260803132250: this used to be a comment alone. `add`/`remove` now
+    /// route their mutation through `WorkspaceRegistry.mutatedPaths(allResolved:)`
+    /// (ForgeKit, pure, no `visible` parameter to accidentally pass) — that
+    /// function, not this one, is what `ForgeKitTests` exercises to assert the
+    /// invariant at the call site, since `ForgeKitTests` cannot import this
+    /// `Forge` executable target.
+    /// Paths the registry declares `kind: workspace` — see
+    /// `ProjectOrganiser.containmentHazards`, the only consumer. `[]` on an
+    /// absent, legacy or unreadable file, which is the same conservative answer
+    /// in all three cases: nothing is declared, so nothing is suppressed.
+    static func declaredWorkspaces() -> Set<String> {
+        guard let data = FileManager.default.contents(atPath: file) else { return [] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.declaredWorkspaces ?? []
+    }
+
+    /// How many repos each active entry declares, keyed by absolute path.
+    /// A path is absent when its `repos[]` is empty — "never measured", never
+    /// "owns zero"; `WorkspaceRegistry.repoCounts` documents why that
+    /// distinction is load-bearing. `[:]` on an absent, legacy or unreadable
+    /// file, all three of which mean the same thing here: nothing measured.
+    static func repoCounts() -> [String: Int] {
+        guard let data = FileManager.default.contents(atPath: file) else { return [:] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.repoCounts ?? [:]
+    }
+
+    static func loadAllResolved() -> [String] {
+        guard let data = FileManager.default.contents(atPath: file) else { return [] }
+        return WorkspaceRegistry.resolution(from: data, home: home)?.paths ?? []
     }
 
     static func save(_ list: [String]) {
-        let unique = Array(Set(list)).sorted()
-        guard let data = try? JSONEncoder().encode(unique) else { return }
+        let original = FileManager.default.contents(atPath: file)
+        // A nil here is a refusal, not a failure to encode: the file on disk is
+        // in a shape we could not parse, and overwriting it would trade the
+        // operator's roots and quarantine for one click.
+        guard let data = WorkspaceRegistry.updatedData(
+            original: original, newPaths: list, home: home) else {
+            FileHandle.standardError.write(Data(
+                "Forge: \(file) está ilegível — recusando sobrescrever para não perder roots/quarentena.\n".utf8))
+            return
+        }
         try? FileManager.default.createDirectory(
             atPath: (file as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true)
         try? data.write(to: URL(fileURLWithPath: file), options: .atomic)
     }
 
-    static func add(_ p: String)    { save(load() + [p]) }
-    static func remove(_ p: String) { save(load().filter { $0 != p }) }
+    static func add(_ p: String)    { save(WorkspaceRegistry.mutatedPaths(allResolved: loadAllResolved(), adding: p)) }
+    static func remove(_ p: String) { save(WorkspaceRegistry.mutatedPaths(allResolved: loadAllResolved(), removing: p)) }
 }
 
 // MARK: - App state
@@ -54,8 +147,35 @@ final class AppState: ObservableObject {
     @Published private(set) var runs: [Run] = []
     @Published private(set) var accounts: [Account] = []
     @Published private(set) var activeAccount: String?
+
+    /// Where `activeAccount` came from. Never collapsed into the name: a label
+    /// that cannot say why it believes something is a label that cannot be
+    /// checked.
+    enum AccountSource { case environment, registry, unknown }
+    @Published private(set) var activeAccountSource: AccountSource = .unknown
     @Published private(set) var usage: [String: AccountUsage] = [:]
     @Published private(set) var workspaces: [String] = []
+
+    /// Registered paths that hold a `.gsd/` but no work — repos a run reached
+    /// into, which our tooling enrolled as a side effect. Surfaced rather than
+    /// filtered away: a misclassification has to cost a click, never a project.
+    @Published private(set) var touchedWorkspaces: [String] = []
+
+    /// Paths the registry declares `kind: workspace`. A workspace containing
+    /// its own members is the normal case, so the containment hazard must not
+    /// accuse it (I-20260803154521).
+    @Published private(set) var declaredWorkspaces: Set<String> = []
+
+    /// Declared repo count per project, for the card's `"workspace · 33 repos"`
+    /// line. A missing key means unmeasured and the card stays silent about
+    /// repos — see `WorkspaceRegistry.repoCounts`.
+    @Published private(set) var repoCounts: [String: Int] = [:]
+
+    /// True exactly when the registry file exists but could not be parsed —
+    /// set by `reloadCheap()` from `Workspaces.loadOutcome()`. The Projects
+    /// screen renders a notice while this is true instead of a silently
+    /// blank list (closes I-20260802223042).
+    @Published private(set) var registryUnreadable = false
 
     /// Raw values of the two `app.*` prefs, read once at init and on explicit
     /// reload only — see `loadAppDefaults()`.
@@ -72,7 +192,19 @@ final class AppState: ObservableObject {
     /// Which sidebar section is showing. Owned here rather than as RootView
     /// `@State` because opening a session has to be able to take the operator
     /// to the terminal — the composer that creates it lives on another screen.
-    @Published var section: Section? = .now
+    ///
+    /// Persisted on every change, and restored on every launch — not just after
+    /// a self-update relaunch. One code path, same storage as `lastWorkspace`.
+    /// An unknown raw value (a renamed sidebar label invalidates what was saved)
+    /// falls back explicitly; see `SectionRestore`.
+    @Published var section: Section? = Section(rawValue: SectionRestore.resolve(
+        rawValue: UserDefaults.standard.string(forKey: "lastSection"),
+        valid: Section.allCases.map(\.rawValue),
+        fallback: Section.terminal.rawValue)) ?? .terminal {
+        didSet {
+            UserDefaults.standard.set(section?.rawValue ?? "", forKey: "lastSection")
+        }
+    }
 
     /// Which session the terminal screen shows. Same reason: the creating code
     /// path needs to name it, and the terminal screen may not be on screen yet.
@@ -83,6 +215,49 @@ final class AppState: ObservableObject {
     func focus(_ s: TerminalSession?) {
         if let s { focusedSession = s.id }
         section = .terminal
+    }
+
+    /// Whether the inline command bar is floating over the terminal.
+    ///
+    /// ⌘T raises it instead of opening a modal sheet. The old sheet asked
+    /// "what do you want to do?" before letting you do anything, and the
+    /// answer was almost always "just give me a terminal" — which is now
+    /// Enter on an empty line.
+    @Published var showComposer = false
+
+    /// The advanced sheet (⌘⇧N). Still the only place that can pick among
+    /// several active runs, which the one-line command bar cannot express.
+    @Published var showLauncherSheet = false
+
+    /// The session the terminal screen is actually showing, resolved the same
+    /// way the view resolves it — so a shortcut can never act on a session the
+    /// operator is not looking at.
+    var visibleSession: TerminalSession? {
+        let id = TerminalFocus.resolve(selection: focusedSession, among: sessions.map(\.id))
+        return sessions.first { $0.id == id }
+    }
+
+    /// ⌘W. Confirms exactly like the button does — a keystroke must not be a
+    /// cheaper way to kill a running unit than clicking.
+    func closeVisibleSession() {
+        guard let s = visibleSession else { return }
+        _ = closeSession(s, confirm: true)
+    }
+
+    /// ⌘1…⌘9. Out-of-range is a no-op, not a clamp: ⌘5 with three tabs open
+    /// means nothing, and jumping to the last one would be a surprise.
+    func focusSession(at index: Int) {
+        guard sessions.indices.contains(index) else { return }
+        focusedSession = sessions[index].id
+    }
+
+    /// ⌘⇧[ / ⌘⇧]. Wraps, like every tabbed app.
+    func cycleSession(by delta: Int) {
+        guard !sessions.isEmpty,
+              let current = visibleSession,
+              let idx = sessions.firstIndex(where: { $0.id == current.id }) else { return }
+        let next = (idx + delta + sessions.count) % sessions.count
+        focusedSession = sessions[next].id
     }
 
     /// Rich per-project status from forge-status.js, keyed by cwd. Spawns node,
@@ -147,12 +322,57 @@ final class AppState: ObservableObject {
         refreshStatus()
     }
 
+#if DEBUG
+    /// An inert state for canvas previews. `init()` reads the operator's real
+    /// `.gsd`, spawns node for the per-project status, installs an FSEvents
+    /// watcher and starts a 15s timer — in a canvas that runs on every redraw,
+    /// which makes the preview slow, machine-dependent and noisy. This does none
+    /// of it, so the views render from whatever the preview stages.
+    ///
+    /// Not a `convenience init` in an extension: that would have to call
+    /// `init()`, which is the work being avoided.
+    init(preview: Void) {}
+#endif
+
     deinit { timer?.invalidate() }
 
     // MARK: Cheap reload (files only)
 
     func reloadCheap() {
-        workspaces = Workspaces.load()
+        // Registered ≠ project. Our own scripts used to write `.gsd/` into any
+        // repo they touched, so the registry accumulated directories that never
+        // held work (see `ProjectMarker`). Splitting here rather than in the
+        // Projects screen fixes every consumer at once: the composer, the
+        // pickers and the metrics screen stop offering a repo nobody planned
+        // work in — which is the wrong-repo dispatch hazard `WorkspaceDefaults`
+        // exists to prevent.
+        let outcome = Workspaces.loadOutcome()
+        registryUnreadable = outcome.unreadable
+        // The notice (and its doc comment above) promises the list below was
+        // NOT changed. `WorkspaceReloadDecision.split` (ForgeKit, hence
+        // testable) is what makes that literally true: on `unreadable` it
+        // returns the previous split untouched rather than rebuilding from
+        // `outcome.visible`, which is always `[]` on that path — R1 review fix,
+        // S02-REVIEW.
+        let split = WorkspaceReloadDecision.split(
+            previous: .init(workspaces: workspaces, touchedWorkspaces: touchedWorkspaces),
+            outcome: outcome,
+            isProject: { ProjectMarker.classify($0).kind == .project })
+        workspaces = split.workspaces
+        touchedWorkspaces = split.touchedWorkspaces
+        // Held over on `unreadable` for the same reason the split is: the
+        // notice promises the list below was not changed, and dropping the
+        // declarations would re-accuse a workspace still on screen.
+        if !outcome.unreadable {
+            declaredWorkspaces = Workspaces.declaredWorkspaces()
+            repoCounts = Workspaces.repoCounts()
+        }
+        if outcome.unreadable {
+            watcher?.watch(workspaces)
+            NotificationCenter.default.post(name: Self.didChange, object: nil)
+            return
+        }
+
         var g: [Gate] = [], r: [Run] = []
         for ws in workspaces {
             g += Self.decodeDir("\(ws)/.gsd/forge/gates", as: Gate.self)
@@ -178,9 +398,33 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Open tasks across every registered project, for the sidebar badge.
+    ///
+    /// Aggregated here rather than in `ItemsView` because the badge has to be
+    /// right while the operator is looking at some other section — a count that
+    /// only exists while its own screen is open is not a badge, it is a label.
+    @Published private(set) var openItemCount = 0
+
+    /// Recount open items across all workspaces. One shell-out per project,
+    /// riding the same cadence as `refreshStatus` instead of adding a poll.
+    func refreshItemCount() {
+        let targets = workspaces
+        guard !targets.isEmpty else { openItemCount = 0; return }
+        Task.detached(priority: .utility) {
+            var total = 0
+            for cwd in targets {
+                let items = ForgeCore.runJSON([Item].self, "forge-items.js",
+                                               ["--list", "--json", "--cwd", cwd]) ?? []
+                total += ItemBoard.openCount(items)
+            }
+            await MainActor.run { self.openItemCount = total }
+        }
+    }
+
     /// Fetch status for the projects that have a live run — the only ones whose
     /// progress can change while you watch.
     func refreshStatus(force: Bool = false) {
+        refreshItemCount()
         let targets = Set(liveRuns.map(\.cwd)).union(force ? Set(workspaces) : [])
         for cwd in targets where !statusLoading.contains(cwd) {
             statusLoading.insert(cwd)
@@ -271,7 +515,31 @@ final class AppState: ObservableObject {
             AccountsPayload.self, "forge-accounts.js", ["--list", "--json"])
         else { return }
         accounts = payload.accounts
-        activeAccount = payload.env_active ?? payload.active
+        // Two different facts wear the same name, and which one it is changes
+        // what the operator should do about it:
+        //
+        //   env_active — this app process carries FORGE_ACCOUNT and (crucially)
+        //     ANTHROPIC_AUTH_TOKEN, inherited from whatever launched it. The
+        //     shell-init `claude()` function goes INERT when a token is already
+        //     set without `--account`, so every bare `claude` in a session
+        //     spawned here runs on that account, outranking the registry.
+        //   active — the forge-accounts default, which is what applies when the
+        //     app was launched clean (from the Dock, say).
+        //
+        // env wins because it is what actually happens. Recording WHICH it was
+        // is the point: "vh, herdada do ambiente" and "vh, padrão do registro"
+        // look identical on screen and mean different things when the default
+        // says lookchina.
+        if let env = payload.env_active {
+            activeAccount = env
+            activeAccountSource = .environment
+        } else if let reg = payload.active {
+            activeAccount = reg
+            activeAccountSource = .registry
+        } else {
+            activeAccount = nil
+            activeAccountSource = .unknown
+        }
     }
 
     /// Costs a real API call per account — only ever on explicit request.
@@ -489,11 +757,30 @@ final class AppState: ObservableObject {
     /// Resume an existing run in an in-app terminal. /forge-auto takes the run
     /// id and picks up from disk state.
     func resume(_ run: Run) {
+        // `--account` was missing here while the session was still LABELLED
+        // with the run's account: the tab named one account and the shell ran
+        // on whatever the default was. Every other creation path passes the
+        // flag; this one is the odd one out, and the label made the mismatch
+        // invisible.
+        let acct = run.account ?? ""
+        let claudeArgs = acct.isEmpty ? "" : " --account \(shq(acct))"
         sessions.append(TerminalSession(
             cwd: run.cwd, title: "\(run.projectName) · auto",
-            bootstrap: "claude \(shq("/forge-auto \(run.id)"))",
+            bootstrap: "claude\(claudeArgs) \(shq("/forge-auto \(run.id)"))",
             runId: run.id, account: run.account))
         focus(sessions.last)
+    }
+
+    /// The session in THIS app driving `run`, if there is one.
+    ///
+    /// Runs live on disk and outlive every process: one started in Terminal.app,
+    /// by `bin/forge-run` headless, or before this app was last quit is active
+    /// and has no session here. That is the normal case, not the exception —
+    /// which is why "open a terminal for it" and "go to its terminal" are two
+    /// different actions rather than one button that sometimes opens a second
+    /// session onto the same run.
+    func session(for run: Run) -> TerminalSession? {
+        sessions.first { $0.runId == run.id && $0.cwd == run.cwd }
     }
 
     /// The sandbox is registered like any other project so examples show up

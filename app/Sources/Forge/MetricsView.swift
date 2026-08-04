@@ -58,8 +58,151 @@ final class MetricsStore: ObservableObject {
     }
 }
 
+extension MetricsStore.Window {
+    /// 1:1 mapping into ForgeKit's `ProgressWindow` (DS3-3). Exhaustive
+    /// `switch` on purpose — no `default:` — so a future case added to
+    /// `Window` fails the build instead of silently falling into the wrong
+    /// window.
+    var progressWindow: ProgressWindow {
+        switch self {
+        case .day:   return .day24h
+        case .week:  return .week
+        case .month: return .month
+        case .all:   return .all
+        }
+    }
+}
+
+/// Data layer for the progress panel (S03). Same shape as `MetricsStore`
+/// above and `ItemsStore` (ItemsView.swift): `@MainActor` store,
+/// `Task.detached` for the shell-out, `await MainActor.run` back.
+///
+/// Reads items only through `forge-items.js --list --json` (ForgeCore) —
+/// every count comes out of `ProgressEngine.load` (ForgeKit/S02); nothing
+/// here reimplements status or closing semantics.
+@MainActor
+final class ProgressStore: ObservableObject {
+    @Published private(set) var summary: ProgressSummary?
+    @Published private(set) var loading = false
+
+    /// Guards against out-of-order loads the same way `ItemsStore` does (no
+    /// `guard !loading` — that would drop a newer request without advancing
+    /// the generation, letting an in-flight older request win the race):
+    /// every call bumps the generation, and only the request whose
+    /// generation is still current is allowed to write `summary`/`loading`.
+    private var generation = LoadGeneration()
+
+    /// `project.isEmpty` is "Todos os projetos" (DS3-1) — the panel does not
+    /// aggregate across projects, so no load happens and `summary` is
+    /// cleared rather than left stale. The generation must still advance
+    /// here so an in-flight load for the previous project can't land after
+    /// the switch to "Todos os projetos".
+    func load(project: String, window: MetricsStore.Window) {
+        guard !project.isEmpty else {
+            _ = generation.start()
+            summary = nil
+            loading = false
+            return
+        }
+        loading = true
+        let pw = window.progressWindow
+        let gen = generation.start()
+
+        Task.detached(priority: .utility) {
+            let items = ForgeCore.runJSON([Item].self, "forge-items.js",
+                                          ["--list", "--json", "--cwd", project]) ?? []
+            // ignoreGlobs: nil (DS3-2) — the drift between ForgeKit's default
+            // list and the completer's resolved list is already guarded by
+            // scripts/forge-app-progress.test.js; reading
+            // file_audit.ignore_list here would be new scope the app's
+            // ResolvedPrefs does not carry.
+            let s = ProgressEngine.load(workspace: project, items: items, window: pw)
+            await MainActor.run {
+                guard self.generation.isCurrent(gen) else { return }
+                self.summary = s
+                self.loading = false
+            }
+        }
+    }
+}
+
+/// Renders a `ProgressSummary` as a segment inside `MetricsView` (S03/T02):
+/// three separate, labelled counts — closed items, ledger deliveries,
+/// commits — never one combined number (D2, critério #7). Coverage is glued
+/// to the first count only; the divergence sentence renders exclusively via
+/// optional binding, with no fallback text when it is nil (D3, critério #9).
+///
+/// `summary`/`hasProject` are injected, not read from disk (DS3-5) — the same
+/// shape as `ItemCard`/`ItemDetailSheet` (S04), so it stages from a fixture
+/// in `Previews.swift` (T04) without touching disk.
+struct ProgressPanel: View {
+    let summary: ProgressSummary?
+    let hasProject: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Progresso")
+            if !hasProject {
+                Text("Escolha um projeto para ver o progresso.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else if let summary {
+                HStack(alignment: .top, spacing: 22) {
+                    progressStat("\(summary.closedItems.closed)", "itens fechados",
+                                 caption: summary.closedItems.coverageLabel)
+                    Divider().frame(height: 34)
+                    progressStat("\(summary.ledger.count)", "entregas",
+                                 caption: ledgerCaption(summary.ledger))
+                    Divider().frame(height: 34)
+                    progressStat("\(summary.gitCommits)", "commits",
+                                 caption: "+\(summary.gitAdded) / −\(summary.gitDeleted) linhas — movimento")
+                    Spacer()
+                }
+                // Optional binding only — no `?? "tudo em ordem"` fallback
+                // (D3). When `divergence` is nil, no view occupies its place.
+                if let d = summary.divergence {
+                    Label(d, systemImage: "arrow.triangle.branch")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// `ledger.windowLabel` ("hoje" for the 24h window, nil otherwise) and the
+    /// undated-fragment caveat combined into one caption — both are secondary
+    /// detail on the deliveries count, never folded into `ledger.count`
+    /// itself.
+    private func ledgerCaption(_ ledger: LedgerCount) -> String? {
+        var parts: [String] = []
+        if let w = ledger.windowLabel { parts.append(w) }
+        if ledger.undated > 0 { parts.append("\(ledger.undated) sem data") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// A three-line stat block: value, label, and an optional secondary
+    /// caption (coverage / window / movement) — the sibling `T02-PLAN.md`
+    /// steps asked for, since the existing `stat(_:_:)` in `MetricsView` has
+    /// no room for a third line.
+    private func progressStat(_ value: String, _ label: String,
+                              caption: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value)
+                .font(.system(size: 22, weight: .semibold)).monospacedDigit()
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            if let caption {
+                Text(caption).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
 struct MetricsView: View {
     @StateObject private var store = MetricsStore()
+    @StateObject private var progress = ProgressStore()
     @ObservedObject var state: AppState
     @State private var project: String = ""
 
@@ -67,6 +210,10 @@ struct MetricsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 headline
+                // Progress and dispatches are independent sources (S03): a
+                // project with zero dispatches can still have closed items,
+                // so this sits outside the `dispatches == 0` branch below.
+                ProgressPanel(summary: progress.summary, hasProject: !project.isEmpty)
                 if store.summary.dispatches == 0 {
                     empty
                 } else {
@@ -107,6 +254,7 @@ struct MetricsView: View {
 
     private func reload() {
         store.load(workspaces: state.workspaces, only: project.isEmpty ? nil : project)
+        progress.load(project: project, window: store.window)
     }
 
     // MARK: Headline

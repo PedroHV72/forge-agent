@@ -11,7 +11,7 @@ import PackageDescription
 
 let package = Package(
     name: "Forge",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS("26.0")],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.15.0"),
     ],
@@ -19,7 +19,16 @@ let package = Package(
         // Pure logic lives here so it can be tested: an executable target cannot
         // be imported by a test target, and the parts most worth pinning down
         // (JSONC editing, git parsing, engine resolution) carry no UI anyway.
-        .target(name: "ForgeKit", path: "Sources/ForgeKit"),
+        // `resources:` carries the vendored brand marks (Simple Icons CC0,
+        // Octicons MIT — see Sources/ForgeKit/Resources/icons/PROVENANCE.md).
+        // They live in ForgeKit rather than in Forge for one reason that
+        // decides it: ForgeKitTests can import ForgeKit and cannot import the
+        // executable, so this is the only placement where "every mark actually
+        // resolves" is a test instead of a hope. `.copy` and not `.process`:
+        // processing an SVG on a machine without Xcode has no tool to run, and
+        // the folder structure is what `BrandArt.directory` looks under.
+        .target(name: "ForgeKit", path: "Sources/ForgeKit",
+                resources: [.copy("Resources/icons")]),
         .executableTarget(
             name: "Forge",
             dependencies: ["SwiftTerm", "ForgeKit"],

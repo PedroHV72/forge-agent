@@ -6,11 +6,13 @@
 //   checkSchema(cwd)            // (cwd?) → { ok, expected, actual, message }
 //   checkProjectionVersioned(cwd) // (cwd?) → { ok, tracked: string[], skipped?: string, message }
 //   checkPlanRepoDeclared(cwd)  // (cwd?) → { ok, plans: string[], skipped?: string, message }  (advisory)
+//   checkWorkspaceConsistency(cwd) // (cwd?) → { ok: true, workspaces, divergentCount, skipped?, message }  (advisory, D3)
 //
 // CLI:
 //   node forge-doctor.js --check schema [--cwd <dir>]
 //   node forge-doctor.js --check projection-versioned [--cwd <dir>]
 //   node forge-doctor.js --check plan-repo-declared [--cwd <dir>]
+//   node forge-doctor.js --check workspace-consistency [--cwd <dir>]
 //   node forge-doctor.js --check all [--cwd <dir>]
 //   node forge-doctor.js --fix [--cwd <dir>]
 //   node forge-doctor.js --regen-projection [--cwd <dir>]
@@ -37,7 +39,7 @@ const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 // Single source of truth for the check names this CLI accepts via `--check`.
 // `runCheck` dispatches these; the unknown-check message and `--help` text
 // must both be derived from this array — never hand-repeated.
-const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities'];
+const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap'];
 
 // ── checkSchema ───────────────────────────────────────────────────────────────
 /**
@@ -257,31 +259,190 @@ function checkPlanRepoDeclared(cwd) {
   };
 }
 
-/**
- * Detects the selected host runtime without installing, logging in, or using
- * the other CLI as a fallback. This is intentionally read-only and returns a
- * stable reason code for every probe.
- */
+/** Runtime capability diagnostics retained alongside the v4.2 workspace checks. */
 function checkCapabilities(cwd, options = {}) {
-  const legacy = detectCapabilities(cwd, options);
-  const report = maintenance.diagnose({ ...options, repo: options.repo || path.resolve(__dirname, '..'), cwd, runtime: options.runtime || 'claude' });
-  // Keep the public failure/warning projections byte-compatible with the
-  // legacy capability detector; the richer maintenance diagnostics remain
-  // additive in `diagnostics`.
+  let legacy = { probes: {} };
+  try { legacy = detectCapabilities(cwd, options); } catch (error) {
+    // `--check all` remains useful in a minimal fixture or an uninitialised
+    // directory; the richer maintenance report below carries the actionable
+    // diagnostic when a catalog is present.
+    legacy = { probes: {}, error: error.message };
+  }
+  const report = maintenance.diagnose({
+    ...options,
+    repo: options.repo || path.resolve(__dirname, '..'),
+    cwd,
+    runtime: options.runtime || 'claude',
+  });
   const failures = (report.required_failures || []).map((id) => {
     const probe = report.probes && report.probes[id];
     return { id, status: probe && probe.status, reason_code: probe && probe.reason_code };
   });
-  const warnings = Object.keys(report.probes || {}).sort().map((id) => report.probes[id])
-    .filter((probe) => probe.reason_code === 'not-selected' || (probe.status !== 'available' && !(report.required_failures || []).includes(probe.id)))
+  const warnings = Object.keys(report.probes || {}).sort()
+    .map((id) => report.probes[id])
+    .filter((probe) => probe.reason_code === 'not-selected'
+      || (probe.status !== 'available' && !(report.required_failures || []).includes(probe.id)))
     .map((probe) => ({ id: probe.id, status: probe.status, reason_code: probe.reason_code }));
   const message = report.ok
     ? `Capabilities ${report.runtime}: required capabilities available (${warnings.length} conditional warning(s)).`
     : `Capabilities ${report.runtime}: ${failures.length} required failure(s); see reason_code.`;
-  return { check: 'capabilities', ok: report.ok, protocol_version: report.protocol_version, runtime: report.runtime,
-    // Preserve the 3.1.4 probe projection for existing doctor consumers while
-    // exposing the new provider-neutral diagnostics alongside it.
-    probes: report.probes || {}, diagnostics: report.diagnostics || [], failures, warnings, message };
+  return {
+    check: 'capabilities',
+    ok: report.ok,
+    protocol_version: report.protocol_version,
+    runtime: report.runtime,
+    // Keep legacy probe fields byte-compatible; richer maintenance diagnostics
+    // are additive and do not change existing doctor consumers.
+    probes: report.probes || legacy.probes || {},
+    diagnostics: report.diagnostics || [],
+    failures,
+    warnings,
+    message,
+  };
+}
+
+// ── checkWorkspaceConsistency ─────────────────────────────────────────────────
+/**
+ * Advisory guard (D3, T04): confronts the registry (~/.claude) against the
+ * on-disk marker of each indexed workspace and surfaces divergence. Wraps
+ * `auditWorkspaces` from `forge-workspace-consistency.js` — this function does
+ * not implement the comparison itself, it only shapes the result the way this
+ * CLI's other checks are shaped, following `checkPlanRepoDeclared`'s form.
+ *
+ * ALWAYS `ok: true` — divergence here is advisory information, never a
+ * failure. See `forge-workspace-consistency.js` for the full rationale (D3
+ * mandates this guard never blocks).
+ *
+ * @param {string} [cwd] - Working directory (default: process.cwd())
+ * @returns {{ ok: true, workspaces: object[], divergentCount: number, skipped?: string, message: string }}
+ */
+function checkWorkspaceConsistency(cwd) {
+  const dir = cwd || process.cwd();
+  const { auditWorkspaces } = require('./forge-workspace-consistency');
+
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (!home) {
+    return {
+      ok: true,
+      workspaces: [],
+      divergentCount: 0,
+      skipped: 'no-home',
+      message: 'forge-workspace-consistency: sem HOME resolvível — check pulado (advisory).',
+    };
+  }
+
+  let result;
+  try {
+    result = auditWorkspaces({ home, cwd: dir });
+  } catch (e) {
+    return {
+      ok: true, // advisory — an internal error here still must not fail `--check all`
+      workspaces: [],
+      divergentCount: 0,
+      skipped: `error: ${e.message}`,
+      message: `forge-workspace-consistency: erro ao auditar (${e.message}) — advisory, não bloqueia.`,
+    };
+  }
+
+  if (result.skipped) {
+    return {
+      ok: true,
+      workspaces: [],
+      divergentCount: 0,
+      skipped: result.skipped,
+      message: `forge-workspace-consistency: ${result.skipped} — nada a confrontar.`,
+    };
+  }
+
+  const divergent = result.workspaces.filter((w) => w.status === 'divergent');
+  const unreadable = result.workspaces.filter((w) => w.status === 'marker-unreadable');
+
+  if (divergent.length === 0 && unreadable.length === 0) {
+    return {
+      ok: true,
+      workspaces: result.workspaces,
+      divergentCount: 0,
+      message: `${result.workspaces.length} workspace(s) indexado(s) verificado(s) — registry e marcador consistentes (advisory).`,
+    };
+  }
+
+  const lines = [];
+  for (const w of divergent) {
+    for (const d of w.diffs) {
+      const reg = d.registry_path || '(ausente)';
+      const mk = d.marker_path || '(ausente)';
+      lines.push(`${w.workspace}: ${d.name} [${d.kind}] registry=${reg} marcador=${mk}`);
+    }
+  }
+  for (const w of unreadable) {
+    lines.push(`${w.workspace}: marcador ilegível (${w.error})`);
+  }
+
+  return {
+    ok: true, // advisory — never fails `--check all`; D3 requires exit 0 always
+    workspaces: result.workspaces,
+    divergentCount: divergent.length,
+    message: `${divergent.length + unreadable.length} workspace(s) com registry × marcador divergentes ou ilegíveis (advisory, nunca bloqueia):\n    `
+      + lines.join('\n    '),
+  };
+}
+
+// ── checkRunOverlap ──────────────────────────────────────────────────────────
+/**
+ * Advisory guard (S07/T03): confronts the touch snapshots forge-touch.js
+ * records against every other active run and surfaces cross-run file
+ * collisions. Wraps `collectRunTouches`/`computeOverlap` from
+ * `forge-overlap.js` — this function does not implement the comparison
+ * itself, it only shapes the result the way this CLI's other checks are
+ * shaped, following `checkWorkspaceConsistency`'s form.
+ *
+ * ALWAYS `ok: true` — overlap here is advisory information, never a failure.
+ * See `forge-overlap.js` for the locked boundary (signals, never sequences)
+ * and the verdict floor (`pairs_compared === 0` → `inconclusive`, never a
+ * silent `clean`).
+ *
+ * @param {string} [cwd] - Working directory (default: process.cwd())
+ * @returns {{ ok: true, verdict?: string, overlaps: object[], skipped?: string, message: string }}
+ */
+function checkRunOverlap(cwd) {
+  const dir = cwd || process.cwd();
+  const { collectRunTouches, computeOverlap, formatOverlap } = require('./forge-overlap');
+
+  const runsDir = path.join(dir, '.gsd', 'forge', 'runs');
+  if (!fs.existsSync(runsDir)) {
+    return {
+      ok: true,
+      overlaps: [],
+      skipped: 'no-runs-registry',
+      message: 'forge-overlap: sem .gsd/forge/runs/ — nada a confrontar (advisory).',
+    };
+  }
+
+  let result;
+  try {
+    result = computeOverlap(collectRunTouches(dir, {}));
+  } catch (e) {
+    return {
+      ok: true, // advisory — an internal error here still must not fail `--check all`
+      overlaps: [],
+      skipped: `error: ${e.message}`,
+      message: `forge-overlap: erro ao confrontar (${e.message}) — advisory, não bloqueia.`,
+    };
+  }
+
+  return {
+    ok: true, // advisory — never fails `--check all`, including verdict === 'overlap'
+    verdict: result.verdict,
+    overlaps: result.overlaps,
+    census: {
+      runs_examined: result.runs_examined,
+      runs_with_touch_data: result.runs_with_touch_data,
+      pairs_compared: result.pairs_compared,
+      files_compared: result.files_compared,
+      skipped: result.skipped.length,
+    },
+    message: formatOverlap(result),
+  };
 }
 
 // ── module.exports ────────────────────────────────────────────────────────────
@@ -292,7 +453,8 @@ module.exports = {
   checkProjectionVersioned,
   checkPlanRepoDeclared,
   checkCapabilities,
-  runCheck,
+  checkWorkspaceConsistency,
+  checkRunOverlap,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -311,6 +473,7 @@ function parseArgs(argv) {
 
 function runCheck(name, cwd, options = {}) {
   const checks = name === 'all' ? VALID_CHECKS.slice() : [name];
+  const explicit = name !== 'all';
 
   let allOk = true;
   const results = [];
@@ -335,6 +498,21 @@ function runCheck(name, cwd, options = {}) {
     } else if (c === 'capabilities') {
       const r = checkCapabilities(cwd, options);
       results.push(r);
+      // Capability availability is actionable when explicitly requested, but
+      // remains advisory in the aggregate doctor dashboard so missing paid
+      // CLIs do not block unrelated schema/workspace diagnostics.
+      if (!r.ok && explicit) allOk = false;
+    } else if (c === 'workspace-consistency') {
+      const r = checkWorkspaceConsistency(cwd);
+      results.push({ check: c, ...r });
+      // Advisory (D3): `r.ok` is always true, so this never flips `allOk` — a
+      // registry × marker divergence must never fail `--check all`.
+      if (!r.ok) allOk = false;
+    } else if (c === 'run-overlap') {
+      const r = checkRunOverlap(cwd);
+      results.push({ check: c, ...r });
+      // Advisory: `r.ok` is always true, so this never flips `allOk` — a
+      // cross-run overlap must never fail `--check all`.
       if (!r.ok) allOk = false;
     } else {
       process.stderr.write(`forge-doctor: unknown check "${c}". Valid: ${VALID_CHECKS.join(', ')}, all\n`);
@@ -348,19 +526,23 @@ function runCheck(name, cwd, options = {}) {
 function formatResults(results) {
   const lines = [];
   for (const r of results) {
-    const advisoryWarn = r.check === 'plan-repo-declared' && Array.isArray(r.plans) && r.plans.length > 0;
+    const advisoryWarn = (r.check === 'plan-repo-declared' && Array.isArray(r.plans) && r.plans.length > 0)
+      || (r.check === 'workspace-consistency' && r.divergentCount > 0)
+      || (r.check === 'run-overlap' && r.verdict === 'overlap');
     const icon = advisoryWarn ? '⚠' : (r.ok ? '✓' : '✗');
     const label = r.check === 'schema' ? 'Layer 2 — Schema version'
       : r.check === 'review-model-drift' ? 'Advisory — Review model drift'
       : r.check === 'plan-repo-declared' ? 'Advisory — Plan repo declaration'
       : r.check === 'capabilities' ? 'Runtime — Capabilities'
+      : r.check === 'workspace-consistency' ? 'Advisory — Workspace registry × marker consistency'
+      : r.check === 'run-overlap' ? 'Advisory — Cross-run overlap'
       : 'Layer 3 — Projection versioned';
     lines.push(`  ${icon} ${label}`);
     lines.push(`    ${r.message}`);
     if (!r.ok && r.tracked && r.tracked.length > 0) {
       for (const t of r.tracked) lines.push(`      - ${t}`);
     }
-    if (advisoryWarn) {
+    if (advisoryWarn && r.check === 'plan-repo-declared') {
       for (const p of r.plans) lines.push(`      - ${p}`);
     }
     if (r.check === 'capabilities') {

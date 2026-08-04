@@ -9,7 +9,9 @@ const { spawn } = require('child_process');
 const lock = require('./forge-lock.js');
 
 function temporary() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'forge lock espaço-測試-'));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge lock espaço-測試-'));
+  fs.mkdirSync(path.join(cwd, '.gsd'), { recursive: true });
+  return cwd;
 }
 function remove(dir) {
   fs.rmSync(dir, { recursive: true, force: true });
