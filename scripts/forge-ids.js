@@ -251,7 +251,29 @@ function listExistingIds(cwd, kind) {
     : [path.join(cwd, '.gsd', 'tasks')];
   const out = [];
   for (const d of dirs) {
-    try { out.push(...fs.readdirSync(d)); } catch { /* dir absent — skip */ }
+    try {
+      const entries = fs.readdirSync(d, { withFileTypes: true });
+      out.push(...entries.map(entry => entry.name));
+      // Grouped containers are an optional storage detail.  Keep this whole
+      // reader local and fail-open: creation must retain loose IDs even when
+      // one container or its format module is unavailable/corrupt.
+      try {
+        const grouped = require('./forge-grouped-file');
+        for (const entry of entries) {
+          if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+          const filePath = path.join(d, entry.name);
+          const sniff = grouped.readSniffBuffer(filePath);
+          if (!grouped.isGroupedFile(entry.name, sniff)) continue;
+          const parsed = grouped.readGroupedUnits(filePath);
+          if (parsed.errors.length) continue;
+          for (const unit of parsed.units) {
+            // Wrapper markers use dir~filename; ordinary members are plain IDs.
+            const marker = String(unit.id || '');
+            out.push(marker.includes('~') ? marker.slice(0, marker.indexOf('~')) : marker);
+          }
+        }
+      } catch { /* optional grouped reader: preserve loose enumeration */ }
+    } catch { /* directory absent or unreadable — preserve loose behavior */ }
   }
   return out;
 }
@@ -291,6 +313,7 @@ module.exports = {
   readIdFormat,
   resolveMilestoneId,
   resolveTaskId,
+  listExistingIds,
 };
 
 // ── CLI ──────────────────────────────────────────────────────────────────────

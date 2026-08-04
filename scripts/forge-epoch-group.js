@@ -7,7 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { epochOfUnit, sealedEpochs } = require('./forge-epoch');
+const { epochOfUnit, sealedEpochs, isWrapperDir, listWrapperDirs } = require('./forge-epoch');
 const { serializeGroup, parseGroup, isGroupedFile } = require('./forge-grouped-file');
 const ledger = require('./forge-ledger');
 const decisions = require('./forge-decisions');
@@ -46,8 +46,19 @@ const STORE_TARGETS = [
   },
 ];
 
+// Wrapper stores are intentionally separate from fragment stores: their
+// parent is the original .gsd directory, so grouping never creates archive or
+// sibling directories.  The marker id is `dir~filename`; the left side keeps
+// the Forge identity while the right side preserves the original filename.
+const WRAPPER_TARGETS = [
+  { name: 'milestone-wrappers', parent: cwd => path.join(cwd, '.gsd', 'milestones') },
+  { name: 'task-wrappers', parent: cwd => path.join(cwd, '.gsd', 'tasks') },
+];
+
+const ALL_TARGETS = [...STORE_TARGETS, ...WRAPPER_TARGETS];
+
 function descriptor(name) {
-  return STORE_TARGETS.find(store => store.name === name) || null;
+  return ALL_TARGETS.find(store => store.name === name) || null;
 }
 
 function isDirectChild(dir, candidate) {
@@ -56,6 +67,19 @@ function isDirectChild(dir, candidate) {
 
 function safeMemberId(id) {
   return typeof id === 'string' && id && path.basename(id) === id && !/[\\/]/.test(id);
+}
+
+function wrapperMarkerId(dirId, fileName) {
+  return `${dirId}~${fileName}`;
+}
+
+function splitWrapperMarkerId(value) {
+  const index = typeof value === 'string' ? value.indexOf('~') : -1;
+  if (index < 1 || index === value.length - 1) return null;
+  const dirId = value.slice(0, index);
+  const fileName = value.slice(index + 1);
+  return safeMemberId(dirId) && safeMemberId(fileName) && fileName.endsWith('.md')
+    ? { dirId, fileName } : null;
 }
 
 function entries(dir) {
@@ -154,6 +178,58 @@ function plan(cwd, opts = {}) {
       targets.push({ store: store.name, epoch, containerPath, members });
     }
   }
+
+  for (const store of WRAPPER_TARGETS) {
+    const parent = store.parent(cwd);
+    // Use the shared enumerator for eligible wrappers; inspect all dirs below
+    // to report why rejected wrappers were skipped rather than hiding them.
+    const eligible = new Map(listWrapperDirs(parent).map(item => [item.path, item]));
+    const units = [];
+    for (const entry of entries(parent)) {
+      if (!entry.isDirectory()) continue;
+      const wrapperPath = path.join(parent, entry.name);
+      // Keep the runtime structural decision owned by forge-epoch; the map is
+      // only the filename projection supplied by listWrapperDirs.
+      const wrapper = isWrapperDir(wrapperPath) ? eligible.get(wrapperPath) : null;
+      if (!wrapper) {
+        const children = entries(wrapperPath);
+        const fileCount = children.filter(child => child.isFile()).length;
+        const subdir = children.find(child => child.isDirectory());
+        if (subdir) skip(skipped, wrapperPath, `contém subpasta ${subdir.name}/`);
+        else skip(skipped, wrapperPath, `${fileCount} arquivos`);
+        continue;
+      }
+      const filePath = wrapper.file;
+      let content;
+      try { content = fs.readFileSync(filePath); }
+      catch (error) { skip(skipped, wrapperPath, 'falha de leitura'); continue; }
+      if (isGroupedFile(filePath, content)) { skip(skipped, wrapperPath, 'já agrupado'); continue; }
+      if (content.indexOf(Buffer.from('<!-- forge:', 'ascii')) !== -1) {
+        skip(skipped, wrapperPath, 'delimitador no conteúdo'); continue;
+      }
+      const resolved = epochOfUnit({ id: entry.name, path: filePath });
+      if (!resolved.epoch) { skip(skipped, wrapperPath, 'época indeterminada'); continue; }
+      units.push({ id: entry.name, path: wrapperPath, filePath, fileName: path.basename(filePath), epoch: resolved.epoch });
+    }
+    const epochSet = sealedEpochs(units.map(unit => unit.epoch));
+    for (const unit of units) {
+      if (unit.epoch === epochSet.current) {
+        skip(skipped, unit.path, 'época corrente — não selada');
+      }
+    }
+    for (const epoch of epochSet.sealed) {
+      const members = units.filter(unit => unit.epoch === epoch).map(unit => ({
+        id: wrapperMarkerId(unit.id, unit.fileName), path: unit.filePath,
+        wrapperPath: unit.path, wrapperId: unit.id, fileName: unit.fileName,
+      }));
+      const containerPath = path.join(parent, `${epoch}.md`);
+      if (fs.existsSync(containerPath)) {
+        for (const member of members) skip(skipped, member.wrapperPath, 'container já agrupado');
+      } else if (members.length) {
+        targets.push({ store: store.name, epoch, containerPath, members });
+      }
+    }
+  }
   return { targets, skipped, dryRun };
 }
 
@@ -162,7 +238,7 @@ function apply(cwd, groupingPlan, opts = {}) {
   const written = [];
   const removed = [];
   const skipped = Array.isArray(input.skipped) ? input.skipped.slice() : [];
-  const allDirs = STORE_TARGETS.map(store => store.dir(cwd));
+  const allDirs = [...STORE_TARGETS.map(store => store.dir(cwd)), ...WRAPPER_TARGETS.map(store => store.parent(cwd))];
   const before = allDirs.reduce((total, dir) => {
     const counts = countTree(dir); total.files += counts.files; total.dirs += counts.dirs; return total;
   }, { files: 0, dirs: 0 });
@@ -173,7 +249,7 @@ function apply(cwd, groupingPlan, opts = {}) {
       skip(skipped, target && target.containerPath, 'store desconhecido');
       continue;
     }
-    const dir = store.dir(cwd);
+    const dir = store.dir ? store.dir(cwd) : store.parent(cwd);
     if (!isDirectChild(dir, target.containerPath) || path.extname(target.containerPath) !== '.md') {
       skip(skipped, target.containerPath, 'container fora do diretório do store');
       continue;
@@ -186,7 +262,11 @@ function apply(cwd, groupingPlan, opts = {}) {
     const units = [];
     let invalid = false;
     for (const member of members) {
-      if (!safeMemberId(member.id) || !isDirectChild(dir, member.path) || !fs.existsSync(member.path)) {
+      const wrapperMember = store.parent ? splitWrapperMarkerId(member.id) : null;
+      const validPath = store.parent
+        ? wrapperMember && isDirectChild(dir, member.wrapperPath) && isDirectChild(member.wrapperPath, member.path)
+        : isDirectChild(dir, member.path);
+      if ((!store.parent && !safeMemberId(member.id)) || !validPath || !fs.existsSync(member.path)) {
         skip(skipped, member && member.path, 'membro fora do diretório do store ou ausente');
         invalid = true;
         continue;
@@ -213,6 +293,19 @@ function apply(cwd, groupingPlan, opts = {}) {
       skip(skipped, target.containerPath, 'falha de escrita');
       continue;
     }
+    if (store.parent) {
+      // The durable container is written first. rmdir is non-recursive so a
+      // wrapper changed between plan and apply is reported, never erased.
+      for (const member of members) {
+        try { fs.unlinkSync(member.path); removed.push(member.path); }
+        catch (error) { skip(skipped, member.path, 'falha ao remover arquivo do invólucro após escrita'); }
+      }
+      for (const member of members) {
+        try { fs.rmdirSync(member.wrapperPath); removed.push(member.wrapperPath); }
+        catch (error) { skip(skipped, member.wrapperPath, 'invólucro não vazio após escrita'); }
+      }
+      continue;
+    }
     for (const member of members) {
       try {
         fs.unlinkSync(member.path);
@@ -235,11 +328,27 @@ function apply(cwd, groupingPlan, opts = {}) {
 
 function ungroup(cwd, containerPath) {
   const container = path.resolve(containerPath);
-  const store = STORE_TARGETS.find(candidate => isDirectChild(candidate.dir(cwd), container));
+  const store = ALL_TARGETS.find(candidate => isDirectChild(candidate.dir ? candidate.dir(cwd) : candidate.parent(cwd), container));
   if (!store) throw new Error('container must be directly inside a fragment store');
   const parsed = parseGroup(fs.readFileSync(container));
   if (parsed.errors.length) throw new Error(`cannot ungroup invalid container: ${parsed.errors[0].reason}`);
   const restored = [];
+  if (store.parent) {
+    const parent = store.parent(cwd);
+    for (const unit of parsed.units) {
+      const member = splitWrapperMarkerId(unit.id);
+      if (!member) throw new Error(`invalid wrapper member id: ${unit.id}`);
+      const wrapper = path.join(parent, member.dirId);
+      const destination = path.join(wrapper, member.fileName);
+      if (!isDirectChild(parent, wrapper) || !isDirectChild(wrapper, destination)) throw new Error('wrapper member escapes store');
+      if (fs.existsSync(wrapper) || fs.existsSync(destination)) throw new Error(`destination already exists: ${destination}`);
+      fs.mkdirSync(wrapper);
+      fs.writeFileSync(destination, unit.content);
+      restored.push(destination);
+    }
+    fs.unlinkSync(container);
+    return { restored };
+  }
   for (const unit of parsed.units) {
     if (!safeMemberId(unit.id)) throw new Error(`invalid grouped unit id: ${unit.id}`);
     const destination = path.join(store.dir(cwd), `${unit.id}.md`);
@@ -251,4 +360,4 @@ function ungroup(cwd, containerPath) {
   return { restored };
 }
 
-module.exports = { STORE_TARGETS, plan, apply, ungroup };
+module.exports = { STORE_TARGETS, WRAPPER_TARGETS, plan, apply, ungroup };

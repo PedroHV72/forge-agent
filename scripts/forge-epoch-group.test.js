@@ -225,5 +225,118 @@ test('the plan defaults to dry-run metadata and never writes implicitly', () => 
   } finally { remove(cwd); }
 });
 
+// Wrapper-directory contract: only the structural predicate from forge-epoch
+// makes a directory eligible.  The fixture deliberately mixes valid, active,
+// multi-file, and nested wrappers so enumeration also proves its diagnostics.
+//
+// Two fixture invariants are load-bearing and neither is decorative:
+//
+// 1. Ids use the shapes forge-ids actually mints — `M-<14>-slug` and
+//    `T-<14>-slug`. `TASK-<14>-slug` is NOT one of them: timestampOf only
+//    accepts `TASK-` in its dashed `TASK-YYYYMMDD-HHMMSS` form, so a compact
+//    `TASK-<14>` id resolves no epoch from the id and silently falls through
+//    epochOfUnit's chain to the file mtime — i.e. to "now" for a fixture file,
+//    which lands every such unit in the current epoch and makes it unplannable.
+//
+// 2. Sealedness is computed PER STORE (sealedEpochs over that store's own
+//    labels), so each store needs its own current-epoch occupant before any
+//    older epoch inside it counts as sealed. That is T05's engine contract, and
+//    it mirrors reality: a live .gsd always holds an active milestone/task.
+//    Hence the tasks store gets its own current wrapper, not just milestones.
+test('wrapper dirs plan only eligible sealed milestone/task directories', () => {
+  const cwd = tmp();
+  try {
+    const roots = ['.gsd/milestones', '.gsd/tasks'];
+    for (const root of roots) fs.mkdirSync(path.join(cwd, root), { recursive: true });
+    for (const id of ['M-20260101000000-a', 'M-20260102000000-b', 'T-20260103000000-c']) {
+      const root = id.startsWith('M') ? '.gsd/milestones' : '.gsd/tasks';
+      write(cwd, `${root}/${id}/PLAN.md`, `original ${id}\r\n`);
+    }
+    write(cwd, '.gsd/milestones/M-20260104000000-two/A.md', 'a');
+    write(cwd, '.gsd/milestones/M-20260104000000-two/B.md', 'b');
+    write(cwd, '.gsd/milestones/M-20260105000000-nested/PLAN.md', 'x');
+    fs.mkdirSync(path.join(cwd, '.gsd/milestones/M-20260105000000-nested', 'slices'));
+    write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'current');
+    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'current');
+    const planned = group.plan(cwd);
+    // One container per store, and the three eligible sealed wrappers land in
+    // them: two milestones in 2026-Q1, one task in 2026-Q1.
+    assert.equal(planned.targets.length, 2);
+    assert(planned.targets.every(target => target.epoch === '2026-Q1'));
+    assert.equal(planned.targets.reduce((total, target) => total + target.members.length, 0), 3);
+    assert.equal(planned.targets.find(target => target.store === 'milestone-wrappers').members.length, 2);
+    assert.equal(planned.targets.find(target => target.store === 'task-wrappers').members.length, 1);
+    assert(planned.skipped.some(item => item.reason.includes('2 arquivos')));
+    assert(planned.skipped.some(item => item.reason.includes('subpasta slices/')));
+    assert(planned.skipped.some(item => item.reason.includes('época corrente')));
+    // The ineligible wrappers stay untouched on disk.
+    assert(fs.existsSync(path.join(cwd, '.gsd/milestones/M-20260104000000-two/A.md')));
+    assert(fs.existsSync(path.join(cwd, '.gsd/milestones/M-20260105000000-nested/slices')));
+  } finally { remove(cwd); }
+});
+
+test('wrapper apply is in-place, removes dirs, and never creates archive', () => {
+  const cwd = tmp();
+  try {
+    const original = write(cwd, '.gsd/milestones/M-20260101000000-one/STATE.md', Buffer.from('bom\r\nconteúdo', 'utf8'));
+    write(cwd, '.gsd/milestones/M-20260401000000-current/STATE.md', 'live');
+    const planned = group.plan(cwd);
+    const result = group.apply(cwd, planned);
+    assert.equal(result.written.length, 1);
+    assert(!fs.existsSync(path.dirname(original)));
+    assert(fs.existsSync(path.join(cwd, '.gsd/milestones/2026-Q1.md')));
+    assert(!fs.existsSync(path.join(cwd, '.gsd/archive')));
+    assert(result.counts.dirsAfter < result.counts.dirsBefore);
+    assert(!fs.existsSync(original));
+  } finally { remove(cwd); }
+});
+
+// Reversibility is the core guarantee: the wrapper's original FILENAME is not
+// derivable from the id, so the container has to carry it. It travels in the
+// marker id as `<dirId>~<fileName>`, which is what lets ungroup rebuild
+// `<parent>/<dirId>/<fileName>` instead of guessing a name.
+test('wrapper ungroup restores original filename and bytes exactly', () => {
+  const cwd = tmp();
+  try {
+    const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x41, 0x0d, 0x0a, 0x42]);
+    // A filename that no convention would reproduce from the id alone, so a
+    // restore that merely guessed a canonical name could not pass this.
+    const source = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES-original.md', bytes);
+    // The tasks store needs its own current-epoch occupant for 2026-Q1 to be
+    // sealed there — sealedness is per store. See the eligibility test above.
+    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
+    const plan = group.plan(cwd);
+    const applied = group.apply(cwd, plan);
+    assert.equal(applied.written.length, 1, 'the sealed task wrapper produced a container');
+    assert(!fs.existsSync(source), 'the wrapper file is gone once grouped');
+    assert(!fs.existsSync(path.dirname(source)), 'the wrapper dir is gone once grouped');
+    // The filename survives inside the container, not merely in memory.
+    assert(fs.readFileSync(applied.written[0]).toString('utf8')
+      .includes('T-20260101000000-one~NOTES-original.md'));
+
+    const result = group.ungroup(cwd, applied.written[0]);
+    assert.deepEqual(result.restored, [source]);
+    assert(fs.existsSync(source), 'the original path is rebuilt with its original filename');
+    assert.equal(Buffer.compare(fs.readFileSync(source), bytes), 0);
+    assert(!fs.existsSync(applied.written[0]), 'the container is consumed by ungroup');
+    // The untouched current wrapper is unaffected by the round-trip.
+    assert(fs.existsSync(path.join(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md')));
+  } finally { remove(cwd); }
+});
+
+test('wrapper apply is idempotent after the first plan is consumed', () => {
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/milestones/M-20260101000000-one/PLAN.md', 'one');
+    write(cwd, '.gsd/milestones/M-20260401000000-current/PLAN.md', 'live');
+    const firstPlan = group.plan(cwd);
+    const first = group.apply(cwd, firstPlan);
+    const second = group.apply(cwd, group.plan(cwd));
+    assert.equal(second.written.length, 0);
+    assert.equal(group.plan(cwd).targets.length, 0);
+    assert.equal(Buffer.compare(fs.readFileSync(first.written[0]), fs.readFileSync(first.written[0])), 0);
+  } finally { remove(cwd); }
+});
+
 console.log(`\nforge-epoch-group: ${passed} passed, ${failed} failed`);
 process.exitCode = failed ? 1 : 0;

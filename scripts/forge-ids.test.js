@@ -522,6 +522,79 @@ test('resolveTaskId: sequential with no tasks dir → TASK-001', () => {
   });
 });
 
+// A container hides its member from readdir, but not from sequence allocation.
+test('resolveMilestoneId: grouped M004 remains occupied', () => {
+  const fsLocal = require('fs');
+  const osLocal = require('os');
+  const pathLocal = require('path');
+  const groupLocal = require('./forge-grouped-file.js');
+  const dir = fsLocal.mkdtempSync(pathLocal.join(osLocal.tmpdir(), 'forge-ids-grouped-'));
+  try {
+    const milestones = pathLocal.join(dir, '.gsd', 'milestones');
+    fsLocal.mkdirSync(milestones, { recursive: true });
+    const packed = groupLocal.serializeGroup({ epoch: '2026-Q1', units: [
+      { id: 'M004', content: Buffer.from('legacy milestone\n') },
+    ] });
+    fsLocal.writeFileSync(pathLocal.join(milestones, '2026-Q1.md'), packed.buffer);
+    assertEq(ids.resolveMilestoneId(dir, 'next', 'sequential'), 'M005');
+  } finally { fsLocal.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('listExistingIds: grouped task IDs are additive to loose entries', () => {
+  const fsLocal = require('fs');
+  const osLocal = require('os');
+  const pathLocal = require('path');
+  const groupLocal = require('./forge-grouped-file.js');
+  const dir = fsLocal.mkdtempSync(pathLocal.join(osLocal.tmpdir(), 'forge-ids-task-grouped-'));
+  try {
+    const tasks = pathLocal.join(dir, '.gsd', 'tasks');
+    fsLocal.mkdirSync(tasks, { recursive: true });
+    fsLocal.writeFileSync(pathLocal.join(tasks, '2026-Q1.md'), groupLocal.serializeGroup({
+      epoch: '2026-Q1', units: [{ id: 'TASK-009', content: Buffer.from('task\n') }],
+    }).buffer);
+    assert(ids.listExistingIds(dir, 'task').includes('TASK-009'));
+  } finally { fsLocal.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// Grouped WRAPPER dirs are the shape .gsd/milestones actually holds: the marker
+// id is `dir~filename`, so the number is only occupied if the filename half is
+// stripped. Without this, M004~M004-SUMMARY.md would not collide with M004 and
+// the sequence would hand out a number that is already taken.
+test('listExistingIds: wrapper marker ids contribute the directory id only', () => {
+  const fsLocal = require('fs');
+  const osLocal = require('os');
+  const pathLocal = require('path');
+  const groupLocal = require('./forge-grouped-file.js');
+  const dir = fsLocal.mkdtempSync(pathLocal.join(osLocal.tmpdir(), 'forge-ids-wrapper-'));
+  try {
+    const milestones = pathLocal.join(dir, '.gsd', 'milestones');
+    fsLocal.mkdirSync(milestones, { recursive: true });
+    fsLocal.writeFileSync(pathLocal.join(milestones, '2026-Q1.md'), groupLocal.serializeGroup({
+      epoch: '2026-Q1', units: [{ id: 'M004~M004-SUMMARY.md', content: Buffer.from('summary\n') }],
+    }).buffer);
+    const listed = ids.listExistingIds(dir, 'milestone');
+    assert(listed.includes('M004'), 'the wrapper directory id is what occupies the number');
+    assert(!listed.some(id => id.includes('~')), 'no raw marker id leaks into the id list');
+    assertEq(ids.resolveMilestoneId(dir, 'next', 'sequential'), 'M005');
+  } finally { fsLocal.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// listExistingIds sits on the milestone-CREATION path, so it must degrade to
+// loose ids rather than throw when a container is unreadable or corrupt.
+test('listExistingIds: a corrupt container never throws and keeps loose ids', () => {
+  const fsLocal = require('fs');
+  const osLocal = require('os');
+  const pathLocal = require('path');
+  const dir = fsLocal.mkdtempSync(pathLocal.join(osLocal.tmpdir(), 'forge-ids-corrupt-'));
+  try {
+    const milestones = pathLocal.join(dir, '.gsd', 'milestones');
+    fsLocal.mkdirSync(pathLocal.join(milestones, 'M007-loose'), { recursive: true });
+    fsLocal.writeFileSync(pathLocal.join(milestones, '2026-Q1.md'), 'not a container at all\n');
+    const listed = ids.listExistingIds(dir, 'milestone');
+    assert(listed.includes('M007-loose'), 'loose entries survive an unparseable neighbour');
+  } finally { fsLocal.rmSync(dir, { recursive: true, force: true }); }
+});
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 // timestampOf coverage: compact and dashed forms share the production ID grammar.
 console.log('timestampOf');
