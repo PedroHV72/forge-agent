@@ -11,9 +11,12 @@ const sourceManifest = require('./forge-source-manifest');
 const VERSION = '3.1.4';
 const RUNTIME = 'codex';
 const ORIGIN = '<!-- forge-source:codex -->';
+const TOML_ORIGIN = '# forge-source:codex';
 const REASON = Object.freeze({ unavailable: 'unavailable', user_owned: 'user_owned', invalid_options: 'invalid_options', missing_source: 'missing_source' });
 
 function norm(value) { return String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
+function tomlOrigin(kind) { return `${TOML_ORIGIN}-${kind} version=${VERSION}`; }
+function hasOrigin(value) { return String(value).startsWith(ORIGIN) || String(value).startsWith(TOML_ORIGIN); }
 function exists(file) { try { return fs.existsSync(file); } catch (_) { return false; } }
 function walk(root) {
   if (!exists(root)) return [];
@@ -35,7 +38,9 @@ function roots(options) {
   const repo = path.resolve(options.repo || path.resolve(__dirname, '..'));
   const paths = resolveForgePaths({ cwd: repo, forgeHome: options.forgeHome, codexHome: options.codexHome, env: options.env, userHome: options.userHome, platform: options.platform });
   const projectRoot = path.resolve(options.projectRoot || repo);
-  return { repo, forgeHome: paths.forgeHome, codexHome: paths.runtimeHomes.codex, projectRoot };
+  const codexHome = paths.runtimeHomes.codex;
+  if (/(?:^|[\\/])\.claude(?:[\\/]|$)/i.test(codexHome)) throw Object.assign(new Error('Codex home não pode apontar para o host Claude'), { code: REASON.invalid_options });
+  return { repo, forgeHome: paths.forgeHome, codexHome, projectRoot };
 }
 function manifestFor(root, options) {
   const manifest = options.manifest || JSON.parse(fs.readFileSync(options.manifestFile || path.join(root.repo, 'forge-source-manifest.json'), 'utf8'));
@@ -53,12 +58,16 @@ function render(options = {}) {
   const common = sources.filter((source) => ['agents', 'commands', 'skills', 'dispatch-templates'].includes(source.source_id));
   const agents = sources.find((source) => source.source_id === 'agents');
   const agentFiles = agents ? walk(path.join(root.repo, agents.inputs[0])).filter((file) => file.endsWith('.md')) : [];
-  const instructions = [ORIGIN, `# Forge Agent ${VERSION} — Codex host`, '', 'Estas instruções são geradas a partir das fontes canônicas do Forge.', '', '## Superfícies comuns', ...common.map((source) => `- ${source.source_id}: ${source.capability}`), '', '## Agentes customizados', ...agentFiles.map((file) => `- ${path.basename(file, '.md')}: .codex/agents/${path.basename(file)}`), ''].join('\n');
+  const instructions = [ORIGIN, `# Forge Agent ${VERSION} — Codex host`, '', 'Estas instruções são geradas a partir das fontes canônicas do Forge.', '', '## Superfícies comuns', ...common.map((source) => `- ${source.source_id}: ${source.capability}`), '', '## Agentes customizados', ...agentFiles.map((file) => `- ${path.basename(file, '.md')}: .codex/agents/${path.basename(file, '.md')}.toml`), ''].join('\n');
   add('codex-instructions', 'AGENTS.md', path.join(root.projectRoot, 'AGENTS.md'), instructions, 'instructions');
-  for (const file of agentFiles) add('agents', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'agents', path.basename(file)), `${ORIGIN}\n\n${norm(fs.readFileSync(file, 'utf8'))}`, 'agent');
-  const config = `${ORIGIN}\n# Generated Codex configuration\n[forge]\nversion = "${VERSION}"\nhost_runtime = "codex"\nsource_manifest = "forge-source-manifest.json"\n`;
+  for (const file of agentFiles) {
+    const name = path.basename(file, '.md');
+    const config = [tomlOrigin(`agent-${name}`), `name = "${name}"`, `description = "Forge ${name.replace(/^forge-/, '')} worker"`, 'sandbox = "workspace-write"', 'role = "operator"', 'capability = "common"', 'instructions = """', 'Read AGENTS.md before acting.', 'Preserve .gsd auditability and report verification results.', '"""', ''].join('\n');
+    add('agents', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'agents', `${name}.toml`), config, 'agent');
+  }
+  const config = `${tomlOrigin('config')}\n[forge]\nversion = "${VERSION}"\nhost_runtime = "codex"\nsource_manifest = "forge-source-manifest.json"\n`;
   add('codex-config', 'config.toml', path.join(root.codexHome, 'config.toml'), config, 'config');
-  const capabilities = { version: VERSION, runtime: RUNTIME, generated: true, surfaces: manifest.sources.map((source) => ({ source_id: source.source_id, codex: source.conditional && source.conditional.codex ? source.conditional.codex.status : 'conditional' })) };
+  const capabilities = { version: VERSION, runtime: RUNTIME, generated: true, surfaces: codexSources(manifest).map((source) => ({ source_id: source.source_id, status: source.conditional && source.conditional.codex ? source.conditional.codex.status : 'common' })) };
   add('codex-capabilities', 'forge-codex-capabilities.json', path.join(root.forgeHome, 'adapters', 'codex', 'capabilities.json'), `${JSON.stringify(capabilities, null, 2)}\n`, 'capabilities');
   artifacts.sort((a, b) => a.destination.localeCompare(b.destination));
   return { runtime: RUNTIME, version: VERSION, repo: root.repo, forge_home: root.forgeHome, codex_home: root.codexHome, project_root: root.projectRoot, artifacts };
@@ -68,7 +77,7 @@ function write(options = {}) {
   for (const artifact of report.artifacts) {
     const current = exists(artifact.destination) ? fs.readFileSync(artifact.destination, 'utf8') : null;
     if (current !== null && norm(current) === artifact.content) { preserved.push({ ...artifact, reason: 'already-current' }); continue; }
-    if (current !== null && !String(current).startsWith(ORIGIN)) { preserved.push({ ...artifact, reason: REASON.user_owned }); conflicts.push({ destination: artifact.destination, reason: REASON.user_owned }); continue; }
+    if (current !== null && !hasOrigin(current)) { preserved.push({ ...artifact, reason: REASON.user_owned }); conflicts.push({ destination: artifact.destination, reason: REASON.user_owned }); continue; }
     if (options.dryRun) { written.push({ ...artifact, dry_run: true }); continue; }
     fs.mkdirSync(path.dirname(artifact.destination), { recursive: true }); fs.writeFileSync(artifact.destination, artifact.content, 'utf8'); written.push(artifact);
   }

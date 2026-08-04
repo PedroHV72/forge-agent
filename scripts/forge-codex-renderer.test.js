@@ -5,10 +5,22 @@ const root = path.resolve(__dirname, '..'); const temp = fs.mkdtempSync(path.joi
 try {
   const project = path.join(temp, 'project Ω'); const codex = path.join(temp, 'Codex Home Ω'); const forge = path.join(temp, 'Forge Home Ω'); fs.mkdirSync(project, { recursive: true });
   const report = renderer.render({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge });
-  assert.strictEqual(report.runtime, 'codex'); assert(report.artifacts.some((item) => item.destination.endsWith(path.join('project Ω', 'AGENTS.md')))); assert(report.artifacts.some((item) => item.destination.endsWith(path.join('Codex Home Ω', 'agents', 'forge-executor.md')))); assert(report.artifacts.every((item) => !item.destination.includes('.claude'))); assert(report.artifacts.every((item) => !item.content.includes('\r')));
+  assert.strictEqual(report.runtime, 'codex'); assert(report.artifacts.some((item) => item.destination.endsWith(path.join('project Ω', 'AGENTS.md')))); assert(report.artifacts.some((item) => item.destination.endsWith(path.join('Codex Home Ω', 'agents', 'forge-executor.toml')))); assert(report.artifacts.every((item) => !item.destination.includes('.claude'))); assert(report.artifacts.every((item) => !item.content.includes('\r'))); assert(report.artifacts.every((item) => !/claude/i.test(item.content)));
+  const agent = report.artifacts.find((item) => item.destination.endsWith(path.join('agents', 'forge-executor.toml')));
+  assert.match(agent.content, /^# forge-source:codex-agent-forge-executor version=3\.1\.4/m);
+  assert.match(agent.content, /^name = "forge-executor"$/m);
+  assert.match(agent.content, /^sandbox = "workspace-write"$/m);
+  assert.match(agent.content, /instructions = """[\s\S]+"""/);
+  // Parse the generated TOML subset: every scalar is quoted and the multiline
+  // instruction value is terminated, so Codex receives a valid agent document.
+  const scalarLines = agent.content.split('\n').filter((line) => line && !line.startsWith('#') && !line.startsWith('Read ') && !line.startsWith('Preserve ') && !line.startsWith('instructions =') && line !== '"""');
+  assert(scalarLines.every((line) => /^(name|description|sandbox|role|capability) = "[^"\n]+"$/.test(line)));
   const first = renderer.write({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge }); assert(first.written.length > 0); assert(fs.existsSync(path.join(project, 'AGENTS.md'))); assert(fs.existsSync(path.join(codex, 'config.toml'))); assert(!fs.existsSync(path.join(temp, 'Claude Home Ω')));
+  assert(!fs.readFileSync(path.join(codex, 'config.toml'), 'utf8').startsWith('<!--'));
+  assert.match(fs.readFileSync(path.join(codex, 'config.toml'), 'utf8'), /^# forge-source:codex-config version=3\.1\.4/m);
   const second = renderer.write({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge }); assert.strictEqual(second.written.length, 0); assert(second.preserved.every((item) => item.reason === 'already-current'));
   fs.writeFileSync(path.join(codex, 'config.toml'), 'operator = true\n'); const preserved = renderer.write({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge }); assert(preserved.conflicts.some((item) => item.destination.endsWith(path.join('Codex Home Ω', 'config.toml')))); assert.match(fs.readFileSync(path.join(codex, 'config.toml'), 'utf8'), /operator/);
   const dry = renderer.write({ repo: root, projectRoot: project, codexHome: path.join(temp, 'dry codex'), forgeHome: path.join(temp, 'dry forge'), dryRun: true }); assert.strictEqual(dry.dry_run, true); assert(!fs.existsSync(path.join(temp, 'dry codex')));
+  assert.throws(() => renderer.render({ repo: root, codexHome: path.join(temp, '.claude') }), error => error.code === 'invalid_options' || error.code === 'host-isolation');
   console.log('forge-codex-renderer tests passed');
 } finally { fs.rmSync(temp, { recursive: true, force: true }); }
