@@ -36,6 +36,10 @@ cross-host fallback is attempted. Windows resolution considers `.cmd` and
 as one argv element. Tests can inject a fake executable through
 `{ binaries: { claude: { command, args } } }` without changing `PATH`.
 
+Runtime `minimum_version` values are CLI-version floors, not Forge product
+versions. For example, the current Claude Code floor is `2.0.0`, while the
+Forge package release is `4.2.0`.
+
 Both version and behavior probes return one of four stable statuses:
 
 | Status | Meaning |

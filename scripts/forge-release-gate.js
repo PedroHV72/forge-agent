@@ -8,6 +8,7 @@ const { spawnSync } = require('child_process');
 const generation = require('./forge-generate.js');
 const offline = require('./forge-offline-ci.js');
 const packaging = require('./forge-package.js');
+const capabilities = require('./forge-capabilities.js');
 
 const SCHEMA_VERSION = '1.0.0';
 const ROOT = path.resolve(__dirname, '..');
@@ -83,6 +84,24 @@ function securityAudit(repo) {
   };
 }
 
+function realCapabilitySmoke(repo, options = {}) {
+  const detection = capabilities.detect(repo, {
+    runtime: 'both',
+    timeout: options.capabilityTimeout,
+    binaries: options.binaries,
+    env: options.env,
+  });
+  return {
+    required: true,
+    mode: 'manual-opt-in',
+    executed: true,
+    ok: detection.ok,
+    selected: detection.selected,
+    required_failures: detection.required_failures,
+    probes: detection.probes,
+  };
+}
+
 function summarizeOffline(report) {
   return {
     host: report.host, platform: report.platform, ok: report.ok,
@@ -102,16 +121,20 @@ function buildReport(options = {}, dependencies = {}) {
     ? PLATFORMS.map((platform) => dependencies.regeneration(repo, platform))
     : PLATFORMS.map((platform) => regeneration(repo, platform));
   const security = dependencies.securityAudit ? dependencies.securityAudit(repo) : securityAudit(repo);
+  const realCapability = options.realCapabilitySmoke
+    ? (dependencies.realCapabilitySmoke || realCapabilitySmoke)(repo, options)
+    : { required: false, mode: 'manual-opt-in', executed: false };
   const packageManifest = packaging.build({ repo, platform: 'linux' }).manifest;
   const after = (dependencies.status || status)(repo, dependencies);
   const tree = { clean_before: before.length === 0, clean_after: after.length === 0, stable: JSON.stringify(before) === JSON.stringify(after), before, after };
   const commit = dependencies.commit || git(repo, ['rev-parse', 'HEAD'], dependencies);
-  const ok = matrix.every((cell) => cell.ok) && regenerate.every((item) => item.idempotent) && security.ok && tree.stable && (options.allowDirty || tree.clean_before);
+  const ok = matrix.every((cell) => cell.ok) && regenerate.every((item) => item.idempotent) && security.ok && (!realCapability.required || realCapability.ok) && tree.stable && (options.allowDirty || tree.clean_before);
   return {
     schema_version: SCHEMA_VERSION,
     release: { commit, product_version: packageManifest.product_version, package_sha256: packageManifest.package_sha256 },
     matrix, regeneration: regenerate, security, tree,
     real_provider_smoke: { required: false, mode: 'manual-opt-in', executed: false },
+    real_capability_smoke: realCapability,
     ok,
   };
 }
@@ -130,11 +153,13 @@ function writeReport(file, report, repo = ROOT) {
 }
 
 function parseArgs(argv = process.argv.slice(2)) {
-  const options = { repo: ROOT, report: null, allowDirty: false, json: false };
+  const options = { repo: ROOT, report: null, allowDirty: false, realCapabilitySmoke: false, json: false };
   for (let index = 0; index < argv.length; index++) {
     if (argv[index] === '--repo') options.repo = path.resolve(argv[++index] || '');
     else if (argv[index] === '--report') options.report = path.resolve(argv[++index] || '');
     else if (argv[index] === '--allow-dirty') options.allowDirty = true;
+    else if (argv[index] === '--real-capability-smoke') options.realCapabilitySmoke = true;
+    else if (argv[index] === '--capability-timeout') options.capabilityTimeout = Number(argv[++index] || '');
     else if (argv[index] === '--json') options.json = true;
     else if (argv[index] === '--help' || argv[index] === '-h') options.help = true;
     else throw new Error(`unknown option: ${argv[index]}`);
@@ -145,7 +170,7 @@ function parseArgs(argv = process.argv.slice(2)) {
 function main(argv = process.argv.slice(2), output = process.stdout.write.bind(process.stdout), errorOutput = process.stderr.write.bind(process.stderr)) {
   try {
     const options = parseArgs(argv);
-    if (options.help) { output('Usage: forge-release-gate.js [--repo DIR] [--report OUTSIDE_REPO.json] [--allow-dirty] [--json]\n'); return 0; }
+    if (options.help) { output('Usage: forge-release-gate.js [--repo DIR] [--report OUTSIDE_REPO.json] [--allow-dirty] [--real-capability-smoke] [--capability-timeout MS] [--json]\n'); return 0; }
     const report = buildReport(options);
     if (options.report) writeReport(options.report, report, options.repo);
     if (options.json) output(`${JSON.stringify(report)}\n`);
@@ -158,4 +183,4 @@ function main(argv = process.argv.slice(2), output = process.stdout.write.bind(p
 }
 
 if (require.main === module) process.exitCode = main();
-module.exports = { HOSTS, PLATFORMS, SCHEMA_VERSION, buildReport, git, inside, main, parseArgs, regeneration, securityAudit, status, summarizeOffline, treeDigest, writeReport };
+module.exports = { HOSTS, PLATFORMS, SCHEMA_VERSION, buildReport, git, inside, main, parseArgs, realCapabilitySmoke, regeneration, securityAudit, status, summarizeOffline, treeDigest, writeReport };

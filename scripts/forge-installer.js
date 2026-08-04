@@ -25,6 +25,8 @@ function parseArgs(argv = process.argv.slice(2)) {
     else if (arg === '--update') result.update = true;
     else if (arg === '--dry-run') result.dryRun = true;
     else if (arg === '--no-model-probe') result.noModelProbe = true;
+    else if (arg === '--capability-timeout') result.capabilityTimeout = Number(argv[++i] || '');
+    else if (arg === '--migrate-legacy') result.migrateLegacy = true;
     else if (arg === '--with-app') result.withApp = true;
     else if (arg === '--repo') result.repo = path.resolve(argv[++i] || '');
     else if (arg === '--forge-home') result.forgeHome = path.resolve(argv[++i] || '');
@@ -34,6 +36,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     else if (arg === '--help' || arg === '-h') result.help = true;
     else throw new Error(`opção desconhecida: ${arg}`);
   }
+  if (result.capabilityTimeout !== undefined && (!Number.isFinite(result.capabilityTimeout) || result.capabilityTimeout <= 0)) throw new Error(`capability timeout inválido: ${JSON.stringify(result.capabilityTimeout)}`);
   if (!RUNTIMES.includes(result.runtime)) throw new Error(`runtime inválido: ${JSON.stringify(result.runtime)} (use claude, codex ou both)`);
   return result;
 }
@@ -115,7 +118,7 @@ function projectionComplete(paths, host, projectRoot) {
 }
 
 function capabilityReport(repo, runtime, options) {
-  if (options.skipCapabilityCheck) return null;
+  if (options.skipCapabilityCheck || options.noModelProbe) return null;
   return detectCapabilities(repo, {
     runtime,
     binaries: options.binaries,
@@ -179,14 +182,20 @@ function install(input = {}) {
   if (installComplete && !options.update && !options.dryRun) {
     return { ok: true, changed: false, already_installed: true, runtime, forge_home: paths.forgeHome, selected, backup: null, capabilities, plan: [{ op: 'skip', reason: 'already-installed', destination: paths.forgeHome }] };
   }
-  if (options.update && coreAlready) {
-    backupExisting(coreFiles.map((item) => path.join(paths.forgeHome, item)), backupRoot, plan, options);
+  if (options.update) {
+    if (coreAlready) backupExisting(coreFiles.map((item) => path.join(paths.forgeHome, item)), backupRoot, plan, options);
     for (const host of selected) {
       const home = paths.runtimeHomes[host];
       for (const directory of ['agents', 'commands', 'skills', path.join('templates', 'dispatch')]) {
         backupExisting([path.join(home, directory)], path.join(backupRoot, 'adapters', host), plan, options);
       }
       backupExisting([path.join(home, 'config.toml')], path.join(backupRoot, 'adapters', host), plan, options);
+    }
+    if (selected.includes('claude')) {
+      backupExisting([
+        path.join(paths.claudeHome, 'forge-agent-prefs.jsonc'),
+        path.join(paths.claudeHome, 'forge-agent-prefs.md'),
+      ], path.join(backupRoot, 'legacy', 'claude'), plan, options);
     }
     const projectFiles = [];
     if (selected.includes('claude')) projectFiles.push(path.join(projectRoot, 'CLAUDE.md'));
@@ -227,6 +236,7 @@ function install(input = {}) {
     forgeHome: paths.forgeHome,
     dryRun: options.dryRun,
     update: options.update,
+    migrateLegacy: options.migrateLegacy,
   });
   const existingManifest = readJsonIfPresent(paths.shared.manifest) || {};
   const adapterManifest = { ...(existingManifest.adapters || {}) };
@@ -250,7 +260,9 @@ function install(input = {}) {
   const installedHosts = Object.keys(adapterManifest).sort();
   const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
   writeText(paths.shared.manifest, JSON.stringify(manifest, null, 2) + '\n', plan, options);
-  return { ok: true, changed: plan.some((entry) => entry.op === 'copy' || entry.op === 'write'), dry_run: Boolean(options.dryRun), runtime, selected, forge_home: paths.forgeHome, runtime_homes: Object.fromEntries(selected.map((host) => [host, paths.runtimeHomes[host]])), backup: options.update && coreAlready ? backupRoot : null, capabilities, plan, manifest };
+  const backupPath = path.resolve(backupRoot);
+  const hasBackup = options.update && plan.some((entry) => entry.destination && (path.resolve(entry.destination) === backupPath || path.resolve(entry.destination).startsWith(`${backupPath}${path.sep}`)));
+  return { ok: true, changed: plan.some((entry) => entry.op === 'copy' || entry.op === 'write'), dry_run: Boolean(options.dryRun), runtime, selected, forge_home: paths.forgeHome, runtime_homes: Object.fromEntries(selected.map((host) => [host, paths.runtimeHomes[host]])), backup: hasBackup ? backupRoot : null, capabilities, plan, manifest };
 }
 
 function render(report) {
@@ -263,13 +275,17 @@ function render(report) {
   if (report.dry_run) lines.push(`Dry-run: ${report.plan.length} operation(s), no files written.`);
   else lines.push(`${report.changed ? 'Installed' : 'No changes'}; ${report.plan.length} operation(s).`);
   if (report.backup) lines.push(`Backup: ${report.backup}`);
+  const conflicts = report.manifest && report.manifest.adapters
+    ? Object.values(report.manifest.adapters).reduce((total, adapter) => total + (Array.isArray(adapter.conflicts) ? adapter.conflicts.length : 0), 0)
+    : 0;
+  if (conflicts) lines.push(`Conflicts preserved: ${conflicts}; use --migrate-legacy to replace unmarked legacy projections.`);
   return lines.join('\n') + '\n';
 }
 
 function run(argv = process.argv.slice(2), write = process.stdout.write.bind(process.stdout), errorWrite = process.stderr.write.bind(process.stderr)) {
   let options;
   try { options = parseArgs(argv); } catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 2; }
-  if (options.help) { write('Usage: install.{sh,ps1} --runtime claude|codex|both [--project-root DIR] [--update] [--dry-run] [--no-model-probe]\n'); return 0; }
+  if (options.help) { write('Usage: install.{sh,ps1} --runtime claude|codex|both [--project-root DIR] [--update] [--dry-run] [--no-model-probe] [--capability-timeout MS] [--migrate-legacy]\n'); return 0; }
   try { const report = install(options); if (options.dryRun || report.ok) write(render(report)); return report.ok ? 0 : 1; }
   catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 1; }
 }

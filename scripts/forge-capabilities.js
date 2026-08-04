@@ -21,7 +21,8 @@ const PROBE_STATUSES = Object.freeze(['available', 'missing', 'unsupported', 'in
 const REASON_CODES = Object.freeze(['available', 'missing', 'unsupported', 'inconclusive', 'permission-denied', 'not-selected', 'invalid-output', 'exit-nonzero', 'minimum-version']);
 const RUNTIME_IDS = Object.freeze(['node', 'claude', 'codex']);
 const DEFAULT_RUNTIME_COMMANDS = Object.freeze({ claude: 'claude', codex: 'codex' });
-const DEFAULT_MINIMUMS = Object.freeze({ node: '18.0.0', claude: '3.1.4', codex: '0.1.0' });
+const DEFAULT_MINIMUMS = Object.freeze({ node: '18.0.0', claude: '2.0.0', codex: '0.1.0' });
+const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
 
 // Public API notes for adapter authors:
 // AVAILABILITY is deliberately closed so a typo cannot claim a green host.
@@ -268,7 +269,9 @@ function candidateCommands(command, platform = process.platform, env = process.e
     return candidates;
   }
   const envPath = String((env && env.PATH) || '').split(platform === 'win32' ? ';' : path.delimiter).filter(Boolean);
-  const suffixes = platform === 'win32' ? ['', '.cmd', '.exe', '.bat'] : [''];
+  // Windows npm shims are normally `.cmd`; prefer them over an extensionless
+  // POSIX shell shim that may be earlier on PATH but cannot be spawned natively.
+  const suffixes = platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : [''];
   const candidates = [];
   for (const directory of envPath) for (const suffix of suffixes) candidates.push(path.join(directory, command + suffix));
   return candidates.length ? candidates : [command];
@@ -307,7 +310,7 @@ function invoke(executable, args, options = {}) {
       env: options.env || process.env,
       shell: false,
       encoding: 'utf8',
-      timeout: Number.isFinite(options.timeout) ? options.timeout : 3000,
+      timeout: Number.isFinite(options.timeout) ? options.timeout : DEFAULT_PROBE_TIMEOUT_MS,
       windowsHide: true,
     });
   } catch (error) {
@@ -423,7 +426,7 @@ function run(argv = process.argv.slice(2), write = process.stdout.write.bind(pro
 }
 
 module.exports = {
-  AVAILABILITY, CLASSIFICATIONS, KINDS, PLATFORMS, PROBE_STATUSES, REASON_CODES,
+  AVAILABILITY, CLASSIFICATIONS, KINDS, PLATFORMS, PROBE_STATUSES, REASON_CODES, DEFAULT_PROBE_TIMEOUT_MS,
   RUNTIME_IDS, posixPath, loadCatalog, discover, validateCatalog, audit, matrix,
   renderText, classifySurface, parseArgs, run, semver, compareVersion, resolveExecutable, invoke,
   probeNode, probeCli, detect, detectCapabilities: detect, probeRuntime: detect,

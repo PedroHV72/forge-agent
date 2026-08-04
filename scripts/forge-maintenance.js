@@ -151,6 +151,7 @@ function planUpdate(options = {}) {
     selected,
     installation_source: installation.source,
     legacy_migration: installation.legacy,
+    migrate_legacy: Boolean(options.migrateLegacy),
     preserve: ['forge-agent-prefs.jsonc', 'operator-managed-runtime-config', 'project-.gsd'],
     backup_required: true,
     installer_args: ['--runtime', runtime, '--update'],

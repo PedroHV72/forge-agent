@@ -17,8 +17,10 @@ bash ./install.sh --runtime claude|codex|both [--project-root DIR] [--update] [-
 
 `claude` é o default legado quando `--runtime`/`-Runtime` é omitido. Um valor
 desconhecido falha antes de qualquer escrita. `--no-model-probe` permanece
-aceito por compatibilidade, mas a instalação não faz chamadas de rede ou
-probes de login; `--with-app` é reservado para o app opcional.
+aceito por compatibilidade e desabilita a sonda local de capability do CLI;
+use-o somente quando o operador já confirmou que o runtime está instalado.
+A instalação não faz chamadas de rede ou probes de login; `--with-app` é
+reservado para o app opcional.
 `--project-root`/`-ProjectRoot` define explicitamente onde `CLAUDE.md` e
 `AGENTS.md` serão projetados; sem ele, o diretório de trabalho atual é usado.
 
@@ -42,7 +44,9 @@ selecionado não é criado, lido nem escrito.
 preferências existentes, `.gsd`, hooks e arquivos não gerenciados ficam fora
 do conjunto gerenciado. Uma preferência legada em
 `<claude-home>/forge-agent-prefs.jsonc` é lida como migração não destrutiva
-para Forge home; a origem nunca é removida.
+para Forge home; a origem nunca é removida. Projeções Claude legadas sem
+marcador são preservadas e reportadas como conflitos; `--migrate-legacy`
+habilita a substituição explícita desses arquivos canônicos.
 
 `--dry-run`/`-DryRun` produz o mesmo plano de operações sem criar diretórios,
 copiar arquivos, escrever manifestos ou modificar homes. O manifesto registra

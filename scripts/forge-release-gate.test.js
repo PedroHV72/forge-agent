@@ -23,6 +23,9 @@ try {
   ]);
   assert(!JSON.stringify(clean).includes('must-not-persist'));
   assert.deepStrictEqual(clean.real_provider_smoke, { required: false, mode: 'manual-opt-in', executed: false });
+  const real = gate.buildReport({ repo: path.resolve(__dirname, '..'), realCapabilitySmoke: true }, { runOffline: fakeOffline, regeneration: idempotent, securityAudit: safe, realCapabilitySmoke: () => ({ required: true, mode: 'manual-opt-in', executed: true, ok: true, selected: ['claude', 'codex'], required_failures: [], probes: {} }), status: () => [], commit: 'deadbeef' });
+  assert.strictEqual(real.ok, true);
+  assert.strictEqual(real.real_capability_smoke.executed, true);
 
   const dirty = [' M operator-file'];
   const refused = gate.buildReport({ repo: path.resolve(__dirname, '..') }, { runOffline: fakeOffline, regeneration: idempotent, securityAudit: safe, status: () => dirty, commit: 'deadbeef' });

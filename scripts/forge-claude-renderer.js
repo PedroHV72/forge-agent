@@ -208,7 +208,7 @@ function write(options = {}) {
     const current = exists(destination) ? fs.readFileSync(destination, 'utf8') : null;
     const generated = artifact.content;
     if (current !== null && current === generated) { preserved.push({ ...artifact, reason: 'already-current' }); continue; }
-    if (current !== null && !String(current).startsWith(`${ORIGIN_PREFIX}`)) {
+    if (current !== null && !String(current).startsWith(`${ORIGIN_PREFIX}`) && !(options.update && options.migrateLegacy)) {
       preserved.push({ ...artifact, reason: REASON.USER_OWNED });
       conflicts.push({ destination, source_id: artifact.source_id, reason: REASON.USER_OWNED });
       continue;
@@ -221,7 +221,9 @@ function write(options = {}) {
     }
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.writeFileSync(destination, generated, 'utf8');
-    written.push(artifact);
+    written.push(options.migrateLegacy && current !== null && !String(current).startsWith(`${ORIGIN_PREFIX}`)
+      ? { ...artifact, reason: 'legacy-migrated' }
+      : artifact);
   }
   return { ...report, changed: written.some((item) => !item.dry_run), written, preserved, conflicts, dry_run: Boolean(options.dryRun) };
 }

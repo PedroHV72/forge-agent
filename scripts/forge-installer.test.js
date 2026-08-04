@@ -103,6 +103,24 @@ test('legacy Claude preference migrates without removing source', () => {
   } finally { data.cleanup(); }
 });
 
+test('legacy Claude projections are reported first and migrated only with explicit opt-in', () => {
+  const data = fixture();
+  try {
+    fs.mkdirSync(path.join(data.claudeHome, 'agents'), { recursive: true });
+    const legacyAgent = path.join(data.claudeHome, 'agents', 'forge-executor.md');
+    fs.writeFileSync(legacyAgent, '---\nname: forge-executor\nlegacy: true\n---\n');
+    const preserved = installer.install({ ...data.options, runtime: 'claude', update: true });
+    const preservedManifest = preserved.manifest.adapters.claude;
+    assert(preserved.backup && fs.existsSync(preserved.backup));
+    assert(preservedManifest.conflicts.some((item) => item.destination === legacyAgent));
+    assert.match(fs.readFileSync(legacyAgent, 'utf8'), /legacy: true/);
+    const migrated = installer.install({ ...data.options, runtime: 'claude', update: true, migrateLegacy: true });
+    assert.strictEqual(migrated.manifest.adapters.claude.conflicts.length, 0);
+    assert.match(fs.readFileSync(legacyAgent, 'utf8'), /^<!-- forge-source:agents/m);
+    assert(migrated.backup && fs.existsSync(migrated.backup));
+  } finally { data.cleanup(); }
+});
+
 test('switching from Claude-only to both fills the missing Codex projection', () => {
   const data = fixture();
   try {
@@ -209,6 +227,15 @@ test('selected runtime capability failure is fail-closed before writes', () => {
   try {
     assert.throws(() => installer.install({ ...data.options, skipCapabilityCheck: false, runtime: 'codex', binaries: { codex: path.join(data.root, 'missing-codex') } }), /capability obrigatória/);
     assert.strictEqual(fs.existsSync(data.forgeHome), false);
+  } finally { data.cleanup(); }
+});
+
+test('--no-model-probe bypasses the local capability gate explicitly', () => {
+  const data = fixture();
+  try {
+    const report = installer.install({ ...data.options, skipCapabilityCheck: false, runtime: 'claude', noModelProbe: true, binaries: { claude: path.join(data.root, 'missing-claude') } });
+    assert.strictEqual(report.capabilities, null);
+    assert.strictEqual(report.ok, true);
   } finally { data.cleanup(); }
 });
 

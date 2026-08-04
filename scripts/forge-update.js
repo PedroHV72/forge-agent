@@ -19,6 +19,8 @@ function parseArgs(argv = process.argv.slice(2)) {
     else if (arg === '--dry-run') options.apply = false;
     else if (arg === '--json') options.json = true;
     else if (arg === '--no-model-probe') options.noModelProbe = true;
+    else if (arg === '--capability-timeout') options.capabilityTimeout = Number(argv[++i] || '');
+    else if (arg === '--migrate-legacy') options.migrateLegacy = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`opção desconhecida: ${arg}`);
   }
@@ -42,8 +44,10 @@ function update(input = {}, dependencies = {}) {
     userHome: input.userHome,
     platform: input.platform,
     binaries: input.binaries,
+    capabilityTimeout: input.capabilityTimeout,
     noModelProbe: input.noModelProbe,
     skipCapabilityCheck: input.skipCapabilityCheck,
+    migrateLegacy: input.migrateLegacy,
   });
   return { ...plan, applied: true, changed: installed.changed, backup: installed.backup, installer: installed };
 }
@@ -56,6 +60,11 @@ function render(report) {
     `backup: ${report.backup_required ? 'required-before-write' : 'not-required'}`,
   ];
   if (report.legacy_migration) lines.push(`legacy migration: ${report.legacy_migration.release} (${report.legacy_migration.runtime})`);
+  if (report.installer && report.installer.backup) lines.push(`backup created: ${report.installer.backup}`);
+  const conflicts = report.installer && report.installer.manifest && report.installer.manifest.adapters
+    ? Object.values(report.installer.manifest.adapters).reduce((total, adapter) => total + (Array.isArray(adapter.conflicts) ? adapter.conflicts.length : 0), 0)
+    : 0;
+  if (conflicts) lines.push(`conflicts preserved: ${conflicts}; use --migrate-legacy to replace unmarked legacy projections`);
   if (report.applied) lines.push(report.changed ? 'managed files updated' : 'no managed-file changes');
   else lines.push('no files written; pass --apply to update');
   return `${lines.join('\n')}\n`;
@@ -65,7 +74,7 @@ function run(argv = process.argv.slice(2), write = process.stdout.write.bind(pro
   try {
     const options = parseArgs(argv);
     if (options.help) {
-      write('Usage: forge-update.js [--runtime claude|codex|both] [--apply|--dry-run] [--repo DIR] [--json]\n');
+      write('Usage: forge-update.js [--runtime claude|codex|both] [--apply|--dry-run] [--repo DIR] [--json] [--no-model-probe] [--capability-timeout MS] [--migrate-legacy]\n');
       return 0;
     }
     const report = update(options);

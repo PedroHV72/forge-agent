@@ -14,6 +14,8 @@ param(
   [switch]$DryRun,
   [switch]$NoModelProbe,
   [switch]$WithApp,
+  [switch]$MigrateLegacy,
+  [int]$CapabilityTimeout,
   [string]$ForgeHome,
   [string]$ClaudeHome,
   [string]$CodexHome,
@@ -27,6 +29,8 @@ if ($Update) { $nodeArgs += '--update' }
 if ($DryRun) { $nodeArgs += '--dry-run' }
 if ($NoModelProbe) { $nodeArgs += '--no-model-probe' }
 if ($WithApp) { $nodeArgs += '--with-app' }
+if ($MigrateLegacy) { $nodeArgs += '--migrate-legacy' }
+if ($CapabilityTimeout) { $nodeArgs += @('--capability-timeout', $CapabilityTimeout) }
 if ($ForgeHome) {
   $forgeHomeArg = $ForgeHome
   if (Test-Path -LiteralPath $ForgeHome) { $forgeHomeArg = (Resolve-Path -LiteralPath $ForgeHome).Path }

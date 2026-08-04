@@ -89,8 +89,10 @@ bash ./install.sh --runtime codex --update
 
 Antes de escrever, o updater exige backup dos arquivos gerenciados. Preferências
 em `FORGE_HOME`, configuração do operador, `.gsd` do projeto e fontes legadas
-Fontes legadas Claude 3.1.4 permanecem byte-idênticas; o pacote atual é 4.2.0.
-Para conferir o pacote de release:
+Claude 3.1.4 permanecem byte-idênticas por padrão; a projeção legada sem
+marcadores é reportada como conflito. Para migrá-la explicitamente, use
+`--migrate-legacy`, que cria backup antes de substituir os arquivos canônicos.
+O pacote atual é 4.2.0. Para conferir o pacote de release:
 
 ```powershell
 node scripts/forge-package.js --output '.\forge-release' --json
@@ -104,6 +106,16 @@ node scripts/forge-package.js --verify './forge-release' --json
 
 O pacote contém `core`, `adapter-claude` e `adapter-codex`, com
 `manifest.json` e `CHECKSUMS.sha256`.
+
+Para validar opcionalmente os CLIs instalados no host real, sem invocar
+modelos, acrescente a sonda de capability ao gate:
+
+```text
+node scripts/forge-release-gate.js --real-capability-smoke --json
+```
+
+Essa sonda usa apenas `--version` e `--help`; a matriz offline continua sendo
+o gate obrigatório para ambientes sem os CLIs.
 
 ## Execução: Claude, Codex e handoff
 

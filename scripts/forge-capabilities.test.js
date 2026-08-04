@@ -208,6 +208,17 @@ test('detects a fake CLI with argv and never spawns the non-selected host', () =
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('accepts the current Claude Code CLI namespace independently of the Forge release', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cap-probe-claude-namespace-'));
+  const fake = path.join(root, 'claude.js');
+  fs.writeFileSync(fake, "if (process.argv.includes('--version')) process.stdout.write('2.1.221\\n'); else process.stdout.write('help\\n');");
+  try {
+    const report = api.detect(path.resolve(__dirname, '..'), { runtime: 'claude', binaries: { claude: { command: process.execPath, args: [fake] } } });
+    assert.strictEqual(report.probes.claude.status, 'available');
+    assert.strictEqual(report.probes.claude.version, '2.1.221');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('classifies missing, unsupported, and invalid CLI probes with stable codes', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cap-probe-negative-'));
   const low = path.join(root, 'low.js');
@@ -236,6 +247,18 @@ test('Windows .cmd shims keep argv and Unicode paths without shell fallback', ()
   try {
     const report = api.detect(path.resolve(__dirname, '..'), { runtime: 'claude', binaries: { claude: shim } });
     assert.strictEqual(report.probes.claude.status, 'available');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Windows bare commands prefer native npm shims over extensionless POSIX wrappers', () => {
+  if (process.platform !== 'win32') return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-cap-bare-command-Ω-'));
+  fs.writeFileSync(path.join(root, 'fake'), '#!/bin/sh\necho 0.0.1\n', 'utf8');
+  fs.writeFileSync(path.join(root, 'fake.cmd'), '@echo off\r\nif "%1"=="--version" (echo 2.1.221) else (echo help)\r\n', 'utf8');
+  try {
+    const report = api.detect(path.resolve(__dirname, '..'), { runtime: 'claude', binaries: { claude: 'fake' }, env: { ...process.env, PATH: `${root};${process.env.PATH || ''}` } });
+    assert.strictEqual(report.probes.claude.status, 'available');
+    assert.match(report.probes.claude.executable, /fake\.cmd$/i);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -43,6 +43,7 @@ test('legacy Claude 3.1.4 migration preserves source bytes and reports provenanc
     fs.writeFileSync(legacy, bytes);
     const report = updater.update({ ...data, runtime: 'claude', apply: true, skipCapabilityCheck: true });
     assert.strictEqual(report.legacy_migration.release, '3.1.4-compatible');
+    assert(report.backup && fs.existsSync(report.backup), 'legacy update must create a rollback backup');
     assert.deepStrictEqual(fs.readFileSync(legacy), bytes);
     assert.deepStrictEqual(fs.readFileSync(path.join(data.forgeHome, 'forge-agent-prefs.jsonc')), bytes);
   } finally { data.cleanup(); }

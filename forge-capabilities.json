@@ -18,7 +18,7 @@
     },
     "claude": {
       "required": false,
-      "minimum_version": "3.1.4",
+      "minimum_version": "2.0.0",
       "probe": { "kind": "cli", "command": "claude", "version_args": ["--version"], "behavior_args": ["--help"] },
       "platforms": { "macos": "common", "windows": "common", "linux": "common" }
     },
