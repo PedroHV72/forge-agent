@@ -32,9 +32,10 @@
 //
 // EXIT CONTRACT
 // -------------
-//   0 — the scan completed.  This includes a FAIL or NO-TARGET verdict: a gate
-//       that reports "no targets" has succeeded at its job.  The verdict lives
-//       in the JSON, never in the exit code.
+//   0 — the scan completed.  This includes a FAIL, NO-TARGET or ERROR verdict:
+//       a gate that reports "no targets" — or "I could not read the store" —
+//       has succeeded at its job of reporting.  The verdict lives in the JSON
+//       and in the report text, never in the exit code.
 //   1 — runtime error
 //   2 — invalid arguments
 //
@@ -206,10 +207,18 @@ function scanStore(cwd, opts) {
 
 // ── verdictOf ─────────────────────────────────────────────────────────────────
 // The slice-level rule, fixed by S04-PLAN and not decided here:
+//   store unreadable             → ERROR
 //   any false positive           → FAIL
 //   zero matches                 → NO-TARGET
 //   ≥1 match, zero false pos.    → PASS
+//
+// ERROR exists because a scanner that could not read the store has measured
+// nothing, and "measured nothing" must never be spelled the same way as
+// "measured a clean store".  Consumers of this verdict (the `## Veredicto`
+// block that T02/T03 read at step zero) proceed only on PASS, so a fourth
+// non-PASS value is safe by construction — it stops them, as it must.
 function verdictOf(scan) {
+  if (scan.population && scan.population.store_error) return 'ERROR';
   if (scan.false_positives.length > 0) return 'FAIL';
   if (scan.counts.matched === 0) return 'NO-TARGET';
   return 'PASS';
@@ -223,6 +232,11 @@ function verdictOf(scan) {
 function formatReport(scan) {
   const lines = [];
   lines.push(`store: ${scan.cwd}`);
+  // Printed FIRST and unconditionally when present: the human output of an
+  // unreadable store must not be readable as the output of a clean one.
+  if (scan.population && scan.population.store_error) {
+    lines.push(`store_error: ${scan.population.store_error}`);
+  }
   lines.push(
     `population: ${scan.population.fragments} fragments returned, ` +
     `${scan.population.facts} facts evaluated, ` +
@@ -304,7 +318,8 @@ if (require.main === module) {
       ? JSON.stringify(Object.assign({ verdict: verdictOf(scan) }, scan), null, 2)
       : formatReport(scan);
     process.stdout.write(`${payload}\n`);
-    // FAIL and NO-TARGET are successful gate runs — exit 0 either way.
+    // FAIL, NO-TARGET and ERROR are all successful gate RUNS — exit 0 either
+    // way; the verdict, not the exit code, is what a consumer reads.
     process.exit(0);
   } catch (error) {
     process.stderr.write(`[forge-legacy-residue] error: ${error.message}\n`);

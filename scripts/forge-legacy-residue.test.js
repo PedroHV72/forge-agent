@@ -358,6 +358,23 @@ test('a store with no memory directory reports a zero population, not a clean on
   assertEq(verdictOf(scan), 'NO-TARGET', 'nothing to match');
 });
 
+test('an unreadable store yields ERROR, never NO-TARGET, and says so in the report', () => {
+  // The store exists and is well-formed; the SCAN is what fails.  An invalid
+  // milestone filter makes the real `listFragments` throw, which is the same
+  // code path an unreachable store takes — so this exercises the degradation
+  // end to end rather than hand-building a scan object.
+  const store = mkStore('storeerror', {
+    'M-20260101000000-e.md': fragment('M-20260101000000-e', fact('MEM001', 'a/S01, b/S02')),
+  });
+  const scan = scanStore(store, { memoryOpts: { milestoneId: 'not-a-milestone-id' } });
+  assert(Boolean(scan.population.store_error), 'the failure is recorded on the population');
+  assertEq(scan.population.facts, 0, 'nothing was measured');
+  assertEq(verdictOf(scan), 'ERROR', 'a scanner failure must not be certified as NO-TARGET');
+  const text = formatReport(scan);
+  assert(text.indexOf('store_error:') !== -1, 'the human report names the failure');
+  assert(text.indexOf('verdict: ERROR') !== -1, 'and closes with the non-verdict');
+});
+
 test('formatReport states the population and the verdict', () => {
   const store = mkStore('report', {
     'M-20260101000000-p.md': fragment(
