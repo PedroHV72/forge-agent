@@ -35,6 +35,15 @@ const {
 
 const { writeFragment } = require('./forge-memory.js');
 
+// Derived, never a literal: the fixture must mean "one major AHEAD of this
+// tooling". A hardcoded version stops being ahead the moment CURRENT_SCHEMA is
+// bumped, and the test then silently asserts the wrong scenario — which is
+// exactly how this case rotted when CURRENT_SCHEMA moved to 2.0.0. Same
+// pattern as forge-schema-guard-wiring.test.js.
+const { CURRENT_SCHEMA } = require('./forge-doctor.js');
+const TOOLING_MAJOR = Number(String(CURRENT_SCHEMA).match(/@(\d+)\./)[1]);
+const AHEAD_SCHEMA  = `fragment-store@${TOOLING_MAJOR + 1}.0.0`;
+
 // ── Test runner boilerplate (mirrors forge-verifier.test.js) ───────────────────
 
 let passed = 0;
@@ -453,7 +462,7 @@ test('.gsd/SCHEMA-VERSION ahead of tooling → result.partial true and markdown 
   const root = mkStore(
     [{ unitId: 'T01', text: 'Fixed `scripts/forge-alpha.js` today.', mem_id: 'mem-schema' }],
     ['scripts/forge-alpha.js'],
-    { schemaVersion: 'fragment-store@2.0.0' },
+    { schemaVersion: AHEAD_SCHEMA },
   );
   try {
     const result = buildFileIndex(root, {});

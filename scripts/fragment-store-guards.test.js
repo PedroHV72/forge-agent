@@ -458,6 +458,14 @@ console.log('\nBUG 4 — SessionStart schema-mismatch guard');
 const HOOK = path.resolve(__dirname, 'forge-hook.js');
 const CURRENT_SCHEMA = require('./forge-doctor').CURRENT_SCHEMA;
 
+// Derived, never a literal: the fixture must mean "one major NEWER than this
+// tooling". A hardcoded version stops being newer the moment CURRENT_SCHEMA is
+// bumped, and the test then asserts a MATCH scenario under a MISMATCH name —
+// green but inert. That is what happened when CURRENT_SCHEMA moved to 2.0.0.
+// Same pattern as forge-schema-guard-wiring.test.js.
+const TOOLING_MAJOR = Number(String(CURRENT_SCHEMA).match(/@(\d+)\./)[1]);
+const NEWER_SCHEMA  = `fragment-store@${TOOLING_MAJOR + 1}.0.0`;
+
 function runHook(cwd, source) {
   // Returns { stdout, parsed } — parsed is hookSpecificOutput JSON or null.
   const input = JSON.stringify({ session_id: 'test-sess', cwd, source: source || 'startup' });
@@ -476,7 +484,7 @@ test('warns (additionalContext) when repo schema is NEWER than tooling → /forg
   const tmp = mkTmp();
   try {
     fs.mkdirSync(path.join(tmp, '.gsd'), { recursive: true });
-    fs.writeFileSync(path.join(tmp, '.gsd', 'SCHEMA-VERSION'), 'fragment-store@2.0.0\n', 'utf8');
+    fs.writeFileSync(path.join(tmp, '.gsd', 'SCHEMA-VERSION'), `${NEWER_SCHEMA}\n`, 'utf8');
     const { parsed } = runHook(tmp);
     assert(parsed && parsed.hookSpecificOutput, 'expected hookSpecificOutput JSON');
     assert(parsed.hookSpecificOutput.hookEventName === 'SessionStart', 'wrong hookEventName');
@@ -524,7 +532,7 @@ test('exits 0 (never blocks the session) even on mismatch', () => {
   const tmp = mkTmp();
   try {
     fs.mkdirSync(path.join(tmp, '.gsd'), { recursive: true });
-    fs.writeFileSync(path.join(tmp, '.gsd', 'SCHEMA-VERSION'), 'fragment-store@2.0.0\n', 'utf8');
+    fs.writeFileSync(path.join(tmp, '.gsd', 'SCHEMA-VERSION'), `${NEWER_SCHEMA}\n`, 'utf8');
     let status = 0;
     try { execFileSync(process.execPath, [HOOK, 'session-start'],
       { input: JSON.stringify({ session_id: 's', cwd: tmp, source: 'resume' }), encoding: 'utf8' }); }

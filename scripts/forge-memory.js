@@ -33,7 +33,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { isValid, entityKind } = require('./forge-ids');
 const yamlSafe = require('./forge-yaml-safe');
-const { isGroupedFile, readGroupedUnits, unitTextOf } = require('./forge-grouped-file');
+const { isGroupedFile, readGroupedUnits, readSniffBuffer, publicEntry, unitTextOf } = require('./forge-grouped-file');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -790,8 +790,11 @@ function listFragments(cwd, opts) {
 
   for (const file of files) {
     const filePath = path.join(dir, file.name);
-    const buffer = fs.readFileSync(filePath);
-    if (isGroupedFile(file.name, buffer)) continue;
+    // A failed sniff (null) means "not classified as a container": the entry is
+    // still returned and the read error stays with the consumer, one unit at a
+    // time, as it did before grouping existed. See readSniffBuffer.
+    const buffer = readSniffBuffer(filePath);
+    if (buffer !== null && isGroupedFile(file.name, buffer)) continue;
     const parsed = parseStorageKey(file.name.slice(0, -3));
     if (!parsed) continue;
     looseKeys.add(parsed.storageKey);
@@ -800,8 +803,8 @@ function listFragments(cwd, opts) {
 
   for (const file of files) {
     const filePath = path.join(dir, file.name);
-    const buffer = fs.readFileSync(filePath);
-    if (!isGroupedFile(file.name, buffer)) continue;
+    const buffer = readSniffBuffer(filePath);
+    if (buffer === null || !isGroupedFile(file.name, buffer)) continue;
     const grouped = readGroupedUnits(filePath);
     for (const error of grouped.errors) {
       process.stderr.write(`[forge-memory] warn: container ${file.name} id ${error.id || '<unknown>'}: ${error.reason}\n`);
@@ -938,7 +941,11 @@ function cliMain(argv) {
     // live consumers (skills/forge-auto, forge-next, forge-sweep iterate it).
     // No schema_partial key: the partial signal travels on stderr only,
     // emitted inside listFragments. --query/--select DO carry the fields.
-    const result = listFragments(cwd, { milestoneId });
+    // Projected through publicEntry for the same reason as forge-ledger.js:
+    // rich library entries, frozen CLI row keys, one shared projection. The
+    // removal-based projection matters most here — this store's stable keys
+    // come from parseStorageKey, so a whitelist would drop them.
+    const result = listFragments(cwd, { milestoneId }).map(publicEntry);
     console.log(JSON.stringify(result));
     process.exit(0);
   }

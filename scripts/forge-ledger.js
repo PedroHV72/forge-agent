@@ -29,7 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const { isValid, entityKind } = require('./forge-ids');
 const { parseScalar, serializeScalar, writeAtomic } = require('./forge-yaml-safe');
-const { isGroupedFile, readGroupedUnits, unitTextOf } = require('./forge-grouped-file');
+const { isGroupedFile, readGroupedUnits, readSniffBuffer, publicEntry, unitTextOf } = require('./forge-grouped-file');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -351,16 +351,19 @@ function listFragments(cwd) {
   const fragments = [];
   for (const file of files) {
     const filePath = path.join(dir, file);
-    const buffer = fs.readFileSync(filePath);
-    if (isGroupedFile(file, buffer)) continue;
+    // A failed sniff (null) means "not classified as a container": the entry is
+    // still returned and the read error stays with the consumer, one unit at a
+    // time, as it did before grouping existed. See readSniffBuffer.
+    const buffer = readSniffBuffer(filePath);
+    if (buffer !== null && isGroupedFile(file, buffer)) continue;
     const id = file.slice(0, -3);
     looseIds.add(id);
     fragments.push({ id, path: filePath, grouped: false, epoch: null });
   }
   for (const file of files) {
     const filePath = path.join(dir, file);
-    const buffer = fs.readFileSync(filePath);
-    if (!isGroupedFile(file, buffer)) continue;
+    const buffer = readSniffBuffer(filePath);
+    if (buffer === null || !isGroupedFile(file, buffer)) continue;
     const parsed = readGroupedUnits(filePath);
     for (const error of parsed.errors) {
       process.stderr.write(`[forge-ledger] warn: container ${file} id ${error.id || '<unknown>'}: ${error.reason}\n`);
@@ -426,7 +429,15 @@ function cliMain(argv) {
     // skills/forge-sweep iterate it directly). The partial signal for this
     // command travels on stderr only, emitted by guardReadHere inside
     // listFragments. Object-shaped envelopes (--stale, --query) do get fields.
-    const result = listFragments(cwd);
+    //
+    // Two shapes, on purpose: listFragments() is the LIBRARY API and carries
+    // the grouping fields (grouped/epoch) for internal consumers; this stdout
+    // is a FROZEN EXTERNAL contract parsed by key, so it must not gain keys
+    // when the storage format evolves. publicEntry is the single shared
+    // projection for all three stores — three local omissions would drift, and
+    // that drift is exactly what leaked these fields in the first place.
+    // Guarded by forge-schema-guard-wiring.test.js ("list row keys unchanged").
+    const result = listFragments(cwd).map(publicEntry);
     console.log(JSON.stringify(result));
     process.exit(0);
   }

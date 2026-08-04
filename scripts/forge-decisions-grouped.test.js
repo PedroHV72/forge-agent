@@ -94,7 +94,13 @@ test('loose entries carry null epoch while members carry the container epoch', (
 
 test('readFragment preserves invalid-id behavior', () => {
   const { cwd } = fixture();
-  assert.throws(() => decisions.readFragment(cwd, 'not-an-id'), /Invalid unit ID/);
+  // Matches the production message verbatim (forge-decisions.js fragmentPath),
+  // which names the store and PREDATES this milestone — `git show
+  // 78bf210:scripts/forge-decisions.js` already carries it. The original regex
+  // was written against an imagined message and never matched. This test is a
+  // regression guard for the error surface users already see, so it is pointed
+  // at the real contract, not loosened: the store name is now required.
+  assert.throws(() => decisions.readFragment(cwd, 'not-an-id'), /Invalid decisions unit ID/);
 });
 
 test('member text is not the container frontmatter', () => {

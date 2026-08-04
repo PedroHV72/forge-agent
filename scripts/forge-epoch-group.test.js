@@ -141,7 +141,28 @@ test('unresolved, grouped, delimiter, and legacy-orphan units are enumerated as 
     write(cwd, '.gsd/ledger/plain.md', 'no date or id\n');
     write(cwd, '.gsd/ledger/M-20260101000000-delimiter.md', ledger('M-20260101000000-delimiter', '2026-01-01', '<!-- forge: unsafe -->'));
     write(cwd, '.gsd/memory/legacy-orphan.md', '<!-- gsd-auto-memory mem_id:MEM001 -->\n');
-    const planned = group.plan(cwd);
+    // epochOfUnit resolves through three links — id, then dateHint, then the
+    // file's mtime. `plain.md` has neither id nor date, but it was just
+    // written, so link 3 succeeds and it is skipped as 'época corrente'
+    // instead. 'época indeterminada' is only reachable when the stat itself
+    // fails (the path vanishing between listing and stat). Stubbing statSync
+    // for that one path is the deterministic, cross-platform way to reach the
+    // branch this assertion names — mirroring what forge-memory-index.test.js
+    // does with readFileSync. The mtime fallback is part of the format and is
+    // NOT removed to make the assertion pass.
+    const realStatSync = fs.statSync;
+    fs.statSync = function (p, ...rest) {
+      if (typeof p === 'string' && p.replace(/\\/g, '/').endsWith('/.gsd/ledger/plain.md')) {
+        throw new Error('ENOENT: simulated vanished fragment');
+      }
+      return realStatSync.call(fs, p, ...rest);
+    };
+    let planned;
+    try {
+      planned = group.plan(cwd);
+    } finally {
+      fs.statSync = realStatSync;
+    }
     const reasons = planned.skipped.map(item => item.reason).join('\n');
     assert(/época indeterminada/.test(reasons));
     assert(/delimitador no conteúdo/.test(reasons));

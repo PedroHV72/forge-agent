@@ -168,11 +168,54 @@ function unitTextOf(unitBuffer) {
   return buffer ? buffer.toString('utf8') : '';
 }
 
+// Fields the grouping layer adds to a store's listFragments() entries. They are
+// additive on the LIBRARY API and internal to it: a container is an on-disk
+// packing detail, not part of the identity of a unit.
+const INTERNAL_ENTRY_FIELDS = ['grouped', 'epoch'];
+
+// The projection that turns a rich library entry into a frozen CLI row.
+//
+// Two shapes exist on purpose. `listFragments()` is the library API and MAY
+// grow fields as the storage format evolves; `--list` stdout is an EXTERNAL
+// contract that skills and scripts parse by key, so it must not gain keys when
+// the format changes. forge-schema-guard-wiring.test.js asserts exactly that.
+//
+// The projection removes the internal fields rather than whitelisting stable
+// ones because the stable row shape differs per store — ledger `{id,path}`,
+// decisions `{unitId,path}`, memory `{...parseStorageKey(),path}` — and a
+// whitelist would silently drop memory's key columns.
+function publicEntry(entry) {
+  const projected = { ...entry };
+  for (const field of INTERNAL_ENTRY_FIELDS) delete projected[field];
+  return projected;
+}
+
+// Read a fragment purely to SNIFF whether it is a container.
+//
+// Returning null on failure instead of throwing keeps the blast radius of one
+// unreadable file at one file. Enumeration in the stores predates the grouped
+// format and never read content: a broken `.md` surfaced at the consumer, one
+// unit at a time. Letting a sniff error escape would instead collapse the whole
+// store to an empty list — the silently-degrading reader this format exists to
+// prevent. On failure the file is simply not classified as a container and its
+// entry is still returned, so the real read (and the real error) stays with the
+// consumer, exactly where it was before grouping existed.
+function readSniffBuffer(filePath) {
+  try {
+    return fs.readFileSync(filePath);
+  } catch (_) {
+    return null;
+  }
+}
+
 module.exports = {
   GROUP_FORMAT,
+  INTERNAL_ENTRY_FIELDS,
   serializeGroup,
   parseGroup,
   isGroupedFile,
   readGroupedUnits,
+  readSniffBuffer,
+  publicEntry,
   unitTextOf,
 };
