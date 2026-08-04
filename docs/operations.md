@@ -124,6 +124,8 @@ o gate obrigatório para ambientes sem os CLIs.
 - No Codex, abra o mesmo projeto e peça explicitamente para usar `forge-auto`
   ou `forge-task`. O adapter fixa `host_runtime: codex` no snapshot.
 - Use `forge-next` quando quiser exatamente uma unidade e uma pausa auditável.
+  O comando não expõe `--dry-run`; para um ensaio sem risco, use um projeto
+  temporário e remova-o ao final, ou execute o release gate offline.
 
 O host permanece fixo durante uma unidade. Para trocar de host:
 
