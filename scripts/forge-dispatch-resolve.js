@@ -193,7 +193,13 @@ function runtimeFields(opts, dispatchEngine) {
   // sidecar. On a Codex host that would recurse unless the caller declared
   // it, so project that effective worker before asking the canonical runtime
   // validator. The omitted-host Claude path remains byte-compatible.
-  if (text(input.host_runtime).toLowerCase() === 'codex' && dispatchEngine === 'codex') {
+  // A routed Codex member is the legacy default sidecar only when the caller
+  // omitted both worker axes.  Never overwrite an explicit worker target or
+  // mode: the host/worker contract must be able to diagnose a mismatch (or
+  // represent a declared cross-host sidecar) instead of silently rewriting it
+  // from the model family.
+  const workerAxesOmitted = input.worker_engine === undefined && input.worker_mode === undefined;
+  if (workerAxesOmitted && text(input.host_runtime).toLowerCase() === 'codex' && dispatchEngine === 'codex') {
     input.worker_engine = 'codex';
     input.worker_mode = 'sidecar';
   }

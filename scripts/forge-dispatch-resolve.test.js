@@ -423,6 +423,49 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  runCase('explicit worker axes are never rewritten by the routed model family', () => {
+    const f = mkFixture({ prefsJsonc: '{"routing":{"default":{"executor":{"standard":["gpt-5-codex"]}}}}' });
+    const crossHost = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'claude', workerMode: 'sidecar', sidecarDeclared: true,
+    });
+    assertEqual(crossHost.worker_engine, 'claude', 'explicit Claude worker survives Codex routing');
+    assertEqual(crossHost.worker_mode, 'sidecar', 'explicit sidecar mode survives Codex routing');
+    assertEqual(crossHost.resolved_worker_engine, 'claude', 'explicit worker target is resolved without family fallback');
+    assertEqual(crossHost.dispatch_allowed, true, 'declared cross-engine sidecar remains representable');
+
+    const mismatch = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'claude', workerMode: 'native',
+    });
+    assertEqual(mismatch.worker_engine, 'claude', 'native mismatch preserves requested worker');
+    assertEqual(mismatch.dispatch_allowed, false, 'native cross-host mismatch is refused');
+    assertEqual(mismatch.dispatch_reason_code, 'native-engine-host-mismatch', 'native mismatch reason is stable');
+    cleanup(f);
+  });
+
+  runCase('runtime decision is stable for CRLF and Unicode/space paths on each supported platform', () => {
+    const f = mkFixture({});
+    const portableDir = path.join(f.dir, 'unicode espaço – runtime');
+    fs.mkdirSync(portableDir, { recursive: true });
+    const planPath = path.join(portableDir, 'T01 – PLAN.md');
+    fs.writeFileSync(planPath, '---\r\ntier: standard\r\nworker: Codex\r\n---\r\n# task\r\n', 'utf8');
+    const results = ['win32', 'darwin', 'linux'].map((platform) => resolveDispatch({
+      cwd: portableDir,
+      planPath,
+      unitType: 'execute-task',
+      hostRuntime: 'codex',
+      workerEngine: 'native',
+      platform,
+    }));
+    for (const [index, result] of results.entries()) {
+      assertEqual(result.host_runtime, 'codex', `platform ${['win32', 'darwin', 'linux'][index]} keeps host`);
+      assertEqual(result.resolved_worker_engine, 'codex', `platform ${['win32', 'darwin', 'linux'][index]} resolves native`);
+      assertEqual(result.dispatch_allowed, true, `platform ${['win32', 'darwin', 'linux'][index]} allows dispatch`);
+    }
+    assertEqual(JSON.stringify(results[0]), JSON.stringify(results[1]), 'Windows/macOS decisions are identical');
+    assertEqual(JSON.stringify(results[1]), JSON.stringify(results[2]), 'macOS/Linux decisions are identical');
+    cleanup(f);
+  });
+
   runCase('implicit Codex-to-Codex sidecar is refused before dispatch', () => {
     const f = mkFixture({});
     const r = dispatch(f, {

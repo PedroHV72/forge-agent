@@ -936,6 +936,16 @@ are `host_runtime:"claude"`, `worker_engine:"native"`,
 `engine`, `dispatch_engine`, and all existing consumers therefore retain the
 Claude-first behavior observed in 3.1.4.
 
+When a caller supplies either worker axis, that explicit value wins over the
+routed model family. A Codex route may project its legacy sidecar only when
+both worker fields are omitted; it must never rewrite an explicit Claude,
+Codex, or `agy` target. This keeps a host/worker mismatch observable and lets
+the policy layer decide whether a declared sidecar is permitted. The resolver
+uses only Node path/process-neutral operations and accepts paths containing
+spaces, Unicode, and either LF or CRLF. The same contract and reason codes are
+therefore used unchanged by native Windows, macOS, and Linux adapters; no
+shell quoting, PID, or platform-specific fallback participates in resolution.
+
 #### When to apply
 
 Engine Routing runs at the **top** of the Step 4 dispatch for a worker, **before** Tier Resolution (and therefore before Effort Resolution, which depends on `$MODEL_ID`). The ordering is deliberate: when `dispatch_engine == codex` the Claude Tier/Effort Resolution is **skipped entirely** (Codex resolves its own model), and only runs on the Claude path — including the fallback path, where the fallback re-enters Tier/Effort Resolution as a normal Claude dispatch.
