@@ -2,7 +2,7 @@
 // forge-doctor — schema-version + projection-versioned checks for Forge Agent
 //
 // Library exports:
-//   CURRENT_SCHEMA              // string — 'fragment-store@2.0.0'
+//   CURRENT_SCHEMA              // string — 'fragment-store@3.0.0'
 //   checkSchema(cwd)            // (cwd?) → { ok, expected, actual, message }
 //   checkProjectionVersioned(cwd) // (cwd?) → { ok, tracked: string[], skipped?: string, message }
 //   checkPlanRepoDeclared(cwd)  // (cwd?) → { ok, plans: string[], skipped?: string, message }  (advisory)
@@ -31,7 +31,7 @@ const { PROJECTION_IGNORE_PATHS, detectVcs } = require('./forge-ignore');
 const { audit: auditReview } = require('./forge-review-audit');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const CURRENT_SCHEMA = 'fragment-store@2.0.0';
+const CURRENT_SCHEMA = 'fragment-store@3.0.0';
 const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 
 // Single source of truth for the check names this CLI accepts via `--check`.

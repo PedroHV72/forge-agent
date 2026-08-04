@@ -13,6 +13,15 @@ const PAYLOAD_DELIMITER = Buffer.from('<!-- forge:', 'ascii');
 const FRONTMATTER_END = Buffer.from('---\n\n', 'ascii');
 const UNIT_START_RE = /^<!-- forge:unit id=([^\s>]+) bytes=(\d+) -->\n/;
 
+// Container identity, sweep-generation era. The generator zero-pads the
+// counter to 2 digits (sweep-project-01 .. sweep-project-99); growing past
+// 99 digits naturally to 3+ and still matches — \d{2,} is a floor, not a
+// width. The RE is strict (anchored, no trailing content) because the NAME
+// is the discovery signal in the buffer-less branch of isGroupedFile (see
+// below): a loose match there would misclassify an unrelated file as a
+// container.
+const SWEEP_CONTAINER_RE = /^sweep-project-\d{2,}$/;
+
 function asBuffer(value) {
   return Buffer.isBuffer(value) ? value : null;
 }
@@ -42,7 +51,14 @@ function utf8RoundTrips(id) {
   return Buffer.from(id, 'utf8').toString('utf8') === id;
 }
 
-function serializeGroup({ epoch, units } = {}) {
+function serializeGroup({ label, epoch, dateRange, units } = {}) {
+  // `epoch` stays an accepted input alias for `label` — an old caller passing
+  // `{ epoch, units }` must not explode. `label` is the field name going
+  // forward; on disk it is still written under the `grouped_epoch` key,
+  // which is a decided, sanctioned misnomer kept for compatibility.
+  const groupLabel = typeof label === 'string' ? label : (typeof epoch === 'string' ? epoch : '');
+  const from = dateRange && typeof dateRange.from === 'string' ? dateRange.from : '';
+  const to = dateRange && typeof dateRange.to === 'string' ? dateRange.to : '';
   const skipped = [];
   const accepted = [];
 
@@ -68,10 +84,20 @@ function serializeGroup({ epoch, units } = {}) {
   }
 
   accepted.sort((left, right) => left.id.localeCompare(right.id, 'en'));
+  // Order and presence are both part of the contract: grouped_from/
+  // grouped_to are ALWAYS emitted, even empty. An absent field and an empty
+  // field are indistinguishable to a reader, and "absent" invites the
+  // suspicion that the slice forgot the range rather than not having one.
+  // GROUP_FORMAT itself does not change: this frontmatter addition is
+  // additive and the old parser reads the body unchanged. What signals the
+  // break is SCHEMA-VERSION (CURRENT_SCHEMA in forge-doctor.js), not
+  // grouped_format.
   const header = [
     '---',
     `grouped_format: ${GROUP_FORMAT}`,
-    `grouped_epoch: ${typeof epoch === 'string' ? epoch : ''}`,
+    `grouped_epoch: ${groupLabel}`,
+    `grouped_from: ${from}`,
+    `grouped_to: ${to}`,
     `grouped_units: ${accepted.length}`,
     '---',
     '',
@@ -131,8 +157,16 @@ function parseGroup(value) {
   }
 
   const frontmatter = parseFrontmatter(buffer, errors);
+  const label = frontmatter.fields.grouped_epoch || null;
   const result = {
-    epoch: frontmatter.fields.grouped_epoch || null,
+    // `epoch` is kept, same value as `label`, so an existing reader that
+    // still asks for `.epoch` does not break. A container written by PR 1
+    // never had grouped_from/grouped_to at all — absent-or-empty both parse
+    // to null here.
+    epoch: label,
+    label,
+    from: frontmatter.fields.grouped_from || null,
+    to: frontmatter.fields.grouped_to || null,
     format: frontmatter.fields.grouped_format || null,
     units,
     errors,
@@ -181,7 +215,13 @@ function isGroupedFile(nameOrPath, buffer) {
       .split('\n').includes(`grouped_format: ${GROUP_FORMAT}`);
   }
   const name = String(nameOrPath || '').replace(/^.*[\\/]/, '').replace(/\.md$/, '');
-  return EPOCH_LABEL_RE.test(name);
+  // EPOCH_LABEL_RE (2026-Q1-shaped) is legacy, read-only recognition (DS9-1):
+  // no code generates that name anymore, but a container the PR 1 sweep
+  // wrote still exists on disk and must still be found when unreadable —
+  // dropping this half would make every PR-1-era container disappear from
+  // listFragments() the moment it can't be opened, instead of surfacing as
+  // an unreadable-file warning.
+  return SWEEP_CONTAINER_RE.test(name) || EPOCH_LABEL_RE.test(name);
 }
 
 function readGroupedUnits(filePath) {
@@ -235,6 +275,7 @@ function readSniffBuffer(filePath) {
 
 module.exports = {
   GROUP_FORMAT,
+  SWEEP_CONTAINER_RE,
   INTERNAL_ENTRY_FIELDS,
   serializeGroup,
   parseGroup,

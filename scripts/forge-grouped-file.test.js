@@ -7,6 +7,7 @@ const path = require('path');
 
 const {
   GROUP_FORMAT,
+  SWEEP_CONTAINER_RE,
   serializeGroup,
   parseGroup,
   isGroupedFile,
@@ -225,6 +226,134 @@ test('readGroupedUnits reads bytes from disk before parsing', () => {
 
 test('unitTextOf supplies the explicit reader-facing UTF-8 conversion', () => {
   assert.strictEqual(unitTextOf(Buffer.from('reader text')), 'reader text');
+});
+
+// --- S09 T03: sweep-project-NN identity, date range, PR-1 compatibility ---
+
+test('SWEEP_CONTAINER_RE accepts sweep-generation names and rejects near-misses', () => {
+  assert.strictEqual(SWEEP_CONTAINER_RE.test('sweep-project-01'), true);
+  assert.strictEqual(SWEEP_CONTAINER_RE.test('sweep-project-137'), true);
+  assert.strictEqual(SWEEP_CONTAINER_RE.test('sweep-project-1'), false);
+  assert.strictEqual(SWEEP_CONTAINER_RE.test('sweep-project-'), false);
+  assert.strictEqual(SWEEP_CONTAINER_RE.test('sweep-project-abc'), false);
+  assert.strictEqual(SWEEP_CONTAINER_RE.test('2026-Q1'), false);
+});
+
+// W3: the name-based recognition path only matters in the buffer-LESS branch
+// of isGroupedFile — the three readers (forge-ledger.js, forge-decisions.js,
+// forge-memory.js) call it without a buffer exactly when the file is
+// UNREADABLE, to warn instead of silently listing it as a loose fragment.
+// A test that only checks a READABLE container proves nothing about DS9-1,
+// because on that path the content already answers. These two plant a
+// corrupted (unreadable) container of each name shape and assert the
+// buffer-less call still recognizes it as a container by name alone.
+test('W3: an unreadable sweep-project-NN container is still recognized by name (buffer-less)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-grouped-file-w3-'));
+  const filePath = path.join(root, 'sweep-project-01.md');
+  // Deliberately corrupt / unreadable content: not valid frontmatter at all.
+  fs.writeFileSync(filePath, Buffer.from([0x00, 0xff, 0x00, 0xff]));
+  // The reader pattern under test: sniff fails to read cleanly upstream (or
+  // the caller chooses not to pass a buffer at all), so isGroupedFile is
+  // invoked with only the name — exactly the unreadable-file path.
+  assert.strictEqual(isGroupedFile(filePath), true,
+    'a sweep-project-NN file must be recognized by name even when unreadable/corrupted');
+});
+
+test('W3: an unreadable legacy 2026-Q1 container is still recognized by name (buffer-less, DS9-1)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-grouped-file-w3-'));
+  const filePath = path.join(root, '2026-Q1.md');
+  fs.writeFileSync(filePath, Buffer.from([0x00, 0xff, 0x00, 0xff]));
+  assert.strictEqual(isGroupedFile(filePath), true,
+    'a legacy 2026-Q1 file must still be recognized by name even when unreadable/corrupted (DS9-1)');
+});
+
+test('a sweep-project-NN file WITH a buffer but no grouped_format is not a container', () => {
+  const content = Buffer.from('# sweep-project-01.md\n\nnot a container at all\n', 'utf8');
+  assert.strictEqual(isGroupedFile('sweep-project-01.md', content), false);
+});
+
+test('recognizes sweep-generation names alongside legacy epoch names in isGroupedFile', () => {
+  assert.strictEqual(isGroupedFile('sweep-project-01.md'), true);
+  assert.strictEqual(isGroupedFile('sweep-project-137.md'), true);
+  assert.strictEqual(isGroupedFile('sweep-project-1.md'), false);
+  assert.strictEqual(isGroupedFile('sweep-project-abc.md'), false);
+  assert.strictEqual(isGroupedFile('2026-Q1.md'), true);
+  assert.strictEqual(isGroupedFile('M-20260101000000-foo.md'), false);
+});
+
+test('serializeGroup + parseGroup round-trip label/from/to via the label field', () => {
+  const grouped = serializeGroup({
+    label: 'sweep-project-01',
+    dateRange: { from: '2026-07-01', to: '2026-07-15' },
+    units: [unit('a', 'A'), unit('b', 'B')],
+  });
+  const parsed = parseGroup(grouped.buffer);
+  assert.strictEqual(parsed.label, 'sweep-project-01');
+  assert.strictEqual(parsed.epoch, 'sweep-project-01', 'epoch must mirror label for existing readers');
+  assert.strictEqual(parsed.from, '2026-07-01');
+  assert.strictEqual(parsed.to, '2026-07-15');
+});
+
+test('serializeGroup accepts the legacy epoch alias for label', () => {
+  const grouped = serializeGroup({ epoch: '2026-Q1', units: [unit('a', 'A')] });
+  const parsed = parseGroup(grouped.buffer);
+  assert.strictEqual(parsed.label, '2026-Q1');
+  assert.strictEqual(parsed.epoch, '2026-Q1');
+});
+
+test('an unknown date range serializes to empty grouped_from/grouped_to fields, never omitted', () => {
+  const grouped = serializeGroup({ label: 'sweep-project-02', units: [unit('a', 'A')] });
+  const text = grouped.buffer.toString('utf8');
+  assert.ok(text.includes('grouped_from: \n'), 'grouped_from must be present, empty');
+  assert.ok(text.includes('grouped_to: \n'), 'grouped_to must be present, empty');
+  const parsed = parseGroup(grouped.buffer);
+  assert.strictEqual(parsed.from, null);
+  assert.strictEqual(parsed.to, null);
+});
+
+// A container written by the PR 1 sweep never had grouped_from/grouped_to at
+// all. This fixture is a hand-built literal string, not generated by the
+// serializer above — generating it with the new serializer would only prove
+// self-consistency, never compatibility with what actually shipped in PR 1.
+test('parses a byte-literal PR-1-era container without error (grouped_from/grouped_to absent)', () => {
+  const bodyA = Buffer.from('first body', 'utf8');
+  const bodyB = Buffer.from('second body', 'utf8');
+  const header = [
+    '---',
+    'grouped_format: forge-group@1',
+    'grouped_epoch: 2026-Q1',
+    'grouped_units: 2',
+    '---',
+    '',
+    '',
+  ].join('\n');
+  const pieces = [
+    Buffer.from(header, 'utf8'),
+    Buffer.from(`<!-- forge:unit id=a bytes=${bodyA.length} -->\n`, 'utf8'),
+    bodyA,
+    Buffer.from('\n<!-- forge:endunit id=a -->\n', 'utf8'),
+    Buffer.from(`<!-- forge:unit id=b bytes=${bodyB.length} -->\n`, 'utf8'),
+    bodyB,
+    Buffer.from('\n<!-- forge:endunit id=b -->\n', 'utf8'),
+  ];
+  const literalPr1Buffer = Buffer.concat(pieces);
+
+  const parsed = parseGroup(literalPr1Buffer);
+  assert.deepStrictEqual(parsed.errors, []);
+  assert.strictEqual(parsed.units.length, 2);
+  assert.strictEqual(parsed.label, '2026-Q1');
+  assert.strictEqual(parsed.epoch, '2026-Q1');
+  assert.strictEqual(parsed.from, null);
+  assert.strictEqual(parsed.to, null);
+});
+
+test('serializeGroup with a date range stays byte-deterministic across calls', () => {
+  const entries = [unit('b', 'B'), unit('a', 'A')];
+  const one = serializeGroup({ label: 'sweep-project-03', dateRange: { from: '2026-01-01', to: '2026-01-31' }, units: entries });
+  const two = serializeGroup({ label: 'sweep-project-03', dateRange: { from: '2026-01-01', to: '2026-01-31' }, units: [...entries].reverse() });
+  assertBufferEqual(one.buffer, two.buffer);
+  const text = one.buffer.toString('utf8');
+  assert.ok(text.indexOf('id=a') < text.indexOf('id=b'), 'ordering by id is unchanged');
 });
 
 if (failed > 0) {
