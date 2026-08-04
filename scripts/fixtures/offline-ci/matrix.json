@@ -9,6 +9,7 @@
     "forge-headless.test.js",
     "forge-mcp.test.js",
     "forge-installer.test.js",
-    "forge-update.test.js"
+    "forge-update.test.js",
+    "forge-package.test.js"
   ]
 }
