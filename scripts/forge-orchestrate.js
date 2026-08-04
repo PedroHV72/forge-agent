@@ -18,6 +18,7 @@ const REASON_CODES = Object.freeze([
   'initialized', 'already-initialized', 'status-ready', 'selected', 'unit-selected',
   'no-next-unit', 'needs-input', 'needs-input-boundary', 'not-initialized',
   'prefs-invalid', 'lease-active', 'transaction-pending', 'invalid-request', 'failed',
+  'handoff-ready', 'boundary-missing', 'boundary-not-transferable', 'response-invalid',
 ]);
 
 function own(value, key) { return Object.prototype.hasOwnProperty.call(value || {}, key); }
@@ -55,6 +56,10 @@ function stable(value) {
 function checksum(value) { return crypto.createHash('sha256').update(JSON.stringify(stable(value))).digest('hex'); }
 function unit(value) {
   if (!value) return null;
+  if (typeof value === 'string') {
+    const separator = value.indexOf('/');
+    return { type: separator < 0 ? value : value.slice(0, separator), id: separator < 0 ? '' : value.slice(separator + 1), key: value };
+  }
   return { type: value.type, id: value.id, key: value.key || `${value.type}/${value.id}` };
 }
 function base(operation, outcome, reason, input) {
@@ -70,6 +75,30 @@ function publicState(value) {
     auto_mode: value.auto_mode || 'off',
     next_action: value.next_action || '',
   };
+}
+function normalizedResponse(value) {
+  if (typeof value === 'string') {
+    const text = value.replace(/[\u0000\r\n]/g, ' ').trim().slice(0, 1000);
+    if (!text) throw error('response-invalid', 'resposta vazia');
+    return { value: text };
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if (Object.keys(value).some((key) => /transcript|conversation|session|credential|token|password/i.test(key))) throw error('response-invalid', 'resposta contém metadado proibido');
+    const choice = typeof value.choice === 'string' ? value.choice.trim().slice(0, 200) : null;
+    if (choice) return { choice };
+    if (typeof value.value === 'string' || typeof value.value === 'number' || typeof value.value === 'boolean') return { value: value.value };
+  }
+  throw error('response-invalid', 'resposta deve conter choice ou value');
+}
+function durableBoundary(input, boundary) {
+  const durable = forgeController.readJson(forgeController.boundaryFile(input.cwd, boundary.unit));
+  if (!durable) throw error('boundary-missing', `boundary ausente para ${boundary.unit}`);
+  const resumedKey = `forge-orchestrate-resume:${boundary.idempotency_key}:complete`;
+  if (![boundary.idempotency_key, resumedKey].includes(durable.idempotency_key) ||
+      (boundary.milestone && durable.milestone !== boundary.milestone)) {
+    throw error('boundary-not-transferable', 'boundary informado não corresponde ao registro durável');
+  }
+  return durable;
 }
 function init(inputValue) {
   const input = normalizeInput(inputValue);
@@ -123,6 +152,7 @@ function next(inputValue, options) {
     const result = base('next', 'blocked', 'needs-input-boundary', input);
     return result;
   }
+  if (input.response !== undefined && input.boundary) return resumeResponse(input, options);
   if (input.inventory && input.inventory.milestone_complete === true) {
     const result = base('next', 'no_work', 'no-next-unit', input);
     result.state = publicState(forgeState.read(input.cwd, input.milestone));
@@ -151,10 +181,24 @@ function next(inputValue, options) {
     // harmless when no transaction exists and makes crash retry deterministic.
     forgeController.resume(input.cwd, { idempotency_key: key, owner_token: input.owner_token }, txOptions);
     const begun = forgeController.begin(input.cwd, request, txOptions);
+    let paused = null;
+    if (input.needs_input) {
+      const beginRecord = forgeController.readJson(forgeController.transactionFile(input.cwd, key)) || begun.transaction;
+      paused = forgeController.pause(input.cwd, {
+        milestone: input.milestone,
+        unit: selectedUnit,
+        host_runtime: input.host_runtime,
+        owner_token: begun.owner_token || input.owner_token,
+        generation: begun.generation || (beginRecord && beginRecord.lease_generation),
+        idempotency_key: `${key}:needs-input`,
+        result: { status: 'cancelled' },
+      }, txOptions);
+    }
     const result = base('next', input.needs_input ? 'needs_input' : 'completed', input.needs_input ? 'needs-input' : 'unit-selected', input);
     result.unit = selectedUnit;
     result.state = publicState(forgeState.read(input.cwd, input.milestone));
     result.events = [{ event: 'unit-began', action: 'begin', unit: selectedUnit.key, milestone: input.milestone, reason_code: 'selected' }];
+    if (paused && paused.transaction && paused.transaction.boundary) result.boundary = paused.transaction.boundary;
     result.details = { transaction: begun.transaction ? { idempotency_key: begun.transaction.idempotency_key, phase: begun.transaction.phase } : null, selection_reason: selection.reason };
     return result;
   } catch (cause) {
@@ -162,6 +206,79 @@ function next(inputValue, options) {
     const code = cause.code || 'failed';
     const result = base('next', code === 'lease-active' || code === 'transaction-pending' || code === 'prefs-invalid' ? 'blocked' : 'failed', code, input);
     result.unit = selectedUnit;
+    return result;
+  }
+}
+function resumeResponse(input, options) {
+  let response;
+  try { response = normalizedResponse(input.response); } catch (cause) { return base('next', 'blocked', cause.code || 'response-invalid', input); }
+  const boundary = input.boundary;
+  if (!boundary || !boundary.unit || !boundary.idempotency_key) return base('next', 'blocked', 'needs-input-boundary', input);
+  let handoff;
+  try {
+    durableBoundary(input, boundary);
+    handoff = forgeController.handoff(input.cwd, { unit: boundary.unit, next_host_runtime: input.host_runtime }, { prefsReader: input.prefsReader });
+    const beginKey = `forge-orchestrate-resume:${boundary.idempotency_key}`;
+    const completeKey = `${beginKey}:complete`;
+    const txOptions = { ...(options || {}), prefsReader: input.prefsReader };
+    const readTransaction = (key) => forgeController.readJson(forgeController.transactionFile(input.cwd, key));
+    // A retry may observe a committed begin or a partially published complete
+    // transaction. Recover from the durable records before creating anything;
+    // never require a provider session to obtain the old lease generation.
+    let completedRecord = readTransaction(completeKey);
+    if (completedRecord && completedRecord.phase !== 'committed') {
+      forgeController.resume(input.cwd, { idempotency_key: completeKey, owner_token: input.owner_token, generation: completedRecord.lease_generation }, txOptions);
+      completedRecord = readTransaction(completeKey);
+    }
+    if (completedRecord && completedRecord.phase === 'committed') {
+      const result = base('next', 'completed', 'handoff-ready', input);
+      result.unit = unit(boundary.unit);
+      result.events = [{ event: 'unit-resumed', action: 'complete', unit: result.unit.key, milestone: input.milestone, reason_code: 'handoff-ready' }];
+      result.state = publicState(forgeState.read(input.cwd, input.milestone));
+      result.boundary = completedRecord.boundary || null;
+      result.details = { previous_host_runtime: handoff.previous_host_runtime, next_host_runtime: handoff.next_host_runtime };
+      return result;
+    }
+    let beginRecord = readTransaction(beginKey);
+    if (beginRecord && beginRecord.phase !== 'committed') {
+      forgeController.resume(input.cwd, { idempotency_key: beginKey, owner_token: input.owner_token, generation: beginRecord.lease_generation }, txOptions);
+      beginRecord = readTransaction(beginKey);
+    }
+    let begun;
+    if (beginRecord && beginRecord.phase === 'committed') {
+      begun = { transaction: beginRecord, owner_token: input.owner_token, generation: beginRecord.lease_generation };
+    } else {
+      begun = forgeController.begin(input.cwd, { milestone: boundary.milestone || input.milestone, unit: boundary.unit, host_runtime: input.host_runtime, owner_token: input.owner_token, idempotency_key: beginKey }, txOptions);
+    }
+    const completed = forgeController.complete(input.cwd, { milestone: boundary.milestone || input.milestone, unit: boundary.unit, host_runtime: input.host_runtime, owner_token: begun.owner_token || input.owner_token, generation: begun.generation || (begun.transaction && begun.transaction.lease_generation), idempotency_key: completeKey, result: { status: 'succeeded', output: response } }, txOptions);
+    const result = base('next', 'completed', 'handoff-ready', input);
+    result.unit = unit(boundary.unit);
+    result.events = [{ event: 'unit-resumed', action: 'complete', unit: result.unit.key, milestone: input.milestone, reason_code: 'handoff-ready' }];
+    result.state = publicState(forgeState.read(input.cwd, input.milestone));
+    result.boundary = completed.transaction && completed.transaction.boundary ? completed.transaction.boundary : null;
+    result.details = { previous_host_runtime: handoff.previous_host_runtime, next_host_runtime: handoff.next_host_runtime };
+    return result;
+  } catch (cause) {
+    const code = cause.code || 'failed';
+    const result = base('next', ['lease-active', 'transaction-pending'].includes(code) ? 'blocked' : 'failed', code, input);
+    result.unit = unit(boundary.unit);
+    return result;
+  }
+}
+function handoff(inputValue) {
+  const input = normalizeInput(inputValue);
+  if (!input.milestone || !input.boundary || !input.boundary.unit) return base('handoff', 'blocked', 'boundary-missing', input);
+  try {
+    const durable = durableBoundary(input, input.boundary);
+    const ready = forgeController.handoff(input.cwd, { unit: input.boundary.unit, next_host_runtime: input.host_runtime }, { prefsReader: input.prefsReader });
+    const result = base('handoff', 'completed', 'handoff-ready', input);
+    result.unit = unit(input.boundary.unit);
+    result.boundary = { ...durable, ...ready };
+    result.state = publicState(forgeState.read(input.cwd, input.milestone));
+    return result;
+  } catch (cause) {
+    const result = base('handoff', ['lease-active', 'transaction-pending'].includes(cause.code) ? 'blocked' : 'failed', cause.code || 'failed', input);
+    result.unit = unit(input.boundary.unit);
     return result;
   }
 }
@@ -199,4 +316,4 @@ function main(argv = process.argv.slice(2), output = process.stdout.write.bind(p
   }
 }
 if (require.main === module) process.exitCode = main();
-module.exports = { PROTOCOL_VERSION, OPERATIONS, OUTCOMES, REASON_CODES, normalizeInput, normalizeHost, init, status, next, run, parseArgs, main, checksum };
+module.exports = { PROTOCOL_VERSION, OPERATIONS, OUTCOMES, REASON_CODES, normalizeInput, normalizeHost, init, status, next, handoff, run, parseArgs, main, checksum };
