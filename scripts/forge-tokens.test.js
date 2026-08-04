@@ -224,5 +224,47 @@ test('budget 0 yields the empty string, budget 1 yields the ellipsis', () => {
   assert.strictEqual(truncateAtSectionBoundary(content, 1, { source: 'x.md' }), '…');
 });
 
+
+// R2 (review-triage): the greedy section pass must reserve for the marker regime
+// that is actually emitted. Reserving for a long source-bearing marker cost whole
+// sections that fit — and could force the mid-content fallback for nothing.
+test('a long opts.source no longer costs whole sections', () => {
+  const SECTION_LEN = 50;
+  const N = 10;
+  let content = '';
+  for (let i = 0; i < N; i++) {
+    const head = '## S' + i + '\n';
+    content += head + 'x'.repeat(SECTION_LEN - head.length - 1) + '\n';
+  }
+  const BUDGET = 400;
+  const longSource = '.gsd/milestones/M-20260101000000-a-rather-long-milestone-id/slices/S01/' + 'p'.repeat(130) + '.md';
+  assert.ok(longSource.length > 150);
+
+  const countSections = (t) => (t.match(/^## S/gm) || []).length;
+
+  const withSource = truncateAtSectionBoundary(content, BUDGET, { source: longSource });
+  const noSource = truncateAtSectionBoundary(content, BUDGET, {});
+
+  // Invariant: never exceed the budget.
+  assert.ok(withSource.length <= BUDGET, `exceeded budget: ${withSource.length}`);
+
+  // The emitted marker regime is the source-less one here, so the retained
+  // section count must match the no-source call exactly.
+  assert.strictEqual(countSections(withSource), countSections(noSource));
+
+  // Strictly better than reserving for the source-bearing marker (old behaviour).
+  const oldReserve = ('\n\n[...truncated ' + N + ' sections — see ' + longSource + ']').length;
+  let running = 0;
+  let oldKept = 0;
+  for (let i = 0; i < N; i++) {
+    if (running + SECTION_LEN + oldReserve > BUDGET && oldKept > 0) break;
+    running += SECTION_LEN;
+    oldKept++;
+    if (running >= BUDGET) break;
+  }
+  assert.ok(countSections(withSource) > oldKept,
+    `expected more than ${oldKept} retained sections, got ${countSections(withSource)}`);
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

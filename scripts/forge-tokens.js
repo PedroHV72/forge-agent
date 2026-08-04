@@ -117,6 +117,10 @@ function ellipsisFor(budgetChars) {
  *  5. Greedily keep parts from the start while running total + reserve <= budgetChars,
  *     where reserve is the length of the marker actually being emitted (derived from
  *     truncationMarker(), not a fixed guess) — worst case sized for parts.length dropped.
+ *     The marker regime is settled before the reserve is spent: the reserve is always
+ *     the shortest (source-less) marker, so no whole section is ever dropped to pay for
+ *     a pointer that may not be printed. Step 6 upgrades to the source-bearing marker
+ *     when it fits at that content length.
  *  6. Append the truncationMarker() text; if the derived reserve does not fit inside
  *     budgetChars, degrade to the source-less (shorter) marker before ever exceeding it.
  *  7. Fallback (zero boundaries or first section > budget): slice mid-content.
@@ -162,7 +166,16 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
   // Reserve is derived from the marker actually being emitted, worst-cased on
   // parts.length dropped sections (the highest digit count possible), never a
   // fixed guessed constant.
-  const reserve = truncationMarker(parts.length, opts).length;
+  //
+  // The marker REGIME is settled BEFORE the reserve is spent. Reserving for the
+  // source-bearing marker while step 6 may end up emitting the shorter
+  // source-less one made a long opts.source cost whole sections that actually
+  // fit — and could force the mid-content fallback for nothing. So we select
+  // against the shortest (source-less) marker, and step 6 upgrades to the
+  // source-bearing marker only when it still fits at that content length.
+  // Content wins over the pointer, consistent with the pre-existing degradation
+  // order (drop the source pointer before ever slicing retained text).
+  const reserve = truncationMarker(parts.length, {}).length;
   const prefixLen = prefix.length;
   let running = prefixLen;
   let kept = 0;
@@ -189,18 +202,20 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
       return ellipsisFor(budgetChars);
     }
     let keptText = prefix + parts.slice(0, kept).join('');
-    let marker = truncationMarker(droppedCount, opts);
+    // Regime upgrade: the selection above reserved for the source-less marker,
+    // so take the source pointer only when it fits at this content length.
+    let marker = truncationMarker(droppedCount, {});
+    if (opts.source) {
+      const withSource = truncationMarker(droppedCount, opts);
+      if (keptText.length + withSource.length <= budgetChars) {
+        marker = withSource;
+      }
+    }
 
-    // Guard: never let the source pointer push us over budget. Degrade to
-    // the shorter, source-less marker first, then trim keptText if it still
-    // doesn't fit.
+    // Guard: the source-less marker itself can still overflow in degenerate
+    // cases (prefix alone near the budget) — trim keptText rather than exceed.
     if (keptText.length + marker.length > budgetChars) {
-      if (opts.source) {
-        marker = truncationMarker(droppedCount, {});
-      }
-      if (keptText.length + marker.length > budgetChars) {
-        keptText = keptText.slice(0, Math.max(0, budgetChars - marker.length));
-      }
+      keptText = keptText.slice(0, Math.max(0, budgetChars - marker.length));
     }
 
     return clampToBudget(keptText + marker, budgetChars);

@@ -46,11 +46,30 @@ const LEDGER_DIR = '.gsd/ledger';
 //   write → assertWriteHere() at the top of writeFragment
 // Reading `.gsd/SCHEMA-VERSION` or comparing versions anywhere else in this
 // file is forbidden — the guard module is the only source of that logic.
+// Only an ABSENT guard module is swallowed. A guard that exists but throws
+// while initializing — or whose own transitive require fails (the guard pulls
+// forge-migrate, which eagerly pulls projection/migrators/store-state/doctor)
+// — is a real fault and must propagate rather than silently disabling both the
+// read warning and the write refusal.
+//
+// SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
+// only. The seam stays FAIL-OPEN on runtime errors raised by the guard's own
+// checks (see assertWrite in forge-schema-guard.js) — that policy was reviewed
+// and kept as is.
 function schemaGuard() {
   try {
     return require('./forge-schema-guard');
-  } catch (_) {
-    return null;
+  } catch (err) {
+    let absent;
+    try {
+      absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-schema-guard');
+    } catch (_) {
+      // Classifier itself missing (partial install) → keep the historical
+      // fail-open instead of crashing the store.
+      absent = true;
+    }
+    if (absent) return null;
+    throw err;
   }
 }
 

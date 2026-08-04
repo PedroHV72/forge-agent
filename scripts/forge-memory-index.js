@@ -237,6 +237,23 @@ function resolveCitation(citation, cwd, index) {
       return { state: 'UNRESOLVED', reason: 'outside-root' };
     }
 
+    // Lexical containment is not enough: existsSync/statSync FOLLOW symlinks, so
+    // a link inside the repo that points outside would otherwise be stat'd and
+    // resolved. Re-establish containment on the REAL paths.
+    //   • real root vs real candidate — never real-vs-lexical: this repo itself
+    //     runs from a worktree under .forge-worktrees, and comparing a real
+    //     candidate against a lexical root would reject that legitimate layout.
+    //   • realpathSync throws ENOENT for a path that does not exist; a missing
+    //     citation must keep falling through to its 'not-found' reason, so a
+    //     failed realpath is simply "nothing to check here", never a rejection.
+    let realRoot = root;
+    try { realRoot = fs.realpathSync(root); } catch (_) { realRoot = root; }
+    let realCandidate = null;
+    try { realCandidate = fs.realpathSync(resolved); } catch (_) { realCandidate = null; }
+    if (realCandidate !== null && !isWithin(realRoot, realCandidate)) {
+      return { state: 'UNRESOLVED', reason: 'outside-root' };
+    }
+
     // Exact match against the disk (relative to root).
     const relNormalized = path.relative(root, resolved).split(path.sep).join('/');
     let existsExact = false;

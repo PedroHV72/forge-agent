@@ -697,6 +697,73 @@ test('R6: pipe-bearing raw citation and mem_id keep the coverage table at 4 colu
   }
 });
 
+// ── Section 7: real-path containment (review-triage R1) ───────────────────────
+// Lexical containment is not enough: existsSync/statSync FOLLOW symlinks, so a
+// link inside the repo pointing outside would get stat'd and resolved.
+console.log('\nSection 7: real-path containment against symlink escape\n');
+
+test('a symlink escaping the root is classified outside-root, not resolved', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mi-realpath-root-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mi-realpath-out-'));
+  try {
+    const secret = path.join(outside, 'secret.md');
+    fs.writeFileSync(secret, '# outside the root\n', 'utf8');
+    const link = path.join(root, 'secret.md');
+    try {
+      fs.symlinkSync(secret, link, 'file');
+    } catch (e) {
+      // symlinkSync returns EPERM on Windows without the privilege. Skip LOUDLY —
+      // a silently skipped test is the failure class this milestone fights.
+      console.log(`      ⚠ SKIPPED: cannot create a symlink here (${e.code || e.message}) — real-symlink escape not exercised on this machine`);
+      return;
+    }
+
+    // Sanity: the link really does resolve outside, so the test has teeth.
+    assert(fs.existsSync(link), 'fixture symlink should be followable');
+
+    const res = resolveCitation({ path: 'secret.md', raw: 'secret.md', pattern: 'path' }, root, null);
+    assertEq(res.state, 'UNRESOLVED', 'a symlink escaping the root must not resolve');
+    assertEq(res.reason, 'outside-root', 'escape must be reported as outside-root');
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
+
+test('a symlink pointing INSIDE the root still resolves (linked layouts must not break)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mi-realpath-in-'));
+  try {
+    const real = path.join(root, 'lib', 'real.js');
+    fs.mkdirSync(path.dirname(real), { recursive: true });
+    fs.writeFileSync(real, '// real\n', 'utf8');
+    const link = path.join(root, 'alias.js');
+    try {
+      fs.symlinkSync(real, link, 'file');
+    } catch (e) {
+      console.log(`      ⚠ SKIPPED: cannot create a symlink here (${e.code || e.message}) — inside-root link not exercised on this machine`);
+      return;
+    }
+    const res = resolveCitation({ path: 'alias.js', raw: 'alias.js', pattern: 'path' }, root, null);
+    assertEq(res.state, 'RESOLVED', 'an inside-root symlink must still resolve');
+    assertEq(res.file, 'alias.js', 'resolution reports the cited path, not the link target');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('a nonexistent citation is still not-found, never a realpath ENOENT throw', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-mi-realpath-enoent-'));
+  try {
+    for (const p of ['scripts/nao-existe.js', 'a/b/c/deep/missing.md', 'missing.md']) {
+      const res = resolveCitation({ path: p, raw: p, pattern: 'path' }, root, null);
+      assertEq(res.state, 'UNRESOLVED', `${p} should stay unresolved`);
+      assertEq(res.reason, 'not-found', `${p} should keep its not-found reason`);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
 // ── Summary ────────────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

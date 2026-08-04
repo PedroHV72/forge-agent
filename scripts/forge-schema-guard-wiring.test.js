@@ -458,6 +458,80 @@ test('[dedupe] guard helper exposes the wiring entry points', () => {
   assert(typeof guard.formatSchemaWarning === 'function', 'formatSchemaWarning (T03) must still be exported');
 });
 
+// ── Section 7: the guard loader only swallows an ABSENT guard ─────────────────
+// R1 (review-triage): `catch (_) { return null }` could not tell "guard not
+// colocated in this install layout" (legitimate fail-open) from "guard exists
+// but threw while initializing" (a real fault that silently disables BOTH the
+// read warning and the write refusal). The guard requires forge-migrate, which
+// eagerly pulls projection/migrators/store-state/doctor — a broken transitive
+// dependency is a realistic case and must NOT look like an absent guard.
+//
+// Scope note: this covers the CATCH only. The seam stays fail-open on runtime
+// errors from checkSchemaDirection — that policy was reviewed and kept.
+
+console.log('\n=== Section 7: guard load errors propagate unless the guard is absent ===\n');
+
+// Runs `body` in a child process with `require('./forge-schema-guard')`
+// intercepted to throw `errExpr`. Returns the spawn result.
+function withGuardLoadError(errExpr, body) {
+  const src = `
+    const Module = require('module');
+    const orig = Module._load;
+    Module._load = function (request, parent, isMain) {
+      if (request === './forge-schema-guard') { throw (${errExpr}); }
+      return orig.apply(this, arguments);
+    };
+    ${body}
+  `;
+  return spawnSync(process.execPath, ['-e', src], { encoding: 'utf8', cwd: ROOT });
+}
+
+const MODULE_NOT_FOUND_SELF = `(() => { const e = new Error("Cannot find module './forge-schema-guard'"); e.code = 'MODULE_NOT_FOUND'; return e; })()`;
+const MODULE_NOT_FOUND_OTHER = `(() => { const e = new Error("Cannot find module './forge-migrate'"); e.code = 'MODULE_NOT_FOUND'; return e; })()`;
+const INIT_THROW = `new TypeError('guard blew up at init')`;
+
+const LOADER_SITES = [
+  ['ledger', LEDGER_CLI, `require(${JSON.stringify(LEDGER_CLI)}).listFragments(${JSON.stringify(AHEAD)});`],
+  ['decisions', DECISIONS_CLI, `require(${JSON.stringify(DECISIONS_CLI)}).listFragments(${JSON.stringify(AHEAD)});`],
+  ['memory', MEMORY_CLI, `require(${JSON.stringify(MEMORY_CLI)}).listFragments(${JSON.stringify(AHEAD)});`],
+  ['projection', PROJECTION_CLI, `require(${JSON.stringify(PROJECTION_CLI)}).isStale(${JSON.stringify(AHEAD)});`],
+];
+
+for (const [label, , call] of LOADER_SITES) {
+  test(`[${label}] a non-MODULE_NOT_FOUND load failure propagates`, () => {
+    const r = withGuardLoadError(INIT_THROW, call);
+    assert(r.status !== 0, `a guard that throws at init must not be swallowed (exit ${r.status})`);
+    assert(/guard blew up at init/.test(String(r.stderr)), `expected the original error on stderr, got: ${r.stderr}`);
+  });
+
+  test(`[${label}] MODULE_NOT_FOUND naming a DIFFERENT module propagates`, () => {
+    const r = withGuardLoadError(MODULE_NOT_FOUND_OTHER, call);
+    assert(r.status !== 0, `a broken transitive dependency must not be swallowed (exit ${r.status})`);
+    assert(/forge-migrate/.test(String(r.stderr)), `expected the transitive module name on stderr, got: ${r.stderr}`);
+  });
+
+  test(`[${label}] MODULE_NOT_FOUND naming the guard itself still fails open`, () => {
+    const r = withGuardLoadError(MODULE_NOT_FOUND_SELF, call + ' process.stdout.write("ok");');
+    assert(r.status === 0, `an absent guard must stay fail-open; exit ${r.status}: ${r.stderr}`);
+    assert(r.stdout.includes('ok'), 'the store call should complete normally');
+    assert(!hasWarning(r.stderr), 'no guard → no warning');
+  });
+}
+
+test('[classifier] isAbsentModuleError distinguishes absent from broken', () => {
+  const { isAbsentModuleError, missingModuleId } = require('./forge-optional-require.js');
+  const absent = new Error("Cannot find module './forge-schema-guard'");
+  absent.code = 'MODULE_NOT_FOUND';
+  const other = new Error("Cannot find module './forge-migrate'");
+  other.code = 'MODULE_NOT_FOUND';
+  assert(isAbsentModuleError(absent, './forge-schema-guard'), 'absent guard must classify as absent');
+  assert(isAbsentModuleError(absent, 'forge-schema-guard.js'), 'id normalization: ./ and .js are noise');
+  assert(!isAbsentModuleError(other, './forge-schema-guard'), 'a different module is a broken dependency');
+  assert(!isAbsentModuleError(new TypeError('boom'), './forge-schema-guard'), 'init errors are never absence');
+  assertEq(missingModuleId(other), './forge-migrate', 'missingModuleId reports the unfindable id');
+  assertEq(missingModuleId(new TypeError('boom')), null, 'non-resolution errors have no missing id');
+});
+
 // ── Cleanup and summary ───────────────────────────────────────────────────────
 try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch (_) {}
 
