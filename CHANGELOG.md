@@ -1,3 +1,37 @@
+## [Unreleased]
+
+### Added
+
+- **Truncation that talks.** Both dispatch truncators — `truncateChars`/`boundStandards`/
+  `truncateContext` in `scripts/forge-prompt.js` (the Claude worker render) and
+  `truncateAtSectionBoundary` in `scripts/forge-tokens.js` (the sidecar/CLI path) — now
+  emit a marker naming what was cut and where to read the rest (`.gsd/CODING-STANDARDS.md
+  § <section>`, `.gsd/memory/`), instead of a mute `…`. The marker is charged against the
+  same budget it protects: the reserve is derived from the worst-case digit count, not a
+  fixed constant, so it can never itself overflow `maxChars`/`budgetChars`. Additive —
+  byte-identical when no `source` is passed.
+- **`scripts/forge-schema-guard.js`**, a directional schema guard: compares only the
+  major of `.gsd/SCHEMA-VERSION` against the schema the tooling understands. Fail-open on
+  read (absence, unreadable stamp, or major ≤ understood all pass clean, with a loud
+  warning plus a `partial` result when the data is ahead); refuses the write outright
+  (non-zero exit) when the data's major is ahead of the tooling's. Wired into the four
+  fragment-store readers — `forge-projection.js`, `forge-ledger.js`, `forge-decisions.js`,
+  `forge-memory.js` — at every read and write entry point, so stale tooling can no longer
+  silently clobber a store written by newer code.
+- **`scripts/forge-memory-index.js`**, a source-file → facts index derived from
+  `.gsd/memory/*.md`. Generated on demand (`--write`), never injected into any
+  prompt/template/budget. Every render carries an unconditional "Cobertura e descarte"
+  section enumerating which file citations resolved, which didn't and why
+  (`not-found`/`ambiguous-basename`/`outside-root`/`dynamic`), and which facts carried no
+  citation at all — a coverage gate that can't silently under-report.
+
+### Fixed
+
+- `shared/forge-dispatch.md § Budgeted Section Injection` previously described only one
+  of the two real truncators; now documents both, each with its own explicit degradation
+  ladder (the two builders intentionally degrade differently — the shared prose that used
+  to cover both was actually wrong for one of them).
+
 ## v4.1.0 — What a project is, and what the screen may claim about it
 
 Two things landed here and they are the same thing seen from two ends. The milestone
