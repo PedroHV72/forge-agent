@@ -1,0 +1,39 @@
+{
+  "vectors": [
+    {
+      "id": "state-phase",
+      "left": { "state": { "phase": "execute-task" } },
+      "right": { "state": { "phase": "complete-slice" } },
+      "equal": false,
+      "path": "$.state.phase"
+    },
+    {
+      "id": "event-order",
+      "left": { "events": [{ "event": "unit-began" }, { "event": "unit-completed" }] },
+      "right": { "events": [{ "event": "unit-completed" }, { "event": "unit-began" }] },
+      "equal": false,
+      "path": "$.events[0].event"
+    },
+    {
+      "id": "unit-selection",
+      "left": { "unit": "execute-task/T01" },
+      "right": { "unit": "execute-task/T02" },
+      "equal": false,
+      "path": "$.unit"
+    },
+    {
+      "id": "boundary-kind",
+      "left": { "boundary": { "kind": "paused", "handoff_ready": true } },
+      "right": { "boundary": { "kind": "completed", "handoff_ready": true } },
+      "equal": false,
+      "path": "$.boundary.kind"
+    },
+    {
+      "id": "unknown-field",
+      "left": { "state": { "custom": "a" } },
+      "right": { "state": { "custom": "b" } },
+      "equal": false,
+      "path": "$.state.custom"
+    }
+  ]
+}
