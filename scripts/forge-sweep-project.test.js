@@ -366,6 +366,123 @@ if (gitAvailable()) {
   skip('casos de journal com repositório Git real (B2/DS8-3/R3)');
 }
 
+// ── T05: --undo CLI + demo ponta-a-ponta do ROADMAP ─────────────────────────
+
+// The demo compares the fragment STORES, not the journal itself (the journal
+// is new operational data this milestone introduced) — walk only the store
+// roots forge-epoch-group knows about, mirroring must-have #1's wording.
+function storeTreeSnapshot(cwd) {
+  const roots = ['ledger', 'decisions', 'memory', 'milestones', 'tasks'];
+  const rows = [];
+  for (const root of roots) {
+    const dir = path.join(cwd, '.gsd', root);
+    if (!fs.existsSync(dir)) continue;
+    for (const row of treeSnapshot(dir)) rows.push({ relative: `${root}/${row.relative}`, kind: row.kind, bytes: row.bytes });
+  }
+  return rows.sort((a, b) => a.relative.localeCompare(b.relative));
+}
+
+if (gitAvailable()) {
+  test('DEMO ROADMAP S08: aplica sem --force num .gsd/ ignorado e --undo produz árvore byte-idêntica', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      const before = storeTreeSnapshot(cwd);
+      const apply = runScript(cwd, ['--apply', '--yes']);
+      assert.strictEqual(apply.status, 0, apply.stderr);
+      assert.doesNotMatch(apply.stdout + apply.stderr, /--force/);
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+
+      const undo = runScript(cwd, ['--undo', '--yes']);
+      assert.strictEqual(undo.status, 0, undo.stderr);
+      const after = storeTreeSnapshot(cwd);
+      assert.deepStrictEqual(after, before, 'árvore dos stores precisa voltar byte-idêntica à pré-aplicação');
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+
+      const entries = readJournalEntries(cwd);
+      assert.deepStrictEqual(entries.map(e => e.phase), ['apply-intent', 'apply-done', 'undo-done']);
+    } finally { cleanup(cwd); }
+  });
+
+  test('--undo tem preview + confirmação: fora de TTY sem --yes não desfaz; --json --undo exige --yes', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      runScript(cwd, ['--apply', '--yes']);
+      const before = fs.readFileSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md'));
+
+      const noTty = runScript(cwd, ['--undo']);
+      assert.strictEqual(noTty.status, 0, noTty.stderr);
+      assert.match(noTty.stdout, /desfazer não confirmado fora de TTY/);
+      assert.deepStrictEqual(fs.readFileSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')), before);
+
+      const jsonNoYes = runScript(cwd, ['--json', '--undo']);
+      assert.strictEqual(jsonNoYes.status, 2);
+      assert.match(jsonNoYes.stderr, /--json --undo exige --yes/);
+
+      const jsonUndo = runScript(cwd, ['--json', '--undo', '--yes']);
+      assert.strictEqual(jsonUndo.status, 0, jsonUndo.stderr);
+      const payload = JSON.parse(jsonUndo.stdout);
+      assert.strictEqual(typeof payload.undo.journalId, 'string');
+      assert(payload.undo.restored.length > 0);
+    } finally { cleanup(cwd); }
+  });
+
+  test('B1: undo parcial é recuperável — loose conflitante nomeado, container sobrevive, retry completa', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      runScript(cwd, ['--apply', '--yes']);
+      const memberPath = path.join(cwd, '.gsd', 'ledger', 'M-20250101000000-alpha.md');
+      fs.writeFileSync(memberPath, 'conflito\n');
+
+      const first = runScript(cwd, ['--undo', '--yes']);
+      assert.strictEqual(first.status, 1);
+      assert.match(first.stdout + first.stderr, /M-20250101000000-alpha\.md/);
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')), 'container precisa sobreviver ao undo parcial');
+
+      fs.unlinkSync(memberPath);
+      const second = runScript(cwd, ['--undo', '--yes']);
+      assert.strictEqual(second.status, 0, second.stderr);
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(fs.existsSync(memberPath));
+    } finally { cleanup(cwd); }
+  });
+
+  test('journal vazio/sem registro desfazível: "nada para desfazer", exit 0', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      const result = runScript(cwd, ['--undo', '--yes']);
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.match(result.stdout, /nada para desfazer/);
+    } finally { cleanup(cwd); }
+  });
+
+  test('após undo bem-sucedido, novo --undo diz "nada para desfazer" (registro anterior não é re-desfazível)', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      runScript(cwd, ['--apply', '--yes']);
+      const undo = runScript(cwd, ['--undo', '--yes']);
+      assert.strictEqual(undo.status, 0, undo.stderr);
+      const again = runScript(cwd, ['--undo', '--yes']);
+      assert.strictEqual(again.status, 0, again.stderr);
+      assert.match(again.stdout, /nada para desfazer/);
+    } finally { cleanup(cwd); }
+  });
+
+  test('--undo é mutuamente exclusivo com --apply e --force (exit 2 com uso)', () => {
+    const cwd = fixtureIgnoredGsd();
+    try {
+      const withApply = runScript(cwd, ['--undo', '--apply']);
+      assert.strictEqual(withApply.status, 2);
+      assert.match(withApply.stderr, /--undo é exclusivo com --apply/);
+      assert.match(withApply.stderr, /Uso:/);
+      const withForce = runScript(cwd, ['--undo', '--force']);
+      assert.strictEqual(withForce.status, 2);
+      assert.match(withForce.stderr, /--undo é exclusivo com --force/);
+    } finally { cleanup(cwd); }
+  });
+} else {
+  skip('casos de --undo com repositório Git real');
+}
+
 test('regressão: sem VCS a recusa não toca o journal (herdada 7 travada)', () => {
   const cwd = fixture(false);
   try {

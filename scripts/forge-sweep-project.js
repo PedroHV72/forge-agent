@@ -14,6 +14,7 @@ const epochGroup = require('./forge-epoch-group');
 const { createRegistry, formatPreview } = require('./forge-sweep-registry');
 const { createEligibility, isVcsQueryFailure } = require('./forge-sweep-eligibility');
 const journal = require('./forge-sweep-journal');
+const { parseGroup } = require('./forge-grouped-file');
 
 const USAGE = [
   'Uso: node scripts/forge-sweep-project.js [opções]',
@@ -21,8 +22,9 @@ const USAGE = [
   'Opções:',
   '  --cwd <dir>  Diretório do projeto (padrão: diretório atual)',
   '  --apply      Aplica o plano depois de confirmação explícita',
-  '  --yes        Confirma a aplicação sem pergunta interativa',
+  '  --yes        Confirma a aplicação/desfazer sem pergunta interativa',
   '  --force      Prossegue sem VCS; não haverá como desfazer',
+  '  --undo       Desfaz o registro mais recente do journal (exclusivo com --apply/--force)',
   '  --json       Emite o relatório no formato JSON',
   '  --help       Mostra esta ajuda',
   '',
@@ -43,7 +45,7 @@ function buildRegistry() {
 }
 
 function parseArgs(argv) {
-  const options = { cwd: process.cwd(), apply: false, yes: false, force: false, json: false, help: false };
+  const options = { cwd: process.cwd(), apply: false, yes: false, force: false, undo: false, json: false, help: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--cwd') {
@@ -54,15 +56,20 @@ function parseArgs(argv) {
     } else if (arg === '--apply') options.apply = true;
     else if (arg === '--yes') options.yes = true;
     else if (arg === '--force') options.force = true;
+    else if (arg === '--undo') options.undo = true;
     else if (arg === '--json') options.json = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`argumento desconhecido: ${arg}`);
   }
-  if (options.yes && !options.apply) throw new Error('--yes exige --apply');
+  // --undo is a distinct mode; it never composes with a plan-apply run.
+  if (options.undo && options.apply) throw new Error('--undo é exclusivo com --apply');
+  if (options.undo && options.force) throw new Error('--undo é exclusivo com --force');
+  if (options.yes && !options.apply && !options.undo) throw new Error('--yes exige --apply ou --undo');
   if (options.force && !options.apply) throw new Error('--force exige --apply');
   // An interactive prompt would have to share stdout with the report, breaking
   // the single-JSON-document invariant; require the non-interactive path.
   if (options.json && options.apply && !options.yes) throw new Error('--json --apply exige --yes');
+  if (options.json && options.undo && !options.yes) throw new Error('--json --undo exige --yes');
   return options;
 }
 
@@ -138,7 +145,7 @@ function writeReport(options, result, eligibility, extraLines, journalInfo) {
   for (const line of extraLines) process.stdout.write(`${line}\n`);
 }
 
-function askForConfirmation() {
+function askForConfirmation(promptText) {
   // readline owns the terminal prompt; its question API is asynchronous, so
   // main's TTY branch first creates a dry preview and asks before its apply run.
   return new Promise(resolve => {
@@ -146,7 +153,7 @@ function askForConfirmation() {
     // EOF closes the interface without ever calling back; refuse rather than
     // leave the promise pending forever.
     terminal.on('close', () => resolve(false));
-    terminal.question('Confirmar aplicação? Digite "sim": ', answer => {
+    terminal.question(promptText || 'Confirmar aplicação? Digite "sim": ', answer => {
       terminal.close();
       resolve(answer.trim().toLowerCase() === 'sim');
     });
@@ -223,6 +230,139 @@ function sha256OfContainers(cwd, containers) {
   return sha256;
 }
 
+// Looks up the operation name recorded on the matching apply-intent line
+// (same id, sibling record). Advisory only — a miss just narrows the
+// preview text, it never blocks the undo.
+function operationNameFor(entries, id) {
+  const intent = entries.find(entry => entry.id === id && entry.phase === 'apply-intent');
+  return (intent && intent.operation) || 'desconhecida';
+}
+
+function resolveUndoContainers(cwd, entry) {
+  const containers = [];
+  for (const rel of entry.containers || []) {
+    const abs = journal._private.safeContainerPath(cwd, rel);
+    // latestUndoable already validated safety+presence for this exact entry;
+    // a miss here would mean the disk changed between the two reads. Skip
+    // rather than throw — the per-container try/catch below is the one
+    // sanctioned isolation boundary (Design).
+    if (abs) containers.push({ rel, abs });
+  }
+  return containers;
+}
+
+function undoPreviewLines(entry, operationName, containers) {
+  const lines = [
+    'Prévia do desfazer',
+    `registro: ${entry.id} (${entry.ts}, operação: ${operationName})`,
+  ];
+  for (const container of containers) {
+    let unitCount = '?';
+    try {
+      const parsed = parseGroup(fs.readFileSync(container.abs));
+      unitCount = String(parsed.units.length);
+    } catch (_) { /* advisory — preview still lists the container */ }
+    lines.push(`  - ${container.rel} (${unitCount} unidades)`);
+  }
+  return lines;
+}
+
+function undoNothingPayload(message) {
+  return { undo: { journalId: null, restored: [], alreadyPresent: [], errors: [] }, messages: [message] };
+}
+
+/**
+ * --undo mode: resolves the latest undoable journal record, previews its
+ * containers, confirms (TTY "sim" / --yes), then restores each container via
+ * epochGroup.ungroup with per-container failure isolation (Design/B1). Never
+ * touches the VCS — restoring is 100% delegated to ungroup.
+ */
+async function runUndo(cwd, options) {
+  const listed = journal.latestUndoable(cwd);
+  if (!listed.ok) {
+    process.stderr.write(`forge-sweep-project: ${listed.error}\n`);
+    return 1;
+  }
+  const entry = listed.entry;
+  if (!entry) {
+    const message = 'nada para desfazer';
+    if (options.json) process.stdout.write(`${JSON.stringify(undoNothingPayload(message), null, 2)}\n`);
+    else process.stdout.write(`${message}\n`);
+    return 0;
+  }
+
+  const allEntries = journal.listEntries(cwd);
+  const operationName = operationNameFor(allEntries.ok ? allEntries.entries : [], entry.id);
+  const containers = resolveUndoContainers(cwd, entry);
+  const previewLines = undoPreviewLines(entry, operationName, containers);
+
+  // --json --undo always carries --yes (parseArgs enforces it), so the
+  // interactive/no-TTY branches below are only reachable in text mode.
+  if (!options.json) for (const line of previewLines) process.stdout.write(`${line}\n`);
+
+  if (!options.yes) {
+    if (!process.stdin.isTTY) {
+      process.stdout.write('desfazer não confirmado fora de TTY; use --yes para confirmar\n');
+      return 0;
+    }
+    const confirmed = await askForConfirmation('Confirmar desfazer? Digite "sim": ');
+    if (!confirmed) {
+      process.stdout.write('desfazer não confirmado\n');
+      return 0;
+    }
+  }
+
+  const restored = [];
+  const alreadyPresent = [];
+  const errors = [];
+  for (const container of containers) {
+    const recordedSha = entry.sha256 && entry.sha256[container.rel];
+    if (recordedSha) {
+      try {
+        const actualSha = crypto.createHash('sha256').update(fs.readFileSync(container.abs)).digest('hex');
+        if (actualSha !== recordedSha) {
+          process.stderr.write(`aviso: sha256 divergente para ${container.rel} (registrado vs disco) — prosseguindo com o parse do container\n`);
+        }
+      } catch (_) { /* advisory — the ungroup below is still the source of truth */ }
+    }
+    try {
+      const result = epochGroup.ungroup(cwd, container.abs);
+      restored.push(...result.restored);
+      alreadyPresent.push(...result.alreadyPresent);
+    } catch (error) {
+      // Isolation by item (Design/B1): one conflicting container never stops
+      // the rest, and it survives on disk (ungroup only unlinks after every
+      // unit in it restores cleanly).
+      errors.push({ container: container.rel, error: error.message });
+    }
+  }
+
+  if (errors.length === 0) {
+    const outcomeResult = journal.appendOutcome(cwd, { id: entry.id, phase: 'undo-done', written: restored });
+    if (!outcomeResult.ok) {
+      process.stderr.write(`aviso: falha ao registrar undo-done no journal: ${outcomeResult.error}\n`);
+    }
+  }
+
+  const payload = {
+    undo: {
+      journalId: entry.id,
+      restored,
+      alreadyPresent,
+      errors: errors.map(item => `${item.container}: ${item.error}`),
+    },
+  };
+
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  } else {
+    for (const path_ of restored) process.stdout.write(`restaurado: ${path_}\n`);
+    process.stdout.write(`desfeito: ${restored.length} restaurado(s), ${alreadyPresent.length} já presente(s)\n`);
+    for (const item of errors) process.stderr.write(`${item.container}: ${item.error}\n`);
+  }
+  return errors.length ? 1 : 0;
+}
+
 async function main(argv) {
   let options;
   try { options = parseArgs(argv); }
@@ -237,6 +377,7 @@ async function main(argv) {
 
   try {
     const cwd = resolveCwd(options.cwd);
+    if (options.undo) return await runUndo(cwd, options);
     const ctx = { cwd };
     // Tool-undo is offered structurally for every target: the CLI's single
     // operation (epoch grouping) is always reversible via ungroup+journal in
