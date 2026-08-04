@@ -1342,6 +1342,69 @@ RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf
 
 After materializing, the orchestrator emits the `dispatch` event (`engine:"codex"`, unit `plan-slice/{S##}`) and control **rejoins the normal `plan-slice` completion path** exactly as if a Claude `forge-planner` had just written the files: the **plan-check gate**, the **symbol-check gate** and the interactive **plan_gate** all run over the materialized files, agnostic of origin (locked — **nothing in those gates changes**). No `T##-SUMMARY`/`---GSD-WORKER-RESULT---` is synthesized here — plan-slice produces plan files, not a task result.
 
+#### Canonical dispatch failure taxonomy (S06/T04)
+
+This table is the single control-flow vocabulary for native and sidecar dispatches. The
+machine-readable mirror is `scripts/fixtures/dispatch-security/failure-taxonomy.json`.
+Older reason strings remain additive as `legacy_reason_code`; they never replace the
+canonical `reason_code`, and an unknown signal fails closed as `error_class: terminal`.
+
+| signal | `reason_code` | `error_class` | same-member retry | next action | reset |
+|--------|---------------|---------------|-------------------|-------------|-------|
+| host unavailable / invalid host | `host-unavailable` | terminal | never | stop → human | none |
+| worker/runtime refusal | `worker-refused` | terminal | never | stop → human | none |
+| malformed or schema-invalid output | `output-invalid` | terminal | never | configured next member | execute only |
+| timeout | `codex-timeout` | terminal | never | configured next member | execute only |
+| orphan / failed tree termination | `codex-orphan` | terminal | never | configured next member | execute only |
+| sandbox or permission denial | `sandbox-permission-denied` | terminal | never | stop → human | none |
+| missing capability | `capability-missing` | terminal | never | stop → human | none |
+| new protected `.gsd/**` delta | `protected-state-path` | terminal | never | stop → human | execute only |
+| pre-dirty overlap | `surgical-reset-overlap` | terminal | never | stop → human | abort, nothing reset |
+| reset/post-run verification failure | `verification-failed` | terminal | never | stop → human | abort |
+| provider rate/network/server/stream failure | `provider-transient` | transient | bounded, same attempt | configured next member after exhaustion | execute only |
+
+Legacy mappings are preserved for diagnosis: `invalid-host-runtime` →
+`host-unavailable`; `sidecar-declaration-required` / `implicit-recursion-refused` /
+`native-engine-host-mismatch` → `worker-refused`; `codex-invalid-json` →
+`output-invalid`; `process-timeout` → `codex-timeout`; `process-termination-failed` →
+`codex-orphan`; `role-permission-denied` / `sandbox-escalation-denied` →
+`sandbox-permission-denied`; `verified-reset-failed` / `reset-unverified` →
+`verification-failed`. Consumers may show both fields but branch only on the canonical one.
+
+**Bounded cursor and attempt identity.** Keep one state snapshot per configured member:
+`{sidecar_attempt, transient_retry_count, current_member, snapshot_id}`. A transient retry
+increments only `transient_retry_count`, allocates a fresh `dispatch_id`, and reuses the
+same `sidecar_attempt`, member, START_SHA/pre-dirty snapshot and state file. Exhaustion or
+a terminal member failure calls `forge-routing.js --next-after "$CURRENT_ID"` exactly once.
+Only the returned configured member may run. The failure handler never manufactures
+`claude`, never changes `host_runtime`, and never reads the other host's home. The returned
+member is passed back through the T01 runtime contract and T02 policy; refusal stops for a
+human instead of silently substituting another host. An empty cursor stops the loop.
+
+`SIDECAR_ATTEMPT` increments only when control enters a configured Codex member. Its hard
+limit is `min(3, count(chain members whose engine is gpt/codex))`; Layer-1 retries do not
+consume this budget. The resolver-supplied category fallback is part of the same deduped
+cursor and may run once. There is no fourth member, recursive Codex host, or second fallback.
+
+**Normalized telemetry.** Emit one `dispatch` event for every actual call and one `retry`
+decision event before every retry. Both preserve `protocol_version`, `dispatch_id`,
+`engine`, `reason_code`, `error_class`, `security_decision`, `attempt`, and a bounded
+`state_snapshot` containing only the counters/current member/snapshot id. A retry event
+references the new call's unique `dispatch_id`; it does not replace that call's event.
+Never emit credentials, environment values, prompt text, transcript/model output, session
+or token secrets, exception bodies, or provider homes. Telemetry append failure is loud.
+
+Offline gate (PowerShell, cmd, macOS and Linux use the same Node entry points):
+
+```text
+node scripts/forge-dispatch-security.test.js
+node scripts/forge-dispatch-resolve.test.js
+node scripts/forge-routing.test.js
+node scripts/forge-xllm.test.js
+```
+
+The paid/real-provider smoke is deliberately outside this mandatory gate.
+
 #### Layer-1 transient retry (sidecar parity with the Claude Retry Handler)
 
 **Purpose:** give the codex sidecar the same transient/permanent distinction the Claude path already gets from § Retry Handler, **before** any Layer-2 chain-walk or `worker-engine-fallback` degradation is considered. This sub-section is the single place that decision lives — Branch C and Branch D both defer to it; neither reimplements it inline.
