@@ -56,9 +56,9 @@ function fixture() {
   run(cwd, ['init', '-q']);
   run(cwd, ['config', 'user.name', 'Forge Test']);
   run(cwd, ['config', 'user.email', 'forge@example.invalid']);
-  for (const name of ['limpo.md', 'sujo.md', 'staged.md']) fs.writeFileSync(path.join(cwd, name), `${name} inicial\n`);
+  for (const name of ['limpo.md', 'sujo.md']) fs.writeFileSync(path.join(cwd, name), `${name} inicial\n`);
   fs.mkdirSync(path.join(cwd, '.gsd', 'forge', 'ledger'), { recursive: true });
-  run(cwd, ['add', 'limpo.md', 'sujo.md', 'staged.md']);
+  run(cwd, ['add', 'limpo.md', 'sujo.md']);
   run(cwd, ['commit', '-qm', 'initial fixture']);
   fs.writeFileSync(path.join(cwd, 'sujo.md'), 'mudança local\n');
   fs.writeFileSync(path.join(cwd, 'novo.md'), 'não rastreado\n');
