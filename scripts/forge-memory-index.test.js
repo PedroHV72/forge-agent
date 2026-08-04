@@ -553,7 +553,7 @@ test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, 
     );
 
     const md = renderIndex(result, {});
-    assert(md.includes('(a) fatos sem menção de arquivo'), 'renderer must label bucket (a) and its reason');
+    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator'), 'renderer must label bucket (a) and its reason');
     assert(md.includes('(b) fatos com forma de arquivo não capturada'), 'renderer must label bucket (b) and its reason');
     assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida'), 'renderer must label bucket (c) and its reason');
     assert(md.includes('`mem-b\\|pipe`'), 'renderer must escape untrusted mem_id in the defect table');
@@ -568,7 +568,7 @@ test('IN-17: empty store still renders all three labelled buckets at zero', () =
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-index-test-'));
   try {
     const md = renderIndex(buildFileIndex(root, {}), {});
-    assert(md.includes('(a) fatos sem menção de arquivo: 0'), 'bucket (a) must render at zero');
+    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator: 0'), 'bucket (a) must render at zero');
     assert(md.includes('(b) fatos com forma de arquivo não capturada: 0'), 'bucket (b) must render at zero');
     assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida: 0'), 'bucket (c) must render at zero');
   } finally {
