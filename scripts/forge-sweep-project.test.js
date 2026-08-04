@@ -12,7 +12,23 @@ const { spawnSync } = require('child_process');
 
 const cliPath = path.join(__dirname, 'forge-sweep-project.js');
 const epochGroup = require('./forge-epoch-group');
+const { serializeGroup } = require('./forge-grouped-file');
 const { buildRegistry } = require('./forge-sweep-project');
+
+// Hand-built legacy container: PR-1 shape, grouped_format present but no
+// grouped_from/grouped_to lines at all — genuinely predates T03's range
+// fields, unlike serializeGroup's output which always emits them (even
+// empty). --list must tell these apart from a range that is merely blank.
+function writeLegacyContainer(cwd, storeDir, label, unitId, payload) {
+  const dir = path.join(cwd, '.gsd', storeDir);
+  fs.mkdirSync(dir, { recursive: true });
+  const body = Buffer.from(payload, 'utf8');
+  const header = ['---', 'grouped_format: forge-group@1', `grouped_epoch: ${label}`, 'grouped_units: 1', '---', '', ''].join('\n');
+  const marker = Buffer.from(`<!-- forge:unit id=${unitId} bytes=${body.length} -->\n`, 'utf8');
+  const endMarker = Buffer.from(`\n<!-- forge:endunit id=${unitId} -->\n`, 'utf8');
+  const buffer = Buffer.concat([Buffer.from(header, 'utf8'), marker, body, endMarker]);
+  fs.writeFileSync(path.join(dir, `${label}.md`), buffer);
+}
 
 let passed = 0;
 let skipped = 0;
@@ -132,7 +148,7 @@ function wrapperBytes(cwd) {
 test('o registro contém apenas a operação número um', () => {
   const operations = buildRegistry().list();
   assert.strictEqual(operations.length, 1);
-  assert.strictEqual(operations[0].name, 'agrupar-epocas-seladas');
+  assert.strictEqual(operations[0].name, 'agrupar-unidades-encerradas');
 });
 
 test('fonte não oferece porta para wrappers além do comentário D11', () => {
@@ -165,6 +181,81 @@ test('--json --apply sem --yes é argumento inválido', () => {
   } finally { cleanup(cwd); }
 });
 
+test('--list é exclusivo com --apply e com --undo', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-list-excl-'));
+  try {
+    const withApply = runScript(cwd, ['--list', '--apply']);
+    assert.strictEqual(withApply.status, 2);
+    assert.match(withApply.stderr, /--list é exclusivo com --apply/);
+    const withUndo = runScript(cwd, ['--list', '--undo']);
+    assert.strictEqual(withUndo.status, 2);
+    assert.match(withUndo.stderr, /--list é exclusivo com --undo/);
+  } finally { cleanup(cwd); }
+});
+
+test('--list sem containers retorna 0 e diz explicitamente que não há nenhum', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-list-empty-'));
+  try {
+    const result = runScript(cwd, ['--list']);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /nenhum container de varredura encontrado/);
+    const json = runScript(cwd, ['--list', '--json']);
+    assert.strictEqual(json.status, 0, json.stderr);
+    assert.deepStrictEqual(JSON.parse(json.stdout), { containers: [] });
+  } finally { cleanup(cwd); }
+});
+
+test('--list mostra a faixa de um container de varredura e "faixa não registrada" para um legado, sem tocar a árvore nem exigir VCS', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-list-'));
+  try {
+    const ledgerDir = path.join(cwd, '.gsd', 'ledger');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+    const serialized = serializeGroup({
+      label: 'sweep-project-07',
+      dateRange: { from: '2026-06-09', to: '2026-08-04' },
+      units: [{ id: 'M-20260609000000-alpha', content: Buffer.from('conteudo\n') }],
+    });
+    fs.writeFileSync(path.join(ledgerDir, 'sweep-project-07.md'), serialized.buffer);
+    writeLegacyContainer(cwd, 'decisions', '2026-Q1', 'D-20260101000000-legado', 'conteudo legado\n');
+
+    const before = treeSnapshot(cwd);
+    const result = runScript(cwd, ['--list']);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /sweep-project-07 \(2026-06-09 → 2026-08-04\)/);
+    assert.match(result.stdout, /2026-Q1 \(faixa não registrada\)/);
+    assert.deepStrictEqual(treeSnapshot(cwd), before, '--list é leitura pura: a árvore não pode mudar');
+
+    const json = runScript(cwd, ['--list', '--json']);
+    assert.strictEqual(json.status, 0, json.stderr);
+    const payload = JSON.parse(json.stdout);
+    const sweepRow = payload.containers.find(row => row.label === 'sweep-project-07');
+    assert.strictEqual(sweepRow.store, 'ledger');
+    assert.strictEqual(sweepRow.from, '2026-06-09');
+    assert.strictEqual(sweepRow.to, '2026-08-04');
+    assert.strictEqual(sweepRow.units, 1);
+    const legacyRow = payload.containers.find(row => row.label === '2026-Q1');
+    assert.strictEqual(legacyRow.store, 'decisions');
+    assert.strictEqual(legacyRow.from, null);
+    assert.strictEqual(legacyRow.to, null);
+    assert.strictEqual(legacyRow.units, 1);
+  } finally { cleanup(cwd); }
+});
+
+test('relatório de pulados nomeia a unidade e o motivo novo de sealedBy (chave local órfã sem prova de encerramento)', () => {
+  const cwd = fixture(false);
+  try {
+    // DS9-4/B1: a bare local key ("S02", no `__<milestone>` prefix) is not
+    // extinct by construction — it falls through sealedBy's three proofs and
+    // is skipped, never grouped on a refuted premise.
+    const memoryDir = path.join(cwd, '.gsd', 'memory');
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.writeFileSync(path.join(memoryDir, 'S02.md'), '---\n---\n\nfragmento sem prova\n');
+    const result = runScript(cwd, []);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /S02\.md — sem prova de encerramento — unidade pode receber escrita/);
+  } finally { cleanup(cwd); }
+});
+
 test('sem VCS não aplica, informa a proteção e reporta zero elegíveis', () => {
   const cwd = fixture(false);
   try {
@@ -183,7 +274,7 @@ test('sem VCS, --force aplica e informa que prosseguiu forçado', () => {
     const result = runScript(cwd, ['--apply', '--yes', '--force']);
     assert.strictEqual(result.status, 0, result.stderr);
     assert.match(result.stdout, /prosseguiu forçado/);
-    assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+    assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
   } finally { cleanup(cwd); }
 });
 
@@ -218,7 +309,7 @@ if (gitAvailable()) {
     try {
       const result = runScript(cwd, ['--apply', '--yes']);
       assert.strictEqual(result.status, 0, result.stderr);
-      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
       assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'M-20250101000000-alpha.md')));
       assert.match(result.stdout, /arquivos: \d+ → \d+/);
       assert.match(result.stdout, /pastas: \d+ → \d+/);
@@ -312,17 +403,17 @@ if (gitAvailable()) {
 
       const apply = runScript(cwd, ['--apply', '--yes']);
       assert.strictEqual(apply.status, 0, apply.stderr);
-      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
       assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'M-20250101000000-alpha.md')));
 
       const entries = readJournalEntries(cwd);
       const phases = entries.map(entry => entry.phase);
       assert.deepStrictEqual(phases, ['apply-intent', 'apply-done']);
       for (const entry of entries) {
-        assert.deepStrictEqual(entry.containers, ['.gsd/ledger/2025-Q1.md']);
+        assert.deepStrictEqual(entry.containers, ['.gsd/ledger/sweep-project-01.md']);
       }
-      assert(entries[1].sha256 && typeof entries[1].sha256['.gsd/ledger/2025-Q1.md'] === 'string');
-      assert.strictEqual(entries[1].sha256['.gsd/ledger/2025-Q1.md'].length, 64);
+      assert(entries[1].sha256 && typeof entries[1].sha256['.gsd/ledger/sweep-project-01.md'] === 'string');
+      assert.strictEqual(entries[1].sha256['.gsd/ledger/sweep-project-01.md'].length, 64);
     } finally { cleanup(cwd); }
   });
 
@@ -336,7 +427,7 @@ if (gitAvailable()) {
       assert.match(apply.stdout + apply.stderr, /registro de undo indisponível/);
       const after = treeSnapshot(path.join(cwd, '.gsd', 'ledger'));
       assert.deepStrictEqual(after, before, 'zero mutação: a árvore do store precisa ficar byte-idêntica');
-      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
     } finally { cleanup(cwd); }
   });
 
@@ -347,7 +438,7 @@ if (gitAvailable()) {
       const apply = runScript(cwd, ['--apply', '--yes']);
       assert.strictEqual(apply.status, 0, apply.stderr);
       assert.match(apply.stderr, /registro de undo indisponível/);
-      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
     } finally { cleanup(cwd); }
   });
 
@@ -390,13 +481,13 @@ if (gitAvailable()) {
       const apply = runScript(cwd, ['--apply', '--yes']);
       assert.strictEqual(apply.status, 0, apply.stderr);
       assert.doesNotMatch(apply.stdout + apply.stderr, /--force/);
-      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
 
       const undo = runScript(cwd, ['--undo', '--yes']);
       assert.strictEqual(undo.status, 0, undo.stderr);
       const after = storeTreeSnapshot(cwd);
       assert.deepStrictEqual(after, before, 'árvore dos stores precisa voltar byte-idêntica à pré-aplicação');
-      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
 
       const entries = readJournalEntries(cwd);
       assert.deepStrictEqual(entries.map(e => e.phase), ['apply-intent', 'apply-done', 'undo-done']);
@@ -407,12 +498,12 @@ if (gitAvailable()) {
     const cwd = fixtureIgnoredGsd();
     try {
       runScript(cwd, ['--apply', '--yes']);
-      const before = fs.readFileSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md'));
+      const before = fs.readFileSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md'));
 
       const noTty = runScript(cwd, ['--undo']);
       assert.strictEqual(noTty.status, 0, noTty.stderr);
       assert.match(noTty.stdout, /desfazer não confirmado fora de TTY/);
-      assert.deepStrictEqual(fs.readFileSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')), before);
+      assert.deepStrictEqual(fs.readFileSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')), before);
 
       const jsonNoYes = runScript(cwd, ['--json', '--undo']);
       assert.strictEqual(jsonNoYes.status, 2);
@@ -436,12 +527,12 @@ if (gitAvailable()) {
       const first = runScript(cwd, ['--undo', '--yes']);
       assert.strictEqual(first.status, 1);
       assert.match(first.stdout + first.stderr, /M-20250101000000-alpha\.md/);
-      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')), 'container precisa sobreviver ao undo parcial');
+      assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')), 'container precisa sobreviver ao undo parcial');
 
       fs.unlinkSync(memberPath);
       const second = runScript(cwd, ['--undo', '--yes']);
       assert.strictEqual(second.status, 0, second.stderr);
-      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+      assert(!fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
       assert(fs.existsSync(memberPath));
     } finally { cleanup(cwd); }
   });
@@ -499,7 +590,7 @@ test('regressão: sem VCS, --force ainda é exigido e aplica normalmente (journa
     const result = runScript(cwd, ['--apply', '--yes', '--force']);
     assert.strictEqual(result.status, 0, result.stderr);
     assert.match(result.stdout, /prosseguiu forçado/);
-    assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', '2025-Q1.md')));
+    assert(fs.existsSync(path.join(cwd, '.gsd', 'ledger', 'sweep-project-01.md')));
   } finally { cleanup(cwd); }
 });
 

@@ -14,7 +14,7 @@ const epochGroup = require('./forge-epoch-group');
 const { createRegistry, formatPreview } = require('./forge-sweep-registry');
 const { createEligibility, isVcsQueryFailure } = require('./forge-sweep-eligibility');
 const journal = require('./forge-sweep-journal');
-const { parseGroup } = require('./forge-grouped-file');
+const { parseGroup, isGroupedFile } = require('./forge-grouped-file');
 
 const USAGE = [
   'Uso: node scripts/forge-sweep-project.js [opções]',
@@ -25,6 +25,7 @@ const USAGE = [
   '  --yes        Confirma a aplicação/desfazer sem pergunta interativa',
   '  --force      Prossegue sem VCS; não haverá como desfazer',
   '  --undo       Desfaz o registro mais recente do journal (exclusivo com --apply/--force)',
+  '  --list       Lista os containers de varredura existentes (leitura pura, exclusivo com --apply/--undo)',
   '  --json       Emite o relatório no formato JSON',
   '  --help       Mostra esta ajuda',
   '',
@@ -34,8 +35,8 @@ const USAGE = [
 function buildRegistry() {
   const registry = createRegistry();
   registry.register({
-    name: 'agrupar-epocas-seladas',
-    description: 'Agrupa fragmentos de épocas seladas em containers reversíveis.',
+    name: 'agrupar-unidades-encerradas',
+    description: 'Agrupa unidades encerradas comprovadas em containers de varredura reversíveis.',
     // D11: deliberately omit includeWrapperDirs; wrapper readers listed in
     // docs/wrapper-dir-readers.md still include entries that break.
     plan: ctx => epochGroup.plan(ctx.cwd),
@@ -45,7 +46,7 @@ function buildRegistry() {
 }
 
 function parseArgs(argv) {
-  const options = { cwd: process.cwd(), apply: false, yes: false, force: false, undo: false, json: false, help: false };
+  const options = { cwd: process.cwd(), apply: false, yes: false, force: false, undo: false, list: false, json: false, help: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--cwd') {
@@ -57,6 +58,7 @@ function parseArgs(argv) {
     else if (arg === '--yes') options.yes = true;
     else if (arg === '--force') options.force = true;
     else if (arg === '--undo') options.undo = true;
+    else if (arg === '--list') options.list = true;
     else if (arg === '--json') options.json = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else throw new Error(`argumento desconhecido: ${arg}`);
@@ -64,6 +66,10 @@ function parseArgs(argv) {
   // --undo is a distinct mode; it never composes with a plan-apply run.
   if (options.undo && options.apply) throw new Error('--undo é exclusivo com --apply');
   if (options.undo && options.force) throw new Error('--undo é exclusivo com --force');
+  // --list is read-only enumeration; it never composes with a mutating mode.
+  if (options.list && options.apply) throw new Error('--list é exclusivo com --apply');
+  if (options.list && options.undo) throw new Error('--list é exclusivo com --undo');
+  if (options.list && options.force) throw new Error('--list é exclusivo com --force');
   if (options.yes && !options.apply && !options.undo) throw new Error('--yes exige --apply ou --undo');
   if (options.force && !options.apply) throw new Error('--force exige --apply');
   // An interactive prompt would have to share stdout with the report, breaking
@@ -363,6 +369,81 @@ async function runUndo(cwd, options) {
   return errors.length ? 1 : 0;
 }
 
+/**
+ * --list mode: pure read-only enumeration of grouped containers across the
+ * three fragment stores (ledger, decisions, memory). No VCS query, no
+ * journal touch, no filesystem write — must-have #4's byte-identical
+ * before/after snapshot is what this function is built to satisfy.
+ */
+function collectContainers(cwd) {
+  const rows = [];
+  for (const store of epochGroup.STORE_TARGETS) {
+    const dir = store.dir(cwd);
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (_) { continue; }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+      const filePath = path.join(dir, entry.name);
+      let buffer;
+      try { buffer = fs.readFileSync(filePath); }
+      catch (_) { continue; }
+      if (!isGroupedFile(entry.name, buffer)) continue;
+      const parsed = parseGroup(buffer);
+      const label = parsed.label || path.basename(entry.name, '.md');
+      rows.push({
+        store: store.name,
+        name: entry.name,
+        label,
+        from: parsed.from,
+        to: parsed.to,
+        units: parsed.units.length,
+      });
+    }
+  }
+  // Deterministic ordering (store, then name) — DS9-1/step 2: --list never
+  // reorders by date, which would pretend a chronology the sweep numbers do
+  // not carry.
+  rows.sort((a, b) => (a.store === b.store ? a.name.localeCompare(b.name) : a.store.localeCompare(b.store)));
+  return rows;
+}
+
+function formatListRow(row) {
+  // A legacy PR-1 container never had grouped_from/grouped_to at all —
+  // empty parens would read as "the range is blank", which is misleading;
+  // say plainly that no range was ever recorded for it (DS9-1).
+  const range = row.from && row.to ? `${row.from} → ${row.to}` : 'faixa não registrada';
+  return `${row.store}: ${row.label} (${range}) — ${row.units} unidade(s)`;
+}
+
+function listPayload(rows) {
+  return {
+    containers: rows.map(row => ({
+      store: row.store,
+      name: row.name,
+      label: row.label,
+      from: row.from,
+      to: row.to,
+      units: row.units,
+    })),
+  };
+}
+
+function runList(cwd, options) {
+  const rows = collectContainers(cwd);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(listPayload(rows), null, 2)}\n`);
+    return 0;
+  }
+  if (!rows.length) {
+    // Silence is indistinguishable from a broken command — always say so.
+    process.stdout.write('nenhum container de varredura encontrado\n');
+    return 0;
+  }
+  for (const row of rows) process.stdout.write(`${formatListRow(row)}\n`);
+  return 0;
+}
+
 async function main(argv) {
   let options;
   try { options = parseArgs(argv); }
@@ -377,6 +458,10 @@ async function main(argv) {
 
   try {
     const cwd = resolveCwd(options.cwd);
+    // Pure reads first: --list never queries the VCS, never touches the
+    // journal, and never mutates a byte — resolving it before eligibility
+    // setup keeps that guarantee structural, not just documented.
+    if (options.list) return runList(cwd, options);
     if (options.undo) return await runUndo(cwd, options);
     const ctx = { cwd };
     // Tool-undo is offered structurally for every target: the CLI's single
@@ -447,7 +532,7 @@ async function main(argv) {
             }
             process.stderr.write(`registro de undo indisponível — prosseguindo sem journal: ${probeResult.error}\n`);
           } else {
-            const intentResult = journal.appendIntent(cwd, { operation: 'agrupar-epocas-seladas', containers });
+            const intentResult = journal.appendIntent(cwd, { operation: 'agrupar-unidades-encerradas', containers });
             if (intentResult.ok) {
               journalId = intentResult.id;
             } else if (hasToolUndo) {
