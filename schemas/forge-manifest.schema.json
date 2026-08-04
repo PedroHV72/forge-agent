@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge-agent.dev/schemas/forge-manifest.schema.json",
+  "title": "Forge canonical source manifest",
+  "type": "object",
+  "required": ["$schema", "schema_version", "product_version", "newline", "entries"],
+  "properties": {
+    "$schema": { "const": "schemas/forge-manifest.schema.json" },
+    "schema_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "product_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "newline": { "const": "lf" },
+    "entries": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/entry" } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "host_status": { "type": "string", "enum": ["common", "implemented", "conditional", "planned", "unavailable"] },
+    "entry": {
+      "type": "object",
+      "required": ["source_id", "kind", "owner", "discovery", "hosts", "capabilities"],
+      "properties": {
+        "source_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "kind": { "type": "string", "enum": ["agent", "command", "skill", "dispatch", "hook", "headless", "mcp"] },
+        "owner": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "discovery": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.{1,2}(?:/|$))" },
+        "hosts": {
+          "type": "object", "required": ["claude", "codex"], "additionalProperties": false,
+          "properties": { "claude": { "$ref": "#/$defs/host_status" }, "codex": { "$ref": "#/$defs/host_status" } }
+        },
+        "capabilities": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" }, "uniqueItems": true }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "schemas/forge-manifest.schema.json",
+  "schema_version": "1.0.0",
+  "product_version": "3.1.4",
+  "newline": "lf",
+  "entries": [
+    { "source_id": "source-agents", "kind": "agent", "owner": "execution", "discovery": "agents/*.md", "hosts": { "claude": "implemented", "codex": "conditional" }, "capabilities": ["agent"] },
+    { "source_id": "source-commands", "kind": "command", "owner": "orchestration", "discovery": "commands/*.md", "hosts": { "claude": "implemented", "codex": "conditional" }, "capabilities": ["command"] },
+    { "source_id": "source-skills", "kind": "skill", "owner": "workflow", "discovery": "skills/*/SKILL.md", "hosts": { "claude": "implemented", "codex": "conditional" }, "capabilities": ["skill"] },
+    { "source_id": "source-dispatch", "kind": "dispatch", "owner": "orchestration", "discovery": "shared/templates/dispatch/*.md", "hosts": { "claude": "common", "codex": "common" }, "capabilities": ["dispatch"] },
+    { "source_id": "source-hooks", "kind": "hook", "owner": "integration", "discovery": "scripts/forge-hook.js", "hosts": { "claude": "implemented", "codex": "conditional" }, "capabilities": ["hooks"] },
+    { "source_id": "source-headless", "kind": "headless", "owner": "integration", "discovery": "scripts/forge-dispatch-resolve.js", "hosts": { "claude": "implemented", "codex": "conditional" }, "capabilities": ["headless"] },
+    { "source_id": "source-mcp", "kind": "mcp", "owner": "integrations", "discovery": "shared/forge-mcps.md", "hosts": { "claude": "implemented", "codex": "conditional" }, "capabilities": ["mcp"] }
+  ]
+}
