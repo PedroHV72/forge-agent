@@ -1,0 +1,86 @@
+#!/usr/bin/env node
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const loop = require('./forge-loop-controller.js');
+const state = require('./forge-state.js');
+
+const vectors = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'long-workflows', 'platform-vectors.json'), 'utf8'));
+const roots = [];
+const milestone = 'M-20260804000000-loop-test';
+function temp(platform, host) { const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `forge-loop-${platform}-${host}-Ω-`)); roots.push(cwd); return cwd; }
+function prefsReader() { return { ok: true, prefs: { workflow: { skip_discuss: true, skip_research: true } } }; }
+function setup(platform, host) {
+  const cwd = path.join(temp(platform, host), vectors.path_suffix); fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(path.join(cwd, '.gsd', 'milestones', milestone), { recursive: true });
+  state.write(cwd, { milestone, phase: 'idle', active_slice: 'S01', active_task: '—', next_action: 'plan', auto_mode: 'off' });
+  return cwd;
+}
+function input(cwd, owner = 'owner-neutral', key = 'loop-neutral-1') {
+  return {
+    cwd, milestone, owner_token: owner, idempotency_key: key, prefsReader,
+    description: vectors.crlf_description,
+    inventory: {
+      roadmap_exists: true, context_exists: true, research_exists: true,
+      slices: [{ id: 'S01', checked: false, plan_exists: true, research_exists: true, summary_exists: false, tasks: [{ id: 'T01', checked: false }] }],
+      milestone_complete: false,
+    },
+  };
+}
+
+try {
+  let cases = 0;
+  for (const platform of vectors.platforms) for (const host of vectors.hosts) {
+    cases += 1;
+    const cwd = setup(platform, host);
+    const initial = loop.create({ mode: 'auto', workflow_id: `${platform}-${host}`, host_runtime: host, max_steps: 3 });
+    const first = loop.advance(initial, 'next', input(cwd));
+    assert.strictEqual(first.outcome, 'dispatch_required');
+    assert.strictEqual(first.action, 'dispatch');
+    assert.strictEqual(first.unit.key, 'execute-task/T01');
+    assert.strictEqual(first.snapshot.step_count, 1);
+    assert.strictEqual(first.host_runtime, host);
+    const repeated = loop.advance(first.snapshot, 'next', input(cwd));
+    assert.deepStrictEqual(repeated, first, `${platform}/${host} retry is idempotent`);
+
+    const paused = loop.advance(first.snapshot, 'pause', input(cwd));
+    assert.strictEqual(paused.outcome, 'needs_input');
+    assert.strictEqual(paused.lifecycle, 'paused');
+    assert(paused.boundary && paused.boundary.idempotency_key);
+    const resumed = loop.advance(paused.snapshot, 'resume', { ...input(cwd), host_runtime: host === 'claude' ? 'codex' : 'claude', response: { choice: 'continue' } });
+    assert.strictEqual(resumed.outcome, 'resumed');
+    assert.strictEqual(resumed.lifecycle, 'idle');
+    assert.strictEqual(resumed.host_runtime, host === 'claude' ? 'codex' : 'claude');
+    assert.strictEqual(JSON.stringify(resumed).includes(vectors.crlf_description), false);
+  }
+  assert.strictEqual(cases, 6);
+
+  // A second owner cannot convert an active lease into a new dispatch.
+  const contested = setup('win32', 'claude');
+  const ownerA = loop.advance(loop.create({ mode: 'auto', workflow_id: 'lease-a', host_runtime: 'claude' }), 'next', input(contested, 'owner-a', 'lease-a'));
+  assert.strictEqual(ownerA.outcome, 'dispatch_required');
+  const ownerB = loop.advance(loop.create({ mode: 'auto', workflow_id: 'lease-b', host_runtime: 'codex' }), 'next', input(contested, 'owner-b', 'lease-b'));
+  assert.strictEqual(ownerB.outcome, 'blocked');
+  assert.strictEqual(ownerB.reason_code, 'lease-active');
+
+  // Task mode is the same controller with a one-unit budget and terminal resume.
+  const taskCwd = setup('darwin', 'codex');
+  const task = loop.advance(loop.create({ mode: 'task', workflow_id: 'task-one', host_runtime: 'codex' }), 'pause', input(taskCwd, 'task-owner', 'task-one'));
+  assert.strictEqual(task.lifecycle, 'paused');
+  const taskDone = loop.advance(task.snapshot, 'resume', { ...input(taskCwd, 'task-owner', 'task-one'), response: { value: 'done' } });
+  assert.strictEqual(taskDone.lifecycle, 'completed');
+  assert.strictEqual(taskDone.action, 'stop');
+  assert.strictEqual(loop.advance(taskDone.snapshot, 'next', input(taskCwd)).reason_code, 'workflow-terminal');
+
+  assert.throws(() => loop.advance(loop.create({ mode: 'auto', workflow_id: 'host-lock', host_runtime: 'claude' }), 'next', { ...input(setup('linux', 'claude')), host_runtime: 'codex' }), (error) => error.code === 'host-runtime-mismatch');
+  assert.throws(() => loop.create({ mode: 'unknown', workflow_id: 'bad', host_runtime: 'claude' }), (error) => error.code === 'invalid-mode');
+
+  const source = fs.readFileSync(path.join(__dirname, 'forge-loop-controller.js'), 'utf8');
+  assert.strictEqual(/child_process|\bspawn(?:Sync)?\s*\(/.test(source), false, 'controller must not spawn');
+  console.log(`forge-loop-controller tests passed (${cases} host/platform vectors)`);
+} finally {
+  for (const cwd of roots) fs.rmSync(cwd, { recursive: true, force: true });
+}
