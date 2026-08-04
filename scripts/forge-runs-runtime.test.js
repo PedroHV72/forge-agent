@@ -22,7 +22,7 @@ function equal(actual, expected, message) {
   }
 }
 function sandbox(fn) {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge runs espaço-')); 
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge runs espaço-'));
   fs.mkdirSync(path.join(cwd, '.gsd'), { recursive: true });
   try { return fn(cwd); } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 }
