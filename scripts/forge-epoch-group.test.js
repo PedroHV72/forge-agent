@@ -429,5 +429,167 @@ test('refuses to restore a store member over an existing loose file', () => {
   } finally { remove(cwd); }
 });
 
+// B1: a container survives a failure that reaches only some of its members —
+// a second ungroup() must complete the restoration instead of relaunching the
+// whole thing from the member that already crashed it. treeSnapshot mirrors
+// the byte-level idiom from forge-sweep-project.test.js:48.
+function treeSnapshot(root) {
+  const rows = [];
+  function visit(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      const relative = path.relative(root, full).split(path.sep).join('/');
+      if (entry.isDirectory()) {
+        rows.push({ relative, kind: 'dir' });
+        visit(full);
+      } else {
+        rows.push({ relative, kind: 'file', bytes: fs.readFileSync(full).toString('base64') });
+      }
+    }
+  }
+  visit(root);
+  return rows.sort((a, b) => a.relative.localeCompare(b.relative));
+}
+
+test('B1 store: ungroup is resumable after a partial failure and idempotent on byte-identical retries', () => {
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledger('M-20260101000000-one', '2026-01-01', 'member one'));
+    write(cwd, '.gsd/ledger/M-20260102000000-two.md', ledger('M-20260102000000-two', '2026-01-02', 'member two'));
+    write(cwd, '.gsd/ledger/M-20260103000000-three.md', ledger('M-20260103000000-three', '2026-01-03', 'member three'));
+    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01', 'current ledger'));
+    const preApplySnapshot = treeSnapshot(path.join(cwd, '.gsd'));
+
+    const planned = group.plan(cwd);
+    const target = planned.targets.find(item => item.store === 'ledger');
+    assert(target, 'the three sealed ledger members are groupable');
+    assert.equal(target.members.length, 3);
+    const originals = new Map(target.members.map(member => [member.path, fs.readFileSync(member.path)]));
+    const applied = group.apply(cwd, planned);
+    assert(applied.written.includes(target.containerPath));
+
+    // Simulate a crash mid-restoration: member one is restored by hand with
+    // its original bytes (as a prior partial ungroup() would have left it),
+    // and member two is planted with DIFFERENT bytes — a genuine conflict.
+    const memberOne = target.members.find(member => /one/.test(member.path));
+    const memberTwo = target.members.find(member => /two/.test(member.path));
+    fs.writeFileSync(memberOne.path, originals.get(memberOne.path));
+    fs.writeFileSync(memberTwo.path, 'conflicting content — not the grouped payload');
+
+    assert.throws(() => group.ungroup(cwd, target.containerPath), /destination already exists with different content/);
+    assert(fs.existsSync(target.containerPath), 'the container survives a refused ungroup');
+    assert.equal(fs.readFileSync(memberOne.path).toString('utf8'), originals.get(memberOne.path).toString('utf8'),
+      'the already-restored member is untouched by the failed retry');
+
+    // Resolve the conflict as an operator would, then retry.
+    fs.writeFileSync(memberTwo.path, originals.get(memberTwo.path));
+    const result = group.ungroup(cwd, target.containerPath);
+    assert.equal(result.restored.length, 1, 'only member three needed a fresh write');
+    assert.equal(result.alreadyPresent.length, 2, 'members one and two were already byte-identical on disk');
+    assert(result.alreadyPresent.includes(memberOne.path));
+    assert(result.alreadyPresent.includes(memberTwo.path));
+    assert(!fs.existsSync(target.containerPath), 'the container is removed once every member is accounted for');
+    for (const member of target.members) {
+      assert.equal(Buffer.compare(originals.get(member.path), fs.readFileSync(member.path)), 0);
+    }
+    assert.deepEqual(treeSnapshot(path.join(cwd, '.gsd')), preApplySnapshot,
+      'the final tree is byte-identical to the state before apply()');
+  } finally { remove(cwd); }
+});
+
+// B1 wrapper branch — same scenario, guarding :374's existsSync check instead
+// of the store branch's :389.
+test('B1 wrapper: ungroup is resumable after a partial failure and idempotent on byte-identical retries', () => {
+  const cwd = tmp();
+  try {
+    const bytesOne = Buffer.from('member one payload\r\n', 'utf8');
+    const bytesTwo = Buffer.from('member two payload\r\n', 'utf8');
+    const sourceOne = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES.md', bytesOne);
+    const sourceTwo = write(cwd, '.gsd/tasks/T-20260102000000-two/NOTES.md', bytesTwo);
+    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
+    const preApplySnapshot = treeSnapshot(path.join(cwd, '.gsd'));
+
+    const planned = group.plan(cwd, { includeWrapperDirs: true });
+    const target = planned.targets.find(item => item.store === 'task-wrappers');
+    assert(target, 'the two sealed task wrappers are groupable');
+    assert.equal(target.members.length, 2);
+    const applied = group.apply(cwd, planned);
+    assert.equal(applied.written.length, 1);
+    const container = applied.written[0];
+
+    // Wrapper dir + destination for member one restored by hand (a prior
+    // partial ungroup would have left exactly this on disk); member two's
+    // wrapper dir is planted with a conflicting destination.
+    fs.mkdirSync(sourceOne.replace(/[\\/]NOTES\.md$/, ''), { recursive: true });
+    fs.writeFileSync(sourceOne, bytesOne);
+    fs.mkdirSync(sourceTwo.replace(/[\\/]NOTES\.md$/, ''), { recursive: true });
+    fs.writeFileSync(sourceTwo, 'conflicting content — not the grouped payload');
+
+    assert.throws(() => group.ungroup(cwd, container), /destination already exists with different content/);
+    assert(fs.existsSync(container), 'the container survives a refused ungroup');
+    assert.equal(fs.readFileSync(sourceOne).toString('utf8'), bytesOne.toString('utf8'),
+      'the already-restored wrapper member is untouched by the failed retry');
+
+    fs.writeFileSync(sourceTwo, bytesTwo);
+    const result = group.ungroup(cwd, container);
+    assert.equal(result.restored.length, 0, 'both wrapper members were already byte-identical on disk');
+    assert.equal(result.alreadyPresent.length, 2);
+    assert(result.alreadyPresent.includes(sourceOne));
+    assert(result.alreadyPresent.includes(sourceTwo));
+    assert(!fs.existsSync(container), 'the container is removed once every member is accounted for');
+    assert.equal(Buffer.compare(fs.readFileSync(sourceOne), bytesOne), 0);
+    assert.equal(Buffer.compare(fs.readFileSync(sourceTwo), bytesTwo), 0);
+    assert.deepEqual(treeSnapshot(path.join(cwd, '.gsd')), preApplySnapshot,
+      'the final tree is byte-identical to the state before apply()');
+  } finally { remove(cwd); }
+});
+
+test('B1: a wrapper directory that already exists (not planted by a prior partial ungroup) is reused, not rejected', () => {
+  const cwd = tmp();
+  try {
+    const bytes = Buffer.from('payload\n', 'utf8');
+    const source = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES.md', bytes);
+    write(cwd, '.gsd/tasks/T-20260401000000-current/PLAN.md', 'live');
+    const planned = group.plan(cwd, { includeWrapperDirs: true });
+    const applied = group.apply(cwd, planned);
+    assert.equal(applied.written.length, 1);
+
+    // The wrapper directory exists (as it would mid-restore) but is empty —
+    // this must not throw merely because fs.existsSync(wrapper) is true.
+    fs.mkdirSync(source.replace(/[\\/]NOTES\.md$/, ''), { recursive: true });
+    const result = group.ungroup(cwd, applied.written[0]);
+    assert.equal(result.restored.length, 1);
+    assert(fs.existsSync(source));
+    assert.equal(Buffer.compare(fs.readFileSync(source), bytes), 0);
+  } finally { remove(cwd); }
+});
+
+test('B1: pure idempotent skip — every destination already byte-identical yields an empty restored list', () => {
+  const cwd = tmp();
+  try {
+    write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledger('M-20260101000000-one', '2026-01-01', 'member one'));
+    write(cwd, '.gsd/ledger/M-20260102000000-two.md', ledger('M-20260102000000-two', '2026-01-02', 'member two'));
+    write(cwd, '.gsd/ledger/M-20260401000000-current.md', ledger('M-20260401000000-current', '2026-04-01', 'current ledger'));
+    const planned = group.plan(cwd);
+    const target = planned.targets.find(item => item.store === 'ledger');
+    const originals = new Map(target.members.map(member => [member.path, fs.readFileSync(member.path)]));
+    const applied = group.apply(cwd, planned);
+    const container = applied.written.find(item => item === target.containerPath);
+
+    // Nothing is deleted — restore every member by hand with identical bytes
+    // before ungroup() ever runs, simulating a fully-completed prior attempt
+    // whose only remaining step was removing the container.
+    for (const [memberPath, content] of originals) fs.writeFileSync(memberPath, content);
+
+    const result = group.ungroup(cwd, container);
+    assert.deepEqual(result.restored, []);
+    assert.equal(result.alreadyPresent.length, target.members.length);
+    assert(!fs.existsSync(container));
+    for (const [memberPath, content] of originals) {
+      assert.equal(Buffer.compare(fs.readFileSync(memberPath), content), 0);
+    }
+  } finally { remove(cwd); }
+});
+
 console.log(`\nforge-epoch-group: ${passed} passed, ${failed} failed`);
 process.exitCode = failed ? 1 : 0;

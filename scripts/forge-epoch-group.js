@@ -357,6 +357,23 @@ function apply(cwd, groupingPlan, opts = {}) {
   } };
 }
 
+// Restores a single member idempotently: absent -> write; present with
+// byte-identical content -> record as already-present without rewriting (a
+// second ungroup() after a partial failure completes cleanly); present with
+// different bytes -> throw, preserving the loose-wins-over-grouped invariant
+// (S03 R3). Shared by both branches so the comparison is never duplicated.
+function restoreUnit(destination, content, restored, alreadyPresent) {
+  if (fs.existsSync(destination)) {
+    if (Buffer.compare(fs.readFileSync(destination), content) === 0) {
+      alreadyPresent.push(destination);
+      return;
+    }
+    throw new Error(`destination already exists with different content: ${destination}`);
+  }
+  fs.writeFileSync(destination, content);
+  restored.push(destination);
+}
+
 function ungroup(cwd, containerPath) {
   const container = path.resolve(containerPath);
   const store = ALL_TARGETS.find(candidate => isDirectChild(candidate.dir ? candidate.dir(cwd) : candidate.parent(cwd), container));
@@ -364,6 +381,7 @@ function ungroup(cwd, containerPath) {
   const parsed = parseGroup(fs.readFileSync(container));
   if (parsed.errors.length) throw new Error(`cannot ungroup invalid container: ${parsed.errors[0].reason}`);
   const restored = [];
+  const alreadyPresent = [];
   if (store.parent) {
     const parent = store.parent(cwd);
     for (const unit of parsed.units) {
@@ -372,26 +390,27 @@ function ungroup(cwd, containerPath) {
       const wrapper = path.join(parent, member.dirId);
       const destination = path.join(wrapper, member.fileName);
       if (!isDirectChild(parent, wrapper) || !isDirectChild(wrapper, destination)) throw new Error('wrapper member escapes store');
-      if (fs.existsSync(wrapper) || fs.existsSync(destination)) throw new Error(`destination already exists: ${destination}`);
-      fs.mkdirSync(wrapper);
-      fs.writeFileSync(destination, unit.content);
-      restored.push(destination);
+      if (fs.existsSync(wrapper)) {
+        if (!fs.statSync(wrapper).isDirectory()) throw new Error(`wrapper path exists and is not a directory: ${wrapper}`);
+      } else {
+        fs.mkdirSync(wrapper);
+      }
+      restoreUnit(destination, unit.content, restored, alreadyPresent);
     }
     fs.unlinkSync(container);
-    return { restored };
+    return { restored, alreadyPresent };
   }
   for (const unit of parsed.units) {
     if (!safeMemberId(unit.id)) throw new Error(`invalid grouped unit id: ${unit.id}`);
     const destination = path.join(store.dir(cwd), `${unit.id}.md`);
     if (!isDirectChild(store.dir(cwd), destination)) throw new Error('grouped member escapes store');
-    // Mirrors the wrapper branch. By the loose-wins invariant the file already
-    // there is the canonical one, so restoring must never overwrite it.
-    if (fs.existsSync(destination)) throw new Error(`destination already exists: ${destination}`);
-    fs.writeFileSync(destination, unit.content);
-    restored.push(destination);
+    // Mirrors the wrapper branch. By the loose-wins invariant a divergent file
+    // already there is the canonical one, so restoring must never overwrite
+    // it — only a byte-identical match is swallowed as already restored.
+    restoreUnit(destination, unit.content, restored, alreadyPresent);
   }
   fs.unlinkSync(container);
-  return { restored };
+  return { restored, alreadyPresent };
 }
 
-module.exports = { STORE_TARGETS, WRAPPER_TARGETS, plan, apply, ungroup };
+module.exports = { STORE_TARGETS, WRAPPER_TARGETS, plan, apply, ungroup, isDirectChild, safeMemberId };
