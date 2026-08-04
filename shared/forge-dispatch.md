@@ -2314,3 +2314,25 @@ When decomposing a slice:
 3. **If two tasks share a file in `writes`** (e.g., both registering exports in a barrel file), either (a) order them with `depends`, or (b) split the shared-file responsibility into a third task that both depend on.
 
 `writes` conflicts are checked bidirectionally — glob on either side matches literal path on the other, and vice versa. `src/auth/**` conflicts with `src/auth/jwt.ts`.
+
+## Pre-dispatch capability policy
+
+`scripts/forge-dispatch-policy.js` is the pure, fail-closed decision boundary
+between runtime resolution and process enforcement. It receives the explicit
+`host_runtime`, `worker_engine`, role, operation and required/available
+capabilities. It does not inspect provider homes, credentials or ambient OS
+permissions and never spawns a process.
+
+Roles have fixed maxima: orchestrator may manage state and materialize results;
+worker/executor may read, write, apply and spawn only inside its declared
+workspace/worktree; reviewer and observer are read-only with no subprocess or
+execution lease. `.gsd/**` remains orchestrator-owned, and a selected host may
+not target the other host's home.
+
+Every decision conforms to `schemas/forge-dispatch-policy.schema.json`, returns
+exactly `allow|deny`, a stable reason code, `grants: []`, and the least native
+projection: Claude tool allowlist or Codex `sandbox_mode`. Missing capabilities,
+custom-agent sandbox escalation and ad-hoc grants deny rather than inherit.
+Structured worker output is untrusted data: fields that resemble role,
+capability, tools, sandbox, grants, credentials, prompt or transcript trigger
+`untrusted-output-barrier` and can never influence a subsequent dispatch.

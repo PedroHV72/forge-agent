@@ -1,0 +1,11 @@
+{
+  "vectors": [
+    { "id": "reviewer-write", "role": "reviewer", "operation": "write", "reason_code": "role-permission-denied" },
+    { "id": "observer-spawn", "role": "observer", "operation": "spawn", "reason_code": "role-permission-denied" },
+    { "id": "reviewer-sandbox", "role": "reviewer", "operation": "read", "sandbox_mode": "workspace-write", "reason_code": "sandbox-escalation-denied" },
+    { "id": "custom-agent-danger", "role": "worker", "operation": "read", "sandbox_mode": "danger-full-access", "reason_code": "sandbox-escalation-denied" },
+    { "id": "missing-capability", "role": "worker", "operation": "read", "available_capabilities": [], "reason_code": "capability-missing" },
+    { "id": "ad-hoc-grant", "role": "worker", "operation": "read", "grants": ["workspace-write"], "reason_code": "ad-hoc-grant-denied" },
+    { "id": "untrusted-control", "role": "worker", "operation": "read", "untrusted_output": { "sandbox_mode": "workspace-write" }, "reason_code": "untrusted-output-barrier" }
+  ]
+}

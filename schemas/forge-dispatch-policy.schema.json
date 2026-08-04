@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge-agent.local/schemas/forge-dispatch-policy.schema.json",
+  "title": "Forge dispatch policy decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "decision", "reason_code", "role", "host_runtime", "worker_engine", "resolved_engine", "operation", "required_capabilities", "sandbox_mode", "permissions", "grants", "projection"],
+  "properties": {
+    "protocol_version": { "const": "1.0.0" },
+    "decision": { "enum": ["allow", "deny"] },
+    "reason_code": { "enum": ["policy-allowed", "invalid-request", "invalid-role", "invalid-operation", "invalid-runtime-contract", "capability-missing", "role-permission-denied", "sandbox-escalation-denied", "target-required", "target-outside-workspace", "protected-state-path", "cross-host-home", "untrusted-output-barrier", "ad-hoc-grant-denied"] },
+    "role": { "type": ["string", "null"], "enum": ["orchestrator", "worker", "reviewer", "observer", null] },
+    "host_runtime": { "type": ["string", "null"], "enum": ["claude", "codex", null] },
+    "worker_engine": { "type": ["string", "null"] },
+    "resolved_engine": { "type": ["string", "null"] },
+    "operation": { "type": ["string", "null"], "enum": ["read", "write", "apply", "spawn", null] },
+    "required_capabilities": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "sandbox_mode": { "enum": ["read-only", "workspace-write"] },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace_write", "apply", "spawn", "execution_lease", "credential_env", "state_write", "result_materialize"],
+      "properties": {
+        "workspace_write": { "type": "boolean" }, "apply": { "type": "boolean" }, "spawn": { "type": "boolean" },
+        "execution_lease": { "type": "boolean" }, "credential_env": { "const": false }, "state_write": { "type": "boolean" }, "result_materialize": { "type": "boolean" }
+      }
+    },
+    "grants": { "type": "array", "maxItems": 0 },
+    "projection": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "object", "additionalProperties": false, "required": ["host", "tools", "permission_mode"], "properties": { "host": { "const": "claude" }, "tools": { "type": "array", "uniqueItems": true, "items": { "enum": ["Read", "Write", "Edit", "Bash"] } }, "permission_mode": { "enum": ["read-only", "workspace-write"] } } },
+        { "type": "object", "additionalProperties": false, "required": ["host", "sandbox_mode", "inheritance"], "properties": { "host": { "const": "codex" }, "sandbox_mode": { "enum": ["read-only", "workspace-write"] }, "inheritance": { "const": "explicit" } } }
+      ]
+    }
+  }
+}
