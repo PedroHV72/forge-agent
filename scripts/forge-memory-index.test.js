@@ -26,6 +26,7 @@ const { spawnSync } = require('child_process');
 
 const {
   extractCitations,
+  CITATION_REGEXES,
   resolveCitation,
   buildFileIndex,
   renderIndex,
@@ -153,6 +154,158 @@ test('extractCitations: dedup by path, first occurrence wins, order preserved', 
   const cites = extractCitations('First scripts/forge-alpha.js:10, then scripts/forge-beta.js, then scripts/forge-alpha.js again.');
   assertEq(cites.map((c) => c.path), ['scripts/forge-alpha.js', 'scripts/forge-beta.js'], 'expected dedup preserving first occurrence and order');
   assertEq(cites[0].line, 10, 'first occurrence line must be kept');
+});
+
+// ── Section 1A: measured false negatives and locked pattern superset ────────
+console.log('\nSection 1A: measured false negatives and locked pattern superset\n');
+
+test('false negative: dotted TSX basename', () => {
+  const cites = extractCitations('o arquivo _preview.tsx define o preview');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, '_preview.tsx');
+  assertEq(cites[0].pattern, 'bare-basename');
+});
+
+test('false negative: dotted HTML basename in backticks', () => {
+  const cites = extractCitations('ver `template.html` no diretorio');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'template.html');
+  assertEq(cites[0].pattern, 'backticked-basename');
+});
+
+test('false negative: backticked versioned path keeps the full span and line', () => {
+  const cites = extractCitations('ver `SERVICES/services@1.2.0/src/config/config.ts` linha 10');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'SERVICES/services@1.2.0/src/config/config.ts');
+  assertEq(cites[0].line, 10);
+  assertEq(cites[0].pattern, 'backticked-path');
+});
+
+test('false negative: bare versioned path is not truncated at the version', () => {
+  const cites = extractCitations('ver SERVICES/services@1.2.0/src/config/config.ts agora');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'SERVICES/services@1.2.0/src/config/config.ts');
+  assertEq(cites[0].pattern, 'bare-path');
+});
+
+test('false negative: dotted JavaScript basename outside backticks', () => {
+  const cites = extractCitations('o teste forge-memory-index.test.js cobre isso');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'forge-memory-index.test.js');
+  assertEq(cites[0].pattern, 'bare-basename');
+});
+
+test('false negative: name@version is enumerated as package-ref', () => {
+  const cites = extractCitations('o pacote wdma@1.2.0 foi citado');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'wdma@1.2.0');
+  assertEq(cites[0].pattern, 'package-ref');
+  const resolved = resolveCitation(cites[0], process.cwd(), null);
+  assertEq(resolved.reason, 'package-ref');
+});
+
+test('locked citation pattern names remain present', () => {
+  const names = CITATION_REGEXES.map((entry) => entry.name);
+  for (const name of ['backticked-path', 'bare-path', 'backticked-basename', 'bare-basename']) {
+    assert(names.includes(name), `missing locked pattern ${name}`);
+  }
+});
+
+test('legacy citation forms retain their path and pattern', () => {
+  const cases = [
+    ['See `scripts/forge-alpha.js`.', 'scripts/forge-alpha.js', 'backticked-path'],
+    ['See scripts/forge-beta.js.', 'scripts/forge-beta.js', 'bare-path'],
+    ['See `forge-gamma.js`.', 'forge-gamma.js', 'backticked-basename'],
+    ['See forge-delta.js.', 'forge-delta.js', 'bare-basename'],
+    ['See `scripts/forge-epsilon.js:27`.', 'scripts/forge-epsilon.js', 'backticked-path'],
+  ];
+  for (const [text, expectedPath, expectedPattern] of cases) {
+    const hit = extractCitations(text)[0];
+    assert(hit, `expected a citation for ${text}`);
+    assertEq(hit.path, expectedPath);
+    assertEq(hit.pattern, expectedPattern);
+  }
+});
+
+test('traversal with @ is rejected before any filesystem probe', () => {
+  const cites = extractCitations('SERVICES/services@1.2.0/../../../../etc/passwd');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'SERVICES/services@1.2.0/../../../../etc/passwd');
+  const realpath = fs.realpathSync;
+  const exists = fs.existsSync;
+  const stat = fs.statSync;
+  let probes = 0;
+  fs.realpathSync = function (...args) { probes++; return realpath.apply(fs, args); };
+  fs.existsSync = function (...args) { probes++; return exists.apply(fs, args); };
+  fs.statSync = function (...args) { probes++; return stat.apply(fs, args); };
+  try {
+    const resolved = resolveCitation(cites[0], process.cwd(), null);
+    assertEq(resolved.reason, 'outside-root');
+    assertEq(probes, 0, 'lexical containment must reject before disk access');
+  } finally {
+    fs.realpathSync = realpath;
+    fs.existsSync = exists;
+    fs.statSync = stat;
+  }
+});
+
+test('absolute Unix and drive-letter paths never resolve as citations', () => {
+  for (const text of ['/etc/passwd', 'C:\\Windows\\win.ini']) {
+    const cites = extractCitations(text);
+    assert(!cites.some((c) => c.path === text && resolveCitation(c, process.cwd(), null).state === 'RESOLVED'), `absolute path resolved: ${text}`);
+  }
+});
+
+test('expanded extension scan remains linear on pathological input', () => {
+  const started = Date.now();
+  const cites = extractCitations('a'.repeat(5000) + '@');
+  assert(Array.isArray(cites), 'pathological input must return an array');
+  assert(Date.now() - started < 1000, 'expanded regex scan must remain trivial');
+});
+
+// ── Section 1B: extensionless prose must not be extracted (T01 repair) ──────
+// Measured against the real WDMA store: an unfiltered `bare-path-traversal`
+// plus an unanchored `package-ref` inflated citations_total 3.1x (311 -> 972)
+// by matching ordinary prose. Each case below is real prose, not a citation.
+console.log('\nSection 1B: extensionless prose must not be extracted\n');
+
+test('prose "e/ou" is not extracted as a citation', () => {
+  const cites = extractCitations('usar o modo e/ou combinar');
+  assertEq(cites.length, 0, 'e/ou has a slash but no traversal segment — must not be a citation');
+});
+
+test('prose date "2026/08/04" is not extracted as a citation', () => {
+  const cites = extractCitations('a data 2026/08/04 vale');
+  assertEq(cites.length, 0, 'a slash-joined date is not a path');
+});
+
+test('prose "N/A" is not extracted as a citation', () => {
+  const cites = extractCitations('ver N/A no campo');
+  assertEq(cites.length, 0, 'N/A has a slash but no traversal segment — must not be a citation');
+});
+
+test('extensionless "SERVICES/services" without traversal is not extracted', () => {
+  const cites = extractCitations('config em SERVICES/services e pronto');
+  assertEq(cites.length, 0, 'a plain slash-joined pair without ".." or a known extension is not a citation');
+});
+
+test('prose "dev@empresa" is not extracted as package-ref (no digit-led version)', () => {
+  const cites = extractCitations('contato dev@empresa e mais');
+  assertEq(cites.length, 0, 'package-ref requires a digit-led version like wdma@1.2.0');
+});
+
+test('guard: a small fixture of junk lines extracts nothing, citations_total must not inflate', () => {
+  const junkLines = [
+    'usar o modo e/ou combinar',
+    'a data 2026/08/04 vale',
+    'ver N/A no campo',
+    'config em SERVICES/services e pronto',
+    'contato dev@empresa e mais',
+    'isso e/ou aquilo, tanto faz',
+  ];
+  let total = 0;
+  for (const line of junkLines) total += extractCitations(line).length;
+  assertEq(total, 0, 'extensionless prose fixture must contribute zero citations');
 });
 
 // ── Section 2: mandatory positive case ───────────────────────────────────────

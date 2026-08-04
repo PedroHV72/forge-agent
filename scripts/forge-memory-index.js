@@ -34,19 +34,19 @@ function isWithin(root, candidate) {
 // Ordered registry — order IS precedence (first match for a given span wins).
 // `name`s are LOCKED: T02 prints them, T03 asserts against them.
 // Uses [ \t], never \s — do not cross newlines (MEM004 precedent). \Z does not exist in JS.
-const CODE_EXT = '(?:js|mjs|cjs|ts|json|md|sh|ps1|yml|yaml)';
+const CODE_EXT = '(?:js|mjs|cjs|ts|tsx|jsx|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg)';
 
 const CITATION_REGEXES = [
   {
     name: 'backticked-path',
     // `some/dir/file.ext` or `some/dir/file.ext:123`
-    regex: new RegExp('`([\\w.\\-/]+/[\\w.\\-]+\\.' + CODE_EXT + ')(?::(\\d+))?`', 'g'),
+    regex: new RegExp('`([\\w.\\-/@]+/[\\w.\\-@]+\\.' + CODE_EXT + ')(?::(\\d+))?`(?:[ \\t]+linha[ \\t]+(\\d+))?', 'g'),
     description: 'Caminho com barra entre crases, extensão de código/markdown, sufixo :linha opcional.',
   },
   {
     name: 'bare-path',
     // some/dir/file.ext outside backticks
-    regex: new RegExp('(?<![`\\w./\\-])([\\w.\\-]+(?:/[\\w.\\-]+)+\\.' + CODE_EXT + ')(?::(\\d+))?(?![`\\w])', 'g'),
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-@]+(?:/[\\w.\\-@]+)+\\.' + CODE_EXT + ')(?::(\\d+))?(?:[ \\t]+linha[ \\t]+(\\d+))?(?![`\\w])', 'g'),
     description: 'Caminho com barra e extensão de código/markdown fora de crases.',
   },
   {
@@ -58,8 +58,32 @@ const CITATION_REGEXES = [
   {
     name: 'bare-basename',
     // file.ext loose in prose — dominant case in this repo's real fragment
-    regex: new RegExp('(?<![`\\w./\\-])([\\w\\-]+\\.' + CODE_EXT + ')(?![`\\w])', 'g'),
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-]+\\.' + CODE_EXT + ')(?![`\\w])', 'g'),
     description: 'Nome de arquivo solto na prosa, sem crases e sem barra.',
+  },
+  {
+    name: 'bare-path-traversal',
+    // Extensionless slash-joined tokens are ordinary prose ("e/ou", "N/A",
+    // "2026/08/04") far more often than they are a path — accepting the span
+    // itself would poison citations_total (measured: 311 -> 972, see T01
+    // repair). Only a candidate that actually contains a literal ".." path
+    // segment is traversal-shaped; `filter` (applied below, in the main loop)
+    // restricts extraction to that case, so the span is retained ONLY to
+    // report the containment rejection and must never become a filesystem
+    // probe.
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-@]+(?:/(?:[\\w.\\-@]+|\\.{1,2}))+)(?![`\\w])', 'g'),
+    description: 'Caminho solto sem extensao contendo segmento ".." mantido para reportar traversal.',
+    filter: (candidatePath) => candidatePath.split('/').includes('..'),
+  },
+  {
+    name: 'package-ref',
+    // `name@version` is a package/directory reference, not a file citation.
+    // Choice (a): enumerate it with a named reason instead of probing the disk
+    // or reporting a misleading generic not-found result. Version MUST be
+    // digit-led (`wdma@1.2.0`) — an unanchored `[\w-]+` after `@` also matches
+    // ordinary prose ("dev@empresa e mais"), see T01 repair.
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w-]+@\\d[\\w.\\-]*)(?![`\\w])', 'g'),
+    description: 'Referencia nome@versao (versao iniciada por digito), enumerada como pacote/diretorio.',
   },
 ];
 
@@ -119,13 +143,19 @@ function extractCitations(text) {
   if (typeof text !== 'string' || text.length === 0) return [];
 
   const found = []; // { raw, path, line, pattern, index }
-  for (const { name, regex } of CITATION_REGEXES) {
+  for (const { name, regex, filter } of CITATION_REGEXES) {
     regex.lastIndex = 0;
     let m;
     while ((m = regex.exec(text)) !== null) {
       const raw = m[0];
       const rawPath = m[1];
-      const line = m[2] ? parseInt(m[2], 10) : null;
+      const lineCapture = m[2] || m[3];
+      const line = lineCapture ? parseInt(lineCapture, 10) : null;
+
+      if (filter && !filter(rawPath)) {
+        if (regex.lastIndex === m.index) regex.lastIndex++;
+        continue;
+      }
 
       found.push({
         raw,
@@ -223,6 +253,10 @@ function resolveCitation(citation, cwd, index) {
 
     if (citation.pattern === 'dynamic') {
       return { state: 'UNRESOLVED', reason: 'dynamic' };
+    }
+
+    if (citation.pattern === 'package-ref') {
+      return { state: 'UNRESOLVED', reason: 'package-ref' };
     }
 
     const root = path.resolve(cwd);
