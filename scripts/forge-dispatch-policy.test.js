@@ -28,14 +28,16 @@ try {
   assert.strictEqual(schema.additionalProperties, false);
   assert.deepStrictEqual(schema.properties.reason_code.enum, policy.REASON_CODES);
 
+  const fixtureRoot = path.join(__dirname, 'fixtures', 'dispatch-security');
+  const published = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'role-matrix.json'), 'utf8'));
   const matrix = [];
-  for (const platform of ['win32', 'darwin', 'linux']) {
-    for (const host of ['claude', 'codex']) {
-      const common = { platform, host_runtime: host };
-      matrix.push(expect({ ...common, role: 'orchestrator', operation: 'read' }, 'allow', 'policy-allowed'));
-      matrix.push(expect({ ...common, role: 'worker', operation: 'write' }, 'allow', 'policy-allowed'));
-      matrix.push(expect({ ...common, role: 'reviewer', operation: 'read' }, 'allow', 'policy-allowed'));
-      matrix.push(expect({ ...common, role: 'observer', operation: 'read' }, 'allow', 'policy-allowed'));
+  for (const platform of published.platforms) {
+    for (const host of published.hosts) {
+      for (const role of published.roles) {
+        const result = expect({ platform, host_runtime: host, ...role }, 'allow', 'policy-allowed');
+        assert.strictEqual(result.sandbox_mode, role.sandbox_mode);
+        matrix.push(result);
+      }
     }
   }
   assert.strictEqual(matrix.length, 24);
@@ -49,16 +51,17 @@ try {
   assert(matrix.some((item) => item.host_runtime === 'claude' && item.projection.host === 'claude' && Array.isArray(item.projection.tools)));
   assert(matrix.some((item) => item.host_runtime === 'codex' && item.projection.host === 'codex' && item.projection.sandbox_mode === 'read-only'));
 
-  const vectors = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'dispatch-security', 'negative-vectors.json'), 'utf8')).vectors;
+  const vectors = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'negative-vectors.json'), 'utf8')).vectors;
   for (const vector of vectors) {
-    const result = expect(vector, 'deny', vector.reason_code);
+    const dynamic = { ...vector };
+    if (vector.target_kind === 'outside') dynamic.target = path.join(temp, 'outside.txt');
+    if (vector.target_kind === 'gsd') dynamic.target = path.join(workspace, '.gsd', 'STATE.md');
+    if (vector.target_kind === 'other-host-home') dynamic.target = path.join(homes.codex, 'config.toml');
+    const result = expect(dynamic, 'deny', vector.reason_code);
     assert.strictEqual(result.projection, null);
   }
-  expect({ role: 'worker', operation: 'write', target: path.join(temp, 'outside.txt') }, 'deny', 'target-outside-workspace');
   expect({ role: 'worker', operation: 'write', sandbox_mode: 'read-only' }, 'deny', 'role-permission-denied');
   expect({ role: 'worker', operation: 'spawn', spawn_cwd: temp }, 'deny', 'target-outside-workspace');
-  expect({ role: 'worker', operation: 'write', target: path.join(workspace, '.gsd', 'STATE.md') }, 'deny', 'protected-state-path');
-  expect({ role: 'worker', host_runtime: 'claude', operation: 'write', target: path.join(homes.codex, 'config.toml') }, 'deny', 'cross-host-home');
   expect({ role: 'worker', host_runtime: 'codex', operation: 'write', target: path.join(homes.claude, 'settings.json') }, 'deny', 'cross-host-home');
   expect({ role: 'worker', required_capabilities: ['state.write'] }, 'deny', 'role-permission-denied');
   expect({ role: 'executor', operation: 'apply' }, 'allow', 'policy-allowed');

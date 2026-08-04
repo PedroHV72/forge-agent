@@ -1,0 +1,10 @@
+{
+  "platforms": ["win32", "darwin", "linux"],
+  "hosts": ["claude", "codex"],
+  "roles": [
+    { "role": "orchestrator", "operation": "read", "sandbox_mode": "read-only" },
+    { "role": "worker", "operation": "write", "sandbox_mode": "workspace-write" },
+    { "role": "reviewer", "operation": "read", "sandbox_mode": "read-only" },
+    { "role": "observer", "operation": "read", "sandbox_mode": "read-only" }
+  ]
+}
