@@ -1,5 +1,20 @@
 ## [Unreleased]
 
+### Breaking
+
+- **`CURRENT_SCHEMA` moves from `fragment-store@1.0.0` to `fragment-store@2.0.0`**
+  (`scripts/forge-doctor.js`), in the same commit (`0e62d47`) that first makes the grouped
+  container format writable — deliberately, so that the directional guard PR 1 shipped
+  actually fires instead of standing decorative. The operational consequence is the point:
+  a `.gsd/` store is pushed by the VCS on its own, while the tooling only arrives when
+  someone runs `/forge-update`. A developer who receives data written by the new code
+  without having updated the tooling now gets the **write refused** by
+  `scripts/forge-schema-guard.js` (non-zero exit, data major ahead of understood major),
+  instead of readers silently skipping the fragments they cannot parse. Reads stay
+  fail-open with a loud warning. `scripts/forge-migrate.js` widens its already-migrated
+  shortcut to tolerate exactly one major behind, so the bump cannot resurrect the
+  documented `.bak` destructive-backup bug.
+
 ### Added
 
 - **Truncation that talks.** Both dispatch truncators — `truncateChars`/`boundStandards`/
@@ -28,6 +43,72 @@
   section enumerating which file citations resolved, which didn't and why
   (`not-found`/`ambiguous-basename`/`outside-root`/`dynamic`), and which facts carried no
   citation at all — a coverage gate that can't silently under-report.
+- **Epoch grouping: one byte-exact container per sealed quarter.** `scripts/forge-epoch.js`
+  derives `YYYY-QN` labels, sealed epochs and wrapper dirs from the store contents at
+  runtime — no cutoff date, no threshold constant. `scripts/forge-grouped-file.js` is the
+  container itself (`serializeGroup`/`parseGroup`, `grouped_format: forge-group@1`):
+  payloads travel as `Buffer` and are never decoded, so CRLF, BOM and a missing final
+  newline survive the round trip, and a member whose payload contains the delimiter is
+  refused and named rather than escaped or truncated. Member ids round-trip as UTF-8 in
+  all three marker positions — the first implementation encoded ASCII on write and decoded
+  ASCII on read, which made a container with a non-ASCII id permanently unparseable *after*
+  the originals were deleted. **All four fragment-store readers learned the format in this
+  same slice** (`forge-ledger.js`, `forge-decisions.js`, `forge-memory.js`, and
+  `forge-projection.js`/`forge-memory-index.js` via the per-store `readFragmentText(cwd,
+  entry)` accessor, replacing direct `fs.readFileSync(entry.path)`), because a format whose
+  readers ship later is a format that loses data in between. Loose beats grouped everywhere:
+  loose ids are collected before any container scan, and `writeFragment()` never edits a
+  container. `scripts/forge-epoch-group.js` is the `plan`/`apply`/`ungroup` engine, and
+  `forge-ids.listExistingIds` reads containers so sequential-id minting cannot reuse a
+  number that is now inside one.
+- **`scripts/forge-sweep-project.js`, a registry of operations rather than a script that
+  sweeps.** `scripts/forge-sweep-registry.js` (`createRegistry`) is generic over any
+  `{name, description, plan, apply}`: dry-run is the default, `run()` only asks for
+  confirmation after the preview has been computed, one failing operation does not abort
+  the others, and the skipped-items report is produced by the registry rather than by each
+  operation — proved by a fake operation that gets a full preview and skip report without
+  touching preview code. The CLI ships with exactly one operation registered
+  (`agrupar-epocas-seladas`) and a 0/1/2 exit contract.
+- **A VCS eligibility gate in front of anything destructive.**
+  `scripts/forge-sweep-eligibility.js` (`createEligibility`) is fail-closed: no VCS means
+  zero eligible targets, and exclusion is by **target**, not by member, naming the offending
+  file and its class instead of writing a silent partial. It rests on one additive export,
+  `workingStatus(cwd, opts)` in `scripts/forge-vcs.js` — a single status query
+  (`-uall -z --ignored` on git, `--no-ignore` on svn) classifying
+  untracked/ignored/added/modified, so callers never issue a second query to disambiguate a
+  path. Ignored or untracked *ancestor directories* fail closed too.
+- **`scripts/forge-wrapper-readers.js`, a frozen inventory of every enumerator of
+  `.gsd/milestones` and `.gsd/tasks`**, verdict-classified (`learned` / `breaks` /
+  `safe-by-construction`) and backed by a test that scans `scripts/` for real and fails by
+  set equality in both directions — a new reader with no entry, or an entry with no reader.
+  It exists because wrapper-dir grouping reaches a class of target whose readers never
+  learned the container format, which is why grouping those targets is gated:
+  `plan(cwd)` omits them, and `plan(cwd, { includeWrapperDirs: true })` is the sole named
+  opt-in, never exposed by the CLI (a test fails if the CLI ever grows one).
+- **`scripts/forge-legacy-residue.js`, a read-only detector** for the legacy multi-source
+  residue signature (a comma inside the *value* of `facts[].source_unit`, not in the raw
+  line) — `scanStore`/`classifyFact` plus a `--cwd --json` CLI, with no write path on disk.
+  A scanner failure now reports `store_error` and returns a distinct non-verdict, so an
+  unreadable store can never be rendered byte-identically to a clean one. See
+  **Not shipped** below for why it is the only thing S04 delivered.
+
+### Changed
+
+- **The citation extractor in `scripts/forge-memory-index.js` recognises the file forms it
+  was missing**: a wider extension vocabulary (`tsx`, `jsx`, `vue`, `html`, `css`, `scss`,
+  `aspx`, `svg`), `@` accepted inside a path segment (so a versioned directory such as
+  `SERVICES/services@1.2.0/...` stops being truncated), dotted basenames aligned between the
+  backticked and bare variants, and two new patterns (`package-ref` for `name@version` with
+  a digit-led version, `bare-path-traversal` which reports a containment rejection and never
+  probes the disk). Measured against the real WDMA store, same store state on both sides:
+  `facts_with_resolved` 117→177, `citations_resolved` 144→227, `files_indexed` 72→126.
+- **Coverage reports three labelled buckets instead of one.** `facts_no_file_mention` (a),
+  `facts_missed_by_extractor` (b, enumerated with `mem_id`/`storage_key`/`sample_token`) and
+  `facts_unresolved_only` (c) are all derived by `filter()` from a single classification
+  list, never by parallel counters, and the sum identity is locked **per fact** and tested:
+  `facts_total = facts_with_resolved + (a) + (b) + (c)` (`177+416+5+109=707` on the real
+  store). Per-fact is a conscious trade-off with a known cost, recorded in the open review
+  items below.
 
 ### Fixed
 
@@ -52,6 +133,48 @@
   matches" and diffs refused to display. Escaped, byte-behaviour-identical, and now locked
   by a new `forge-smoke.js` section that scans `scripts/*.js` for `0x00`/`0x0b`/`0x0c` with
   an anti-silence floor (0 files scanned is a failure, not a clean pass).
+
+- **`docs/memory-index-citation-coverage.md`** names the cause of the unresolved citations
+  instead of inheriting a hypothesis. The 261 unresolvable citations decompose by reason
+  with the sum closing (`94+94+53+16+4=261`), and the tie is the finding: `not-found` and
+  `ambiguous-basename` land on **94 each**, which **refutes** the D5-inherited hypothesis
+  that file renaming dominated. The clearer structural cause is basename ambiguity in a
+  directory-versioned monorepo. Two backlogs are named rather than fixed here
+  (`BACKLOG-MEMORY-STORE-SKIP-28` — 28 of 145 fragments outside the index;
+  `BACKLOG-UNRESOLVED-CITATION-POLICY`), because correcting the cause would reopen the very
+  numbers this table measures.
+- `scripts/forge-migrate.js`'s header comment described a rule the code does not implement
+  (the already-migrated shortcut accepts any stamp not newer than `CURRENT_SCHEMA`, not
+  "exactly one major behind"). Comment-only diff.
+
+### Not shipped
+
+- **S04 (legacy-residue cleanup) was cut by its own gate, with verdict `NO-TARGET`.** The
+  slice opened with a precision gate that had to produce a verdict before a line of cleanup
+  was written, and the verdict was measured against the real WDMA store: the D9 signature
+  matched **0 facts out of 707 evaluated across 117 fragments, with 0 false positives**
+  (negative control: a naive line grep "matches" 64, all of them the JSON end-of-line comma,
+  i.e. the record delimiter rather than the data). The cut is informative rather than empty,
+  because the residue *does* exist — roughly 25 multi-source entries, the largest `MEM077`
+  with 11 sources — but it lives in the **markdown body** of `.gsd/memory/legacy-orphan.md`
+  in the legacy `- source: a, b, c` form, outside `facts[].source_unit`, which is the only
+  surface the D9 signature inspects. Widening the signature is a re-scope of D9 and an
+  operator decision, so it was not taken here; the count is recorded as named backlog. The
+  cleanup engine (T02) and its registration as operation #2 (T03) were therefore never
+  dispatched. What stays on the branch is the read-only detector and its 19 tests.
+
+**Open review items.** This entry does not describe a clean branch. Six dialectic-review
+objections are **open and pending operator triage**: S05 R3 (the CLI is inert on `.gsd/` in
+this repository, and both proposed remediations weaken the eligibility gate that was just
+built — a product decision, not a mechanical repair), S05 R9 (the fail-closed test sits
+behind `if (gitAvailable())` with no mock and no hard fail), S05 R13 (`shell:false` in
+`optionsFor()` is outside the literal scope of the plan), S05 R16 (wrapper targets vanish
+from `skipped` while the gate is closed, and silence is indistinguishable from a broken
+detector), S06 R3 (`facts_missed_by_extractor` counts only **total** loss — a fact with
+three citations of which one resolves is never enumerated as missed, so the published `5`
+reads as a defect count without that qualifier) and S06 R4 (`package-ref` and `dynamic` fall
+into the bucket rendered as "could not be located" although they are, by design, not files
+at all).
 
 ## v4.1.0 — What a project is, and what the screen may claim about it
 
