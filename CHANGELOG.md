@@ -190,20 +190,23 @@
   cleanup engine (T02) and its registration as operation #2 (T03) were therefore never
   dispatched. What stays on the branch is the read-only detector and its 19 tests.
 
-**Open review items.** This entry does not describe a clean branch. Six dialectic-review
-objections are **open and pending operator triage**: S05 R3 (the CLI is inert on `.gsd/` in
-this repository, and both proposed remediations weaken the eligibility gate that was just
-built — a product decision, not a mechanical repair; **S08's undo journal resolves the
-substance** — the command is no longer inert on the `.gsd/`-ignored case once a tool-undo
-guarantee exists — but the item is left open for the operator to close formally rather
-than closed unilaterally here), S05 R9 (the fail-closed test sits behind `if
-(gitAvailable())` with no mock and no hard fail), S05 R13 (`shell:false` in `optionsFor()`
-is outside the literal scope of the plan), S05 R16 (wrapper targets vanish from `skipped`
-while the gate is closed, and silence is indistinguishable from a broken detector), S06 R3
-(`facts_missed_by_extractor` counts only **total** loss — a fact with three citations of
-which one resolves is never enumerated as missed, so the published `5` reads as a defect
-count without that qualifier) and S06 R4 (`package-ref` and `dynamic` fall into the bucket
-rendered as "could not be located" although they are, by design, not files at all).
+**Review triage — six objections arbitrated, all closed.** S05 R3 closed with **no code
+change**: both proposed remediations (widening `--force`, adding a dedicated
+`--force-untracked`) were rejected as weakening the eligibility gate that was just built;
+**S08's undo journal resolves the substance instead** — `tool-undo` makes
+`untracked`/`ignored` targets eligible without `--force` at all. S05 R9 closed: the
+fail-closed test no longer passes green without git — the suite now exits non-zero unless
+`FORGE_ALLOW_NO_GIT=1` is set, removing the silent-skip-behind-`if (gitAvailable())` path.
+S05 R13 closed: the `shell:false` hardening in `optionsFor()` is **kept** — reverting
+correct hardening to satisfy scope discipline would make the module worse — and the scope
+deviation is recorded rather than undone. S05 R16 closed: the D11 gate stays closed, but
+the count of protected wrapper dirs is now always reported, so a wrapper target vanishing
+from `skipped` is no longer indistinguishable from a broken detector. S06 R3/R4 closed:
+the coverage labels are corrected to state exactly what they measure — no new bucket was
+added and the four-way sum identity is untouched, only the wording changed to stop
+`facts_missed_by_extractor` reading as a defect count it never was, and to stop
+`package-ref`/`dynamic` rendering as "could not be located" when they are, by design, not
+files at all.
 
 **S09 — the calendar axis is gone; sweeps are triggered, not scheduled.**
 
@@ -274,21 +277,37 @@ rendered as "could not be located" although they are, by design, not files at al
   timestamps and an advisory sha256 of the container — **never** the label — so a journal
   line written against an old `YYYY-QN` container still undoes correctly after this slice.
   Exercised directly rather than left as an inherited claim (`S09-RISK.md` W5).
+- **`sealedBy: PRECISION` disagreement resolved by narrowing proof (b), not by picking a
+  side.** The precision test the slice wrote about itself (`sealedBy: PRECISION — a live
+  unit is refused with a reason, surrounded by eligible ones`) showed that a milestone id's
+  embedded timestamp records **creation**, not closure — a still-open milestone with no
+  ledger entry was passing proof (b) on the strength of its id alone. Proof (b) now trusts
+  a bare embedded timestamp directly only for `ask-*` session ids; a milestone/task id
+  additionally requires the ledger check that proof (a) already performs. The test that
+  exposed the disagreement now passes without being weakened.
+- **Proof (c) narrowed a third time by an independent cross-family challenger** (the S09
+  review ran with a Codex challenger against Claude-authored code): the objection was that
+  a shape `parseStorageKey` rejects is evidence the parser won't write it *today*, not proof
+  that no future code path ever will — parser rejection is not the same claim as permanent
+  unwritability. Resolved **not by narrowing eligibility again** but by persisting the
+  admitting proof per member (which of (a)/(b)/(c) qualified it, recorded alongside the
+  member) and pinning the rejection grammar itself with a test that names the consequence
+  of a future parser change, so a later widening of `parseStorageKey` fails loudly instead
+  of silently re-admitting members proof (c) already sealed.
 
-### Known issue — not fixed in this slice, by design
+### Dogfood — one bug live proof-of-narrowing missed, found by running the tool for real
 
-- **`scripts/forge-sweep-sealed.test.js` has one failing assertion** (`sealedBy: PRECISION
-  — a live unit is refused with a reason, surrounded by eligible ones`), introduced by T02
-  and left unfixed per this task's own instruction (verification tasks report, they do not
-  repair). The test expects a milestone id with an embedded timestamp but **no** ledger
-  entry (`M-20260601000000-still-open`) to be refused as "still live"; the implementation,
-  and every *other* test in the same file (`sealedBy: proof (b) id-date`, the `ordering`
-  test using a bare `M-<14>-fixture` id), instead treats **any** id carrying a valid
-  embedded timestamp as satisfying proof (b) regardless of ledger status — which is also
-  what `S09-PLAN.md`/the governing decision record describe proof (b) as doing ("ids
-  timestamp (`M-<14>`, forma dashed)", not qualified to `ask-*` only). The test and the
-  design it sits next to disagree with each other; which side is wrong is a call for the
-  operator, not for this verification task. See `S09-SUITE.md` for the measured detail.
+- **Preview run against the real reference store** (dry-run only, nothing applied) turned
+  up a `high` bug that no earlier mechanism — not the three narrowings above, not the 21
+  review objections across the milestone — caught: proof (b)'s regexes anchored on
+  `^ask-<digits>`, but every real session id on disk carries a **doubled** `ask-` prefix
+  (`ask-ask-<date>`), so the anchor matched **zero** real fragments and every `ask-*`
+  fragment fell through to "no proof" regardless of how old it was. Fixed by matching the
+  doubled prefix. Under the calendar axis the same store measured 222 eligible members;
+  under the corrected sweep rule it measures **508 of 529 members eligible, 21 skipped with
+  a reason, and the totals reconcile** (`508 + 21 = 529`).
+
+**Review across the milestone: 21 objections raised, 21 closed, zero open.**
 
 ## v4.1.0 — What a project is, and what the screen may claim about it
 
