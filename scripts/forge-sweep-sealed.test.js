@@ -188,6 +188,26 @@ test('sealedBy: PRECISION — a live unit is refused with a reason, surrounded b
   assert.strictEqual(eligible2.groupable, true);
 });
 
+test('sealedBy: milestone-shaped timestamp id WITHOUT ledger entry is refused — proof (b) is closure-only', () => {
+  const result = sealedBy({ id: 'M-20260619010251-re-estilizacao-mobile' }, { ledgerIds: new Set() });
+  assert.strictEqual(result.groupable, false);
+  assert.strictEqual(typeof result.reason, 'string');
+  assert.ok(result.reason.length > 0);
+});
+
+test('sealedBy: same milestone-shaped timestamp id WITH ledger entry passes by proof (a), not (b)', () => {
+  const ledgerIds = new Set(['M-20260619010251-re-estilizacao-mobile']);
+  const result = sealedBy({ id: 'M-20260619010251-re-estilizacao-mobile' }, { ledgerIds });
+  assert.strictEqual(result.groupable, true);
+  assert.strictEqual(result.proof, 'ledger');
+});
+
+test('sealedBy: ask-<date> session id still passes by proof (b) with no ledger entry', () => {
+  const result = sealedBy({ id: 'ask-2026-06-02-1004' }, { ledgerIds: new Set() });
+  assert.strictEqual(result.groupable, true);
+  assert.strictEqual(result.proof, 'id-date');
+});
+
 test('sealedBy: bare local key (S02) is skipped with a reason, never grouped — B1 narrowing', () => {
   const result = sealedBy({ id: 'S02' }, { ledgerIds: new Set() });
   assert.strictEqual(result.groupable, false);

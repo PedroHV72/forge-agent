@@ -82,12 +82,31 @@ const ASK_COMPACT_DATE_RE = /^ask-(\d{4})(\d{2})(\d{2})(?:[-_].*)?$/;
 function dateInId(id) {
   if (typeof id !== 'string' || !id) return null;
 
+  const closure = closureDateInId(id);
+  if (closure) return closure;
+
   const canonical = timestampOf(id);
   if (canonical) {
     const date = dateFromCanonicalTimestamp(canonical);
     if (date) return date;
   }
 
+  return null;
+}
+
+// ── closureDateInId — the ONLY dates that satisfy proof (b) ────────────────
+// A date embedded in an id proves closure only when the id's OWN semantics
+// mean the date is a point in time that is never revisited — a session id
+// (`ask-<date>`). A milestone/task id's embedded timestamp is CREATION time,
+// not closure — a milestone can still be open (unmerged, no ledger entry)
+// long after its timestamp, and the currently-executing milestone is exactly
+// that shape. Grouping on creation-timestamp alone would let the next write
+// to a still-open milestone/task miss the loose fragment and shadow
+// accumulated memory — the precise hazard this slice exists to prevent.
+// Canonical (M-/T-) timestamp ids therefore fall through to proof (a)
+// (ledger) instead; dateInId() above still surfaces their date as metadata
+// once grouped by ledger, but sealedBy()'s proof (b) must not use it.
+function closureDateInId(id) {
   let match = ASK_DASHED_DATE_RE.exec(id);
   if (match) {
     const date = validDateFromParts(match[1], match[2], match[3]);
@@ -154,8 +173,11 @@ function sealedBy(unit, ctx) {
     return { groupable: true, proof: 'ledger', date: dateInId(id) };
   }
 
-  // (b) date embedded in the id.
-  const date = dateInId(id);
+  // (b) date embedded in the id — ONLY closure-semantics ids (ask-<date>
+  // sessions). A milestone/task's embedded timestamp is creation time, not
+  // closure, and must fall through to proof (a)/(c) instead (see
+  // closureDateInId above).
+  const date = closureDateInId(id);
   if (date) {
     return { groupable: true, proof: 'id-date', date };
   }
