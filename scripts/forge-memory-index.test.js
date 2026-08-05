@@ -196,9 +196,9 @@ test('false negative: dotted JavaScript basename outside backticks', () => {
 });
 
 test('false negative: name@version is enumerated as package-ref', () => {
-  const cites = extractCitations('o pacote wdma@1.2.0 foi citado');
+  const cites = extractCitations('o pacote acme@1.2.0 foi citado');
   assertEq(cites.length, 1);
-  assertEq(cites[0].path, 'wdma@1.2.0');
+  assertEq(cites[0].path, 'acme@1.2.0');
   assertEq(cites[0].pattern, 'package-ref');
   const resolved = resolveCitation(cites[0], process.cwd(), null);
   assertEq(resolved.reason, 'package-ref');
@@ -275,7 +275,7 @@ test('expanded extension scan remains linear on slash-dense traversal input', ()
 });
 
 // ── Section 1B: extensionless prose must not be extracted (T01 repair) ──────
-// Measured against the real WDMA store: an unfiltered `bare-path-traversal`
+// Measured against the real reference store: an unfiltered `bare-path-traversal`
 // plus an unanchored `package-ref` inflated citations_total 3.1x (311 -> 972)
 // by matching ordinary prose. Each case below is real prose, not a citation.
 console.log('\nSection 1B: extensionless prose must not be extracted\n');
@@ -302,7 +302,7 @@ test('extensionless "SERVICES/services" without traversal is not extracted', () 
 
 test('prose "dev@empresa" is not extracted as package-ref (no digit-led version)', () => {
   const cites = extractCitations('contato dev@empresa e mais');
-  assertEq(cites.length, 0, 'package-ref requires a digit-led version like wdma@1.2.0');
+  assertEq(cites.length, 0, 'package-ref requires a digit-led version like acme@1.2.0');
 });
 
 test('guard: a small fixture of junk lines extracts nothing, citations_total must not inflate', () => {

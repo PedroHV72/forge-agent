@@ -127,7 +127,7 @@
   `SERVICES/services@1.2.0/...` stops being truncated), dotted basenames aligned between the
   backticked and bare variants, and two new patterns (`package-ref` for `name@version` with
   a digit-led version, `bare-path-traversal` which reports a containment rejection and never
-  probes the disk). Measured against the real WDMA store, same store state on both sides:
+  probes the disk). Measured against the real reference store, same store state on both sides:
   `facts_with_resolved` 117→177, `citations_resolved` 144→227, `files_indexed` 72→126.
 - **Coverage reports three labelled buckets instead of one.** `facts_no_file_mention` (a),
   `facts_missed_by_extractor` (b, enumerated with `mem_id`/`storage_key`/`sample_token`) and
@@ -178,7 +178,7 @@
 
 - **S04 (legacy-residue cleanup) was cut by its own gate, with verdict `NO-TARGET`.** The
   slice opened with a precision gate that had to produce a verdict before a line of cleanup
-  was written, and the verdict was measured against the real WDMA store: the D9 signature
+  was written, and the verdict was measured against the real reference store: the D9 signature
   matched **0 facts out of 707 evaluated across 117 fragments, with 0 false positives**
   (negative control: a naive line grep "matches" 64, all of them the JSON end-of-line comma,
   i.e. the record delimiter rather than the data). The cut is informative rather than empty,
@@ -752,7 +752,7 @@ The previous `disable-model-invocation: true` flag (added in v1.16.0 because the
 
 ## v1.16.0 (2026-05-22) — forge-sweep skill
 
-New maintenance skill, promoted from a project-local draft used in production (WDMA / custody-transfer).
+New maintenance skill, promoted from a project-local draft used in production (a reference deployment / custody-transfer).
 
 ### Added
 

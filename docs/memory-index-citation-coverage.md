@@ -1,4 +1,4 @@
-# Cobertura de citações do índice de memória — diagnóstico WDMA
+# Cobertura de citações do índice de memória — diagnóstico do store de referência
 
 Este documento registra a cobertura produzida por `scripts/forge-memory-index.js`: o
 índice associa fatos de memória a arquivos apenas quando uma citação em prosa pode ser
@@ -12,16 +12,16 @@ A medição de **depois** foi refeita em 2026-08-04, após as correções de rev
 abaixo. Os números desta página são a saída dessa execução, não valores editados à mão:
 
 ```text
-node scripts/forge-memory-index.js --cwd "C:/SVN/CMA/WDMA" --json
+node scripts/forge-memory-index.js --cwd "<REF_STORE_ROOT>" --json
 ```
 
-Ele usou `--json`, sem `--write` e sem `--out`; portanto leu o WDMA e não escreveu
-arquivo nele. Nenhum comando `svn` foi usado. A saída foi consumida em memória para a
-análise, e não foi despejada neste documento.
+Ele usou `--json`, sem `--write` e sem `--out`; portanto leu o store de referência e não
+escreveu arquivo nele. Nenhum comando `svn` foi usado. A saída foi consumida em memória
+para a análise, e não foi despejada neste documento.
 
-Decisão de divulgação: o caminho de checkout aparece uma única vez, no comando exato
-necessário à auditoria. Ele é tratado como raiz de checkout, não como credencial; fora
-desse comando, este texto usa `<WDMA_ROOT>`. Não há caminho absoluto da máquina autora.
+Decisão de divulgação: o caminho de checkout foi substituído pelo placeholder
+`<REF_STORE_ROOT>`, tratado como raiz de checkout, não como credencial. Não há caminho
+absoluto da máquina autora neste documento.
 Os identificadores `mem_id` abaixo foram preservados como evidência verificável, mas não
 foram publicados `storage_key`, nomes de cliente, hostname, URL interna, credencial ou
 texto integral de fato. Cada amostra foi lida antes da inclusão e não continha esses
@@ -135,7 +135,7 @@ recusa corretamente a adivinhar qual deles a memória queria dizer.
 ### Amostras lidas de `ambiguous-basename`
 
 As cinco amostras a seguir foram verificadas individualmente no store e na varredura de
-arquivos de `<WDMA_ROOT>`. A citação é apresentada em código, fora de tabela, para que
+arquivos de `<REF_STORE_ROOT>`. A citação é apresentada em código, fora de tabela, para que
 caracteres de prosa não possam quebrar Markdown. “Procurado” descreve exatamente a busca
 por basename que a CLI fez; não expõe a lista de diretórios internos.
 
@@ -198,4 +198,4 @@ O artefato é somente diagnóstico derivado. A task de diagnóstico que o escrev
 alterou `scripts/`; a correção de review posterior alterou (guarda de sufixo e exigência
 de ponto em `package-ref`, além de rótulos do render), e por isso os números acima foram
 **remedidos**, não editados. Em nenhum momento este documento gerou índice sob `.gsd/`
-nem escreveu no WDMA: toda leitura do checkout foi feita com `--json`.
+nem escreveu no store de referência: toda leitura do checkout foi feita com `--json`.

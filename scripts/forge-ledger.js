@@ -607,7 +607,7 @@ function runSmokeRegression() {
     // do. fragmentPath() used to throw for task IDs, breaking post-task
     // housekeeping and the /forge-sweep LEDGER guard. Cover both the timestamp
     // (T-<ts>-<slug>) and legacy (TASK-###) task ID forms.
-    const taskIds = ['T-20260618020926-wdma-fechar-modal', 'TASK-007'];
+    const taskIds = ['T-20260618020926-demo-fechar-modal', 'TASK-007'];
     for (const taskId of taskIds) {
       let threw = false;
       try {
@@ -640,7 +640,7 @@ function runSmokeRegression() {
     try {
       const projection = require('./forge-projection');
       const renderedWithTasks = projection.renderLedger(smokeCwd);
-      assert('renderLedger: contains timestamp task heading', renderedWithTasks.includes('## T-20260618020926-wdma-fechar-modal'), true);
+      assert('renderLedger: contains timestamp task heading', renderedWithTasks.includes('## T-20260618020926-demo-fechar-modal'), true);
       assert('renderLedger: contains legacy task heading', renderedWithTasks.includes('## TASK-007'), true);
     } catch (e) {
       console.log('FAIL: renderLedger (tasks) threw: ' + e.message);

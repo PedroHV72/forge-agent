@@ -9,7 +9,7 @@
 //   - anti-naive-grep: a file whose raw lines end in a JSON delimiter comma
 //     right after the source_unit value is matched by a line-level regex and
 //     NOT matched by the detector.  This is the exact false-positive class the
-//     gate exists to catch (a line grep returns 64 of them in the WDMA store).
+//     gate exists to catch (a line grep returns 64 of them in the reference store).
 //   - enumeration coverage: items.length === population.facts, no fact escapes
 //     the report without a verdict
 //   - read-only: file list + mtimes identical before and after scanStore, and

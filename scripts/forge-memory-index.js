@@ -86,7 +86,7 @@ const CITATION_REGEXES = [
     // `name@version` is a package/directory reference, not a file citation.
     // Choice (a): enumerate it with a named reason instead of probing the disk
     // or reporting a misleading generic not-found result. Version MUST be
-    // digit-led (`wdma@1.2.0`) — an unanchored `[\w-]+` after `@` also matches
+    // digit-led (`acme@1.2.0`) — an unanchored `[\w-]+` after `@` also matches
     // ordinary prose ("dev@empresa e mais"), see T01 repair.
     //
     // S06 R10: the digit anchor alone still matched prose handles with a year

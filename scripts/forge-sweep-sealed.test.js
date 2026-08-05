@@ -122,7 +122,7 @@ test('dateInId: ask-<YYYYMMDD> compact form also yields a Date', () => {
   assert.ok(date instanceof Date);
 });
 
-// The REAL shape in the WDMA store — forge-ask's session-id minting doubles
+// The REAL shape in the reference store — forge-ask's session-id minting doubles
 // the `ask-` prefix (`ask-ask-<date>-<time>`). Both regexes used to anchor
 // right after the FIRST `ask-`, which matched only the invented single-
 // prefix shape used by the fixtures above and admitted ZERO real fragments
@@ -218,7 +218,7 @@ test('sealedBy: proof (b) id-date — ask-* single prefix with NO ledger entry',
   assert.ok(result.date instanceof Date);
 });
 
-// The real WDMA store shape (dogfood F4) — every one of the 10 ask-* session
+// The real reference store shape (dogfood F4) — every one of the 10 ask-* session
 // fragments there carries this doubled `ask-ask-` prefix.
 test('sealedBy: proof (b) id-date — ask-ask-* DOUBLED prefix (the real store shape)', () => {
   const result = sealedBy({ id: 'ask-ask-2026-05-29-1403' }, { ledgerIds: new Set() });

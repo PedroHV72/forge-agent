@@ -77,7 +77,7 @@ function dateFromCanonicalTimestamp(ts) {
 // prepends `ask-` to an id that already starts with `ask-`). Anchoring the
 // date match right after the FIRST `ask-` (the old ASK_DASHED_DATE_RE /
 // ASK_COMPACT_DATE_RE below) matched a shape that only ever existed in the
-// test fixtures — every real fragment in the WDMA store failed both regexes
+// test fixtures — every real fragment in the reference store failed both regexes
 // and fell through to "no proof", the literal repeat of PR 1's F2. Fix:
 // gate on memory.ASK_ID_RE (the actual `ask-<anything>` validity check,
 // already used by forge-memory.js and forge-decisions.js) and THEN look for
