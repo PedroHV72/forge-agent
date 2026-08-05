@@ -1182,19 +1182,39 @@ Challenger routing (`review.challenger: claude|codex|gemini`) follows `shared/fo
 
 **Pairing resolution (`challenger`/`advocate: auto`).** When either axis reads `auto`, run `shared/forge-review.md § "Resolução de pairing (auto)"` unchanged, with the **task-unit scoping** called out there: skip `--slice`/`--milestone` entirely, filter `$WORKING_DIR/.gsd/forge/events.jsonl` by `e.unit === "execute-task/{TASK_ID}"` (usually one dispatch event, but cross-engine resumes of the same loose task can produce more than one), then call `forge-review-pairing.js --events "$SCOPED" --cwd "$WORKING_DIR" --challenger "$CHALLENGER" --advocate "$ADVOCATE" --policy last` (no `--slice`/`--milestone`). The task boundary always passes `--policy last` — **last-dispatch-wins**, not majority: the engine of the most recent matching dispatch is the author, since that is the engine that actually produced the final `START_SHA..HEAD` diff (with 3+ dispatches an older-engine majority could otherwise outvote the latest execution). This yields the same `$RESOLVED_CHALLENGER`/`$RESOLVED_ADVOCATE`/`$AUTHOR_ENGINE`/`$PAIR_MODE`/`$PAIR_POLICY`/`$PAIRING_LINE` used by the per-slice boundary — consumed identically from here on (Steps 2/3/4/6 of the shared spec). `$PAIRING_LINE` reflects `(last-dispatch)` as the applied policy for this boundary.
 
-**Compute DIFF_CMD** (task boundary — START_SHA marker). In `worktree` mode the commits live in `CODE_DIR`, so every git call targets it via `git -C`:
+**Compute DIFF_CMD** (task boundary). VCS-aware — git keeps the `START_SHA` marker path unchanged; an SVN working copy routes through `scripts/forge-review-diff.js` (M017 Phase 2). In `worktree` mode the commits live in `CODE_DIR`, so every VCS call targets it.
 
-> Limitation declared: SVN review scoping via `svn diff` is Phase 2 and outside M017. In a SVN working copy the baseline marker is recorded, but `DIFF_CMD` remains git-only and degrades to “no diff to review”, exactly as before (no regression).
+**SVN — write the unit manifest first.** The manifest is what keeps the review inside this unit's work: an SVN working copy has no per-slice branch and is routinely shared by several developers at once, so an unscoped `svn diff` carries a colleague's uncommitted files. Emit the result block's `files_changed` paths, one per line. This file is optional — `--unit-dir` also mines the task's own `*-PLAN.md`/`*-SUMMARY.md` — and an empty/absent manifest degrades to today's unscoped diff, never to an empty one:
+```bash
+printf '%s\n' {files_changed paths from the ---GSD-WORKER-RESULT--- block, one per line} \
+  > .gsd/tasks/{TASK_ID}/.review-manifest 2>/dev/null || true
+```
+
 ```bash
 GIT_DIR_FLAG="-C ${CODE_DIR:-.}"
 START_SHA=$(cat .gsd/tasks/{TASK_ID}/.start-sha 2>/dev/null || echo "")
-if [ -n "$START_SHA" ] && git $GIT_DIR_FLAG rev-parse "$START_SHA" >/dev/null 2>&1 && [ "$START_SHA" != "$(git $GIT_DIR_FLAG rev-parse HEAD 2>/dev/null)" ]; then
-  DIFF_CMD="git $GIT_DIR_FLAG diff ${START_SHA}..HEAD"
+if git $GIT_DIR_FLAG rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if [ -n "$START_SHA" ] && git $GIT_DIR_FLAG rev-parse "$START_SHA" >/dev/null 2>&1 && [ "$START_SHA" != "$(git $GIT_DIR_FLAG rev-parse HEAD 2>/dev/null)" ]; then
+    DIFF_CMD="git $GIT_DIR_FLAG diff ${START_SHA}..HEAD"
+  else
+    DIFF_CMD="git $GIT_DIR_FLAG diff HEAD"
+  fi
+elif svn info "${CODE_DIR:-.}" >/dev/null 2>&1; then
+  MANIFEST_FLAG=""
+  [ -s .gsd/tasks/{TASK_ID}/.review-manifest ] && MANIFEST_FLAG=" --paths-file \"$WORKING_DIR/.gsd/tasks/{TASK_ID}/.review-manifest\""
+  DIFF_CMD="node \"$FORGE_SCRIPTS_DIR/forge-review-diff.js\" --cwd \"${CODE_DIR:-.}\" --unit-dir \"$WORKING_DIR/.gsd/tasks/{TASK_ID}\"$MANIFEST_FLAG"
+  # Only this branch answers --scope-report; asking git would rely on where it
+  # happens to print its usage text.
+  SCOPE_REPORT=$(eval "$DIFF_CMD" --scope-report 2>/dev/null || echo "")
 else
   DIFF_CMD="git $GIT_DIR_FLAG diff HEAD"
 fi
 ```
 `git diff HEAD` is the fallback for `auto_commit: false` (working-tree changes) or when no commit happened. If `$DIFF_CMD` is empty → write a minimal `{TASK_ID}-REVIEW.md` ("no diff to review") and skip the dispatches.
+
+**SVN baseline is intentionally inert.** `.start-sha` still records `svnversion` output, and the SVN branch deliberately ignores it: in a mixed-revision working copy that value looks like `44531:44534M`, which `svn diff -r` does not accept — and diffing against a recorded revision in a SHARED working copy would pull in every *other* developer's commits landed since, the opposite of the scoping above. The reviewable change is the uncommitted work against BASE. Same precedent as `forge-vcs.js svnPostChanges`.
+
+**Record the scope in the artifact** — a review that skipped files must say so. `$SCOPE_REPORT` (set in the SVN branch above; empty on git, so nothing is written) is carried into `{TASK_ID}-REVIEW.md` by the Step 6 binding below.
 
 **Pattern scan.** Grep changed files (`$DIFF_CMD --name-only`) for the same risky patterns as forge-completer step 4a → `PATTERN_HITS`.
 
@@ -1211,6 +1231,7 @@ TaskCreate({ subject: "[{TASK_ID}] review", activeForm: "review · forge-reviewe
 - **Rebuttal** × `rounds` (default 1) → `forge-reviewer` with `DEFENSE` injected (rebuttal mode).
 - The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literals are a violation detected by `forge-review-audit.js`.
 - **Resolve** via the Step 5 truth table; write the dialogue to `{TASK_ID}-REVIEW.md` (Step 6 template, `## Pattern hits` from `PATTERN_HITS`). The header carries the `**Pairing:**` line (`$PAIRING_LINE`, assembled in Step 0 of the shared spec) exactly as in `S##-REVIEW.md` — boundary-agnostic, no task-specific variant.
+- **Scope disclosure (SVN only).** When `$SCOPE_REPORT` is non-empty, append a `## Escopo do diff (SVN)` section stating `reason`, the reviewed paths (`scoped`) and — explicitly — the `excluded` ones. Silent truncation reads as "everything was reviewed"; a `reason` of `unscoped:*` means the manifest did not apply and the whole working copy was read, which the operator must be able to see.
 - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{TASK_ID}` with `model: '{RF_ALIAS}'` only when non-empty.
 - **OPEN items (Step 7b):** for each, `AskUserQuestion` live (`Manter` / `Refatorar agora` — dispatches a `review-fix` unit / `Criar follow-up`) and record the decision.
   - `Criar follow-up` → create an item per `shared/forge-review.md § Item capture`: `source: review/{TASK_ID}/{R#}`, `origin: auto`, `status: inbox`, `file`/`sha` from the objection's `path:line` + HEAD sha.
@@ -1242,9 +1263,9 @@ Do NOT amend the `feat({TASK_ID})` commit — create a distinct follow-up.
 
 After: `TaskUpdate({ status: "completed" })`, `session_units += 1`.
 
-Clean up `.start-sha` marker:
+Clean up the review scratch markers:
 ```bash
-rm -f .gsd/tasks/{TASK_ID}/.start-sha
+rm -f .gsd/tasks/{TASK_ID}/.start-sha .gsd/tasks/{TASK_ID}/.review-manifest
 ```
 
 ---
