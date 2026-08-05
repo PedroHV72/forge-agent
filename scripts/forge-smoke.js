@@ -2486,6 +2486,56 @@ function smokeChallengerWiring() {
   assert(spec.includes('Challenger:'), 'spec Step 6 has Challenger: header', 'token "Challenger:" not found');
   assert(spec.includes('"challenger"'), 'spec Step 8 event has challenger field', 'token \'"challenger"\' not found');
   assert(spec.includes('scripts/forge-xllm.js'), 'spec invokes the forge-xllm.js adapter', 'token not found');
+
+  // ── Step 8 is machine-emitted ────────────────────────────────────────────
+  // The hand-written template produced 151 key shapes over 265 events in a real
+  // workspace and zero conformant rows, so the spec must route Step 8 through the
+  // emitter and say so. Grepping the markdown only proves the instruction exists;
+  // the shape itself is asserted behaviorally in forge-review-emit.test.js.
+  assert(spec.includes('forge-review-emit.js'), 'spec Step 8 calls the event emitter', 'token not found');
+  assert(spec.includes('Never hand-write this row'), 'spec Step 8 forbids hand-writing the event', 'prohibition not found');
+  assert(/derived by the emitter/.test(spec), 'spec states intra_family_debate is derived, not passed', 'token not found');
+  // The derivation must not excuse the shipped default (claude author, claude
+  // challenger, claude advocate) as "not a collapse" — that clause would pin the
+  // flag at false on every default-configured review, which is the silence the
+  // emitter was built to end. And the author has to be IN the row: a reader who
+  // cannot see it cannot recompute the flag it was derived from.
+  assert(spec.includes('"author_engine"'), 'spec Step 8 event carries author_engine', 'token \'"author_engine"\' not found');
+  assert(
+    /`--author-engine` is required/.test(spec),
+    'spec Step 8 requires --author-engine',
+    'an author the emitter cannot resolve must be refused, never derived as false'
+  );
+
+  // ── Step 3 can route to an external defender ─────────────────────────────
+  // Without this branch `advocate: auto` is decorative for a GPT/Gemini author:
+  // pairing resolves the author's family and Step 3 has nowhere to send it.
+  assert(spec.includes('--mode defend'), 'spec Step 3 has the external defend branch', 'token "--mode defend" not found');
+  assert(spec.includes('XLLM_ENGINE_ADVOCATE'), 'spec Step 3 derives the advocate engine', 'token not found');
+  assert(
+    /recompute `INTRA_FAMILY`/.test(spec),
+    'spec recomputes INTRA_FAMILY when the external advocate falls back',
+    'a fallback that keeps the pre-fallback pairing in the artifact is the drift the gate exists to surface'
+  );
+  assert(
+    spec.includes("'claude','codex','gemini','auto'"),
+    'spec Step 0 advocate whitelist accepts the external families',
+    'advocate whitelist still claude|auto only'
+  );
+
+  // ── shared/*.md is resolved, not assumed ─────────────────────────────────
+  // The installer flattens shared/ into ~/.claude/, so a bare relative path is a
+  // dead reference in every consumer project — which makes following the spec a
+  // per-session guess rather than a procedure.
+  for (const skill of ['forge-auto', 'forge-next', 'forge-task']) {
+    const text = readRepoText(path.join(ROOT, 'skills', skill, 'SKILL.md'));
+    assert(text.includes('FORGE_SHARED_DIR'), `${skill} resolves FORGE_SHARED_DIR`, 'token not found');
+    assert(
+      /Path convention — binding for the whole skill/.test(text),
+      `${skill} states the shared-path convention`,
+      'convention note not found'
+    );
+  }
   assert(spec.includes("'claude','codex','gemini'"), 'spec Step 0 whitelist includes gemini', 'whitelist token not found');
   assert(spec.includes('XLLM_ENGINE'), 'spec Step 0 derives XLLM_ENGINE', 'token "XLLM_ENGINE" not found');
   assert(spec.includes('gemini-exit-nonzero'), 'spec has gemini-exit-nonzero fallback reason', 'token not found');
@@ -4113,10 +4163,21 @@ function smokeReviewPairing() {
   assert(pTie2 && pTie2.author === 'gpt' && pTie2.policy === 'tie-last',
     '(h2) empate, última=codex → author=gpt, policy=tie-last', JSON.stringify(pTie2));
 
-  // (i) defend-mode: puro-codex + --advocate auto
+  // (i) defend-mode: puro-codex + --advocate auto. Com `--mode defend` no adapter, o
+  // advogado passa a ser da família DO AUTOR (codex) — sem degradação. Este é o caso
+  // que colapsava o debate inteiro numa família só (M134/S02).
   const { parsed: pDefend1 } = runPairing(evPuroCodex, dirPuroCodex, ['--advocate', 'auto']);
-  assert(pDefend1 && pDefend1.advocate === 'claude' && pDefend1.fallbacks.includes('defend-mode-unavailable'),
-    '(i) puro-codex + advocate=auto → advocate=claude, fallback defend-mode-unavailable', JSON.stringify(pDefend1));
+  assert(pDefend1 && pDefend1.advocate === 'codex' && !pDefend1.fallbacks.includes('defend-mode-unavailable'),
+    '(i) puro-codex + advocate=auto → advocate=codex (mesma família do autor), sem fallback', JSON.stringify(pDefend1));
+
+  // (i1b) o desenho inteiro numa asserção: challenger oposto AO autor, advogado DO autor.
+  assert(pDefend1 && pDefend1.challenger === 'claude' && pDefend1.advocate === 'codex',
+    '(i1b) autor gpt → challenger claude + advogado codex (cross-family nas duas direções)', JSON.stringify(pDefend1));
+
+  // (i1c) degradação continua disponível e explícita para adapters sem defend.
+  const { parsed: pDefend1c } = runPairing(evPuroCodex, dirPuroCodex, ['--advocate', 'auto', '--defend-unavailable']);
+  assert(pDefend1c && pDefend1c.advocate === 'claude' && pDefend1c.fallbacks.includes('defend-mode-unavailable'),
+    '(i1c) --defend-unavailable reinstala advocate=claude + fallback defend-mode-unavailable', JSON.stringify(pDefend1c));
 
   // (i2) defend-mode: puro-claude + --advocate auto → sem fallback
   const { parsed: pDefend2 } = runPairing(evPuroClaude, dirPuroClaude, ['--advocate', 'auto']);
@@ -4368,10 +4429,10 @@ function smokeReviewPairingWiring() {
   assert(c3.parsed && c3.parsed.challenger === 'codex',
     '(c4) BLOCKER célula: auto+autor-claude resolve para codex (não `auto` cru) — insumo do force engine=agents', JSON.stringify(c3.parsed));
 
-  // (c5) advocate auto + autor gpt → advocate=claude + fallback defend-mode-unavailable.
+  // (c5) advocate auto + autor gpt → advocate=codex (mesma família do autor), sem degradação.
   const c5 = runScoped(dirCodex, rawCodex, ['--advocate', 'auto']);
-  assert(c5.parsed && c5.parsed.advocate === 'claude' && c5.parsed.fallbacks.includes('defend-mode-unavailable'),
-    '(c5) advocate:auto + autor gpt → advocate=claude, fallback defend-mode-unavailable', JSON.stringify(c5.parsed));
+  assert(c5.parsed && c5.parsed.advocate === 'codex' && !c5.parsed.fallbacks.includes('defend-mode-unavailable'),
+    '(c5) advocate:auto + autor gpt → advocate=codex, sem fallback defend-mode-unavailable', JSON.stringify(c5.parsed));
 
   // ── (d) EXCLUSÃO review-fix — unit não começa com execute-task/ ──────────────
   const dirRfix = mkTmp('pairing-wire-review-fix');
@@ -9632,7 +9693,9 @@ function smokeReviewAgentUnavailable() {
 
   const REASONS = [
     ['review-agent-unavailable', { 'shared/forge-dispatch.md': 2, 'shared/forge-review.md': 11 }],
-    ['review-advocate-unavailable', { 'shared/forge-dispatch.md': 1, 'shared/forge-review.md': 6 }],
+    // 7th occurrence: the forge-review-emit.js --unavailable-reason example in Step 8,
+    // added when the event stopped being hand-written.
+    ['review-advocate-unavailable', { 'shared/forge-dispatch.md': 1, 'shared/forge-review.md': 7 }],
     ['review-challenger-unavailable', { 'shared/forge-dispatch.md': 1, 'shared/forge-review.md': 5 }],
     ['review-rebuttal-unavailable', { 'shared/forge-dispatch.md': 1, 'shared/forge-review.md': 3 }],
   ];

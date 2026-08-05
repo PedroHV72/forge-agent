@@ -51,10 +51,23 @@ if [ -f "scripts/forge-prefs.js" ]; then
 else
   FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
 fi
+# Same resolution for the shared reference specs — the installer FLATTENS shared/*.md
+# into ~/.claude/, so a bare relative `shared/X.md` is a dead path in every consumer project.
+if [ -f "shared/forge-review.md" ]; then
+  FORGE_SHARED_DIR="shared"
+else
+  FORGE_SHARED_DIR="$HOME/.claude"
+fi
 WORKING_DIR="${WORKING_DIR:-$(pwd)}"
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --explain --cwd "$WORKING_DIR")
 PREFS_EXIT=$?
 ```
+
+**Path convention — binding for the whole skill.** Every reference below written as
+`shared/<name>.md` MUST be read from `$FORGE_SHARED_DIR/<name>.md`. `shared/` in prose is
+the canonical *name* of the spec, never a literal path to open. A spec you could not open
+is a hard stop for the step that needs it — never a cue to improvise the procedure from
+memory. Same rule for `scripts/<name>.js` → `$FORGE_SCRIPTS_DIR/<name>.js`.
 
 **Loud-stop on parse error (M008-CONTEXT decision #2 — ALWAYS stop on a broken config, NEVER degrade to defaults silently):**
 ```
