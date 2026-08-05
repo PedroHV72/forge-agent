@@ -122,8 +122,25 @@ test('dateInId: ask-<YYYYMMDD> compact form also yields a Date', () => {
   assert.ok(date instanceof Date);
 });
 
+// The REAL shape in the WDMA store — forge-ask's session-id minting doubles
+// the `ask-` prefix (`ask-ask-<date>-<time>`). Both regexes used to anchor
+// right after the FIRST `ask-`, which matched only the invented single-
+// prefix shape used by the fixtures above and admitted ZERO real fragments
+// (dogfood F4).
+test('dateInId: ask-ask-<YYYY-MM-DD> DOUBLED prefix (the real store shape) yields a Date', () => {
+  const date = dateInId('ask-ask-2026-05-29-1403');
+  assert.ok(date instanceof Date);
+  assert.strictEqual(date.getUTCFullYear(), 2026);
+  assert.strictEqual(date.getUTCMonth(), 4); // May, 0-indexed
+  assert.strictEqual(date.getUTCDate(), 29);
+});
+
 test('dateInId: rejects an out-of-range embedded date instead of rolling it over', () => {
   assert.strictEqual(dateInId('ask-9999-99-99-garbage'), null);
+});
+
+test('dateInId: ask-* id with no embeddable date returns null (still refused)', () => {
+  assert.strictEqual(dateInId('ask-no-date-here'), null);
 });
 
 test('dateInId: plain legacy id with no embeddable date returns null', () => {
@@ -194,11 +211,31 @@ test('sealedBy: proof (a) ledger — entry exists for the owning unit', () => {
   assert.strictEqual(result.proof, 'ledger');
 });
 
-test('sealedBy: proof (b) id-date — ask-* with NO ledger entry (the ask-ask-* case)', () => {
+test('sealedBy: proof (b) id-date — ask-* single prefix with NO ledger entry', () => {
   const result = sealedBy({ id: 'ask-2026-01-05-sem-ledger' }, { ledgerIds: new Set() });
   assert.strictEqual(result.groupable, true);
   assert.strictEqual(result.proof, 'id-date');
   assert.ok(result.date instanceof Date);
+});
+
+// The real WDMA store shape (dogfood F4) — every one of the 10 ask-* session
+// fragments there carries this doubled `ask-ask-` prefix.
+test('sealedBy: proof (b) id-date — ask-ask-* DOUBLED prefix (the real store shape)', () => {
+  const result = sealedBy({ id: 'ask-ask-2026-05-29-1403' }, { ledgerIds: new Set() });
+  assert.strictEqual(result.groupable, true);
+  assert.strictEqual(result.proof, 'id-date');
+  assert.ok(result.date instanceof Date);
+  assert.strictEqual(result.date.getUTCDate(), 29);
+});
+
+test('sealedBy: proof (b) refuses an ask-* id with no embeddable date', () => {
+  const result = sealedBy({ id: 'ask-no-date-here' }, { ledgerIds: new Set() });
+  assert.strictEqual(result.groupable, false);
+});
+
+test('sealedBy: proof (b) refuses an ask-* id with an out-of-range date', () => {
+  const result = sealedBy({ id: 'ask-ask-9999-99-99-garbage' }, { ledgerIds: new Set() });
+  assert.strictEqual(result.groupable, false);
 });
 
 test('sealedBy: proof (c) extinct-id — hyphenated legacy key with no ledger, no date', () => {

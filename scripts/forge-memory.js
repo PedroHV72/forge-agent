@@ -870,6 +870,7 @@ module.exports = {
   validateUnitId,
   validateMilestoneId,
   queryRelevant,
+  ASK_ID_RE,
 };
 
 // ── cliMain ───────────────────────────────────────────────────────────────────

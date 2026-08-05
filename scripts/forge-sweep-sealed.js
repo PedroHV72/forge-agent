@@ -72,8 +72,18 @@ function dateFromCanonicalTimestamp(ts) {
   return validDateFromParts(ts.slice(0, 4), ts.slice(4, 6), ts.slice(6, 8));
 }
 
-const ASK_DASHED_DATE_RE = /^ask-(\d{4})-(\d{2})-(\d{2})(?:[-_].*)?$/;
-const ASK_COMPACT_DATE_RE = /^ask-(\d{4})(\d{2})(\d{2})(?:[-_].*)?$/;
+// Real ask-* session ids in the store carry a DOUBLED prefix
+// (`ask-ask-2026-05-29-1403`, `forge-ask`'s own session-id minting logic
+// prepends `ask-` to an id that already starts with `ask-`). Anchoring the
+// date match right after the FIRST `ask-` (the old ASK_DASHED_DATE_RE /
+// ASK_COMPACT_DATE_RE below) matched a shape that only ever existed in the
+// test fixtures — every real fragment in the WDMA store failed both regexes
+// and fell through to "no proof", the literal repeat of PR 1's F2. Fix:
+// gate on memory.ASK_ID_RE (the actual `ask-<anything>` validity check,
+// already used by forge-memory.js and forge-decisions.js) and THEN look for
+// a date anywhere within the id, not immediately after the first `ask-`.
+const ASK_DASHED_DATE_RE = /(\d{4})-(\d{2})-(\d{2})(?:[-_].*)?$/;
+const ASK_COMPACT_DATE_RE = /(\d{4})(\d{2})(\d{2})(?:[-_].*)?$/;
 
 // ── dateInId ─────────────────────────────────────────────────────────────────
 // Date embedded in the id, or null when none can be derived — a null date
@@ -107,6 +117,8 @@ function dateInId(id) {
 // (ledger) instead; dateInId() above still surfaces their date as metadata
 // once grouped by ledger, but sealedBy()'s proof (b) must not use it.
 function closureDateInId(id) {
+  if (!memory.ASK_ID_RE.test(id)) return null;
+
   let match = ASK_DASHED_DATE_RE.exec(id);
   if (match) {
     const date = validDateFromParts(match[1], match[2], match[3]);
