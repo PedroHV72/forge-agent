@@ -554,8 +554,10 @@ test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, 
 
     const md = renderIndex(result, {});
     assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator'), 'renderer must label bucket (a) and its reason');
-    assert(md.includes('(b) fatos com forma de arquivo não capturada'), 'renderer must label bucket (b) and its reason');
-    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida'), 'renderer must label bucket (c) and its reason');
+    assert(md.includes('(b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator'), 'renderer must label bucket (b) with the entirely-missed wording');
+    assert(md.includes('captura PARCIAL'), 'renderer must caveat that partial capture is not counted in bucket (b)');
+    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo'), 'renderer must label bucket (c) with the resolved-to-a-file wording');
+    assert(md.includes('por design não são arquivo'), 'renderer must caveat that bucket (c) mixes not-found with by-design-non-file citations');
     assert(md.includes('`mem-b\\|pipe`'), 'renderer must escape untrusted mem_id in the defect table');
     assert(md.includes('`T01`'), 'renderer must enumerate untrusted storage_key in the defect table');
     assert(md.includes('`.tsx`'), 'renderer must escape and render the sample token');
@@ -569,8 +571,8 @@ test('IN-17: empty store still renders all three labelled buckets at zero', () =
   try {
     const md = renderIndex(buildFileIndex(root, {}), {});
     assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator: 0'), 'bucket (a) must render at zero');
-    assert(md.includes('(b) fatos com forma de arquivo não capturada: 0'), 'bucket (b) must render at zero');
-    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida: 0'), 'bucket (c) must render at zero');
+    assert(md.includes('(b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator: 0'), 'bucket (b) must render at zero');
+    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo: 0'), 'bucket (c) must render at zero');
   } finally {
     cleanup(root);
   }

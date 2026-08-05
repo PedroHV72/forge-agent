@@ -60,9 +60,20 @@ Corrigindo o registro: a T02 **não** introduziu os três campos. Ela introduziu
 envelope de `4c92dfe`; para esses dois, e apenas para eles, não há coluna **Antes**, e
 inventá-la retrospectivamente contrariaria o contrato de procedência. O que a T02 fez com
 eles foi **particionar** o balde pré-existente `facts_without_citation` em `(a)` fatos sem
-menção a arquivo e `(b)` fatos com menção que o extrator não capturou: no depois,
-`416 + 5 = 421 = facts_without_citation`, que é a prova de IN-17 — o balde legado é
-reconstituído exatamente pelas duas partes. Já `facts_unresolved_only` **já existia** em
+menção a arquivo e `(b)` fatos cuja citação de arquivo não foi capturada **inteiramente**
+pelo extrator: no depois, `416 + 5 = 421 = facts_without_citation`, que é a prova de
+IN-17 — o balde legado é reconstituído exatamente pelas duas partes.
+
+**Triagem S06 (R3):** `(b)` só é preenchido quando um fato não tem **nenhuma** citação
+extraída (`citations.length === 0`). Um fato que cite três arquivos e do qual o extrator
+capturou apenas um cai em `facts_with_resolved`, não em `(b)` — captura **parcial** é a
+classe de perda dominante e permanece **inteiramente invisível** a este número. O rótulo
+do render foi corrigido para dizer "não foi capturada inteiramente" (em vez de "não
+capturada"), e o valor `facts_missed_by_extractor: 5` deve ser lido como "5 fatos sem
+nenhuma citação capturada", nunca como uma contagem completa de perdas do extrator.
+Medir captura parcial é instrumento novo, fora do escopo desta correção.
+
+Já `facts_unresolved_only` **já existia** em
 `4c92dfe` (vive em `coverage`, não em `counts`, e por isso parece ausente a quem lê só o
 envelope `counts`); a T02 apenas lhe deu rótulo com motivo no render, sem renomear o
 campo. Declará-lo "não emitido" seria escrever desconhecimento sobre um número medível —
@@ -81,6 +92,17 @@ duas populações, o rótulo honesto é **parte desconhecida**. Isso é material
 que é .NET/SVN: `.cs`, `.sql`, `.config`, `.resx` e `.cshtml` não estão em `CODE_EXT`.
 Quantificar essa fatia é trabalho de outra task; afirmar que ela é zero seria a própria
 sobre-afirmação que este documento existe para remover.
+
+**Triagem S06 (R4):** o render rotulava `(c)` como "a citação existe, porém não foi
+localizada" para todo `facts_unresolved_only`. Isso é falso para os fatos cuja única
+causa é `package-ref` ou `dynamic` — ambos são citações que, por desenho, **não são
+arquivo** (mesma categoria de `(a)`, não uma falha de busca; ver a tabela de reasons
+abaixo). O rótulo foi corrigido para "mas nenhuma resolvida **a um arquivo**", com uma
+ressalva explícita de que a contagem mistura "apontava para arquivo e não foi
+localizado" com "por design não é arquivo" sem separar as duas populações. Dividir
+`facts_unresolved_only` (109) por essas duas causas — por exemplo, quanto do delta
+`88 → 109` vem de `package-ref`/`dynamic` versus do `CODE_EXT` ampliado — permanece
+**não medido**; é instrumento novo, deliberadamente fora do escopo desta correção.
 
 ## Causa nomeada das citações irresolúveis
 

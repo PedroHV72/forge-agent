@@ -729,8 +729,8 @@ function renderIndex(result, opts) {
   const missedByExtractor = Array.isArray(coverage.facts_missed_by_extractor) ? coverage.facts_missed_by_extractor : [];
   const unresolvedOnly = Array.isArray(coverage.facts_unresolved_only) ? coverage.facts_unresolved_only : [];
   lines.push(`- (a) fatos sem menção reconhecida pelo vocabulário atual do extrator: ${noFileMention.length} — parte desconhecida. Este balde absorve tanto fatos que realmente não citam arquivo quanto menções cujo sufixo está fora de \`CODE_EXT\`; não há medição que separe as duas populações, portanto ele NÃO pode ser declarado livre de defeito.`);
-  lines.push(`- (b) fatos com forma de arquivo não capturada: ${missedByExtractor.length} — é defeito real do extrator e requer investigação.`);
-  lines.push(`- (c) fatos com citações extraídas, mas nenhuma resolvida: ${unresolvedOnly.length} — a citação existe, porém não foi localizada.`);
+  lines.push(`- (b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator: ${missedByExtractor.length} — é defeito real do extrator e requer investigação. Esta contagem cobre apenas fatos SEM NENHUMA citação capturada; captura PARCIAL (ex.: um fato que cita três arquivos e o extrator só capturou um) não é medida aqui — permanece invisível a este balde.`);
+  lines.push(`- (c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo: ${unresolvedOnly.length} — mistura duas causas que esta contagem NÃO separa: citações que apontam para arquivo e não foram localizadas, e citações que por design não são arquivo (\`package-ref\`, \`dynamic\` — ver tabela abaixo). A divisão entre as duas populações permanece não medida.`);
   lines.push(`- citations_total: ${coverage.citations_total || 0}`);
   lines.push(`- citations_resolved: ${coverage.citations_resolved || 0}`);
   lines.push(`- files_indexed: ${coverage.files_indexed || 0}`);
@@ -761,7 +761,7 @@ function renderIndex(result, opts) {
   }
   lines.push('');
 
-  lines.push('### Fatos com forma de arquivo não capturada pelo extrator (defeito)');
+  lines.push('### Fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator (defeito, captura parcial não incluída)');
   lines.push('');
   if (missedByExtractor.length === 0) {
     lines.push('_Nenhum fato neste balde._');
