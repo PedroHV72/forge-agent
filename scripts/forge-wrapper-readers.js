@@ -119,6 +119,13 @@ const WRAPPER_DIR_READERS = Object.freeze([
     verdict: 'safe-by-construction',
     why: 'The specific /^T\\d{2}$/ task-name filter applies only after the selected slice/tasks path; it never enumerates .gsd/milestones or .gsd/tasks roots.',
   },
+  {
+    file: 'forge-workspace.js',
+    dirs: Object.freeze(['.gsd/milestones', '.gsd/tasks']),
+    evidence: 'forge-workspace.js:113 — fs.readdirSync(gsd), where gsd is path.join(dir, \'.gsd\') (line 106); \'milestones\' and \'tasks\' appear at line 51 only as names inside the WORK_ENTRIES presence list. The second enumeration, line 965, walks repository directories and prunes every dotted name (including .gsd).',
+    verdict: 'safe-by-construction',
+    why: 'Both enumerations stop above the wrapper roots: the classify() readdir lists .gsd itself and only tests membership of the specific names \'milestones\'/\'tasks\', and the discovery walk filters out dotted directories before descending, so neither ever consumes a milestone or task wrapper entry.',
+  },
 ].map(Object.freeze));
 
 function unlearnedReaders() {

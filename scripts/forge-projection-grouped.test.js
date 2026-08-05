@@ -28,6 +28,15 @@ function test(name, fn) {
   }
 }
 
+// listFragments returns the *resolved* path on purpose: the store realpaths its
+// directory so a symlinked .gsd/<store> cannot redirect writes out of the
+// workspace. Fixture helpers build raw paths. Raw-vs-resolved only agrees where
+// os.tmpdir() has no symlink component (Linux yes, macOS /tmp -> /private/tmp no),
+// so resolve BOTH sides rather than downgrading the hardened one.
+function assertSamePath(actual, expected) {
+  assert.strictEqual(fs.realpathSync(actual), fs.realpathSync(expected));
+}
+
 function fixture() {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-projection-grouped-'));
   fs.mkdirSync(ledger.ledgerDir(cwd), { recursive: true });
@@ -120,9 +129,9 @@ test('every grouped store entry points at its physical container', () => {
   const ledgerEntry = ledger.listFragments(cwd)[0];
   const decisionsEntry = decisions.listFragments(cwd)[0];
   const memoryEntry = memory.listFragments(cwd)[0];
-  assert.strictEqual(ledgerEntry.path, containers.ledger);
-  assert.strictEqual(decisionsEntry.path, containers.decisions);
-  assert.strictEqual(memoryEntry.path, containers.memory);
+  assertSamePath(ledgerEntry.path, containers.ledger);
+  assertSamePath(decisionsEntry.path, containers.decisions);
+  assertSamePath(memoryEntry.path, containers.memory);
   assert.ok(ledgerEntry.grouped && decisionsEntry.grouped && memoryEntry.grouped);
 });
 

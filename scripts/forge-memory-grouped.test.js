@@ -55,6 +55,15 @@ function groupEntries(cwd, unitSpecs, epoch) {
   return container;
 }
 
+// listFragments deliberately returns the *resolved* path (assertMemoryDirectory
+// realpaths the memory dir so a symlinked .gsd/memory cannot redirect writes out
+// of the workspace). Test helpers build raw paths from memoryDir(). Comparing the
+// two sides only agrees where os.tmpdir() has no symlink component, so resolve
+// BOTH sides instead of downgrading the hardened one to its raw form.
+function samePath(a, b) {
+  return fs.realpathSync(a) === fs.realpathSync(b);
+}
+
 function captureStderr(fn) {
   let output = '';
   const original = process.stderr.write;
@@ -79,7 +88,7 @@ test('grouped store preserves the unfiltered loose fragment count', () => {
   const after = memory.listFragments(cwd);
   assert.strictEqual(after.length, before.length);
   assert.strictEqual(after.filter(entry => entry.grouped).length, 2);
-  assert.ok(after.filter(entry => entry.grouped).every(entry => entry.path === container));
+  assert.ok(after.filter(entry => entry.grouped).every(entry => samePath(entry.path, container)));
   assert.ok(after.every(entry => typeof entry.storageKey === 'string'));
 });
 

@@ -53,6 +53,19 @@ function freshFixture() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-journal-test-'));
 }
 
+// Fixture for the traversal test: a sandbox with the working root buried two
+// levels down, so `../../<name>` from the root lands INSIDE the sandbox instead
+// of two levels above os.tmpdir(). The escape is still real (the target is
+// outside the root and outside every store dir) but the test never writes
+// outside ground it owns — a traversal-rejection test must not itself perform an
+// unbounded traversal. Returns { sandbox, root }.
+function nestedFixture() {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-journal-escape-'));
+  const root = path.join(sandbox, 'nested', 'root');
+  fs.mkdirSync(root, { recursive: true });
+  return { sandbox, root };
+}
+
 // Creates a fake "ledger" container inside cwd/.gsd/ledger/<id>.md — a real
 // store dir that forge-epoch-group's STORE_TARGETS knows about, so
 // latestUndoable's read-side validation accepts it.
@@ -254,12 +267,21 @@ test('(e) garbage line in the middle is skipped with stderr warn, listing contin
 console.log('\nSection 5: path-escape vector\n');
 
 test('latestUndoable rejects a relative traversal path (../../evil.md)', () => {
-  const ROOT = freshFixture();
+  const { sandbox, root: ROOT } = nestedFixture();
   // Simulate a tampered journal line pointing outside any known store.
+  // The bait is materialized so the rejection cannot be an artifact of the
+  // target simply not existing (latestUndoable also drops missing containers):
+  // the file IS there and IS reachable by resolution, and must still be refused
+  // because the *path shape* escapes. It lives inside the sandbox, never above
+  // os.tmpdir().
   const evilRel = '../../evil.md';
   const evilAbs = path.resolve(ROOT, evilRel);
-  fs.mkdirSync(path.dirname(evilAbs), { recursive: true });
+  assert(
+    evilAbs === path.join(sandbox, 'evil.md'),
+    `traversal target must stay inside the fixture sandbox, got ${evilAbs}`
+  );
   fs.writeFileSync(evilAbs, 'not supposed to be reachable', 'utf-8');
+  assert(fs.existsSync(evilAbs), 'bait file should exist so the refusal is path-shaped, not existence-shaped');
 
   const intent = appendIntent(ROOT, { operation: 'group', containers: [] });
   // Hand-craft the outcome line directly to bypass write-side normalization,
@@ -273,7 +295,8 @@ test('latestUndoable rejects a relative traversal path (../../evil.md)', () => {
   const result = latestUndoable(ROOT);
   assert(result.ok === true, 'latestUndoable should still succeed');
   assert(result.entry === null, 'a traversal-path entry must be treated as unresolvable, never trusted');
-  fs.rmSync(ROOT, { recursive: true, force: true });
+  assert(fs.existsSync(evilAbs), 'the bait must still exist — refusal is about the path, not the file');
+  fs.rmSync(sandbox, { recursive: true, force: true });
 });
 
 test('latestUndoable rejects an absolute path container', () => {
