@@ -1,9 +1,13 @@
 # PR brief — Review cross-model (Codex/xLLM) não funciona em working copy SVN
 
-> **Status:** 🟢 **resolvido** (2026-07-15). Descoberto ao ativar o challenger Codex no repo **WDMA**
+> **Status:** 🟢 **resolvido** (2026-07-15). Descoberto ao ativar o challenger Codex no store de referência
 > (working copy **SVN**, sem `.git`). **Issue 2 (adaptador `--skip-git-repo-check`) foi mergeado na PR #42.**
-> **Issue 1 (diff SVN) é corrigido NESTE branch** (`feat/review-svn-diff`): `Step 1` do
-> `shared/forge-review.md` agora detecta o VCS e usa `svn diff` em working copies SVN.
+> **Issue 1 (diff SVN) foi corrigido** (`feat/review-svn-diff`): `Step 1` do
+> `shared/forge-review.md` detecta o VCS em working copies SVN. A **Fase 2**
+> (`feat/review-svn-diff-scoped`) substituiu o `svn diff` cru por `scripts/forge-review-diff.js` —
+> escopo por unidade, arquivos novos incluídos, `--name-only`/`-- <files>` funcionando — e estendeu o
+> ramo SVN ao boundary de **task solta** (`/forge-task` Step 5.5), que era git-only. Ver a seção
+> *Ressalva resolvida* abaixo.
 > **Origem:** sessão `/forge-prefs` — reconfiguração de modelos + tentativa de ligar `review.challenger: codex`.
 
 ## TL;DR
@@ -25,7 +29,7 @@ O review dialético (`shared/forge-review.md`) assume git em dois pontos, e **os
    `-c projects."…".trust_level="trusted"` e `-c skip_git_repo_check=true` — nenhum resolve).
    Só a flag `--skip-git-repo-check` funciona (testado: com a flag, `codex exec` retorna OK / exit 0).
 
-**Efeito combinado:** em repositórios SVN (WDMA e afins), o review cross-model é inalcançável — e o
+**Efeito combinado:** em repositórios SVN (o store de referência e afins), o review cross-model é inalcançável — e o
 review gate em geral é um no-op silencioso.
 
 ---
@@ -45,13 +49,29 @@ review gate em geral é um no-op silencioso.
 Serve tanto o review de slice (`forge-auto`/`forge-next`) quanto o de task (`forge-task` Step 5.5),
 pois ambos consomem o `Step 1`.
 
-**Ressalva conhecida (polish futuro):** `svn diff` é **unscoped** — inclui qualquer arquivo versionado
-modificado no working copy, inclusive artefatos de build versionados (ex.: `obj/*.json`, `*.nuget.*`).
-Em git o `.gitignore` os exclui; em SVN eles entram no diff. O adaptador trunca em 4000 linhas, então
-não quebra, mas gera ruído. Refino possível: scoping por path ou respeitar um ignore-list no `Step 1`. **Fora de escopo (follow-up):** o modo **execute** do codex
-(`--mode execute` em `scripts/forge-xllm.js`) e o diff `START_SHA`-based do `forge-task` continuam
-git-only (`git rev-parse`/`git diff --name-status $START_SHA` + reset via `git checkout`/`clean`) —
-rodar TASK via codex em SVN é um item maior, separado deste.
+**✅ Ressalva resolvida (Fase 2).** A ressalva registrada aqui — `svn diff` **unscoped** inclui
+qualquer arquivo modificado no working copy — era maior do que "ruído": numa working copy
+**compartilhada** por mais de um desenvolvedor, o diff carrega o trabalho não-commitado dos colegas
+(medido em campo: 49 arquivos, 8 da unidade), então o challenger gasta orçamento objetando código que
+a unidade não é dona. Somavam-se dois defeitos não registrados na época:
+
+- **Arquivo novo (`?`) não aparece em `svn diff` de jeito nenhum.** Numa slice cujo change inteiro
+  eram dois arquivos novos, o review teria lido quase nada e renderizado **limpo** — o pior resultado
+  possível para um gate.
+- **`svn diff --name-only` não existe**, e três consumidores *anexam* argumentos ao `DIFF_CMD`
+  (`$DIFF_CMD --name-only` no pattern scan e no probe de diff vazio; `{DIFF_CMD} -- <files>` no
+  sharding do Step 2.0). O `DIFF_CMD="svn diff"` desta correção quebrava os três silenciosamente.
+
+Os três são resolvidos por `scripts/forge-review-diff.js`, que é o `DIFF_CMD` do ramo SVN nos **dois**
+boundaries (slice e task): escopa ao manifesto de paths da unidade, reconstrói arquivos novos como
+hunks de adição, e aceita `--name-only` / `-- <files>`. Nunca produz diff vazio por escopo — manifesto
+ausente ou que não casa nada cai no comportamento unscoped e declara isso em `--scope-report`. O
+`forge-cost-policy.js` ganhou `--scope-file` pelo mesmo motivo: sem ele a policy contava os arquivos
+alheios e promovia a review a dialectic/sharding sobre código de outro dono.
+
+**Fora de escopo (follow-up):** o modo **execute** do codex (`--mode execute` em
+`scripts/forge-xllm.js`) continua git-only (`git rev-parse`/`git diff --name-status $START_SHA` +
+reset via `git checkout`/`clean`) — rodar TASK via codex em SVN é um item maior, separado deste.
 
 ## ✅ Issue 2 — `forge-xllm.js` não passa `--skip-git-repo-check` (corrigido nesta PR)
 
@@ -90,7 +110,7 @@ codex exec --skip-git-repo-check --sandbox read-only -o /tmp/t.txt "responda: OK
 # → OK, exit 0
 ```
 
-## Workaround atual (WDMA)
+## Workaround atual (store de referência)
 
 Nenhum patch aplicado no tooling. `review.challenger: codex` fica **ativado porém dormente** nas prefs
 (fallback seguro para `forge-reviewer` se o Codex falhar; e o diff vazio já pula o gate antes disso).
@@ -102,4 +122,4 @@ resolvidos.
 - `shared/forge-review.md` — `DIFF_CMD`, boundaries, Steps 2/4 (challenge/rebuttal).
 - `scripts/forge-xllm.js` — `invokeCodex()` (args do `codex exec`), `resolveCodexCommand()`.
 - `forge-agent-prefs.jsonc § Review Settings` — `review.{challenger,challenger_model,engine,advocate_model}`.
-- `docs/fragment-store-migration-bugs.md` — precedente de gap SVN (mesmo repo WDMA).
+- `docs/fragment-store-migration-bugs.md` — precedente de gap SVN (mesmo store de referência).

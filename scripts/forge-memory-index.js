@@ -1,0 +1,960 @@
+'use strict';
+
+// forge-memory-index.js — core of the file-source → facts index.
+//
+// Invariants (LOCKED — T02 renders on top of this, T03 asserts against it):
+//   1. Citation extraction from `fact.text` prose is HEURISTIC. Any result this module
+//      produces MUST carry the report of what it could not cover — a gate that does not
+//      enumerate its own coverage/discard is an inert gate (Layer-3 forge-doctor precedent).
+//   2. Paths found inside `fact.text` are UNTRUSTED STRINGS. Containment is checked
+//      BEFORE any disk access (existsSync/basename lookup) — never a blind realpathSync.
+//   3. `counts`/`coverage` numbers are ALWAYS derived by filtering the entries/facts
+//      arrays — never incremented in a parallel counter (checkSymbols contract).
+//
+// This file exports the plain core (citation extraction, resolution, file walk,
+// summarization, index building). The markdown renderer and CLI are added in T02 —
+// intentionally absent here.
+
+const fs = require('fs');
+const path = require('path');
+
+const { listFragments, parseFragment, memoryDir, readFragmentText } = require('./forge-memory');
+const { guardReadAndWarn } = require('./forge-schema-guard');
+
+// T02 default artifact path — LOCKED with T03 so the two never diverge.
+const DEFAULT_INDEX_PATH = '.gsd/MEMORY-INDEX-BY-FILE.md';
+
+// ── isWithin (molde de forge-prompt.js:75-78) ──────────────────────────────────
+function isWithin(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+// ── CITATION_REGEXES ────────────────────────────────────────────────────────────
+// Ordered registry — order IS precedence (first match for a given span wins).
+// `name`s are LOCKED: T02 prints them, T03 asserts against them.
+// Uses [ \t], never \s — do not cross newlines (MEM004 precedent). \Z does not exist in JS.
+const CODE_EXT = '(?:js|mjs|cjs|ts|tsx|jsx|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg)';
+
+const CITATION_REGEXES = [
+  {
+    name: 'backticked-path',
+    // `some/dir/file.ext` or `some/dir/file.ext:123`
+    regex: new RegExp('`([\\w.\\-/@]+/[\\w.\\-@]+\\.' + CODE_EXT + ')(?::(\\d+))?`(?:[ \\t]+linha[ \\t]+(\\d+))?', 'g'),
+    description: 'Caminho com barra entre crases, extensão de código/markdown, sufixo :linha opcional.',
+  },
+  {
+    name: 'bare-path',
+    // some/dir/file.ext outside backticks
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-@]+(?:/[\\w.\\-@]+)+\\.' + CODE_EXT + ')(?::(\\d+))?(?:[ \\t]+linha[ \\t]+(\\d+))?(?![`\\w])', 'g'),
+    description: 'Caminho com barra e extensão de código/markdown fora de crases.',
+  },
+  {
+    name: 'backticked-basename',
+    // `file.ext` — no slash, inside backticks
+    regex: new RegExp('`([\\w.\\-]+\\.' + CODE_EXT + ')`', 'g'),
+    description: 'Nome de arquivo (sem barra) só com extensão, entre crases.',
+  },
+  {
+    name: 'bare-basename',
+    // file.ext loose in prose — dominant case in this repo's real fragment
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-]+\\.' + CODE_EXT + ')(?![`\\w])', 'g'),
+    description: 'Nome de arquivo solto na prosa, sem crases e sem barra.',
+  },
+  {
+    name: 'bare-path-traversal',
+    // Extensionless slash-joined tokens are ordinary prose ("e/ou", "N/A",
+    // "2026/08/04") far more often than they are a path — accepting the span
+    // itself would poison citations_total (measured: 311 -> 972, see T01
+    // repair). Only a candidate that actually contains a literal ".." path
+    // segment is traversal-shaped; `filter` (applied below, in the main loop)
+    // restricts extraction to that case, so the span is retained ONLY to
+    // report the containment rejection.
+    //
+    // S06 R6: the invariant that actually holds is CONTAINMENT, not "no disk
+    // access" — a retained span whose `..` segments stay inside the root (e.g.
+    // `scripts/../scripts/foo`) does reach realpathSync/existsSync in
+    // resolveCitation, and that is fine. What can never happen is a probe
+    // OUTSIDE the root: `resolveCitation` rejects with `outside-root` before any
+    // disk call, and re-checks containment on the REAL paths afterwards.
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-@]+(?:/(?:[\\w.\\-@]+|\\.{1,2}))+)(?![`\\w])', 'g'),
+    description: 'Caminho solto sem extensao contendo segmento ".." mantido para reportar traversal.',
+    filter: (candidatePath) => candidatePath.split('/').includes('..'),
+  },
+  {
+    name: 'package-ref',
+    // `name@version` is a package/directory reference, not a file citation.
+    // Choice (a): enumerate it with a named reason instead of probing the disk
+    // or reporting a misleading generic not-found result. Version MUST be
+    // digit-led (`acme@1.2.0`) — an unanchored `[\w-]+` after `@` also matches
+    // ordinary prose ("dev@empresa e mais"), see T01 repair.
+    //
+    // S06 R10: the digit anchor alone still matched prose handles with a year
+    // ("suporte@2024"), so the version MUST also carry at least one dot
+    // (`\d[\w-]*(?:\.[\w-]+)+`) — a real version always does.
+    // S06 R1: a versioned path (`services@1.2.0/src/index.js`) is already read
+    // whole by `bare-path`; without a trailing guard the same span was ALSO
+    // counted here, manufacturing a permanently-UNRESOLVED phantom citation
+    // that inflated the published citations_total denominator. `/` and `@` join
+    // the trailing guard, and `(?!\.[\w\-])` blocks the backtracking escape in
+    // which the version group gives back its last `.N` to satisfy the guard.
+    regex: new RegExp('(?<![`\\w./\\-@])([\\w-]+@\\d[\\w\\-]*(?:\\.[\\w\\-]+)+)(?![`\\w/@])(?!\\.[\\w\\-])', 'g'),
+    description: 'Referencia nome@versao (versao iniciada por digito, com ponto), enumerada como pacote/diretorio.',
+  },
+];
+
+// Extension test used by the token-based dynamic-candidate scan below — bounded
+// per-token, never a whole-text greedy match (avoids catastrophic over-match
+// across unrelated backticks elsewhere in the sentence).
+const EXT_SUFFIX_RE = new RegExp('\\.' + CODE_EXT + '[)\\],.;:!?]*$');
+
+// Uses the extractor's CODE_EXT vocabulary as the sole source of truth for
+// the missed-extractor bucket (T02 plan: "fonte única obrigatória"). The
+// consequence is stated where it is published: a file mention whose extension
+// is outside CODE_EXT is invisible to BOTH the extractor and this detector, so
+// it lands in bucket (a) — see the (a) label in renderIndex, which does not
+// claim that bucket is defect-free.
+//
+// S06 R7: the token IS copied into the index verbatim — it is rendered in the
+// defect table and emitted whole under `coverage` by `--json`. The 120-char cap
+// is a SIGNAL BUDGET (enough to identify the shape of the missed mention), not
+// a privacy guarantee. What bounds exposure is the `\S+` match: a token never
+// spans whitespace, so it cannot carry a prose fragment. It CAN still be a UNC
+// path or an identifying URL — that is the real exposure, and it is the reason
+// this index is not published without being read first. The token is never
+// probed on disk.
+function findSampleFileToken(text) {
+  if (typeof text !== 'string') return null;
+  const tokenRe = /\S+/g;
+  let match;
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (EXT_SUFFIX_RE.test(match[0])) return match[0].slice(0, 120);
+  }
+  return null;
+}
+
+// ── findDynamicCandidates ────────────────────────────────────────────────────
+// Token-bounded scan (never a single greedy regex over the whole text) for
+// candidates that embed a template-literal `${`, a wildcard `*`, or an
+// INTERNAL backtick (one that is not merely the token's own wrapping pair)
+// before an accepted extension. Always discarded as pattern:'dynamic' — never
+// silenced; enumerated, per step 4 of T01-PLAN.
+function findDynamicCandidates(text) {
+  const results = [];
+  const tokenRe = /\S+/g;
+  let tm;
+  while ((tm = tokenRe.exec(text)) !== null) {
+    const token = tm[0];
+
+    // S02 R2: strip ONE wrapping backtick pair BEFORE the extension test.
+    // EXT_SUFFIX_RE anchors on `$`, so a trailing backtick used to block the
+    // match entirely — a wrapped `scripts/forge-${name}.js` was never even
+    // TESTED for `${` and vanished from coverage (silent discard, forbidden by
+    // invariant #1). The original token is kept as `raw` so the report shows
+    // exactly what the fact wrote.
+    const core = (token.length >= 2 && token[0] === '`' && token[token.length - 1] === '`')
+      ? token.slice(1, -1)
+      : token;
+
+    if (!EXT_SUFFIX_RE.test(core)) continue;
+
+    const hasTemplate = core.includes('${');
+    const hasWildcard = core.includes('*');
+    // After removing the single wrapping pair, ANY remaining backtick is by
+    // definition internal (a plain `path/file.js` is already handled by the
+    // ordered backtick patterns above and leaves no backtick in `core`).
+    const hasInternalBacktick = core.includes('`');
+
+    if (hasTemplate || hasWildcard || hasInternalBacktick) {
+      results.push({ raw: token, path: core, line: null, pattern: 'dynamic', index: tm.index });
+    }
+  }
+  return results;
+}
+
+// ── extractCitations ─────────────────────────────────────────────────────────
+// Extracts file citations from free-prose fact.text.
+// Returns Array<{ raw, path, line, pattern }>, deduplicated by path
+// (first occurrence wins, including its line), preserving order of appearance.
+//
+// Candidates containing `${`, an internal backtick, or `*` are discarded as
+// "dynamic" citations — the caller keeps them enumerable via resolveCitation
+// returning UNRESOLVED/dynamic, rather than silently dropping them.
+function extractCitations(text) {
+  if (typeof text !== 'string' || text.length === 0) return [];
+
+  const found = []; // { raw, path, line, pattern, index }
+  for (const { name, regex, filter } of CITATION_REGEXES) {
+    regex.lastIndex = 0;
+    let m;
+    while ((m = regex.exec(text)) !== null) {
+      const raw = m[0];
+      const rawPath = m[1];
+      const lineCapture = m[2] || m[3];
+      const line = lineCapture ? parseInt(lineCapture, 10) : null;
+
+      if (filter && !filter(rawPath)) {
+        if (regex.lastIndex === m.index) regex.lastIndex++;
+        continue;
+      }
+
+      found.push({
+        raw,
+        path: rawPath,
+        line,
+        pattern: name,
+        index: m.index,
+      });
+
+      // Guard against zero-width infinite loop (should not happen with these patterns).
+      if (regex.lastIndex === m.index) regex.lastIndex++;
+    }
+  }
+
+  // Dynamic candidates (${, *, internal backtick) — bounded per-token scan.
+  found.push(...findDynamicCandidates(text));
+
+  // Preserve order of appearance across all patterns combined.
+  found.sort((a, b) => a.index - b.index);
+
+  // Dedup by path — first occurrence wins (keeps its line).
+  const seen = new Map();
+  const ordered = [];
+  for (const c of found) {
+    if (seen.has(c.path)) continue;
+    seen.set(c.path, true);
+    ordered.push({ raw: c.raw, path: c.path, line: c.line, pattern: c.pattern });
+  }
+
+  return ordered;
+}
+
+// ── listRepoFiles ────────────────────────────────────────────────────────────
+// Single bounded walk of the repository. Skips .git, node_modules, dist, build,
+// .next, .forge-worktrees. Returns paths normalized with '/' for stable output
+// across Windows and POSIX. Caps at opts.limit (default 20000) files — the cap
+// itself is a reported fact in coverage, never a silent truncation.
+const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.forge-worktrees']);
+
+function listRepoFiles(root, opts) {
+  opts = opts || {};
+  const limit = typeof opts.limit === 'number' ? opts.limit : 20000;
+
+  const files = [];
+  const byBasename = new Map();
+  let capped = false;
+
+  const stack = [root];
+  while (stack.length > 0) {
+    if (capped) break;
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (capped) break;
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue;
+        stack.push(path.join(dir, entry.name));
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      if (files.length >= limit) {
+        capped = true;
+        break;
+      }
+
+      const abs = path.join(dir, entry.name);
+      const rel = path.relative(root, abs).split(path.sep).join('/');
+      files.push(rel);
+
+      const basename = entry.name;
+      if (!byBasename.has(basename)) byBasename.set(basename, []);
+      byBasename.get(basename).push(rel);
+    }
+  }
+
+  return { files, byBasename, capped };
+}
+
+// ── resolveCitation ──────────────────────────────────────────────────────────
+// Non-binary resolution. NEVER throws (total try/catch).
+// Order: dynamic → containment (outside-root, BEFORE any existsSync) →
+//        exact disk match → basename match (1 candidate = RESOLVED, ≥2 = ambiguous) →
+//        not-found.
+function resolveCitation(citation, cwd, index) {
+  try {
+    if (!citation || typeof citation.path !== 'string' || citation.path.length === 0) {
+      return { state: 'UNRESOLVED', reason: 'not-found' };
+    }
+
+    if (citation.pattern === 'dynamic') {
+      return { state: 'UNRESOLVED', reason: 'dynamic' };
+    }
+
+    if (citation.pattern === 'package-ref') {
+      return { state: 'UNRESOLVED', reason: 'package-ref' };
+    }
+
+    const root = path.resolve(cwd);
+    const candidatePath = citation.path;
+
+    // Absolute path or path escaping the root → outside-root, before any disk access.
+    if (path.isAbsolute(candidatePath)) {
+      return { state: 'UNRESOLVED', reason: 'outside-root' };
+    }
+    const resolved = path.resolve(root, candidatePath);
+    if (!isWithin(root, resolved)) {
+      return { state: 'UNRESOLVED', reason: 'outside-root' };
+    }
+
+    // Lexical containment is not enough: existsSync/statSync FOLLOW symlinks, so
+    // a link inside the repo that points outside would otherwise be stat'd and
+    // resolved. Re-establish containment on the REAL paths.
+    //   • real root vs real candidate — never real-vs-lexical: this repo itself
+    //     runs from a worktree under .forge-worktrees, and comparing a real
+    //     candidate against a lexical root would reject that legitimate layout.
+    //   • realpathSync throws ENOENT for a path that does not exist; a missing
+    //     citation must keep falling through to its 'not-found' reason, so a
+    //     failed realpath is simply "nothing to check here", never a rejection.
+    let realRoot = root;
+    try { realRoot = fs.realpathSync(root); } catch (_) { realRoot = root; }
+    let realCandidate = null;
+    try { realCandidate = fs.realpathSync(resolved); } catch (_) { realCandidate = null; }
+    if (realCandidate !== null && !isWithin(realRoot, realCandidate)) {
+      return { state: 'UNRESOLVED', reason: 'outside-root' };
+    }
+
+    // Exact match against the disk (relative to root).
+    const relNormalized = path.relative(root, resolved).split(path.sep).join('/');
+    let existsExact = false;
+    try {
+      existsExact = fs.existsSync(resolved) && fs.statSync(resolved).isFile();
+    } catch (_) {
+      existsExact = false;
+    }
+    if (existsExact) {
+      return { state: 'RESOLVED', file: relNormalized, how: 'path' };
+    }
+
+    // Basename match, only meaningful for bare-basename / backticked-basename patterns
+    // (candidatePath without a slash) but harmless to try generally.
+    const basename = path.basename(candidatePath);
+    const byBasename = index && index.byBasename;
+    const candidates = byBasename ? byBasename.get(basename) : null;
+
+    if (candidates && candidates.length === 1) {
+      return { state: 'RESOLVED', file: candidates[0], how: 'basename' };
+    }
+    if (candidates && candidates.length >= 2) {
+      return { state: 'UNRESOLVED', reason: 'ambiguous-basename', candidates: candidates.slice() };
+    }
+
+    return { state: 'UNRESOLVED', reason: 'not-found' };
+  } catch (_) {
+    return { state: 'UNRESOLVED', reason: 'not-found' };
+  }
+}
+
+// ── summarizeFact ─────────────────────────────────────────────────────────────
+// First sentence of fact.text, normalized (collapse line breaks/whitespace),
+// truncated at opts.maxChars (default 160) with an ellipsis. Deterministic, no
+// wallclock.
+function summarizeFact(fact, opts) {
+  opts = opts || {};
+  const maxChars = typeof opts.maxChars === 'number' ? opts.maxChars : 160;
+
+  const text = (fact && typeof fact.text === 'string') ? fact.text : '';
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (collapsed.length === 0) return '';
+
+  // First sentence: up to first '. ' (followed by space/end) or full string if none.
+  const sentenceMatch = collapsed.match(/^(.+?[.!?])(?:\s|$)/);
+  let sentence = sentenceMatch ? sentenceMatch[1] : collapsed;
+
+  if (sentence.length > maxChars) {
+    sentence = sentence.slice(0, Math.max(0, maxChars - 1)).trimEnd() + '…';
+  }
+
+  return sentence;
+}
+
+// ── listSkippedFragmentFiles ──────────────────────────────────────────────────
+// Dogfood fix (real store, 144 files on disk → 116 returned): `listFragments`
+// silently drops every `.md` in `.gsd/memory/` whose name does not parse as a
+// valid storage key. 19% of that store was absent from the index and mentioned
+// NOWHERE — exactly the failure class invariant #1 exists to forbid.
+//
+// This function only REPORTS the gap; it never closes it. `listFragments`
+// behavior is deliberately untouched (it is consumed system-wide).
+//
+// Compares by FILENAME ON DISK, never by re-reading through the store API:
+// listFragments can return an entry (`legacy-orphan`) that readFragment then
+// rejects by throwing, so a re-read would turn a report into a crash path.
+// Total try/catch: an absent/unreadable memory dir yields [] exactly as before.
+function listSkippedFragmentFiles(cwd, fragments) {
+  try {
+    const dir = memoryDir(cwd);
+    const onDisk = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.md'))
+      .map((e) => e.name);
+
+    const returned = new Set(
+      (Array.isArray(fragments) ? fragments : [])
+        .map((f) => (f && typeof f.path === 'string' ? path.basename(f.path) : null))
+        .filter((n) => n !== null)
+    );
+
+    return onDisk
+      .filter((name) => !returned.has(name))
+      .sort((a, b) => a.localeCompare(b, 'en')); // determinism: byte-identical reruns
+  } catch (_) {
+    return [];
+  }
+}
+
+// ── buildFileIndex ────────────────────────────────────────────────────────────
+// Orchestrator: reads all memory fragments via listFragments/parseFragment,
+// extracts + resolves citations per fact, and aggregates entries by resolved
+// file plus a coverage block whose numbers are always derived by filtering the
+// same lists that produced entries — never a parallel counter.
+function buildFileIndex(cwd, opts) {
+  opts = opts || {};
+  const root = path.resolve(cwd);
+
+  // Guarded read (T02): wired HERE, at the single entry point that reads the
+  // fragment store, so `result.partial` is set for every caller (direct API
+  // and CLI alike) instead of being duplicated at each call site.
+  // `forge-memory.listFragments` already calls the guard internally to decide
+  // whether IT should degrade — but it does not hand `partial` back to us, so
+  // this explicit call exists purely so the ARTIFACT can mark itself partial.
+  // Do not remove this as "duplicate of listFragments' internal guard call" —
+  // it is a second, deliberate call for a different purpose.
+  let guardPartial = false;
+  let guardUnavailable = false;
+  try {
+    const g = guardReadAndWarn(cwd, opts.schemaGuard || {});
+    guardPartial = !!(g && g.partial);
+  } catch (_) {
+    // S01 R1 (known fragility, not fixed here): if the guard fails to load or
+    // throws, degrade to partial:false — but that degradation itself must be
+    // visible, never silent, so it is recorded below as a coverage entry.
+    guardPartial = false;
+    guardUnavailable = true;
+  }
+
+  const fileIndex = listRepoFiles(root, opts.listRepoFiles || {});
+
+  const unreadableFragments = [];
+  const allFacts = []; // { fact, fragment }
+
+  // S02 R3: an enumeration failure used to yield fragments_read:0 with an empty
+  // unreadable_fragments and partial untouched — BYTE-IDENTICAL to a genuinely
+  // empty store. The per-fragment read failure right below is enumerated; that
+  // same discipline now covers the enumeration step itself. A consumer must be
+  // able to tell "could not read the store" from "the store is empty".
+  let fragments;
+  let fragmentListingFailed = null;
+  try {
+    fragments = listFragments(cwd, opts.listFragments || {});
+  } catch (e) {
+    fragments = [];
+    fragmentListingFailed = (e && e.message) ? e.message : 'list-error';
+  }
+
+  // Files present in .gsd/memory/ that the store did NOT hand back — see
+  // listSkippedFragmentFiles. Their facts are absent from this index.
+  const fragmentsSkippedByStore = listSkippedFragmentFiles(cwd, fragments);
+
+  for (const fragment of fragments) {
+    let parsed;
+    try {
+      const text = readFragmentText(cwd, fragment);
+      parsed = parseFragment(text);
+    } catch (e) {
+      unreadableFragments.push({
+        storageKey: fragment.storageKey,
+        path: fragment.path,
+        reason: (e && e.message) ? e.message : 'read-error',
+      });
+      continue;
+    }
+
+    const facts = Array.isArray(parsed.facts) ? parsed.facts : [];
+    for (const fact of facts) {
+      allFacts.push({ fact, fragment });
+    }
+  }
+
+  // entries keyed by resolved file path.
+  const entriesByFile = new Map();
+
+  // Per-citation resolution results, kept for coverage aggregation.
+  const resolvedCitations = []; // { citation, resolution }
+  const factsWithoutCitation = []; // { mem_id, storage_key }
+  const factsUnresolvedOnly = []; // { mem_id, storage_key }
+  const factClassifications = []; // { mem_id, storage_key, bucket, sample_token? }
+
+  for (const { fact, fragment } of allFacts) {
+    const memId = fact && fact.mem_id ? fact.mem_id : null;
+    const storageKey = fragment.storageKey;
+
+    const citations = extractCitations(fact && fact.text);
+
+    if (citations.length === 0) {
+      const sampleToken = findSampleFileToken(fact && fact.text);
+      const record = { mem_id: memId, storage_key: storageKey };
+      factsWithoutCitation.push(record);
+      factClassifications.push(sampleToken
+        ? { mem_id: memId, storage_key: storageKey, bucket: 'missed_by_extractor', sample_token: sampleToken }
+        : { mem_id: memId, storage_key: storageKey, bucket: 'no_file_mention' });
+      continue;
+    }
+
+    let anyResolved = false;
+    // S02 R5: citations are deduped by RAW TEXT upstream, but two distinct
+    // citations in one fact can resolve to the SAME target file (e.g.
+    // `scripts/foo.js` via how:'path' and the unique basename `foo.js` via
+    // how:'basename'). Pushing per citation emitted two identical rows under
+    // one file. Dedup per fact by the RESOLVED file, keeping the first
+    // citation's line.
+    const seenFilesForFact = new Set();
+
+    for (const citation of citations) {
+      const resolution = resolveCitation(citation, cwd, fileIndex);
+      resolvedCitations.push({ citation, resolution });
+
+      if (resolution.state === 'RESOLVED') {
+        anyResolved = true;
+        const file = resolution.file;
+        if (seenFilesForFact.has(file)) continue;
+        seenFilesForFact.add(file);
+        if (!entriesByFile.has(file)) {
+          entriesByFile.set(file, { file, facts: [] });
+        }
+        entriesByFile.get(file).facts.push({
+          mem_id: memId,
+          category: fact && fact.category ? fact.category : null,
+          summary: summarizeFact(fact, opts.summarize || {}),
+          source_unit: fact && fact.source_unit ? fact.source_unit : null,
+          unit_id: fragment.unitId,
+          storage_key: storageKey,
+          line: citation.line,
+        });
+      }
+    }
+
+    if (!anyResolved) {
+      const record = { mem_id: memId, storage_key: storageKey };
+      factsUnresolvedOnly.push(record);
+      factClassifications.push({ mem_id: memId, storage_key: storageKey, bucket: 'unresolved_only' });
+    } else {
+      factClassifications.push({ mem_id: memId, storage_key: storageKey, bucket: 'with_resolved' });
+    }
+  }
+
+  // entries ordered by file (localeCompare('en')); facts ordered by storage_key then mem_id.
+  const entries = [...entriesByFile.values()]
+    .sort((a, b) => a.file.localeCompare(b.file, 'en'))
+    .map((entry) => ({
+      file: entry.file,
+      facts: entry.facts.slice().sort((a, b) => {
+        const sk = String(a.storage_key).localeCompare(String(b.storage_key), 'en');
+        if (sk !== 0) return sk;
+        return String(a.mem_id).localeCompare(String(b.mem_id), 'en');
+      }),
+    }));
+
+  // unresolved — aggregated by raw+reason → { raw, reason, count, example_mem_id, candidates? },
+  // ordered by count desc then raw.
+  const unresolvedMap = new Map(); // key: `raw` + NUL + `reason` (NUL cannot occur in either part)
+  for (const { citation, resolution } of resolvedCitations) {
+    if (resolution.state !== 'UNRESOLVED') continue;
+    const key = `${citation.raw}\0${resolution.reason}`;
+    if (!unresolvedMap.has(key)) {
+      unresolvedMap.set(key, {
+        raw: citation.raw,
+        reason: resolution.reason,
+        count: 0,
+        example_mem_id: null,
+        candidates: resolution.candidates,
+      });
+    }
+    const agg = unresolvedMap.get(key);
+    agg.count += 1;
+  }
+  // Attach an example_mem_id per aggregate (first occurrence).
+  for (const { citation, resolution } of resolvedCitations) {
+    if (resolution.state !== 'UNRESOLVED') continue;
+    const key = `${citation.raw}\0${resolution.reason}`;
+    const agg = unresolvedMap.get(key);
+    if (agg && agg.example_mem_id === null) {
+      // Find owning fact for this citation among allFacts — best effort, first match.
+      for (const { fact } of allFacts) {
+        const memId = fact && fact.mem_id ? fact.mem_id : null;
+        const citations = extractCitations(fact && fact.text);
+        if (citations.some((c) => c.raw === citation.raw)) {
+          agg.example_mem_id = memId;
+          break;
+        }
+      }
+    }
+  }
+
+  const unresolved = [...unresolvedMap.values()].sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    return String(a.raw).localeCompare(String(b.raw), 'en');
+  });
+
+  const citationsTotal = resolvedCitations.length;
+  const citationsResolved = resolvedCitations.filter((r) => r.resolution.state === 'RESOLVED').length;
+
+  const coverage = {
+    fragments_read: fragments.length - unreadableFragments.length,
+    facts_total: allFacts.length,
+    facts_with_resolved: factClassifications.filter((f) => f.bucket === 'with_resolved').length,
+    facts_unresolved_only: factsUnresolvedOnly,
+    facts_without_citation: factsWithoutCitation,
+    facts_no_file_mention: factClassifications.filter((f) => f.bucket === 'no_file_mention'),
+    facts_missed_by_extractor: factClassifications.filter((f) => f.bucket === 'missed_by_extractor'),
+    files_indexed: entries.length,
+    citations_total: citationsTotal,
+    citations_resolved: citationsResolved,
+    unresolved,
+    unreadable_fragments: unreadableFragments,
+    // Additive (dogfood fix): fragment FILES the store dropped before we ever
+    // saw them. Distinct from unreadable_fragments (which the store returned
+    // and we failed to read). Never feeds the citation sum invariant.
+    fragments_skipped_by_store: fragmentsSkippedByStore,
+    scan_capped: fileIndex.capped,
+    guard_unavailable: guardUnavailable,
+    fragment_listing_failed: fragmentListingFailed,
+  };
+
+  return { entries, coverage, partial: guardPartial || fragmentListingFailed !== null };
+}
+
+// ── renderIndex ────────────────────────────────────────────────────────────────
+// Deterministic markdown renderer. No wallclock anywhere in the output — two
+// runs over the same store produce byte-identical strings. `coverage` field
+// names come from T01 and are LOCKED: rendered verbatim, never renamed.
+// S02 R6: every value interpolated into markdown is UNTRUSTED — `raw` comes
+// from free prose scanned as `\S+` tokens (so `a|b*.js` is reachable) and
+// `mem_id` comes from fragment frontmatter. An unescaped `|` turns a 4-column
+// row into a 6-column one, corrupting the one section whose entire purpose is
+// being trustworthy.
+//
+// cell()     — safe for a table cell: no raw pipes, no line breaks.
+// codeCell() — cell() + code-formatted; uses a `` fence when the value itself
+//              contains a backtick, so the span never breaks.
+// prose()    — neutralizes raw HTML for free-text rendered outside a table.
+function cell(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/\r?\n/g, ' ')
+    .replace(/\|/g, '\\|');
+}
+
+function codeCell(value) {
+  const s = cell(value);
+  if (s.length === 0) return '';
+  if (s.includes('`')) return '`` ' + s + ' ``';
+  return '`' + s + '`';
+}
+
+function prose(value) {
+  return cell(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderIndex(result, opts) {
+  opts = opts || {};
+  const entries = Array.isArray(result && result.entries) ? result.entries : [];
+  const coverage = (result && result.coverage) || {};
+  const partial = !!(result && result.partial);
+
+  const lines = [];
+
+  lines.push('# Índice de memória por arquivo-fonte');
+  lines.push('');
+  lines.push('_Este arquivo é derivado e regenerável — nunca edite à mão. Para regenerar:_');
+  lines.push('`node scripts/forge-memory-index.js --write`');
+  lines.push('');
+  lines.push('_Consulta sob demanda: este arquivo não é injetado em nenhum prompt._');
+  lines.push('');
+
+  if (partial) {
+    lines.push('> ⚠️ **Índice parcial** — o dado em `.gsd/SCHEMA-VERSION` está à frente da tooling local.');
+    lines.push('> Este índice pode estar incompleto até a tooling ser atualizada (`/forge-update`).');
+    lines.push('');
+  }
+
+  lines.push('## Índice por arquivo-fonte');
+  lines.push('');
+  if (entries.length === 0) {
+    lines.push('_Nenhum fragmento de memória encontrado._');
+    lines.push('');
+  } else {
+    for (const entry of entries) {
+      lines.push(`### ${codeCell(entry.file)}`);
+      lines.push('');
+      for (const fact of entry.facts) {
+        const memId = fact.mem_id ? codeCell(fact.mem_id) : '(sem mem_id)';
+        const category = fact.category ? prose(fact.category) : '(sem categoria)';
+        const summary = fact.summary ? prose(fact.summary) : '(sem resumo)';
+        const unit = (fact.unit_id || fact.storage_key)
+          ? codeCell(fact.unit_id || fact.storage_key)
+          : '(unidade desconhecida)';
+        lines.push(`- ${memId} (${category}) — ${summary} — origem: ${unit}`);
+      }
+      lines.push('');
+    }
+  }
+
+  // ── Cobertura e descarte — INCONDICIONAL (never omitted, never skipped). ──
+  lines.push('## Cobertura e descarte');
+  lines.push('');
+  // S02 R3: an enumeration failure must NEVER read as an empty store.
+  if (coverage.fragment_listing_failed) {
+    lines.push(`> 🛑 **Não foi possível LER o store de memória** (\`fragment_listing_failed\`): ${prose(coverage.fragment_listing_failed)}`);
+    lines.push('> Os números abaixo são zerados por FALHA DE LEITURA, não porque o store esteja vazio. Índice marcado como parcial.');
+    lines.push('');
+  }
+  lines.push(`- fragments_read: ${coverage.fragments_read || 0}`);
+  lines.push(`- facts_total: ${coverage.facts_total || 0}`);
+  lines.push(`- facts_with_resolved: ${coverage.facts_with_resolved || 0}`);
+  const noFileMention = Array.isArray(coverage.facts_no_file_mention) ? coverage.facts_no_file_mention : [];
+  const missedByExtractor = Array.isArray(coverage.facts_missed_by_extractor) ? coverage.facts_missed_by_extractor : [];
+  const unresolvedOnly = Array.isArray(coverage.facts_unresolved_only) ? coverage.facts_unresolved_only : [];
+  lines.push(`- (a) fatos sem menção reconhecida pelo vocabulário atual do extrator: ${noFileMention.length} — parte desconhecida. Este balde absorve tanto fatos que realmente não citam arquivo quanto menções cujo sufixo está fora de \`CODE_EXT\`; não há medição que separe as duas populações, portanto ele NÃO pode ser declarado livre de defeito.`);
+  lines.push(`- (b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator: ${missedByExtractor.length} — é defeito real do extrator e requer investigação. Esta contagem cobre apenas fatos SEM NENHUMA citação capturada; captura PARCIAL (ex.: um fato que cita três arquivos e o extrator só capturou um) não é medida aqui — permanece invisível a este balde.`);
+  lines.push(`- (c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo: ${unresolvedOnly.length} — mistura duas causas que esta contagem NÃO separa: citações que apontam para arquivo e não foram localizadas, e citações que por design não são arquivo (\`package-ref\`, \`dynamic\` — ver tabela abaixo). A divisão entre as duas populações permanece não medida.`);
+  lines.push(`- citations_total: ${coverage.citations_total || 0}`);
+  lines.push(`- citations_resolved: ${coverage.citations_resolved || 0}`);
+  lines.push(`- files_indexed: ${coverage.files_indexed || 0}`);
+  lines.push('');
+
+  lines.push('### Citações não resolvidas');
+  lines.push('');
+  const unresolved = Array.isArray(coverage.unresolved) ? coverage.unresolved : [];
+  if (unresolved.length === 0) {
+    lines.push('_Nenhuma citação não resolvida._');
+  } else {
+    lines.push('| citação | motivo | ocorrências | exemplo mem_id |');
+    lines.push('|---|---|---|---|');
+    for (const u of unresolved) {
+      const raw = codeCell(u.raw) || '(vazio)';
+      const example = u.example_mem_id ? codeCell(u.example_mem_id) : '(nenhum)';
+      lines.push(`| ${raw} | ${cell(u.reason)} | ${cell(u.count)} | ${example} |`);
+    }
+  }
+  lines.push('');
+
+  lines.push('### Fatos com apenas citações irresolúveis');
+  lines.push('');
+  if (unresolvedOnly.length === 0) {
+    lines.push('_Nenhum fato com apenas citações irresolúveis._');
+  } else {
+    for (const f of unresolvedOnly) lines.push(`- ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} (${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'})`);
+  }
+  lines.push('');
+
+  lines.push('### Fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator (defeito, captura parcial não incluída)');
+  lines.push('');
+  if (missedByExtractor.length === 0) {
+    lines.push('_Nenhum fato neste balde._');
+  } else {
+    lines.push('| mem_id | storage_key | token de amostra |');
+    lines.push('|---|---|---|');
+    for (const f of missedByExtractor) {
+      lines.push(`| ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} | ${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'} | ${f.sample_token ? codeCell(f.sample_token) : '(nenhum)'} |`);
+    }
+  }
+  lines.push('');
+
+  lines.push('### Fatos sem menção reconhecida pelo vocabulário do extrator (parte desconhecida)');
+  lines.push('');
+  if (noFileMention.length === 0) {
+    lines.push('_Nenhum fato neste balde._');
+  } else {
+    for (const f of noFileMention) lines.push(`- ${f.mem_id ? codeCell(f.mem_id) : '(sem mem_id)'} (${f.storage_key ? codeCell(f.storage_key) : '(unidade desconhecida)'})`);
+  }
+  lines.push('');
+
+  // S06 R9: this legacy bucket is reconstituted EXACTLY by the two sections
+  // above ((a) + (b)), so enumerating it again printed every no-citation fact
+  // twice — 421 duplicated lines on the real store, in a report whose whole
+  // purpose is legibility. The COUNT stays (it anchors the identity proof and
+  // the "Antes" column of the diagnostic doc); only the listing is dropped.
+  // The `facts_without_citation` FIELD is untouched in the JSON envelope.
+  const withoutCitation = Array.isArray(coverage.facts_without_citation) ? coverage.facts_without_citation : [];
+  lines.push('### Fatos sem nenhuma citação');
+  lines.push('');
+  lines.push(`- facts_without_citation: ${withoutCitation.length} — este balde é a soma exata de (a) + (b); a enumeração está nas duas seções acima e não é repetida aqui.`);
+  lines.push('');
+
+  lines.push('### Fragmentos ilegíveis');
+  lines.push('');
+  const unreadable = Array.isArray(coverage.unreadable_fragments) ? coverage.unreadable_fragments : [];
+  if (unreadable.length === 0) {
+    lines.push('_Nenhum fragmento ilegível._');
+  } else {
+    for (const u of unreadable) lines.push(`- ${codeCell(u.storageKey || u.path)} — ${prose(u.reason)}`);
+  }
+  lines.push('');
+
+  lines.push('### Fragmentos descartados pelo store');
+  lines.push('');
+  const skipped = Array.isArray(coverage.fragments_skipped_by_store) ? coverage.fragments_skipped_by_store : [];
+  if (skipped.length === 0) {
+    lines.push('_Nenhum arquivo de `.gsd/memory/` foi descartado pelo store._');
+  } else {
+    lines.push(`⚠️ ${skipped.length} arquivo(s) em \`.gsd/memory/\` não foram devolvidos pelo store (nome não parseável como storage key). **Os fatos desses fragmentos estão AUSENTES deste índice.**`);
+    lines.push('');
+    lines.push('| arquivo |');
+    lines.push('|---|');
+    // Filenames are uncontrolled input — same table-cell escaping as R6.
+    for (const name of skipped) lines.push(`| ${codeCell(name)} |`);
+  }
+  lines.push('');
+
+  if (coverage.scan_capped) {
+    lines.push('> ⚠️ A varredura de arquivos do repositório atingiu o limite (`scan_capped`) — a resolução de citações por basename pode estar incompleta.');
+    lines.push('');
+  }
+
+  if (coverage.guard_unavailable) {
+    lines.push('> ⚠️ O guard de schema não pôde ser carregado nesta execução — leitura degradou para `partial:false` sem checagem de direção.');
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push('');
+  lines.push('_A extração de citações é heurística (regex sobre prosa livre). A seção acima é o contrato de honestidade do gerador: tudo que não pôde ser resolvido está listado, nunca omitido em silêncio._');
+
+  return lines.join('\n') + '\n';
+}
+
+// ── writeIndex ────────────────────────────────────────────────────────────────
+// Writes the rendered markdown to `opts.out` (resolved against cwd, contained
+// under root via isWithin — same containment discipline as citation
+// resolution). Returns { path, bytes, changed }; `changed:false` when the
+// content on disk is already identical (same economy as
+// forge-memory.js writeFragment's pre-write comparison).
+function writeIndex(result, cwd, opts) {
+  opts = opts || {};
+  const root = path.resolve(cwd);
+  const outRel = typeof opts.out === 'string' && opts.out ? opts.out : DEFAULT_INDEX_PATH;
+  const outAbs = path.resolve(root, outRel);
+
+  if (!isWithin(root, outAbs)) {
+    throw new Error(`--out escapes cwd: ${outRel}`);
+  }
+
+  const md = renderIndex(result, opts);
+
+  let unchanged = false;
+  try {
+    if (fs.existsSync(outAbs) && fs.readFileSync(outAbs, 'utf8') === md) unchanged = true;
+  } catch (_) {
+    unchanged = false;
+  }
+
+  if (!unchanged) {
+    fs.mkdirSync(path.dirname(outAbs), { recursive: true });
+    fs.writeFileSync(outAbs, md, 'utf8');
+  }
+
+  return { path: outAbs, bytes: Buffer.byteLength(md, 'utf8'), changed: !unchanged };
+}
+
+module.exports = {
+  CITATION_REGEXES,
+  extractCitations,
+  resolveCitation,
+  listRepoFiles,
+  summarizeFact,
+  buildFileIndex,
+  renderIndex,
+  writeIndex,
+  DEFAULT_INDEX_PATH,
+};
+
+// ── CLI ──────────────────────────────────────────────────────────────────────
+// node forge-memory-index.js [--write] [--json] [--out <path>] [--cwd <dir>]
+// Molde: forge-symbol-check.js (argv manual, JSON de 1 linha em stdout,
+// {error} em stderr, exits 0/1/2). Exit 2 rejeita args inválidos explicitamente
+// (S01's guard CLI took a review objection precisely for accepting bad args).
+function parseCliArgs(argv) {
+  const KNOWN = new Set(['--write', '--json', '--out', '--cwd']);
+  const out = { write: false, json: false, out: undefined, cwd: undefined, valid: true };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!KNOWN.has(arg)) { out.valid = false; return out; }
+    if (arg === '--write') { out.write = true; continue; }
+    if (arg === '--json') { out.json = true; continue; }
+    if (arg === '--out') {
+      if (argv[i + 1] === undefined) { out.valid = false; return out; }
+      out.out = argv[++i];
+      continue;
+    }
+    if (arg === '--cwd') {
+      if (argv[i + 1] === undefined) { out.valid = false; return out; }
+      out.cwd = argv[++i];
+      continue;
+    }
+  }
+  return out;
+}
+
+function runCli(argv) {
+  const args = parseCliArgs(argv);
+  if (!args.valid) {
+    process.stderr.write(JSON.stringify({ error: 'Usage: forge-memory-index.js [--write] [--json] [--out <path>] [--cwd <dir>]' }) + '\n');
+    return 2;
+  }
+
+  const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd();
+  // Sem flag de saída explícita → default --write (step 6 do plano).
+  const doWrite = args.write || !args.json;
+
+  try {
+    const result = buildFileIndex(cwd, {});
+
+    let writeInfo = null;
+    if (doWrite) {
+      writeInfo = writeIndex(result, cwd, { out: args.out });
+    }
+
+    if (args.json) {
+      const envelope = {
+        partial: result.partial,
+        counts: {
+          fragments_read: result.coverage.fragments_read,
+          facts_total: result.coverage.facts_total,
+          facts_with_resolved: result.coverage.facts_with_resolved,
+          facts_no_file_mention: Array.isArray(result.coverage.facts_no_file_mention) ? result.coverage.facts_no_file_mention.length : 0,
+          facts_missed_by_extractor: Array.isArray(result.coverage.facts_missed_by_extractor) ? result.coverage.facts_missed_by_extractor.length : 0,
+          facts_unresolved_only: Array.isArray(result.coverage.facts_unresolved_only) ? result.coverage.facts_unresolved_only.length : 0,
+          citations_total: result.coverage.citations_total,
+          citations_resolved: result.coverage.citations_resolved,
+        },
+        coverage: result.coverage,
+        files_indexed: result.coverage.files_indexed,
+        out: writeInfo ? writeInfo.path : null,
+      };
+      process.stdout.write(JSON.stringify(envelope) + '\n');
+    }
+
+    return 0;
+  } catch (err) {
+    process.stderr.write(JSON.stringify({ error: err && err.message ? err.message : String(err) }) + '\n');
+    return 1;
+  }
+}
+
+if (require.main === module) {
+  process.exitCode = runCli(process.argv.slice(2));
+}

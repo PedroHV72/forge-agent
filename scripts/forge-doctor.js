@@ -2,7 +2,7 @@
 // forge-doctor — schema-version + projection-versioned checks for Forge Agent
 //
 // Library exports:
-//   CURRENT_SCHEMA              // string — 'fragment-store@1.0.0'
+//   CURRENT_SCHEMA              // string — 'fragment-store@3.0.0'
 //   checkSchema(cwd)            // (cwd?) → { ok, expected, actual, message }
 //   checkProjectionVersioned(cwd) // (cwd?) → { ok, tracked: string[], skipped?: string, message }
 //   checkPlanRepoDeclared(cwd)  // (cwd?) → { ok, plans: string[], skipped?: string, message }  (advisory)
@@ -33,7 +33,7 @@ const { detect: detectCapabilities } = require('./forge-capabilities');
 const maintenance = require('./forge-maintenance');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const CURRENT_SCHEMA = 'fragment-store@1.0.0';
+const CURRENT_SCHEMA = 'fragment-store@3.0.0';
 const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 
 // Single source of truth for the check names this CLI accepts via `--check`.
@@ -83,8 +83,16 @@ function checkSchema(cwd) {
 /**
  * Checks if any projection monolith is tracked by VCS (should be ignored).
  * Uses PROJECTION_IGNORE_PATHS from forge-ignore.js — single source of truth.
+ *
+ * The membership question goes through the `forge-vcs.js` seam (`isTracked`),
+ * never through a VCS command parsed here. This layer previously read
+ * `svn status <path>` textually and got the answer backwards on both ends —
+ * an ignored path prints `I <path>` (read as tracked) and a versioned clean
+ * one prints nothing (read as untracked). Re-implementing VCS access beside
+ * the seam is what produced that; the seam owns the oracle now.
+ *
  * @param {string} [cwd] - Working directory (default: process.cwd())
- * @returns {{ ok: boolean, tracked: string[], skipped?: string, message: string }}
+ * @returns {{ ok: boolean, tracked: string[], skipped?: string, unreadable?: string[], message: string }}
  */
 function checkProjectionVersioned(cwd) {
   const dir = cwd || process.cwd();
@@ -99,55 +107,43 @@ function checkProjectionVersioned(cwd) {
     };
   }
 
-  if (vcs === 'svn') {
-    // SVN support: check svn status for each path
-    const tracked = [];
-    for (const projPath of PROJECTION_IGNORE_PATHS) {
-      const absPath = path.join(dir, projPath);
-      if (!fs.existsSync(absPath)) continue;
-      try {
-        const out = execFileSync('svn', ['status', absPath], { encoding: 'utf8' }).trim();
-        // If svn status shows no '?' prefix, the file is tracked
-        if (out && !out.startsWith('?')) {
-          tracked.push(projPath);
-        }
-      } catch (_) {
-        // not versioned or svn error — treat as not tracked
-      }
-    }
-    if (tracked.length === 0) {
-      return { ok: true, tracked: [], message: 'No projection monoliths are tracked by SVN.' };
-    }
+  const { isTracked } = require('./forge-vcs');
+
+  const tracked = [];
+  const unreadable = [];
+  for (const projPath of PROJECTION_IGNORE_PATHS) {
+    const probe = isTracked(dir, projPath, { vcs });
+    // `ok: false` is "could not ask" (VCS binary absent), never "the answer is
+    // no". Accusing on an unanswered probe is how this check lost the operator's
+    // trust in the first place — it is reported, not counted.
+    if (!probe.ok) unreadable.push(projPath);
+    else if (probe.tracked) tracked.push(projPath);
+  }
+
+  const label = vcs === 'svn' ? 'SVN' : 'git';
+  const suffix = unreadable.length
+    ? ` (${unreadable.length} path(s) could not be probed: ${unreadable.join(', ')})`
+    : '';
+
+  if (tracked.length === 0) {
     return {
-      ok: false,
-      tracked,
-      message: `${tracked.length} projection monolith(s) tracked by SVN (should be ignored): ${tracked.join(', ')}`,
+      ok: true,
+      tracked: [],
+      ...(unreadable.length ? { unreadable } : {}),
+      message: `No projection monoliths are tracked by ${label}.${suffix}`,
     };
   }
 
-  // git
-  const tracked = [];
-  for (const projPath of PROJECTION_IGNORE_PATHS) {
-    try {
-      const out = execFileSync(
-        'git',
-        ['ls-files', '--error-unmatch', projPath],
-        { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
-      ).trim();
-      if (out) tracked.push(projPath);
-    } catch (_) {
-      // exit 1 = file not tracked — expected, continue
-    }
-  }
-
-  if (tracked.length === 0) {
-    return { ok: true, tracked: [], message: 'No projection monoliths are tracked by git.' };
-  }
-
+  // Both failure texts are verbatim what they were before the seam refactor —
+  // `commands/forge-doctor.md` reproduces the git one as sample output.
+  const accusation = vcs === 'svn'
+    ? `${tracked.length} projection monolith(s) tracked by SVN (should be ignored): ${tracked.join(', ')}`
+    : `${tracked.length} projection monolith(s) accidentally tracked by git (should be in .gitignore): ${tracked.join(', ')}`;
   return {
     ok: false,
     tracked,
-    message: `${tracked.length} projection monolith(s) accidentally tracked by git (should be in .gitignore): ${tracked.join(', ')}`,
+    ...(unreadable.length ? { unreadable } : {}),
+    message: `${accusation}${suffix}`,
   };
 }
 

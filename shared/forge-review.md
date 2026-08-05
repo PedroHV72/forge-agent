@@ -4,8 +4,8 @@ Authoritative spec for the **review gate**: a two-agent confrontation on a compl
 
 | Consumer | Boundary | DIFF_CMD | Artifact | MODE |
 |----------|----------|----------|----------|------|
-| `forge-auto` / `forge-next` (before `complete-slice`) | per-slice — branch `gsd/{M###}/{S##}` still **unmerged** | git: `git diff {merge-base}...HEAD` · svn: `svn diff` (Step 1, VCS-aware) | `{S##}-REVIEW.md` | `auto` / `interactive` |
-| `forge-task` (Step 5.5) | standalone task | `git diff {START_SHA}..HEAD` (worktree fallback) | `{TASK_ID}-REVIEW.md` | `interactive` |
+| `forge-auto` / `forge-next` (before `complete-slice`) | per-slice — branch `gsd/{M###}/{S##}` still **unmerged** | git: `git diff {merge-base}...HEAD` · svn: `forge-review-diff.js` (Step 1, VCS-aware) | `{S##}-REVIEW.md` | `auto` / `interactive` |
+| `forge-task` (Step 5.5) | standalone task | git: `git diff {START_SHA}..HEAD` (worktree fallback) · svn: `forge-review-diff.js` | `{TASK_ID}-REVIEW.md` | `interactive` |
 
 Steps 2–8 below are boundary-agnostic — only the four bindings above differ. Step 9 (milestone-final triage) applies only to the per-slice boundary. The rest of this doc is written in slice terms (`{S##}-REVIEW.md`); substitute the task bindings when invoked from `forge-task`.
 
@@ -24,6 +24,19 @@ The human only adjudicates what the two AIs genuinely disagree on. Everything el
 - `{M###}` — active milestone id
 - `{S##}` — slice being completed
 - `MODE` — `interactive` (forge-next) or `auto` (forge-auto)
+- `FORGE_SCRIPTS_DIR` / `FORGE_SHARED_DIR` — resolved by the calling skill's bootstrap. Every
+  `scripts/<x>.js` and `shared/<x>.md` named below is opened through them; the installer flattens
+  `shared/*.md` into `~/.claude/`, so the bare relative path only exists inside the forge-agent
+  repo. If the calling skill did not export them, resolve them the same way before Step 0.
+
+> **This spec is executed, not consulted.** Every step below is a procedure with a fixed output
+> contract, not guidance to be paraphrased. Two failure modes have been observed in production and
+> are explicitly out of bounds: (a) skipping a dispatch and substituting the orchestrator's own
+> reading of the diff — the advocate exists precisely because self-review is not review; (b)
+> hand-writing the Step 8 telemetry instead of calling the emitter, which produced 151 distinct
+> event shapes across 265 reviews and zero conformant rows in the workspace that surfaced this
+> note. When a step cannot run, use its named degradation path (`§ Agent unavailability`,
+> `review-*-fallback`) and record it — improvising the step is never one of the options.
 
 ## Step 0 — Read review prefs (via the canonical prefs CLI)
 
@@ -53,7 +66,7 @@ let gateTimeoutMs=Number.isInteger(rv.gate_timeout_ms)&&rv.gate_timeout_ms>0?rv.
 let fixConceded=(low(rv.fix_conceded)==='false')?false:(rv.fix_conceded===false?false:true);
 let engine=low(rv.engine); if(!['agents','workflow'].includes(engine))engine='agents';
 let challenger=low(rv.challenger); if(!['claude','codex','gemini','auto'].includes(challenger))challenger='claude';
-let advocate=low(rv.advocate); if(!['claude','auto'].includes(advocate))advocate='claude';
+let advocate=low(rv.advocate); if(!['claude','codex','gemini','auto'].includes(advocate))advocate='claude';
 let challengerModel=(typeof rv.challenger_model==='string'&&rv.challenger_model.trim())?rv.challenger_model.trim():null;
 let advocateModel=(typeof rv.advocate_model==='string'&&rv.advocate_model)?rv.advocate_model:'claude-fable-5';
 process.stdout.write(JSON.stringify({mode,style,trigger,adaptiveFlagsLines,adaptiveDialecticLines,rounds,askAuto,gateTimeoutMs,fixConceded,engine,challenger,advocate,challengerModel,advocateModel}));
@@ -78,7 +91,7 @@ XLLM_ENGINE=$([ "$CHALLENGER" = "gemini" ] && echo agy || echo codex)
 
 ### Resolução de pairing (`auto`) — uma vez, antes de tudo
 
-`challenger`/`advocate` aceitam agora `claude | codex | gemini | auto` (advocate: `claude | auto` — advocate GPT/Gemini é fase 2, ver M006-CONTEXT #1). Quando **qualquer** eixo é `auto`, o pairing é resolvido **por autoria do diff** via `scripts/forge-review-pairing.js` — **uma única vez**, e essa resolução acontece **ANTES** da regra `engine: workflow força agents` (precedência abaixo) e **ANTES** do branch `style: flags`. `auto` cru nunca é testado por nenhuma regra a jusante; só o valor **resolvido** (`RESOLVED_CHALLENGER`/`RESOLVED_ADVOCATE`) é consumido dali em diante.
+`challenger`/`advocate` aceitam `claude | codex | gemini | auto` — **ambos os eixos, mesmo whitelist**. O advocate GPT/Gemini deixou de ser fase 2: `scripts/forge-xllm.js --mode defend` existe, então `advocate: auto` resolve para a família **do autor** em vez de degradar para Claude. A degradação antiga (`defend-mode-unavailable`) continua alcançável via `--defend-unavailable`, para adapters instalados sem o modo. Quando **qualquer** eixo é `auto`, o pairing é resolvido **por autoria do diff** via `scripts/forge-review-pairing.js` — **uma única vez**, e essa resolução acontece **ANTES** da regra `engine: workflow força agents` (precedência abaixo) e **ANTES** do branch `style: flags`. `auto` cru nunca é testado por nenhuma regra a jusante; só o valor **resolvido** (`RESOLVED_CHALLENGER`/`RESOLVED_ADVOCATE`) é consumido dali em diante.
 
 **Fonte de autoria = stream GLOBAL canônico** `$WORKING_DIR/.gsd/forge/events.jsonl` (declarado em `shared/forge-dispatch.md`; nunca arquivado — os dispatch events `execute-task/*` com `engine`/`slice`/`milestone` vivem lá; o per-milestone `{M###}-events.jsonl` guarda `repair`/`plan_check` e é movido no `milestone_cleanup`, portanto **não** é fonte). Se **nenhum** eixo é `auto` (ambos explícitos) → o CLI **não é chamado** (explícito vence; o CLI respeita o valor explícito, não deriva por autoria).
 
@@ -190,8 +203,19 @@ if [ "$PAIR_POLICY" = majority ] || [ "$PAIR_POLICY" = tie-last ] || [ "$PAIR_PO
 fi
 PAIRING_LINE="**Pairing:** ${PAIR_MODE} — autor ${AUTHOR_ENGINE} → challenger ${CHALLENGER_FAMILY}${PAIR_SUFFIX}"
 ADVOCATE_FAMILY=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --family "$RESOLVED_ADVOCATE")
+# Both sides above are FAMILIES ('claude'|'gpt'|'gemini'), never engines: an
+# engine compared against a family ('gpt' vs 'codex') is unequal for the SAME
+# family and silently inverts this flag the moment a gpt advocate exists.
+#
+# The author is deliberately NOT part of this test. Requiring the debaters'
+# family to also differ from the author's excuses the shipped default (claude
+# author, claude challenger, claude advocate) as "not a collapse", which pins
+# the flag at false on every default-configured review. This rule MUST stay
+# byte-for-byte equivalent to the emitter's (forge-review-emit.js), or the
+# artifact the human reads and the row a script aggregates disagree — the log
+# announcing a collapse the page denies.
 INTRA_FAMILY=false
-if [ "$ADVOCATE_FAMILY" = "$CHALLENGER_FAMILY" ] && [ "$ADVOCATE_FAMILY" != "$AUTHOR_ENGINE" ]; then INTRA_FAMILY=true; fi
+if [ "$ADVOCATE_FAMILY" = "$CHALLENGER_FAMILY" ]; then INTRA_FAMILY=true; fi
 ```
 
 A partir daqui, **todo o gate consome os resolvidos**: Steps 2/4 e a regra workflow abaixo usam `$RESOLVED_CHALLENGER`; Steps 3/6 usam `$RESOLVED_ADVOCATE`. `AUTHOR_ENGINE`/`PAIR_MODE`/`PAIR_POLICY`/`PAIR_REASON` alimentam a linha `**Pairing:**` do header (Step 6), já pré-montada em `$PAIRING_LINE`. A resolução ocorre **uma vez por review**; `style: flags` (abaixo) usa o pairing já resolvido (decisão #31 preservada).
@@ -306,13 +330,45 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     DIFF_CMD="git diff HEAD"
   fi
 elif svn info >/dev/null 2>&1; then
-  # svn — no per-slice branch/merge-base; the reviewable change is the uncommitted working copy.
-  DIFF_CMD="svn diff"
+  # svn — scoped to this slice's paths, new files included (M017 Phase 2).
+  DIFF_CMD="node \"$FORGE_SCRIPTS_DIR/forge-review-diff.js\" --cwd \"${CODE_DIR:-$WORKING_DIR}\" --unit-dir \"$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}\""
+  # Only this branch answers --scope-report; asking git would rely on where it
+  # happens to print its usage text.
+  SCOPE_REPORT=$(eval "$DIFF_CMD" --scope-report 2>/dev/null || echo "")
 else
   # unknown VCS (or CLI absent) — degrade to the no-diff path below, never error.
   DIFF_CMD="git diff HEAD"
 fi
 ```
+
+**Why the SVN branch is a program and not `svn diff`.** Three properties the bare command
+cannot deliver, each observed in the field:
+
+- **Scope.** `svn diff` with no paths is the ENTIRE working copy. With no per-slice branch and
+  a working copy shared by several developers at once, it carries their uncommitted work —
+  measured: 49 files, 8 of them the unit's. The challenger then spends its budget objecting to
+  code this slice does not own. `--unit-dir` mines the slice's `T##-PLAN.md`/`*-SUMMARY.md` for
+  declared outputs and intersects them with what actually changed.
+- **New files.** `svn diff` cannot render an unversioned (`?`) file at all. On a slice whose
+  whole change was two new files, the review would have read nothing and rendered CLEAN — the
+  worst outcome a gate has. They are reconstructed as added-file hunks.
+- **Appended arguments.** `$DIFF_CMD --name-only` (Step 1.5/pattern scan) and `{DIFF_CMD} -- <files>`
+  (Step 2.0 sharding) are appended by consumers below. `svn diff --name-only` does not exist, so
+  the previous `DIFF_CMD="svn diff"` broke both of them silently. The program accepts both.
+
+`.gsd/**` is excluded up front (canonical `isGsdPath` predicate) and reported as `gsd_excluded`:
+in an SVN working copy Forge's own plans, summaries and evidence logs sit in the tree as unversioned
+files, so the unscoped diff was handing the challenger its own artifacts to review.
+
+The SVN baseline marker stays intentionally inert: `svnversion` yields `44531:44534M` in a mixed-revision
+working copy, which `svn diff -r` does not accept, and diffing against a recorded revision in a shared
+working copy would import other developers' landed commits. The diff is against BASE.
+
+Scoping never produces an empty diff — an absent or non-matching manifest falls back to the whole
+working copy (previous behavior) and says so in `--scope-report`, captured as `$SCOPE_REPORT` above.
+Disclose it in the artifact, including `excluded`: a review that skipped files must never read as one
+that found nothing. A `reason` of `unscoped:*` means the manifest did not apply and the whole working
+copy was read — the operator has to be able to see that.
 
 If `$DIFF_CMD` still produces no changes → write a minimal `{S##}-REVIEW.md` stating "no diff to review" and proceed. Do not dispatch agents.
 
@@ -327,6 +383,16 @@ never spend an LLM call deciding whether to spend an LLM call.
 REVIEW_CODE_DIR="${CODE_DIR:-$WORKING_DIR}"
 POLICY_ARGS=(review --cwd "$REVIEW_CODE_DIR" --risk "${SLICE_RISK:-normal}")
 [ -n "${BASE:-}" ] && POLICY_ARGS+=(--base "$BASE")
+# SVN only: the policy must count the SCOPED diff. Left unscoped it reads the whole
+# shared working copy, so a colleague's uncommitted files decide this slice's review
+# budget — promoting to dialectic and sharding challengers across code the unit does
+# not own. Fails open: the flag is added only when the scope list was produced.
+if [ -n "${SCOPE_REPORT:-}" ]; then
+  mkdir -p "$WORKING_DIR/.gsd/forge"
+  REVIEW_SCOPE_FILE="$WORKING_DIR/.gsd/forge/review-scope-{S##}.txt"
+  eval "$DIFF_CMD" --name-only > "$REVIEW_SCOPE_FILE" 2>/dev/null \
+    && POLICY_ARGS+=(--scope-file "$REVIEW_SCOPE_FILE")
+fi
 compgen -G "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/tasks/*/*-SECURITY.md" >/dev/null && POLICY_ARGS+=(--security-present)
 grep -Eq 'substantive:[[:space:]]*(false|✗)|wired:[[:space:]]*(false|✗)' \
   "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/{S##}-VERIFICATION.md" 2>/dev/null \
@@ -444,7 +510,32 @@ XLLM_EXIT=$?
 - **exit 0** → stdout is JSON `{objections:[{id,severity,file,line,issue,fix,challenge}]}` (already normalized by the adapter). Map each objection into the same `OBJECTIONS` contract the Claude branch produces — id (`R#`), `path:line` (`file:line`), severity, claim (`issue`), suggested fix (`fix`), and the `challenge` question — so Steps 3/5/6 consume it identically. Empty `objections` array → treat as `NO_FLAGS` (write a clean `{S##}-REVIEW.md`, proceed).
 - **exit != 0** → **single fallback** (no retry) to `Agent("forge-reviewer")` (the `challenger == 'claude'` invocation above), echo `⚠ challenger: $CHALLENGER indisponível (exit ≠ 0) — usando forge-reviewer`, and append a `review-challenger-fallback` event with `reason: "{challenger}-exit-nonzero"` (`codex-exit-nonzero` or `gemini-exit-nonzero`; cause is on the adapter's stderr). See **Fallback challenger (review-challenger-fallback)** (trigger b). The gate then continues with the agent's objections.
 
-## Step 3 — Defense (forge-advocate)
+## Step 3 — Defense
+
+Routed by `$RESOLVED_ADVOCATE` (from Step 0), symmetrically with Step 2: `claude` runs the in-context `forge-advocate`; `codex` / `gemini` run the adapter with `--mode defend --engine $XLLM_ENGINE_ADVOCATE`.
+
+### `advocate == 'codex' | 'gemini'` (S01 adapter)
+
+This is the branch that makes `advocate: auto` mean something for a GPT/Gemini author — before `--mode defend` existed, the defense of non-Claude code was always argued by a family that did not write it.
+
+Render the objections into a temp file (the same `OBJECTIONS` contract Step 2 produced), then invoke the adapter. `--diff-cmd` is passed so the defender verifies claims against the real code instead of arguing from the objection text alone:
+
+```bash
+XLLM_ENGINE_ADVOCATE=$([ "$RESOLVED_ADVOCATE" = "gemini" ] && echo agy || echo codex)
+if [ -n "$ADVOCATE_MODEL_EXTERNAL" ]; then
+  node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode defend --engine "$XLLM_ENGINE_ADVOCATE" --input "$DEFENSE_INPUT" --diff-cmd "{DIFF_CMD}" --cwd {WORKING_DIR} --model "$ADVOCATE_MODEL_EXTERNAL"
+else
+  node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode defend --engine "$XLLM_ENGINE_ADVOCATE" --input "$DEFENSE_INPUT" --diff-cmd "{DIFF_CMD}" --cwd {WORKING_DIR}
+fi
+XLLM_DEFEND_EXIT=$?
+```
+
+- **exit 0** → stdout is JSON `{verdicts:[{id,verdict,rationale}]}` with `verdict ∈ refuted|conceded|open` — the exact contract the Claude branch produces, so Steps 4/5/6/7a consume it identically and never learn which family defended.
+- **exit != 0** → **single fallback** (no retry) to `Agent("forge-advocate")` (the `claude` branch below), echo `⚠ advocate: $RESOLVED_ADVOCATE indisponível (exit ≠ 0) — usando forge-advocate`, and append a `review-pairing-fallback` event with `reason: "{advocate}-defend-exit-nonzero"`. **The debate then IS intra-family** — recompute `INTRA_FAMILY` against the advocate that actually ran, so the Step 6 header and the emitted event both say so. A fallback that silently keeps the pre-fallback pairing in the artifact is the exact drift this gate exists to surface.
+
+`$ADVOCATE_MODEL_EXTERNAL` is `advocate_model` when its family matches the resolved external advocate, else empty (CLI default). A `claude-*` id must never be forwarded to `codex`/`agy` as `--model`.
+
+### `advocate == 'claude'` (forge-advocate)
 
 `ADVOCATE_ALIAS` was resolved in Step 0 from `advocate_model` (default `claude-fable-5`) via `scripts/forge-model-alias.js`. **The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literal sonnet/fable/opus/haiku is a violation detected post-hoc by `forge-review-audit.js`.** Pass `model:` only when the alias is non-empty:
 
@@ -723,7 +814,7 @@ The artifact is the **dialogue**, not a flag dump. Auditable, durable with the m
 **Challenger:** {claude|codex|gemini} (<model|default>)
 **Defender:** {advocate_model|alias}
 {$PAIRING_LINE}
-{$INTRA_FAMILY == true ? '**⚠ Adversarialidade reduzida:** refutação e juízo de tradeoff são da mesma família; fase 2 deve prover defesa cross-family.' : ''}
+{$INTRA_FAMILY == true ? '**⚠ Adversarialidade reduzida:** refutação e juízo de tradeoff vêm da mesma família. Se o autor também é dessa família (o caso do default shipado), a objeção carrega o viés de auto-preferência que o pairing cross-family existe para evitar; se não é, o autor não está representado na própria defesa. Com `--mode defend` disponível isto indica pairing explícito ou degradação registrada — cheque `fallbacks` no evento.' : ''}
 
 ## Abertas — requerem decisão humana
 > O reviewer e o autor não chegaram a acordo. Você decide.
@@ -747,6 +838,13 @@ The artifact is the **dialogue**, not a flag dump. Auditable, durable with the m
 
 ## Pattern hits (scan determinístico)
 - `path:line` — pattern `{p}` — <context>   ← optional; deterministic grep, same patterns as forge-completer step 4a
+
+## Escopo do diff (SVN)                      ← only when `$SCOPE_REPORT` is non-empty (SVN boundary)
+- **Baseline:** BASE (marker inerte — ver Step 1)
+- **Critério:** {reason}
+- **Revisados:** {scoped, one per line}
+- **Fora do escopo:** {excluded, one per line — "(nenhum)" when empty}
+- **Artefatos `.gsd/` omitidos:** {gsd_excluded}
 ```
 
 Omit any section with zero items — **exceto** o bloco de indisponibilidade do caminho `review-agent-unavailable`, que é obrigatório sempre que um agente não pôde ser ouvido e nunca pode ser lido como aprovação (ver **§ Agent unavailability (review-agent-unavailable)**).
@@ -849,15 +947,47 @@ ITEM_ID=$(printf '%s' "$RESULT" | node -e "let s='';process.stdin.on('data',d=>s
 
 ## Step 8 — Event log
 
-Append one line per agent dispatch to `{WORKING_DIR}/.gsd/forge/events.jsonl` (I/O errors propagate — no silent-fail):
+**Never hand-write this row.** Call the emitter — it is the only sanctioned writer of the `review` event:
+
+```bash
+node "$FORGE_SCRIPTS_DIR/forge-review-emit.js" --cwd "$WORKING_DIR" \
+  --milestone "${RUN_ID:-{M###}}" --slice "{S##}" \
+  --style "$STYLE" --rounds N --engine "$ENGINE" \
+  --author-engine "$AUTHOR_ENGINE" --challenger "$RESOLVED_CHALLENGER" \
+  --advocate "$ADVOCATE_ALIAS" \
+  --resolved N --conceded N --open N --conceded-fixed N \
+  --intra-family-withdrawn N
+```
+
+Exit 2 means the invocation was malformed and **nothing was written** — fix the arguments and re-run; do not fall back to appending a hand-built line. I/O errors propagate (no silent-fail), same posture as before.
+
+Shape written (documented for **readers of the log**, not for retyping — the emitter is the only writer):
 
 ```json
-{"ts":"<ISO-8601>","event":"review","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","style":"dialectic","rounds":N,"counts":{"resolved":N,"conceded":N,"open":N},"conceded_fixed":N,"engine":"agents","challenger":"claude","advocate":$([ -n "$ADVOCATE_ALIAS" ] && printf '"%s"' "$ADVOCATE_ALIAS" || printf 'null'),"intra_family_debate":$INTRA_FAMILY,"intra_family_withdrawn":N}
+{"ts":"<ISO-8601>","event":"review","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","style":"dialectic","rounds":N,"counts":{"resolved":N,"conceded":N,"open":N},"conceded_fixed":N,"engine":"agents","author_engine":"claude","challenger":"claude","advocate":"fable","intra_family_debate":true,"intra_family_withdrawn":0}
 ```
+
+**Why a script and not a template.** The template that used to sit here was retyped per slice, and the retyping drifted: one measured workspace holds **265 `review` events in 151 distinct key shapes, none conformant**, with `advocate` values ranging from a clean alias (`fable`) to a full id (`claude-opus-5`) to a sentence (`not-invoked-orchestrator-verified-by-direct-reading`). Aggregating that history is impossible, which is why the intra-family collapse in M134/S02 was found by a human reading prose rather than by the field built to announce it. The emitter constructs the row from resolved values, so the shape cannot vary.
+
+**`intra_family_debate` is derived by the emitter, not passed in.** It takes `--author-engine`, `--challenger` and `--advocate` and compares *family to family*. The `INTRA_FAMILY` bash in Step 0 compares `$ADVOCATE_FAMILY` (a family) against `$AUTHOR_ENGINE` (an engine); that is correct only while every advocate is Claude, and inverts the moment a gpt advocate exists (`'gpt' != 'codex'` is true for the same family). `$INTRA_FAMILY` still renders the Step 6 header and gates **§ Adversarialidade reduzida**, and the event's copy comes from the emitter — so the Step 0 bash and the emitter MUST encode the same rule. They are two evaluations of one predicate, not two predicates: when they drift, the log announces a collapse that the page a human reads denies, which is a more expensive way to be right than being wrong in one place. `intra_family_withdrawn` is clamped to `0` whenever the flag is false, so the two can never contradict each other.
+
+**The flag means what its name says: both debaters came from one family.** It does *not* additionally require that family to differ from the author's. That extra clause reads like a refinement and is a blind spot: on the explicit path this spec sets `AUTHOR_ENGINE=claude` and the shipped prefs default `challenger`/`advocate` to `claude`, so author and both debaters land in one family and the clause would hold the flag at `false` on **every review of every default-configured project** — a debate with zero cross-family adversarialidade filed as "no collapse", which is the silence the emitter exists to end. A Claude challenging Claude-authored code defended by Claude *is* the collapse, author in the room or not. Expect the flag to read `true` under defaults; that is the honest reading, and it is the signal that argues for flipping `challenger: auto`.
+
+**`--author-engine` is required.** The emitter refuses (exit 2, nothing written) when it is absent or resolves to no known family, because the alternative is deriving `false` — "measured, no collapse" — from an author it could not identify. `author_engine` is also **recorded** in the row, not merely consumed: a reader that cannot see the author cannot recompute the flag, and cannot separate "the debaters agreed on a family that is not the author's" (the M134/S02 shape) from "everyone, including the author, is in one family" (the default shape). Both are `true`; the field is what tells them apart. On the explicit path the recorded value is the `claude` this spec assumes, not a measurement — the `auto` path is where it is derived from dispatch authorship.
 
 `conceded_fixed`, `engine`, `challenger` and `advocate` are additive fields (readers that ignore unknown fields stay compatible — same convention as `tier`/`reason` from M002). `engine` is either `"agents"` or `"workflow"` and is emitted by **both** engine paths. `conceded_fixed`: number of conceded items whose Step 7a fix landed. `challenger` is `"claude"`, `"codex"` or `"gemini"` — the challenger that actually ran the challenge (so an external→agent fallback records `"claude"`). `advocate` is the resolved `ADVOCATE_ALIAS` (e.g. `"fable"`) or JSON `null` when the id had no known alias (frontmatter governed instead) — same optional-field glue pattern as the rest of this event. `intra_family_withdrawn` is the count of items listed under **§ Adversarialidade reduzida** (`refuted+withdrawn` resolutions from the Step 5 truth table, **excluding** `open+withdrawn`) — always `0` when `intra_family_debate` is `false`.
 
 **Agent unavailability (additive).** When a review `Agent()` stayed unavailable after the Retry Handler (see **§ Agent unavailability (review-agent-unavailable)**), append one extra line — it does **not** replace the `review` line above; both are emitted, and the Step 6 header is stamped honestly with what actually ran:
+
+Emit it in the SAME emitter call that writes the `review` row — both lines are appended together, so a review can never land without its companion:
+
+```bash
+node "$FORGE_SCRIPTS_DIR/forge-review-emit.js" --cwd "$WORKING_DIR" \
+  --milestone "${RUN_ID:-{M###}}" --slice "{S##}" ... \
+  --unavailable-reason review-advocate-unavailable --attempts N
+```
+
+Shape written (for readers, not for retyping):
 
 ```json
 {"ts":"<ISO-8601>","event":"review-agent-unavailable","milestone":"${RUN_ID:-{M###}}","slice":"{S##}","reason":"review-advocate-unavailable","attempts":N}

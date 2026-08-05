@@ -264,17 +264,15 @@ const loadDoctor = () => {
   return null;
 };
 
-// Parse the semver embedded in a schema string ("fragment-store@1.0.0" → [1,0,0]).
-// Returns null when the version cannot be parsed.
-const parseSchemaSemver = (s) => {
-  const m = String(s || '').match(/@(\d+)\.(\d+)\.(\d+)/);
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-};
-
-// Compare two [major,minor,patch] tuples → -1 | 0 | 1.
-const cmpSemver = (a, b) => {
-  for (let i = 0; i < 3; i++) { if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; }
-  return 0;
+// Lazy-load forge-schema-guard (owns parseSchemaSemver + cmpSemver). Same
+// dev/installed resolution as loadDoctor above. When the helper doesn't
+// resolve (missing file, broken require), buildSchemaWarning below falls back
+// to the generic divergence message — it never reintroduces a local copy of
+// the comparator and never throws (MEM008: hook is absolute silent-fail).
+const loadSchemaGuard = () => {
+  try { return require(path.join(__dirname, 'scripts', 'forge-schema-guard.js')); } catch {}
+  try { return require(path.join(__dirname, 'forge-schema-guard.js')); } catch {}
+  return null;
 };
 
 // Build the high-visibility warning injected into session context on mismatch.
@@ -284,10 +282,20 @@ const cmpSemver = (a, b) => {
 const buildSchemaWarning = (res) => {
   const tooling = res.expected; // CURRENT_SCHEMA baked into the local tooling
   const repo    = res.actual;   // .gsd/SCHEMA-VERSION committed in the repo
-  const tv = parseSchemaSemver(tooling);
-  const rv = parseSchemaSemver(repo);
-  const dir = (tv && rv) ? cmpSemver(tv, rv) : null;
+  const guard = loadSchemaGuard();
   const header = '⚠️ ATENÇÃO — incompatibilidade de schema do Forge';
+
+  if (!guard || typeof guard.parseSchemaSemver !== 'function' || typeof guard.cmpSemver !== 'function') {
+    return [
+      header,
+      `A tooling Forge (${tooling}) e o schema do repo (${repo}) divergem.`,
+      'Rode /forge-update ou /forge-doctor --fix --migrate antes de fechar milestone.',
+    ].join('\n');
+  }
+
+  const tv = guard.parseSchemaSemver(tooling);
+  const rv = guard.parseSchemaSemver(repo);
+  const dir = (tv && rv) ? guard.cmpSemver(tv, rv) : null;
 
   if (dir === -1) {
     // tooling < repo — the headline failure mode

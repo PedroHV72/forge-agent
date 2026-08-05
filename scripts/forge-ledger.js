@@ -29,10 +29,86 @@ const fs = require('fs');
 const path = require('path');
 const { isValid, entityKind } = require('./forge-ids');
 const { parseScalar, serializeScalar, writeAtomic } = require('./forge-yaml-safe');
+const { isGroupedFile, readGroupedUnits, readSniffBuffer, publicEntry, unitTextOf } = require('./forge-grouped-file');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const LEDGER_DIR = '.gsd/ledger';
+
+// Grouped containers are a read format only. listFragments exposes one
+// envelope per unit and preserves the physical container path for provenance.
+// The grouped and epoch fields are additive metadata for existing consumers.
+// A container parse error is reported on stderr with its source filename and
+// member id, allowing callers to retain healthy units during partial reads.
+// Loose files are discovered first so the loose representation is canonical.
+// readFragment deliberately checks the canonical loose path first, then
+// reuses listFragments for the grouped fallback rather than duplicating the
+// directory scan. writeFragment never accepts a container path as a target.
+// This keeps reads additive while preserving the established write contract.
+//
+// The helper module owns marker parsing, byte bounds, and epoch extraction.
+// This store only maps those parsed units into ledger-shaped envelopes.
+
+// ── Schema guard seam (M-S01 T04) ────────────────────────────────────────────
+// Lazy require, deliberately: forge-schema-guard → forge-migrate →
+// forge-projection → forge-ledger is a top-level cycle (see forge-migrate.js:33
+// and forge-projection.js:32). Resolving inside the call defers it past module
+// init, so no consumer ever captures a half-built exports object. The `catch`
+// keeps this file loadable if the guard is not colocated (installed layouts).
+//
+// SINGLE INSERTION POINT PER SIDE:
+//   read  → guardReadHere() at the top of listFragments/readFragment
+//   write → assertWriteHere() at the top of writeFragment
+// Reading `.gsd/SCHEMA-VERSION` or comparing versions anywhere else in this
+// file is forbidden — the guard module is the only source of that logic.
+// Only an ABSENT guard module is swallowed. A guard that exists but throws
+// while initializing — or whose own transitive require fails (the guard pulls
+// forge-migrate, which eagerly pulls projection/migrators/store-state/doctor)
+// — is a real fault and must propagate rather than silently disabling both the
+// read warning and the write refusal.
+//
+// SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
+// only — it is about LOADING the guard, not about what the guard decides.
+// The seam stays FAIL-OPEN on an unexpected runtime error raised inside the
+// guard's own check (see the catch in assertWrite, forge-schema-guard.js).
+// It is NOT fail-open on a stamp the guard could not READ: that case refuses
+// the write, naming the errno. This note used to say the fail-open of
+// assertWrite had been reviewed and kept as is — the PR #70 dogfood revised
+// that decision: a directory at .gsd/SCHEMA-VERSION disabled the write guard
+// silently, so "unreadable" now closes, while "absent" and "present but
+// garbage" stay open.
+function schemaGuard() {
+  try {
+    return require('./forge-schema-guard');
+  } catch (err) {
+    let absent;
+    try {
+      absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-schema-guard');
+    } catch (_) {
+      // Classifier itself missing (partial install) → keep the historical
+      // fail-open instead of crashing the store.
+      absent = true;
+    }
+    if (absent) return null;
+    throw err;
+  }
+}
+
+// Fail-open read guard: returns { ok, partial, warning } and emits the warning
+// to stderr at most once per process per cwd. Never throws, never blocks.
+function guardReadHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return { ok: true, partial: false, warning: null };
+  return guard.guardReadAndWarn(cwd || process.cwd());
+}
+
+// Write refusal: throws when the on-disk schema major is AHEAD of this
+// tooling's. The CLI catch blocks turn that into stderr + exit 1.
+function assertWriteHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return;
+  guard.assertWriteOrThrow(cwd || process.cwd());
+}
 
 // ── ledgerDir ─────────────────────────────────────────────────────────────────
 // Returns the absolute path to the ledger directory for a given cwd.
@@ -199,6 +275,9 @@ function serializeFrontmatter(entry) {
 // Returns { path: string, created: boolean }
 // created: false if file existed and content is identical (idempotent).
 function writeFragment(cwd, entry, opts) {
+  // Refuse before any validation or serialization — nothing reaches disk.
+  // Grouped containers are never edited; this always writes fragmentPath().
+  assertWriteHere(cwd);
   opts = opts || {};
   if (!entry || !entry.id) {
     throw new Error('entry.id is required');
@@ -236,6 +315,7 @@ function writeFragment(cwd, entry, opts) {
 // Reads and parses a LEDGER fragment (milestone or task). Returns null if the
 // file does not exist.
 function readFragment(cwd, id) {
+  guardReadHere(cwd);
   let fpath;
   try {
     fpath = fragmentPath(cwd, id);
@@ -243,9 +323,18 @@ function readFragment(cwd, id) {
     throw e; // propagate invalid id error
   }
 
-  if (!fs.existsSync(fpath)) return null;
-  const text = fs.readFileSync(fpath, 'utf8');
-  return parseFragment(text);
+  if (fs.existsSync(fpath)) return parseFragment(fs.readFileSync(fpath, 'utf8'));
+  const entry = listFragments(cwd).find(item => item.id === id);
+  return entry ? parseFragment(readFragmentText(cwd, entry)) : null;
+}
+
+function readFragmentText(cwd, entry) {
+  if (!entry || !entry.path) throw new Error('fragment entry is required');
+  if (!entry.grouped) return fs.readFileSync(entry.path, 'utf8');
+  const parsed = readGroupedUnits(entry.path);
+  const unit = parsed.units.find(item => item.id === entry.id);
+  if (!unit) throw new Error(`Grouped ledger unit not found: ${entry.id}`);
+  return unitTextOf(unit.content);
 }
 
 // ── listFragments ─────────────────────────────────────────────────────────────
@@ -253,17 +342,47 @@ function readFragment(cwd, id) {
 // Returns Array<{ id, path }> sorted by id ascending.
 // Returns [] if the directory does not exist.
 function listFragments(cwd) {
+  guardReadHere(cwd);
   const dir = ledgerDir(cwd);
   if (!fs.existsSync(dir)) return [];
 
-  const files = fs.readdirSync(dir);
-  const fragments = files
-    .filter(f => f.endsWith('.md'))
-    .map(f => ({
-      id: f.slice(0, -3), // strip .md
-      path: path.join(dir, f),
-    }))
-    .sort((a, b) => a.id.localeCompare(b.id));
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.md'));
+  const looseIds = new Set();
+  const fragments = [];
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    // A failed sniff (null) means "not classified as a container": the entry is
+    // still returned and the read error stays with the consumer, one unit at a
+    // time, as it did before grouping existed. See readSniffBuffer.
+    const buffer = readSniffBuffer(filePath);
+    // Unreadable AND epoch-shaped: pushing it as a loose fragment named
+    // `2026-Q1` would make every unit inside it vanish with nothing on stderr.
+    if (buffer === null && isGroupedFile(file)) {
+      process.stderr.write(`[forge-ledger] warn: container ${file}: container-unreadable — unidades não listadas\n`);
+      continue;
+    }
+    if (buffer !== null && isGroupedFile(file, buffer)) continue;
+    const id = file.slice(0, -3);
+    looseIds.add(id);
+    fragments.push({ id, path: filePath, grouped: false, epoch: null });
+  }
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const buffer = readSniffBuffer(filePath);
+    if (buffer === null || !isGroupedFile(file, buffer)) continue;
+    const parsed = readGroupedUnits(filePath);
+    for (const error of parsed.errors) {
+      process.stderr.write(`[forge-ledger] warn: container ${file} id ${error.id || '<unknown>'}: ${error.reason}\n`);
+    }
+    for (const unit of parsed.units) {
+      if (looseIds.has(unit.id)) {
+        process.stderr.write(`[forge-ledger] warn: unidade ${unit.id} existe solta e em ${file} — usando a solta\n`);
+        continue;
+      }
+      fragments.push({ id: unit.id, path: filePath, grouped: true, epoch: parsed.epoch });
+    }
+  }
+  fragments.sort((a, b) => a.id.localeCompare(b.id));
 
   return fragments;
 }
@@ -310,7 +429,21 @@ function cliMain(argv) {
   }
 
   if (cmd === '--list') {
-    const result = listFragments(cwd);
+    // `--list` stdout is a bare JSON ARRAY of fragments — it is data, not an
+    // envelope, so it carries no schema_partial/schema_warning key (a JSON
+    // array cannot hold one without changing its shape, and consumers such as
+    // skills/forge-sweep iterate it directly). The partial signal for this
+    // command travels on stderr only, emitted by guardReadHere inside
+    // listFragments. Object-shaped envelopes (--stale, --query) do get fields.
+    //
+    // Two shapes, on purpose: listFragments() is the LIBRARY API and carries
+    // the grouping fields (grouped/epoch) for internal consumers; this stdout
+    // is a FROZEN EXTERNAL contract parsed by key, so it must not gain keys
+    // when the storage format evolves. publicEntry is the single shared
+    // projection for all three stores — three local omissions would drift, and
+    // that drift is exactly what leaked these fields in the first place.
+    // Guarded by forge-schema-guard-wiring.test.js ("list row keys unchanged").
+    const result = listFragments(cwd).map(publicEntry);
     console.log(JSON.stringify(result));
     process.exit(0);
   }
@@ -339,7 +472,17 @@ function cliMain(argv) {
         process.stderr.write(`Failed to parse JSON from stdin: ${e.message}\n`);
         process.exit(1);
       }
-      const result = writeFragment(cwd, entry);
+      // Explicit catch: this runs inside an async stdin handler, outside the
+      // require.main try/catch below, so a schema-guard refusal (or any write
+      // error) would otherwise surface as an uncaught stack trace. Message on
+      // stderr, exit 1 — the store CLI contract.
+      let result;
+      try {
+        result = writeFragment(cwd, entry);
+      } catch (e) {
+        process.stderr.write(`${e.message}\n`);
+        process.exit(1);
+      }
       console.log(JSON.stringify(result));
       process.exit(0);
     });
@@ -464,7 +607,7 @@ function runSmokeRegression() {
     // do. fragmentPath() used to throw for task IDs, breaking post-task
     // housekeeping and the /forge-sweep LEDGER guard. Cover both the timestamp
     // (T-<ts>-<slug>) and legacy (TASK-###) task ID forms.
-    const taskIds = ['T-20260618020926-wdma-fechar-modal', 'TASK-007'];
+    const taskIds = ['T-20260618020926-demo-fechar-modal', 'TASK-007'];
     for (const taskId of taskIds) {
       let threw = false;
       try {
@@ -497,7 +640,7 @@ function runSmokeRegression() {
     try {
       const projection = require('./forge-projection');
       const renderedWithTasks = projection.renderLedger(smokeCwd);
-      assert('renderLedger: contains timestamp task heading', renderedWithTasks.includes('## T-20260618020926-wdma-fechar-modal'), true);
+      assert('renderLedger: contains timestamp task heading', renderedWithTasks.includes('## T-20260618020926-demo-fechar-modal'), true);
       assert('renderLedger: contains legacy task heading', renderedWithTasks.includes('## TASK-007'), true);
     } catch (e) {
       console.log('FAIL: renderLedger (tasks) threw: ' + e.message);
@@ -527,6 +670,7 @@ module.exports = {
   fragmentPath,
   writeFragment,
   readFragment,
+  readFragmentText,
   listFragments,
   parseFragment,
 };

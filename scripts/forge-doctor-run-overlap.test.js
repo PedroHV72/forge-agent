@@ -24,7 +24,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const { checkRunOverlap, VALID_CHECKS } = require('./forge-doctor.js');
+const { checkRunOverlap, VALID_CHECKS, CURRENT_SCHEMA } = require('./forge-doctor.js');
 
 const DOCTOR_CLI = path.join(__dirname, 'forge-doctor.js');
 const REPO_ROOT = path.join(__dirname, '..');
@@ -96,7 +96,10 @@ test('--check all stays exit 0 with overlap present (advisory never flips allOk)
     // Non-advisory layers (schema) must pass on their own terms so this test
     // isolates the advisory check's contribution to `allOk` — a schema
     // failure here would give a false green/red unrelated to run-overlap.
-    fs.writeFileSync(path.join(root, '.gsd', 'SCHEMA-VERSION'), 'fragment-store@1.0.0\n', 'utf8');
+    // Derived from the module, never hand-written: a hand-written stamp goes
+    // stale on the next CURRENT_SCHEMA bump and fails this test for a reason
+    // that has nothing to do with run-overlap.
+    fs.writeFileSync(path.join(root, '.gsd', 'SCHEMA-VERSION'), `${CURRENT_SCHEMA}\n`, 'utf8');
     writeRun(root, 'RUN-A', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
     writeRun(root, 'RUN-B', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
 
@@ -143,7 +146,10 @@ test('checkRunOverlap ok:true — success path (clean and overlap verdicts both)
 
 test('checkRunOverlap ok:true — internal exception path (unreadable runs dir)', () => {
   if (process.platform === 'win32') {
-    console.log('  (skip: chmod 000 does not produce EACCES under the Windows test account)');
+    // Same skip forge-schema-guard.test.js:383-386 already carries: chmod 000
+    // does not block reads on win32, so the sanity assert below cannot hold and
+    // the test would report an environment fact as a product defect.
+    console.log('    (skip: chmod 000 does not block reads on win32)');
     return;
   }
   const root = mkTmp('t03-overlap-error');

@@ -1,6 +1,6 @@
 # PR brief — Fragment-store: guardas de segurança na migração + bug do forge-ignore (SVN)
 
-> **Status:** ✅ **implementado** na branch `fix/fragment-store-migration-guards` (2026-06-01). Os 3 issues abaixo foram corrigidos e cobertos por testes de regressão em `scripts/fragment-store-guards.test.js` (9 casos). Descoberto em 2026-06-01 ao usar o Forge no repo **WDMA** (working copy **SVN**, equipe, trabalho na `master`/trunk).
+> **Status:** ✅ **implementado** na branch `fix/fragment-store-migration-guards` (2026-06-01). Os 3 issues abaixo foram corrigidos e cobertos por testes de regressão em `scripts/fragment-store-guards.test.js` (9 casos). Descoberto em 2026-06-01 ao usar o Forge no store de referência (working copy **SVN**, equipe, trabalho na `master`/trunk).
 > **Origem:** sessão de diagnóstico via `/forge-doctor`. Nenhum dado foi perdido (arquivos versionados → `svn revert` restaurou), mas o caminho de "fix + regen" zerou os monólitos em um WC ainda não-migrado.
 >
 > **Resolução (resumo):**
@@ -11,13 +11,13 @@
 
 ## TL;DR do que aconteveu
 
-O `.gsd` do WDMA está num estado **híbrido / não-migrado**: os monólitos (`LEDGER.md` 311 linhas, `DECISIONS.md` 56, `AUTO-MEMORY.md` 189) ainda são a **única fonte de verdade** e o fragment store **nunca foi populado** (não existe `.gsd/ledger/`; `.gsd/decisions/` tem ~1 fragmento). Rodar `forge-doctor.js --fix` + `--regen-projection` nesse estado:
+O `.gsd` do store de referência está num estado **híbrido / não-migrado**: os monólitos (`LEDGER.md` 311 linhas, `DECISIONS.md` 56, `AUTO-MEMORY.md` 189) ainda são a **única fonte de verdade** e o fragment store **nunca foi populado** (não existe `.gsd/ledger/`; `.gsd/decisions/` tem ~1 fragmento). Rodar `forge-doctor.js --fix` + `--regen-projection` nesse estado:
 
 1. carimba `SCHEMA-VERSION` e marca o store como "migrado" (mentira — está vazio);
 2. regenera os monólitos a partir do store vazio → escreve esqueletos de poucas linhas **por cima** do conteúdo real (LEDGER 311→5, DECISIONS 56→9, AUTO-MEMORY 189→6);
 3. adiciona os monólitos ao `svn:ignore` (errado enquanto eles são a fonte de verdade).
 
-Só não houve perda porque no WDMA esses arquivos estão versionados no SVN. Em um WC onde estivessem ignorados/não-versionados, seria **perda silenciosa de histórico**.
+Só não houve perda porque no store de referência esses arquivos estão versionados no SVN. Em um WC onde estivessem ignorados/não-versionados, seria **perda silenciosa de histórico**.
 
 ---
 
@@ -83,7 +83,7 @@ svnPropset(absDir, merged);                    // ← THROW E155010 não tratado
 
 ## Nota operacional (separado da PR de código)
 
-O WDMA (e possivelmente outros WCs da equipe) está **não-migrado**. Depois que a PR estiver pronta, rodar a migração de forma **coordenada** num único WC e commitar o resultado (fragmentos) — porque o `.gsd` é compartilhado via SVN. Até lá, **não rodar `forge-doctor --fix`/`--regen-projection` em WCs do WDMA**.
+O store de referência (e possivelmente outros WCs da equipe) está **não-migrado**. Depois que a PR estiver pronta, rodar a migração de forma **coordenada** num único WC e commitar o resultado (fragmentos) — porque o `.gsd` é compartilhado via SVN. Até lá, **não rodar `forge-doctor --fix`/`--regen-projection` em WCs do store de referência**.
 
 ---
 

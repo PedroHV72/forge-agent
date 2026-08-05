@@ -1201,7 +1201,34 @@ test('dogfood: forge-agent itself is shape-standalone → derives shared (read-o
   assert(shape.role !== 'workspace', `role must not be workspace, got ${shape.role}`);
 });
 
-test('dogfood: a synthetic registry listing ONLY this repo derives shared, independent of the operator machine', () => {
+// The SUBJECT here is synthetic on purpose, and that is the whole fix.
+//
+// resolveRole() asks classify(), which decides `project` by reading .gsd/ off the
+// disk. This repo's .gsd/ is gitignored (see the dogfood block in .gitignore), so
+// it exists for anyone who runs forge here and never exists in a fresh checkout.
+// Aiming this assertion at repoRoot therefore derived `project` on an operator's
+// machine and `null` on CI — a test named "independent of the operator machine"
+// that depended on it, red on every commit while green for every author.
+//
+// What is actually under test is the registry rule — one entry, no registered
+// descendant → project → shared — so the subject only has to be a real project,
+// not this one.
+test('a synthetic registry listing ONLY one project derives project/shared, independent of the operator machine', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-isolation-solo-'));
+  const home = path.join(base, 'home');
+  fs.mkdirSync(home, { recursive: true });
+  const project = makeProjectDir(path.join(base, 'solo'));
+  writeRegistryEntries(home, [{ path: project }]);
+  try {
+    withHome(home, () => {
+      const shape = deriveShapeMode(project);
+      assertEq(shape.role, 'project', 'registered, with no registered descendant');
+      assertEq(shape.mode, 'shared');
+    });
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('dogfood: a synthetic registry listing ONLY this repo never promotes it to workspace', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-isolation-dogfood-'));
   const home = path.join(base, 'home');
   fs.mkdirSync(home, { recursive: true });
@@ -1215,7 +1242,11 @@ test('dogfood: a synthetic registry listing ONLY this repo derives shared, indep
   try {
     withHome(home, () => {
       const shape = deriveShapeMode(repoRoot);
-      assertEq(shape.role, 'project', 'registered, with no registered descendant');
+      // True on both shapes of checkout: with .gsd/ present the role is `project`,
+      // without it classify() says `none` and the role is null. Neither may become
+      // `workspace` — that is the one role that flips the mode to worktree, which
+      // is what this pin exists to prevent.
+      assert(shape.role !== 'workspace', `role must not be workspace, got ${shape.role}`);
       assertEq(shape.mode, 'shared');
     });
   } finally { fs.rmSync(base, { recursive: true, force: true }); }

@@ -27,7 +27,7 @@ try {
     assert.deepStrictEqual(manifests[0], manifests[1]);
     assert.deepStrictEqual(manifests[1], manifests[2]);
     const manifest = manifests[0];
-    assert.strictEqual(manifest.product_version, '4.2.0');
+    assert.strictEqual(manifest.product_version, '4.6.0');
     assert.strictEqual(manifest.schema_version, '1.0.0');
     assert.strictEqual(manifest.product_version, installer.VERSION);
     assert(/^[a-f0-9]{64}$/.test(manifest.package_sha256));
@@ -69,13 +69,13 @@ try {
       path.join(projectRoot, '.gsd', 'STATE.md'),
     ];
     const before = new Map(watched.map((file) => [file, fs.readFileSync(file)]));
-    const report = updater.update({ repo: REPO, runtime: 'claude', apply: true, skipCapabilityCheck: true, forgeHome, claudeHome, codexHome, projectRoot });
+    const report = updater.update({ repo: REPO, runtime: 'claude', apply: true, skipCapabilityCheck: true, userHome: caseRoot, forgeHome, claudeHome, codexHome, projectRoot });
     assert.strictEqual(report.runtime, 'claude');
     assert.strictEqual(report.legacy_migration.release, '3.1.4-compatible');
     for (const [file, bytes] of before) assert.deepStrictEqual(fs.readFileSync(file), bytes, file);
     assert.deepStrictEqual(fs.readFileSync(path.join(forgeHome, 'forge-agent-prefs.jsonc')), before.get(path.join(claudeHome, 'forge-agent-prefs.jsonc')));
     assert.strictEqual(fs.existsSync(codexHome), false);
-    const second = updater.update({ repo: REPO, runtime: 'claude', apply: true, skipCapabilityCheck: true, forgeHome, claudeHome, codexHome, projectRoot });
+    const second = updater.update({ repo: REPO, runtime: 'claude', apply: true, skipCapabilityCheck: true, userHome: caseRoot, forgeHome, claudeHome, codexHome, projectRoot });
     assert(second.backup && fs.existsSync(second.backup), 'installed update must back up managed bytes');
   });
 
@@ -89,8 +89,8 @@ try {
     const sentinel = path.join(claudeHome, 'operator-sentinel.txt');
     fs.writeFileSync(sentinel, 'do not touch\r\nΩ\r\n');
     const bytes = fs.readFileSync(sentinel);
-    installer.install({ repo: REPO, runtime: 'codex', skipCapabilityCheck: true, forgeHome, claudeHome, codexHome, projectRoot });
-    updater.update({ repo: REPO, runtime: 'codex', apply: true, skipCapabilityCheck: true, forgeHome, claudeHome, codexHome, projectRoot });
+    installer.install({ repo: REPO, runtime: 'codex', skipCapabilityCheck: true, userHome: caseRoot, forgeHome, claudeHome, codexHome, projectRoot });
+    updater.update({ repo: REPO, runtime: 'codex', apply: true, skipCapabilityCheck: true, userHome: caseRoot, forgeHome, claudeHome, codexHome, projectRoot });
     assert.deepStrictEqual(fs.readFileSync(sentinel), bytes);
     const manifest = JSON.parse(fs.readFileSync(path.join(forgeHome, 'manifest.json'), 'utf8'));
     assert.deepStrictEqual(Object.keys(manifest.adapters), ['codex']);

@@ -826,19 +826,44 @@ Event appended to `.gsd/forge/events.jsonl`:
 
 #### Budgeted Section Injection
 
-Wrap OPTIONAL placeholders with the boundary-aware truncator so oversize injections never blow up a worker context. Mandatory placeholders throw instead.
+Wrap OPTIONAL placeholders with a boundary-aware truncator so oversize injections never blow up a worker context. Mandatory placeholders throw instead.
+
+**Two truncators, not one.** There is no single function that governs every placeholder — the render path decides which one applies:
+
+- **`truncateAtSectionBoundary`** (`scripts/forge-tokens.js`) governs the **sidecar's context** (`scripts/forge-xllm.js`, non-Claude engines — Codex/Gemini via `dispatch_engine`) and the standalone CLI. It splits on markdown section boundaries (`## `, `### `, `---`, `***`) and drops whole sections from the tail.
+- **`truncateChars`** — invoked via `boundStandards`/`truncateContext` (`scripts/forge-prompt.js`) — governs `{CS_LINT}`, `{CS_STRUCTURE}`, `{CS_RULES}`, and `{TOP_MEMORIES}` in the **Claude worker render** (`materializePrompt`/`buildValues`). It cuts at the nearest preceding newline within budget, not at markdown section boundaries.
+
+The orchestrator never calls `truncateAtSectionBoundary` for `{TOP_MEMORIES}` or the `{CS_*}` placeholders on the Claude path — that call belongs to the sidecar-context/CLI path only.
 
 ```js
-// Helper pseudocode — orchestrator-side only
+// Helper pseudocode — Claude worker render (scripts/forge-prompt.js)
 const budgetTokens = PREFS?.token_budget?.auto_memory ?? 2000;
 const budgetChars  = budgetTokens * 4;
-const MEMORIES_SAFE = truncateAtSectionBoundary(
+const MEMORIES_SAFE = truncateContext(
   ALL_MEMORIES,
-  budgetChars,
-  { mandatory: false, label: "AUTO-MEMORY" }
+  budgetTokens,
+  { source: '.gsd/memory/' }
 );
 // MEMORIES_SAFE is substituted for {TOP_MEMORIES} in the template.
-// Truncated output ends with: [...truncated N sections]
+// Truncated output ends with: [...truncated N chars — see .gsd/memory/]
+// (or the shorter "[...truncated — see .gsd/memory/]" if the full marker
+// would not fit inside budgetChars — see Source pointer rule below.)
+
+// CS_STRUCTURE / CS_RULES / CS_LINT go through boundStandards(), which resolves
+// the effective standards path (default .gsd/CODING-STANDARDS.md, or the
+// --standards-file override when set) once and passes it as the pointer:
+boundStandards(standards, standardsMaxTokens, template, {
+  standardsPath: effectiveStandardsPath, // never the hardcoded default when overridden
+});
+
+// Helper pseudocode — sidecar context / CLI path (scripts/forge-xllm.js)
+const contextText = truncateAtSectionBoundary(
+  rawSidecarContext,
+  CONTEXT_BUDGET_CHARS,
+  { mandatory: false, source: '.gsd/CODING-STANDARDS.md' } // optional pointer
+);
+// Truncated output ends with: [...truncated N sections — see .gsd/CODING-STANDARDS.md]
+// (or "[...truncated N sections]" when no source pointer is supplied.)
 
 // For mandatory sections (T##-PLAN, S##-CONTEXT, M###-SCOPE):
 const planContent = readFileSync(planPath, 'utf8');
@@ -851,19 +876,30 @@ truncateAtSectionBoundary(
 
 When a mandatory-section throw reaches the orchestrator's catch path, surface it as a `scope_exceeded` blocker (existing failure taxonomy). The blocker message must include the label and the actual vs. budget numbers for debugging (e.g. `"T03-PLAN: 42000 chars > 32000 budget"`).
 
+**Source pointer rule (normative).** Every OPTIONAL section that gets truncated MUST emit a source pointer — the file it came from, plus `§ section` when the section is addressable — so the worker can reread the dropped content at its own initiative instead of operating on a silent gap. Both truncators accept an `opts.source` (optionally combined with `opts.section` on the `forge-prompt.js` side, pre-joined as `"<file> § <section>"` when passed to `forge-tokens.js`) and both share the `[...truncated ` marker prefix so a worker recognizes either truncator's output as the same family of signal.
+
+**Budget rule (normative).** The source pointer is charged against the same budget it protects — it is never an unbudgeted addition on top of `budgetChars`. Both truncators reserve space for the marker text before deciding how much content to keep, and both degrade through a ladder of decreasing information when the full marker would not fit. The ladders differ because the two markers carry different fields — spelled out here rather than collapsed into one sentence, since a doc that generalizes them contradicts one of the two implementations:
+
+- **`truncateChars` (`scripts/forge-prompt.js`)** — full marker (cut char count + pointer + `§ section`) → **shorter marker that KEEPS the pointer** but drops the char count and the `§ section` (`[...truncated — see <source>]`) → `…` (a single ellipsis, or `''` at budget 0). The pointer survives the first degradation deliberately: the point of the marker is to name where the rest lives, so the count is the field worth sacrificing first.
+- **`truncateAtSectionBoundary` (`scripts/forge-tokens.js`)** — marker with source (`[...truncated N sections — see <source>]`) → marker **without** source (`[...truncated N sections]`; the dropped-section count is required by the legacy byte-identical format, so there is no room left for the pointer at this rung) → `…` / silent cut.
+
+In both truncators the last rung is unconditional: when the budget cannot hold even the shortest complete marker, the truncator emits the ellipsis (or the empty string at budget 0) and **never** a sliced marker. A partial `[...tru` fragment would violate the `[...truncated ` prefix contract above and is a defect, not a degradation. No marker at all also remains valid in the pre-existing legacy path where `opts.source` was never passed. The rendered result never exceeds `budgetChars`/`maxChars`.
+
 Placeholder classification:
 
-| Placeholder | Category | Budget key | Default (tokens) |
-|-------------|----------|-----------|------------------|
-| `{TOP_MEMORIES}` | optional | `auto_memory` | 2000 |
-| `{CS_STRUCTURE}` | optional | `coding_standards` | 3000 |
-| `{CS_RULES}` | optional | `coding_standards` | (shares key with CS_STRUCTURE — count once per dispatch) |
-| `{LEDGER}` (future) | optional | `ledger_snapshot` | 1500 |
-| T##-PLAN content | mandatory | — | no cap (overflow throws) |
-| S##-CONTEXT content | mandatory | — | no cap (overflow throws) |
-| M###-SCOPE content | mandatory | — | no cap (overflow throws) |
-| `{CS_LINT}` | inlined (small) | — | wrapped with anti-injection markers |
-| `{auto_commit}`, `{unit_effort}`, `{THINKING_OPUS}` | scalar | — | not wrapped |
+| Placeholder | Category | Budget key | Default (tokens) | Source pointer |
+|-------------|----------|-----------|------------------|-----------------|
+| `{TOP_MEMORIES}` | optional | `auto_memory` | 2000 | `.gsd/memory/` |
+| `{CS_STRUCTURE}` | optional | `coding_standards` | 3000 | effective standards path (default `.gsd/CODING-STANDARDS.md`, or `--standards-file` override) `§ Directory Conventions + Asset Map + Pattern Catalog` |
+| `{CS_RULES}` | optional | `coding_standards` | (shares key with CS_STRUCTURE — count once per dispatch) | effective standards path `§ Code Rules` |
+| `{LEDGER}` (future) | optional | `ledger_snapshot` | 1500 | to be defined once the placeholder exists — the mechanism (budget key + reservation) is already wired, the number just has nowhere to render yet |
+| T##-PLAN content | mandatory | — | no cap (overflow throws) | n/a — mandatory sections never truncate, they throw |
+| S##-CONTEXT content | mandatory | — | no cap (overflow throws) | n/a |
+| M###-SCOPE content | mandatory | — | no cap (overflow throws) | n/a |
+| `{CS_LINT}` | optional (inlined, small) | `coding_standards` | shares key/budget path with CS_STRUCTURE/CS_RULES; also wrapped with anti-injection markers | effective standards path `§ Lint & Format Commands` |
+| `{auto_commit}`, `{unit_effort}`, `{THINKING_OPUS}` | scalar | — | not wrapped | n/a |
+
+`{LEDGER}` remains a future placeholder: as of this writing it does not appear in any template in `shared/templates/dispatch/`. Nothing above promises a specific token number for it beyond the existing `ledger_snapshot` default already scaffolded in `## Prefs contract` — the budget key and reservation exist so the number can materialize the moment a template starts using `{LEDGER}`, without a follow-up contract change.
 
 ---
 

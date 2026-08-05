@@ -30,8 +30,15 @@
  *
  * Whitelist reconciled with the spec side (shared/forge-review.md § Step 0):
  * claude | codex | gemini | auto. `gemini` is a valid EXPLICIT challenger
- * request (never normalized to `auto`); it stays challenge/rebuttal-only until
- * the agy engine grows --mode execute/plan.
+ * request (never normalized to `auto`); it stays challenge/defend/rebuttal-only
+ * until the agy engine grows --mode execute/plan.
+ *
+ * Both axes now resolve symmetrically under `auto`: challenger = the family
+ * OPPOSITE the author, advocate = the author's OWN family. The advocate side was
+ * inert before `--mode defend` existed in scripts/forge-xllm.js — every non-Claude
+ * author was force-degraded to a Claude defender, which put both debaters in the
+ * same family whenever the challenger had been resolved to Claude by opposition.
+ * Pass `defendAvailable: false` to reinstate that degradation deliberately.
  */
 
 'use strict';
@@ -186,6 +193,15 @@ function opposite(family) {
   return family === 'claude' ? 'codex' : 'claude';
 }
 
+// same() — the advocate side of the rule: the defender comes from the author's OWN
+// family, because it is reconstructing the author's reasoning. Inverse of the family→
+// request-token mapping used by `opposite`.
+function same(family) {
+  if (family === 'gpt') return 'codex';
+  if (family === 'gemini') return 'gemini';
+  return 'claude';
+}
+
 function resolvePairing(author, opts) {
   const options = opts || {};
   const family =
@@ -204,13 +220,24 @@ function resolvePairing(author, opts) {
     ? challengerReq
     : opposite(family);
 
+  // `--mode defend` landed in scripts/forge-xllm.js, so a non-Claude author can now be
+  // defended by its own family. Callers that know the adapter is missing (an older
+  // installed copy, a probe failure) pass defendAvailable:false and get the historical
+  // degradation instead — the fallback marker is preserved, not deleted, because the
+  // downstream `codex-unavailable` path and the PAIR_MODE render still consume it.
+  const defendAvailable = options.defendAvailable !== false;
+
   let advocate;
+  let advocatePolicy;
   if (advocateExplicit) {
     advocate = advocateReq;
-  } else if (family === 'claude') {
-    advocate = 'claude';
+    advocatePolicy = 'explicit';
+  } else if (family === 'claude' || defendAvailable) {
+    advocate = same(family);
+    advocatePolicy = 'same-family';
   } else {
     advocate = 'claude';
+    advocatePolicy = 'defend-mode-unavailable';
     if (!fallbacks.includes('defend-mode-unavailable')) {
       fallbacks.push('defend-mode-unavailable');
     }
@@ -220,9 +247,7 @@ function resolvePairing(author, opts) {
     challenger,
     advocate,
     challengerPolicy: challengerExplicit ? 'explicit' : 'opposite',
-    advocatePolicy: advocateExplicit
-      ? 'explicit'
-      : (family === 'claude' ? 'same-family' : 'defend-mode-unavailable'),
+    advocatePolicy,
     fallbacks,
     requested: { challenger: challengerReq, advocate: advocateReq },
   };
@@ -255,6 +280,7 @@ function parseArgs(args) {
     eventsFile: null,
     asJson: false,
     policy: 'majority',
+    defendAvailable: true,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -277,6 +303,8 @@ function parseArgs(args) {
     } else if (args[i] === '--events' && value !== undefined) {
       parsed.eventsFile = value;
       i += 1;
+    } else if (args[i] === '--defend-unavailable') {
+      parsed.defendAvailable = false;
     } else if (args[i] === '--json') {
       parsed.asJson = true;
     } else if (args[i] === '--policy' && value !== undefined) {
@@ -305,6 +333,7 @@ function runCli(args) {
     challengerReq: options.challengerReq,
     advocateReq: options.advocateReq,
     fallbacks: authorship.fallbacks,
+    defendAvailable: options.defendAvailable,
   });
 
   const result = {

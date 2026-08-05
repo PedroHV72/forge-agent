@@ -26,7 +26,11 @@
 
 'use strict';
 
-const fs   = require('fs');
+// This module still owns the legacy orphan file and rendered output files.
+// Store-backed projection loops use the corresponding store text accessor.
+// Keeping those paths explicit prevents future grouped-container regressions.
+// Checker memory remains intentionally out of scope for this grouped-store slice.
+const fs   = require('fs'); // retained for legacy-orphan and projection writes
 const path = require('path');
 
 const ledgerMod    = require('./forge-ledger');
@@ -43,6 +47,70 @@ const DECISIONS_FILE = '.gsd/DECISIONS.md';
 const MEMORY_FILE    = '.gsd/AUTO-MEMORY.md';
 
 // Decay half-life: 30 days in milliseconds (depth-2 decay per R1)
+// ── Schema guard seam (M-S01 T04) ────────────────────────────────────────────
+// Lazy require, deliberately: forge-schema-guard → forge-migrate →
+// forge-projection is a top-level cycle (forge-migrate.js:33). A top-level
+// require here would make forge-migrate capture this module's half-built
+// exports object, which is later REPLACED by the `module.exports = {...}`
+// below — a silent breakage. Resolving inside the call defers it past init.
+//
+// SINGLE INSERTION POINT PER SIDE:
+//   read  → guardReadHere() at the top of renderLedger/renderDecisions/
+//           renderMemory/renderChecker/renderItems/isStale/queryMemoryEntries
+//   write → assertWriteHere() at the top of writeAll
+// Reading `.gsd/SCHEMA-VERSION` or comparing versions anywhere else in this
+// file is forbidden — the guard module is the only source of that logic.
+// Only an ABSENT guard module is swallowed. A guard that exists but throws
+// while initializing — or whose own transitive require fails (the guard pulls
+// forge-migrate, which eagerly pulls projection/migrators/store-state/doctor)
+// — is a real fault and must propagate rather than silently disabling both the
+// read warning and the write refusal.
+//
+// SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
+// only — it is about LOADING the guard, not about what the guard decides.
+// The seam stays FAIL-OPEN on an unexpected runtime error raised inside the
+// guard's own check (see the catch in assertWrite, forge-schema-guard.js).
+// It is NOT fail-open on a stamp the guard could not READ: that case refuses
+// the write, naming the errno. This note used to say the fail-open of
+// assertWrite had been reviewed and kept as is — the PR #70 dogfood revised
+// that decision: a directory at .gsd/SCHEMA-VERSION disabled the write guard
+// silently, so "unreadable" now closes, while "absent" and "present but
+// garbage" stay open.
+function schemaGuard() {
+  try {
+    return require('./forge-schema-guard');
+  } catch (err) {
+    let absent;
+    try {
+      absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-schema-guard');
+    } catch (_) {
+      // Classifier itself missing (partial install) → keep the historical
+      // fail-open instead of crashing the store.
+      absent = true;
+    }
+    if (absent) return null;
+    throw err;
+  }
+}
+
+// Fail-open read guard: returns { ok, partial, warning } and emits the warning
+// to stderr at most once per process per cwd. Never throws, never blocks.
+// Note the renderX functions call into forge-ledger/decisions/memory, which
+// guard too — the dedupe Set collapses that into one emission.
+function guardReadHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return { ok: true, partial: false, warning: null };
+  return guard.guardReadAndWarn(cwd || process.cwd());
+}
+
+// Write refusal: throws when the on-disk schema major is AHEAD of this
+// tooling's. cliMain's catch turns that into stderr + exit 1.
+function assertWriteHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return;
+  guard.assertWriteOrThrow(cwd || process.cwd());
+}
+
 const DECAY_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Memory cap (legacy AUTO-MEMORY.md behaviour)
@@ -58,6 +126,10 @@ const MEMORY_CAP = 50;
 // Fragments without completed_at sort first (treated as oldest).
 // Mirrors the legacy LEDGER.md block shape produced by forge-completer.
 function renderLedger(cwd) {
+  // Markdown output: warning on stderr only, NOT a line in the rendered text —
+  // /forge-explain pipes this straight into a prompt, so injecting a marker
+  // would change the data itself.
+  guardReadHere(cwd);
   const fragments = ledgerMod.listFragments(cwd);
   const lines = ['# Forge Project Ledger', ''];
   lines.push('> Compact record of completed milestones. Append-only. Never deleted.');
@@ -70,9 +142,10 @@ function renderLedger(cwd) {
 
   // Parse everything up-front — ordering needs completed_at from the frontmatter
   const parsed = [];
-  for (const { id, path: fpath } of fragments) {
+  for (const entry of fragments) {
+    const { id } = entry;
     try {
-      const text = fs.readFileSync(fpath, 'utf8');
+      const text = ledgerMod.readFragmentText(cwd, entry);
       parsed.push({ id, frag: ledgerMod.parseFragment(text) });
     } catch (e) {
       process.stderr.write(`[forge-projection] warn: skipping ledger fragment ${id}: ${e.message}\n`);
@@ -135,16 +208,18 @@ function renderLedger(cwd) {
 // assigned monotonically increasing # numbers at render time (never persisted).
 // Legacy orphan fragment rows are appended directly (lenient handling).
 function renderDecisions(cwd) {
+  guardReadHere(cwd); // stderr only — markdown stdout stays byte-identical
   const fragments = decisionsMod.listFragments(cwd);
 
   // Gather all decision rows from all fragments
   const allDecisions = [];
   const legacyOrphanBodies = [];
 
-  for (const { unitId, path: fpath } of fragments) {
+  for (const entry of fragments) {
+    const { unitId } = entry;
     let frag;
     try {
-      const text = fs.readFileSync(fpath, 'utf8');
+      const text = decisionsMod.readFragmentText(cwd, entry);
       frag = decisionsMod.parseFragment(text);
     } catch (e) {
       process.stderr.write(`[forge-projection] warn: skipping decisions fragment ${unitId}: ${e.message}\n`);
@@ -280,7 +355,8 @@ function projectMemoryEntries(cwd, opts) {
   const validRawIds = new Set();
   const pendingOrphans = [];
 
-  for (const { unitId, milestoneId, storageKey, path: fpath } of fragments) {
+  for (const entry of fragments) {
+    const { unitId, milestoneId, storageKey, path: fpath } = entry;
     // legacy-orphan: block format (not YAML-frontmatter fragment) — special-case before parseFragment
     if (unitId === 'legacy-orphan') {
       try {
@@ -299,7 +375,7 @@ function projectMemoryEntries(cwd, opts) {
 
     let frag;
     try {
-      const text = fs.readFileSync(fpath, 'utf8');
+      const text = memoryMod.readFragmentText(cwd, entry);
       frag = memoryMod.parseFragment(text);
     } catch (e) {
       process.stderr.write(`[forge-projection] warn: skipping memory fragment ${unitId}: ${e.message}\n`);
@@ -475,6 +551,9 @@ function inlineLabel(value, fallback) {
 
 function queryMemoryEntries(cwd, opts) {
   opts = opts || {};
+  // Module boundary: forge-memory.queryRelevant (← forge-prompt.js:306) and the
+  // `--query`/`--select` CLI both land here. Object envelope → additive fields.
+  const schema = guardReadHere(cwd);
   const unitType = String(opts.unitType || 'other').toLowerCase();
   const terms = queryTerms(queryText(opts.query));
   const limit = boundedQueryInteger(opts.limit, 8, 1, 50, 'limit');
@@ -551,18 +630,26 @@ function queryMemoryEntries(cwd, opts) {
   }
 
   const markdown = lines.length ? lines.join('\n') : '(none)';
-  return {
+  const result = {
     entries: selected,
     markdown,
     estimated_tokens: Math.ceil(markdown.length / 4),
     truncated,
     considered: ranked.length,
   };
+  // Additive, partial-only. `markdown` itself is untouched: it is injected into
+  // prompts verbatim, so the marker must not travel inside the data.
+  if (schema.partial) {
+    result.schema_partial = true;
+    result.schema_warning = schema.warning;
+  }
+  return result;
 }
 
 // ── renderMemory ─────────────────────────────────────────────────────────────────
 // Reconstructs AUTO-MEMORY.md from the structured, collision-safe projection.
 function renderMemory(cwd) {
+  guardReadHere(cwd); // stderr only — markdown stdout stays byte-identical
   const active = projectMemoryEntries(cwd);
 
   // Cap at MEMORY_CAP
@@ -605,6 +692,7 @@ function renderMemory(cwd) {
 //   ## Verification Patterns  — events where kind === 'verify'
 //   ## Plan Quality Patterns  — events where kind === 'plan'
 function renderChecker(cwd) {
+  guardReadHere(cwd); // stderr only — markdown stdout stays byte-identical
   const fragments = checkerMod.listFragments(cwd);
   const lines = ['# Forge Checker Memory', ''];
   lines.push('> Aggregated checker events from completed milestones. On-demand projection — not persisted.');
@@ -667,6 +755,7 @@ function renderChecker(cwd) {
 const ITEM_STATUS_ORDER = ['inbox', 'triaged', 'doing', 'done', 'dropped'];
 
 function renderItems(cwd) {
+  guardReadHere(cwd); // stderr only — markdown stdout stays byte-identical
   const items = itemsMod.listItems(cwd);
   const lines = ['# Forge Items', ''];
   lines.push('> Backlog items grouped by status. On-demand projection — not persisted.');
@@ -733,6 +822,7 @@ function projectionMtime(cwd, filename) {
 // Returns { ledger:bool, decisions:bool, memory:bool }
 // true = projection is older than fragments (stale), false = up to date.
 function isStale(cwd) {
+  const schema = guardReadHere(cwd);
   const ledgerFragDir    = path.join(cwd, '.gsd', 'ledger');
   const decisionsFragDir = path.join(cwd, '.gsd', 'decisions');
   const memoryFragDir    = path.join(cwd, '.gsd', 'memory');
@@ -745,11 +835,21 @@ function isStale(cwd) {
   const decisionsProjMtime = projectionMtime(cwd, DECISIONS_FILE);
   const memoryProjMtime    = projectionMtime(cwd, MEMORY_FILE);
 
-  return {
+  const result = {
     ledger:    ledgerFragMtime    > ledgerProjMtime,
     decisions: decisionsFragMtime > decisionsProjMtime,
     memory:    memoryFragMtime    > memoryProjMtime,
   };
+
+  // Object ENVELOPE → additive partial marking. Keys appear ONLY when the
+  // on-disk schema major is ahead; the fail-open path returns byte-identical
+  // JSON to before this guard existed, and existing consumers that read
+  // .ledger/.decisions/.memory ignore unknown keys.
+  if (schema.partial) {
+    result.schema_partial = true;
+    result.schema_warning = schema.warning;
+  }
+  return result;
 }
 
 // ── writeAll ──────────────────────────────────────────────────────────────────
@@ -765,6 +865,12 @@ function isStale(cwd) {
 //
 // Returns { written:[string], skipped:[string], blocked:[{file, reason}] }
 function writeAll(cwd, opts) {
+  // Refuse before rendering anything — no file is touched, and `--force` does
+  // NOT override this: force exists to overwrite a populated monolith from an
+  // empty store, a different hazard from writing under stale tooling.
+  // Consequence: the `--write-all` envelope never carries schema_partial —
+  // when the schema is ahead the command exits 1 instead of returning a body.
+  assertWriteHere(cwd);
   const { force = false } = opts || {};
   const written = [];
   const skipped = [];

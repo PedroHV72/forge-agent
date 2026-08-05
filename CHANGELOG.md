@@ -1,3 +1,318 @@
+## [Unreleased]
+
+### Breaking
+
+- **`CURRENT_SCHEMA` moves from `fragment-store@1.0.0` to `fragment-store@2.0.0`**
+  (`scripts/forge-doctor.js`), in the same commit (`0e62d47`) that first makes the grouped
+  container format writable — deliberately, so that the directional guard PR 1 shipped
+  actually fires instead of standing decorative. The operational consequence is the point:
+  a `.gsd/` store is pushed by the VCS on its own, while the tooling only arrives when
+  someone runs `/forge-update`. A developer who receives data written by the new code
+  without having updated the tooling now gets the **write refused** by
+  `scripts/forge-schema-guard.js` (non-zero exit, data major ahead of understood major),
+  instead of readers silently skipping the fragments they cannot parse. Reads stay
+  fail-open with a loud warning. `scripts/forge-migrate.js` widens its already-migrated
+  shortcut to tolerate exactly one major behind, so the bump cannot resurrect the
+  documented `.bak` destructive-backup bug.
+
+### Added
+
+- **Forge Agent 4.6.0 multi-runtime:** um único core em `FORGE_HOME` com projeções
+  selecionáveis para Claude Code e Codex CLI, instaladores compartilhados para Windows,
+  macOS e Linux, diagnóstico/capabilities offline por host e handoff auditável sem copiar
+  login, keychain ou credenciais entre runtimes.
+- **Truncation that talks.** Both dispatch truncators — `truncateChars`/`boundStandards`/
+  `truncateContext` in `scripts/forge-prompt.js` (the Claude worker render) and
+  `truncateAtSectionBoundary` in `scripts/forge-tokens.js` (the sidecar/CLI path) — now
+  emit a marker naming what was cut and where to read the rest (`.gsd/CODING-STANDARDS.md
+  § <section>`, `.gsd/memory/`), instead of a mute `…`. The marker is charged against the
+  same budget it protects: the reserve is derived from the worst-case digit count, not a
+  fixed constant, so it can never itself overflow `maxChars`/`budgetChars`. Additive —
+  byte-identical when no `source` is passed.
+- **`scripts/forge-schema-guard.js`**, a directional schema guard: compares only the
+  major of `.gsd/SCHEMA-VERSION` against the schema the tooling understands. Fail-open on
+  read (absence, unreadable stamp, or major ≤ understood all pass clean, with a loud
+  warning plus a `partial` result when the data is ahead). The write side refuses outright
+  (non-zero exit) in **two** cases: when the data's major is ahead of the tooling's, and
+  when the stamp exists but could not be read at all (a directory in its place,
+  `EACCES`/`EPERM`, …) — the refusal names the errno and claims nothing about direction,
+  because a guard that could not read the stamp measured nothing. Absence and readable
+  garbage still write, unchanged: only the read failure closes. Wired into the four
+  fragment-store readers — `forge-projection.js`, `forge-ledger.js`, `forge-decisions.js`,
+  `forge-memory.js` — at every read and write entry point, so stale tooling can no longer
+  silently clobber a store written by newer code.
+- **`scripts/forge-memory-index.js`**, a source-file → facts index derived from
+  `.gsd/memory/*.md`. Generated on demand (`--write`), never injected into any
+  prompt/template/budget. Every render carries an unconditional "Cobertura e descarte"
+  section enumerating which file citations resolved, which didn't and why
+  (`not-found`/`ambiguous-basename`/`outside-root`/`dynamic`), and which facts carried no
+  citation at all — a coverage gate that can't silently under-report.
+- **Epoch grouping: one byte-exact container per sealed quarter.** `scripts/forge-epoch.js`
+  derives `YYYY-QN` labels, sealed epochs and wrapper dirs from the store contents at
+  runtime — no cutoff date, no threshold constant. `scripts/forge-grouped-file.js` is the
+  container itself (`serializeGroup`/`parseGroup`, `grouped_format: forge-group@1`):
+  payloads travel as `Buffer` and are never decoded, so CRLF, BOM and a missing final
+  newline survive the round trip, and a member whose payload contains the delimiter is
+  refused and named rather than escaped or truncated. Member ids round-trip as UTF-8 in
+  all three marker positions — the first implementation encoded ASCII on write and decoded
+  ASCII on read, which made a container with a non-ASCII id permanently unparseable *after*
+  the originals were deleted. **All four fragment-store readers learned the format in this
+  same slice** (`forge-ledger.js`, `forge-decisions.js`, `forge-memory.js`, and
+  `forge-projection.js`/`forge-memory-index.js` via the per-store `readFragmentText(cwd,
+  entry)` accessor, replacing direct `fs.readFileSync(entry.path)`), because a format whose
+  readers ship later is a format that loses data in between. Loose beats grouped everywhere:
+  loose ids are collected before any container scan, and `writeFragment()` never edits a
+  container. `scripts/forge-epoch-group.js` is the `plan`/`apply`/`ungroup` engine, and
+  `forge-ids.listExistingIds` reads containers so sequential-id minting cannot reuse a
+  number that is now inside one.
+- **`scripts/forge-sweep-project.js`, a registry of operations rather than a script that
+  sweeps.** `scripts/forge-sweep-registry.js` (`createRegistry`) is generic over any
+  `{name, description, plan, apply}`: dry-run is the default, `run()` only asks for
+  confirmation after the preview has been computed, one failing operation does not abort
+  the others, and the skipped-items report is produced by the registry rather than by each
+  operation — proved by a fake operation that gets a full preview and skip report without
+  touching preview code. The CLI ships with exactly one operation registered
+  (`agrupar-epocas-seladas`) and a 0/1/2 exit contract.
+- **A VCS eligibility gate in front of anything destructive.**
+  `scripts/forge-sweep-eligibility.js` (`createEligibility`) is fail-closed: no VCS means
+  zero eligible targets, and exclusion is by **target**, not by member, naming the offending
+  file and its class instead of writing a silent partial. It rests on one additive export,
+  `workingStatus(cwd, opts)` in `scripts/forge-vcs.js` — a single status query
+  (`-uall -z --ignored` on git, `--no-ignore` on svn) classifying
+  untracked/ignored/added/modified, so callers never issue a second query to disambiguate a
+  path. Ignored or untracked *ancestor directories* fail closed too.
+- **`scripts/forge-wrapper-readers.js`, a frozen inventory of every enumerator of
+  `.gsd/milestones` and `.gsd/tasks`**, verdict-classified (`learned` / `breaks` /
+  `safe-by-construction`) and backed by a test that scans `scripts/` for real and fails by
+  set equality in both directions — a new reader with no entry, or an entry with no reader.
+  It exists because wrapper-dir grouping reaches a class of target whose readers never
+  learned the container format, which is why grouping those targets is gated:
+  `plan(cwd)` omits them, and `plan(cwd, { includeWrapperDirs: true })` is the sole named
+  opt-in, never exposed by the CLI (a test fails if the CLI ever grows one).
+- **`scripts/forge-legacy-residue.js`, a read-only detector** for the legacy multi-source
+  residue signature (a comma inside the *value* of `facts[].source_unit`, not in the raw
+  line) — `scanStore`/`classifyFact` plus a `--cwd --json` CLI, with no write path on disk.
+  A scanner failure now reports `store_error` and returns a distinct non-verdict, so an
+  unreadable store can never be rendered byte-identically to a clean one. See
+  **Not shipped** below for why it is the only thing S04 delivered.
+- **`forge-sweep-project` can undo its own grouping — a journal, not a copy of the
+  bytes.** `ungroup()` (`scripts/forge-epoch-group.js`) already reconstitutes every
+  member byte-for-byte from `unit.id`/`unit.content`; the container was always the
+  content journal. What was missing was recoverability after a partial failure and a
+  record of which containers exist to undo. `ungroup` is now idempotent: a destination
+  that already exists with **identical** bytes (`Buffer.compare === 0`) is treated as
+  restored (`alreadyPresent: true`) instead of throwing, so re-running `ungroup` after a
+  half-finished restore is the retry path; a destination with **different** bytes still
+  throws — loose-beats-grouped stays intact. Both `ungroup` branches (store containers
+  and wrapper-dir containers) got the fix, because `ungroup` is callable as a library
+  over either. `scripts/forge-sweep-journal.js` is a new append-only, pointer-only JSONL
+  log (`.gsd/forge/sweep-journal.jsonl`, same idiom as `events.jsonl`): container paths
+  (relative POSIX), timestamps, operation, phase and an advisory sha256 of the
+  container — **never** member bytes, so the journal cannot diverge from the container
+  it points at. `agrupar-epocas-seladas` now carries a named eligibility basis surfaced
+  in the CLI preview: `tool-undo` (untracked/ignored targets, direct or via an ignored
+  ancestor — exactly the `.gsd/`-in-`.gitignore` case) alongside the existing `vcs`
+  basis; `modified`/`added`/`deleted` targets are still refused outright, unchanged,
+  because dirty tracked state signals an in-flight edit that undo does not address. The
+  apply path appends a pre-mutation *intent* record before touching disk; if that append
+  fails and any accepted target carries a `tool-undo` basis, the **entire apply is
+  refused** (exit 1, zero mutation) rather than silently proceeding without a recovery
+  record — the same fail-closed posture as the eligibility gate itself. If the append
+  fails and every accepted target is `basis: 'vcs'`, the apply proceeds with a stderr
+  warning (that class's guarantee is the VCS, not the journal). The CLI gained `--undo
+  <container>`, restoring a container's members via `ungroup`, resolved strictly from
+  journal-recorded containers.
+
+### Changed
+
+- **The citation extractor in `scripts/forge-memory-index.js` recognises the file forms it
+  was missing**: a wider extension vocabulary (`tsx`, `jsx`, `vue`, `html`, `css`, `scss`,
+  `aspx`, `svg`), `@` accepted inside a path segment (so a versioned directory such as
+  `SERVICES/services@1.2.0/...` stops being truncated), dotted basenames aligned between the
+  backticked and bare variants, and two new patterns (`package-ref` for `name@version` with
+  a digit-led version, `bare-path-traversal` which reports a containment rejection and never
+  probes the disk). Measured against the real reference store, same store state on both sides:
+  `facts_with_resolved` 117→177, `citations_resolved` 144→227, `files_indexed` 72→126.
+- **Coverage reports three labelled buckets instead of one.** `facts_no_file_mention` (a),
+  `facts_missed_by_extractor` (b, enumerated with `mem_id`/`storage_key`/`sample_token`) and
+  `facts_unresolved_only` (c) are all derived by `filter()` from a single classification
+  list, never by parallel counters, and the sum identity is locked **per fact** and tested:
+  `facts_total = facts_with_resolved + (a) + (b) + (c)` (`177+416+5+109=707` on the real
+  store). Per-fact is a conscious trade-off with a known cost, recorded in the open review
+  items below.
+
+### Fixed
+
+- `shared/forge-dispatch.md § Budgeted Section Injection` previously described only one
+  of the two real truncators; now documents both, each with its own explicit degradation
+  ladder (the two builders intentionally degrade differently — the shared prose that used
+  to cover both was actually wrong for one of them).
+- **The schema write guard could be disabled by a directory** (found by dogfood review on
+  PR #70). `readSchemaVersion` collapsed every read error into `null`, and
+  `checkSchemaDirection` then read that `null` as "not ahead" — so a `.gsd/SCHEMA-VERSION`
+  that existed as a *directory* (`EISDIR`) made every fragment-store write sail through
+  with exit 0 and a file on disk. The `catch` inside `assertWrite` was never the fix: it
+  was unreachable, because nothing on that path ever threw. The information now originates
+  where the errno is visible — `readSchemaVersionDetailed` in `scripts/forge-migrate.js`
+  reports `{ value, unreadable, errno }` — and survives to the write side as a first-class
+  `unreadable` field. Read behaviour is untouched in all three stamp states.
+- **Raw NUL bytes in three source files made git and grep treat them as binary.**
+  `scripts/forge-memory-index.js` (two, a `Map` key separator) and
+  `scripts/forge-review-diff.test.js` (one, in the assertion string that checks NULs never
+  reach the reviewer) carried literal `0x00`s where the two-character escape `\0` was
+  meant. The cost was review visibility, not behaviour: `grep` answered "Binary file …
+  matches" and diffs refused to display. Escaped, byte-behaviour-identical, and now locked
+  by a new `forge-smoke.js` section that scans `scripts/*.js` for `0x00`/`0x0b`/`0x0c` with
+  an anti-silence floor (0 files scanned is a failure, not a clean pass).
+
+- **`docs/memory-index-citation-coverage.md`** names the cause of the unresolved citations
+  instead of inheriting a hypothesis. The 261 unresolvable citations decompose by reason
+  with the sum closing (`94+94+53+16+4=261`), and the tie is the finding: `not-found` and
+  `ambiguous-basename` land on **94 each**, which **refutes** the D5-inherited hypothesis
+  that file renaming dominated. The clearer structural cause is basename ambiguity in a
+  directory-versioned monorepo. Two backlogs are named rather than fixed here
+  (`BACKLOG-MEMORY-STORE-SKIP-28` — 28 of 145 fragments outside the index;
+  `BACKLOG-UNRESOLVED-CITATION-POLICY`), because correcting the cause would reopen the very
+  numbers this table measures.
+- `scripts/forge-migrate.js`'s header comment described a rule the code does not implement
+  (the already-migrated shortcut accepts any stamp not newer than `CURRENT_SCHEMA`, not
+  "exactly one major behind"). Comment-only diff.
+
+### Not shipped
+
+- **S04 (legacy-residue cleanup) was cut by its own gate, with verdict `NO-TARGET`.** The
+  slice opened with a precision gate that had to produce a verdict before a line of cleanup
+  was written, and the verdict was measured against the real reference store: the D9 signature
+  matched **0 facts out of 707 evaluated across 117 fragments, with 0 false positives**
+  (negative control: a naive line grep "matches" 64, all of them the JSON end-of-line comma,
+  i.e. the record delimiter rather than the data). The cut is informative rather than empty,
+  because the residue *does* exist — roughly 25 multi-source entries, the largest `MEM077`
+  with 11 sources — but it lives in the **markdown body** of `.gsd/memory/legacy-orphan.md`
+  in the legacy `- source: a, b, c` form, outside `facts[].source_unit`, which is the only
+  surface the D9 signature inspects. Widening the signature is a re-scope of D9 and an
+  operator decision, so it was not taken here; the count is recorded as named backlog. The
+  cleanup engine (T02) and its registration as operation #2 (T03) were therefore never
+  dispatched. What stays on the branch is the read-only detector and its 19 tests.
+
+**Review triage — six objections arbitrated, all closed.** S05 R3 closed with **no code
+change**: both proposed remediations (widening `--force`, adding a dedicated
+`--force-untracked`) were rejected as weakening the eligibility gate that was just built;
+**S08's undo journal resolves the substance instead** — `tool-undo` makes
+`untracked`/`ignored` targets eligible without `--force` at all. S05 R9 closed: the
+fail-closed test no longer passes green without git — the suite now exits non-zero unless
+`FORGE_ALLOW_NO_GIT=1` is set, removing the silent-skip-behind-`if (gitAvailable())` path.
+S05 R13 closed: the `shell:false` hardening in `optionsFor()` is **kept** — reverting
+correct hardening to satisfy scope discipline would make the module worse — and the scope
+deviation is recorded rather than undone. S05 R16 closed: the D11 gate stays closed, but
+the count of protected wrapper dirs is now always reported, so a wrapper target vanishing
+from `skipped` is no longer indistinguishable from a broken detector. S06 R3/R4 closed:
+the coverage labels are corrected to state exactly what they measure — no new bucket was
+added and the four-way sum identity is untouched, only the wording changed to stop
+`facts_missed_by_extractor` reading as a defect count it never was, and to stop
+`package-ref`/`dynamic` rendering as "could not be located" when they are, by design, not
+files at all.
+
+**S09 — the calendar axis is gone; sweeps are triggered, not scheduled.**
+
+### Breaking
+
+- **`CURRENT_SCHEMA` moves from `fragment-store@2.0.0` to `fragment-store@3.0.0`**
+  (`scripts/forge-doctor.js`), landed in the same commit as the container format change
+  (`116007a`), never as a follow-up — a bump that arrives separately from the format it
+  guards is a guard that fires on the wrong thing. This bump is effectively irreversible in
+  practice: once a store writes `sweep-project-NN` containers, reverting the tooling means
+  a developer's writes get refused until they update, and no S10 exists to soften a second
+  bump — this is the last slice before the PR. Legacy `YYYY-QN` containers (from the
+  epoch-grouping code S03 shipped) are still **read** by `isGroupedFile`/`parseGroup`
+  (`EPOCH_LABEL_RE`, preserved read-only in `scripts/forge-epoch.js`) but are **never
+  written or migrated** by any code on this branch — a store that already has a `2026-Q1.md`
+  container keeps it exactly as-is; only new sweeps use the new name.
+
+### Added
+
+- **On-demand sweeps replace the calendar axis.** The quarter/calendar label (`YYYY-QN`)
+  that `scripts/forge-epoch.js` derived from wall-clock time is gone; grouping now fires
+  because an operator judged that enough has accumulated, not because a quarter boundary
+  passed. Containers are named sequentially, `sweep-project-NN`
+  (`scripts/forge-sweep-sealed.js`'s `nextSweepNumber`/`containerName`, `SWEEP_CONTAINER_RE
+  = /^sweep-project-\d{2,}$/` in `scripts/forge-grouped-file.js`), numbered by scanning
+  every store directory and taking `max + 1` across all of them (one number shared per
+  sweep, not one counter per store) — legacy `YYYY-QN` containers never count toward the
+  max. `scripts/forge-epoch.js` keeps only what the new axis still needs:
+  `dateOfUnit(unit)` (id → hint → mtime fallback chain) and the wrapper-dir helpers
+  (`isWrapperDir`/`listWrapperDirs`), both untouched; the calendar-labelling functions are
+  deleted, not deprecated.
+- **`scripts/forge-sweep-sealed.js` — three closure proofs, and nothing groups without
+  one.** `sealedBy(unit, ctx)` answers, for a single fragment id, whether it is *provably*
+  closed for future writes: **(a) ledger** — an entry exists in `.gsd/ledger` for the id's
+  owning milestone/task; **(b) id-date** — a valid date is embedded in the id itself
+  (canonical `M-<14>`/`T-<14>`/dashed timestamps via `forge-ids.timestampOf`, or
+  `ask-<YYYY-MM-DD>`/`ask-<YYYYMMDD>`); **(c) extinct-id** — the id has a shape
+  `parseStorageKey` in `scripts/forge-memory.js` refuses outright (e.g. `S03-T02`), so no
+  code path in this tooling can ever produce a write to it. Proof (c) was **narrowed**
+  during T02 by a finding that refuted its own original premise (see `CLAUDE.md` below): a
+  bare local key like `S02` is *not* extinct — `skills/forge-sweep/SKILL.md:262` writes
+  memory without `--milestone`, and such a write is live today — so a bare local key falls
+  through to "no proof" and is **skipped with a reason**, never grouped on the strength of
+  a refuted premise. `legacy-orphan` is refused unconditionally, before any of the three
+  proofs, identically regardless of which of the three stores calls it (DS9-6). Every
+  failure to prove closure returns a legible pt-BR reason string; the function never throws
+  and never returns `undefined`.
+- **Date range travels with the container, and with `--list`.**
+  `scripts/forge-grouped-file.js`'s `serializeGroup`/`parseGroup` now carry `dateRange`
+  (`from`/`to`) alongside `label` (the field `epoch` is renamed but still accepted as a
+  legacy input alias, and still written on disk under the `grouped_epoch` frontmatter key —
+  a deliberate, documented misnomer to avoid a second frontmatter-key migration). An
+  unknown range serializes to explicit empty strings, never an omitted field.
+  `scripts/forge-sweep-project.js --list` surfaces the same range per container alongside
+  the sweep vocabulary (operation renamed from `agrupar-epocas-seladas`-era naming to match
+  `sweep-project-NN`), so an operator can see what a container spans without opening it.
+- **`scripts/forge-epoch-group.js` selects and names by the new proofs.** `plan()`/`apply()`
+  now select members by `sealedBy()` instead of a calendar cutoff, and name the resulting
+  container by `containerName(nextSweepNumber(dirs))`. The `store.name === 'memory'` guard
+  that special-cased the memory store (needed only because the legacy-orphan check used to
+  live inline) is removed now that `forge-sweep-sealed.js` owns that guard uniformly for
+  all three stores.
+
+### Fixed
+
+- `ungroup()` (`scripts/forge-epoch-group.js`) and the S08 undo journal are unaffected by
+  the axis swap by construction, not by assumption: the journal records container paths,
+  timestamps and an advisory sha256 of the container — **never** the label — so a journal
+  line written against an old `YYYY-QN` container still undoes correctly after this slice.
+  Exercised directly rather than left as an inherited claim (`S09-RISK.md` W5).
+- **`sealedBy: PRECISION` disagreement resolved by narrowing proof (b), not by picking a
+  side.** The precision test the slice wrote about itself (`sealedBy: PRECISION — a live
+  unit is refused with a reason, surrounded by eligible ones`) showed that a milestone id's
+  embedded timestamp records **creation**, not closure — a still-open milestone with no
+  ledger entry was passing proof (b) on the strength of its id alone. Proof (b) now trusts
+  a bare embedded timestamp directly only for `ask-*` session ids; a milestone/task id
+  additionally requires the ledger check that proof (a) already performs. The test that
+  exposed the disagreement now passes without being weakened.
+- **Proof (c) narrowed a third time by an independent cross-family challenger** (the S09
+  review ran with a Codex challenger against Claude-authored code): the objection was that
+  a shape `parseStorageKey` rejects is evidence the parser won't write it *today*, not proof
+  that no future code path ever will — parser rejection is not the same claim as permanent
+  unwritability. Resolved **not by narrowing eligibility again** but by persisting the
+  admitting proof per member (which of (a)/(b)/(c) qualified it, recorded alongside the
+  member) and pinning the rejection grammar itself with a test that names the consequence
+  of a future parser change, so a later widening of `parseStorageKey` fails loudly instead
+  of silently re-admitting members proof (c) already sealed.
+
+### Dogfood — one bug live proof-of-narrowing missed, found by running the tool for real
+
+- **Preview run against the real reference store** (dry-run only, nothing applied) turned
+  up a `high` bug that no earlier mechanism — not the three narrowings above, not the 21
+  review objections across the milestone — caught: proof (b)'s regexes anchored on
+  `^ask-<digits>`, but every real session id on disk carries a **doubled** `ask-` prefix
+  (`ask-ask-<date>`), so the anchor matched **zero** real fragments and every `ask-*`
+  fragment fell through to "no proof" regardless of how old it was. Fixed by matching the
+  doubled prefix. Under the calendar axis the same store measured 222 eligible members;
+  under the corrected sweep rule it measures **508 of 529 members eligible, 21 skipped with
+  a reason, and the totals reconcile** (`508 + 21 = 529`).
+
+**Review across the milestone: 21 objections raised, 21 closed, zero open.**
+
 ## v4.1.0 — What a project is, and what the screen may claim about it
 
 Two things landed here and they are the same thing seen from two ends. The milestone
@@ -460,7 +775,7 @@ The previous `disable-model-invocation: true` flag (added in v1.16.0 because the
 
 ## v1.16.0 (2026-05-22) — forge-sweep skill
 
-New maintenance skill, promoted from a project-local draft used in production (WDMA / custody-transfer).
+New maintenance skill, promoted from a project-local draft used in production (a reference deployment / custody-transfer).
 
 ### Added
 

@@ -3,13 +3,20 @@
  * forge-xllm.js — zero-dep sidecar adapter for external review challengers/rebuttals + execute.
  * Engines: `codex` (OpenAI Codex CLI, `codex exec`) and `agy` (Google Antigravity CLI,
  * `agy --print` — Gemini).
- *   • challenge / rebuttal : review challenger/rebuttal (read-only sandbox, spawnSync) — codex or agy.
+ *   • challenge / defend / rebuttal : the three review dialogue turns (read-only sandbox,
+ *                            spawnSync) — codex or agy.
  *   • execute              : run a T##-PLAN.md via codex under workspace-write, detached,
  *                            with heartbeat + process-group timeout, result-file only (codex only).
  *
+ * `defend` completes the dialogue. Without it, `advocate: auto` could not honor its own
+ * rule (defender = the AUTHOR's family): every GPT/Gemini author degraded to a Claude
+ * defender, and when the challenger was Claude by opposition, both debaters ended up in
+ * one family with the author's family absent from its own defense.
+ *
  * Exports:
  *   runChallenge(opts)         → { objections: [...] }   (or throws)
- *   runRebuttal(opts)          → { verdicts: [...] }      (or throws)
+ *   runDefend(opts)            → { verdicts: [...] }      (or throws) — refuted|conceded|open
+ *   runRebuttal(opts)          → { verdicts: [...] }      (or throws) — maintained|withdrawn
  *   runExecute(opts)           → Promise<result object>   (or rejects) — writes result-file
  *   extractLastJsonBlock(text) → object|array|null
  *   validateObjections(obj)    → boolean
@@ -22,11 +29,12 @@
  *
  * CLI usage:
  *   node scripts/forge-xllm.js --mode challenge --diff-cmd "git diff" [--engine codex|agy] [--model <id>] [--timeout 300] [--env-policy minimal|inherit] [--cwd <dir>]
+ *   node scripts/forge-xllm.js --mode defend --input <objections> [--diff-cmd "git diff"] [--engine codex|agy] [--model <id>] [--timeout 300] [--env-policy minimal|inherit] [--cwd <dir>]
  *   node scripts/forge-xllm.js --mode rebuttal --input <file> [--engine codex|agy] [--model <id>] [--timeout 300] [--env-policy minimal|inherit] [--cwd <dir>]
  *   node scripts/forge-xllm.js --mode execute --plan <T##-PLAN.md> --result-file <path> --cwd <repo> [--dispatch-id <id>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit]
  *   node scripts/forge-xllm.js --mode plan --plan-context <file> --result-file <path> --cwd <repo> [--dispatch-id <id>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit]
  *
- * Exit contract: 0 on success. For challenge/rebuttal the normalized JSON goes to stdout
+ * Exit contract: 0 on success. For challenge/defend/rebuttal the normalized JSON goes to stdout
  * (nothing else on stdout). For execute the result-file is the ONLY result channel —
  * stdout stays empty (LOCKED — M005-CONTEXT). ANY failure (bad args, missing binary,
  * non-zero exit, timeout, unparseable/invalid output, HEAD moved) →
@@ -106,6 +114,10 @@ const MAX_BUFFER = 16 * 1024 * 1024; // 16MB — guards against runaway output (
 const MAX_STDERR_SNIPPET = 200; // only the tail of child stderr surfaces in an error cause
 const SEVERITY_ENUM = ['critical', 'high', 'medium', 'low'];
 const VERDICT_ENUM = ['maintained', 'withdrawn'];
+// Defense verdicts (--mode defend). Mirrors the `forge-advocate` agent's own three
+// outcomes so an external defender is interchangeable with the in-context one: the
+// review spec's Step 5 truth table consumes these labels unchanged.
+const DEFEND_VERDICT_ENUM = ['refuted', 'conceded', 'open'];
 const EXEC_STATUS_ENUM = ['done', 'partial', 'blocked'];
 const PLAN_STATUS_ENUM = ['done'];
 const MH_STATUS_ENUM = ['met', 'unmet', 'unknown'];
@@ -373,12 +385,13 @@ function validateObjections(obj) {
  * @param {*} obj
  * @returns {boolean}
  */
-function validateVerdicts(obj) {
+function validateVerdicts(obj, allowed) {
+  const enumeration = Array.isArray(allowed) ? allowed : VERDICT_ENUM;
   if (!obj || typeof obj !== 'object' || !Array.isArray(obj.verdicts)) return false;
   for (const item of obj.verdicts) {
     if (!item || typeof item !== 'object') return false;
     if (typeof item.id !== 'string' || !item.id) return false;
-    if (!VERDICT_ENUM.includes(item.verdict)) return false;
+    if (!enumeration.includes(item.verdict)) return false;
     if (typeof item.rationale !== 'string') return false;
   }
   return true;
@@ -471,6 +484,41 @@ function buildChallengePrompt(diffText) {
     '--- DIFF START ---',
     diffText,
     '--- DIFF END ---',
+  ].join('\n');
+}
+
+// The defender is the AUTHOR, not a neutral judge. That framing is the whole point
+// of pairing it to the author's own family: it reconstructs the reasoning that
+// produced the code, so a challenger from another family has something to actually
+// argue against. A defender that just agrees is worth nothing — hence the explicit
+// instruction that conceding everything and refuting everything are both failures.
+function buildDefendPrompt(inputText) {
+  return [
+    'You are the engineer who wrote the code under review. An adversarial reviewer',
+    'raised the objections below against your diff. Answer each one honestly — you are',
+    'not trying to win, and you are not trying to be agreeable.',
+    '',
+    'For each objection choose exactly one verdict:',
+    ' "refuted"  — the objection is wrong. You must say WHY, citing the code or behavior',
+    '              that makes it wrong. A refutation without a concrete reason is invalid.',
+    ' "conceded" — the objection is right and the code should change.',
+    ' "open"     — a real tradeoff you deliberately made, where reasonable engineers',
+    '              disagree. Use this for judgment calls, NOT for uncertainty. If you do',
+    '              not know, investigate before answering.',
+    '',
+    'You have read access to the repository: verify claims against the actual code',
+    'before answering. Do not accept an objection merely because it sounds plausible,',
+    'and do not refute one merely because you wrote the line.',
+    '',
+    'Conceding every objection and refuting every objection are both failure modes.',
+    '',
+    'Respond with ONLY a single JSON object of the exact shape:',
+    '{ "verdicts": [ { "id", "verdict": "refuted"|"conceded"|"open", "rationale" } ] }',
+    'One entry per objection, reusing the objection ids exactly. No prose outside the JSON.',
+    '',
+    '--- OBJECTIONS START ---',
+    inputText,
+    '--- OBJECTIONS END ---',
   ].join('\n');
 }
 
@@ -874,7 +922,14 @@ function invokeCodexDetached(opts) {
       const { cmd, prefixArgs } = resolveCodexCommand();
       child = spawn(cmd, [...prefixArgs, ...args], {
         shell: false,
-        detached: true,
+        // POSIX: detached puts codex in its own process group so the timeout below can
+        // SIGKILL the WHOLE group via `process.kill(-pid)` (codex#7852).
+        // Windows: detached leaves codex with NO console, so every shell command it runs
+        // hands off to the default terminal app — one real, focus-stealing window per
+        // command (measured: 3-4 windows and 3-8 focus steals per run; zero without
+        // detached). The Windows timeout path below kills the tree by pid (/T /F) and
+        // needs no process group, so dropping detached there costs nothing.
+        detached: process.platform !== 'win32',
         // stdin = pipe (prompt transport), stdout ignored (result via -o file), stderr piped.
         stdio: ['pipe', 'ignore', 'pipe'],
         env: buildSidecarEnv(envPolicy),
@@ -1231,6 +1286,20 @@ function normalizeRebuttal(obj) {
   };
 }
 
+// Defense keeps the key named `rationale` (not `reason`, as the rebuttal does):
+// Steps 5/7a of shared/forge-review.md read `defense.rationale` when they carry a
+// concession into the fix dispatch, and the in-context forge-advocate emits the same
+// name. An external defender must be swappable with it without touching those steps.
+function normalizeDefense(obj) {
+  return {
+    verdicts: obj.verdicts.map((v) => ({
+      id: v.id,
+      verdict: v.verdict,
+      rationale: v.rationale,
+    })),
+  };
+}
+
 // ── Execute helpers (git READ-ONLY + prefs) ────────────────────────────────────
 
 function gitBuffer(cwd, args, what) {
@@ -1326,13 +1395,22 @@ function readWorkersTimeout(baseDir) {
 /**
  * Construct the environment for a sidecar process. `minimal` is an allowlist minus
  * a credential denylist; `inherit` starts from a shallow copy but applies the same
- * credential denylist before the child is spawned.
+ * credential denylist before the child is spawned. FORGE_* control variables are
+ * eligible for either policy, then filtered by that denylist as defense in depth.
  * macOS probe (2026-07-19): Codex ChatGPT keychain auth works with the minimal base.
  * @param {'minimal'|'inherit'} [policy]
  * @param {NodeJS.ProcessEnv} [sourceEnv]
  * @param {NodeJS.Platform} [platform]
  * @returns {NodeJS.ProcessEnv}
  */
+function isSensitiveSidecarEnvKey(key) {
+  const upper = String(key || '').toUpperCase();
+  if (upper === 'CODEX_HOME' || upper === 'FORGE_ACCOUNT' || upper === 'FORGE_SESSION_ID') return true;
+  if (upper !== 'DBUS_SESSION_BUS_ADDRESS' && /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|AUTH|COOKIE|SESSION)(?:_|$)/.test(upper)) return true;
+  return /^(?:AWS|AZURE|GCP|DATABASE|ANTHROPIC|CLAUDE|OPENAI|GEMINI|ANTIGRAVITY)_/.test(upper)
+    || /^FORGE_(?:AWS|AZURE|GCP|DATABASE|ANTHROPIC|CLAUDE|OPENAI|GEMINI|ANTIGRAVITY)_/.test(upper);
+}
+
 function buildSidecarEnv(policy = 'minimal', sourceEnv = process.env, platform = process.platform) {
   const common = [
     'PATH', 'HOME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'HTTP_PROXY',
@@ -1344,12 +1422,11 @@ function buildSidecarEnv(policy = 'minimal', sourceEnv = process.env, platform =
       ? ['DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME']
       : [];
   const env = policy === 'inherit' ? { ...sourceEnv } : {};
-  if (policy !== 'inherit') for (const key of [...common, ...platformKeys]) if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
-  // Test/embedding binary overrides are routing inputs, not credentials.
-  for (const key of ['FORGE_XLLM_CODEX_BIN', 'FORGE_XLLM_AGY_BIN']) if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
-  for (const key of Object.keys(env)) {
-    if (key === 'CODEX_HOME' || /(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|AUTH|COOKIE|SESSION|^AWS_|^AZURE_|^GCP_|^ANTHROPIC_|^CLAUDE_|^OPENAI_|^GEMINI_|^ANTIGRAVITY_|^FORGE_ACCOUNT$)/i.test(key)) delete env[key];
+  if (policy !== 'inherit') {
+    for (const key of [...common, ...platformKeys]) if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
+    for (const key of Object.keys(sourceEnv)) if (key.startsWith('FORGE_')) env[key] = sourceEnv[key];
   }
+  for (const key of Object.keys(env)) if (isSensitiveSidecarEnvKey(key)) delete env[key];
   return env;
 }
 
@@ -1430,6 +1507,66 @@ function runChallenge(opts) {
   if (!validateObjections(parsed)) throw new Error(`${engine} output failed objections validation`);
 
   return normalizeChallenge(parsed);
+}
+
+/**
+ * Run defend mode: read the objections from --input, optionally embed the diff the
+ * objections were raised against, invoke the engine, validate, normalize.
+ *
+ * This is the surface whose absence made `advocate: auto` a no-op for GPT/Gemini
+ * authors: `resolvePairing` had to degrade every non-Claude author to a Claude
+ * defender (`defend-mode-unavailable`), which — when the challenger was also Claude
+ * by opposition — put both debaters in one family and left the author's family
+ * unrepresented in its own defense.
+ *
+ * `--diff-cmd` is optional but strongly recommended: without it the defender argues
+ * from the objection text alone, which is exactly the credulous posture the
+ * "verify claims against the actual code" instruction is trying to prevent.
+ *
+ * @param {object} opts
+ * @param {string} opts.inputFile — objections (challenge output, rendered)
+ * @param {string} [opts.diffCmd] — command producing the diff under review
+ * @param {string} opts.cwd
+ * @param {string} [opts.engine] — 'codex' (default) | 'agy'
+ * @param {string} [opts.model]
+ * @param {number} [opts.timeoutSecs]
+ * @returns {{verdicts: object[]}}
+ * @throws {Error} on any failure — cause in message
+ */
+function runDefend(opts) {
+  const cwd = opts.cwd || process.cwd();
+  const timeoutSecs = opts.timeoutSecs || DEFAULT_TIMEOUT_SECS;
+  const engine = opts.engine || 'codex';
+  if (!opts.inputFile) throw new Error('defend mode requires --input <file>');
+
+  let inputText;
+  try {
+    inputText = fs.readFileSync(opts.inputFile, 'utf8');
+  } catch (e) {
+    throw new Error(`failed to read --input file: ${e.message}`);
+  }
+
+  if (opts.diffCmd) {
+    inputText = `${inputText}\n\n--- DIFF UNDER REVIEW START ---\n${acquireDiff(opts.diffCmd, cwd)}\n--- DIFF UNDER REVIEW END ---`;
+  }
+
+  const prompt = buildDefendPrompt(inputText);
+  const rawContent = invokeEngine(engine, {
+    prompt,
+    schema: verdictSchema(DEFEND_VERDICT_ENUM),
+    cwd,
+    model: opts.model,
+    timeoutSecs,
+    envPolicy: opts.envPolicy || 'minimal',
+  });
+
+  const parsed = extractLastJsonBlock(rawContent);
+  if (parsed === null) throw new Error(`no parseable JSON block found in ${engine} output`);
+  if (!validateVerdicts(parsed, DEFEND_VERDICT_ENUM)) {
+    throw new Error(`${engine} output failed defense verdicts validation`);
+  }
+
+  return normalizeDefense(parsed);
 }
 
 /**
@@ -1888,7 +2025,11 @@ async function runPlan(opts) {
 
 module.exports = {
   runChallenge,
+  runDefend,
   runRebuttal,
+  buildDefendPrompt,
+  normalizeDefense,
+  DEFEND_VERDICT_ENUM,
   runExecute,
   runPlan,
   loadSchemaFile,
@@ -1941,8 +2082,8 @@ if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
   const mode = args.mode;
 
-  if (mode !== 'challenge' && mode !== 'rebuttal' && mode !== 'execute' && mode !== 'plan') {
-    process.stderr.write('Usage: forge-xllm.js --mode challenge|rebuttal|execute|plan [--engine codex|agy] [--diff-cmd <cmd>] [--input <file>] [--plan <file>] [--security <file>] [--context-bundle <file>] [--plan-context <file>] [--result-file <path>] [--dispatch-id <id>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit] [--cwd <dir>]\n');
+  if (mode !== 'challenge' && mode !== 'defend' && mode !== 'rebuttal' && mode !== 'execute' && mode !== 'plan') {
+    process.stderr.write('Usage: forge-xllm.js --mode challenge|defend|rebuttal|execute|plan [--engine codex|agy] [--diff-cmd <cmd>] [--input <file>] [--plan <file>] [--security <file>] [--context-bundle <file>] [--plan-context <file>] [--result-file <path>] [--dispatch-id <id>] [--model <id>] [--timeout <secs>] [--env-policy minimal|inherit] [--cwd <dir>]\n');
     process.exit(2);
   }
 
@@ -1964,8 +2105,8 @@ if (require.main === module) {
   }
   const envPolicy = flagEnvPolicy || readSidecarsEnvPolicy(process.cwd()) || 'minimal';
 
-  if ((mode === 'challenge' || mode === 'rebuttal') && args['result-file'] !== undefined) {
-    process.stderr.write(`forge-xllm: --result-file is not supported in --mode ${mode}; challenge/rebuttal write their JSON to stdout — --result-file is exclusive to execute/plan\n`);
+  if ((mode === 'challenge' || mode === 'defend' || mode === 'rebuttal') && args['result-file'] !== undefined) {
+    process.stderr.write(`forge-xllm: --result-file is not supported in --mode ${mode}; challenge/defend/rebuttal write their JSON to stdout — --result-file is exclusive to execute/plan\n`);
     process.exit(2);
   }
 
@@ -2053,12 +2194,14 @@ if (require.main === module) {
     return;
   }
 
-  // Synchronous modes (challenge / rebuttal) — unchanged flow, JSON on stdout.
+  // Synchronous modes (challenge / defend / rebuttal) — JSON on stdout.
   const timeoutSecs = args.timeout ? Number(args.timeout) : DEFAULT_TIMEOUT_SECS;
   try {
     let result;
     if (mode === 'challenge') {
       result = runChallenge({ diffCmd: args['diff-cmd'], cwd, engine, model, timeoutSecs, envPolicy });
+    } else if (mode === 'defend') {
+      result = runDefend({ inputFile: args.input, diffCmd: args['diff-cmd'], cwd, engine, model, timeoutSecs, envPolicy });
     } else {
       result = runRebuttal({ inputFile: args.input, cwd, engine, model, timeoutSecs, envPolicy });
     }

@@ -281,6 +281,33 @@ test('SVN hashPath uses distinct null and directory sentinels', () => {
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test('isTracked answers membership in git and separates "no" from "could not ask"', () => {
+  const cwd = fixture();
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-vcs-untracked-'));
+  try {
+    fs.writeFileSync(path.join(cwd, 'untracked.txt'), 'new\n');
+    assert.deepStrictEqual(vcs.isTracked(cwd, 'modified.txt'), { vcs: 'git', ok: true, tracked: true });
+    assert.deepStrictEqual(vcs.isTracked(cwd, 'untracked.txt'), { vcs: 'git', ok: true, tracked: false });
+    // Outside a repository git exits non-zero: an ANSWER ("no"), not a failure.
+    assert.deepStrictEqual(vcs.isTracked(empty, 'anything.txt'), { vcs: 'git', ok: true, tracked: false });
+    // A tracked path deleted from the worktree is still under version control.
+    fs.rmSync(path.join(cwd, 'deleted.txt'));
+    assert.strictEqual(vcs.isTracked(cwd, 'deleted.txt').tracked, true);
+    assert.deepStrictEqual(vcs.isTracked(cwd, 'modified.txt', { vcs: 'hg' }),
+      { vcs: 'hg', ok: false, tracked: false, error: 'vcs-unsupported:hg' });
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test('svnPegSafe escapes every target so a path containing @ is not read as a peg revision', () => {
+  // Unconditional: SVN strips one trailing @, so an ordinary path is unaffected
+  // and `services@1.2.0` stops parsing as revision "1.2.0" (E205000).
+  assert.strictEqual(vcs.svnPegSafe('.gsd/LEDGER.md'), '.gsd/LEDGER.md@');
+  assert.strictEqual(vcs.svnPegSafe('SERVICES/services@1.2.0'), 'SERVICES/services@1.2.0@');
+});
+
 test('all primitives use explicit vcs and do not call detectVcs', () => {
   const cwd = fixture();
   let probes = 0;

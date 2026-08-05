@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { resolveForgePaths } = require('./forge-home');
 const { detect: detectCapabilities } = require('./forge-capabilities');
 const { generate: generateProjections } = require('./forge-generate');
@@ -14,7 +15,7 @@ const { VERSION } = require('./forge-version');
 
 const RUNTIMES = Object.freeze(['claude', 'codex', 'both']);
 const MANAGED_CORE = Object.freeze([
-  'scripts', 'schemas', 'forge-capabilities.json', 'forge-prefs.schema.json',
+  'scripts', 'schemas', 'shared', 'bin', 'forge-capabilities.json', 'forge-prefs.schema.json',
 ]);
 
 function parseArgs(argv = process.argv.slice(2)) {
@@ -147,6 +148,24 @@ function backupExisting(paths, backupRoot, plan, options) {
   return files;
 }
 
+function installApp(repo, plan, options, platform) {
+  if (!options.withApp) return null;
+  const script = path.join(repo, 'app', 'build.sh');
+  if (platform !== 'darwin') {
+    const report = { requested: true, status: 'skipped', reason: 'macos-only', script };
+    plan.push({ op: 'skip', reason: report.reason, destination: script });
+    return report;
+  }
+  if (!exists(script)) throw new Error(`app build ausente: ${script}`);
+  plan.push({ op: 'app-build', command: 'bash', args: [script, '--install'], destination: '/Applications/Forge.app' });
+  if (options.dryRun) return { requested: true, status: 'planned', script };
+  const runner = options.spawnSync || spawnSync;
+  const result = runner('bash', [script, '--install'], { cwd: repo, shell: false, stdio: 'inherit' });
+  if (result && result.error) throw new Error(`app build falhou: ${result.error.message}`);
+  if (!result || result.status !== 0) throw new Error(`app build falhou com exit ${result && result.status}`);
+  return { requested: true, status: 'installed', script, destination: '/Applications/Forge.app' };
+}
+
 function install(input = {}) {
   const options = { ...input };
   const runtime = options.runtime || 'claude';
@@ -179,7 +198,7 @@ function install(input = {}) {
   const coreAlready = exists(paths.forgeHome) && coreFiles.length > 0 && coreFiles.every((item) => exists(path.join(paths.forgeHome, item)));
   const installComplete = coreAlready && exists(paths.shared.version) && exists(paths.shared.prefs)
     && selected.every((host) => projectionComplete(paths, host, projectRoot));
-  if (installComplete && !options.update && !options.dryRun) {
+  if (installComplete && !options.update && !options.dryRun && !options.withApp) {
     return { ok: true, changed: false, already_installed: true, runtime, forge_home: paths.forgeHome, selected, backup: null, capabilities, plan: [{ op: 'skip', reason: 'already-installed', destination: paths.forgeHome }] };
   }
   if (options.update) {
@@ -210,6 +229,17 @@ function install(input = {}) {
     const destination = path.join(paths.forgeHome, item);
     if (fs.statSync(source).isDirectory()) copyTree(source, destination, plan, options);
     else copyFile(source, destination, plan, options);
+  }
+  // Review schemas historically lived under shared/schemas in the repository,
+  // while installed scripts resolve the canonical Forge-home schemas directory.
+  copyTree(path.join(repo, 'shared', 'schemas'), paths.shared.schemas, plan, options);
+  // Preserve the historical CLI surface without duplicating installer logic in
+  // Bash/PowerShell. The canonical copy lives in Forge home; launchers are also
+  // mirrored to the cross-platform user bin used by existing installations.
+  const sourceBin = path.join(repo, 'bin');
+  const userBin = path.join(paths.userHome, '.local', 'bin');
+  for (const relative of relativeFiles(sourceBin)) {
+    copyFile(path.join(sourceBin, relative), path.join(userBin, relative), plan, options);
   }
   const versionFile = path.join(paths.forgeHome, 'VERSION');
   if (!exists(versionFile) || options.update) writeText(versionFile, `${VERSION}\n`, plan, options);
@@ -260,9 +290,10 @@ function install(input = {}) {
   const installedHosts = Object.keys(adapterManifest).sort();
   const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
   writeText(paths.shared.manifest, JSON.stringify(manifest, null, 2) + '\n', plan, options);
+  const app = installApp(repo, plan, options, paths.platform);
   const backupPath = path.resolve(backupRoot);
   const hasBackup = options.update && plan.some((entry) => entry.destination && (path.resolve(entry.destination) === backupPath || path.resolve(entry.destination).startsWith(`${backupPath}${path.sep}`)));
-  return { ok: true, changed: plan.some((entry) => entry.op === 'copy' || entry.op === 'write'), dry_run: Boolean(options.dryRun), runtime, selected, forge_home: paths.forgeHome, runtime_homes: Object.fromEntries(selected.map((host) => [host, paths.runtimeHomes[host]])), backup: hasBackup ? backupRoot : null, capabilities, plan, manifest };
+  return { ok: true, changed: plan.some((entry) => entry.op === 'copy' || entry.op === 'write' || entry.op === 'app-build'), dry_run: Boolean(options.dryRun), runtime, selected, forge_home: paths.forgeHome, runtime_homes: Object.fromEntries(selected.map((host) => [host, paths.runtimeHomes[host]])), backup: hasBackup ? backupRoot : null, capabilities, plan, manifest, app };
 }
 
 function render(report) {
@@ -272,8 +303,12 @@ function render(report) {
     lines.push(`Capabilities: ${state}`);
   }
   if (report.already_installed) lines.push('Already installed; use --update to replace managed files.');
-  if (report.dry_run) lines.push(`Dry-run: ${report.plan.length} operation(s), no files written.`);
+  if (report.dry_run) {
+    lines.push(`Dry-run: ${report.plan.length} operation(s), no files written.`);
+    for (const entry of report.plan) lines.push(`  [${entry.op}] ${entry.destination || [entry.command, ...(entry.args || [])].filter(Boolean).join(' ')}`);
+  }
   else lines.push(`${report.changed ? 'Installed' : 'No changes'}; ${report.plan.length} operation(s).`);
+  if (report.app) lines.push(`App: ${report.app.status}${report.app.reason ? ` (${report.app.reason})` : ''}`);
   if (report.backup) lines.push(`Backup: ${report.backup}`);
   const conflicts = report.manifest && report.manifest.adapters
     ? Object.values(report.manifest.adapters).reduce((total, adapter) => total + (Array.isArray(adapter.conflicts) ? adapter.conflicts.length : 0), 0)
@@ -285,10 +320,10 @@ function render(report) {
 function run(argv = process.argv.slice(2), write = process.stdout.write.bind(process.stdout), errorWrite = process.stderr.write.bind(process.stderr)) {
   let options;
   try { options = parseArgs(argv); } catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 2; }
-  if (options.help) { write('Usage: install.{sh,ps1} --runtime claude|codex|both [--project-root DIR] [--update] [--dry-run] [--no-model-probe] [--capability-timeout MS] [--migrate-legacy]\n'); return 0; }
+  if (options.help) { write('Usage: install.{sh,ps1} --runtime claude|codex|both [--project-root DIR] [--update] [--dry-run] [--no-model-probe] [--capability-timeout MS] [--migrate-legacy] [--with-app]\n'); return 0; }
   try { const report = install(options); if (options.dryRun || report.ok) write(render(report)); return report.ok ? 0 : 1; }
   catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 1; }
 }
 
-module.exports = { RUNTIMES, VERSION, MANAGED_CORE, parseArgs, walk, adapterSources, install, render, run };
+module.exports = { RUNTIMES, VERSION, MANAGED_CORE, parseArgs, walk, adapterSources, installApp, install, render, run };
 if (require.main === module) process.exitCode = run();

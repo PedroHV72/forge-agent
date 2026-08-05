@@ -12,7 +12,7 @@ let passed = 0;
 function test(name, fn) { fn(); passed++; process.stdout.write(`  ✓ ${name}\n`); }
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-update-'));
-  return { root, forgeHome: path.join(root, 'forge'), claudeHome: path.join(root, 'claude'), codexHome: path.join(root, 'codex'), projectRoot: path.join(root, 'project'), repo: path.resolve(__dirname, '..'), cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+  return { root, userHome: root, forgeHome: path.join(root, 'forge'), claudeHome: path.join(root, 'claude'), codexHome: path.join(root, 'codex'), projectRoot: path.join(root, 'project'), repo: path.resolve(__dirname, '..'), cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
 test('codex-only apply preserves prefs/config and does not create Claude home', () => {

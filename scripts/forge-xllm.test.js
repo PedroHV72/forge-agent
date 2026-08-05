@@ -27,21 +27,21 @@ try {
     DBUS_SESSION_BUS_ADDRESS: 'dbus', XDG_RUNTIME_DIR: 'runtime',
     OPENAI_API_KEY: 'openai-secret', GEMINI_API_KEY: 'gemini-secret',
     ANTHROPIC_API_KEY: 'anthropic-secret', CODEX_HOME: 'provider-home',
-    AWS_SECRET_ACCESS_KEY: 'aws-secret', FORGE_ACCOUNT: 'account-secret',
+    AWS_SECRET_ACCESS_KEY: 'aws-secret', DATABASE_URL: 'database-secret',
+    FORGE_ACCOUNT: 'account-secret', FORGE_SESSION_ID: 'session-secret',
     FORGE_XLLM_CODEX_BIN: path.join(workspace, 'mock codex.js'),
-    FORGE_SAFE_VALUE: 'not forwarded',
+    FORGE_SAFE_VALUE: 'forwarded',
   };
   for (const platform of ['win32', 'darwin', 'linux']) {
     const env = buildSidecarEnv('minimal', source, platform);
     assert.strictEqual(env.PATH, source.PATH);
     assert.strictEqual(env.FORGE_XLLM_CODEX_BIN, source.FORGE_XLLM_CODEX_BIN);
-    for (const key of ['OPENAI_API_KEY', 'GEMINI_API_KEY', 'ANTHROPIC_API_KEY', 'CODEX_HOME', 'AWS_SECRET_ACCESS_KEY', 'FORGE_ACCOUNT', 'FORGE_SAFE_VALUE']) {
+    for (const key of ['OPENAI_API_KEY', 'GEMINI_API_KEY', 'ANTHROPIC_API_KEY', 'CODEX_HOME', 'AWS_SECRET_ACCESS_KEY', 'DATABASE_URL', 'FORGE_ACCOUNT', 'FORGE_SESSION_ID']) {
       assert.strictEqual(Object.prototype.hasOwnProperty.call(env, key), false, `${platform} strips ${key}`);
     }
+    assert.strictEqual(env.FORGE_SAFE_VALUE, source.FORGE_SAFE_VALUE, `${platform} forwards non-sensitive FORGE_* controls`);
     assert.strictEqual(Object.prototype.hasOwnProperty.call(env, 'SystemRoot'), platform === 'win32');
-    // Session bus addresses are intentionally excluded by the credential/session
-    // denylist even though Linux exposes the key in its base allowlist.
-    assert.strictEqual(Object.prototype.hasOwnProperty.call(env, 'DBUS_SESSION_BUS_ADDRESS'), false);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(env, 'DBUS_SESSION_BUS_ADDRESS'), platform === 'linux');
   }
   // Explicit inherit remains an environment policy input, but the same
   // credential denylist applies; a caller cannot smuggle secrets through it.

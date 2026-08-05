@@ -6,7 +6,10 @@
  * Token counting heuristic: Math.ceil(chars / 4)  (M002-CONTEXT D1)
  * Zero npm dependencies — only Node built-ins (fs, path).
  * CommonJS dual-mode: require() for module use, or run directly as CLI.
- * Marker format: [...truncated N sections]
+ * Marker format: [...truncated N sections] (without opts.source) or
+ *   [...truncated N sections — see <source>] (with opts.source) — both share the
+ *   [...truncated  prefix and sections]/sections — token, so the self-test and
+ *   any prefix-based caller keep working unmodified.
  * Mandatory-mode semantics: throw Error instead of truncating when opts.mandatory === true.
  * MEM036 nuance: classification outcomes = data; budget violations = exceptions.
  *   Do NOT "fix" the mandatory throw by swallowing it.
@@ -31,8 +34,8 @@ const PHASE_ORDER = [
   'memory-extract',
 ];
 
-// Reserve chars for worst-case marker: "\n\n[...truncated 999 sections]" = 32 chars → use 40 for safety.
-const MARKER_LENGTH = 40;
+// (MARKER_LENGTH fixed reserve removed — the marker reserve is now derived from
+// the actual marker text emitted by truncationMarker(), never a fixed guess.)
 
 // Boundary detection: split at lines starting with "## ", "### ", or lines that ARE exactly "---" or "***".
 // Using lookahead so each part retains its leading boundary line (re-join with parts.join('') is lossless).
@@ -55,6 +58,55 @@ function countTokens(text) {
 }
 
 /**
+ * Build the truncation marker text for a given dropped-section count.
+ *
+ * With `opts.source` present, the marker names where the dropped content can
+ * be reread: `\n\n[...truncated N sections — see <source>]`. Without it, the
+ * marker is byte-identical to the historical format:
+ * `\n\n[...truncated N sections]`. The prefix `[...truncated ` and the
+ * `sections]`/`sections —` token are preserved either way — this is an
+ * additive extension, never a substitution, so the self-test and any
+ * existing prefix asserts keep passing unmodified.
+ *
+ * Not exported: the public surface stays countTokens/truncateAtSectionBoundary/aggregate.
+ *
+ * @param {number} droppedCount
+ * @param {{ source?: string }} [opts]
+ * @returns {string}
+ */
+function truncationMarker(droppedCount, opts) {
+  if (!opts) opts = {};
+  if (opts.source) {
+    return `\n\n[...truncated ${droppedCount} sections — see ${opts.source}]`;
+  }
+  return `\n\n[...truncated ${droppedCount} sections]`;
+}
+
+/**
+ * True when the budget cannot hold even the shortest (source-less) marker for
+ * this dropped count. In that case emitting any marker would slice it into an
+ * unterminated fragment.
+ *
+ * @param {number} budgetChars
+ * @param {number} droppedCount
+ * @returns {boolean}
+ */
+function tooSmallForMarker(budgetChars, droppedCount) {
+  return truncationMarker(droppedCount, {}).length > budgetChars;
+}
+
+/**
+ * Terminal degradation of the marker ladder: a single ellipsis, or the empty
+ * string when the budget is 0. Mirrors scripts/forge-prompt.js:181.
+ *
+ * @param {number} budgetChars
+ * @returns {string}
+ */
+function ellipsisFor(budgetChars) {
+  return budgetChars <= 0 ? '' : '…';
+}
+
+/**
  * Truncate content at markdown section boundaries to fit within a character budget.
  *
  * Algorithm:
@@ -62,14 +114,22 @@ function countTokens(text) {
  *  2. If opts.mandatory === true, throw (never truncate mandatory sections).
  *  3. Strip frontmatter (--- block at top) before splitting (pitfall 2).
  *  4. Split on BOUNDARY_RE; each part retains its leading boundary line.
- *  5. Greedily keep parts from the start while running total + MARKER_LENGTH <= budgetChars.
- *  6. Append [...truncated N sections] marker.
+ *  5. Greedily keep parts from the start while running total + reserve <= budgetChars,
+ *     where reserve is the length of the marker actually being emitted (derived from
+ *     truncationMarker(), not a fixed guess) — worst case sized for parts.length dropped.
+ *     The marker regime is settled before the reserve is spent: the reserve is always
+ *     the shortest (source-less) marker, so no whole section is ever dropped to pay for
+ *     a pointer that may not be printed. Step 6 upgrades to the source-bearing marker
+ *     when it fits at that content length.
+ *  6. Append the truncationMarker() text; if the derived reserve does not fit inside
+ *     budgetChars, degrade to the source-less (shorter) marker before ever exceeding it.
  *  7. Fallback (zero boundaries or first section > budget): slice mid-content.
  *     This is the ONLY case where we cut mid-content (documented intentionally).
+ *     The return value here is also guarded to never exceed budgetChars.
  *
  * @param {string} content
  * @param {number} budgetChars
- * @param {{ mandatory?: boolean, label?: string }} [opts]
+ * @param {{ mandatory?: boolean, label?: string, source?: string }} [opts]
  * @returns {string}
  */
 function truncateAtSectionBoundary(content, budgetChars, opts) {
@@ -102,13 +162,26 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
   BOUNDARY_RE.lastIndex = 0;
   const parts = body.split(BOUNDARY_RE).filter(p => p.length > 0);
 
-  // Step 5: greedy keep — budget must also accommodate the prefix and the marker
+  // Step 5: greedy keep — budget must also accommodate the prefix and the marker.
+  // Reserve is derived from the marker actually being emitted, worst-cased on
+  // parts.length dropped sections (the highest digit count possible), never a
+  // fixed guessed constant.
+  //
+  // The marker REGIME is settled BEFORE the reserve is spent. Reserving for the
+  // source-bearing marker while step 6 may end up emitting the shorter
+  // source-less one made a long opts.source cost whole sections that actually
+  // fit — and could force the mid-content fallback for nothing. So we select
+  // against the shortest (source-less) marker, and step 6 upgrades to the
+  // source-bearing marker only when it still fits at that content length.
+  // Content wins over the pointer, consistent with the pre-existing degradation
+  // order (drop the source pointer before ever slicing retained text).
+  const reserve = truncationMarker(parts.length, {}).length;
   const prefixLen = prefix.length;
   let running = prefixLen;
   let kept = 0;
 
   for (let i = 0; i < parts.length; i++) {
-    const tentative = running + parts[i].length + MARKER_LENGTH;
+    const tentative = running + parts[i].length + reserve;
     if (tentative > budgetChars && kept > 0) {
       break;
     }
@@ -121,8 +194,31 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
 
   // Step 6: success path — we kept at least some sections and dropped some
   if (droppedCount > 0 && kept > 0) {
-    const keptText = prefix + parts.slice(0, kept).join('');
-    return keptText + `\n\n[...truncated ${droppedCount} sections]`;
+    // Guard: a budget too small for even the shortest marker must never emit a
+    // sliced (unterminated) marker. Mirror forge-prompt.js:181 — degrade to the
+    // silent ellipsis instead. The `[...truncated ` prefix contract in
+    // shared/forge-dispatch.md only admits complete markers.
+    if (tooSmallForMarker(budgetChars, droppedCount)) {
+      return ellipsisFor(budgetChars);
+    }
+    let keptText = prefix + parts.slice(0, kept).join('');
+    // Regime upgrade: the selection above reserved for the source-less marker,
+    // so take the source pointer only when it fits at this content length.
+    let marker = truncationMarker(droppedCount, {});
+    if (opts.source) {
+      const withSource = truncationMarker(droppedCount, opts);
+      if (keptText.length + withSource.length <= budgetChars) {
+        marker = withSource;
+      }
+    }
+
+    // Guard: the source-less marker itself can still overflow in degenerate
+    // cases (prefix alone near the budget) — trim keptText rather than exceed.
+    if (keptText.length + marker.length > budgetChars) {
+      keptText = keptText.slice(0, Math.max(0, budgetChars - marker.length));
+    }
+
+    return clampToBudget(keptText + marker, budgetChars);
   }
 
   // droppedCount === 0 after greedy pass means everything fits — but we already
@@ -131,8 +227,36 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
 
   // Step 7: Fallback branch — zero boundaries OR first section alone > budget.
   // This is the only place we cut mid-content. Documented intentionally (MEM036).
-  const cutAt = Math.max(0, budgetChars - MARKER_LENGTH);
-  return content.substring(0, cutAt) + `\n\n[...truncated 1 sections]`;
+  // Reserve here mirrors step 5: derived from the marker actually emitted, not
+  // a fixed constant.
+  let fallbackMarker = truncationMarker(1, opts);
+  if (fallbackMarker.length >= budgetChars && opts.source) {
+    // Source pointer alone doesn't fit — degrade to the shorter marker.
+    fallbackMarker = truncationMarker(1, {});
+  }
+  // Same guard as step 6: below the shortest marker there is no room for any
+  // complete marker, with or without opts.source. Emit the ellipsis, never a
+  // sliced `[...tru` fragment.
+  if (tooSmallForMarker(budgetChars, 1)) {
+    return ellipsisFor(budgetChars);
+  }
+  const cutAt = Math.max(0, budgetChars - fallbackMarker.length);
+  return clampToBudget(content.substring(0, cutAt) + fallbackMarker, budgetChars);
+}
+
+/**
+ * Final safety net: never return a string longer than budgetChars, regardless
+ * of how long an opts.source pointer turned out to be. Guarantees the "never
+ * exceed budgetChars" invariant even in degenerate cases (e.g. a source path
+ * longer than the whole budget).
+ *
+ * @param {string} text
+ * @param {number} budgetChars
+ * @returns {string}
+ */
+function clampToBudget(text, budgetChars) {
+  if (text.length <= budgetChars) return text;
+  return text.slice(0, budgetChars);
 }
 
 /**

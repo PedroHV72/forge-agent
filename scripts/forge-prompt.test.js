@@ -13,7 +13,9 @@ const {
   renderPrompt,
   materializePrompt,
   cleanupPrompt,
+  _private,
 } = require('./forge-prompt.js');
+const { truncateChars, truncateContext, boundStandards } = _private;
 const { countTokens } = require('./forge-tokens.js');
 
 const SCRIPT = path.join(__dirname, 'forge-prompt.js');
@@ -367,6 +369,117 @@ test('CLI rejects unknown options instead of silently drifting', () => {
   });
   assert.notStrictEqual(run.status, 0);
   assert.match(run.stderr, /Unknown option: --unit-typo/);
+});
+
+// --- Speaking truncation marker -------------------------------------------
+
+const LONG_RULES = 'never swallow errors\n'.repeat(60);
+
+test('emits the full marker with cut count and file § section when the budget is roomy', () => {
+  const out = truncateChars(LONG_RULES, 400, {
+    source: '.gsd/CODING-STANDARDS.md',
+    section: 'Code Rules',
+  });
+  assert.ok(out.length <= 400, `length=${out.length}`);
+  assert.match(out, /\n\n\[\.\.\.truncated \d+ chars — see \.gsd\/CODING-STANDARDS\.md § Code Rules\]$/);
+  const cut = Number(out.match(/truncated (\d+) chars/)[1]);
+  const content = out.slice(0, out.indexOf('\n\n[...truncated'));
+  assert.strictEqual(cut, LONG_RULES.length - content.length);
+  assert.ok(cut > 0 && content.length > 0);
+});
+
+test('omits the § section when no section is supplied', () => {
+  const out = truncateChars(LONG_RULES, 400, { source: '.gsd/memory/' });
+  assert.match(out, /\n\n\[\.\.\.truncated \d+ chars — see \.gsd\/memory\/\]$/);
+  assert.ok(!out.includes('§'));
+});
+
+test('degrades to the short marker when the full marker does not fit', () => {
+  const source = '.gsd/CODING-STANDARDS.md';
+  const section = 'Directory Conventions + Asset Map + Pattern Catalog';
+  const full = `\n\n[...truncated ${LONG_RULES.length} chars — see ${source} § ${section}]`;
+  const short = `\n\n[...truncated — see ${source}]`;
+  const budget = full.length; // room for the short marker + content, never the full one
+  assert.ok(budget > short.length);
+  const out = truncateChars(LONG_RULES, budget, { source, section });
+  assert.ok(out.length <= budget, `length=${out.length}`);
+  assert.strictEqual(out.endsWith(short), true, `got: ${JSON.stringify(out)}`);
+  assert.ok(!out.includes('§'));
+});
+
+test('degrades to the silent ellipsis when not even the short marker fits', () => {
+  const out = truncateChars(LONG_RULES, 12, {
+    source: '.gsd/CODING-STANDARDS.md',
+    section: 'Code Rules',
+  });
+  assert.ok(out.length <= 12, `length=${out.length}`);
+  assert.ok(out.endsWith('…'));
+  assert.ok(!out.includes('truncated'));
+});
+
+test('never exceeds maxChars across every regime, including degenerate budgets', () => {
+  const opts = { source: '.gsd/CODING-STANDARDS.md', section: 'Code Rules' };
+  for (const maxChars of [0, 1, 2, 3, 10, 47, 48, 71, 72, 120, 400, 1200]) {
+    const bare = truncateChars(LONG_RULES, maxChars);
+    const marked = truncateChars(LONG_RULES, maxChars, opts);
+    assert.ok(bare.length <= maxChars, `bare maxChars=${maxChars} length=${bare.length}`);
+    assert.ok(marked.length <= maxChars, `marked maxChars=${maxChars} length=${marked.length}`);
+  }
+  assert.strictEqual(truncateChars(LONG_RULES, 0, opts), '');
+});
+
+test('adds no marker at all when the text fits the budget', () => {
+  const text = 'fits fine\nsecond line';
+  const opts = { source: '.gsd/CODING-STANDARDS.md', section: 'Code Rules' };
+  assert.strictEqual(truncateChars(text, text.length, opts), text);
+  assert.strictEqual(truncateChars(text, 5000, opts), text);
+  assert.strictEqual(truncateContext(text, 1000, opts), text);
+  assert.strictEqual(truncateChars(LONG_RULES, 400), truncateChars(LONG_RULES, 400, {}));
+});
+
+test('keeps the emitted pointer relative to the workspace, never absolute', () => {
+  const cwd = tempWorkspace('marker-pointer');
+  const result = renderPrompt({
+    ...baseOptions(cwd, 'plan-slice'),
+    standards: {
+      CS_LINT: 'lint '.repeat(200),
+      CS_STRUCTURE: 'structure '.repeat(200),
+      CS_RULES: 'rules '.repeat(200),
+    },
+    standardsMaxTokens: 300,
+  });
+  const markers = result.prompt.match(/\[\.\.\.truncated [^\]]*\]/g) || [];
+  assert.ok(markers.length > 0, 'expected at least one truncation marker');
+  for (const marker of markers) {
+    assert.ok(marker.includes('.gsd/CODING-STANDARDS.md'), marker);
+    assert.ok(!/[A-Za-z]:[\\/]/.test(marker), `absolute pointer: ${marker}`);
+    assert.ok(!/see \//.test(marker), `absolute pointer: ${marker}`);
+    assert.ok(!marker.includes('\\'), `windows separator leaked: ${marker}`);
+  }
+  // The marker lives inside the DATA envelope it describes, never outside it.
+  const rules = result.prompt.match(/CODING-STANDARDS\.rules"[^\n]*\n([\s\S]*?)\n\[END DATA FROM "CODING-STANDARDS\.rules"\]/)[1];
+  assert.ok(rules.includes('[...truncated'), rules.slice(-120));
+});
+
+test('boundStandards keeps the sum of injected sections inside the token budget', () => {
+  const template = 'Lint: {CS_LINT}\nStructure: {CS_STRUCTURE}\nRules: {CS_RULES}\n';
+  for (const maxTokens of [3, 12, 20, 64, 300]) {
+    const bound = boundStandards({
+      CS_LINT: 'lint '.repeat(200),
+      CS_STRUCTURE: 'structure '.repeat(200),
+      CS_RULES: 'rules '.repeat(200),
+    }, maxTokens, template, { standardsPath: '.gsd/CODING-STANDARDS.md' });
+    const total = bound.CS_LINT.length + bound.CS_STRUCTURE.length + bound.CS_RULES.length;
+    assert.ok(total <= maxTokens * 4, `maxTokens=${maxTokens} chars=${total}`);
+  }
+  const roomy = boundStandards({
+    CS_LINT: 'lint',
+    CS_STRUCTURE: 'structure',
+    CS_RULES: 'rules '.repeat(400),
+  }, 400, template, { standardsPath: 'docs/STANDARDS.md' });
+  assert.strictEqual(roomy.CS_LINT, 'lint');
+  assert.strictEqual(roomy.CS_STRUCTURE, 'structure');
+  assert.match(roomy.CS_RULES, /see docs\/STANDARDS\.md § Code Rules\]$/);
 });
 
 process.on('exit', () => {

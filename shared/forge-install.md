@@ -27,7 +27,7 @@ reservado para o app opcional.
 ## Árvore e isolamento
 
 O core é copiado uma única vez para `FORGE_HOME` (ou `~/.forge-agent`):
-`scripts/`, `schemas/`, `forge-capabilities.json`, `forge-prefs.schema.json`,
+`scripts/`, `schemas/`, `shared/`, `bin/`, `forge-capabilities.json`, `forge-prefs.schema.json`,
 `VERSION`, preferências JSONC e `manifest.json`. Os homes Claude/Codex são
 projeções selecionadas e recebem somente seus agentes, comandos, skills e
 templates dispatch. Em `both`, o core e as preferências continuam únicos.
@@ -40,7 +40,7 @@ selecionado não é criado, lido nem escrito.
 ## Atualização e rollback
 
 `--update`/`-Update` copia os arquivos gerenciados atuais para
-`<FORGE_HOME>/backups/backup-4.2.0-<timestamp>` antes de substituir. As
+`<FORGE_HOME>/backups/backup-4.6.0-<timestamp>` antes de substituir. As
 preferências existentes, `.gsd`, hooks e arquivos não gerenciados ficam fora
 do conjunto gerenciado. Uma preferência legada em
 `<claude-home>/forge-agent-prefs.jsonc` é lida como migração não destrutiva

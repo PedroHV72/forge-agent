@@ -2,10 +2,16 @@
 // forge-migrate — Consolidated migration orchestrator for Forge Agent fragment stores.
 //
 // Runs the three migrators (ledger, decisions, memory) in order. For each:
-//   0. Already-migrated shortcut: when .gsd/SCHEMA-VERSION is already CURRENT_SCHEMA
+//   0. Already-migrated shortcut: when .gsd/SCHEMA-VERSION is stamped with any
+//      version that is NOT NEWER than CURRENT_SCHEMA (including several majors
+//      behind — there is no "one major back" cutoff)
 //      AND the store's fragments are populated, the monolith on disk is a REGENERATED
 //      projection cache — NOT a legacy pre-migration monolith. Skip backup + migrate so
 //      the cache is never retired to .bak (reports skipped_reason: 'already-migrated').
+//      This guards against a major-version bump turning a regenerated projection
+//      into a discarded .bak (see docs/fragment-store-migration-bugs.md:94).
+//      If the guard module can't be loaded/parsed, the check falls back to strict
+//      equality — a MORE restrictive check, never more permissive.
 //   1. Otherwise: renames the legacy monolith to <name>.bak (preserves existing .bak).
 //   2. Invokes the migrator's migrate() export.
 //   3. Verifies: renders via forge-projection and diffs against .bak content.
@@ -33,6 +39,22 @@ const memoryMigrate    = require('./forge-memory-migrate');
 const projection       = require('./forge-projection');
 const storeStateMod    = require('./forge-store-state');
 const { CURRENT_SCHEMA } = require('./forge-doctor');
+
+// Schema comparison stays owned by forge-schema-guard. Loading it only when
+// migration runs avoids the existing guard -> migrate dependency cycle during
+// module initialization.
+function stampedSchemaIsCompatible(cwd) {
+  const stamped = readSchemaVersion(cwd);
+  try {
+    const { parseSchemaSemver, cmpSemver } = require('./forge-schema-guard');
+    const actual = parseSchemaSemver(stamped);
+    const current = parseSchemaSemver(CURRENT_SCHEMA);
+    return Boolean(actual && current && cmpSemver(actual, current) <= 0);
+  } catch (_) {
+    // A missing/unparseable guard is not evidence that an older stamp is safe.
+    return stamped === CURRENT_SCHEMA;
+  }
+}
 
 // ── Store descriptors ─────────────────────────────────────────────────────────
 // Each store: { name, monolithRel, bakRel, migrate, render }
@@ -188,14 +210,47 @@ function compareContent(bakContent, rendered, storeName) {
   return 'differs';
 }
 
-// ── readSchemaVersion ───────────────────────────────────────────────────────
-// Returns the trimmed content of .gsd/SCHEMA-VERSION, or null if absent.
-function readSchemaVersion(cwd) {
+// ── readSchemaVersionDetailed ───────────────────────────────────────────────
+// Reads .gsd/SCHEMA-VERSION and DISTINGUISHES THE THREE STATES the callers care
+// about, which the plain `readSchemaVersion` below cannot express (it collapses
+// all of them into null):
+//
+//   absent      → the file is not there            → { value: null,  unreadable: false, errno: 'ENOENT'|null }
+//   unreadable  → the path exists but cannot be read (EISDIR when a directory
+//                 sits where the file belongs, EACCES/EPERM, ENOTDIR, EBUSY…)
+//                                                  → { value: null,  unreadable: true,  errno: <code> }
+//   readable    → content returned, trimmed; may still be garbage that nobody
+//                 can parse — parsing is not this function's business
+//                                                  → { value: <string>, unreadable: false, errno: null }
+//
+// Discrimination rule (measured on win32/Node 24 and matching POSIX): a read
+// error whose `code` is 'ENOENT' means absent; ANY OTHER errno means the stamp
+// is there in some form we could not read. Errors carrying no `code` at all
+// (e.g. a TypeError from a non-string cwd — a programmer error, not an I/O
+// condition) stay fail-open as "absent", preserving the historical behaviour.
+//
+// Why this matters: a write guard that cannot read the stamp knows NOTHING
+// about direction. Treating "could not read" as "not ahead" let a directory
+// named .gsd/SCHEMA-VERSION disable the guard silently (PR #70 dogfood).
+function readSchemaVersionDetailed(cwd) {
   try {
-    return fs.readFileSync(path.join(cwd, '.gsd', 'SCHEMA-VERSION'), 'utf8').trim();
-  } catch (_) {
-    return null;
+    const value = fs.readFileSync(path.join(cwd, '.gsd', 'SCHEMA-VERSION'), 'utf8').trim();
+    return { value, unreadable: false, errno: null };
+  } catch (err) {
+    const code = err && typeof err.code === 'string' ? err.code : null;
+    if (!code || code === 'ENOENT') return { value: null, unreadable: false, errno: code };
+    return { value: null, unreadable: true, errno: code };
   }
+}
+
+// ── readSchemaVersion ───────────────────────────────────────────────────────
+// Returns the trimmed content of .gsd/SCHEMA-VERSION, or null when it is absent
+// OR could not be read for any reason (fail-open, string|null contract). Callers
+// that must tell those apart use readSchemaVersionDetailed above; this signature
+// is load-bearing for `migrateAll`'s already-migrated shortcut
+// (`readSchemaVersion(cwd) === CURRENT_SCHEMA`) and must not change shape.
+function readSchemaVersion(cwd) {
+  return readSchemaVersionDetailed(cwd).value;
 }
 
 // ── backupMonolith ────────────────────────────────────────────────────────────
@@ -352,7 +407,7 @@ function migrateAll(cwd, opts = {}) {
   // both: SCHEMA-VERSION must be current AND the store's fragments must be
   // populated. storeState is read up-front — stores are independent, so a per-store
   // snapshot taken here stays accurate across the loop.
-  const schemaCurrent = readSchemaVersion(cwd) === CURRENT_SCHEMA;
+  const schemaCurrent = stampedSchemaIsCompatible(cwd);
   const state = storeStateMod.storeState(cwd);
 
   const results = {};
@@ -386,7 +441,11 @@ function migrateAll(cwd, opts = {}) {
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
-module.exports = { migrateAll };
+// readSchemaVersion / readSchemaVersionDetailed are additionally exported for
+// scripts/forge-schema-guard.js (M-S01 T03), which reads .gsd/SCHEMA-VERSION via
+// this single source of truth instead of reimplementing file reading. The guard
+// uses the Detailed variant because it must tell "absent" from "unreadable".
+module.exports = { migrateAll, readSchemaVersion, readSchemaVersionDetailed };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 function printUsage() {

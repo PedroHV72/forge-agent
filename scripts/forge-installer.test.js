@@ -16,7 +16,7 @@ function fixture() {
   const claudeHome = path.join(root, 'Claude Home');
   const codexHome = path.join(root, 'Codex Home');
   const projectRoot = path.join(root, 'Project Root');
-  const options = { repo: path.resolve(__dirname, '..'), forgeHome, claudeHome, codexHome, projectRoot, skipCapabilityCheck: true };
+  const options = { repo: path.resolve(__dirname, '..'), forgeHome, claudeHome, codexHome, projectRoot, userHome: root, skipCapabilityCheck: true };
   return { root, forgeHome, claudeHome, codexHome, projectRoot, options, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 function files(root) { return fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }).map((entry) => entry.name).sort() : []; }
@@ -38,13 +38,43 @@ test('dry-run plans Claude-only without touching Forge, Claude, or Codex homes',
   } finally { data.cleanup(); }
 });
 
+test('shared references and cross-platform launchers are installed by the Node core', () => {
+  const data = fixture();
+  try {
+    const report = installer.install({ ...data.options, runtime: 'both' });
+    assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'shared', 'forge-review.md')), true);
+    assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'shared', 'forge-dispatch.md')), true);
+    assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'schemas', 'challenge.schema.json')), true);
+    assert.strictEqual(fs.existsSync(path.join(data.root, '.local', 'bin', 'forge-status.cmd')), true);
+    assert(report.plan.some((entry) => entry.destination && entry.destination.endsWith(path.join('shared', 'forge-state.md'))));
+  } finally { data.cleanup(); }
+});
+
+test('--with-app is planned on macOS, executed through bash, and skipped elsewhere', () => {
+  const plan = [];
+  const calls = [];
+  const repo = path.resolve(__dirname, '..');
+  const dry = installer.installApp(repo, plan, { withApp: true, dryRun: true }, 'darwin');
+  assert.strictEqual(dry.status, 'planned');
+  assert(plan.some((entry) => entry.op === 'app-build'));
+  const built = installer.installApp(repo, [], {
+    withApp: true,
+    spawnSync: (command, args, options) => { calls.push({ command, args, options }); return { status: 0 }; },
+  }, 'darwin');
+  assert.strictEqual(built.status, 'installed');
+  assert.deepStrictEqual(calls[0].args.slice(-1), ['--install']);
+  assert.strictEqual(calls[0].options.shell, false);
+  assert.strictEqual(installer.installApp(repo, [], { withApp: true }, 'linux').reason, 'macos-only');
+  assert.strictEqual(installer.installApp(repo, [], { withApp: true }, 'win32').reason, 'macos-only');
+});
+
 test('Claude-only writes shared core once and only Claude projection', () => {
   const data = fixture();
   try {
     const report = installer.install({ ...data.options, runtime: 'claude' });
     assert.strictEqual(report.ok, true);
-    assert.strictEqual(installer.VERSION, '4.2.0');
-    assert.strictEqual(fs.readFileSync(path.join(data.forgeHome, 'VERSION'), 'utf8'), '4.2.0\n');
+    assert.strictEqual(installer.VERSION, '4.6.0');
+    assert.strictEqual(fs.readFileSync(path.join(data.forgeHome, 'VERSION'), 'utf8'), '4.6.0\n');
     assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'scripts', 'forge-home.js')), true);
     assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'forge-capabilities.json')), true);
     assert.strictEqual(fs.existsSync(path.join(data.forgeHome, 'manifest.json')), true);

@@ -14,7 +14,11 @@ function locksDir(cwd) { return path.join(cwd, '.gsd', 'forge', 'file-locks'); }
 function encodePath(value) { return Buffer.from(String(value), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
 function canonicalPath(cwd, filePath) {
   validatePath(filePath);
-  const normalized = path.normalize(path.resolve(cwd, String(filePath).normalize('NFC'))).normalize('NFC');
+  // Forge plans and state use POSIX separators on every platform. Treat both
+  // spellings as separators before resolving so `src/foo.js` and
+  // `src\\foo.js` cannot acquire different locks on macOS/Linux.
+  const portable = String(filePath).normalize('NFC').replace(/[\\/]/g, path.sep);
+  const normalized = path.normalize(path.resolve(cwd, portable)).normalize('NFC');
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 function lockPathFor(cwd, filePath) { const canonical = canonicalPath(cwd, filePath); return path.join(locksDir(cwd), `${encodePath(canonical)}.json`); }
@@ -26,7 +30,11 @@ function readLock(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8'))
 function writeAtomic(file, meta) { const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`; fs.writeFileSync(temporary, JSON.stringify(meta), 'utf8'); fs.renameSync(temporary, file); }
 function ageOf(meta, now) { return meta ? now - (meta.renewed_at || meta.acquired_at || 0) : null; }
 function isHolderRunActive(cwd, runId) { if (!runs || !runId) return false; try { const run = runs.get(cwd, runId); return !!(run && run.active); } catch { return false; } }
-function guardName(filePath) { return `filelock-${encodePath(filePath)}`; }
+// Mutex names are capped at 160 characters. Absolute paths routinely exceed
+// that once base64url-encoded (especially under Windows temp directories), so
+// use a stable digest for the internal guard while retaining the readable
+// canonical path in the file-lock metadata itself.
+function guardName(filePath) { return `filelock-${crypto.createHash('sha256').update(String(filePath), 'utf8').digest('hex')}`; }
 function withGuard(cwd, filePath, fn) {
   const guard = mutex.tryAcquireSync(cwd, guardName(filePath), { ttlMs: 5_000 });
   if (!guard) return { acquired: false, reason: 'guard_busy', holder: null };

@@ -8,6 +8,7 @@
 //   parseFragment(text)                 → object  // parse markdown with YAML frontmatter
 //   writeFragment(cwd, fragment, opts)  → { path, created }
 //   readFragment(cwd, unitId, opts?)    → object | null
+//   readFragmentText(cwd, entry)        → string // selected fragment payload
 //   listFragments(cwd, opts?)           → Array<{ storageKey, unitId, milestoneId, path }>
 //   validateUnitId(unitId)              → boolean
 //   queryRelevant(query)                → bounded selector result
@@ -32,6 +33,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { isValid, entityKind } = require('./forge-ids');
 const yamlSafe = require('./forge-yaml-safe');
+const { isGroupedFile, readGroupedUnits, readSniffBuffer, publicEntry, unitTextOf } = require('./forge-grouped-file');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -48,6 +50,68 @@ const ASK_ID_RE = /^ask-[A-Za-z0-9._-]+$/;
 // owners (for example S02 plan research and T03 execution summaries).
 const LOCAL_UNIT_ID_RE = /^(?:S\d+|T\d+(?:\.\d+)?)$/i;
 const QUALIFIED_KEY_RE = /^(.+)__((?:S\d+|T\d+(?:\.\d+)?))$/i;
+
+// ── Schema guard seam (M-S01 T04) ────────────────────────────────────────────
+// Lazy require, deliberately: forge-schema-guard → forge-migrate →
+// forge-projection → forge-memory is a top-level cycle (forge-migrate.js:33,
+// forge-projection.js:34) — this file already resolves forge-projection lazily
+// for the same reason (see queryRelevant below). The `catch` keeps this file
+// loadable if the guard is not colocated (installed layouts).
+//
+// SINGLE INSERTION POINT PER SIDE:
+//   read  → guardReadHere() at the top of listFragments/readFragment/queryRelevant
+//   write → assertWriteHere() at the top of writeFragment
+// queryRelevant is the MODULE boundary the guard exists for: forge-prompt.js
+// calls it directly, never through this CLI, so a cliMain-only guard would miss
+// the hot render path entirely.
+// Only an ABSENT guard module is swallowed. A guard that exists but throws
+// while initializing — or whose own transitive require fails (the guard pulls
+// forge-migrate, which eagerly pulls projection/migrators/store-state/doctor)
+// — is a real fault and must propagate rather than silently disabling both the
+// read warning and the write refusal.
+//
+// SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
+// only — it is about LOADING the guard, not about what the guard decides.
+// The seam stays FAIL-OPEN on an unexpected runtime error raised inside the
+// guard's own check (see the catch in assertWrite, forge-schema-guard.js).
+// It is NOT fail-open on a stamp the guard could not READ: that case refuses
+// the write, naming the errno. This note used to say the fail-open of
+// assertWrite had been reviewed and kept as is — the PR #70 dogfood revised
+// that decision: a directory at .gsd/SCHEMA-VERSION disabled the write guard
+// silently, so "unreadable" now closes, while "absent" and "present but
+// garbage" stay open.
+function schemaGuard() {
+  try {
+    return require('./forge-schema-guard');
+  } catch (err) {
+    let absent;
+    try {
+      absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-schema-guard');
+    } catch (_) {
+      // Classifier itself missing (partial install) → keep the historical
+      // fail-open instead of crashing the store.
+      absent = true;
+    }
+    if (absent) return null;
+    throw err;
+  }
+}
+
+// Fail-open read guard: returns { ok, partial, warning } and emits the warning
+// to stderr at most once per process per cwd. Never throws, never blocks.
+function guardReadHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return { ok: true, partial: false, warning: null };
+  return guard.guardReadAndWarn(cwd || process.cwd());
+}
+
+// Write refusal: throws when the on-disk schema major is AHEAD of this
+// tooling's. The CLI catch blocks turn that into stderr + exit 1.
+function assertWriteHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return;
+  guard.assertWriteOrThrow(cwd || process.cwd());
+}
 
 function isWithin(root, candidate) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
@@ -598,6 +662,9 @@ function serializeFrontmatter(fragment) {
 // created: false if content is identical after merge.
 function writeFragment(cwd, fragment, opts) {
   opts = opts || {};
+  // Refuse before validation, lock acquisition or merge — nothing reaches disk
+  // and no lock is taken on a write that is going to be refused anyway.
+  assertWriteHere(cwd);
   if (!fragment || !fragment.unit_id) {
     throw new Error('fragment.unit_id is required');
   }
@@ -666,6 +733,7 @@ function writeFragment(cwd, fragment, opts) {
 // ── readFragment ──────────────────────────────────────────────────────────────
 // Reads and parses a MEMORY fragment. Returns null if the file does not exist.
 function readFragment(cwd, unitId, opts) {
+  guardReadHere(cwd);
   let fpath;
   try {
     fpath = fragmentPath(cwd, unitId, opts);
@@ -673,14 +741,32 @@ function readFragment(cwd, unitId, opts) {
     throw e; // propagate invalid id error
   }
 
-  if (!fs.existsSync(fpath)) return null;
-  assertMemoryDirectory(cwd, false);
-  const targetStat = fs.lstatSync(fpath);
-  if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
-    throw new Error(`Refusing to read non-regular memory fragment: ${fpath}`);
+  if (fs.existsSync(fpath)) {
+    assertMemoryDirectory(cwd, false);
+    const targetStat = fs.lstatSync(fpath);
+    if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+      throw new Error(`Refusing to read non-regular memory fragment: ${fpath}`);
+    }
+    return parseFragment(fs.readFileSync(fpath, 'utf8'));
   }
-  const text = fs.readFileSync(fpath, 'utf8');
-  return parseFragment(text);
+
+  // A grouped container has no per-unit path.  Find its expanded envelope only
+  // after the ordinary loose-file lookup so a newly written loose fragment wins.
+  const storageKey = qualifiedStorageKey(unitId, milestoneFromOptions(opts));
+  const entry = listFragments(cwd, opts).find(item => item.storageKey === storageKey);
+  return entry ? parseFragment(readFragmentText(cwd, entry)) : null;
+}
+
+// Reads the payload represented by one listFragments() envelope. Grouped
+// envelopes all point at the physical container, so reading entry.path directly
+// would incorrectly return every member rather than this unit.
+function readFragmentText(cwd, entry) {
+  if (!entry || !entry.path) throw new Error('memory fragment entry is required');
+  if (!entry.grouped) return fs.readFileSync(entry.path, 'utf8');
+  const parsed = readGroupedUnits(entry.path);
+  const unit = parsed.units.find(item => item.id === entry.storageKey);
+  if (!unit) throw new Error(`Grouped memory unit not found: ${entry.storageKey}`);
+  return unitTextOf(unit.content);
 }
 
 // ── listFragments ─────────────────────────────────────────────────────────────
@@ -688,6 +774,7 @@ function readFragment(cwd, unitId, opts) {
 // Returns Array<{ storageKey, unitId, milestoneId, path }> sorted by storageKey.
 // Returns [] if the directory does not exist.
 function listFragments(cwd, opts) {
+  guardReadHere(cwd);
   const dir = assertMemoryDirectory(cwd, false);
   if (!dir) return [];
 
@@ -696,25 +783,68 @@ function listFragments(cwd, opts) {
     throw new Error(`Invalid memory milestone ID: "${milestoneId}"`);
   }
 
-  const fragments = fs.readdirSync(dir, { withFileTypes: true })
-    .filter(entry => {
-      if (!entry.isFile() || !entry.name.endsWith('.md')) return false;
-      const parsed = parseStorageKey(entry.name.slice(0, -3));
-      return parsed && (!milestoneId || parsed.milestoneId === milestoneId);
-    })
-    .map(entry => ({
-      ...parseStorageKey(entry.name.slice(0, -3)),
-      path: path.join(dir, entry.name),
-    }))
-    .sort((a, b) => a.storageKey.localeCompare(b.storageKey));
+  const files = fs.readdirSync(dir, { withFileTypes: true })
+    .filter(entry => entry.isFile() && entry.name.endsWith('.md'));
+  const looseKeys = new Set();
+  const fragments = [];
 
-  return fragments;
+  for (const file of files) {
+    const filePath = path.join(dir, file.name);
+    // A failed sniff (null) means "not classified as a container": the entry is
+    // still returned and the read error stays with the consumer, one unit at a
+    // time, as it did before grouping existed. See readSniffBuffer.
+    const buffer = readSniffBuffer(filePath);
+    // Unreadable AND epoch-shaped: pushing it as a loose fragment named
+    // `2026-Q1` would make every unit inside it vanish with nothing on stderr.
+    if (buffer === null && isGroupedFile(file.name)) {
+      process.stderr.write(`[forge-memory] warn: container ${file.name}: container-unreadable — unidades não listadas\n`);
+      continue;
+    }
+    if (buffer !== null && isGroupedFile(file.name, buffer)) continue;
+    const parsed = parseStorageKey(file.name.slice(0, -3));
+    if (!parsed) continue;
+    looseKeys.add(parsed.storageKey);
+    fragments.push({ ...parsed, path: filePath, grouped: false, epoch: null });
+  }
+
+  for (const file of files) {
+    const filePath = path.join(dir, file.name);
+    const buffer = readSniffBuffer(filePath);
+    if (buffer === null || !isGroupedFile(file.name, buffer)) continue;
+    const grouped = readGroupedUnits(filePath);
+    for (const error of grouped.errors) {
+      process.stderr.write(`[forge-memory] warn: container ${file.name} id ${error.id || '<unknown>'}: ${error.reason}\n`);
+    }
+    for (const member of grouped.units) {
+      const parsed = parseStorageKey(member.id);
+      if (!parsed) {
+        process.stderr.write(`[forge-memory] warn: container ${file.name} id ${member.id}: invalid storage key; discarded\n`);
+        continue;
+      }
+      if (looseKeys.has(parsed.storageKey)) {
+        process.stderr.write(`[forge-memory] warn: unidade ${member.id} existe solta e em ${file.name} — usando a solta\n`);
+        continue;
+      }
+      fragments.push({ ...parsed, path: filePath, grouped: true, epoch: grouped.epoch });
+    }
+  }
+
+  const filtered = milestoneId
+    ? fragments.filter(fragment => fragment.milestoneId === milestoneId)
+    : fragments;
+  filtered.sort((a, b) => a.storageKey.localeCompare(b.storageKey));
+
+  return filtered;
 }
 
 // Trusted in-process selector seam consumed by forge-prompt.js.  The lazy
 // require avoids the forge-memory <-> forge-projection module cycle.
 function queryRelevant(query) {
   if (!query || typeof query !== 'object') throw new Error('memory query must be an object');
+  // Module-boundary guard (forge-prompt.js:306 calls this directly). The
+  // delegate below guards too; the dedupe Set in forge-schema-guard collapses
+  // both into a single stderr emission per cwd.
+  guardReadHere(query.cwd || process.cwd());
   const { queryMemoryEntries } = require('./forge-projection');
   return queryMemoryEntries(query.cwd || process.cwd(), {
     unitType: query.unitType,
@@ -735,10 +865,12 @@ module.exports = {
   parseFragment,
   writeFragment,
   readFragment,
+  readFragmentText,
   listFragments,
   validateUnitId,
   validateMilestoneId,
   queryRelevant,
+  ASK_ID_RE,
 };
 
 // ── cliMain ───────────────────────────────────────────────────────────────────
@@ -812,7 +944,15 @@ function cliMain(argv) {
   }
 
   if (cmd === '--list') {
-    const result = listFragments(cwd, { milestoneId });
+    // Bare JSON ARRAY — data, not an envelope, and the one array output with
+    // live consumers (skills/forge-auto, forge-next, forge-sweep iterate it).
+    // No schema_partial key: the partial signal travels on stderr only,
+    // emitted inside listFragments. --query/--select DO carry the fields.
+    // Projected through publicEntry for the same reason as forge-ledger.js:
+    // rich library entries, frozen CLI row keys, one shared projection. The
+    // removal-based projection matters most here — this store's stable keys
+    // come from parseStorageKey, so a whitelist would drop them.
+    const result = listFragments(cwd, { milestoneId }).map(publicEntry);
     console.log(JSON.stringify(result));
     process.exit(0);
   }

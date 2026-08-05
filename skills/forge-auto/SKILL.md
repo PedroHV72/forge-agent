@@ -35,7 +35,24 @@ else
   FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
 fi
 echo "FORGE_SCRIPTS_DIR=$FORGE_SCRIPTS_DIR"
+
+# Same resolution for the shared reference specs. The installer FLATTENS shared/*.md
+# into ~/.claude/ (no ~/.claude/shared/ dir exists), so a bare relative `shared/X.md`
+# resolves only inside the forge-agent repo itself — in every consumer project it is
+# a dead path. Without this, following a spec is a per-session guess.
+if [ -f "shared/forge-review.md" ]; then
+  FORGE_SHARED_DIR="shared"
+else
+  FORGE_SHARED_DIR="$HOME/.claude"
+fi
+echo "FORGE_SHARED_DIR=$FORGE_SHARED_DIR"
 ```
+
+**Path convention — binding for the whole skill.** Every reference below written as
+`shared/<name>.md` MUST be read from `$FORGE_SHARED_DIR/<name>.md`. `shared/` in prose is
+the canonical *name* of the spec, never a literal path to open. A spec you could not open
+is a hard stop for the step that needs it — never a cue to improvise the procedure from
+memory. Same rule for `scripts/<name>.js` → `$FORGE_SCRIPTS_DIR/<name>.js`.
 
 **Se CLAUDE.md não existe:** Stop. Tell the user:
 > Projeto não inicializado. Execute `/forge-init` primeiro — isso cria o `CLAUDE.md` que restaura o contexto automaticamente ao reabrir o chat.

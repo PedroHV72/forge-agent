@@ -143,6 +143,11 @@ function nextSequentialTaskId(existingIds) {
 }
 
 // ── classify ─────────────────────────────────────────────────────────────────
+// Timestamp prefixes are shared by classify, isValid, prefixGlob, and
+// timestampOf so ID recognition remains centralized in this module.
+const COMPACT_TIMESTAMP_RE = /^[MTI]-(\d{14})(-|$)/;
+const DASHED_TIMESTAMP_RE = /^(?:M|T|TASK)-(\d{8})-(\d{6})(-|$)/i;
+
 // Returns 'timestamp' for new-style IDs, 'legacy' otherwise.
 // Conservative default: unknown patterns classified as 'legacy' so S02 can
 // handle errors via isValid() rather than crashing on unexpected input.
@@ -151,11 +156,11 @@ function classify(id) {
   const s = String(id);
   // I- (item) participates in the compact form only — the dashed regex below
   // deliberately stays M|T|TASK.
-  if (/^[MTI]-\d{14}(-|$)/.test(s)) return 'timestamp';
+  if (COMPACT_TIMESTAMP_RE.test(s)) return 'timestamp';
   // Dashed timestamp form: M-YYYYMMDD-HHMMSS / T-… / TASK-… (date and time
   // separated by a hyphen). Observed in the wild alongside the compact 14-digit
   // form — both encode a creation timestamp, so both classify as 'timestamp'.
-  if (/^(?:M|T|TASK)-\d{8}-\d{6}(-|$)/i.test(s)) return 'timestamp';
+  if (DASHED_TIMESTAMP_RE.test(s)) return 'timestamp';
   // Legacy patterns: M005, M123, TASK-001, task-fix-foo, etc.
   if (/^M\d+$/i.test(s)) return 'legacy';
   if (/^TASK-\d+$/i.test(s)) return 'legacy';
@@ -181,6 +186,17 @@ function isValid(id) {
   if (/^TASK-\d+$/i.test(s)) return true;
   if (/^task-[a-z0-9-]+$/.test(s)) return true;
   return false;
+}
+
+// Return the creation timestamp encoded by a recognized timestamp ID.
+// Legacy sequential IDs intentionally have no timestamp and return null.
+function timestampOf(id) {
+  if (typeof id !== 'string') return null;
+  let match = id.match(COMPACT_TIMESTAMP_RE);
+  if (match) return match[1];
+  match = id.match(DASHED_TIMESTAMP_RE);
+  if (match) return `${match[1]}${match[2]}`;
+  return null;
 }
 
 // ── prefixGlob ───────────────────────────────────────────────────────────────
@@ -235,7 +251,36 @@ function listExistingIds(cwd, kind) {
     : [path.join(cwd, '.gsd', 'tasks')];
   const out = [];
   for (const d of dirs) {
-    try { out.push(...fs.readdirSync(d)); } catch { /* dir absent — skip */ }
+    try {
+      const entries = fs.readdirSync(d, { withFileTypes: true });
+      out.push(...entries.map(entry => entry.name));
+      // Grouped containers are an optional storage detail.  Keep this reader
+      // local and fail-open: creation must retain loose IDs even when one
+      // container or its format module is unavailable/corrupt.  The try is PER
+      // FILE — wrapping the whole loop meant a throw on container k dropped the
+      // ids of k+1..n, and under ids.format: sequential a dropped id gets
+      // re-minted over a live unit.
+      for (const entry of entries) {
+        try {
+          if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+          const grouped = require('./forge-grouped-file');
+          const filePath = path.join(d, entry.name);
+          const sniff = grouped.readSniffBuffer(filePath);
+          // An unreadable file is not a container.  Passing null through would
+          // fall back to the filename heuristic, classify `2026-Q1.md` as one,
+          // and make readGroupedUnits throw on that very file.
+          if (sniff === null) continue;
+          if (!grouped.isGroupedFile(entry.name, sniff)) continue;
+          const parsed = grouped.readGroupedUnits(filePath);
+          if (parsed.errors.length) continue;
+          for (const unit of parsed.units) {
+            // Wrapper markers use dir~filename; ordinary members are plain IDs.
+            const marker = String(unit.id || '');
+            out.push(marker.includes('~') ? marker.slice(0, marker.indexOf('~')) : marker);
+          }
+        } catch { /* one bad container never drops the remaining files */ }
+      }
+    } catch { /* directory absent or unreadable — preserve loose behavior */ }
   }
   return out;
 }
@@ -269,11 +314,13 @@ module.exports = {
   nextSequentialTaskId,
   classify,
   isValid,
+  timestampOf,
   prefixGlob,
   entityKind,
   readIdFormat,
   resolveMilestoneId,
   resolveTaskId,
+  listExistingIds,
 };
 
 // ── CLI ──────────────────────────────────────────────────────────────────────

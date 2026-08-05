@@ -9,6 +9,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, 'forge-tokens.js');
+const { truncateAtSectionBoundary } = require('./forge-tokens.js');
 let passed = 0;
 let failed = 0;
 
@@ -111,6 +112,158 @@ test('stdin mode retains the structured JSON contract', () => {
     chars: 11,
     method: 'heuristic',
   });
+});
+
+// ── truncateAtSectionBoundary(content, budgetChars, opts) — marker + budget ceiling ──
+
+function multiSectionContent(n) {
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    out += `## Section ${i}\ncontent for section ${i} with some padding text here\n`;
+  }
+  return out;
+}
+
+test('with opts.source, marker names the source pointer', () => {
+  const content = multiSectionContent(20);
+  const result = truncateAtSectionBoundary(content, 200, { source: '.gsd/CODING-STANDARDS.md § Lint' });
+  assert.match(result, /\[\.\.\.truncated \d+ sections — see \.gsd\/CODING-STANDARDS\.md § Lint\]$/);
+});
+
+test('without opts.source, marker is byte-identical to the historical format', () => {
+  const content = multiSectionContent(20);
+  const result = truncateAtSectionBoundary(content, 200);
+  assert.match(result, /\n\n\[\.\.\.truncated \d+ sections\]$/);
+  // The exact literal string the self-test and legacy prefix-based callers depend on.
+  const droppedMatch = result.match(/\[\.\.\.truncated (\d+) sections\]$/);
+  assert.ok(droppedMatch, 'marker must match legacy literal shape');
+});
+
+test('result never exceeds budgetChars across a sweep of small budgets, with and without source', () => {
+  const content = multiSectionContent(30);
+  const budgets = [10, 20, 40, 80];
+  const sources = [undefined, '.gsd/CODING-STANDARDS.md § Somewhat Long Section Name'];
+  for (const budgetChars of budgets) {
+    for (const source of sources) {
+      const opts = source !== undefined ? { source } : undefined;
+      const result = truncateAtSectionBoundary(content, budgetChars, opts);
+      assert.ok(
+        result.length <= budgetChars,
+        `budget=${budgetChars} source=${source}: result.length=${result.length} exceeds budgetChars`
+      );
+    }
+  }
+});
+
+test('an absurdly long opts.source never blows the budget', () => {
+  const content = multiSectionContent(10);
+  const absurdSource = 'x'.repeat(5000);
+  const result = truncateAtSectionBoundary(content, 100, { source: absurdSource });
+  assert.ok(result.length <= 100, `result.length=${result.length} exceeds budget 100`);
+});
+
+test('opts.mandatory still throws with the same message, before any marker calculation', () => {
+  assert.throws(
+    () => truncateAtSectionBoundary('x'.repeat(1000), 100, { mandatory: true, label: 'test-label' }),
+    /Context budget exceeded for mandatory section test-label/
+  );
+});
+
+test('opts.mandatory throws even when opts.source is also present', () => {
+  assert.throws(
+    () => truncateAtSectionBoundary('x'.repeat(1000), 100, { mandatory: true, label: 'test-label', source: 'foo.md' }),
+    /Context budget exceeded for mandatory section test-label/
+  );
+});
+
+test('content that fits returns verbatim, unaffected by opts.source', () => {
+  const content = 'short content that fits easily';
+  const result = truncateAtSectionBoundary(content, 1000, { source: 'irrelevant.md' });
+  assert.strictEqual(result, content);
+});
+
+test('fallback mid-content branch (zero boundaries) also respects opts.source and the budget ceiling', () => {
+  const content = 'a'.repeat(500); // no "## " boundaries at all -> fallback branch
+  const result = truncateAtSectionBoundary(content, 60, { source: 'fallback-source.md' });
+  assert.ok(result.length <= 60, `result.length=${result.length} exceeds budget 60`);
+  assert.match(result, /\[\.\.\.truncated 1 sections/);
+});
+
+// R3 (review-fix S01): a budget smaller than the shortest marker must degrade to
+// the silent ellipsis. Slicing the marker produced `[...tru` — an unterminated
+// fragment that violates the `[...truncated ` prefix contract in
+// shared/forge-dispatch.md § Truncation markers.
+test('tiny budgets never emit a partial truncation marker (with and without opts.source)', () => {
+  const withBoundaries = '## A\n' + 'a'.repeat(200) + '\n## B\n' + 'b'.repeat(200);
+  const noBoundaries = 'a'.repeat(500);
+  for (const content of [withBoundaries, noBoundaries]) {
+    for (const opts of [{}, { source: 'some/long/source/path.md' }]) {
+      for (let budget = 0; budget <= 28; budget++) {
+        const result = truncateAtSectionBoundary(content, budget, opts);
+        assert.ok(result.length <= budget, `budget=${budget} exceeded: got ${result.length}`);
+        const idx = result.indexOf('[...tru');
+        if (idx !== -1) {
+          assert.ok(
+            /\[\.\.\.truncated \d+ sections( — see [^\]]*)?\]/.test(result),
+            `budget=${budget} source=${!!opts.source} emitted an unterminated marker: ${JSON.stringify(result)}`
+          );
+        } else {
+          assert.ok(
+            result === '' || result === '…',
+            `budget=${budget} should degrade to '' or '…', got ${JSON.stringify(result)}`
+          );
+        }
+      }
+    }
+  }
+});
+
+test('budget 0 yields the empty string, budget 1 yields the ellipsis', () => {
+  const content = 'a'.repeat(500);
+  assert.strictEqual(truncateAtSectionBoundary(content, 0, {}), '');
+  assert.strictEqual(truncateAtSectionBoundary(content, 1, { source: 'x.md' }), '…');
+});
+
+
+// R2 (review-triage): the greedy section pass must reserve for the marker regime
+// that is actually emitted. Reserving for a long source-bearing marker cost whole
+// sections that fit — and could force the mid-content fallback for nothing.
+test('a long opts.source no longer costs whole sections', () => {
+  const SECTION_LEN = 50;
+  const N = 10;
+  let content = '';
+  for (let i = 0; i < N; i++) {
+    const head = '## S' + i + '\n';
+    content += head + 'x'.repeat(SECTION_LEN - head.length - 1) + '\n';
+  }
+  const BUDGET = 400;
+  const longSource = '.gsd/milestones/M-20260101000000-a-rather-long-milestone-id/slices/S01/' + 'p'.repeat(130) + '.md';
+  assert.ok(longSource.length > 150);
+
+  const countSections = (t) => (t.match(/^## S/gm) || []).length;
+
+  const withSource = truncateAtSectionBoundary(content, BUDGET, { source: longSource });
+  const noSource = truncateAtSectionBoundary(content, BUDGET, {});
+
+  // Invariant: never exceed the budget.
+  assert.ok(withSource.length <= BUDGET, `exceeded budget: ${withSource.length}`);
+
+  // The emitted marker regime is the source-less one here, so the retained
+  // section count must match the no-source call exactly.
+  assert.strictEqual(countSections(withSource), countSections(noSource));
+
+  // Strictly better than reserving for the source-bearing marker (old behaviour).
+  const oldReserve = ('\n\n[...truncated ' + N + ' sections — see ' + longSource + ']').length;
+  let running = 0;
+  let oldKept = 0;
+  for (let i = 0; i < N; i++) {
+    if (running + SECTION_LEN + oldReserve > BUDGET && oldKept > 0) break;
+    running += SECTION_LEN;
+    oldKept++;
+    if (running >= BUDGET) break;
+  }
+  assert.ok(countSections(withSource) > oldKept,
+    `expected more than ${oldKept} retained sections, got ${countSections(withSource)}`);
 });
 
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
