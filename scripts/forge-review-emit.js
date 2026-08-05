@@ -38,10 +38,12 @@
  * A Claude challenging Claude-authored code defended by Claude IS the collapse,
  * whether or not the author shares the room.
  *
- * `author_engine` is therefore recorded, not just consumed: a reader that
- * cannot see the author cannot recompute the flag, and cannot tell the two
- * collapse shapes apart (debaters agreeing across the author's family vs.
- * everyone in the author's family). Both are `true`; the field says which.
+ * `author_engine` is therefore recorded, not just consumed. The flag itself is
+ * recomputable without it — challenger and advocate are both in the row — but
+ * WHICH collapse it found is not: debaters agreeing on a family that is not the
+ * author's (the M134/S02 shape) reads identically to everyone, author included,
+ * sitting in one family (the default shape). Both are `true`; this field is what
+ * separates them.
  *
  * CLI:
  *   node forge-review-emit.js --cwd <dir> --milestone <id> --slice <id>
@@ -171,11 +173,15 @@ function buildReviewEvent(opts) {
     );
   }
 
-  // Required, not optional. The flag below is derived from this value, and a
-  // family that resolves to null would fold into `false` — the emitter writing
-  // "no collapse" for a question it could not ask. Refusing is the only honest
-  // answer available, and it is the same posture the rest of the pipeline takes
-  // toward an unanswerable probe.
+  // Required — but NOT because the flag depends on it. It does not: the
+  // derivation below compares challenger to advocate, and both are in the row.
+  // What this value decides is which collapse the row describes, and a row that
+  // cannot answer that is the incomplete row this emitter exists to stop
+  // shipping (265 events, 151 key shapes, none aggregatable). That is a weaker
+  // reason than "otherwise we derive a wrong boolean" — which is what it was
+  // before the author clause left the formula — and it is the honest one. The
+  // cost of exit 2 is a re-run with the flag added, which Step 8 already
+  // prescribes over appending a hand-built line.
   const rawAuthorEngine =
     typeof options.authorEngine === 'string' ? options.authorEngine.trim() : '';
   const authorEngine = rawAuthorEngine.toLowerCase();
@@ -183,7 +189,7 @@ function buildReviewEvent(opts) {
   if (rawAuthorEngine === '') {
     errors.push(
       '--author-engine is required (claude|codex|gemini) — ' +
-        'intra_family_debate cannot be derived without it'
+        'the row must record who wrote the code under review'
     );
   } else if (authorFamily === null) {
     errors.push(

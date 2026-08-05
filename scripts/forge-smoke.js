@@ -2498,9 +2498,45 @@ function smokeChallengerWiring() {
   // The derivation must not excuse the shipped default (claude author, claude
   // challenger, claude advocate) as "not a collapse" — that clause would pin the
   // flag at false on every default-configured review, which is the silence the
-  // emitter was built to end. And the author has to be IN the row: a reader who
-  // cannot see it cannot recompute the flag it was derived from.
+  // emitter was built to end. And the author has to be IN the row: the flag is
+  // recomputable without it, but WHICH collapse it found is not.
   assert(spec.includes('"author_engine"'), 'spec Step 8 event carries author_engine', 'token \'"author_engine"\' not found');
+  // ── One predicate, two evaluations — they may not drift ──────────────────
+  // $INTRA_FAMILY (Step 0 bash) renders the Step 6 header and gates
+  // § Adversarialidade reduzida; the emitter writes intra_family_debate to the
+  // log. They are two evaluations of ONE rule. When the emitter dropped the
+  // author clause and the bash kept it, the log announced a collapse that the
+  // page a human reads denied — worse than being wrong in one place, because
+  // each artifact corroborates a different answer.
+  const intraBash = (spec.match(/^if \[ "\$ADVOCATE_FAMILY".*INTRA_FAMILY=true.*$/m) || [''])[0];
+  const authorFreeRule = (line) =>
+    line.includes('$ADVOCATE_FAMILY') &&
+    line.includes('$CHALLENGER_FAMILY') &&
+    !/AUTHOR/.test(line);
+  assert(intraBash !== '', 'spec Step 0 still sets INTRA_FAMILY from a family comparison', 'the INTRA_FAMILY bash line was not found — the guard below cannot bite');
+  assert(
+    authorFreeRule(intraBash),
+    'spec Step 0 INTRA_FAMILY matches the emitter: no author clause',
+    `bash rule still weighs the author, so the artifact and the log disagree: ${intraBash}`
+  );
+  // Positive control: the predicate must reject the clause it was written to
+  // catch, or it is a guard that passes because it cannot see.
+  assert(
+    !authorFreeRule('if [ "$ADVOCATE_FAMILY" = "$CHALLENGER_FAMILY" ] && [ "$ADVOCATE_FAMILY" != "$AUTHOR_FAMILY" ]; then INTRA_FAMILY=true; fi'),
+    'the drift guard bites the pre-fix rule',
+    'the guard accepts the author clause it exists to reject'
+  );
+  // And the emitter's side of that same rule, behaviourally: the shipped
+  // default (claude author, claude challenger, claude advocate) is a collapse.
+  const { buildReviewEvent: emitRow } = require('./forge-review-emit.js');
+  assert(
+    emitRow({
+      milestone: 'M1', slice: 'S1', authorEngine: 'claude',
+      challenger: 'claude', advocate: 'fable',
+    }).event.intra_family_debate === true,
+    'emitter flags the shipped all-claude default as intra-family',
+    'the emitter and the Step 0 bash would disagree on the most common configuration'
+  );
   assert(
     /`--author-engine` is required/.test(spec),
     'spec Step 8 requires --author-engine',
