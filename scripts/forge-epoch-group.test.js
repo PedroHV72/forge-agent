@@ -16,6 +16,7 @@ const os = require('os');
 const path = require('path');
 const group = require('./forge-epoch-group');
 const journal = require('./forge-sweep-journal');
+const { serializeGroup } = require('./forge-grouped-file');
 
 let passed = 0;
 let failed = 0;
@@ -47,6 +48,19 @@ function ledgerFragment(id, date, body) {
 
 function decisionFragment(id, when) {
   return `---\nunit_id: ${id}\ndecisions:\n  - when: ${when}\n    scope: test\n    decision: group\n    choice: yes\n    rationale: test\n    revisable: false\n---\n`;
+}
+
+// Seeds ledger proof (a) for each id via an ALREADY-GROUPED container. A
+// LOOSE ledger fragment for the same id would also make plan()'s ledger-store
+// loop treat it as its own independently-groupable member — an extra target
+// (or an extra member inside the ledger target) that wrapper/store fixtures
+// below do not expect, since plan() skips an already-grouped file outright
+// ('já agrupado') instead of listing it as loose. The filename deliberately
+// does not match sweep-project-NN so it never perturbs nextSweepNumber().
+function seedLedgerProof(cwd, ids) {
+  const units = ids.map(id => ({ id, content: Buffer.from(ledgerFragment(id, '2026-01-01'), 'utf8') }));
+  const serialized = serializeGroup({ label: 'sweep-project-00', units });
+  write(cwd, '.gsd/ledger/seed-closure-proof.md', serialized.buffer);
 }
 
 function memoryFragment(id, date) {
@@ -94,6 +108,12 @@ test('precision: a member with no proof at all is skipped by name, even surround
     write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-01'));
     write(cwd, '.gsd/memory/T-20260102000000-two.md', memoryFragment('T-20260102000000-two', '2026-01-02'));
     write(cwd, '.gsd/memory/T-20260103000000-three.md', memoryFragment('T-20260103000000-three', '2026-01-03'));
+    // A memory-store id's own timestamp is creation, not closure (proof (b)
+    // narrowing) — each of the three eligible members needs a real ledger
+    // entry (proof a) naming its owning task id to be groupable.
+    write(cwd, '.gsd/ledger/T-20260101000000-one.md', ledgerFragment('T-20260101000000-one', '2026-01-01'));
+    write(cwd, '.gsd/ledger/T-20260102000000-two.md', ledgerFragment('T-20260102000000-two', '2026-01-02'));
+    write(cwd, '.gsd/ledger/T-20260103000000-three.md', ledgerFragment('T-20260103000000-three', '2026-01-03'));
     // A bare local unit id, per the B1 finding: it passes parseStorageKey
     // (so it is NOT extinct), has no timestamp in the id, and the ledger
     // store (untouched in this fixture) has no entry naming it — no proof
@@ -119,6 +139,11 @@ test('legacy-orphan is skipped in all three stores by the shared proof module (D
     write(cwd, '.gsd/decisions/T-20260101000000-one.md', decisionFragment('T-20260101000000-one', '2026-01-02'));
     write(cwd, '.gsd/memory/legacy-orphan.md', '<!-- gsd-auto-memory mem_id:MEM001 -->\n');
     write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-03'));
+    // The task-shaped id's own timestamp is creation, not closure — give it a
+    // real ledger entry (proof a) so the decisions/memory members are
+    // groupable on the honest proof, independent of the legacy-orphan guard
+    // this test is actually about.
+    write(cwd, '.gsd/ledger/T-20260101000000-one.md', ledgerFragment('T-20260101000000-one', '2026-01-02'));
     const planned = group.plan(cwd);
     const orphanSkips = planned.skipped.filter(item => /legacy-orphan\.md$/.test(item.path));
     assert.equal(orphanSkips.length, 3, 'legacy-orphan is skipped in ledger, decisions, and memory');
@@ -150,6 +175,10 @@ test('NN is shared across every store the plan touches, and grows on the next sw
     write(cwd, '.gsd/ledger/M-20260101000000-a.md', ledgerFragment('M-20260101000000-a', '2026-01-01'));
     write(cwd, '.gsd/decisions/T-20260101000000-b.md', decisionFragment('T-20260101000000-b', '2026-01-01'));
     write(cwd, '.gsd/memory/T-20260101000000-c.md', memoryFragment('T-20260101000000-c', '2026-01-01'));
+    // Task-shaped ids b and c need their own ledger entries (proof a) — their
+    // embedded timestamp is creation time, not closure.
+    write(cwd, '.gsd/ledger/T-20260101000000-b.md', ledgerFragment('T-20260101000000-b', '2026-01-01'));
+    write(cwd, '.gsd/ledger/T-20260101000000-c.md', ledgerFragment('T-20260101000000-c', '2026-01-01'));
     const first = group.plan(cwd);
     assert.equal(first.targets.length, 3, 'ledger, decisions, and memory each produce one target');
     const labels = new Set(first.targets.map(target => target.label));
@@ -380,8 +409,15 @@ test('the default plan gates wrapper directories until explicitly enabled', () =
     write(cwd, '.gsd/ledger/M-20260101000000-one.md', ledgerFragment('M-20260101000000-one', '2026-01-01'));
     write(cwd, '.gsd/decisions/T-20260101000000-one.md', decisionFragment('T-20260101000000-one', '2026-01-02'));
     write(cwd, '.gsd/memory/T-20260101000000-one.md', memoryFragment('T-20260101000000-one', '2026-01-03'));
+    // T-20260101000000-one's own timestamp is creation, not closure — give it
+    // a real ledger entry (proof a) so decisions/memory still produce targets.
+    write(cwd, '.gsd/ledger/T-20260101000000-one.md', ledgerFragment('T-20260101000000-one', '2026-01-02'));
     write(cwd, '.gsd/milestones/M-20260101000000-old/PLAN.md', 'old milestone');
     write(cwd, '.gsd/tasks/T-20260101000000-old/PLAN.md', 'old task');
+    // Same narrowing applies to the wrapper dirs exercised later in this test
+    // (explicitlyEnabled) — they need ledger entries to be sealed.
+    write(cwd, '.gsd/ledger/M-20260101000000-old.md', ledgerFragment('M-20260101000000-old', '2026-01-01'));
+    write(cwd, '.gsd/ledger/T-20260101000000-old.md', ledgerFragment('T-20260101000000-old', '2026-01-01'));
 
     const planned = group.plan(cwd);
     assert(planned.targets.some(target => target.store === 'ledger'));
@@ -413,6 +449,17 @@ test('wrapper dirs plan only structurally eligible AND sealed milestone/task dir
     write(cwd, '.gsd/milestones/M-20260101000000-a/PLAN.md', 'a');
     write(cwd, '.gsd/milestones/M-20260102000000-b/PLAN.md', 'b');
     write(cwd, '.gsd/tasks/T-20260103000000-c/PLAN.md', 'c');
+    // The wrapper's own embedded timestamp is creation, not closure — each
+    // structurally-eligible wrapper needs a real ledger entry (proof a) to
+    // also be sealed. M-20260104000000-two and M-20260105000000-nested are
+    // deliberately left without one: they are excluded on STRUCTURAL grounds
+    // (file count / nested subfolder) before sealedBy is ever consulted, so
+    // this test's proof-independence is preserved.
+    // Seeded already-grouped (not loose) so these entries only prove closure
+    // for the wrapper members — they must not also surface as their own
+    // ledger-store target/members, which would break the total-member count
+    // this test asserts below.
+    seedLedgerProof(cwd, ['M-20260101000000-a', 'M-20260102000000-b', 'T-20260103000000-c']);
     write(cwd, '.gsd/milestones/M-20260104000000-two/A.md', 'a');
     write(cwd, '.gsd/milestones/M-20260104000000-two/B.md', 'b');
     write(cwd, '.gsd/milestones/M-20260105000000-nested/PLAN.md', 'x');
@@ -433,6 +480,10 @@ test('wrapper apply is in-place, removes dirs, and never creates archive', () =>
   const cwd = tmp();
   try {
     const original = write(cwd, '.gsd/milestones/M-20260101000000-one/STATE.md', Buffer.from('bom\r\nconteúdo', 'utf8'));
+    // The wrapper's embedded timestamp is creation, not closure — a real
+    // ledger entry (proof a) is what makes it sealed. Seeded already-grouped
+    // so it does not also become a standalone ledger-store target here.
+    seedLedgerProof(cwd, ['M-20260101000000-one']);
     const planned = group.plan(cwd, { includeWrapperDirs: true });
     const result = group.apply(cwd, planned);
     assert.equal(result.written.length, 1);
@@ -451,6 +502,10 @@ test('wrapper ungroup restores original filename and bytes exactly', () => {
   try {
     const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x41, 0x0d, 0x0a, 0x42]);
     const source = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES-original.md', bytes);
+    // The wrapper's embedded timestamp is creation, not closure — a real
+    // ledger entry (proof a) is what makes it sealed. Seeded already-grouped
+    // so it does not also become its own ledger-store target here.
+    seedLedgerProof(cwd, ['T-20260101000000-one']);
     const plan = group.plan(cwd, { includeWrapperDirs: true });
     const applied = group.apply(cwd, plan);
     assert.equal(applied.written.length, 1);
@@ -483,6 +538,11 @@ test('skips only the non-.md wrapper and still groups its sibling', () => {
   try {
     const stray = write(cwd, '.gsd/tasks/T-20260102000000-two/notes.txt', 'not markdown');
     const groupable = write(cwd, '.gsd/tasks/T-20260101000000-one/PLAN.md', 'payload');
+    // T-20260102000000-two is skipped for the non-.md reason regardless of
+    // proof, so it deliberately gets none; T-20260101000000-one needs a real
+    // ledger entry (proof a) to be the sibling that is groupable. Seeded
+    // already-grouped so it does not also become its own ledger-store target.
+    seedLedgerProof(cwd, ['T-20260101000000-one']);
     const planned = group.plan(cwd, { includeWrapperDirs: true });
     assert.equal(planned.targets.length, 1);
     assert.equal(planned.targets[0].members.length, 1);
@@ -569,6 +629,12 @@ test('B1 wrapper: ungroup is resumable after a partial failure and idempotent on
     const bytesTwo = Buffer.from('member two payload\r\n', 'utf8');
     const sourceOne = write(cwd, '.gsd/tasks/T-20260101000000-one/NOTES.md', bytesOne);
     const sourceTwo = write(cwd, '.gsd/tasks/T-20260102000000-two/NOTES.md', bytesTwo);
+    // Both wrappers' embedded timestamps are creation, not closure — real
+    // ledger entries (proof a) are what make them sealed. Seeded
+    // already-grouped so they do not also become their own ledger-store
+    // target/members, which the byte-identity round trip below does not
+    // touch either way (nothing here ever ungroups the seed container).
+    seedLedgerProof(cwd, ['T-20260101000000-one', 'T-20260102000000-two']);
     const preApplySnapshot = treeSnapshot(path.join(cwd, '.gsd'));
 
     const planned = group.plan(cwd, { includeWrapperDirs: true });

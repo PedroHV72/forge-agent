@@ -118,11 +118,31 @@ function writeWrappers(cwd) {
   }
 }
 
+// A milestone/task wrapper's own embedded timestamp is creation time, not
+// closure (forge-sweep-sealed.js closureDateInId narrowing) — a wrapper is
+// only sealed with a real ledger entry (proof a) naming its id. Seeded
+// already-grouped (not a loose `<id>.md`) so it proves closure for the
+// wrapper WITHOUT also becoming its own standalone member of the ledger
+// store's plan — plan() skips an already-grouped container outright ('já
+// agrupado') instead of listing it as loose, so alpha/beta (the fixture's
+// real ledger-store subjects) stay the only loose ledger members.
+function seedWrapperLedgerProof(cwd, ids) {
+  const dir = path.join(cwd, '.gsd', 'ledger');
+  fs.mkdirSync(dir, { recursive: true });
+  const units = ids.map(id => ({
+    id,
+    content: Buffer.from(['---', `id: ${id}`, 'completed_at: 2025-01-01T00:00:00Z', '---', '', `fragmento ${id}`].join('\n'), 'utf8'),
+  }));
+  const serialized = serializeGroup({ label: 'sweep-project-00', units });
+  fs.writeFileSync(path.join(dir, 'seed-wrapper-closure-proof.md'), serialized.buffer);
+}
+
 function fixture(withVcs) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-project-'));
   writeLedger(cwd, 'M-20250101000000-alpha', '2025-01-01T00:00:00Z');
   writeLedger(cwd, 'M-20250401000000-beta', '2025-04-01T00:00:00Z');
   writeWrappers(cwd);
+  seedWrapperLedgerProof(cwd, [...WRAPPER_IDS.milestones, ...WRAPPER_IDS.tasks]);
   if (withVcs) {
     git(cwd, ['init', '-q']);
     git(cwd, ['config', 'user.name', 'Forge Test']);
