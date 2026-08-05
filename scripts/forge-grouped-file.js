@@ -11,7 +11,14 @@ const { EPOCH_LABEL_RE } = require('./forge-epoch');
 const GROUP_FORMAT = 'forge-group@1';
 const PAYLOAD_DELIMITER = Buffer.from('<!-- forge:', 'ascii');
 const FRONTMATTER_END = Buffer.from('---\n\n', 'ascii');
-const UNIT_START_RE = /^<!-- forge:unit id=([^\s>]+) bytes=(\d+) -->\n/;
+// The `proof=` attribute is OPTIONAL and additive (review R1 triage, Guard A):
+// it persists sealedBy()'s admitting proof ('ledger' | 'id-date' | 'extinct-id')
+// per member, so a future audit can ask "which grouped units were admitted by
+// proof (c) extinct-id?" as a query instead of archaeology. A container written
+// before this field existed has no `proof=` token in its marker line — that is
+// not an error, it parses as `proof: null`, same as a container whose caller
+// simply never supplied one.
+const UNIT_START_RE = /^<!-- forge:unit id=([^\s>]+) bytes=(\d+)(?: proof=([^\s>]+))? -->\n/;
 
 // Container identity, sweep-generation era. The generator zero-pads the
 // counter to 2 digits (sweep-project-01 .. sweep-project-99); growing past
@@ -36,8 +43,9 @@ function hasPayloadDelimiter(content) {
 // one way read back mangled, markerEnd never matched, and parseGroup returned
 // zero units for the whole container. bytes= stays a BYTE count either way —
 // it is Buffer.length, never String.length.
-function markerStart(id, bytes) {
-  return Buffer.from(`<!-- forge:unit id=${id} bytes=${bytes} -->\n`, 'utf8');
+function markerStart(id, bytes, proof) {
+  const proofToken = typeof proof === 'string' && proof ? ` proof=${proof}` : '';
+  return Buffer.from(`<!-- forge:unit id=${id} bytes=${bytes}${proofToken} -->\n`, 'utf8');
 }
 
 function markerEnd(id) {
@@ -80,7 +88,14 @@ function serializeGroup({ label, epoch, dateRange, units } = {}) {
       skipped.push({ path: unit.path, reason: 'delimiter-in-payload' });
       continue;
     }
-    accepted.push({ id: unit.id, content });
+    // proof is informational, never identity: an unsafe/malformed proof value
+    // is dropped silently (falls back to no proof= token) rather than
+    // rejecting the whole member — the member's groupability was already
+    // decided by sealedBy() before this call; a bad proof string must not
+    // undo that.
+    const proof = typeof unit.proof === 'string' && unit.proof && !/[\s>]/.test(unit.proof)
+      ? unit.proof : null;
+    accepted.push({ id: unit.id, content, proof });
   }
 
   accepted.sort((left, right) => left.id.localeCompare(right.id, 'en'));
@@ -105,7 +120,7 @@ function serializeGroup({ label, epoch, dateRange, units } = {}) {
   ].join('\n');
   const pieces = [Buffer.from(header, 'utf8')];
   for (const unit of accepted) {
-    pieces.push(markerStart(unit.id, unit.content.length));
+    pieces.push(markerStart(unit.id, unit.content.length, unit.proof));
     pieces.push(unit.content);
     // This separator is outside bytes= and is deliberately emitted even when
     // the payload itself already ends with a newline.
@@ -145,7 +160,7 @@ function parseStartAt(buffer, offset) {
   const line = buffer.subarray(offset, end + 1).toString('utf8');
   const match = UNIT_START_RE.exec(line);
   if (!match) return null;
-  return { id: match[1], bytes: Number(match[2]), next: end + 1 };
+  return { id: match[1], bytes: Number(match[2]), proof: match[3] || null, next: end + 1 };
 }
 
 function parseGroup(value) {
@@ -192,7 +207,11 @@ function parseGroup(value) {
       errors.push({ id: start.id, reason: 'end-marker-mismatch' });
       break;
     }
-    units.push({ id: start.id, content: Buffer.from(buffer.subarray(start.next, payloadEnd)) });
+    units.push({
+      id: start.id,
+      content: Buffer.from(buffer.subarray(start.next, payloadEnd)),
+      proof: start.proof,
+    });
     offset = markerEndOffset;
   }
   // Every error branch above breaks, so a container damaged at member 3 of 40

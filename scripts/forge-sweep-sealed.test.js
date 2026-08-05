@@ -16,6 +16,7 @@ const {
 } = require('./forge-sweep-sealed');
 
 const ledger = require('./forge-ledger');
+const memory = require('./forge-memory');
 
 let passed = 0;
 let failed = 0;
@@ -145,6 +146,43 @@ test('isExtinctId: legacy-orphan sentinel is not treated as extinct by this help
   // not refuse it, so this helper alone reports false. Behaviour of the
   // COMBINED sealedBy() for legacy-orphan is covered separately below.
   assert.strictEqual(isExtinctId('legacy-orphan'), false);
+});
+
+// ── GRAMMAR PIN (review R1 triage, Guard B) ──────────────────────────────────
+// isExtinctId()'s entire proof rests on memory.parseStorageKey() being unable
+// to accept these specific shapes TODAY. It deliberately does NOT read a
+// frozen allowlist (that would defeat the point of consulting the LIVE
+// parser — see the module comment above isExtinctId) — so nothing else in
+// this suite fails if someone widens validateUnitId()/LOCAL_UNIT_ID_RE/
+// QUALIFIED_KEY_RE/ASK_ID_RE to accept one of them. This test exists
+// precisely to be the thing that fails, on purpose, the day that happens.
+//
+// If this test breaks because parseStorageKey() now accepts one of the ids
+// below: WIDENING THIS GRAMMAR MAKES IDS THAT WERE PREVIOUSLY EXTINCT
+// WRITABLE AGAIN. A unit id that isExtinctId() called "extinct" may already
+// be sitting inside a sweep-project-NN.md container, admitted by proof
+// `extinct-id` — Guard A (forge-grouped-file.js markerStart's `proof=`
+// attribute) persists that per member. Before landing the grammar change,
+// audit existing containers for members admitted by proof `extinct-id`:
+//
+//   node scripts/forge-grouped-file.js ...  # or, ad hoc:
+//   grep -RhoE '<!-- forge:unit id=[^ ]+ bytes=[0-9]+ proof=extinct-id -->' \
+//     .gsd/ledger .gsd/decisions .gsd/memory .gsd/milestones .gsd/tasks
+//
+// A widened grammar plus an already-grouped unit means the NEXT write to
+// that unit id goes to a fresh loose file instead of the grouped container —
+// and loose-wins-over-grouped (forge-memory.js:692-704, forge-epoch-group.js
+// restoreUnit) means the loose file silently shadows the grouped copy from
+// then on. Re-narrow isExtinctId (or add a migration) before proceeding.
+test('GRAMMAR PIN: parseStorageKey still refuses the exact shapes isExtinctId relies on', () => {
+  // Hyphenated legacy local key — no `__` qualifier, LOCAL_UNIT_ID_RE has no
+  // hyphen production, so this is refused both bare and as a qualified key.
+  assert.strictEqual(memory.parseStorageKey('S03-T02'), null);
+  // Same shape, decimal task variant.
+  assert.strictEqual(memory.parseStorageKey('T02-S01'), null);
+  // Garbage that is neither a milestone/task id, a local S##/T##, nor
+  // ask-<session>.
+  assert.strictEqual(memory.parseStorageKey('not-a-real-id-at-all-????'), null);
 });
 
 // ── sealedBy — the three proofs, in order ────────────────────────────────────

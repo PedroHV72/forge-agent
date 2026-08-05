@@ -216,7 +216,10 @@ function plan(cwd, opts = {}) {
         continue;
       }
       const derived = dateOfUnit({ id, dateHint, path: filePath });
-      loose.push({ id, path: filePath, date: dateOnly(derived.date) });
+      // proof (review R1 triage, Guard A) is carried from sealedBy()'s verdict
+      // all the way to serializeGroup, so the container itself records which
+      // of the three admitting proofs let this member group.
+      loose.push({ id, path: filePath, date: dateOnly(derived.date), proof: verdict.proof });
     }
 
     if (!loose.length) continue;
@@ -285,6 +288,7 @@ function plan(cwd, opts = {}) {
         wrapperPath,
         fileName: path.basename(filePath),
         date: dateOnly(derived.date),
+        proof: verdict.proof,
       });
     }
     if (!units.length) continue;
@@ -336,7 +340,14 @@ function apply(cwd, groupingPlan, opts = {}) {
         invalid = true;
         continue;
       }
-      try { units.push({ id: member.id, path: member.path, content: fs.readFileSync(member.path) }); }
+      try {
+        units.push({
+          id: member.id,
+          path: member.path,
+          content: fs.readFileSync(member.path),
+          proof: member.proof,
+        });
+      }
       catch (error) {
         warn(`cannot read ${member.path}: ${error.message}`);
         skip(skipped, member.path, 'falha de leitura');
