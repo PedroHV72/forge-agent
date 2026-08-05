@@ -56,6 +56,30 @@ function gitAvailable() {
   return spawnSync('git', ['--version'], { encoding: 'utf8', shell: false }).status === 0;
 }
 
+// R9 triage: gate cases below only exercise real behaviour when a git
+// binary is on the PATH. Without one, silently skipping those cases would
+// let the suite print "passed" having verified zero gate behaviour. The
+// escape hatch has to be explicit — FORGE_ALLOW_NO_GIT=1 — and the process
+// exit code has to say so when it is not set.
+const ALLOW_NO_GIT = process.env.FORGE_ALLOW_NO_GIT === '1';
+const GIT_OK = gitAvailable();
+if (!GIT_OK) {
+  if (ALLOW_NO_GIT) {
+    process.stderr.write(
+      'forge-sweep-project.test.js: git indisponível no PATH — FORGE_ALLOW_NO_GIT=1 setado, ' +
+      'pulando explicitamente os casos de gate que exigem git real (opt-out deliberado).\n'
+    );
+  } else {
+    process.stderr.write(
+      'forge-sweep-project.test.js: git indisponível no PATH — os casos de gate NÃO seriam ' +
+      'exercitados e a suíte passaria verde tendo verificado zero comportamento. Defina ' +
+      'FORGE_ALLOW_NO_GIT=1 para pular explicitamente este ambiente sem git; sem essa variável, ' +
+      'este é um erro de suíte (exit != 0).\n'
+    );
+    process.exitCode = 1;
+  }
+}
+
 function git(cwd, args) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8', shell: false });
   assert.strictEqual(result.status, 0, result.stderr || `git ${args.join(' ')} falhou`);
@@ -298,7 +322,7 @@ test('sem VCS, --force aplica e informa que prosseguiu forçado', () => {
   } finally { cleanup(cwd); }
 });
 
-if (gitAvailable()) {
+if (GIT_OK) {
   test('dry-run imprime prévia e pulados sem alterar bytes ou mtimes', () => {
     const cwd = fixture(true);
     try {
@@ -357,6 +381,30 @@ if (gitAvailable()) {
         'fixture vácua: o opt-in não produz alvo de invólucro');
     } finally { cleanup(cwd); }
   });
+
+  // R16 triage: with D11 closed, wrapper dirs used to vanish from the report
+  // entirely — no trace the gate ever ran. Both dry-run and --json must now
+  // carry an informative "protected" line naming a non-zero count (this
+  // fixture seeds 4 wrapper dirs via writeWrappers), and the gate must stay
+  // closed (still zero wrapper targets/stores in the plan).
+  test('R16: invólucros protegidos aparecem no relatório com o gate D11 fechado', () => {
+    const cwd = fixture(true);
+    try {
+      const dry = runScript(cwd, []);
+      assert.strictEqual(dry.status, 0, dry.stderr);
+      assert.match(dry.stdout, /4 invólucro\(s\) protegido\(s\)/);
+      assert.match(dry.stdout, /gate D11 fechado/);
+
+      const jsonResult = runScript(cwd, ['--json']);
+      assert.strictEqual(jsonResult.status, 0, jsonResult.stderr);
+      const payload = JSON.parse(jsonResult.stdout);
+      assert(payload.messages.some(line => /4 invólucro\(s\) protegido\(s\)/.test(line)));
+
+      // Non-vacuity + gate-still-closed: the same run must not have produced
+      // any wrapper target/store, proving the line is reporting, not opening.
+      assert(!payload.preview.operations[0].targets.some(target => /-wrappers$/.test(target.store)));
+    } finally { cleanup(cwd); }
+  });
 } else {
   skip('casos com repositório Git real');
 }
@@ -413,7 +461,7 @@ function blockJournal(cwd) {
   fs.writeFileSync(path.join(cwd, '.gsd', 'forge'), 'não é um diretório');
 }
 
-if (gitAvailable()) {
+if (GIT_OK) {
   test('R3: dry-run nomeia o basis tool-undo e --apply --yes sem --force escreve o container', () => {
     const cwd = fixtureIgnoredGsd();
     try {
@@ -493,7 +541,7 @@ function storeTreeSnapshot(cwd) {
   return rows.sort((a, b) => a.relative.localeCompare(b.relative));
 }
 
-if (gitAvailable()) {
+if (GIT_OK) {
   test('DEMO ROADMAP S08: aplica sem --force num .gsd/ ignorado e --undo produz árvore byte-idêntica', () => {
     const cwd = fixtureIgnoredGsd();
     try {
@@ -621,7 +669,7 @@ async function testOutcomeAppendFailureKeepsJournalRecordedTruthful() {
   // pattern as testVcsQueryFailureExitsOne) since spawnSync fixtures can't
   // inject a mid-run write failure timed after the intent but before the
   // outcome append.
-  if (!gitAvailable()) {
+  if (!GIT_OK) {
     skipped += 1;
     process.stdout.write('  - falha ao gravar outcome (apply-done) mantém journal.recorded truthful (git indisponível no PATH)\n');
     return;
@@ -785,6 +833,9 @@ testOutcomeAppendFailureKeepsJournalRecordedTruthful()
   .then(() => testListSurfacesUnreadableContainers())
   .then(() => {
     process.stdout.write(`forge-sweep-project: ${passed} passed, ${skipped} skipped\n`);
+    if (!GIT_OK) {
+      process.stdout.write(`forge-sweep-project: git gate ${ALLOW_NO_GIT ? 'opted out (FORGE_ALLOW_NO_GIT=1)' : 'FAILED — set FORGE_ALLOW_NO_GIT=1 to opt out explicitly'}\n`);
+    }
   }).catch(error => {
     process.stderr.write(`${error && error.stack ? error.stack : error}\n`);
     process.exitCode = 1;

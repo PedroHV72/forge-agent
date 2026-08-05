@@ -166,14 +166,24 @@ function askForConfirmation(promptText) {
   });
 }
 
-function statusLines(eligibility, options) {
+// R16 triage: the D11 gate (wrapper dirs excluded from this CLI's plan) is
+// closed by design — see buildRegistry above — but a closed gate that never
+// appears in the output is indistinguishable from one that silently broke.
+// This line is informative, not a warning: it proves the gate ran.
+function wrapperGateLine(cwd) {
+  const count = epochGroup.countProtectedWrapperDirs(cwd);
+  return `${count} invólucro(s) protegido(s) (gate D11 fechado — não incluído nesta varredura)`;
+}
+
+function statusLines(eligibility, options, cwd) {
+  const gateLine = wrapperGateLine(cwd);
   if (eligibility.vcs !== 'none') {
     // --force only relaxes the no-VCS refusal.  Saying so beats letting the
     // operator believe the flag took effect on a VCS-backed refusal.
-    return options && options.force ? [`--force ignorado: repositório sob ${eligibility.vcs}`] : [];
+    return (options && options.force ? [`--force ignorado: repositório sob ${eligibility.vcs}`] : []).concat(gateLine);
   }
-  if (eligibility.forced) return ['sem VCS — não há como desfazer', 'prosseguiu forçado'];
-  return ['sem VCS — não há como desfazer', '0 elegíveis'];
+  if (eligibility.forced) return ['sem VCS — não há como desfazer', 'prosseguiu forçado', gateLine];
+  return ['sem VCS — não há como desfazer', '0 elegíveis', gateLine];
 }
 
 /**
@@ -495,7 +505,7 @@ async function main(argv) {
     // identical tree-snapshot regressions (must-have 6).
     const eligibility = createEligibility(cwd, { force: options.force, toolUndo: { available: true } });
     const registry = buildRegistry();
-    const messages = statusLines(eligibility, options);
+    const messages = statusLines(eligibility, options, cwd);
 
     if (!options.apply) {
       const result = registry.run(ctx, { filter: eligibility.filter });

@@ -38,6 +38,30 @@ function gitAvailable() {
   return result.status === 0;
 }
 
+// R9 triage: gate cases below only exercise real behaviour when a git
+// binary is on the PATH. Without one, silently skipping those cases would
+// let the suite print "passed" having verified zero gate behaviour. The
+// escape hatch has to be explicit — FORGE_ALLOW_NO_GIT=1 — and the process
+// exit code has to say so when it is not set.
+const ALLOW_NO_GIT = process.env.FORGE_ALLOW_NO_GIT === '1';
+const GIT_OK = gitAvailable();
+if (!GIT_OK) {
+  if (ALLOW_NO_GIT) {
+    process.stderr.write(
+      'forge-sweep-eligibility.test.js: git indisponível no PATH — FORGE_ALLOW_NO_GIT=1 setado, ' +
+      'pulando explicitamente os casos de gate que exigem git real (opt-out deliberado).\n'
+    );
+  } else {
+    process.stderr.write(
+      'forge-sweep-eligibility.test.js: git indisponível no PATH — os casos de gate NÃO seriam ' +
+      'exercitados e a suíte passaria verde tendo verificado zero comportamento. Defina ' +
+      'FORGE_ALLOW_NO_GIT=1 para pular explicitamente este ambiente sem git; sem essa variável, ' +
+      'este é um erro de suíte (exit != 0).\n'
+    );
+    process.exitCode = 1;
+  }
+}
+
 function fileHash(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
@@ -181,7 +205,7 @@ test('ancestral não versionado ou ignorado recusa o descendente', () => {
   assert.strictEqual(classifyPath(cwd, path.join(cwd, 'pasta', 'arquivo.md'), sibling).eligible, true);
 });
 
-if (gitAvailable()) {
+if (GIT_OK) {
   test('só o alvo limpo passa; estados e conteúdo ficam idênticos após o filtro', () => {
     const cwd = fixture();
     try {
@@ -332,6 +356,33 @@ test('ramo sem VCS ignora toolUndo por completo (herdada 7 travada)', () => {
   } finally { cleanup(cwd); }
 });
 
+// R9 triage regression: a subprocess run with a git-less PATH must fail
+// loudly (non-zero, explicit stderr) by default, and must only pass green
+// when FORGE_ALLOW_NO_GIT=1 is set explicitly — proven end-to-end by
+// re-spawning this very file under a PATH stripped of a git binary.
+// FORGE_TEST_NO_RECURSE guards the nested runs from re-spawning this same
+// test (which would otherwise fork exponentially).
+if (!process.env.FORGE_TEST_NO_RECURSE) {
+  test('R9: git indisponível falha por padrão e só passa com FORGE_ALLOW_NO_GIT=1 explícito', () => {
+    const nodeDir = path.dirname(process.execPath);
+    const withoutOptOut = spawnSync(process.execPath, [__filename], {
+      encoding: 'utf8',
+      shell: false,
+      env: { PATH: nodeDir, FORGE_TEST_NO_RECURSE: '1' },
+    });
+    assert.notStrictEqual(withoutOptOut.status, 0, 'sem FORGE_ALLOW_NO_GIT, git indisponível deve falhar a suíte');
+    assert.match(withoutOptOut.stderr, /FORGE_ALLOW_NO_GIT=1/);
+
+    const withOptOut = spawnSync(process.execPath, [__filename], {
+      encoding: 'utf8',
+      shell: false,
+      env: { PATH: nodeDir, FORGE_TEST_NO_RECURSE: '1', FORGE_ALLOW_NO_GIT: '1' },
+    });
+    assert.strictEqual(withOptOut.status, 0, 'com FORGE_ALLOW_NO_GIT=1, git indisponível deve pular explicitamente e passar');
+    assert.match(withOptOut.stderr, /opt-out deliberado/);
+  });
+}
+
 test('classifyPath expõe kind/via aditivos sem alterar a string reason', () => {
   const cwd = workspaceCwd();
   const direct = classifyPath(cwd, path.join(cwd, 'novo.md'), new Map([['novo.md', 'untracked']]));
@@ -345,3 +396,6 @@ test('classifyPath expõe kind/via aditivos sem alterar a string reason', () => 
 });
 
 process.stdout.write(`forge-sweep-eligibility: ${passed} passed, ${skipped} skipped\n`);
+if (!GIT_OK) {
+  process.stdout.write(`forge-sweep-eligibility: git gate ${ALLOW_NO_GIT ? 'opted out (FORGE_ALLOW_NO_GIT=1)' : 'FAILED — set FORGE_ALLOW_NO_GIT=1 to opt out explicitly'}\n`);
+}

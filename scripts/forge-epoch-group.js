@@ -145,6 +145,23 @@ function skip(skipped, itemPath, reason) {
   skipped.push({ path: itemPath, reason });
 }
 
+// R16 triage: with the D11 gate closed (the CLI's default — see
+// forge-sweep-project.js buildRegistry), wrapper dirs never enter `skipped`
+// at all, so a run that protected them left no trace of having done so —
+// indistinguishable from a detector that never looked. This does not open
+// the gate; it only counts what the gate is currently shielding, for an
+// informative line the caller can always print (present even when the
+// count is zero — silence reads as broken, not as "nothing to protect").
+function countProtectedWrapperDirs(cwd) {
+  let count = 0;
+  for (const store of WRAPPER_TARGETS) {
+    for (const entry of entries(store.parent(cwd))) {
+      if (entry.isDirectory()) count += 1;
+    }
+  }
+  return count;
+}
+
 function plan(cwd, opts = {}) {
   const dryRun = opts.dryRun === undefined ? true : Boolean(opts.dryRun);
   const includeWrapperDirs = opts.includeWrapperDirs === true;
@@ -458,4 +475,4 @@ function ungroup(cwd, containerPath) {
   return { restored, alreadyPresent };
 }
 
-module.exports = { STORE_TARGETS, WRAPPER_TARGETS, plan, apply, ungroup, isDirectChild, safeMemberId };
+module.exports = { STORE_TARGETS, WRAPPER_TARGETS, plan, apply, ungroup, isDirectChild, safeMemberId, countProtectedWrapperDirs };
