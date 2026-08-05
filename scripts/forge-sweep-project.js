@@ -387,7 +387,25 @@ function collectContainers(cwd) {
       const filePath = path.join(dir, entry.name);
       let buffer;
       try { buffer = fs.readFileSync(filePath); }
-      catch (_) { continue; }
+      catch (_) {
+        // Unreadable file: fall back to the name-only recognition idiom
+        // used by the store readers (forge-memory.js, forge-ledger.js) —
+        // DS9-1 promises legacy containers stay listable, and an unreadable
+        // one is exactly the case that idiom exists for. Surface it as an
+        // error row instead of silently dropping it (review R2).
+        if (isGroupedFile(entry.name)) {
+          rows.push({
+            store: store.name,
+            name: entry.name,
+            label: path.basename(entry.name, '.md'),
+            from: null,
+            to: null,
+            units: null,
+            error: 'container-unreadable',
+          });
+        }
+        continue;
+      }
       if (!isGroupedFile(entry.name, buffer)) continue;
       const parsed = parseGroup(buffer);
       const label = parsed.label || path.basename(entry.name, '.md');
@@ -409,6 +427,9 @@ function collectContainers(cwd) {
 }
 
 function formatListRow(row) {
+  if (row.error) {
+    return `${row.store}: ${row.label} — erro: ${row.error} — unidades não listadas`;
+  }
   // A legacy PR-1 container never had grouped_from/grouped_to at all —
   // empty parens would read as "the range is blank", which is misleading;
   // say plainly that no range was ever recorded for it (DS9-1).
@@ -425,6 +446,7 @@ function listPayload(rows) {
       from: row.from,
       to: row.to,
       units: row.units,
+      ...(row.error ? { error: row.error } : {}),
     })),
   };
 }

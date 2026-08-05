@@ -702,8 +702,87 @@ async function testVcsQueryFailureExitsOne() {
   }
 }
 
+async function testListSurfacesUnreadableContainers() {
+  // Runs in-process (not via spawnSync) because the failure has to be
+  // injected into the exact fs.readFileSync call collectContainers makes —
+  // chmod does not reliably produce an unreadable file cross-platform
+  // (Windows only toggles the read-only attribute), so the seam is stubbed
+  // instead, mirroring testOutcomeAppendFailureKeepsJournalRecordedTruthful
+  // above. Covers a sweep-numbered container AND a legacy epoch-shaped one —
+  // review R2 requires isGroupedFile's name-only branch to catch both.
+  const { main } = require('./forge-sweep-project');
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-list-unreadable-'));
+  const ledgerDir = path.join(cwd, '.gsd', 'ledger');
+  const decisionsDir = path.join(cwd, '.gsd', 'decisions');
+  fs.mkdirSync(ledgerDir, { recursive: true });
+  fs.mkdirSync(decisionsDir, { recursive: true });
+  const serialized = serializeGroup({
+    label: 'sweep-project-09',
+    dateRange: { from: '2026-06-09', to: '2026-08-04' },
+    units: [{ id: 'M-20260609000000-alpha', content: Buffer.from('conteudo\n') }],
+  });
+  const unreadableSweepPath = path.join(ledgerDir, 'sweep-project-09.md');
+  fs.writeFileSync(unreadableSweepPath, serialized.buffer);
+  writeLegacyContainer(cwd, 'decisions', '2026-Q2', 'D-20260401000000-legado', 'conteudo legado\n');
+  const unreadableLegacyPath = path.join(decisionsDir, '2026-Q2.md');
+  // A readable, well-formed container in the mix confirms the stub only
+  // breaks the two targeted files — everything else still lists normally.
+  const okSerialized = serializeGroup({
+    label: 'sweep-project-10',
+    dateRange: { from: '2026-05-01', to: '2026-05-02' },
+    units: [{ id: 'M-20260501000000-gamma', content: Buffer.from('ok\n') }],
+  });
+  fs.writeFileSync(path.join(ledgerDir, 'sweep-project-10.md'), okSerialized.buffer);
+
+  const realReadFileSync = fs.readFileSync;
+  const stdoutWrite = process.stdout.write;
+  let capturedOut = '';
+  try {
+    fs.readFileSync = function stubbedReadFileSync(target, ...rest) {
+      if (target === unreadableSweepPath || target === unreadableLegacyPath) {
+        const error = new Error(`EACCES: permission denied, open '${target}' (simulado)`);
+        error.code = 'EACCES';
+        throw error;
+      }
+      return realReadFileSync.call(fs, target, ...rest);
+    };
+
+    process.stdout.write = chunk => { capturedOut += chunk; return true; };
+    const textCode = await main(['--cwd', cwd, '--list']);
+    process.stdout.write = stdoutWrite;
+    assert.strictEqual(textCode, 0, '--list must not fail the process on an unreadable container');
+    assert.match(capturedOut, /ledger: sweep-project-09 — erro: container-unreadable — unidades não listadas/);
+    assert.match(capturedOut, /decisions: 2026-Q2 — erro: container-unreadable — unidades não listadas/);
+    assert.match(capturedOut, /sweep-project-10 \(2026-05-01 → 2026-05-02\)/);
+
+    capturedOut = '';
+    process.stdout.write = chunk => { capturedOut += chunk; return true; };
+    const jsonCode = await main(['--cwd', cwd, '--list', '--json']);
+    process.stdout.write = stdoutWrite;
+    assert.strictEqual(jsonCode, 0);
+    const payload = JSON.parse(capturedOut);
+    const sweepRow = payload.containers.find(row => row.name === 'sweep-project-09.md');
+    assert.strictEqual(sweepRow.error, 'container-unreadable');
+    assert.strictEqual(sweepRow.units, null);
+    const legacyRow = payload.containers.find(row => row.name === '2026-Q2.md');
+    assert.strictEqual(legacyRow.error, 'container-unreadable');
+    assert.strictEqual(legacyRow.units, null);
+    const okRow = payload.containers.find(row => row.name === 'sweep-project-10.md');
+    assert.strictEqual(okRow.error, undefined);
+    assert.strictEqual(okRow.units, 1);
+
+    passed += 1;
+    process.stdout.write('  ✓ --list surfaces an unreadable sweep container AND an unreadable legacy epoch container, in text and JSON\n');
+  } finally {
+    process.stdout.write = stdoutWrite;
+    fs.readFileSync = realReadFileSync;
+    cleanup(cwd);
+  }
+}
+
 testOutcomeAppendFailureKeepsJournalRecordedTruthful()
   .then(() => testVcsQueryFailureExitsOne())
+  .then(() => testListSurfacesUnreadableContainers())
   .then(() => {
     process.stdout.write(`forge-sweep-project: ${passed} passed, ${skipped} skipped\n`);
   }).catch(error => {

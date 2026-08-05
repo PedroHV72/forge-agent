@@ -124,7 +124,7 @@ Forge Doctor
 ============
 
   ✓ Layer 2 — Schema version
-    Schema version matches: fragment-store@2.0.0
+    Schema version matches: fragment-store@3.0.0
 
   Summary: 1/1 checks passed
 ```
@@ -135,7 +135,7 @@ Forge Doctor
 ============
 
   ✗ Layer 2 — Schema version
-    Schema version mismatch — expected "fragment-store@2.0.0", got "fragment-store@0.9.0". Run --fix to update.
+    Schema version mismatch — expected "fragment-store@3.0.0", got "fragment-store@0.9.0". Run --fix to update.
 
   Summary: 0/1 checks passed
 ```
@@ -233,9 +233,9 @@ Forge Doctor
     Status: — skipped (VCS: none)
 
   Layer 2 — Schema version
-    Status: ✓ OK  (fragment-store@2.0.0)
+    Status: ✓ OK  (fragment-store@3.0.0)
     (ou)
-    Status: ✗ mismatch — expected "fragment-store@2.0.0", got "<actual>"
+    Status: ✗ mismatch — expected "fragment-store@3.0.0", got "<actual>"
     (ou)
     Status: ✗ SCHEMA-VERSION not found
 
