@@ -2,13 +2,23 @@
 // forge-schema-guard.test.js — standalone test suite for forge-schema-guard.js
 //
 // Covers the locked decision table (CONTEXT § S01 guard):
-//   - absent/unreadable SCHEMA-VERSION → ok/ok, fail-open, no warning
+//   - ABSENT SCHEMA-VERSION            → ok/ok, fail-open, no warning
+//   - GARBAGE but readable content     → ok/ok, fail-open, no warning
+//     ("lixo", empty, whitespace — present and parseable-by-nobody, but READ)
+//   - UNREADABLE stamp (a directory in its place, chmod 000 on POSIX)
+//                                      → read fail-open; WRITE REFUSED, errno
+//                                        named in the message (PR #70 dogfood)
 //   - major(data) <= major(tooling)    → clean read + clean write
 //   - major(data) >  major(tooling)    → read ok + partial + warning;
 //                                         write refused (ok:false + message)
 //   - guardRead never throws (missing cwd, binary/empty SCHEMA-VERSION)
 //   - only MAJOR decides — minor/patch-only difference stays clean
 //   - CLI: --check prints one-line JSON, exit 0; unknown args exit 2
+//
+// NOTE ON NAMING: Section 2 used to be titled "unreadable content" while every
+// case in it was readable garbage. That name advertised coverage that did not
+// exist and is precisely what hid the write-guard hole for a whole review
+// cycle. "Unreadable" now means one thing in this file: the read syscall fails.
 //
 // Run: node scripts/forge-schema-guard.test.js   (exit 0 = all pass)
 
@@ -55,15 +65,25 @@ function assert(cond, msg) {
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-schema-guard-test-'));
 
 // Helper: build a fixture repo dir with an optional .gsd/SCHEMA-VERSION content.
-// content === undefined → no .gsd dir at all (truly absent).
-// content === null → .gsd dir exists but no SCHEMA-VERSION file.
+// content === undefined  → no .gsd dir at all (truly absent).
+// content === null       → .gsd dir exists but no SCHEMA-VERSION file.
+// content === AS_DIRECTORY → .gsd/SCHEMA-VERSION exists AS A DIRECTORY, so any
+//   readFileSync on it fails with EISDIR. This is the cross-platform way to
+//   produce a genuinely unreadable stamp: it works identically on win32 and
+//   POSIX (chmod 000 does NOT — see Section 8), and it is the exact shape the
+//   PR #70 dogfood hit in the wild.
+// content === <string>   → that content, written as a file.
+const AS_DIRECTORY = Symbol('as-directory');
+
 function makeRepo(name, content) {
   const dir = path.join(ROOT, name);
   fs.mkdirSync(dir, { recursive: true });
   if (content !== undefined) {
     const gsdDir = path.join(dir, '.gsd');
     fs.mkdirSync(gsdDir, { recursive: true });
-    if (content !== null) {
+    if (content === AS_DIRECTORY) {
+      fs.mkdirSync(path.join(gsdDir, 'SCHEMA-VERSION'), { recursive: true });
+    } else if (content !== null) {
       fs.writeFileSync(path.join(gsdDir, 'SCHEMA-VERSION'), content, 'utf8');
     }
   }
@@ -100,8 +120,12 @@ test('.gsd dir exists but no SCHEMA-VERSION file: guardRead/assertWrite ok', () 
   assert(w.ok === true && w.message === null, 'assertWrite should be clean');
 });
 
-// ── Section 2: unreadable/garbage content → fail-open ─────────────────────────
-console.log('\nSection 2: unreadable content\n');
+// ── Section 2: garbage/unparseable BUT READABLE content → fail-open ───────────
+// Every fixture here is a file the guard reads successfully and nobody can
+// parse. That is a different state from "unreadable" (Section 8): here the
+// write is ALLOWED, because a repo whose stamp we read and did not understand
+// is indistinguishable from an old repo, and blocking it would break them.
+console.log('\nSection 2: garbage/unparseable (readable) content\n');
 
 test('garbage content "lixo": fail-open on both sides', () => {
   const dir = makeRepo('garbage', 'lixo');
@@ -293,6 +317,101 @@ test('CLI valid forms still exit 0 (--check alone, and --check --cwd <dir>)', ()
   assert(bare.status === 0, `expected exit 0 for --check alone, got ${bare.status}: ${bare.stderr}`);
   const withCwd = spawnSync(process.execPath, [CLI_PATH, '--check', '--cwd', dir], { encoding: 'utf8' });
   assert(withCwd.status === 0, `expected exit 0 for --check --cwd <dir>, got ${withCwd.status}`);
+});
+
+// ── Section 8: UNREADABLE stamp → read fail-open, write REFUSED ───────────────
+// The regression this section locks (PR #70 dogfood): `.gsd/SCHEMA-VERSION`
+// existing as a DIRECTORY made every write guard pass silently, because the
+// EISDIR was swallowed into `null` by the reader and then converted into
+// `ahead: false`. Refusing here is the D1 decision: a guard that could not read
+// the stamp knows nothing about direction, and "could not measure" is not
+// evidence of safety.
+console.log('\nSection 8: unreadable stamp (real read failure)\n');
+
+// Sibling of hasWarning() in forge-schema-guard-wiring.test.js — the refusal
+// message for this case has its own header on purpose, so it does NOT match
+// /schema do Forge à frente da tooling local/ (it would be a false claim about
+// a direction nobody measured).
+const UNREADABLE_HEADER = /não pôde ser lido/;
+
+test('stamp as a DIRECTORY: assertWrite refuses and names the errno', () => {
+  const dir = makeRepo('unreadable-dir-write', AS_DIRECTORY);
+  const w = assertWrite(dir, { toolingSchema: TOOLING });
+  assert(w.ok === false, 'assertWrite must REFUSE when the stamp cannot be read');
+  assert(typeof w.message === 'string' && UNREADABLE_HEADER.test(w.message),
+    `message should use the unreadable-stamp header, got: ${w.message}`);
+  assert(/EISDIR/.test(w.message), `message should name the errno, got: ${w.message}`);
+  assert(!/à frente da tooling/.test(w.message),
+    'refusal must NOT claim the data is ahead — direction was never measured');
+  assert(!/\(null\)/.test(w.message), 'refusal must not interpolate a null dataSchema');
+});
+
+test('stamp as a DIRECTORY: guardRead stays fail-open (clean, no warning)', () => {
+  const dir = makeRepo('unreadable-dir-read', AS_DIRECTORY);
+  const r = guardRead(dir, { toolingSchema: TOOLING });
+  assert(r.ok === true, 'guardRead ok should stay true');
+  assert(r.partial === false, 'guardRead must not mark the read partial on an unreadable stamp');
+  assert(r.warning === null, 'guardRead must stay silent — reading never breaks');
+});
+
+test('checkSchemaDirection reports unreadable + errno, and never claims ahead', () => {
+  const dir = makeRepo('unreadable-dir-check', AS_DIRECTORY);
+  const res = checkSchemaDirection(dir, { toolingSchema: TOOLING });
+  assert(res.unreadable === true, 'unreadable should be true');
+  assert(typeof res.errno === 'string' && res.errno.length > 0, 'errno should be a non-empty string');
+  assert(res.ahead === false, 'ahead must stay false — direction was not measured');
+  assert(res.dataSchema === null, 'dataSchema should be null when nothing could be read');
+});
+
+test('absent stamp is NOT unreadable — the write stays allowed (asymmetry pin)', () => {
+  const absent = makeRepo('absent-not-unreadable', null);
+  const res = checkSchemaDirection(absent, { toolingSchema: TOOLING });
+  assert(res.unreadable === false, 'an absent stamp must never be reported as unreadable');
+  assert(assertWrite(absent, { toolingSchema: TOOLING }).ok === true,
+    'absence must keep writing — pre-stamp repos are legitimate');
+  const garbage = makeRepo('garbage-not-unreadable', 'lixo');
+  assert(checkSchemaDirection(garbage, { toolingSchema: TOOLING }).unreadable === false,
+    'readable garbage must never be reported as unreadable');
+  assert(assertWrite(garbage, { toolingSchema: TOOLING }).ok === true,
+    'readable garbage must keep writing');
+});
+
+test('chmod 000 stamp: write refused (POSIX only — chmod is inert on win32)', () => {
+  if (process.platform === 'win32') {
+    console.log('      (skipped on win32: chmod 000 does not block reads there)');
+    return;
+  }
+  const dir = makeRepo('unreadable-chmod', 'fragment-store@1.0.0');
+  const stamp = path.join(dir, '.gsd', 'SCHEMA-VERSION');
+  fs.chmodSync(stamp, 0o000);
+  try {
+    // Sanity: the fixture must actually make the read fail. Without this the
+    // test would silently degrade into re-testing the happy path.
+    let threw = false;
+    try { fs.readFileSync(stamp, 'utf8'); } catch (_) { threw = true; }
+    assert(threw === true, 'fixture setup must make readFileSync throw (EACCES)');
+
+    const w = assertWrite(dir, { toolingSchema: TOOLING });
+    assert(w.ok === false, 'assertWrite must refuse on a permission-denied stamp');
+    assert(UNREADABLE_HEADER.test(w.message), `expected the unreadable header, got: ${w.message}`);
+
+    const r = guardRead(dir, { toolingSchema: TOOLING });
+    assert(r.ok === true && r.partial === false && r.warning === null,
+      'guardRead must stay fail-open on a permission-denied stamp');
+  } finally {
+    fs.chmodSync(stamp, 0o644);
+  }
+});
+
+test('CLI --check reports unreadable:true with the errno, still exit 0 (diagnostic)', () => {
+  const dir = makeRepo('cli-unreadable', AS_DIRECTORY);
+  const result = spawnSync(process.execPath, [CLI_PATH, '--check', '--cwd', dir], { encoding: 'utf8' });
+  assert(result.status === 0, `--check is diagnostic, expected exit 0, got ${result.status}`);
+  const parsed = JSON.parse(result.stdout.trim());
+  assert(parsed.unreadable === true, 'CLI JSON should expose unreadable:true');
+  assert(typeof parsed.errno === 'string' && parsed.errno.length > 0, 'CLI JSON should expose the errno');
+  assert(parsed.ahead === false, 'CLI JSON ahead should stay false');
+  assert(UNREADABLE_HEADER.test(result.stderr), `expected the refusal text on stderr, got: ${result.stderr}`);
 });
 
 // ── Summary ────────────────────────────────────────────────────────────────────

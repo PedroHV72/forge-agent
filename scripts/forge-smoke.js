@@ -12325,7 +12325,7 @@ function smokeSchemaGuardWiring() {
     const CURRENT = require(path.join(SCRIPTS, 'forge-doctor.js')).CURRENT_SCHEMA;
     const major = Number(String(CURRENT).match(/@(\d+)\./)[1]);
     const WARN_RE = /schema do Forge à frente da tooling local/;
-    const ledgerId = 'M-20260101000000-smoke84';
+    const ledgerId = 'M-20260101000000-smoke90';
 
     // Fixture: um fragmento em cada store, os três stores povoados.
     const mkStores = (root) => {
@@ -12333,9 +12333,9 @@ function smokeSchemaGuardWiring() {
         fs.mkdirSync(path.join(root, '.gsd', store), { recursive: true });
       }
       fs.writeFileSync(path.join(root, '.gsd', 'ledger', `${ledgerId}.md`),
-        `---\nid: ${ledgerId}\ntitle: Smoke 84\ncompleted_at: 2026-01-01T00:00:00Z\nslices: [S01]\nkey_files: []\nkey_decisions: []\n---\n\nBody.\n`, 'utf8');
+        `---\nid: ${ledgerId}\ntitle: Smoke 90\ncompleted_at: 2026-01-01T00:00:00Z\nslices: [S01]\nkey_files: []\nkey_decisions: []\n---\n\nBody.\n`, 'utf8');
       fs.writeFileSync(path.join(root, '.gsd', 'memory', `${ledgerId}.md`),
-        `---\nunit_id: ${ledgerId}\nfacts:\n  - mem_id: S84-1\n    category: gotcha\n    text: smoke 84 fixture\n    created_at: 2026-01-01\n    source_unit: ${ledgerId}\nstats: []\n---\n`, 'utf8');
+        `---\nunit_id: ${ledgerId}\nfacts:\n  - mem_id: S90-1\n    category: gotcha\n    text: smoke 90 fixture\n    created_at: 2026-01-01\n    source_unit: ${ledgerId}\nstats: []\n---\n`, 'utf8');
     };
 
     const clean = path.join(dir, 'clean');
@@ -12424,6 +12424,27 @@ function smokeSchemaGuardWiring() {
       && !fs.existsSync(path.join(ahead, '.gsd', 'LEDGER.md')),
       '(e) --write-all is refused with and without --force, and writes no monolith');
 
+    // (e2) stamp ILEGÍVEL (a repro do dogfood da PR #70): `.gsd/SCHEMA-VERSION`
+    // como DIRETÓRIO fazia toda escrita passar com exit 0 e arquivo em disco —
+    // o EISDIR virava null e o null virava "não está à frente". Agora recusa,
+    // nomeando o errno, e SEM alegar que o dado está à frente (ninguém mediu
+    // direção nenhuma). A leitura continua limpa: a assimetria é o desenho.
+    const unread = path.join(dir, 'unreadable');
+    mkStores(unread);
+    fs.mkdirSync(path.join(unread, '.gsd', 'SCHEMA-VERSION'), { recursive: true });
+    const UNREADABLE_RE = /não pôde ser lido/;
+    const unreadWrite = runScript('forge-ledger.js', ['--write', '--cwd', unread],
+      { input: entry('M-20260202000000-w') });
+    assert(unreadWrite.status !== 0 && UNREADABLE_RE.test(unreadWrite.stderr)
+      && /EISDIR/.test(unreadWrite.stderr) && !WARN_RE.test(unreadWrite.stderr)
+      && !fs.existsSync(writeTarget(unread)),
+      '(e2) an unreadable stamp refuses the write, names the errno, and claims nothing about direction',
+      `status=${unreadWrite.status} stderr=${unreadWrite.stderr}`);
+    const unreadRead = runScript('forge-ledger.js', ['--list', '--cwd', unread]);
+    assert(unreadRead.status === 0 && !UNREADABLE_RE.test(unreadRead.stderr) && !WARN_RE.test(unreadRead.stderr)
+      && Array.isArray(JSON.parse(unreadRead.stdout)),
+      '(e2) reading under an unreadable stamp stays clean and silent (fail-open preserved)');
+
     // (f) o helper é a única fonte da lógica: nenhum dos 4 leitores relê
     // SCHEMA-VERSION nem compara versão por conta própria.
     for (const reader of ['forge-projection.js', 'forge-ledger.js', 'forge-decisions.js', 'forge-memory.js']) {
@@ -12440,6 +12461,93 @@ function smokeSchemaGuardWiring() {
       '(g) Section 90 is registered through a closure in main()');
     pass('(final) Section 90: read warns/marks, write refuses, fail-open untouched, single source of schema logic');
   } finally { cleanup(dir); }
+}
+
+// ── Section 91: nenhum byte de controle inesperado em scripts/*.js ─────────
+// Regressão que isto trava: um byte NUL (ou VT/FF) cru no fonte. Dois deles
+// viviam em scripts/forge-memory-index.js e um em forge-review-diff.test.js —
+// invisíveis na leitura, mas suficientes para o git e o grep classificarem o
+// arquivo inteiro como BINÁRIO. O efeito não é cosmético: `grep` para de
+// mostrar as linhas, o diff da PR vira "Binary file … differs", e a revisão
+// perde o arquivo de vista exatamente onde ele deveria ser lido. O conserto é
+// o escape de duas letras (\0); esta seção existe para que o byte cru não
+// volte. Também vale para 0x0b/0x0c — a regra do `\f` no install.ps1 (ver
+// CLAUDE.md) é a mesma classe de defeito, com a mesma causa: um escape que
+// virou byte na hora de escrever o arquivo.
+//
+// Esta seção NUNCA escreve um byte de controle literal no próprio fonte: o
+// fixture de mordida monta o byte com String.fromCharCode em runtime, senão
+// forge-smoke.js seria o próximo arquivo a se auto-flagrar.
+const CONTROL_BYTES = new Map([[0x00, 'NUL (0x00)'], [0x0b, 'VT (0x0b)'], [0x0c, 'FF (0x0c)']]);
+const CONTROL_BYTE_FLOOR = 50; // scripts/ tem ~170 .js; 0 varridos é falha, não passe limpo
+
+// { ok, scanned, violations: [{ file, byte, offset }] }
+function scanControlBytes(rootDir, opts) {
+  const floor = (opts && opts.floor) || CONTROL_BYTE_FLOOR;
+  const { collectFiles } = require('./forge-doc-claims.js');
+  const files = collectFiles(rootDir, { extensions: ['.js'] });
+  const violations = [];
+  let scanned = 0;
+  for (const file of files) {
+    let buf;
+    try { buf = fs.readFileSync(file); } catch { continue; } // ilegível: não conta como varrido
+    scanned++;
+    for (let i = 0; i < buf.length; i++) {
+      const label = CONTROL_BYTES.get(buf[i]);
+      if (label) violations.push({ file, byte: label, offset: i });
+    }
+  }
+  // Piso anti-silêncio (padrão de forge-doc-claims.js): "0 violações" e
+  // "0 arquivos varridos" precisam ser distinguíveis — um scanner apontado
+  // para o diretório errado deve ficar VERMELHO, não verde.
+  const ok = violations.length === 0 && scanned >= floor;
+  return { ok, scanned, floor, violations };
+}
+
+function smokeControlBytes() {
+  process.stdout.write('\n▸ Section 91: bytes de controle inesperados em scripts/*.js\n');
+
+  // (a) a árvore real está limpa E acima do piso — a asserção de aceitação.
+  const real = scanControlBytes(SCRIPTS);
+  assert(real.scanned >= real.floor,
+    `(a) scanned (${real.scanned}) >= piso anti-silêncio (${real.floor})`);
+  assert(real.violations.length === 0,
+    '(a) scripts/*.js não contém 0x00/0x0b/0x0c',
+    JSON.stringify(real.violations.slice(0, 5).map(v => `${path.basename(v.file)}@${v.offset}:${v.byte}`)));
+  assert(real.ok === true, '(a) varredura real: ok === true');
+
+  const dir = mkTmp('control-bytes');
+  try {
+    const file = path.join(dir, 'injected.js');
+    // (b) mordida: com o byte cru, VERMELHO.
+    fs.writeFileSync(file, `const key = 'a'${String.fromCharCode(0)}'b';\n`, 'utf8');
+    const dirty = scanControlBytes(dir, { floor: 1 });
+    assert(dirty.ok === false, '(b) fixture com NUL cru: ok === false (mordida observada)');
+    assert(dirty.violations.length === 1 && dirty.violations[0].byte === 'NUL (0x00)',
+      '(b) fixture com NUL cru: a violação é reportada com o byte nomeado', JSON.stringify(dirty.violations));
+
+    // (c) com o escape de duas letras no lugar, VERDE — as duas direções.
+    fs.writeFileSync(file, 'const key = \'a\' + \'\\0\' + \'b\';\n', 'utf8');
+    const clean = scanControlBytes(dir, { floor: 1 });
+    assert(clean.ok === true, '(c) fixture com o escape \\0: ok === true (verde restaurado)', JSON.stringify(clean.violations));
+
+    // (d) o piso morde sozinho: diretório vazio é FALHA, não passe limpo.
+    const empty = mkTmp('control-bytes-empty');
+    try {
+      const none = scanControlBytes(path.join(empty, 'nao-existe'));
+      assert(none.ok === false && none.scanned === 0,
+        '(d) diretório inexistente: 0 varridos é falha (piso anti-silêncio morde)', JSON.stringify(none));
+    } finally { cleanup(empty); }
+  } finally { cleanup(dir); }
+
+  // (e) auto-registro em main() — impede desfiar a seção em silêncio.
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeControlBytes\(\); \}/.test(mainBody),
+    '(e) Section 91 is registered through a closure in main()');
+
+  pass('(final) Section 91: nenhum 0x00/0x0b/0x0c em scripts/*.js, acima do piso anti-silêncio, ' +
+    'com mordida e volta ao verde provadas no fixture');
 }
 
 async function main() {
@@ -12547,6 +12655,7 @@ async function main() {
       () => { smokeDocClaimsGuard(); },
       () => { smokeRunOverlapSignal(); },
       () => { smokeSchemaGuardWiring(); },
+      () => { smokeControlBytes(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {

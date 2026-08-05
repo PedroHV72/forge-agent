@@ -13,8 +13,12 @@
 - **`scripts/forge-schema-guard.js`**, a directional schema guard: compares only the
   major of `.gsd/SCHEMA-VERSION` against the schema the tooling understands. Fail-open on
   read (absence, unreadable stamp, or major ≤ understood all pass clean, with a loud
-  warning plus a `partial` result when the data is ahead); refuses the write outright
-  (non-zero exit) when the data's major is ahead of the tooling's. Wired into the four
+  warning plus a `partial` result when the data is ahead). The write side refuses outright
+  (non-zero exit) in **two** cases: when the data's major is ahead of the tooling's, and
+  when the stamp exists but could not be read at all (a directory in its place,
+  `EACCES`/`EPERM`, …) — the refusal names the errno and claims nothing about direction,
+  because a guard that could not read the stamp measured nothing. Absence and readable
+  garbage still write, unchanged: only the read failure closes. Wired into the four
   fragment-store readers — `forge-projection.js`, `forge-ledger.js`, `forge-decisions.js`,
   `forge-memory.js` — at every read and write entry point, so stale tooling can no longer
   silently clobber a store written by newer code.
@@ -31,6 +35,23 @@
   of the two real truncators; now documents both, each with its own explicit degradation
   ladder (the two builders intentionally degrade differently — the shared prose that used
   to cover both was actually wrong for one of them).
+- **The schema write guard could be disabled by a directory** (found by dogfood review on
+  PR #70). `readSchemaVersion` collapsed every read error into `null`, and
+  `checkSchemaDirection` then read that `null` as "not ahead" — so a `.gsd/SCHEMA-VERSION`
+  that existed as a *directory* (`EISDIR`) made every fragment-store write sail through
+  with exit 0 and a file on disk. The `catch` inside `assertWrite` was never the fix: it
+  was unreachable, because nothing on that path ever threw. The information now originates
+  where the errno is visible — `readSchemaVersionDetailed` in `scripts/forge-migrate.js`
+  reports `{ value, unreadable, errno }` — and survives to the write side as a first-class
+  `unreadable` field. Read behaviour is untouched in all three stamp states.
+- **Raw NUL bytes in three source files made git and grep treat them as binary.**
+  `scripts/forge-memory-index.js` (two, a `Map` key separator) and
+  `scripts/forge-review-diff.test.js` (one, in the assertion string that checks NULs never
+  reach the reviewer) carried literal `0x00`s where the two-character escape `\0` was
+  meant. The cost was review visibility, not behaviour: `grep` answered "Binary file …
+  matches" and diffs refused to display. Escaped, byte-behaviour-identical, and now locked
+  by a new `forge-smoke.js` section that scans `scripts/*.js` for `0x00`/`0x0b`/`0x0c` with
+  an anti-silence floor (0 files scanned is a failure, not a clean pass).
 
 ## v4.1.0 — What a project is, and what the screen may claim about it
 

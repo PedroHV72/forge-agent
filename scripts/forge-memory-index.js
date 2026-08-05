@@ -486,10 +486,10 @@ function buildFileIndex(cwd, opts) {
 
   // unresolved — aggregated by raw+reason → { raw, reason, count, example_mem_id, candidates? },
   // ordered by count desc then raw.
-  const unresolvedMap = new Map(); // key: raw|reason
+  const unresolvedMap = new Map(); // key: `raw` + NUL + `reason` (NUL cannot occur in either part)
   for (const { citation, resolution } of resolvedCitations) {
     if (resolution.state !== 'UNRESOLVED') continue;
-    const key = `${citation.raw} ${resolution.reason}`;
+    const key = `${citation.raw}\0${resolution.reason}`;
     if (!unresolvedMap.has(key)) {
       unresolvedMap.set(key, {
         raw: citation.raw,
@@ -505,7 +505,7 @@ function buildFileIndex(cwd, opts) {
   // Attach an example_mem_id per aggregate (first occurrence).
   for (const { citation, resolution } of resolvedCitations) {
     if (resolution.state !== 'UNRESOLVED') continue;
-    const key = `${citation.raw} ${resolution.reason}`;
+    const key = `${citation.raw}\0${resolution.reason}`;
     const agg = unresolvedMap.get(key);
     if (agg && agg.example_mem_id === null) {
       // Find owning fact for this citation among allFacts — best effort, first match.

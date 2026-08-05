@@ -16,6 +16,10 @@
 //      on disk (content assert, not just the exit code)
 //   5. Module boundary — queryRelevant warns, writeFragment throws
 //   6. Dedupe — two guarded reads in one process emit ONE warning
+//   7. Guard load errors propagate unless the guard is absent
+//   8. UNREADABLE stamp — the PR #70 dogfood repro, through the real CLIs:
+//      a directory at .gsd/SCHEMA-VERSION → every --write exits != 0 and
+//      nothing lands on disk, while reads stay clean
 //
 // Run: node scripts/forge-schema-guard-wiring.test.js   (exit 0 = all pass)
 
@@ -466,8 +470,10 @@ test('[dedupe] guard helper exposes the wiring entry points', () => {
 // eagerly pulls projection/migrators/store-state/doctor — a broken transitive
 // dependency is a realistic case and must NOT look like an absent guard.
 //
-// Scope note: this covers the CATCH only. The seam stays fail-open on runtime
-// errors from checkSchemaDirection — that policy was reviewed and kept.
+// Scope note: this covers the CATCH only. The seam stays fail-open on an
+// unexpected runtime error raised inside checkSchemaDirection itself. It is NOT
+// fail-open on a stamp it could not read — that case is a refusal now, and
+// Section 8 below is what proves it.
 
 console.log('\n=== Section 7: guard load errors propagate unless the guard is absent ===\n');
 
@@ -530,6 +536,74 @@ test('[classifier] isAbsentModuleError distinguishes absent from broken', () => 
   assert(!isAbsentModuleError(new TypeError('boom'), './forge-schema-guard'), 'init errors are never absence');
   assertEq(missingModuleId(other), './forge-migrate', 'missingModuleId reports the unfindable id');
   assertEq(missingModuleId(new TypeError('boom')), null, 'non-resolution errors have no missing id');
+});
+
+// ── Section 8: UNREADABLE stamp — the PR #70 dogfood repro, end to end ────────
+// The maintainer's repro, inverted into a gate: `.gsd/SCHEMA-VERSION` created as
+// a DIRECTORY used to make every fragment-store write sail through with exit 0
+// and a file on disk, because the EISDIR was swallowed into `null` and then
+// read as "not ahead". Here it must exit != 0 with nothing written, on all four
+// CLIs, while reads keep working.
+
+console.log('\n=== Section 8: unreadable stamp — writes refused end to end ===\n');
+
+// Marker unique to the unreadable-stamp refusal. Deliberately a DIFFERENT
+// header from hasWarning(): claiming "data is ahead" here would assert a
+// direction that was never measured.
+function hasUnreadableRefusal(stderr) {
+  return /não pôde ser lido/.test(String(stderr || ''));
+}
+
+// Fixture with the stamp as a directory. makeFixture only writes files, so the
+// directory is created after it (the `null` argument means "no stamp file").
+const UNREADABLE_W = makeFixture('unreadable-write', null);
+fs.mkdirSync(path.join(UNREADABLE_W, '.gsd', 'SCHEMA-VERSION'), { recursive: true });
+
+const UNREADABLE_WRITE_SITES = [
+  ['ledger', LEDGER_CLI, VALID_LEDGER_ENTRY, path.join(UNREADABLE_W, '.gsd', 'ledger', 'M-20260202000000-written.md')],
+  ['decisions', DECISIONS_CLI, VALID_DECISIONS_ENTRY, path.join(UNREADABLE_W, '.gsd', 'decisions', 'M-20260202000000-written.md')],
+  ['memory', MEMORY_CLI, VALID_MEMORY_ENTRY, path.join(UNREADABLE_W, '.gsd', 'memory', 'M-20260202000000-written.md')],
+];
+
+for (const [label, cli, entry, target] of UNREADABLE_WRITE_SITES) {
+  test(`[unreadable] ${label} --write refused: exit != 0, errno named, no file created`, () => {
+    const r = run(cli, ['--write'], UNREADABLE_W, entry);
+    assert(r.status !== 0, `write under an unreadable stamp must exit non-zero (got ${r.status})`);
+    assert(hasUnreadableRefusal(r.stderr), `expected the unreadable-stamp refusal on stderr, got: ${r.stderr}`);
+    assert(/EISDIR/.test(String(r.stderr)), `refusal should name the errno, got: ${r.stderr}`);
+    assert(!hasWarning(r.stderr), 'must not claim the data is ahead — direction was never measured');
+    assert(!fs.existsSync(target), 'refused write must not create the fragment file');
+  });
+}
+
+test('[unreadable] existing fragment content is untouched by a refused write', () => {
+  const existing = path.join(UNREADABLE_W, '.gsd', 'ledger', `${LEDGER_ID}.md`);
+  const before = fs.readFileSync(existing, 'utf8');
+  const overwrite = JSON.stringify({
+    id: LEDGER_ID, title: 'CLOBBERED', completed_at: '2026-03-03T00:00:00Z',
+    slices: [], key_files: [], key_decisions: [], body: 'clobber',
+  });
+  const r = run(LEDGER_CLI, ['--write'], UNREADABLE_W, overwrite);
+  assert(r.status !== 0, 'overwrite must be refused');
+  assertEq(fs.readFileSync(existing, 'utf8'), before, 'fragment bytes must be unchanged');
+});
+
+test('[unreadable] projection --write-all (and --force) refused, no monolith written', () => {
+  const target = path.join(UNREADABLE_W, '.gsd', 'LEDGER.md');
+  const r = run(PROJECTION_CLI, ['--write-all'], UNREADABLE_W);
+  assert(r.status !== 0, '--write-all under an unreadable stamp must exit non-zero');
+  assert(hasUnreadableRefusal(r.stderr), `expected the refusal on stderr, got: ${r.stderr}`);
+  assert(!fs.existsSync(target), 'refused --write-all must not create LEDGER.md');
+  const f = run(PROJECTION_CLI, ['--write-all', '--force'], UNREADABLE_W);
+  assert(f.status !== 0, '--force must not bypass the unreadable-stamp refusal');
+  assert(!fs.existsSync(target), 'nothing written');
+});
+
+test('[unreadable] reads still work and stay silent (read side unchanged)', () => {
+  const r = run(LEDGER_CLI, ['--read', LEDGER_ID], UNREADABLE_W);
+  assert(r.status === 0, `a read under an unreadable stamp must still succeed, got ${r.status}: ${r.stderr}`);
+  assert(!hasUnreadableRefusal(r.stderr) && !hasWarning(r.stderr),
+    `reads must stay silent on an unreadable stamp, got: ${r.stderr}`);
 });
 
 // ── Cleanup and summary ───────────────────────────────────────────────────────

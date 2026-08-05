@@ -188,14 +188,47 @@ function compareContent(bakContent, rendered, storeName) {
   return 'differs';
 }
 
-// ── readSchemaVersion ───────────────────────────────────────────────────────
-// Returns the trimmed content of .gsd/SCHEMA-VERSION, or null if absent.
-function readSchemaVersion(cwd) {
+// ── readSchemaVersionDetailed ───────────────────────────────────────────────
+// Reads .gsd/SCHEMA-VERSION and DISTINGUISHES THE THREE STATES the callers care
+// about, which the plain `readSchemaVersion` below cannot express (it collapses
+// all of them into null):
+//
+//   absent      → the file is not there            → { value: null,  unreadable: false, errno: 'ENOENT'|null }
+//   unreadable  → the path exists but cannot be read (EISDIR when a directory
+//                 sits where the file belongs, EACCES/EPERM, ENOTDIR, EBUSY…)
+//                                                  → { value: null,  unreadable: true,  errno: <code> }
+//   readable    → content returned, trimmed; may still be garbage that nobody
+//                 can parse — parsing is not this function's business
+//                                                  → { value: <string>, unreadable: false, errno: null }
+//
+// Discrimination rule (measured on win32/Node 24 and matching POSIX): a read
+// error whose `code` is 'ENOENT' means absent; ANY OTHER errno means the stamp
+// is there in some form we could not read. Errors carrying no `code` at all
+// (e.g. a TypeError from a non-string cwd — a programmer error, not an I/O
+// condition) stay fail-open as "absent", preserving the historical behaviour.
+//
+// Why this matters: a write guard that cannot read the stamp knows NOTHING
+// about direction. Treating "could not read" as "not ahead" let a directory
+// named .gsd/SCHEMA-VERSION disable the guard silently (PR #70 dogfood).
+function readSchemaVersionDetailed(cwd) {
   try {
-    return fs.readFileSync(path.join(cwd, '.gsd', 'SCHEMA-VERSION'), 'utf8').trim();
-  } catch (_) {
-    return null;
+    const value = fs.readFileSync(path.join(cwd, '.gsd', 'SCHEMA-VERSION'), 'utf8').trim();
+    return { value, unreadable: false, errno: null };
+  } catch (err) {
+    const code = err && typeof err.code === 'string' ? err.code : null;
+    if (!code || code === 'ENOENT') return { value: null, unreadable: false, errno: code };
+    return { value: null, unreadable: true, errno: code };
   }
+}
+
+// ── readSchemaVersion ───────────────────────────────────────────────────────
+// Returns the trimmed content of .gsd/SCHEMA-VERSION, or null when it is absent
+// OR could not be read for any reason (fail-open, string|null contract). Callers
+// that must tell those apart use readSchemaVersionDetailed above; this signature
+// is load-bearing for `migrateAll`'s already-migrated shortcut
+// (`readSchemaVersion(cwd) === CURRENT_SCHEMA`) and must not change shape.
+function readSchemaVersion(cwd) {
+  return readSchemaVersionDetailed(cwd).value;
 }
 
 // ── backupMonolith ────────────────────────────────────────────────────────────
@@ -386,10 +419,11 @@ function migrateAll(cwd, opts = {}) {
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
-// readSchemaVersion is additionally exported for scripts/forge-schema-guard.js
-// (M-S01 T03), which reads .gsd/SCHEMA-VERSION via this single source of
-// truth instead of reimplementing file reading.
-module.exports = { migrateAll, readSchemaVersion };
+// readSchemaVersion / readSchemaVersionDetailed are additionally exported for
+// scripts/forge-schema-guard.js (M-S01 T03), which reads .gsd/SCHEMA-VERSION via
+// this single source of truth instead of reimplementing file reading. The guard
+// uses the Detailed variant because it must tell "absent" from "unreadable".
+module.exports = { migrateAll, readSchemaVersion, readSchemaVersionDetailed };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 function printUsage() {

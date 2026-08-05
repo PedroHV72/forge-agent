@@ -4,20 +4,36 @@
 /*
  * forge-schema-guard.js — directional schema guard seam (M-S01 T03).
  *
+ * THE STAMP HAS THREE STATES, and the two sides treat them differently:
+ *
+ *   state                          | guardRead        | assertWrite
+ *   -------------------------------|------------------|---------------------
+ *   absent (no .gsd, no file)      | clean, no warning| allowed
+ *   garbage but READABLE ("lixo")  | clean, no warning| allowed
+ *   UNREADABLE (EISDIR/EACCES/…)   | clean, no warning| REFUSED (errno named)
+ *
  * INVARIANTS:
- *  - Read is fail-open, unconditionally. Absent or unparseable
- *    `.gsd/SCHEMA-VERSION` NEVER blocks a read and NEVER produces a warning —
- *    a repo with no stamp, or a stamp neither side can parse, behaves exactly
- *    like today. `guardRead` never throws: every branch is wrapped so a
- *    missing cwd or a garbage file degrades to the same fail-open result.
- *  - Write refusal is intentional. When the data's major version is AHEAD of
- *    the major the tooling understands, the data was pushed by newer tooling
- *    (SVN model) — writing under old code risks silently dropping content
- *    that newer code would have understood (see forge-hook.js buildSchemaWarning
- *    for the mirror-image danger: tooling older than repo). `assertWrite`
- *    returns `{ ok: false }` in that case; it does not throw — the caller
- *    (CLI here, and the 4 fragment-store readers in T04) decides whether that
- *    becomes a thrown error or a non-zero exit.
+ *  - Read is fail-open, unconditionally, in ALL THREE states above. A repo with
+ *    no stamp, a stamp neither side can parse, or a stamp that cannot be read at
+ *    all behaves exactly like today on the read side. `guardRead` never throws:
+ *    every branch is wrapped so a missing cwd or a garbage file degrades to the
+ *    same fail-open result. Reading must never be the thing that breaks.
+ *  - Write refusal is intentional, and there are TWO conditions for it:
+ *    (1) The data's major version is AHEAD of the major the tooling understands:
+ *        the data was pushed by newer tooling (SVN model) — writing under old
+ *        code risks silently dropping content that newer code would have
+ *        understood (see forge-hook.js buildSchemaWarning for the mirror-image
+ *        danger: tooling older than repo).
+ *    (2) The stamp EXISTS BUT COULD NOT BE READ (`unreadable`). A guard that
+ *        could not read the stamp knows nothing about direction, and "I could
+ *        not measure it" is not evidence of safety in either direction (the
+ *        precedent from PR #68: an unanswered question is not evidence). Before
+ *        this, a directory named `.gsd/SCHEMA-VERSION` disabled the write guard
+ *        silently — found by dogfood on PR #70. Absence is NOT this state:
+ *        absence is a legitimate, common, pre-stamp repo and still writes.
+ *    In both cases `assertWrite` returns `{ ok: false }`; it does not throw —
+ *    the caller (CLI here, and the 4 fragment-store writers in T04) decides
+ *    whether that becomes a thrown error or a non-zero exit.
  *  - Only the MAJOR component decides direction. `cmpSemver` still compares
  *    all three components and stays exported for reuse/compat, but the guard
  *    itself only looks at `parsed[0]`. A minor/patch bump on either side is
@@ -28,10 +44,12 @@
 
 const path = require('path');
 
-// readSchemaVersion(cwd) is the single source of truth for reading
-// `.gsd/SCHEMA-VERSION` (fail-open, returns null on any read error). This
-// module deliberately does not reimplement file reading.
-const { readSchemaVersion } = require('./forge-migrate.js');
+// readSchemaVersionDetailed(cwd) is the single source of truth for reading
+// `.gsd/SCHEMA-VERSION`. This module deliberately does not reimplement file
+// reading. The Detailed variant (not the plain `readSchemaVersion`, which
+// collapses every failure into null) is used because the write side must tell
+// "absent" apart from "unreadable" — see the three-state table above.
+const { readSchemaVersionDetailed } = require('./forge-migrate.js');
 
 // ── parseSchemaSemver ────────────────────────────────────────────────────────
 // Parses the semver embedded in a schema string ("fragment-store@1.0.0" →
@@ -67,8 +85,15 @@ function defaultToolingSchema() {
 }
 
 // ── checkSchemaDirection ──────────────────────────────────────────────────────
-// { ok, ahead, dataSchema, toolingSchema, message }
+// { ok, ahead, unreadable, errno, dataSchema, toolingSchema, message }
 // ahead === true only when BOTH sides parse and major(data) > major(tooling).
+// unreadable === true when the stamp exists but could not be read; it is a
+// SEPARATE axis from `ahead` (an unreadable stamp yields ahead:false, because
+// direction was never measured). Both `unreadable` and `errno` are additive
+// fields: every consumer reads named fields, none spreads or iterates this
+// object, so adding them cannot change existing behaviour — but the write side
+// MUST NOT collapse them into `ahead:false` again, which is exactly the bug
+// this closes.
 function checkSchemaDirection(cwd, opts) {
   const options = opts || {};
   const toolingSchema = typeof options.toolingSchema === 'string'
@@ -76,24 +101,38 @@ function checkSchemaDirection(cwd, opts) {
     : defaultToolingSchema();
 
   let dataSchema = null;
+  let unreadable = false;
+  let errno = null;
   try {
-    dataSchema = readSchemaVersion(cwd);
+    const read = readSchemaVersionDetailed(cwd);
+    dataSchema = read.value;
+    unreadable = read.unreadable === true;
+    errno = read.errno;
   } catch (_) {
+    // The reader is documented never to throw; if it somehow does, we know even
+    // less than in the unreadable case. Stay on the historical fail-open path
+    // rather than inventing a state we did not measure.
     dataSchema = null;
+    unreadable = false;
+    errno = null;
   }
 
   const dataParsed = parseSchemaSemver(dataSchema);
   const toolingParsed = parseSchemaSemver(toolingSchema);
 
-  // Fail-open: absent/unparseable on either side is never "ahead".
+  // Fail-open on DIRECTION: absent/unparseable on either side is never "ahead".
+  // `unreadable` still travels out of here untouched — the read side ignores it,
+  // the write side refuses on it.
   if (!dataParsed || !toolingParsed) {
-    return { ok: true, ahead: false, dataSchema, toolingSchema, message: null };
+    return { ok: true, ahead: false, unreadable, errno, dataSchema, toolingSchema, message: null };
   }
 
   const ahead = dataParsed[0] > toolingParsed[0];
   return {
     ok: true,
     ahead,
+    unreadable,
+    errno,
     dataSchema,
     toolingSchema,
     message: ahead
@@ -114,11 +153,33 @@ function formatSchemaWarning(res) {
   ].join('\n');
 }
 
+// ── formatUnreadableStampRefusal ──────────────────────────────────────────────
+// High-visibility pt-BR refusal string for the `unreadable` write case. It is
+// deliberately NOT formatSchemaWarning: that one interpolates res.dataSchema,
+// which is null on this path, and would claim "O dado em .gsd/SCHEMA-VERSION
+// (null) está à frente da tooling" — an assertion about a direction that was
+// never measured. Names the errno instead, because the errno is the only thing
+// we actually know, and it is what tells the operator what to fix (EISDIR: a
+// directory sits where the file belongs; EACCES/EPERM: permissions).
+function formatUnreadableStampRefusal(res) {
+  const header = '⚠️ ATENÇÃO — .gsd/SCHEMA-VERSION existe mas não pôde ser lido';
+  const errno = res && res.errno ? res.errno : 'desconhecido';
+  return [
+    header,
+    `A leitura de .gsd/SCHEMA-VERSION falhou com ${errno}, então a direção do schema não pôde ser verificada.`,
+    'Escrita recusada: um guard que não conseguiu medir o schema não pode autorizar a escrita.',
+    'Verifique o caminho .gsd/SCHEMA-VERSION (ele deve ser um ARQUIVO legível) e tente de novo.',
+  ].join('\n');
+}
+
 // ── guardRead ──────────────────────────────────────────────────────────────
 // { ok: true, partial: <ahead>, warning: <string|null> } — never throws.
 function guardRead(cwd, opts) {
   try {
     const res = checkSchemaDirection(cwd, opts);
+    // NOTE: `res.unreadable` is deliberately NOT consulted here. The read side
+    // stays fail-open in all three stamp states — only the write side refuses.
+    // The asymmetry is the design (see the table at the top of this file).
     if (!res.ahead) return { ok: true, partial: false, warning: null };
     return { ok: true, partial: true, warning: formatSchemaWarning(res) };
   } catch (_) {
@@ -129,18 +190,28 @@ function guardRead(cwd, opts) {
 }
 
 // ── assertWrite ───────────────────────────────────────────────────────────────
-// { ok: <!ahead>, message: <string|null> } — returns, never throws. The
-// caller (CLI below, and the 4 fragment-store writers in T04) decides
-// whether a false `ok` becomes a thrown error or a non-zero exit.
+// { ok: <!ahead && !unreadable>, message: <string|null> } — returns, never
+// throws. The caller (CLI below, and the 4 fragment-store writers in T04)
+// decides whether a false `ok` becomes a thrown error or a non-zero exit.
 function assertWrite(cwd, opts) {
   let res;
   try {
     res = checkSchemaDirection(cwd, opts);
   } catch (_) {
-    // A runtime error while checking direction must not block a write that
-    // would otherwise be legal — treat as fail-open, mirroring guardRead.
+    // Distinguish the two error shapes: an error RAISED BY THIS CHECK ITSELF
+    // (unexpected runtime fault in the guard's own code) must not block a write
+    // that would otherwise be legal, so this stays fail-open. An error READING
+    // THE STAMP is a different thing entirely — it never reaches this catch,
+    // because the reader reports it as `res.unreadable` below, and that path
+    // REFUSES. This catch used to be the only line of defense and was
+    // unreachable for the real EISDIR case (PR #70 dogfood); it is now the
+    // narrow net it was always meant to be.
     return { ok: true, message: null };
   }
+  // Refuse first on "could not read the stamp": at this point `ahead` is false
+  // only because direction was never measured, so checking `ahead` first would
+  // hand back an allow for a repo we know nothing about.
+  if (res.unreadable) return { ok: false, message: formatUnreadableStampRefusal(res) };
   if (!res.ahead) return { ok: true, message: null };
   return { ok: false, message: formatSchemaWarning(res) };
 }
@@ -209,6 +280,7 @@ module.exports = {
   guardRead,
   assertWrite,
   formatSchemaWarning,
+  formatUnreadableStampRefusal,
   emitSchemaWarningOnce,
   guardReadAndWarn,
   assertWriteOrThrow,
@@ -260,10 +332,15 @@ function main() {
     const res = checkSchemaDirection(cwd, {});
     if (res.ahead) {
       process.stderr.write(`${formatSchemaWarning(res)}\n`);
+    } else if (res.unreadable) {
+      // Diagnostic only — --check reports, it does not gate (exit stays 0).
+      process.stderr.write(`${formatUnreadableStampRefusal(res)}\n`);
     }
     process.stdout.write(`${JSON.stringify({
       ok: res.ok,
       ahead: res.ahead,
+      unreadable: res.unreadable,
+      errno: res.errno,
       dataSchema: res.dataSchema,
       toolingSchema: res.toolingSchema,
       message: res.message,

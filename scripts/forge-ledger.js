@@ -53,9 +53,15 @@ const LEDGER_DIR = '.gsd/ledger';
 // read warning and the write refusal.
 //
 // SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
-// only. The seam stays FAIL-OPEN on runtime errors raised by the guard's own
-// checks (see assertWrite in forge-schema-guard.js) — that policy was reviewed
-// and kept as is.
+// only — it is about LOADING the guard, not about what the guard decides.
+// The seam stays FAIL-OPEN on an unexpected runtime error raised inside the
+// guard's own check (see the catch in assertWrite, forge-schema-guard.js).
+// It is NOT fail-open on a stamp the guard could not READ: that case refuses
+// the write, naming the errno. This note used to say the fail-open of
+// assertWrite had been reviewed and kept as is — the PR #70 dogfood revised
+// that decision: a directory at .gsd/SCHEMA-VERSION disabled the write guard
+// silently, so "unreadable" now closes, while "absent" and "present but
+// garbage" stay open.
 function schemaGuard() {
   try {
     return require('./forge-schema-guard');
