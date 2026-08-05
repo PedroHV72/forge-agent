@@ -9116,9 +9116,17 @@ function smokeRoutingDomains() {
       `(a) ${name} has exact "ROUTING_DOMAINS" count (expected ${EXPECTED[name]}, got ${count})`);
   }
 
-  // (b) canonical templates carry the placeholder form, not a hardcoded value.
-  assert(contents['shared/forge-dispatch.md'].includes('ROUTING_DOMAINS: {routing_domains}'),
-    '(b) canonical templates use the {routing_domains} placeholder');
+  // (b) The EXECUTABLE templates carry the placeholder form, not a hardcoded value.
+  // Repointed (review R1, conceded): this assert used to read shared/forge-dispatch.md and call it
+  // "canonical templates". That file is prose documentation — its own header calls its template
+  // bodies compatibility reference. The renderer reads shared/templates/dispatch/ (forge-prompt.js
+  // candidateTemplateRoots), so the old target could stay green while the shipping template lost
+  // the declaration. Section 92 covers the rendered output; this covers the declaration at rest.
+  for (const rel of ['plan-slice.md', 'plan-milestone.md']) {
+    const tpl = fs.readFileSync(path.join(repo, 'shared', 'templates', 'dispatch', rel), 'utf8');
+    assert(tpl.includes('ROUTING_DOMAINS: {routing_domains}'),
+      `(b) executable template ${rel} declares the {routing_domains} placeholder`);
+  }
 
   // (c) Inline-path mirrors derive via the canonical helper. The renderer now owns auto/next injection.
   for (const name of ['skills/forge-task/SKILL.md', 'skills/forge-new-milestone/SKILL.md']) {
@@ -9496,8 +9504,16 @@ function smokeWorkspaceRepos() {
     const got = contents[file].split('WORKSPACE_REPOS').length - 1;
     assert(got === count, `(a) ${file} has exact WORKSPACE_REPOS count (expected ${count}, got ${got})`);
   }
-  assert(contents['shared/forge-dispatch.md'].includes('WORKSPACE_REPOS: {workspace_repos}'),
-    '(b) canonical plan-slice template uses the workspace repo placeholder');
+  // Repointed (review R1, conceded) — same reasoning as Section 61(b): assert the EXECUTABLE
+  // template, not the prose doc. Also pins the asymmetry at rest: plan-milestone must NOT declare
+  // it, because repo: is a T##-PLAN frontmatter field and T##-PLAN only exists at plan-slice.
+  {
+    const dispatchTpl = rel => fs.readFileSync(path.join(repoRoot, 'shared', 'templates', 'dispatch', rel), 'utf8');
+    assert(dispatchTpl('plan-slice.md').includes('WORKSPACE_REPOS: {workspace_repos}'),
+      '(b) executable plan-slice template declares the {workspace_repos} placeholder');
+    assert(!dispatchTpl('plan-milestone.md').includes('WORKSPACE_REPOS'),
+      '(b) executable plan-milestone template declares NO workspace repo placeholder (asymmetry is substantive)');
+  }
   // The renderer now owns auto/next injection; only forge-task remains an inline path.
   for (const file of ['skills/forge-task/SKILL.md']) {
     assert(/forge-repos\.js" --list/.test(contents[file]),
