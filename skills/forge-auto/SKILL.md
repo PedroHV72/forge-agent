@@ -469,15 +469,6 @@ fi
 
 `unit_effort` (and `$EFFORT`/`$EFFORT_REASON` for the dispatch event) are set by the resolver above. Inject `effort: {unit_effort}` and (for opus/fable phases) `thinking: {THINKING_OPUS}` into the worker prompt header.
 
-**Valid domain and repo lists (plan-slice/plan-milestone only):** derive and inject them into the worker prompt header, right after `thinking:`, replacing the `{routing_domains}` and `{workspace_repos}` placeholders in the template:
-```bash
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-routing.js ] && echo scripts || echo "$HOME/.claude/scripts")
-ROUTING_DOMAINS=$(node "$FORGE_SCRIPTS_DIR/forge-routing.js" --list-domains --cwd "$WORKING_DIR" \
-  | node -e 'const a=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(a.length?a.join(", "):"(none — omit domain:)")')
-WORKSPACE_REPOS=$(node "$FORGE_SCRIPTS_DIR/forge-repos.js" --list --cwd "$WORKING_DIR" \
-  | node -e 'const l=require("fs").readFileSync(0,"utf8").split("\n").map(s=>s.trim()).filter(Boolean).map(p=>p.split(/[\\/]/).pop());process.stdout.write(l.length>1?l.join(", "):"(single repo — omit repo:)")')
-```
-
 **Batch determination (step 1.6 — execute-task only):** When `unit_type == execute-task`, the dispatch is no longer strictly single-task. Invoke `scripts/forge-parallelism.js` to compute a **ready batch** — a set of tasks in the active slice whose `depends:[]` are satisfied AND whose `writes:[]` don't overlap with each other.
 
 ```bash

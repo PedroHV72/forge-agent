@@ -15,7 +15,7 @@ const {
   cleanupPrompt,
   _private,
 } = require('./forge-prompt.js');
-const { truncateChars, truncateContext, boundStandards } = _private;
+const { truncateChars, truncateContext, boundStandards, NO_DOMAINS_NOTICE, SINGLE_REPO_NOTICE } = _private;
 const { countTokens } = require('./forge-tokens.js');
 
 const SCRIPT = path.join(__dirname, 'forge-prompt.js');
@@ -75,6 +75,18 @@ function baseOptions(cwd, unitType) {
     mustHavesCheckResults: 'pass: 4\nwarn: 0\nfail: 0',
     memories: ['Prefer deterministic inputs', 'Keep prompts bounded'],
   };
+}
+
+function withIsolatedHome(home, fn) {
+  const oldHome = process.env.HOME;
+  const oldUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try { return fn(); }
+  finally {
+    if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+    if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile;
+  }
 }
 
 test('declares every currently dispatched unit type', () => {
@@ -243,6 +255,68 @@ test('does not load optional memory or standards for templates that do not refer
   });
   assert.strictEqual(memoryCalls, 0);
   assert.ok(result.prompt.includes('Complete GSD milestone M001'));
+});
+
+test('renders routing domains and workspace repositories through the plan-slice renderer path', () => {
+  const cwd = tempWorkspace('routing-positive');
+  const home = path.join(cwd, 'home');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  fs.mkdirSync(path.join(cwd, 'api', '.git'), { recursive: true });
+  fs.mkdirSync(path.join(cwd, 'web', '.git'), { recursive: true });
+  // The routing block MUST come from the jsonc layer. A bare legacy
+  // `claude-agent-prefs.md` is a deliberate hard-stop after the prefs cutover
+  // (`legacy-md-without-jsonc`), which makes readPrefsCached return ok:false and
+  // listDomains() return [] — so a .md fixture silently exercises the DEGRADATION
+  // path while claiming to be the positive case. See shared/forge-prefs-cutover.md.
+  fs.writeFileSync(
+    path.join(cwd, '.gsd', 'forge-prefs.jsonc'),
+    JSON.stringify({ routing: { alpha: {}, beta: {} } }, null, 2),
+  );
+  withIsolatedHome(home, () => {
+    const result = renderPrompt({ ...baseOptions(cwd, 'plan-slice'), routingDomains: ' ', workspaceRepos: ' ' });
+    assert.match(result.prompt, /^ROUTING_DOMAINS: alpha, beta$/m);
+    assert.match(result.prompt, /^WORKSPACE_REPOS: (?:api, web|web, api)$/m);
+  });
+});
+
+test('degrades routing and repository headers to non-empty exported notices', () => {
+  const cwd = tempWorkspace('routing-degrade');
+  const home = path.join(cwd, 'home');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  withIsolatedHome(home, () => {
+    const result = renderPrompt(baseOptions(cwd, 'plan-slice'));
+    const domains = result.prompt.match(/^ROUTING_DOMAINS: (.*)$/m)[1];
+    const repos = result.prompt.match(/^WORKSPACE_REPOS: (.*)$/m)[1];
+    assert.strictEqual(domains, NO_DOMAINS_NOTICE);
+    assert.strictEqual(repos, SINGLE_REPO_NOTICE);
+    for (const value of [domains, repos]) assert.ok(value !== '' && value != null);
+  });
+});
+
+test('malformed routing prefs degrade instead of throwing or rendering silence', () => {
+  const cwd = tempWorkspace('routing-malformed');
+  const home = path.join(cwd, 'home');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  // Malformed in the layer that is actually READ (jsonc), not the legacy .md one.
+  // A .md fixture here would degrade for the wrong reason (cutover hard-stop rather
+  // than a parse failure), so the assert would pass without ever exercising the
+  // malformed-config path it names.
+  fs.writeFileSync(path.join(cwd, '.gsd', 'forge-prefs.jsonc'), '{ "routing": { "alpha": ');
+  withIsolatedHome(home, () => {
+    const result = renderPrompt(baseOptions(cwd, 'plan-slice'));
+    assert.strictEqual(result.prompt.match(/^ROUTING_DOMAINS: (.*)$/m)[1], NO_DOMAINS_NOTICE);
+  });
+});
+
+test('does not resolve workspace repositories for templates without the placeholder', () => {
+  const cwd = tempWorkspace('routing-gate');
+  const home = path.join(cwd, 'home');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  withIsolatedHome(home, () => {
+    const poison = 'POISONED-WORKSPACE-REPOS';
+    const result = renderPrompt({ ...baseOptions(cwd, 'plan-milestone'), workspaceRepos: poison });
+    assert.ok(!result.prompt.includes(poison));
+  });
 });
 
 test('renders the same prompt body for identical inputs', () => {

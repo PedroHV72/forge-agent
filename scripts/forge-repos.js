@@ -85,6 +85,10 @@ function discoverRepos(cwd, opts) {
   return candidates;
 }
 
+function repoNames(cwd) {
+  return discoverRepos(cwd).map(p => path.basename(p));
+}
+
 // ── CLI ─────────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
   const args = {};
@@ -129,4 +133,4 @@ Flags:
 
 if (require.main === module) cliMain();
 
-module.exports = { discoverRepos, readReposPrefs, globMatch };
+module.exports = { discoverRepos, repoNames, readReposPrefs, globMatch };
