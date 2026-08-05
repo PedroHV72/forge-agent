@@ -14,15 +14,23 @@ const {
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-review-emit-'));
 const CLI = path.join(__dirname, 'forge-review-emit.js');
-const base = { milestone: 'M134', slice: 'S02', ts: '2026-08-05T01:06:45Z' };
+// `authorEngine` is part of the base because it is REQUIRED: the emitter
+// refuses a row whose intra_family_debate it cannot derive (asserted below).
+const base = {
+  milestone: 'M134', slice: 'S02', ts: '2026-08-05T01:06:45Z', authorEngine: 'claude',
+};
 
 // ── The canonical shape is complete, always ─────────────────────────────────
 // The defect this emitter closes was field OMISSION, not field corruption:
 // 265 hand-written events produced 151 key shapes. Every row must carry the
 // full key set so aggregation across a history is possible at all.
+// `author_engine` is carried, not merely consumed: a reader that cannot see the
+// author cannot recompute intra_family_debate, and cannot separate "the two
+// debaters agreed on a family that is not the author's" from "everyone,
+// including the author, is in one family". Both collapse; the field says which.
 const CANONICAL_KEYS = [
   'ts', 'event', 'milestone', 'slice', 'style', 'rounds', 'counts',
-  'conceded_fixed', 'engine', 'challenger', 'advocate',
+  'conceded_fixed', 'engine', 'author_engine', 'challenger', 'advocate',
   'intra_family_debate', 'intra_family_withdrawn',
 ];
 const minimal = buildReviewEvent(base);
@@ -45,20 +53,33 @@ const s01 = buildReviewEvent({
 });
 assert.strictEqual(s01.event.intra_family_debate, false, 'cross-family challenger');
 
-// A claude author defended by claude and challenged by claude is same-family
-// throughout — the author is IN that family, so this is the designed pairing,
-// not a collapse.
+// A claude author, challenged by claude, defended by claude: one family holds
+// all three roles. This is the SHIPPED default (`challenger: claude`,
+// `advocate: claude`, and an explicit path that assumes a claude author), and
+// it IS the collapse — the challenge carries the author's own family bias,
+// which is the whole reason M006 wants the challenger cross-family. Excusing it
+// as "the author is in that family too" would pin the flag at false on every
+// review of every default-configured project: the same silence this emitter
+// exists to end, re-entering through the derivation.
 const allClaude = buildReviewEvent({
   ...base, authorEngine: 'claude', challenger: 'claude', advocate: 'fable',
 });
-assert.strictEqual(allClaude.event.intra_family_debate, false, 'author inside the family');
+assert.strictEqual(allClaude.event.intra_family_debate, true, 'shipped defaults collapse too');
+assert.strictEqual(allClaude.event.author_engine, 'claude', 'author recorded, not just consumed');
 
-// Forward guard for --mode defend: once a gpt advocate exists, a gpt author
-// defended by gpt and challenged by gpt must NOT read as intra-family. The
-// original bash compared a family to an engine ('gpt' != 'codex' → true) and
-// would have inverted exactly here.
-const gptDefend = buildReviewEvent({
+// The same shape one family over — the flag is not Claude-specific.
+const gptOnly = buildReviewEvent({
   ...base, authorEngine: 'codex', challenger: 'codex', advocate: 'gpt-5.6-sol',
+});
+assert.strictEqual(gptOnly.event.intra_family_debate, true, 'collapse is family-agnostic');
+
+// Forward guard for --mode defend, on the exact case where the original bash
+// inverted: a gpt author DEFENDED by gpt (the designed pairing) and challenged
+// by claude is a genuine cross-family debate. `$ADVOCATE_FAMILY != $AUTHOR_ENGINE`
+// read 'gpt' != 'codex' → true and would have condemned this healthy pairing as
+// a collapse. Comparing family to family gets it right.
+const gptDefend = buildReviewEvent({
+  ...base, authorEngine: 'codex', challenger: 'claude', advocate: 'gpt-5.6-sol',
 });
 assert.strictEqual(
   gptDefend.event.intra_family_debate, false,
@@ -68,6 +89,38 @@ assert.strictEqual(familyOf('codex'), 'gpt');
 assert.strictEqual(familyOf('gpt-5.6-sol'), 'gpt');
 assert.strictEqual(familyOf('fable'), 'claude');
 assert.strictEqual(familyOf(''), null);
+
+// ── An author it cannot resolve is refused, never defaulted to `false` ───────
+// `false` reads as "measured, no collapse". Deriving it from an author the
+// emitter could not identify would publish that claim without the measurement —
+// the failure this file exists to make impossible, aimed at the flag itself.
+const noAuthor = buildReviewEvent({
+  milestone: 'M134', slice: 'S02', challenger: 'claude', advocate: 'fable',
+});
+assert.ok(
+  noAuthor.errors.some((e) => /--author-engine is required/.test(e)),
+  'a missing author is an error, not a silent false'
+);
+const unknownAuthor = buildReviewEvent({ ...base, authorEngine: 'banana' });
+assert.ok(
+  unknownAuthor.errors.some((e) => /did not resolve to a known family/.test(e)),
+  'an unrecognized author is an error, not a silent false'
+);
+// And the refusal reaches the process: exit 2, nothing appended.
+const refusedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-review-emit-refuse-'));
+let refusedStatus = 0;
+try {
+  execFileSync(process.execPath, [CLI, '--cwd', refusedDir, '--milestone', 'M1', '--slice', 'S1'], {
+    stdio: 'pipe',
+  });
+} catch (err) {
+  refusedStatus = err.status;
+}
+assert.strictEqual(refusedStatus, 2, 'CLI exits 2 without an author engine');
+assert.strictEqual(
+  fs.existsSync(path.join(refusedDir, '.gsd', 'forge', 'events.jsonl')), false,
+  'a refused invocation writes no row at all'
+);
 
 // ── The withdrawn count cannot contradict the flag ──────────────────────────
 const clamped = buildReviewEvent({
@@ -134,7 +187,10 @@ assert.strictEqual(
   fs.existsSync(path.join(cliDir, '.gsd', 'forge', 'events.jsonl')), false,
   'a refused invocation writes no row'
 );
-const dry = run(['--cwd', cliDir, '--milestone', 'M134', '--slice', 'S02', '--dry-run', '--json']);
+const dry = run([
+  '--cwd', cliDir, '--milestone', 'M134', '--slice', 'S02',
+  '--author-engine', 'claude', '--dry-run', '--json',
+]);
 assert.strictEqual(dry.code, 0);
 assert.strictEqual(fs.existsSync(path.join(cliDir, '.gsd', 'forge', 'events.jsonl')), false, 'dry-run writes nothing');
 const wrote = run([

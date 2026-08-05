@@ -2495,6 +2495,17 @@ function smokeChallengerWiring() {
   assert(spec.includes('forge-review-emit.js'), 'spec Step 8 calls the event emitter', 'token not found');
   assert(spec.includes('Never hand-write this row'), 'spec Step 8 forbids hand-writing the event', 'prohibition not found');
   assert(/derived by the emitter/.test(spec), 'spec states intra_family_debate is derived, not passed', 'token not found');
+  // The derivation must not excuse the shipped default (claude author, claude
+  // challenger, claude advocate) as "not a collapse" — that clause would pin the
+  // flag at false on every default-configured review, which is the silence the
+  // emitter was built to end. And the author has to be IN the row: a reader who
+  // cannot see it cannot recompute the flag it was derived from.
+  assert(spec.includes('"author_engine"'), 'spec Step 8 event carries author_engine', 'token \'"author_engine"\' not found');
+  assert(
+    /`--author-engine` is required/.test(spec),
+    'spec Step 8 requires --author-engine',
+    'an author the emitter cannot resolve must be refused, never derived as false'
+  );
 
   // ── Step 3 can route to an external defender ─────────────────────────────
   // Without this branch `advocate: auto` is decorative for a GPT/Gemini author:

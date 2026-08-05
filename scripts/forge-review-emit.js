@@ -26,10 +26,27 @@
  * 'gpt' != 'codex' is true for the same family and the flag inverts. This
  * module maps both sides to a family first and compares like with like.
  *
+ * The flag means what its name says: the two debaters came from ONE family.
+ * It deliberately does NOT also require that family to differ from the
+ * author's. That extra clause looks like a refinement and is actually a blind
+ * spot: under the SHIPPED defaults (`challenger: claude`, `advocate: claude`,
+ * and an explicit path that assumes `AUTHOR_ENGINE=claude`) every debater and
+ * the author land in one family, so the clause would hold the flag at `false`
+ * on every review of every default-configured project — a debate with zero
+ * cross-family adversarialidade filed as "no collapse". That is the same
+ * silence this emitter was built to end, re-entering through the derivation.
+ * A Claude challenging Claude-authored code defended by Claude IS the collapse,
+ * whether or not the author shares the room.
+ *
+ * `author_engine` is therefore recorded, not just consumed: a reader that
+ * cannot see the author cannot recompute the flag, and cannot tell the two
+ * collapse shapes apart (debaters agreeing across the author's family vs.
+ * everyone in the author's family). Both are `true`; the field says which.
+ *
  * CLI:
  *   node forge-review-emit.js --cwd <dir> --milestone <id> --slice <id>
  *     [--events <file>] [--style dialectic|flags] [--rounds N]
- *     [--engine agents|workflow] [--author-engine claude|codex|gemini]
+ *     [--engine agents|workflow] --author-engine claude|codex|gemini
  *     [--challenger claude|codex|gemini] [--advocate <alias>]
  *     [--resolved N] [--conceded N] [--open N] [--conceded-fixed N]
  *     [--intra-family-withdrawn N]
@@ -154,16 +171,33 @@ function buildReviewEvent(opts) {
     );
   }
 
-  // Derived, never taken on the caller's word.
-  const authorFamily = familyOf(options.authorEngine);
+  // Required, not optional. The flag below is derived from this value, and a
+  // family that resolves to null would fold into `false` — the emitter writing
+  // "no collapse" for a question it could not ask. Refusing is the only honest
+  // answer available, and it is the same posture the rest of the pipeline takes
+  // toward an unanswerable probe.
+  const rawAuthorEngine =
+    typeof options.authorEngine === 'string' ? options.authorEngine.trim() : '';
+  const authorEngine = rawAuthorEngine.toLowerCase();
+  const authorFamily = familyOf(authorEngine);
+  if (rawAuthorEngine === '') {
+    errors.push(
+      '--author-engine is required (claude|codex|gemini) — ' +
+        'intra_family_debate cannot be derived without it'
+    );
+  } else if (authorFamily === null) {
+    errors.push(
+      `--author-engine did not resolve to a known family (got ${JSON.stringify(rawAuthorEngine)})`
+    );
+  }
+
+  // Derived, never taken on the caller's word. Both debaters in one family IS
+  // the collapse; the author's family is recorded alongside rather than folded
+  // into this test — see the header for the blind spot that folding creates.
   const challengerFamily = familyOf(challenger);
   const advocateFamily = advocate === null ? null : familyOf(advocate);
   const intraFamily = Boolean(
-    challengerFamily &&
-      advocateFamily &&
-      challengerFamily === advocateFamily &&
-      authorFamily &&
-      advocateFamily !== authorFamily
+    challengerFamily && advocateFamily && challengerFamily === advocateFamily
   );
 
   let intraFamilyWithdrawn = parseCount(
@@ -185,6 +219,7 @@ function buildReviewEvent(opts) {
     counts,
     conceded_fixed: concededFixed,
     engine,
+    author_engine: authorEngine,
     challenger,
     advocate,
     intra_family_debate: intraFamily,
@@ -282,7 +317,8 @@ function runCli(argv) {
     const shape = built.event.intra_family_debate ? ' intra-family=TRUE' : '';
     process.stdout.write(
       `review event: ${built.event.milestone}/${built.event.slice} ` +
-        `challenger=${built.event.challenger} advocate=${built.event.advocate}${shape}\n`
+        `author=${built.event.author_engine} challenger=${built.event.challenger} ` +
+        `advocate=${built.event.advocate}${shape}\n`
     );
   }
   return 0;
