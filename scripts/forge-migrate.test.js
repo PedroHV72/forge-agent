@@ -3,7 +3,7 @@
 //
 //   Bug: backupMonolith decided to retire a monolith to .bak purely by file
 //   presence — no SCHEMA-VERSION / fragment-store check. On a repo already
-//   migrated to fragment-store@1.0.0 whose monoliths are REGENERATED projection
+//   migrated to the prior fragment-store major whose monoliths are REGENERATED projection
 //   caches, the first `forge-migrate` (run by /forge-update) renamed those caches
 //   to .bak and never regenerated them, so they vanished from disk and skills
 //   like forge-sweep aborted with "Project not initialized".
@@ -149,6 +149,52 @@ test('already-migrated repo: monoliths are NOT retired to .bak', () => {
       assert(fs.readFileSync(path.join(cwd, rel), 'utf8') === before[i],
         `post: ${rel} content unchanged`);
     });
+  } finally {
+    rmrf(cwd);
+  }
+});
+
+test('an earlier schema major with populated fragments is already migrated', () => {
+  const cwd = mkTmp();
+  try {
+    buildMigratedRepo(cwd);
+    const legacySchema = ['fragment-store', '1.0.0'].join('@');
+    fs.writeFileSync(path.join(cwd, '.gsd', 'SCHEMA-VERSION'), legacySchema + '\n', 'utf8');
+    const res = migrate.migrateAll(cwd);
+    for (const name of STORE_NAMES) {
+      assert(res[name].skipped_reason === 'already-migrated', `${name}: legacy major should skip`);
+    }
+    for (const { rel } of MONOLITHS) assert(!bakExists(cwd, rel), `${rel}.bak must not be created`);
+  } finally {
+    rmrf(cwd);
+  }
+});
+
+test('compatible legacy stamp is refreshed only after the no-backup shortcut', () => {
+  const cwd = mkTmp();
+  try {
+    buildMigratedRepo(cwd);
+    fs.writeFileSync(path.join(cwd, '.gsd', 'SCHEMA-VERSION'), ['fragment-store', '1.0.0'].join('@') + '\n', 'utf8');
+    const result = migrate.migrateAll(cwd);
+    assert(result.schema_version_written === CURRENT_SCHEMA, 'migration refreshes the stamp to current schema');
+    for (const { rel } of MONOLITHS) {
+      assert(fs.existsSync(path.join(cwd, rel)), `${rel} cache remains present`);
+      assert(!bakExists(cwd, rel), `${rel} must not be backed up during schema refresh`);
+    }
+  } finally {
+    rmrf(cwd);
+  }
+});
+
+test('a schema newer than tooling does not use the compatible-stamp shortcut', () => {
+  const cwd = mkTmp();
+  try {
+    buildMigratedRepo(cwd);
+    fs.writeFileSync(path.join(cwd, '.gsd', 'SCHEMA-VERSION'), ['fragment-store', '99.0.0'].join('@') + '\n', 'utf8');
+    const result = migrate.migrateAll(cwd, { dryRun: true });
+    for (const name of STORE_NAMES) {
+      assert(result[name].skipped_reason !== 'already-migrated', `${name}: newer stamp is not compatible`);
+    }
   } finally {
     rmrf(cwd);
   }

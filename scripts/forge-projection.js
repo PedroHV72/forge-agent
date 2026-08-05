@@ -26,7 +26,11 @@
 
 'use strict';
 
-const fs   = require('fs');
+// This module still owns the legacy orphan file and rendered output files.
+// Store-backed projection loops use the corresponding store text accessor.
+// Keeping those paths explicit prevents future grouped-container regressions.
+// Checker memory remains intentionally out of scope for this grouped-store slice.
+const fs   = require('fs'); // retained for legacy-orphan and projection writes
 const path = require('path');
 
 const ledgerMod    = require('./forge-ledger');
@@ -138,9 +142,10 @@ function renderLedger(cwd) {
 
   // Parse everything up-front — ordering needs completed_at from the frontmatter
   const parsed = [];
-  for (const { id, path: fpath } of fragments) {
+  for (const entry of fragments) {
+    const { id } = entry;
     try {
-      const text = fs.readFileSync(fpath, 'utf8');
+      const text = ledgerMod.readFragmentText(cwd, entry);
       parsed.push({ id, frag: ledgerMod.parseFragment(text) });
     } catch (e) {
       process.stderr.write(`[forge-projection] warn: skipping ledger fragment ${id}: ${e.message}\n`);
@@ -210,10 +215,11 @@ function renderDecisions(cwd) {
   const allDecisions = [];
   const legacyOrphanBodies = [];
 
-  for (const { unitId, path: fpath } of fragments) {
+  for (const entry of fragments) {
+    const { unitId } = entry;
     let frag;
     try {
-      const text = fs.readFileSync(fpath, 'utf8');
+      const text = decisionsMod.readFragmentText(cwd, entry);
       frag = decisionsMod.parseFragment(text);
     } catch (e) {
       process.stderr.write(`[forge-projection] warn: skipping decisions fragment ${unitId}: ${e.message}\n`);
@@ -349,7 +355,8 @@ function projectMemoryEntries(cwd, opts) {
   const validRawIds = new Set();
   const pendingOrphans = [];
 
-  for (const { unitId, milestoneId, storageKey, path: fpath } of fragments) {
+  for (const entry of fragments) {
+    const { unitId, milestoneId, storageKey, path: fpath } = entry;
     // legacy-orphan: block format (not YAML-frontmatter fragment) — special-case before parseFragment
     if (unitId === 'legacy-orphan') {
       try {
@@ -368,7 +375,7 @@ function projectMemoryEntries(cwd, opts) {
 
     let frag;
     try {
-      const text = fs.readFileSync(fpath, 'utf8');
+      const text = memoryMod.readFragmentText(cwd, entry);
       frag = memoryMod.parseFragment(text);
     } catch (e) {
       process.stderr.write(`[forge-projection] warn: skipping memory fragment ${unitId}: ${e.message}\n`);

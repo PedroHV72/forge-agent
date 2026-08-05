@@ -90,7 +90,8 @@ function makeRepo(name, content) {
   return dir;
 }
 
-const TOOLING = 'fragment-store@1.0.0';
+const TOOLING = require('./forge-doctor').CURRENT_SCHEMA;
+const schema = (major, minor, patch) => `fragment-store@${major}.${minor}.${patch}`;
 
 console.log('\n=== forge-schema-guard.js — directional schema guard ===\n');
 
@@ -154,16 +155,16 @@ test('whitespace-only content: fail-open on both sides', () => {
 // ── Section 3: major(data) <= major(tooling) → clean both sides ───────────────
 console.log('\nSection 3: major(data) <= major(tooling)\n');
 
-test('equal schema (fragment-store@1.0.0): clean read + clean write', () => {
-  const dir = makeRepo('equal', 'fragment-store@1.0.0');
+test('equal schema: clean read + clean write', () => {
+  const dir = makeRepo('equal', TOOLING);
   const r = guardRead(dir, { toolingSchema: TOOLING });
   const w = assertWrite(dir, { toolingSchema: TOOLING });
   assert(r.ok === true && r.partial === false && r.warning === null, 'guardRead should be clean on equal schema');
   assert(w.ok === true && w.message === null, 'assertWrite should be clean on equal schema');
 });
 
-test('older major (fragment-store@0.9.0): clean read + clean write', () => {
-  const dir = makeRepo('older', 'fragment-store@0.9.0');
+test('older major: clean read + clean write', () => {
+  const dir = makeRepo('older', schema(0, 9, 0));
   const r = guardRead(dir, { toolingSchema: TOOLING });
   const w = assertWrite(dir, { toolingSchema: TOOLING });
   assert(r.ok === true && r.partial === false && r.warning === null, 'guardRead should be clean on older major');
@@ -173,34 +174,36 @@ test('older major (fragment-store@0.9.0): clean read + clean write', () => {
 // ── Section 4: major(data) > major(tooling) → partial read, refused write ─────
 console.log('\nSection 4: major(data) > major(tooling)\n');
 
-test('newer major (fragment-store@2.0.0): guardRead partial + warning', () => {
-  const dir = makeRepo('newer', 'fragment-store@2.0.0');
+test('newer major: guardRead partial + warning', () => {
+  const dir = makeRepo('newer', schema(99, 0, 0));
   const r = guardRead(dir, { toolingSchema: TOOLING });
   assert(r.ok === true, 'ok should still be true (read never blocked)');
   assert(r.partial === true, 'partial should be true');
   assert(typeof r.warning === 'string' && r.warning.length > 0, 'warning should be a non-empty string');
 });
 
-test('newer major (fragment-store@2.0.0): assertWrite refused', () => {
-  const dir = makeRepo('newer-write', 'fragment-store@2.0.0');
+test('newer major: assertWrite refused', () => {
+  const dir = makeRepo('newer-write', schema(99, 0, 0));
   const w = assertWrite(dir, { toolingSchema: TOOLING });
   assert(w.ok === false, 'ok should be false — write refused');
   assert(typeof w.message === 'string' && w.message.length > 0, 'message should be a non-empty string');
 });
 
 test('formatSchemaWarning cites dataSchema and toolingSchema', () => {
-  const dir = makeRepo('newer-format', 'fragment-store@2.0.0');
+  const dataSchema = schema(99, 0, 0);
+  const dir = makeRepo('newer-format', dataSchema);
   const res = checkSchemaDirection(dir, { toolingSchema: TOOLING });
   const msg = formatSchemaWarning(res);
-  assert(msg.includes('fragment-store@2.0.0'), 'warning should cite dataSchema');
+  assert(msg.includes(dataSchema), 'warning should cite dataSchema');
   assert(msg.includes(TOOLING), 'warning should cite toolingSchema');
 });
 
 // ── Section 5: minor/patch-only difference stays clean (major-only decision) ──
 console.log('\nSection 5: only major decides (regression)\n');
 
-test('minor+patch above but same major (fragment-store@1.9.9): clean both sides', () => {
-  const dir = makeRepo('minor-patch', 'fragment-store@1.9.9');
+test('minor+patch above but same major: clean both sides', () => {
+  const current = parseSchemaSemver(TOOLING);
+  const dir = makeRepo('minor-patch', schema(current[0], 9, 9));
   const r = guardRead(dir, { toolingSchema: TOOLING });
   const w = assertWrite(dir, { toolingSchema: TOOLING });
   assert(r.ok === true && r.partial === false && r.warning === null, 'guardRead must stay clean — same major');
@@ -214,7 +217,7 @@ test('cmpSemver still reports full-tuple comparison for reuse/compat', () => {
 });
 
 test('parseSchemaSemver parses and rejects correctly', () => {
-  const parsed = parseSchemaSemver('fragment-store@1.2.3');
+  const parsed = parseSchemaSemver(schema(1, 2, 3));
   assert(Array.isArray(parsed) && parsed[0] === 1 && parsed[1] === 2 && parsed[2] === 3, 'should parse major/minor/patch');
   assert(parseSchemaSemver('lixo') === null, 'unparseable string should return null');
   assert(parseSchemaSemver('') === null, 'empty string should return null');
@@ -251,7 +254,7 @@ test('assertWrite on nonexistent cwd does not throw', () => {
 });
 
 test('guardRead with malformed toolingSchema (garbage) still fail-opens', () => {
-  const dir = makeRepo('malformed-tooling', 'fragment-store@2.0.0');
+  const dir = makeRepo('malformed-tooling', schema(99, 0, 0));
   const res = guardRead(dir, { toolingSchema: 'not-a-schema-string' });
   assert(res.ok === true && res.partial === false, 'unparseable tooling schema should also fail-open');
 });
@@ -262,7 +265,7 @@ console.log('\nSection 7: CLI\n');
 const CLI_PATH = path.join(__dirname, 'forge-schema-guard.js');
 
 test('CLI --check prints one-line JSON and exits 0 (clean repo)', () => {
-  const dir = makeRepo('cli-clean', 'fragment-store@1.0.0');
+  const dir = makeRepo('cli-clean', TOOLING);
   const result = spawnSync(process.execPath, [CLI_PATH, '--check', '--cwd', dir], { encoding: 'utf8' });
   assert(result.status === 0, `expected exit 0, got ${result.status}: ${result.stderr}`);
   const lines = result.stdout.trim().split('\n');
@@ -273,7 +276,7 @@ test('CLI --check prints one-line JSON and exits 0 (clean repo)', () => {
 });
 
 test('CLI --check exits 0 even when ahead:true (diagnostic, not a gate)', () => {
-  const dir = makeRepo('cli-ahead', 'fragment-store@2.0.0');
+  const dir = makeRepo('cli-ahead', schema(99, 0, 0));
   const result = spawnSync(process.execPath, [CLI_PATH, '--check', '--cwd', dir], { encoding: 'utf8' });
   assert(result.status === 0, `expected exit 0 even when ahead, got ${result.status}`);
   const parsed = JSON.parse(result.stdout.trim());
@@ -306,13 +309,13 @@ test('CLI --check --cwd (no value) exits 2 instead of falling back to process.cw
 });
 
 test('CLI --check with a positional argument exits 2', () => {
-  const dir = makeRepo('cli-positional', 'fragment-store@1.0.0');
+  const dir = makeRepo('cli-positional', TOOLING);
   const result = spawnSync(process.execPath, [CLI_PATH, '--check', dir], { encoding: 'utf8' });
   assert(result.status === 2, `expected exit 2 for positional arg, got ${result.status}`);
 });
 
 test('CLI valid forms still exit 0 (--check alone, and --check --cwd <dir>)', () => {
-  const dir = makeRepo('cli-valid-forms', 'fragment-store@1.0.0');
+  const dir = makeRepo('cli-valid-forms', TOOLING);
   const bare = spawnSync(process.execPath, [CLI_PATH, '--check'], { encoding: 'utf8' });
   assert(bare.status === 0, `expected exit 0 for --check alone, got ${bare.status}: ${bare.stderr}`);
   const withCwd = spawnSync(process.execPath, [CLI_PATH, '--check', '--cwd', dir], { encoding: 'utf8' });

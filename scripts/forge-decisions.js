@@ -30,10 +30,22 @@ const path = require('path');
 const crypto = require('crypto');
 const { isValid, entityKind } = require('./forge-ids');
 const yamlSafe = require('./forge-yaml-safe');
+const { isGroupedFile, readGroupedUnits, readSniffBuffer, publicEntry, unitTextOf } = require('./forge-grouped-file');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const DECISIONS_DIR = '.gsd/decisions';
+
+// Grouped containers are a read format only. listFragments exposes one
+// envelope per decision unit and preserves the physical container path;
+// readFragmentText extracts only the selected member payload.
+// Parse warnings remain on stderr so the JSON list output stays compatible.
+// Loose entries are collected before containers to make precedence stable.
+// readFragment checks the loose fragment path first and only scans grouped
+// entries when that path is absent. The grouped-file helper remains the sole
+// implementation of marker parsing and payload extraction.
+//
+// Both fields are envelope metadata; the parsed decision data is unchanged.
 
 // Pattern for forge-ask session IDs: ask-<session-id>
 const ASK_ID_RE = /^ask-[A-Za-z0-9._-]+$/;
@@ -400,9 +412,10 @@ function serializeFrontmatter(fragment) {
 // Returns { path: string, created: boolean }
 // created: false if content is identical after merge (idempotent).
 function writeFragment(cwd, fragment, opts) {
-  if (opts === undefined) opts = {};
   // Refuse before any merge or serialization — nothing reaches disk.
+  // Grouped containers are never edited; this always writes fragmentPath().
   assertWriteHere(cwd);
+  if (opts === undefined) opts = {};
   if (!fragment || !fragment.unit_id) {
     throw new Error('fragment.unit_id is required');
   }
@@ -458,9 +471,18 @@ function readFragment(cwd, unitId) {
     throw e; // propagate invalid id error
   }
 
-  if (!fs.existsSync(fpath)) return null;
-  const text = fs.readFileSync(fpath, 'utf8');
-  return parseFragment(text);
+  if (fs.existsSync(fpath)) return parseFragment(fs.readFileSync(fpath, 'utf8'));
+  const entry = listFragments(cwd).find(item => item.unitId === unitId);
+  return entry ? parseFragment(readFragmentText(cwd, entry)) : null;
+}
+
+function readFragmentText(cwd, entry) {
+  if (!entry || !entry.path) throw new Error('fragment entry is required');
+  if (!entry.grouped) return fs.readFileSync(entry.path, 'utf8');
+  const parsed = readGroupedUnits(entry.path);
+  const unit = parsed.units.find(item => item.id === entry.unitId);
+  if (!unit) throw new Error(`Grouped decisions unit not found: ${entry.unitId}`);
+  return unitTextOf(unit.content);
 }
 
 // ── listFragments ─────────────────────────────────────────────────────────────
@@ -472,14 +494,43 @@ function listFragments(cwd) {
   const dir = decisionsDir(cwd);
   if (!fs.existsSync(dir)) return [];
 
-  const files = fs.readdirSync(dir);
-  const fragments = files
-    .filter(f => f.endsWith('.md'))
-    .map(f => ({
-      unitId: f.slice(0, -3), // strip .md
-      path: path.join(dir, f),
-    }))
-    .sort((a, b) => a.unitId.localeCompare(b.unitId));
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.md'));
+  const looseIds = new Set();
+  const fragments = [];
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    // A failed sniff (null) means "not classified as a container": the entry is
+    // still returned and the read error stays with the consumer, one unit at a
+    // time, as it did before grouping existed. See readSniffBuffer.
+    const buffer = readSniffBuffer(filePath);
+    // Unreadable AND epoch-shaped: pushing it as a loose fragment named
+    // `2026-Q1` would make every unit inside it vanish with nothing on stderr.
+    if (buffer === null && isGroupedFile(file)) {
+      process.stderr.write(`[forge-decisions] warn: container ${file}: container-unreadable — unidades não listadas\n`);
+      continue;
+    }
+    if (buffer !== null && isGroupedFile(file, buffer)) continue;
+    const unitId = file.slice(0, -3);
+    looseIds.add(unitId);
+    fragments.push({ unitId, path: filePath, grouped: false, epoch: null });
+  }
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const buffer = readSniffBuffer(filePath);
+    if (buffer === null || !isGroupedFile(file, buffer)) continue;
+    const parsed = readGroupedUnits(filePath);
+    for (const error of parsed.errors) {
+      process.stderr.write(`[forge-decisions] warn: container ${file} id ${error.id || '<unknown>'}: ${error.reason}\n`);
+    }
+    for (const unit of parsed.units) {
+      if (looseIds.has(unit.id)) {
+        process.stderr.write(`[forge-decisions] warn: unidade ${unit.id} existe solta e em ${file} — usando a solta\n`);
+        continue;
+      }
+      fragments.push({ unitId: unit.id, path: filePath, grouped: true, epoch: parsed.epoch });
+    }
+  }
+  fragments.sort((a, b) => a.unitId.localeCompare(b.unitId));
 
   return fragments;
 }
@@ -492,6 +543,7 @@ module.exports = {
   parseFragment,
   writeFragment,
   readFragment,
+  readFragmentText,
   listFragments,
 };
 
@@ -672,7 +724,9 @@ function cliMain(argv) {
     // Bare JSON ARRAY — data, not an envelope. No schema_partial key here (see
     // the same note in forge-ledger.js): the partial signal for array-shaped
     // stdout travels on stderr only, emitted inside listFragments.
-    const result = listFragments(cwd);
+    // Projected through publicEntry for the same reason as forge-ledger.js:
+    // rich library entries, frozen CLI row keys, one shared projection.
+    const result = listFragments(cwd).map(publicEntry);
     console.log(JSON.stringify(result));
     process.exit(0);
   }

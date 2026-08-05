@@ -26,6 +26,7 @@ const { spawnSync } = require('child_process');
 
 const {
   extractCitations,
+  CITATION_REGEXES,
   resolveCitation,
   buildFileIndex,
   renderIndex,
@@ -34,6 +35,15 @@ const {
 } = require('./forge-memory-index.js');
 
 const { writeFragment } = require('./forge-memory.js');
+
+// Derived, never a literal: the fixture must mean "one major AHEAD of this
+// tooling". A hardcoded version stops being ahead the moment CURRENT_SCHEMA is
+// bumped, and the test then silently asserts the wrong scenario — which is
+// exactly how this case rotted when CURRENT_SCHEMA moved to 2.0.0. Same
+// pattern as forge-schema-guard-wiring.test.js.
+const { CURRENT_SCHEMA } = require('./forge-doctor.js');
+const TOOLING_MAJOR = Number(String(CURRENT_SCHEMA).match(/@(\d+)\./)[1]);
+const AHEAD_SCHEMA  = `fragment-store@${TOOLING_MAJOR + 1}.0.0`;
 
 // ── Test runner boilerplate (mirrors forge-verifier.test.js) ───────────────────
 
@@ -144,6 +154,169 @@ test('extractCitations: dedup by path, first occurrence wins, order preserved', 
   const cites = extractCitations('First scripts/forge-alpha.js:10, then scripts/forge-beta.js, then scripts/forge-alpha.js again.');
   assertEq(cites.map((c) => c.path), ['scripts/forge-alpha.js', 'scripts/forge-beta.js'], 'expected dedup preserving first occurrence and order');
   assertEq(cites[0].line, 10, 'first occurrence line must be kept');
+});
+
+// ── Section 1A: measured false negatives and locked pattern superset ────────
+console.log('\nSection 1A: measured false negatives and locked pattern superset\n');
+
+test('false negative: dotted TSX basename', () => {
+  const cites = extractCitations('o arquivo _preview.tsx define o preview');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, '_preview.tsx');
+  assertEq(cites[0].pattern, 'bare-basename');
+});
+
+test('false negative: dotted HTML basename in backticks', () => {
+  const cites = extractCitations('ver `template.html` no diretorio');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'template.html');
+  assertEq(cites[0].pattern, 'backticked-basename');
+});
+
+test('false negative: backticked versioned path keeps the full span and line', () => {
+  const cites = extractCitations('ver `SERVICES/services@1.2.0/src/config/config.ts` linha 10');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'SERVICES/services@1.2.0/src/config/config.ts');
+  assertEq(cites[0].line, 10);
+  assertEq(cites[0].pattern, 'backticked-path');
+});
+
+test('false negative: bare versioned path is not truncated at the version', () => {
+  const cites = extractCitations('ver SERVICES/services@1.2.0/src/config/config.ts agora');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'SERVICES/services@1.2.0/src/config/config.ts');
+  assertEq(cites[0].pattern, 'bare-path');
+});
+
+test('false negative: dotted JavaScript basename outside backticks', () => {
+  const cites = extractCitations('o teste forge-memory-index.test.js cobre isso');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'forge-memory-index.test.js');
+  assertEq(cites[0].pattern, 'bare-basename');
+});
+
+test('false negative: name@version is enumerated as package-ref', () => {
+  const cites = extractCitations('o pacote acme@1.2.0 foi citado');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'acme@1.2.0');
+  assertEq(cites[0].pattern, 'package-ref');
+  const resolved = resolveCitation(cites[0], process.cwd(), null);
+  assertEq(resolved.reason, 'package-ref');
+});
+
+test('locked citation pattern names remain present', () => {
+  const names = CITATION_REGEXES.map((entry) => entry.name);
+  for (const name of ['backticked-path', 'bare-path', 'backticked-basename', 'bare-basename']) {
+    assert(names.includes(name), `missing locked pattern ${name}`);
+  }
+});
+
+test('legacy citation forms retain their path and pattern', () => {
+  const cases = [
+    ['See `scripts/forge-alpha.js`.', 'scripts/forge-alpha.js', 'backticked-path'],
+    ['See scripts/forge-beta.js.', 'scripts/forge-beta.js', 'bare-path'],
+    ['See `forge-gamma.js`.', 'forge-gamma.js', 'backticked-basename'],
+    ['See forge-delta.js.', 'forge-delta.js', 'bare-basename'],
+    ['See `scripts/forge-epsilon.js:27`.', 'scripts/forge-epsilon.js', 'backticked-path'],
+  ];
+  for (const [text, expectedPath, expectedPattern] of cases) {
+    const hit = extractCitations(text)[0];
+    assert(hit, `expected a citation for ${text}`);
+    assertEq(hit.path, expectedPath);
+    assertEq(hit.pattern, expectedPattern);
+  }
+});
+
+test('traversal with @ is rejected before any filesystem probe', () => {
+  const cites = extractCitations('SERVICES/services@1.2.0/../../../../etc/passwd');
+  assertEq(cites.length, 1);
+  assertEq(cites[0].path, 'SERVICES/services@1.2.0/../../../../etc/passwd');
+  const realpath = fs.realpathSync;
+  const exists = fs.existsSync;
+  const stat = fs.statSync;
+  let probes = 0;
+  fs.realpathSync = function (...args) { probes++; return realpath.apply(fs, args); };
+  fs.existsSync = function (...args) { probes++; return exists.apply(fs, args); };
+  fs.statSync = function (...args) { probes++; return stat.apply(fs, args); };
+  try {
+    const resolved = resolveCitation(cites[0], process.cwd(), null);
+    assertEq(resolved.reason, 'outside-root');
+    assertEq(probes, 0, 'lexical containment must reject before disk access');
+  } finally {
+    fs.realpathSync = realpath;
+    fs.existsSync = exists;
+    fs.statSync = stat;
+  }
+});
+
+test('absolute Unix and drive-letter paths never resolve as citations', () => {
+  for (const text of ['/etc/passwd', 'C:\\Windows\\win.ini']) {
+    const cites = extractCitations(text);
+    assert(!cites.some((c) => c.path === text && resolveCitation(c, process.cwd(), null).state === 'RESOLVED'), `absolute path resolved: ${text}`);
+  }
+});
+
+test('expanded extension scan remains linear on pathological input', () => {
+  const started = Date.now();
+  const cites = extractCitations('a'.repeat(5000) + '@');
+  assert(Array.isArray(cites), 'pathological input must return an array');
+  assert(Date.now() - started < 1000, 'expanded regex scan must remain trivial');
+});
+
+// S06 R11: the case above contains no `/`, so it never ENTERS the only new
+// construct with backtracking ambiguity — `bare-path-traversal`'s nested
+// alternation `(?:/(?:[\w.\-@]+|\.{1,2}))+`. A slash-dense input is what
+// actually exercises the guard this section exists to provide.
+test('expanded extension scan remains linear on slash-dense traversal input', () => {
+  const started = Date.now();
+  const cites = extractCitations('ver ' + '../'.repeat(3000) + ' agora');
+  assert(Array.isArray(cites), 'slash-dense input must return an array');
+  assert(Date.now() - started < 1000, 'nested traversal alternation must not backtrack catastrophically');
+});
+
+// ── Section 1B: extensionless prose must not be extracted (T01 repair) ──────
+// Measured against the real reference store: an unfiltered `bare-path-traversal`
+// plus an unanchored `package-ref` inflated citations_total 3.1x (311 -> 972)
+// by matching ordinary prose. Each case below is real prose, not a citation.
+console.log('\nSection 1B: extensionless prose must not be extracted\n');
+
+test('prose "e/ou" is not extracted as a citation', () => {
+  const cites = extractCitations('usar o modo e/ou combinar');
+  assertEq(cites.length, 0, 'e/ou has a slash but no traversal segment — must not be a citation');
+});
+
+test('prose date "2026/08/04" is not extracted as a citation', () => {
+  const cites = extractCitations('a data 2026/08/04 vale');
+  assertEq(cites.length, 0, 'a slash-joined date is not a path');
+});
+
+test('prose "N/A" is not extracted as a citation', () => {
+  const cites = extractCitations('ver N/A no campo');
+  assertEq(cites.length, 0, 'N/A has a slash but no traversal segment — must not be a citation');
+});
+
+test('extensionless "SERVICES/services" without traversal is not extracted', () => {
+  const cites = extractCitations('config em SERVICES/services e pronto');
+  assertEq(cites.length, 0, 'a plain slash-joined pair without ".." or a known extension is not a citation');
+});
+
+test('prose "dev@empresa" is not extracted as package-ref (no digit-led version)', () => {
+  const cites = extractCitations('contato dev@empresa e mais');
+  assertEq(cites.length, 0, 'package-ref requires a digit-led version like acme@1.2.0');
+});
+
+test('guard: a small fixture of junk lines extracts nothing, citations_total must not inflate', () => {
+  const junkLines = [
+    'usar o modo e/ou combinar',
+    'a data 2026/08/04 vale',
+    'ver N/A no campo',
+    'config em SERVICES/services e pronto',
+    'contato dev@empresa e mais',
+    'isso e/ou aquilo, tanto faz',
+  ];
+  let total = 0;
+  for (const line of junkLines) total += extractCitations(line).length;
+  assertEq(total, 0, 'extensionless prose fixture must contribute zero citations');
 });
 
 // ── Section 2: mandatory positive case ───────────────────────────────────────
@@ -342,6 +515,69 @@ test('facts_with_resolved + facts_unresolved_only.length + facts_without_citatio
   }
 });
 
+// ── Section 6b: three coverage buckets (IN-17) ─────────────────────────────
+console.log('\nSection 6b: three labelled coverage buckets and identities\n');
+
+test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, and resolved facts', () => {
+  const root = mkStore(
+    [
+      { unitId: 'T01', text: 'Only architecture prose; no file is mentioned.', mem_id: 'mem-a' },
+      { unitId: 'T01', text: 'A token with only e.g and payload.side is ordinary prose.', mem_id: 'mem-eg' },
+      { unitId: 'T01', text: 'The malformed file-shaped token .tsx was not captured.', mem_id: 'mem-b|pipe' },
+      { unitId: 'T01', text: 'Only scripts/missing.js is mentioned.', mem_id: 'mem-c' },
+      { unitId: 'T01', text: 'Resolved in scripts/forge-alpha.js.', mem_id: 'mem-resolved' },
+    ],
+    ['scripts/forge-alpha.js'],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const coverage = result.coverage;
+    assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-a'), 'expected bucket (a)');
+    assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-eg'), 'e.g/payload.side must be bucket (a)');
+    assert(!coverage.facts_missed_by_extractor.some((f) => f.mem_id === 'mem-eg'), 'e.g/payload.side must not be bucket (b)');
+    const missed = coverage.facts_missed_by_extractor.find((f) => f.mem_id === 'mem-b|pipe');
+    assert(missed, 'expected bucket (b) enumeration');
+    assertEq(missed.storage_key, 'T01', 'bucket (b) must enumerate storage_key');
+    assertEq(missed.sample_token, '.tsx', 'bucket (b) must carry only a bounded sample token');
+    assert(coverage.facts_unresolved_only.some((f) => f.mem_id === 'mem-c'), 'expected bucket (c)');
+
+    assertEq(
+      coverage.facts_total,
+      coverage.facts_with_resolved + coverage.facts_no_file_mention.length + coverage.facts_missed_by_extractor.length + coverage.facts_unresolved_only.length,
+      'the four fact classifications must reconstruct facts_total',
+    );
+    assertEq(
+      coverage.facts_no_file_mention.length + coverage.facts_missed_by_extractor.length,
+      coverage.facts_without_citation.length,
+      'the split must reconstruct the additive legacy facts_without_citation bucket',
+    );
+
+    const md = renderIndex(result, {});
+    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator'), 'renderer must label bucket (a) and its reason');
+    assert(md.includes('(b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator'), 'renderer must label bucket (b) with the entirely-missed wording');
+    assert(md.includes('captura PARCIAL'), 'renderer must caveat that partial capture is not counted in bucket (b)');
+    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo'), 'renderer must label bucket (c) with the resolved-to-a-file wording');
+    assert(md.includes('por design não são arquivo'), 'renderer must caveat that bucket (c) mixes not-found with by-design-non-file citations');
+    assert(md.includes('`mem-b\\|pipe`'), 'renderer must escape untrusted mem_id in the defect table');
+    assert(md.includes('`T01`'), 'renderer must enumerate untrusted storage_key in the defect table');
+    assert(md.includes('`.tsx`'), 'renderer must escape and render the sample token');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('IN-17: empty store still renders all three labelled buckets at zero', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-index-test-'));
+  try {
+    const md = renderIndex(buildFileIndex(root, {}), {});
+    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator: 0'), 'bucket (a) must render at zero');
+    assert(md.includes('(b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator: 0'), 'bucket (b) must render at zero');
+    assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo: 0'), 'bucket (c) must render at zero');
+  } finally {
+    cleanup(root);
+  }
+});
+
 // ── Section 7: empty store ───────────────────────────────────────────────────
 console.log('\nSection 7: empty store — coverage section still renders\n');
 
@@ -453,7 +689,7 @@ test('.gsd/SCHEMA-VERSION ahead of tooling → result.partial true and markdown 
   const root = mkStore(
     [{ unitId: 'T01', text: 'Fixed `scripts/forge-alpha.js` today.', mem_id: 'mem-schema' }],
     ['scripts/forge-alpha.js'],
-    { schemaVersion: 'fragment-store@2.0.0' },
+    { schemaVersion: AHEAD_SCHEMA },
   );
   try {
     const result = buildFileIndex(root, {});
@@ -554,6 +790,9 @@ test('CLI: --json --cwd <fixture> exits 0 with one-line parseable JSON on stdout
     let parsed;
     assert((() => { parsed = JSON.parse(stdoutLines[0]); return true; })(), 'stdout line must be valid JSON');
     assert(typeof parsed.coverage === 'object', 'expected a coverage object in the JSON envelope');
+    assert(typeof parsed.counts.facts_no_file_mention === 'number', 'expected additive bucket (a) count in JSON');
+    assert(typeof parsed.counts.facts_missed_by_extractor === 'number', 'expected additive bucket (b) count in JSON');
+    assert(typeof parsed.counts.facts_unresolved_only === 'number', 'expected additive bucket (c) count in JSON');
   } finally {
     cleanup(root);
   }

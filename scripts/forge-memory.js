@@ -8,6 +8,7 @@
 //   parseFragment(text)                 → object  // parse markdown with YAML frontmatter
 //   writeFragment(cwd, fragment, opts)  → { path, created }
 //   readFragment(cwd, unitId, opts?)    → object | null
+//   readFragmentText(cwd, entry)        → string // selected fragment payload
 //   listFragments(cwd, opts?)           → Array<{ storageKey, unitId, milestoneId, path }>
 //   validateUnitId(unitId)              → boolean
 //   queryRelevant(query)                → bounded selector result
@@ -32,6 +33,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { isValid, entityKind } = require('./forge-ids');
 const yamlSafe = require('./forge-yaml-safe');
+const { isGroupedFile, readGroupedUnits, readSniffBuffer, publicEntry, unitTextOf } = require('./forge-grouped-file');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -739,14 +741,32 @@ function readFragment(cwd, unitId, opts) {
     throw e; // propagate invalid id error
   }
 
-  if (!fs.existsSync(fpath)) return null;
-  assertMemoryDirectory(cwd, false);
-  const targetStat = fs.lstatSync(fpath);
-  if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
-    throw new Error(`Refusing to read non-regular memory fragment: ${fpath}`);
+  if (fs.existsSync(fpath)) {
+    assertMemoryDirectory(cwd, false);
+    const targetStat = fs.lstatSync(fpath);
+    if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+      throw new Error(`Refusing to read non-regular memory fragment: ${fpath}`);
+    }
+    return parseFragment(fs.readFileSync(fpath, 'utf8'));
   }
-  const text = fs.readFileSync(fpath, 'utf8');
-  return parseFragment(text);
+
+  // A grouped container has no per-unit path.  Find its expanded envelope only
+  // after the ordinary loose-file lookup so a newly written loose fragment wins.
+  const storageKey = qualifiedStorageKey(unitId, milestoneFromOptions(opts));
+  const entry = listFragments(cwd, opts).find(item => item.storageKey === storageKey);
+  return entry ? parseFragment(readFragmentText(cwd, entry)) : null;
+}
+
+// Reads the payload represented by one listFragments() envelope. Grouped
+// envelopes all point at the physical container, so reading entry.path directly
+// would incorrectly return every member rather than this unit.
+function readFragmentText(cwd, entry) {
+  if (!entry || !entry.path) throw new Error('memory fragment entry is required');
+  if (!entry.grouped) return fs.readFileSync(entry.path, 'utf8');
+  const parsed = readGroupedUnits(entry.path);
+  const unit = parsed.units.find(item => item.id === entry.storageKey);
+  if (!unit) throw new Error(`Grouped memory unit not found: ${entry.storageKey}`);
+  return unitTextOf(unit.content);
 }
 
 // ── listFragments ─────────────────────────────────────────────────────────────
@@ -763,19 +783,58 @@ function listFragments(cwd, opts) {
     throw new Error(`Invalid memory milestone ID: "${milestoneId}"`);
   }
 
-  const fragments = fs.readdirSync(dir, { withFileTypes: true })
-    .filter(entry => {
-      if (!entry.isFile() || !entry.name.endsWith('.md')) return false;
-      const parsed = parseStorageKey(entry.name.slice(0, -3));
-      return parsed && (!milestoneId || parsed.milestoneId === milestoneId);
-    })
-    .map(entry => ({
-      ...parseStorageKey(entry.name.slice(0, -3)),
-      path: path.join(dir, entry.name),
-    }))
-    .sort((a, b) => a.storageKey.localeCompare(b.storageKey));
+  const files = fs.readdirSync(dir, { withFileTypes: true })
+    .filter(entry => entry.isFile() && entry.name.endsWith('.md'));
+  const looseKeys = new Set();
+  const fragments = [];
 
-  return fragments;
+  for (const file of files) {
+    const filePath = path.join(dir, file.name);
+    // A failed sniff (null) means "not classified as a container": the entry is
+    // still returned and the read error stays with the consumer, one unit at a
+    // time, as it did before grouping existed. See readSniffBuffer.
+    const buffer = readSniffBuffer(filePath);
+    // Unreadable AND epoch-shaped: pushing it as a loose fragment named
+    // `2026-Q1` would make every unit inside it vanish with nothing on stderr.
+    if (buffer === null && isGroupedFile(file.name)) {
+      process.stderr.write(`[forge-memory] warn: container ${file.name}: container-unreadable — unidades não listadas\n`);
+      continue;
+    }
+    if (buffer !== null && isGroupedFile(file.name, buffer)) continue;
+    const parsed = parseStorageKey(file.name.slice(0, -3));
+    if (!parsed) continue;
+    looseKeys.add(parsed.storageKey);
+    fragments.push({ ...parsed, path: filePath, grouped: false, epoch: null });
+  }
+
+  for (const file of files) {
+    const filePath = path.join(dir, file.name);
+    const buffer = readSniffBuffer(filePath);
+    if (buffer === null || !isGroupedFile(file.name, buffer)) continue;
+    const grouped = readGroupedUnits(filePath);
+    for (const error of grouped.errors) {
+      process.stderr.write(`[forge-memory] warn: container ${file.name} id ${error.id || '<unknown>'}: ${error.reason}\n`);
+    }
+    for (const member of grouped.units) {
+      const parsed = parseStorageKey(member.id);
+      if (!parsed) {
+        process.stderr.write(`[forge-memory] warn: container ${file.name} id ${member.id}: invalid storage key; discarded\n`);
+        continue;
+      }
+      if (looseKeys.has(parsed.storageKey)) {
+        process.stderr.write(`[forge-memory] warn: unidade ${member.id} existe solta e em ${file.name} — usando a solta\n`);
+        continue;
+      }
+      fragments.push({ ...parsed, path: filePath, grouped: true, epoch: grouped.epoch });
+    }
+  }
+
+  const filtered = milestoneId
+    ? fragments.filter(fragment => fragment.milestoneId === milestoneId)
+    : fragments;
+  filtered.sort((a, b) => a.storageKey.localeCompare(b.storageKey));
+
+  return filtered;
 }
 
 // Trusted in-process selector seam consumed by forge-prompt.js.  The lazy
@@ -806,10 +865,12 @@ module.exports = {
   parseFragment,
   writeFragment,
   readFragment,
+  readFragmentText,
   listFragments,
   validateUnitId,
   validateMilestoneId,
   queryRelevant,
+  ASK_ID_RE,
 };
 
 // ── cliMain ───────────────────────────────────────────────────────────────────
@@ -887,7 +948,11 @@ function cliMain(argv) {
     // live consumers (skills/forge-auto, forge-next, forge-sweep iterate it).
     // No schema_partial key: the partial signal travels on stderr only,
     // emitted inside listFragments. --query/--select DO carry the fields.
-    const result = listFragments(cwd, { milestoneId });
+    // Projected through publicEntry for the same reason as forge-ledger.js:
+    // rich library entries, frozen CLI row keys, one shared projection. The
+    // removal-based projection matters most here — this store's stable keys
+    // come from parseStorageKey, so a whitelist would drop them.
+    const result = listFragments(cwd, { milestoneId }).map(publicEntry);
     console.log(JSON.stringify(result));
     process.exit(0);
   }
