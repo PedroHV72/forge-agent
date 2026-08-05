@@ -871,7 +871,14 @@ function invokeCodexDetached(opts) {
       // POSIX → { cmd: 'codex', prefixArgs: [] } (byte-identical to a bare spawn).
       const { cmd, prefixArgs } = resolveCodexCommand();
       child = spawn(cmd, [...prefixArgs, ...args], {
-        detached: true,
+        // POSIX: detached puts codex in its own process group so the timeout below can
+        // SIGKILL the WHOLE group via `process.kill(-pid)` (codex#7852).
+        // Windows: detached leaves codex with NO console, so every shell command it runs
+        // hands off to the default terminal app — one real, focus-stealing window per
+        // command (measured: 3-4 windows and 3-8 focus steals per run; zero without
+        // detached). The Windows timeout path below kills the tree by pid (/T /F) and
+        // needs no process group, so dropping detached there costs nothing.
+        detached: process.platform !== 'win32',
         // stdin = pipe (prompt transport), stdout ignored (result via -o file), stderr piped.
         stdio: ['pipe', 'ignore', 'pipe'],
         env: buildSidecarEnv(envPolicy),
