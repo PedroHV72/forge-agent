@@ -49,6 +49,68 @@ const ASK_ID_RE = /^ask-[A-Za-z0-9._-]+$/;
 const LOCAL_UNIT_ID_RE = /^(?:S\d+|T\d+(?:\.\d+)?)$/i;
 const QUALIFIED_KEY_RE = /^(.+)__((?:S\d+|T\d+(?:\.\d+)?))$/i;
 
+// ── Schema guard seam (M-S01 T04) ────────────────────────────────────────────
+// Lazy require, deliberately: forge-schema-guard → forge-migrate →
+// forge-projection → forge-memory is a top-level cycle (forge-migrate.js:33,
+// forge-projection.js:34) — this file already resolves forge-projection lazily
+// for the same reason (see queryRelevant below). The `catch` keeps this file
+// loadable if the guard is not colocated (installed layouts).
+//
+// SINGLE INSERTION POINT PER SIDE:
+//   read  → guardReadHere() at the top of listFragments/readFragment/queryRelevant
+//   write → assertWriteHere() at the top of writeFragment
+// queryRelevant is the MODULE boundary the guard exists for: forge-prompt.js
+// calls it directly, never through this CLI, so a cliMain-only guard would miss
+// the hot render path entirely.
+// Only an ABSENT guard module is swallowed. A guard that exists but throws
+// while initializing — or whose own transitive require fails (the guard pulls
+// forge-migrate, which eagerly pulls projection/migrators/store-state/doctor)
+// — is a real fault and must propagate rather than silently disabling both the
+// read warning and the write refusal.
+//
+// SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
+// only — it is about LOADING the guard, not about what the guard decides.
+// The seam stays FAIL-OPEN on an unexpected runtime error raised inside the
+// guard's own check (see the catch in assertWrite, forge-schema-guard.js).
+// It is NOT fail-open on a stamp the guard could not READ: that case refuses
+// the write, naming the errno. This note used to say the fail-open of
+// assertWrite had been reviewed and kept as is — the PR #70 dogfood revised
+// that decision: a directory at .gsd/SCHEMA-VERSION disabled the write guard
+// silently, so "unreadable" now closes, while "absent" and "present but
+// garbage" stay open.
+function schemaGuard() {
+  try {
+    return require('./forge-schema-guard');
+  } catch (err) {
+    let absent;
+    try {
+      absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-schema-guard');
+    } catch (_) {
+      // Classifier itself missing (partial install) → keep the historical
+      // fail-open instead of crashing the store.
+      absent = true;
+    }
+    if (absent) return null;
+    throw err;
+  }
+}
+
+// Fail-open read guard: returns { ok, partial, warning } and emits the warning
+// to stderr at most once per process per cwd. Never throws, never blocks.
+function guardReadHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return { ok: true, partial: false, warning: null };
+  return guard.guardReadAndWarn(cwd || process.cwd());
+}
+
+// Write refusal: throws when the on-disk schema major is AHEAD of this
+// tooling's. The CLI catch blocks turn that into stderr + exit 1.
+function assertWriteHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return;
+  guard.assertWriteOrThrow(cwd || process.cwd());
+}
+
 function isWithin(root, candidate) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === '' || (
@@ -598,6 +660,9 @@ function serializeFrontmatter(fragment) {
 // created: false if content is identical after merge.
 function writeFragment(cwd, fragment, opts) {
   opts = opts || {};
+  // Refuse before validation, lock acquisition or merge — nothing reaches disk
+  // and no lock is taken on a write that is going to be refused anyway.
+  assertWriteHere(cwd);
   if (!fragment || !fragment.unit_id) {
     throw new Error('fragment.unit_id is required');
   }
@@ -666,6 +731,7 @@ function writeFragment(cwd, fragment, opts) {
 // ── readFragment ──────────────────────────────────────────────────────────────
 // Reads and parses a MEMORY fragment. Returns null if the file does not exist.
 function readFragment(cwd, unitId, opts) {
+  guardReadHere(cwd);
   let fpath;
   try {
     fpath = fragmentPath(cwd, unitId, opts);
@@ -688,6 +754,7 @@ function readFragment(cwd, unitId, opts) {
 // Returns Array<{ storageKey, unitId, milestoneId, path }> sorted by storageKey.
 // Returns [] if the directory does not exist.
 function listFragments(cwd, opts) {
+  guardReadHere(cwd);
   const dir = assertMemoryDirectory(cwd, false);
   if (!dir) return [];
 
@@ -715,6 +782,10 @@ function listFragments(cwd, opts) {
 // require avoids the forge-memory <-> forge-projection module cycle.
 function queryRelevant(query) {
   if (!query || typeof query !== 'object') throw new Error('memory query must be an object');
+  // Module-boundary guard (forge-prompt.js:306 calls this directly). The
+  // delegate below guards too; the dedupe Set in forge-schema-guard collapses
+  // both into a single stderr emission per cwd.
+  guardReadHere(query.cwd || process.cwd());
   const { queryMemoryEntries } = require('./forge-projection');
   return queryMemoryEntries(query.cwd || process.cwd(), {
     unitType: query.unitType,
@@ -812,6 +883,10 @@ function cliMain(argv) {
   }
 
   if (cmd === '--list') {
+    // Bare JSON ARRAY — data, not an envelope, and the one array output with
+    // live consumers (skills/forge-auto, forge-next, forge-sweep iterate it).
+    // No schema_partial key: the partial signal travels on stderr only,
+    // emitted inside listFragments. --query/--select DO carry the fields.
     const result = listFragments(cwd, { milestoneId });
     console.log(JSON.stringify(result));
     process.exit(0);

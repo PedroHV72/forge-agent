@@ -38,6 +38,67 @@ const DECISIONS_DIR = '.gsd/decisions';
 // Pattern for forge-ask session IDs: ask-<session-id>
 const ASK_ID_RE = /^ask-[A-Za-z0-9._-]+$/;
 
+// ── Schema guard seam (M-S01 T04) ────────────────────────────────────────────
+// Lazy require, deliberately: forge-schema-guard → forge-migrate →
+// forge-projection → forge-decisions is a top-level cycle (forge-migrate.js:33,
+// forge-projection.js:33). Resolving inside the call defers it past module
+// init, so no consumer captures a half-built exports object. The `catch` keeps
+// this file loadable if the guard is not colocated (installed layouts).
+//
+// SINGLE INSERTION POINT PER SIDE:
+//   read  → guardReadHere() at the top of listFragments/readFragment
+//   write → assertWriteHere() at the top of writeFragment
+// Reading `.gsd/SCHEMA-VERSION` or comparing versions anywhere else in this
+// file is forbidden — the guard module is the only source of that logic.
+// Only an ABSENT guard module is swallowed. A guard that exists but throws
+// while initializing — or whose own transitive require fails (the guard pulls
+// forge-migrate, which eagerly pulls projection/migrators/store-state/doctor)
+// — is a real fault and must propagate rather than silently disabling both the
+// read warning and the write refusal.
+//
+// SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
+// only — it is about LOADING the guard, not about what the guard decides.
+// The seam stays FAIL-OPEN on an unexpected runtime error raised inside the
+// guard's own check (see the catch in assertWrite, forge-schema-guard.js).
+// It is NOT fail-open on a stamp the guard could not READ: that case refuses
+// the write, naming the errno. This note used to say the fail-open of
+// assertWrite had been reviewed and kept as is — the PR #70 dogfood revised
+// that decision: a directory at .gsd/SCHEMA-VERSION disabled the write guard
+// silently, so "unreadable" now closes, while "absent" and "present but
+// garbage" stay open.
+function schemaGuard() {
+  try {
+    return require('./forge-schema-guard');
+  } catch (err) {
+    let absent;
+    try {
+      absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-schema-guard');
+    } catch (_) {
+      // Classifier itself missing (partial install) → keep the historical
+      // fail-open instead of crashing the store.
+      absent = true;
+    }
+    if (absent) return null;
+    throw err;
+  }
+}
+
+// Fail-open read guard: returns { ok, partial, warning } and emits the warning
+// to stderr at most once per process per cwd. Never throws, never blocks.
+function guardReadHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return { ok: true, partial: false, warning: null };
+  return guard.guardReadAndWarn(cwd || process.cwd());
+}
+
+// Write refusal: throws when the on-disk schema major is AHEAD of this
+// tooling's. The CLI catch blocks turn that into stderr + exit 1.
+function assertWriteHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return;
+  guard.assertWriteOrThrow(cwd || process.cwd());
+}
+
 // ── decisionsDir ──────────────────────────────────────────────────────────────
 // Returns the absolute path to the decisions directory for a given cwd.
 function decisionsDir(cwd) {
@@ -340,6 +401,8 @@ function serializeFrontmatter(fragment) {
 // created: false if content is identical after merge (idempotent).
 function writeFragment(cwd, fragment, opts) {
   if (opts === undefined) opts = {};
+  // Refuse before any merge or serialization — nothing reaches disk.
+  assertWriteHere(cwd);
   if (!fragment || !fragment.unit_id) {
     throw new Error('fragment.unit_id is required');
   }
@@ -387,6 +450,7 @@ function writeFragment(cwd, fragment, opts) {
 // ── readFragment ──────────────────────────────────────────────────────────────
 // Reads and parses a DECISIONS fragment. Returns null if the file does not exist.
 function readFragment(cwd, unitId) {
+  guardReadHere(cwd);
   let fpath;
   try {
     fpath = fragmentPath(cwd, unitId);
@@ -404,6 +468,7 @@ function readFragment(cwd, unitId) {
 // Returns Array<{ unitId, path }> sorted by unitId ascending.
 // Returns [] if the directory does not exist.
 function listFragments(cwd) {
+  guardReadHere(cwd);
   const dir = decisionsDir(cwd);
   if (!fs.existsSync(dir)) return [];
 
@@ -604,6 +669,9 @@ function cliMain(argv) {
   }
 
   if (cmd === '--list') {
+    // Bare JSON ARRAY — data, not an envelope. No schema_partial key here (see
+    // the same note in forge-ledger.js): the partial signal for array-shaped
+    // stdout travels on stderr only, emitted inside listFragments.
     const result = listFragments(cwd);
     console.log(JSON.stringify(result));
     process.exit(0);

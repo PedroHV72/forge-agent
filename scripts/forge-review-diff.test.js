@@ -235,7 +235,7 @@ test('a new file is rendered as an added-file hunk, and a binary one is not dump
     assert.ok(out.includes('@@ -0,0 +1,2 @@'), 'hunk counts the added lines');
     assert.ok(out.includes('+const a = 1;') && out.includes('+const b = 2;'));
     assert.ok(out.includes('Cannot display: file marked as a binary type.'), 'binary is described, not dumped');
-    assert.ok(!out.includes(' '), 'no NUL byte reaches the reviewer');
+    assert.ok(!out.includes('\0'), 'no NUL byte reaches the reviewer');
     assert.ok(out.includes('\\ No newline at end of file'));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

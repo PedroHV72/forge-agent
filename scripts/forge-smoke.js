@@ -12311,6 +12311,245 @@ function smokeRunOverlapSignal() {
   }
 }
 
+// ── Section 90: guard direcional de schema fiado nos 4 leitores ───────────
+// End-to-end através das CLIs reais. A suíte de wiring
+// (forge-schema-guard-wiring.test.js) cobre a fronteira de módulo; aqui o que
+// se prova é que os processos de verdade — os que o orquestrador invoca —
+// avisam ALTO na leitura, continuam com exit 0, e RECUSAM a escrita quando o
+// major em .gsd/SCHEMA-VERSION está à frente do que a tooling entende.
+// Regressão que isto trava: um leitor voltar a degradar em silêncio.
+function smokeSchemaGuardWiring() {
+  process.stdout.write('\n▸ Section 90: guard direcional de schema nos 4 leitores\n');
+  const dir = mkTmp('schema-guard-wiring');
+  try {
+    const CURRENT = require(path.join(SCRIPTS, 'forge-doctor.js')).CURRENT_SCHEMA;
+    const major = Number(String(CURRENT).match(/@(\d+)\./)[1]);
+    const WARN_RE = /schema do Forge à frente da tooling local/;
+    const ledgerId = 'M-20260101000000-smoke90';
+
+    // Fixture: um fragmento em cada store, os três stores povoados.
+    const mkStores = (root) => {
+      for (const store of ['ledger', 'decisions', 'memory']) {
+        fs.mkdirSync(path.join(root, '.gsd', store), { recursive: true });
+      }
+      fs.writeFileSync(path.join(root, '.gsd', 'ledger', `${ledgerId}.md`),
+        `---\nid: ${ledgerId}\ntitle: Smoke 90\ncompleted_at: 2026-01-01T00:00:00Z\nslices: [S01]\nkey_files: []\nkey_decisions: []\n---\n\nBody.\n`, 'utf8');
+      fs.writeFileSync(path.join(root, '.gsd', 'memory', `${ledgerId}.md`),
+        `---\nunit_id: ${ledgerId}\nfacts:\n  - mem_id: S90-1\n    category: gotcha\n    text: smoke 90 fixture\n    created_at: 2026-01-01\n    source_unit: ${ledgerId}\nstats: []\n---\n`, 'utf8');
+    };
+
+    const clean = path.join(dir, 'clean');
+    const ahead = path.join(dir, 'ahead');
+    mkStores(clean);
+    mkStores(ahead);
+    fs.writeFileSync(path.join(ahead, '.gsd', 'SCHEMA-VERSION'), `fragment-store@${major + 1}.0.0\n`, 'utf8');
+
+    const entry = (id) => JSON.stringify({
+      id, title: 'W', completed_at: '2026-02-02T00:00:00Z',
+      slices: [], key_files: [], key_decisions: [], body: 'x',
+    });
+    const writeTarget = (root) => path.join(root, '.gsd', 'ledger', 'M-20260202000000-w.md');
+
+    // (a) fail-open: sem SCHEMA-VERSION nada muda — nem stderr, nem chave nova.
+    const cleanList = runScript('forge-ledger.js', ['--list', '--cwd', clean]);
+    const cleanStale = runScript('forge-projection.js', ['--stale', '--cwd', clean]);
+    assert(cleanList.status === 0 && !WARN_RE.test(cleanList.stderr)
+      && Array.isArray(JSON.parse(cleanList.stdout))
+      && cleanStale.status === 0 && !WARN_RE.test(cleanStale.stderr)
+      && Object.keys(JSON.parse(cleanStale.stdout)).sort().join(',') === 'decisions,ledger,memory',
+      '(a) fail-open read is byte-identical: no warning, no schema_partial key');
+
+    const cleanWrite = runScript('forge-ledger.js', ['--write', '--cwd', clean],
+      { input: entry('M-20260202000000-w') });
+    assert(cleanWrite.status === 0 && fs.existsSync(writeTarget(clean)),
+      '(a) fail-open write succeeds and lands on disk');
+
+    // (b) major à frente, leitura: exit 0 + warning em stderr, envelope marcado.
+    for (const cli of ['forge-ledger.js', 'forge-decisions.js', 'forge-memory.js']) {
+      const r = runScript(cli, ['--list', '--cwd', ahead]);
+      assert(r.status === 0 && WARN_RE.test(r.stderr) && Array.isArray(JSON.parse(r.stdout)),
+        `(b) ${cli} --list warns on stderr, exits 0 and keeps its array shape`);
+    }
+    const aheadStale = runScript('forge-projection.js', ['--stale', '--cwd', ahead]);
+    const staleJson = aheadStale.status === 0 ? JSON.parse(aheadStale.stdout) : {};
+    assert(aheadStale.status === 0 && WARN_RE.test(aheadStale.stderr)
+      && staleJson.schema_partial === true && typeof staleJson.schema_warning === 'string'
+      && typeof staleJson.ledger === 'boolean',
+      '(b) --stale envelope gains schema_partial/schema_warning without losing its keys');
+
+    // (c) --read e --render não ganham NADA no stdout — o dado não muda de forma.
+    const aheadRead = runScript('forge-ledger.js', ['--read', ledgerId, '--cwd', ahead]);
+    const readJson = aheadRead.status === 0 ? JSON.parse(aheadRead.stdout) : {};
+    const aheadRender = runScript('forge-projection.js', ['--render', 'ledger', '--cwd', ahead]);
+    const cleanRender = runScript('forge-projection.js', ['--render', 'ledger', '--cwd', clean]);
+    assert(aheadRead.status === 0 && WARN_RE.test(aheadRead.stderr)
+      && !('schema_partial' in readJson) && !('schema_warning' in readJson),
+      '(c) --read prints the fragment untouched; the signal is stderr-only');
+    assert(aheadRender.status === 0 && WARN_RE.test(aheadRender.stderr)
+      && !WARN_RE.test(aheadRender.stdout)
+      && aheadRender.stdout.startsWith(cleanRender.stdout.slice(0, 40)),
+      '(c) --render markdown stdout carries no extra text');
+
+    // (d) uma emissão por processo por cwd — senão o aviso se afoga em ruído.
+    const renderMemory = runScript('forge-projection.js', ['--render', 'memory', '--cwd', ahead]);
+    assert(renderMemory.status === 0
+      && (renderMemory.stderr.match(/schema do Forge à frente da tooling local/g) || []).length === 1,
+      '(d) a render walking several guarded reads emits exactly one warning');
+
+    // (e) escrita recusada: exit != 0 E nada em disco (conteúdo, não só o code).
+    for (const [cli, payload, target] of [
+      ['forge-ledger.js', entry('M-20260202000000-w'), writeTarget(ahead)],
+      ['forge-decisions.js', JSON.stringify({ unit_id: 'M-20260202000000-w', decisions: [] }),
+        path.join(ahead, '.gsd', 'decisions', 'M-20260202000000-w.md')],
+      ['forge-memory.js', JSON.stringify({ unit_id: 'M-20260202000000-w', facts: [], stats: [] }),
+        path.join(ahead, '.gsd', 'memory', 'M-20260202000000-w.md')],
+    ]) {
+      const r = runScript(cli, ['--write', '--cwd', ahead], { input: payload });
+      assert(r.status !== 0 && WARN_RE.test(r.stderr) && !fs.existsSync(target),
+        `(e) ${cli} --write is refused with exit != 0 and writes nothing`);
+    }
+
+    const existingBefore = fs.readFileSync(path.join(ahead, '.gsd', 'ledger', `${ledgerId}.md`), 'utf8');
+    const clobber = runScript('forge-ledger.js', ['--write', '--cwd', ahead], { input: entry(ledgerId) });
+    assert(clobber.status !== 0
+      && fs.readFileSync(path.join(ahead, '.gsd', 'ledger', `${ledgerId}.md`), 'utf8') === existingBefore,
+      '(e) a refused overwrite leaves the existing fragment byte-identical');
+
+    // --force cobre o guard de monolito não-migrado, NÃO este: tooling velha
+    // escrevendo sobre dado novo é outro perigo, e não tem override.
+    const writeAll = runScript('forge-projection.js', ['--write-all', '--cwd', ahead]);
+    const writeAllForced = runScript('forge-projection.js', ['--write-all', '--force', '--cwd', ahead]);
+    assert(writeAll.status !== 0 && writeAllForced.status !== 0
+      && WARN_RE.test(writeAll.stderr)
+      && !fs.existsSync(path.join(ahead, '.gsd', 'LEDGER.md')),
+      '(e) --write-all is refused with and without --force, and writes no monolith');
+
+    // (e2) stamp ILEGÍVEL (a repro do dogfood da PR #70): `.gsd/SCHEMA-VERSION`
+    // como DIRETÓRIO fazia toda escrita passar com exit 0 e arquivo em disco —
+    // o EISDIR virava null e o null virava "não está à frente". Agora recusa,
+    // nomeando o errno, e SEM alegar que o dado está à frente (ninguém mediu
+    // direção nenhuma). A leitura continua limpa: a assimetria é o desenho.
+    const unread = path.join(dir, 'unreadable');
+    mkStores(unread);
+    fs.mkdirSync(path.join(unread, '.gsd', 'SCHEMA-VERSION'), { recursive: true });
+    const UNREADABLE_RE = /não pôde ser lido/;
+    const unreadWrite = runScript('forge-ledger.js', ['--write', '--cwd', unread],
+      { input: entry('M-20260202000000-w') });
+    assert(unreadWrite.status !== 0 && UNREADABLE_RE.test(unreadWrite.stderr)
+      && /EISDIR/.test(unreadWrite.stderr) && !WARN_RE.test(unreadWrite.stderr)
+      && !fs.existsSync(writeTarget(unread)),
+      '(e2) an unreadable stamp refuses the write, names the errno, and claims nothing about direction',
+      `status=${unreadWrite.status} stderr=${unreadWrite.stderr}`);
+    const unreadRead = runScript('forge-ledger.js', ['--list', '--cwd', unread]);
+    assert(unreadRead.status === 0 && !UNREADABLE_RE.test(unreadRead.stderr) && !WARN_RE.test(unreadRead.stderr)
+      && Array.isArray(JSON.parse(unreadRead.stdout)),
+      '(e2) reading under an unreadable stamp stays clean and silent (fail-open preserved)');
+
+    // (f) o helper é a única fonte da lógica: nenhum dos 4 leitores relê
+    // SCHEMA-VERSION nem compara versão por conta própria.
+    for (const reader of ['forge-projection.js', 'forge-ledger.js', 'forge-decisions.js', 'forge-memory.js']) {
+      const text = fs.readFileSync(path.join(SCRIPTS, reader), 'utf8');
+      assert(text.includes("require('./forge-schema-guard')"),
+        `(f) ${reader} requires the guard helper`);
+      assert(!/SCHEMA-VERSION/.test(text.replace(/^\s*\/\/.*$/gm, '')),
+        `(f) ${reader} never re-reads .gsd/SCHEMA-VERSION outside the helper`);
+    }
+
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeSchemaGuardWiring\(\); \}/.test(mainBody),
+      '(g) Section 90 is registered through a closure in main()');
+    pass('(final) Section 90: read warns/marks, write refuses, fail-open untouched, single source of schema logic');
+  } finally { cleanup(dir); }
+}
+
+// ── Section 91: nenhum byte de controle inesperado em scripts/*.js ─────────
+// Regressão que isto trava: um byte NUL (ou VT/FF) cru no fonte. Dois deles
+// viviam em scripts/forge-memory-index.js e um em forge-review-diff.test.js —
+// invisíveis na leitura, mas suficientes para o git e o grep classificarem o
+// arquivo inteiro como BINÁRIO. O efeito não é cosmético: `grep` para de
+// mostrar as linhas, o diff da PR vira "Binary file … differs", e a revisão
+// perde o arquivo de vista exatamente onde ele deveria ser lido. O conserto é
+// o escape de duas letras (\0); esta seção existe para que o byte cru não
+// volte. Também vale para 0x0b/0x0c — a regra do `\f` no install.ps1 (ver
+// CLAUDE.md) é a mesma classe de defeito, com a mesma causa: um escape que
+// virou byte na hora de escrever o arquivo.
+//
+// Esta seção NUNCA escreve um byte de controle literal no próprio fonte: o
+// fixture de mordida monta o byte com String.fromCharCode em runtime, senão
+// forge-smoke.js seria o próximo arquivo a se auto-flagrar.
+const CONTROL_BYTES = new Map([[0x00, 'NUL (0x00)'], [0x0b, 'VT (0x0b)'], [0x0c, 'FF (0x0c)']]);
+const CONTROL_BYTE_FLOOR = 50; // scripts/ tem ~170 .js; 0 varridos é falha, não passe limpo
+
+// { ok, scanned, violations: [{ file, byte, offset }] }
+function scanControlBytes(rootDir, opts) {
+  const floor = (opts && opts.floor) || CONTROL_BYTE_FLOOR;
+  const { collectFiles } = require('./forge-doc-claims.js');
+  const files = collectFiles(rootDir, { extensions: ['.js'] });
+  const violations = [];
+  let scanned = 0;
+  for (const file of files) {
+    let buf;
+    try { buf = fs.readFileSync(file); } catch { continue; } // ilegível: não conta como varrido
+    scanned++;
+    for (let i = 0; i < buf.length; i++) {
+      const label = CONTROL_BYTES.get(buf[i]);
+      if (label) violations.push({ file, byte: label, offset: i });
+    }
+  }
+  // Piso anti-silêncio (padrão de forge-doc-claims.js): "0 violações" e
+  // "0 arquivos varridos" precisam ser distinguíveis — um scanner apontado
+  // para o diretório errado deve ficar VERMELHO, não verde.
+  const ok = violations.length === 0 && scanned >= floor;
+  return { ok, scanned, floor, violations };
+}
+
+function smokeControlBytes() {
+  process.stdout.write('\n▸ Section 91: bytes de controle inesperados em scripts/*.js\n');
+
+  // (a) a árvore real está limpa E acima do piso — a asserção de aceitação.
+  const real = scanControlBytes(SCRIPTS);
+  assert(real.scanned >= real.floor,
+    `(a) scanned (${real.scanned}) >= piso anti-silêncio (${real.floor})`);
+  assert(real.violations.length === 0,
+    '(a) scripts/*.js não contém 0x00/0x0b/0x0c',
+    JSON.stringify(real.violations.slice(0, 5).map(v => `${path.basename(v.file)}@${v.offset}:${v.byte}`)));
+  assert(real.ok === true, '(a) varredura real: ok === true');
+
+  const dir = mkTmp('control-bytes');
+  try {
+    const file = path.join(dir, 'injected.js');
+    // (b) mordida: com o byte cru, VERMELHO.
+    fs.writeFileSync(file, `const key = 'a'${String.fromCharCode(0)}'b';\n`, 'utf8');
+    const dirty = scanControlBytes(dir, { floor: 1 });
+    assert(dirty.ok === false, '(b) fixture com NUL cru: ok === false (mordida observada)');
+    assert(dirty.violations.length === 1 && dirty.violations[0].byte === 'NUL (0x00)',
+      '(b) fixture com NUL cru: a violação é reportada com o byte nomeado', JSON.stringify(dirty.violations));
+
+    // (c) com o escape de duas letras no lugar, VERDE — as duas direções.
+    fs.writeFileSync(file, 'const key = \'a\' + \'\\0\' + \'b\';\n', 'utf8');
+    const clean = scanControlBytes(dir, { floor: 1 });
+    assert(clean.ok === true, '(c) fixture com o escape \\0: ok === true (verde restaurado)', JSON.stringify(clean.violations));
+
+    // (d) o piso morde sozinho: diretório vazio é FALHA, não passe limpo.
+    const empty = mkTmp('control-bytes-empty');
+    try {
+      const none = scanControlBytes(path.join(empty, 'nao-existe'));
+      assert(none.ok === false && none.scanned === 0,
+        '(d) diretório inexistente: 0 varridos é falha (piso anti-silêncio morde)', JSON.stringify(none));
+    } finally { cleanup(empty); }
+  } finally { cleanup(dir); }
+
+  // (e) auto-registro em main() — impede desfiar a seção em silêncio.
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeControlBytes\(\); \}/.test(mainBody),
+    '(e) Section 91 is registered through a closure in main()');
+
+  pass('(final) Section 91: nenhum 0x00/0x0b/0x0c em scripts/*.js, acima do piso anti-silêncio, ' +
+    'com mordida e volta ao verde provadas no fixture');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -12415,6 +12654,8 @@ async function main() {
       () => { smokeConcurrentRunAddresses(); },
       () => { smokeDocClaimsGuard(); },
       () => { smokeRunOverlapSignal(); },
+      () => { smokeSchemaGuardWiring(); },
+      () => { smokeControlBytes(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {

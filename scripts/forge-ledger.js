@@ -34,6 +34,67 @@ const { parseScalar, serializeScalar, writeAtomic } = require('./forge-yaml-safe
 
 const LEDGER_DIR = '.gsd/ledger';
 
+// ── Schema guard seam (M-S01 T04) ────────────────────────────────────────────
+// Lazy require, deliberately: forge-schema-guard → forge-migrate →
+// forge-projection → forge-ledger is a top-level cycle (see forge-migrate.js:33
+// and forge-projection.js:32). Resolving inside the call defers it past module
+// init, so no consumer ever captures a half-built exports object. The `catch`
+// keeps this file loadable if the guard is not colocated (installed layouts).
+//
+// SINGLE INSERTION POINT PER SIDE:
+//   read  → guardReadHere() at the top of listFragments/readFragment
+//   write → assertWriteHere() at the top of writeFragment
+// Reading `.gsd/SCHEMA-VERSION` or comparing versions anywhere else in this
+// file is forbidden — the guard module is the only source of that logic.
+// Only an ABSENT guard module is swallowed. A guard that exists but throws
+// while initializing — or whose own transitive require fails (the guard pulls
+// forge-migrate, which eagerly pulls projection/migrators/store-state/doctor)
+// — is a real fault and must propagate rather than silently disabling both the
+// read warning and the write refusal.
+//
+// SCOPE BOUNDARY (deliberate, do not 'complete' it): this narrows the CATCH
+// only — it is about LOADING the guard, not about what the guard decides.
+// The seam stays FAIL-OPEN on an unexpected runtime error raised inside the
+// guard's own check (see the catch in assertWrite, forge-schema-guard.js).
+// It is NOT fail-open on a stamp the guard could not READ: that case refuses
+// the write, naming the errno. This note used to say the fail-open of
+// assertWrite had been reviewed and kept as is — the PR #70 dogfood revised
+// that decision: a directory at .gsd/SCHEMA-VERSION disabled the write guard
+// silently, so "unreadable" now closes, while "absent" and "present but
+// garbage" stay open.
+function schemaGuard() {
+  try {
+    return require('./forge-schema-guard');
+  } catch (err) {
+    let absent;
+    try {
+      absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-schema-guard');
+    } catch (_) {
+      // Classifier itself missing (partial install) → keep the historical
+      // fail-open instead of crashing the store.
+      absent = true;
+    }
+    if (absent) return null;
+    throw err;
+  }
+}
+
+// Fail-open read guard: returns { ok, partial, warning } and emits the warning
+// to stderr at most once per process per cwd. Never throws, never blocks.
+function guardReadHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return { ok: true, partial: false, warning: null };
+  return guard.guardReadAndWarn(cwd || process.cwd());
+}
+
+// Write refusal: throws when the on-disk schema major is AHEAD of this
+// tooling's. The CLI catch blocks turn that into stderr + exit 1.
+function assertWriteHere(cwd) {
+  const guard = schemaGuard();
+  if (!guard) return;
+  guard.assertWriteOrThrow(cwd || process.cwd());
+}
+
 // ── ledgerDir ─────────────────────────────────────────────────────────────────
 // Returns the absolute path to the ledger directory for a given cwd.
 function ledgerDir(cwd) {
@@ -200,6 +261,8 @@ function serializeFrontmatter(entry) {
 // created: false if file existed and content is identical (idempotent).
 function writeFragment(cwd, entry, opts) {
   opts = opts || {};
+  // Refuse before any validation or serialization — nothing reaches disk.
+  assertWriteHere(cwd);
   if (!entry || !entry.id) {
     throw new Error('entry.id is required');
   }
@@ -236,6 +299,7 @@ function writeFragment(cwd, entry, opts) {
 // Reads and parses a LEDGER fragment (milestone or task). Returns null if the
 // file does not exist.
 function readFragment(cwd, id) {
+  guardReadHere(cwd);
   let fpath;
   try {
     fpath = fragmentPath(cwd, id);
@@ -253,6 +317,7 @@ function readFragment(cwd, id) {
 // Returns Array<{ id, path }> sorted by id ascending.
 // Returns [] if the directory does not exist.
 function listFragments(cwd) {
+  guardReadHere(cwd);
   const dir = ledgerDir(cwd);
   if (!fs.existsSync(dir)) return [];
 
@@ -310,6 +375,12 @@ function cliMain(argv) {
   }
 
   if (cmd === '--list') {
+    // `--list` stdout is a bare JSON ARRAY of fragments — it is data, not an
+    // envelope, so it carries no schema_partial/schema_warning key (a JSON
+    // array cannot hold one without changing its shape, and consumers such as
+    // skills/forge-sweep iterate it directly). The partial signal for this
+    // command travels on stderr only, emitted by guardReadHere inside
+    // listFragments. Object-shaped envelopes (--stale, --query) do get fields.
     const result = listFragments(cwd);
     console.log(JSON.stringify(result));
     process.exit(0);
@@ -339,7 +410,17 @@ function cliMain(argv) {
         process.stderr.write(`Failed to parse JSON from stdin: ${e.message}\n`);
         process.exit(1);
       }
-      const result = writeFragment(cwd, entry);
+      // Explicit catch: this runs inside an async stdin handler, outside the
+      // require.main try/catch below, so a schema-guard refusal (or any write
+      // error) would otherwise surface as an uncaught stack trace. Message on
+      // stderr, exit 1 — the store CLI contract.
+      let result;
+      try {
+        result = writeFragment(cwd, entry);
+      } catch (e) {
+        process.stderr.write(`${e.message}\n`);
+        process.exit(1);
+      }
       console.log(JSON.stringify(result));
       process.exit(0);
     });
