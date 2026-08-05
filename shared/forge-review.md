@@ -203,14 +203,19 @@ if [ "$PAIR_POLICY" = majority ] || [ "$PAIR_POLICY" = tie-last ] || [ "$PAIR_PO
 fi
 PAIRING_LINE="**Pairing:** ${PAIR_MODE} — autor ${AUTHOR_ENGINE} → challenger ${CHALLENGER_FAMILY}${PAIR_SUFFIX}"
 ADVOCATE_FAMILY=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --family "$RESOLVED_ADVOCATE")
-# AUTHOR_ENGINE is an ENGINE ('claude'|'codex'); the two above are FAMILIES
-# ('claude'|'gpt'|'gemini'). Compare like with like — mapping the engine through
-# --family first. Comparing 'gpt' against 'codex' directly is true for the SAME
-# family, which silently inverts this flag the moment a gpt advocate exists.
-AUTHOR_FAMILY=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --family "$AUTHOR_ENGINE")
-[ -z "$AUTHOR_FAMILY" ] && AUTHOR_FAMILY="$AUTHOR_ENGINE"
+# Both sides above are FAMILIES ('claude'|'gpt'|'gemini'), never engines: an
+# engine compared against a family ('gpt' vs 'codex') is unequal for the SAME
+# family and silently inverts this flag the moment a gpt advocate exists.
+#
+# The author is deliberately NOT part of this test. Requiring the debaters'
+# family to also differ from the author's excuses the shipped default (claude
+# author, claude challenger, claude advocate) as "not a collapse", which pins
+# the flag at false on every default-configured review. This rule MUST stay
+# byte-for-byte equivalent to the emitter's (forge-review-emit.js), or the
+# artifact the human reads and the row a script aggregates disagree — the log
+# announcing a collapse the page denies.
 INTRA_FAMILY=false
-if [ "$ADVOCATE_FAMILY" = "$CHALLENGER_FAMILY" ] && [ "$ADVOCATE_FAMILY" != "$AUTHOR_FAMILY" ]; then INTRA_FAMILY=true; fi
+if [ "$ADVOCATE_FAMILY" = "$CHALLENGER_FAMILY" ]; then INTRA_FAMILY=true; fi
 ```
 
 A partir daqui, **todo o gate consome os resolvidos**: Steps 2/4 e a regra workflow abaixo usam `$RESOLVED_CHALLENGER`; Steps 3/6 usam `$RESOLVED_ADVOCATE`. `AUTHOR_ENGINE`/`PAIR_MODE`/`PAIR_POLICY`/`PAIR_REASON` alimentam a linha `**Pairing:**` do header (Step 6), já pré-montada em `$PAIRING_LINE`. A resolução ocorre **uma vez por review**; `style: flags` (abaixo) usa o pairing já resolvido (decisão #31 preservada).
@@ -809,7 +814,7 @@ The artifact is the **dialogue**, not a flag dump. Auditable, durable with the m
 **Challenger:** {claude|codex|gemini} (<model|default>)
 **Defender:** {advocate_model|alias}
 {$PAIRING_LINE}
-{$INTRA_FAMILY == true ? '**⚠ Adversarialidade reduzida:** refutação e juízo de tradeoff são da mesma família, e o autor não está representado na própria defesa. Com `--mode defend` disponível isto indica pairing explícito ou degradação registrada — cheque `fallbacks` no evento.' : ''}
+{$INTRA_FAMILY == true ? '**⚠ Adversarialidade reduzida:** refutação e juízo de tradeoff vêm da mesma família. Se o autor também é dessa família (o caso do default shipado), a objeção carrega o viés de auto-preferência que o pairing cross-family existe para evitar; se não é, o autor não está representado na própria defesa. Com `--mode defend` disponível isto indica pairing explícito ou degradação registrada — cheque `fallbacks` no evento.' : ''}
 
 ## Abertas — requerem decisão humana
 > O reviewer e o autor não chegaram a acordo. Você decide.
@@ -964,7 +969,7 @@ Shape written (documented for **readers of the log**, not for retyping — the e
 
 **Why a script and not a template.** The template that used to sit here was retyped per slice, and the retyping drifted: one measured workspace holds **265 `review` events in 151 distinct key shapes, none conformant**, with `advocate` values ranging from a clean alias (`fable`) to a full id (`claude-opus-5`) to a sentence (`not-invoked-orchestrator-verified-by-direct-reading`). Aggregating that history is impossible, which is why the intra-family collapse in M134/S02 was found by a human reading prose rather than by the field built to announce it. The emitter constructs the row from resolved values, so the shape cannot vary.
 
-**`intra_family_debate` is derived by the emitter, not passed in.** It takes `--author-engine`, `--challenger` and `--advocate` and compares *family to family*. The `INTRA_FAMILY` bash in Step 0 compares `$ADVOCATE_FAMILY` (a family) against `$AUTHOR_ENGINE` (an engine); that is correct only while every advocate is Claude, and inverts the moment a gpt advocate exists (`'gpt' != 'codex'` is true for the same family). Keep `$INTRA_FAMILY` for the Step 6 header rendering; the event's copy comes from the emitter. `intra_family_withdrawn` is clamped to `0` whenever the flag is false, so the two can never contradict each other.
+**`intra_family_debate` is derived by the emitter, not passed in.** It takes `--author-engine`, `--challenger` and `--advocate` and compares *family to family*. The `INTRA_FAMILY` bash in Step 0 compares `$ADVOCATE_FAMILY` (a family) against `$AUTHOR_ENGINE` (an engine); that is correct only while every advocate is Claude, and inverts the moment a gpt advocate exists (`'gpt' != 'codex'` is true for the same family). `$INTRA_FAMILY` still renders the Step 6 header and gates **§ Adversarialidade reduzida**, and the event's copy comes from the emitter — so the Step 0 bash and the emitter MUST encode the same rule. They are two evaluations of one predicate, not two predicates: when they drift, the log announces a collapse that the page a human reads denies, which is a more expensive way to be right than being wrong in one place. `intra_family_withdrawn` is clamped to `0` whenever the flag is false, so the two can never contradict each other.
 
 **The flag means what its name says: both debaters came from one family.** It does *not* additionally require that family to differ from the author's. That extra clause reads like a refinement and is a blind spot: on the explicit path this spec sets `AUTHOR_ENGINE=claude` and the shipped prefs default `challenger`/`advocate` to `claude`, so author and both debaters land in one family and the clause would hold the flag at `false` on **every review of every default-configured project** — a debate with zero cross-family adversarialidade filed as "no collapse", which is the silence the emitter exists to end. A Claude challenging Claude-authored code defended by Claude *is* the collapse, author in the room or not. Expect the flag to read `true` under defaults; that is the honest reading, and it is the signal that argues for flipping `challenger: auto`.
 
