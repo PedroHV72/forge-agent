@@ -575,6 +575,35 @@ rejeitadas — o item R3 permanece formalmente aberto para o operador fechar na 
 com R9/R13/R16 (S05) e R3/R4 (S06). S08 não é coberta por nenhum critério `IN-` do SCOPE original —
 foi acrescentada após o review, por decisão do operador em 2026-08-04, com origem em S05 R3.
 
+### O calendário era um proxy ruim para "encerrado" — trocado por três provas diretas (S09)
+S03 derivava o rótulo de agrupamento (`YYYY-QN`) do relógio de parede: um projeto ocioso produz um
+trimestre selado vazio, um projeto intenso produz um trimestre grosso demais, e há ambiguidade de
+fuso/limite em cada virada. O calendário nunca foi o critério real — era um substituto para "ninguém
+escreve mais aqui", e um substituto ruim: mede o tempo passado, não se o endereço morreu. S09
+substitui o eixo por varredura sob demanda (`sweep-project-NN`, numeração sequencial compartilhada
+entre os três stores) disparada porque um operador julgou que já acumulou o suficiente — a mutação
+de memória institucional acontece porque um humano olhou e decidiu, não porque outubro chegou, a
+postura mais segura para uma operação cujo risco é perder história. `scripts/forge-sweep-sealed.js`
+é o módulo que substitui o calendário: `sealedBy(unit, ctx)` só agrupa com prova direta —
+**(a) ledger** (entrada para a unidade dona do id), **(b) id-date** (timestamp válido embutido no
+próprio id, ou `ask-<data>`) ou **(c) extinct-id** (formato que `parseStorageKey` recusa hoje, então
+nenhum caminho em curso pode produzir aquele id). O dano que essas três provas evitam não é visível
+quando acontece: `forge-memory.js:692-704` (`writeFragment`) mescla **apenas** contra o caminho
+solto — agrupar uma unidade que ainda vai receber escrita faz a próxima gravação começar do zero e
+**sombrear** os fatos já acumulados (regra solto-vence-agrupado). Nenhum teste de "agrupou e
+desagrupou igual" pega esse dano; só um teste de precisão que cerca uma unidade viva de unidades
+elegíveis pega. A prova (c) foi **estreitada** durante T02 por um achado que refutou sua própria
+premissa: a hipótese original era que só uma migração one-shot (`forge-memory-migrate.js:451`)
+produz chave local nua (ex.: `S02`); falso — `skills/forge-sweep/SKILL.md:262` grava memória sem
+`--milestone` e isso está **em curso** hoje, não é arqueologia. Sem esse achado a task teria
+agrupado (e sombreado) memória institucional viva sob a bandeira de "formato legado". A assimetria
+que decide a direção do estreitamento: falso negativo deixa resíduo solto (inofensivo, estado
+atual); falso positivo sombreia memória institucional (não-reversível pelo journal do S08, que
+desfaz o container, não a mescla que já aconteceu na próxima escrita). `CURRENT_SCHEMA` sobe para
+`fragment-store@3.0.0` no mesmo commit que muda o formato do container (T03) — nunca depois, num
+commit separado, porque é a última slice antes da PR e o bump é, na prática, irreversível.
+Containers `YYYY-QN` legados continuam **lidos**, nunca escritos ou migrados.
+
 ## Estado atual
 
 - **Milestone ativo:** **M-20260804003633-forge-sweep-project-pr2** (PR 2 — fatias mutantes: agrupar época, empacotar o comando, medir antes de limpar, journal de desfazer), com **S08 entregue** (journal de desfazer — ver decisão acima). Empilhada sobre o branch da PR 1 (`forge/M-20260803205433-sweep-project-stratify`, tip `78bf210`), **não** sobre `master`.

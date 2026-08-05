@@ -205,6 +205,91 @@ which one resolves is never enumerated as missed, so the published `5` reads as 
 count without that qualifier) and S06 R4 (`package-ref` and `dynamic` fall into the bucket
 rendered as "could not be located" although they are, by design, not files at all).
 
+**S09 — the calendar axis is gone; sweeps are triggered, not scheduled.**
+
+### Breaking
+
+- **`CURRENT_SCHEMA` moves from `fragment-store@2.0.0` to `fragment-store@3.0.0`**
+  (`scripts/forge-doctor.js`), landed in the same commit as the container format change
+  (`116007a`), never as a follow-up — a bump that arrives separately from the format it
+  guards is a guard that fires on the wrong thing. This bump is effectively irreversible in
+  practice: once a store writes `sweep-project-NN` containers, reverting the tooling means
+  a developer's writes get refused until they update, and no S10 exists to soften a second
+  bump — this is the last slice before the PR. Legacy `YYYY-QN` containers (from the
+  epoch-grouping code S03 shipped) are still **read** by `isGroupedFile`/`parseGroup`
+  (`EPOCH_LABEL_RE`, preserved read-only in `scripts/forge-epoch.js`) but are **never
+  written or migrated** by any code on this branch — a store that already has a `2026-Q1.md`
+  container keeps it exactly as-is; only new sweeps use the new name.
+
+### Added
+
+- **On-demand sweeps replace the calendar axis.** The quarter/calendar label (`YYYY-QN`)
+  that `scripts/forge-epoch.js` derived from wall-clock time is gone; grouping now fires
+  because an operator judged that enough has accumulated, not because a quarter boundary
+  passed. Containers are named sequentially, `sweep-project-NN`
+  (`scripts/forge-sweep-sealed.js`'s `nextSweepNumber`/`containerName`, `SWEEP_CONTAINER_RE
+  = /^sweep-project-\d{2,}$/` in `scripts/forge-grouped-file.js`), numbered by scanning
+  every store directory and taking `max + 1` across all of them (one number shared per
+  sweep, not one counter per store) — legacy `YYYY-QN` containers never count toward the
+  max. `scripts/forge-epoch.js` keeps only what the new axis still needs:
+  `dateOfUnit(unit)` (id → hint → mtime fallback chain) and the wrapper-dir helpers
+  (`isWrapperDir`/`listWrapperDirs`), both untouched; the calendar-labelling functions are
+  deleted, not deprecated.
+- **`scripts/forge-sweep-sealed.js` — three closure proofs, and nothing groups without
+  one.** `sealedBy(unit, ctx)` answers, for a single fragment id, whether it is *provably*
+  closed for future writes: **(a) ledger** — an entry exists in `.gsd/ledger` for the id's
+  owning milestone/task; **(b) id-date** — a valid date is embedded in the id itself
+  (canonical `M-<14>`/`T-<14>`/dashed timestamps via `forge-ids.timestampOf`, or
+  `ask-<YYYY-MM-DD>`/`ask-<YYYYMMDD>`); **(c) extinct-id** — the id has a shape
+  `parseStorageKey` in `scripts/forge-memory.js` refuses outright (e.g. `S03-T02`), so no
+  code path in this tooling can ever produce a write to it. Proof (c) was **narrowed**
+  during T02 by a finding that refuted its own original premise (see `CLAUDE.md` below): a
+  bare local key like `S02` is *not* extinct — `skills/forge-sweep/SKILL.md:262` writes
+  memory without `--milestone`, and such a write is live today — so a bare local key falls
+  through to "no proof" and is **skipped with a reason**, never grouped on the strength of
+  a refuted premise. `legacy-orphan` is refused unconditionally, before any of the three
+  proofs, identically regardless of which of the three stores calls it (DS9-6). Every
+  failure to prove closure returns a legible pt-BR reason string; the function never throws
+  and never returns `undefined`.
+- **Date range travels with the container, and with `--list`.**
+  `scripts/forge-grouped-file.js`'s `serializeGroup`/`parseGroup` now carry `dateRange`
+  (`from`/`to`) alongside `label` (the field `epoch` is renamed but still accepted as a
+  legacy input alias, and still written on disk under the `grouped_epoch` frontmatter key —
+  a deliberate, documented misnomer to avoid a second frontmatter-key migration). An
+  unknown range serializes to explicit empty strings, never an omitted field.
+  `scripts/forge-sweep-project.js --list` surfaces the same range per container alongside
+  the sweep vocabulary (operation renamed from `agrupar-epocas-seladas`-era naming to match
+  `sweep-project-NN`), so an operator can see what a container spans without opening it.
+- **`scripts/forge-epoch-group.js` selects and names by the new proofs.** `plan()`/`apply()`
+  now select members by `sealedBy()` instead of a calendar cutoff, and name the resulting
+  container by `containerName(nextSweepNumber(dirs))`. The `store.name === 'memory'` guard
+  that special-cased the memory store (needed only because the legacy-orphan check used to
+  live inline) is removed now that `forge-sweep-sealed.js` owns that guard uniformly for
+  all three stores.
+
+### Fixed
+
+- `ungroup()` (`scripts/forge-epoch-group.js`) and the S08 undo journal are unaffected by
+  the axis swap by construction, not by assumption: the journal records container paths,
+  timestamps and an advisory sha256 of the container — **never** the label — so a journal
+  line written against an old `YYYY-QN` container still undoes correctly after this slice.
+  Exercised directly rather than left as an inherited claim (`S09-RISK.md` W5).
+
+### Known issue — not fixed in this slice, by design
+
+- **`scripts/forge-sweep-sealed.test.js` has one failing assertion** (`sealedBy: PRECISION
+  — a live unit is refused with a reason, surrounded by eligible ones`), introduced by T02
+  and left unfixed per this task's own instruction (verification tasks report, they do not
+  repair). The test expects a milestone id with an embedded timestamp but **no** ledger
+  entry (`M-20260601000000-still-open`) to be refused as "still live"; the implementation,
+  and every *other* test in the same file (`sealedBy: proof (b) id-date`, the `ordering`
+  test using a bare `M-<14>-fixture` id), instead treats **any** id carrying a valid
+  embedded timestamp as satisfying proof (b) regardless of ledger status — which is also
+  what `S09-PLAN.md`/the governing decision record describe proof (b) as doing ("ids
+  timestamp (`M-<14>`, forma dashed)", not qualified to `ask-*` only). The test and the
+  design it sits next to disagree with each other; which side is wrong is a call for the
+  operator, not for this verification task. See `S09-SUITE.md` for the measured detail.
+
 ## v4.1.0 — What a project is, and what the screen may claim about it
 
 Two things landed here and they are the same thing seen from two ends. The milestone
