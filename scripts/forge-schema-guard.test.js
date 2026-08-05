@@ -389,7 +389,20 @@ test('chmod 000 stamp: write refused (POSIX only — chmod is inert on win32)', 
     // test would silently degrade into re-testing the happy path.
     let threw = false;
     try { fs.readFileSync(stamp, 'utf8'); } catch (_) { threw = true; }
-    assert(threw === true, 'fixture setup must make readFileSync throw (EACCES)');
+
+    // Root reads a mode-000 file just fine, so under an elevated identity
+    // (Linux containers, a dev running as root) the fixture cannot produce
+    // EACCES at all — the precondition is unmeetable, not violated. Report
+    // that out loud and stop, rather than failing on a fixture that this
+    // environment is incapable of building. This is NOT a silent skip: the
+    // line is printed, and the primary unreadable-stamp coverage is the
+    // AS_DIRECTORY case above, which is cross-platform AND privilege-
+    // independent. Raised as R2 by the codex challenger on the PR #70
+    // dogfood, arbitrated by the operator.
+    if (!threw) {
+      console.log('      (skipped: chmod 000 is still readable — running as root, EACCES unreachable here)');
+      return;
+    }
 
     const w = assertWrite(dir, { toolingSchema: TOOLING });
     assert(w.ok === false, 'assertWrite must refuse on a permission-denied stamp');
