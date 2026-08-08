@@ -7,6 +7,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const capabilities = require('./forge-capabilities.js');
 
 const root = path.resolve(__dirname, '..');
 let passed = 0;
@@ -166,6 +167,22 @@ test('SubagentStop repairs result-producing agents but excludes forge-memory', (
   assert(members.has('forge-executor'), 'forge-executor must be protected by the result contract');
   assert(members.has('forge-worker'), 'forge-worker must be protected by the result contract');
   assert(members.has('forge-completer'), 'forge-completer must be protected by the result contract');
+});
+
+test('native Claude contracts remain represented in the capability catalog', () => {
+  const result = capabilities.audit(root);
+  assert.deepStrictEqual(result.issues, [], 'capability catalog must audit cleanly');
+  const byId = new Map(result.catalog.capabilities.map((entry) => [entry.capability_id, entry]));
+  for (const id of ['operational-hooks', 'operational-headless', 'operational-mcp']) {
+    const entry = byId.get(id);
+    assert(entry, `${id} must remain cataloged`);
+    assert.strictEqual(entry.hosts.claude, 'implemented', `${id} must retain current Claude availability`);
+    assert.strictEqual(entry.hosts.codex, 'planned', `${id} must not claim a Codex implementation early`);
+  }
+  for (const agent of agentFiles) {
+    const id = `agent-${path.basename(agent, '.md')}`;
+    assert(byId.has(id), `${agent} must remain represented by the catalog`);
+  }
 });
 
 process.stdout.write(`\n${passed} passed, 0 failed\n`);

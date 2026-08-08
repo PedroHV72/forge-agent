@@ -4,7 +4,20 @@
 // through this module (M015 S01 cut).
 
 const fs = require('fs');
+const path = require('path');
 const { loadSchema } = require('./forge-prefs.js');
+const { resolveRuntimeHome } = require('./forge-home.js');
+
+// Kept as an adapter-only helper: production callers should not derive a
+// Claude path themselves. It is used by migration diagnostics and remains
+// read-only so legacy files are never treated as Forge's source of truth.
+function legacyGlobalPreferenceFiles(options) {
+  const dir = resolveRuntimeHome('claude', options);
+  return [
+    path.join(dir, 'forge-agent-prefs.jsonc'),
+    path.join(dir, 'forge-agent-prefs.md'),
+  ];
+}
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -334,4 +347,4 @@ function legacyReadLayer(files) {
   return { ok: true, prefs: merged, routingMalformed, malformedFile };
 }
 
-module.exports = { legacyReadFile, legacyReadLayer, legacyReadFlatKeys };
+module.exports = { legacyReadFile, legacyReadLayer, legacyReadFlatKeys, legacyGlobalPreferenceFiles };

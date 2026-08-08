@@ -4,6 +4,21 @@ description: "Task autonoma sem milestone — brainstorm, discuss, plan, execute
 allowed-tools: Read, Write, Edit, Bash, Agent, Skill, AskUserQuestion, TaskCreate, TaskUpdate, TaskList, TaskStop, SendMessage, WebSearch, WebFetch
 ---
 
+## Provider-neutral loop authority (S07)
+
+Read `shared/forge-lifecycle.md` before task intake. Resolve the current host
+explicitly as `claude|codex`, then call
+`scripts/forge-long-workflow-adapter.js` with `--mode task`. Preserve the
+returned `snapshot`; task mode has a one-unit budget and reaches a terminal
+boundary after resume/completion.
+
+The adapter action is authoritative: `dispatch` permits the existing body below
+to execute only that unit; `pause` yields at its durable boundary; `stop` ends.
+The host-specific prose may collect/present data and invoke the chosen host, but
+must not select again, acquire another lease, infer a worker/model or fall back
+to another host. A host change is valid only through explicit `resume` with the
+persisted boundary. Lifecycle ownership remains in `forge-orchestrate`.
+
 ## Parse arguments
 
 From `$ARGUMENTS`:

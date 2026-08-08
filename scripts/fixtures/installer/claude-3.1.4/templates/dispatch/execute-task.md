@@ -1,0 +1,1 @@
+# Legacy dispatch template fixture

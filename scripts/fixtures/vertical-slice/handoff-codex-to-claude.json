@@ -1,0 +1,23 @@
+{
+  "from": "codex",
+  "to": "claude",
+  "milestone": "M-20260729192554-forge-agent-3-1-4-multi",
+  "unit": "execute-task/T01",
+  "lease": null,
+  "boundary": {
+    "protocol_version": "1.0.0",
+    "idempotency_key": "fixture-codex-to-claude",
+    "unit": "execute-task/T01",
+    "milestone": "M-20260729192554-forge-agent-3-1-4-multi",
+    "kind": "paused",
+    "handoff_ready": true,
+    "outcome": "cancelled",
+    "reason_code": "pause",
+    "result_ref": ".gsd/forge/results/fixture-codex-to-claude.json",
+    "result_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+    "event_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+    "state_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+    "previous_host_runtime": "codex",
+    "committed_at": "2026-08-04T00:00:00.000Z"
+  }
+}

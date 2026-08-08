@@ -192,7 +192,8 @@ function activateValues(catalogText, values, schema) {
 
 // ── Layer descriptors ──────────────────────────────────────────────────────
 // The file lists come from forge-prefs.js#preferenceLayerDescriptors — the
-// SAME lists readPrefs resolves (global ~/.claude; local <cwd>/.gsd with the
+// SAME lists readPrefs resolves (Forge global with a Claude legacy fallback;
+// local <cwd>/.gsd with the
 // repo-shared md before the personal md, last-wins). The 3→2 fold direction
 // of decision #1 therefore comes from the old-reader itself and is never
 // re-implemented here. No legacy filename literal exists in this module.
@@ -216,17 +217,20 @@ function resolveCurrent(cwd, opts) {
   const options = opts || {};
   const errors = [];
   const layers = layerDescriptors(cwd, options).map((layer) => {
-    if (existingFiles([layer.jsoncPath]).length === 1) {
+    const jsoncCandidates = layer.jsoncCandidates || [layer.jsoncPath];
+    const jsoncPresent = existingFiles(jsoncCandidates);
+    if (jsoncPresent.length > 0) {
+      const jsoncPath = jsoncPresent[0];
       let raw;
       try {
-        raw = fs.readFileSync(layer.jsoncPath, 'utf8');
+        raw = fs.readFileSync(jsoncPath, 'utf8');
       } catch (error) {
-        errors.push({ file: layer.jsoncPath, line: null, message: error.message });
+        errors.push({ file: jsoncPath, line: null, message: error.message });
         return {};
       }
       const parsed = parseJsonc(raw);
       if (!parsed.ok) {
-        errors.push({ file: layer.jsoncPath, line: parsed.error.line, message: parsed.error.message });
+        errors.push({ file: jsoncPath, line: parsed.error.line, message: parsed.error.message });
         return {};
       }
       return parsed.value;
@@ -260,7 +264,8 @@ function bakPathFor(mdFile) {
 // a prep whose gate passed may be handed to commitLayer.
 function prepareLayer(layer) {
   const { name, jsoncPath, mdFiles, oldLayerResolved, schema } = layer;
-  if (fs.existsSync(jsoncPath)) {
+  const jsoncCandidates = layer.jsoncCandidates || [jsoncPath];
+  if (existingFiles(jsoncCandidates).length > 0) {
     // Idempotence (D5): the layer already migrated. Do not re-read md or .bak.
     return { name, action: 'skipped', reason: 'already-migrated', jsoncPath };
   }
@@ -300,7 +305,15 @@ function prepareLayer(layer) {
   if (warnings.length > 0) {
     return { name, action: 'stop', reason: 'schema-warnings', warnings, jsoncPath };
   }
-  return { name, action: 'ready', jsoncPath, mdFiles: present, generated, diff: [] };
+  return {
+    name,
+    action: 'ready',
+    jsoncPath,
+    mdFiles: present,
+    preserveFiles: (layer.legacyMdFiles || []).filter((file) => present.includes(file)),
+    generated,
+    diff: [],
+  };
 }
 
 // commitLayer performs the write half: .bak of every legacy md FIRST (never
@@ -312,8 +325,17 @@ function commitLayer(prep) {
     fs.copyFileSync(mdFile, bak);
     baks.push(bak);
   }
+  fs.mkdirSync(path.dirname(prep.jsoncPath), { recursive: true });
   fs.writeFileSync(prep.jsoncPath, prep.generated, 'utf8');
-  return { name: prep.name, action: 'migrated', jsoncPath: prep.jsoncPath, baks, mdFiles: prep.mdFiles, diff: [] };
+  return {
+    name: prep.name,
+    action: 'migrated',
+    jsoncPath: prep.jsoncPath,
+    baks,
+    mdFiles: prep.mdFiles,
+    preserveFiles: prep.preserveFiles || [],
+    diff: [],
+  };
 }
 
 // Single-layer convenience pipeline (exported for tests / targeted callers).
@@ -503,7 +525,8 @@ function setPreference(cwd, expression, opts) {
   const layerName = options.layer || defaultLayer;
   if (layerName !== 'global' && layerName !== 'local') throw new Error('--layer must be global or local');
   const layer = descriptors.find((entry) => entry.name === layerName);
-  const exists = fs.existsSync(layer.jsoncPath);
+  const sourceJsonc = existingFiles(layer.jsoncCandidates || [layer.jsoncPath])[0];
+  const exists = Boolean(sourceJsonc);
   if (!exists && layerName === 'local' && !options.create) {
     return { status: 'local-create-required', layer: layerName, path: layer.jsoncPath };
   }
@@ -524,7 +547,7 @@ function setPreference(cwd, expression, opts) {
     throw new Error(candidateWarnings.map((warning) => warning.message).join('; '));
   }
   const schemaRef = path.relative(path.dirname(layer.jsoncPath), path.join(__dirname, '..', 'forge-prefs.schema.json')).split(path.sep).join('/') || 'forge-prefs.schema.json';
-  const original = exists ? fs.readFileSync(layer.jsoncPath, 'utf8') : generateScaffold(schema, { schemaRef });
+  const original = sourceJsonc ? fs.readFileSync(sourceJsonc, 'utf8') : generateScaffold(schema, { schemaRef });
   const next = exists
     ? setCatalogValue(original, requested.key, requested.value, schema)
     : activateValues(original, setDottedValue({}, requested.key, requested.value), schema);
@@ -560,7 +583,7 @@ function migrateAll(cwd, opts) {
   // the merged pre-migration resolved for the whole-object re-verify gate.
   const captures = [];
   for (const layer of descriptors) {
-    if (fs.existsSync(layer.jsoncPath) || existingFiles(layer.mdFiles).length === 0) {
+    if (existingFiles(layer.jsoncCandidates || [layer.jsoncPath]).length > 0 || existingFiles(layer.mdFiles).length === 0) {
       captures.push({ layer, oldLayerResolved: {} });
       continue;
     }
@@ -591,7 +614,9 @@ function migrateAll(cwd, opts) {
     const prep = prepareLayer({
       name: capture.layer.name,
       jsoncPath: capture.layer.jsoncPath,
+      jsoncCandidates: capture.layer.jsoncCandidates,
       mdFiles: capture.layer.mdFiles,
+      legacyMdFiles: capture.layer.legacyMdFiles,
       oldLayerResolved: capture.oldLayerResolved,
       schema,
     });
@@ -667,6 +692,7 @@ function migrateAll(cwd, opts) {
   // Success: retire the legacy md files (the .bak stays as the recovery copy).
   for (const result of migrated) {
     for (const mdFile of result.mdFiles) {
+      if ((result.preserveFiles || []).includes(mdFile)) continue;
       try { fs.unlinkSync(mdFile); } catch { /* leave shadowed file behind */ }
     }
   }
@@ -715,7 +741,7 @@ function parseCliArgs(argv) {
     else if (arg === '--layer') args.layer = argv[++index] || '';
     else if (arg === '--create') args.create = true;
     // Test/advanced overrides — keep the CLI e2e-testable without ever
-    // touching the operator's real ~/.claude.
+    // touching the operator's real runtime home.
     else if (arg === '--global-dir') args.globalDir = path.resolve(argv[++index] || '');
     else if (arg === '--local-dir') args.localDir = path.resolve(argv[++index] || '');
     else return { error: `unknown argument: ${arg}` };

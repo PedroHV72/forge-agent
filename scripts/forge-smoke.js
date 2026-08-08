@@ -244,16 +244,18 @@ function smokeLock() {
 
   let r = runScript('forge-lock.js', ['--acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
   assert(r.status === 0, 'acquire DECISIONS.md', r.stderr);
+  const acquiredLock = JSON.parse(r.stdout);
 
   r = runScript('forge-lock.js', ['--try-acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
   assert(r.status === 1 && /busy/.test(r.stderr), 'try-acquire returns busy when held');
 
-  r = runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--cwd', dir]);
+  r = runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--token', acquiredLock.metadata.owner_token, '--generation', acquiredLock.metadata.generation, '--cwd', dir]);
   assert(r.status === 0, 'release DECISIONS.md');
 
   r = runScript('forge-lock.js', ['--try-acquire', 'DECISIONS.md', '--ttl', '5000', '--cwd', dir]);
   assert(r.status === 0, 'try-acquire after release succeeds');
-  runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--cwd', dir]);
+  const reacquiredLock = JSON.parse(r.stdout);
+  runScript('forge-lock.js', ['--release', 'DECISIONS.md', '--token', reacquiredLock.metadata.owner_token, '--generation', reacquiredLock.metadata.generation, '--cwd', dir]);
 
   cleanup(dir);
 }
@@ -403,25 +405,27 @@ function smokeFilelock() {
   runScript('forge-runs.js', ['--add', '--id', 'M070', '--kind', 'milestone', '--session', 'sess-x', '--cwd', dir]);
   runScript('forge-runs.js', ['--add', '--id', 'M071', '--kind', 'milestone', '--session', 'sess-y', '--cwd', dir]);
 
-  let r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--cwd', dir]);
+  let r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--ttl', '1000', '--cwd', dir]);
   assert(r.status === 0, 'M070 acquires src/foo.ts');
   let res = JSON.parse(r.stdout);
   assert(res.acquired === true, 'acquired:true on fresh acquire');
+  const firstFileLock = res;
 
-  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--cwd', dir]);
+  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--ttl', '1000', '--cwd', dir]);
   assert(r.status === 1, 'M071 blocked');
   res = JSON.parse(r.stdout);
   assert(res.acquired === false && res.holder.run_id === 'M070', 'holder details surfaced');
 
   // M070 same-run renew
-  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--cwd', dir]);
+  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M070', '--session', 'sess-x', '--token', firstFileLock.owner_token, '--ttl', '1000', '--cwd', dir]);
   assert(r.status === 0, 'M070 renews own lock');
 
   // Deactivate M070 → M071 can steal
   runScript('forge-runs.js', ['--update', 'M070', '--json', '{"active":false}', '--cwd', dir]);
-  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--cwd', dir]);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
+  r = runScript('forge-filelock.js', ['--acquire', 'src/foo.ts', '--run', 'M071', '--session', 'sess-y', '--ttl', '1000', '--cwd', dir]);
   res = JSON.parse(r.stdout);
-  assert(res.acquired === true && res.stolen && res.stolen.reason === 'inactive', 'M071 steals from inactive M070');
+  assert(res.acquired === true && res.stolen && res.stolen.reason === 'expired', 'M071 steals only after TTL expiry');
 
   cleanup(dir);
 }
@@ -1700,8 +1704,12 @@ function smokeAccounts() {
 
   // shell-init (zsh/bash) emits valid shell + handles the --account override
   const sh = acct.shellInit();
-  const bn = spawnSync('bash', ['-n'], { input: sh, encoding: 'utf8' });
-  assert(bn.status === 0, 'shell-init emits valid bash', bn.stderr);
+  const bashProbe = spawnSync('bash', ['--version'], { encoding: 'utf8' });
+  if (bashProbe.status !== 0) skip('shell-init emits valid bash', 'bash não está disponível neste host');
+  else {
+    const bn = spawnSync('bash', ['-n'], { input: sh, encoding: 'utf8' });
+    assert(bn.status === 0, 'shell-init emits valid bash', bn.stderr);
+  }
   assert(/--account\)/.test(sh) && /launch-prep/.test(sh), 'shell-init handles --account via launch-prep');
 
   // shell-init-pwsh emits a claude() function with the managed marker
@@ -2250,8 +2258,9 @@ function smokeXllm() {
     fs.writeFileSync(path.join(dir, 'big.txt'), bigDiff, 'utf8');
     const payload = JSON.stringify({ objections: [] });
     writeMockCodex(mockDir, { payload, exitCode: 0 });
+    const portableDiffCmd = `"${process.execPath}" -e "process.stdout.write(require('fs').readFileSync('big.txt'))"`;
     const r = runXllm(
-      ['--mode', 'challenge', '--diff-cmd', 'cat big.txt', '--cwd', dir],
+      ['--mode', 'challenge', '--diff-cmd', portableDiffCmd, '--cwd', dir],
       mockDir, dir, { FORGE_PROMPTLEN_FILE: lenFile },
     );
     assert(bigDiff.length > 40 * 1024, 'A2: fixture diff is >40KB', `len=${bigDiff.length}`);
@@ -2561,6 +2570,10 @@ function smokeModelAlias() {
   // Live bash reproduction of the MODEL_APPLIED_JSON glue + event line assembly —
   // catches malformed-JSON regressions that pure substring asserts miss (R2 fix).
   {
+    const bashProbe = spawnSync('bash', ['--version'], { encoding: 'utf8' });
+    if (bashProbe.status !== 0) {
+      skip('MODEL_APPLIED_JSON glue live probe', 'bash não está disponível neste host');
+    } else {
     const buildAndParse = (modelAlias) => {
       const script = [
         `MODEL_ALIAS='${modelAlias}'`,
@@ -2582,6 +2595,7 @@ function smokeModelAlias() {
     assert(!!withoutAlias.parsed, 'MODEL_APPLIED_JSON glue produces valid JSON when MODEL_ALIAS empty', withoutAlias.raw);
     assert(withoutAlias.parsed && withoutAlias.parsed.model_applied === null,
       'model_applied === null when MODEL_ALIAS=""', JSON.stringify(withoutAlias.parsed));
+    }
   }
 }
 
@@ -2911,6 +2925,10 @@ process.stdout.write(JSON.stringify({challengerModel,advocateModel}));
   // valid JSON + advocate === "fable" / null (mirror of Section 21's
   // model_applied glue test, R2 fix).
   {
+    const bashProbe = spawnSync('bash', ['--version'], { encoding: 'utf8' });
+    if (bashProbe.status !== 0) {
+      skip('advocate event-line glue live probe', 'bash não está disponível neste host');
+    } else {
     const buildAndParse = (advocateAlias) => {
       const script = [
         `ADVOCATE_ALIAS='${advocateAlias}'`,
@@ -2931,6 +2949,7 @@ process.stdout.write(JSON.stringify({challengerModel,advocateModel}));
     assert(!!withoutAlias.parsed, 'advocate event-line glue produces valid JSON when ADVOCATE_ALIAS empty', withoutAlias.raw);
     assert(withoutAlias.parsed && withoutAlias.parsed.advocate === null,
       'advocate === null when ADVOCATE_ALIAS=""', JSON.stringify(withoutAlias.parsed));
+    }
   }
 }
 
@@ -3628,7 +3647,7 @@ function smokeEngineDispatch() {
     fs.writeFileSync(stateFile,
       JSON.stringify({ start_sha: startSha, reason: '', result_file: resultFile, code_dir: codeDir }) + '\n', 'utf8');
     const readField = (field) => spawnSync(process.execPath,
-      ['-pe', `JSON.parse(require('fs').readFileSync('${stateFile}','utf8')).${field}`],
+      ['-pe', `JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).${field}`, stateFile],
       { encoding: 'utf8' }).stdout.trim();
     assert(readField('start_sha') === startSha, 'E: start_sha round-trips from state file', readField('start_sha'));
     assert(readField('code_dir') === codeDir, 'E: code_dir round-trips from state file', readField('code_dir'));
@@ -4077,10 +4096,12 @@ function smokeStatusPackaging() {
   assert(fs.existsSync(path.join(REPO, 'bin', 'forge-status')), '(c) bin/forge-status existe', 'arquivo ausente');
   assert(fs.existsSync(path.join(REPO, 'bin', 'forge-status.cmd')), '(c) bin/forge-status.cmd existe', 'arquivo ausente');
 
-  // (d) install.ps1 Join-Path + no-\f
+  // (d) PowerShell delegates to the shared installer; the Node core owns bin
+  // packaging for Windows/macOS/Linux.
   const ps1 = rd('install.ps1');
-  assert(/Join-Path[^\n]*forge-status\.cmd/.test(ps1),
-    '(d) install.ps1 copia forge-status.cmd via Join-Path', 'bloco Join-Path ... forge-status.cmd não encontrado');
+  const installer = require('./forge-installer.js');
+  assert(/forge-installer\.js/.test(ps1) && installer.MANAGED_CORE.includes('bin'),
+    '(d) install.ps1 delegates and the Node core packages forge-status.cmd', 'delegação/core bin ausente');
   const ps1buf = fs.readFileSync(path.join(REPO, 'install.ps1'));
   assert(!ps1buf.includes(0x0C), '(d) install.ps1 sem byte 0x0C (literal \\f)', 'byte 0x0C encontrado em install.ps1');
 
@@ -5473,15 +5494,15 @@ function smokePrefsEngine() {
   const { parseJsonc, readPrefs, deepMerge } = require('./forge-prefs.js');
   const { readRoutingConfig } = require('./forge-routing.js');
   const requires = [...prefsSource.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]);
-  const allowed = new Set(['fs', 'path', 'os', './forge-prefs-scaffold.js']);
+  const allowed = new Set(['fs', 'path', 'os', './forge-home.js', './forge-prefs-scaffold.js']);
 
   assert(requires.every((name) => allowed.has(name)),
     '(a) forge-prefs.js usa somente builtins permitidos (fs/path/os)', JSON.stringify(requires));
-  // No LEGACY cross-imports: the new scaffold module is the sole intentional
-  // forge-* dependency, and only on the cold --scaffold CLI branch.
+  // The shared-home resolver and scaffold module are the only intentional
+  // forge-* dependencies; legacy parsing remains outside the read engine.
   assert(requires.length === 4 && requires.every((name) => allowed.has(name)) &&
-    requires.includes('./forge-prefs-scaffold.js'),
-    '(a) forge-prefs.js usa a allowlist exata (scaffold lazy)', JSON.stringify(requires));
+    requires.includes('./forge-home.js') && requires.includes('./forge-prefs-scaffold.js'),
+    '(a) forge-prefs.js usa a allowlist exata (home boundary + scaffold lazy)', JSON.stringify(requires));
   assert(!prefsSource.includes('forge-prefs-legacy.js'),
     '(a) forge-prefs.js never requires forge-prefs-legacy.js (transitivity guard)');
   const scaffoldSource = fs.readFileSync(path.join(SCRIPTS, 'forge-prefs-scaffold.js'), 'utf8');
@@ -5759,8 +5780,8 @@ function smokePrefsCatalog() {
     '(d) scaffold mantém require-set fechado [fs,path,./forge-prefs.js]',
     JSON.stringify(requiresOf(sourceOf('forge-prefs-scaffold.js'))));
   assert(JSON.stringify(requiresOf(sourceOf('forge-prefs.js'))) ===
-    JSON.stringify(['fs', 'os', 'path', './forge-prefs-scaffold.js']),
-    '(d) engine mantém require-set fechado com scaffold lazy',
+    JSON.stringify(['fs', 'path', './forge-home.js', './forge-prefs-scaffold.js']),
+    '(d) engine mantém require-set fechado com home boundary + scaffold lazy',
     JSON.stringify(requiresOf(sourceOf('forge-prefs.js'))));
   const hotPath = spawnSync(process.execPath, ['-e',
     "require('./scripts/forge-prefs.js'); process.exit(require.cache[require.resolve('./scripts/forge-prefs-scaffold.js')] ? 1 : 0)"],
@@ -6061,9 +6082,9 @@ function smokePrefsCutover() {
       `(e) ${name}: wired to forge-prefs readPrefsCached`);
   }
 
-  // Positive guard for the dual-read boundary. test-*.js and the smoke file
-  // intentionally contain fixture writers for the compatibility tests; no
-  // production script may carry the legacy filenames except the engine.
+  // Positive guard for the dual-read boundary. The shared-home boundary owns
+  // canonical/legacy path resolution; installer and maintenance may name a
+  // legacy Claude artifact only for backup/detection, never for preference reads.
   const fixtureWriters = new Set(['forge-smoke.js', 'test-review-pipeline.js']);
   const scriptFiles = fs.readdirSync(SCRIPTS)
     .filter((name) => name.endsWith('.js') && !name.endsWith('.test.js') && !fixtureWriters.has(name));
@@ -6071,12 +6092,16 @@ function smokePrefsCutover() {
     const source = sourceOf(name);
     return legacyFilenameLiterals.some((literal) => source.includes(literal));
   });
-  assert(JSON.stringify(legacyHolders) === JSON.stringify(['forge-prefs.js']),
-    '(e) forge-prefs.js is the sole production holder of legacy filenames',
+  const sanctionedLegacyHolders = ['forge-home.js', 'forge-installer.js', 'forge-maintenance.js', 'forge-prefs-legacy.js'];
+  assert(JSON.stringify(legacyHolders) === JSON.stringify(sanctionedLegacyHolders),
+    '(e) only the path boundary and maintenance flows hold legacy filenames',
     JSON.stringify(legacyHolders));
   const legacyReaderSource = sourceOf('forge-prefs-legacy.js');
-  assert(legacyFilenameLiterals.every((literal) => !legacyReaderSource.includes(literal)),
-    '(e) forge-prefs-legacy.js receives paths as arguments and holds no legacy filename literals');
+  assert(/resolveRuntimeHome\(['"]claude['"]/.test(legacyReaderSource)
+      && legacyReaderSource.includes('forge-agent-prefs.md')
+      && !legacyReaderSource.includes('claude-agent-prefs.md')
+      && !legacyReaderSource.includes('prefs.local'),
+    '(e) forge-prefs-legacy.js resolves only the Claude-global compatibility input through forge-home');
 }
 
 // ── Section 40: S04 skills/dispatch cutover: equivalence + absence guards ──
@@ -6296,7 +6321,11 @@ function smokeSkillsCutover() {
     assert(!repoPathGrepRe.test(source), `(c) ${rel}: legacy repo_path-grep construct absent`);
     // Wired half: every cut-over file references the new engine. forge-sweep's
     // only mention is a protect-list filename entry (see below), still checked.
-    assert(source.includes('forge-prefs.js'), `(c) ${rel}: references forge-prefs.js`);
+    if (rel === 'skills/forge-doctor/SKILL.md') {
+      assert(source.includes('forge-doctor.js'), `(c) ${rel}: delegates to forge-doctor.js`);
+    } else {
+      assert(source.includes('forge-prefs.js'), `(c) ${rel}: references forge-prefs.js`);
+    }
   }
 
   // forge-sweep's protect-list must include both the new local jsonc and the
@@ -6512,10 +6541,11 @@ function smokePrefsMigration() {
 
   const root = path.join(__dirname, '..'); const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
   const sh = read('install.sh'); const ps = read('install.ps1'); const update = read('commands/forge-update.md');
-  assert(sh.includes('--scaffold') && !sh.includes('.gsd/forge-prefs.jsonc'), '(e) install.sh invokes --scaffold and never creates local .gsd catalog');
+  const installerCore = read('scripts/forge-installer.js'); const updateCore = read('scripts/forge-update.js');
+  assert(/generateScaffold/.test(installerCore) && !installerCore.includes('.gsd/forge-prefs.jsonc'), '(e) installer core scaffolds the global Forge-home catalog and never creates a local .gsd catalog');
   assert(ps.includes('Join-Path') && !ps.includes('\f') && !ps.includes(String.fromCharCode(0x0c)), '(e) install.ps1 uses Join-Path and contains no form-feed byte');
-  assert(update.indexOf('forge-prefs-migrate.js') < update.indexOf('--rescaffold'), '(e) forge-update migrates before re-scaffold');
-  { const repoPathSetCalls = update.match(/--set "repo_path=[^"]*"/g) || []; assert(repoPathSetCalls.length >= 2 && repoPathSetCalls.every((call) => { const idx = update.indexOf(call); const line = update.slice(update.lastIndexOf('\n', idx) + 1, update.indexOf('\n', idx)); return line.includes('--layer global'); }), '(e2) every --set repo_path invocation in forge-update.md carries --layer global (global-only knob must not land in local layer)', JSON.stringify(repoPathSetCalls)); }
+  assert(/forge-update\.js --apply/.test(update) && /installer\.install/.test(updateCore), '(e) forge-update thin adapter delegates migration/update ordering to the Node core');
+  assert(/migrateLegacy:\s*input\.migrateLegacy/.test(updateCore), '(e2) forge-update forwards explicit legacy migration without writing repo_path through a local layer');
   for (const skill of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
     const skillText = read(skill);
     assert(!skillText.includes('Deprecation warning (once per session)') &&
@@ -6523,9 +6553,8 @@ function smokePrefsMigration() {
       `(e) ${skill}: consumer uses structured legacy-md-without-jsonc posture`);
   }
   const doctorText = read('skills/forge-doctor/SKILL.md');
-  assert(doctorText.includes('md-blocked') &&
-    /forge-prefs-migrate\.js[\s\S]{0,180}--local-only/.test(doctorText),
-    '(e) doctor detects blocked prefs and documents local-only migration');
+  assert(/forge-doctor\.js --check all/.test(doctorText) && /--fix/.test(doctorText),
+    '(e) doctor delegates diagnostics and reversible fixes to the shared engine');
   pass('(f) Section 41 fixtures are substantive real-shaped markdown, not synthetic key-only stubs');
 }
 
@@ -6816,10 +6845,11 @@ function smokeInitSetupScaffold() {
   const caseB = init.slice(caseBStart, caseBEnd < 0 ? init.length : caseBEnd);
   assert(!/(?:mkdir|touch|cat|echo|tee|writeFile|cp)[^\n]*(?:claude-agent-prefs\.md|prefs\.local\.md)/i.test(caseB),
     '(d) Case B não contém criação dos .md legados');
-  assert(read('install.sh').includes('--schema-ref forge-prefs.schema.json'),
-    '(e) install.sh passa --schema-ref forge-prefs.schema.json ao scaffold global');
-  assert(read('install.ps1').includes('--schema-ref forge-prefs.schema.json'),
-    '(e) install.ps1 passa --schema-ref forge-prefs.schema.json ao scaffold global');
+  const installerSource = read('scripts/forge-installer.js');
+  assert(/generateScaffold\(schema, \{ schemaRef: 'schemas\/forge-prefs\.schema\.json' \}\)/.test(installerSource),
+    '(e) installer core passes the Forge-home schema ref to the global scaffold');
+  assert(/forge-installer\.js/.test(read('install.sh')) && /forge-installer\.js/.test(read('install.ps1')),
+    '(e) both platform wrappers delegate schema/scaffold handling to the same core');
   pass('(final) Section 44: setup scaffold curado, schema ref e wiring verificados');
 }
 
@@ -7722,39 +7752,28 @@ function smokePrefsChokepoints() {
   const sh = fs.readFileSync(path.join(REPO, 'install.sh'), 'utf8');
   const ps = fs.readFileSync(path.join(REPO, 'install.ps1'), 'utf8');
 
-  // The installers must only migrate an existing legacy global file; the
-  // repository's deleted Markdown template is not an installation source.
+  const installerSource = fs.readFileSync(path.join(SCRIPTS, 'forge-installer.js'), 'utf8');
+  // Shells are adapters only. The Node core owns shared-home preference
+  // migration/scaffold so Bash and PowerShell cannot drift.
   assert(!sh.includes('copy "${REPO_DIR}/forge-agent-prefs.md"'),
     '(a) install.sh does not copy the repository forge-agent-prefs.md template', 'install.sh');
   assert(!sh.includes('forge-agent-prefs.md (novo)'),
     '(a) install.sh has no legacy Portuguese template-copy line', 'install.sh');
-  assert(sh.includes('forge-prefs-migrate.js" --global-only'),
-    '(a) install.sh invokes forge-prefs-migrate.js --global-only', 'install.sh');
-  const shLegacyStart = sh.indexOf('elif [ -f "$PREFS_DST" ]');
-  const shFirstNextBranch = sh.indexOf('elif command -v node', shLegacyStart);
-  const shScaffoldStart = sh.indexOf('elif command -v node', shFirstNextBranch + 1);
-  const shLegacy = sh.slice(shLegacyStart, shScaffoldStart);
-  assert(/if node[\s\S]*else[\s\S]*manual[\s\S]*--global-only[\s\S]*\n\s*fi/.test(shLegacy),
-    '(b) install.sh degrades a refused migration to a manual instruction', shLegacy);
-  assert(!/manual:[\s\S]{0,300}\bexit\b/.test(shLegacy),
-    '(b) install.sh continues after a non-zero migrator exit', shLegacy);
+  assert(/exec node .*forge-installer\.js/.test(sh),
+    '(a) install.sh delegates preference handling to forge-installer.js', 'install.sh');
+  assert(/resolveForgePaths/.test(installerSource) && /legacyPrefs/.test(installerSource)
+      && /generateScaffold/.test(installerSource),
+    '(b) installer core owns legacy fallback and canonical Forge-home scaffold', 'forge-installer.js');
 
   assert(!ps.includes('CopyFile "$RepoDir\\forge-agent-prefs.md"'),
     '(c) install.ps1 does not CopyFile the repository forge-agent-prefs.md template', 'install.ps1');
-  assert(ps.includes('--global-only'),
-    '(c) install.ps1 invokes forge-prefs-migrate.js --global-only', 'install.ps1');
-  assert(/for f in .*shared\/\*\.md/.test(sh),
-    '(c2) install.sh copies shared references through the glob loop', 'install.sh');
-  assert(/Get-ChildItem[\s\S]*-Path \$SharedSrc[\s\S]*-Filter '\*\.md'/m.test(ps),
-    '(c2) install.ps1 copies shared references through the Get-ChildItem loop', 'install.ps1');
-  const psLegacyStart = ps.indexOf("elseif (Test-Path $prefsFile)");
-  const psFirstNextBranch = ps.indexOf("elseif (Get-Command node", psLegacyStart);
-  const psScaffoldStart = ps.indexOf("elseif (Get-Command node", psFirstNextBranch + 1);
-  const psLegacy = ps.slice(psLegacyStart, psScaffoldStart);
-  assert(/LASTEXITCODE\s*-eq\s*0/.test(psLegacy) && /Warn[\s\S]*manual[\s\S]*--global-only/.test(psLegacy),
-    '(d) install.ps1 degrades a refused migration to a manual instruction', psLegacy);
-  assert(!/manual:[\s\S]{0,300}\bexit\b/i.test(psLegacy),
-    '(d) install.ps1 continues after a non-zero migrator exit', psLegacy);
+  assert(/forge-installer\.js/.test(ps),
+    '(c) install.ps1 delegates preference handling to forge-installer.js', 'install.ps1');
+  const managedCore = require('./forge-installer.js').MANAGED_CORE;
+  assert(managedCore.includes('shared'),
+    '(c2) Node installer copies shared references once for both shell wrappers', JSON.stringify(managedCore));
+  assert(!/\.gsd[\\/].*forge-prefs\.jsonc/.test(installerSource),
+    '(d) global installer never creates a local .gsd preference catalog', 'forge-installer.js');
 
   const psBytes = fs.readFileSync(path.join(REPO, 'install.ps1'));
   assert(!psBytes.includes(0x0c), '(e) install.ps1 contains no literal 0x0C byte', 'install.ps1');
@@ -7814,16 +7833,14 @@ function smokePrefsConsumers() {
       `(a) ${rel} handles legacy-md-without-jsonc`, rel);
   }
 
-  // Doctor reports the blocked layer and its --fix path delegates migration
-  // to the local-only migrator, without reviving the removed source label.
+  // Doctor remains a thin runtime-aware adapter. Preference migration belongs
+  // to the shared installer/update core and is covered by its behavioral tests.
   const doctorRel = 'skills/forge-doctor/SKILL.md';
   const doctor = readRepoText(path.join(REPO, doctorRel));
-  assert(doctor.includes('md-blocked'),
-    '(b) forge-doctor detects md-blocked', doctorRel);
-  const fixStart = doctor.indexOf('## C5a:');
-  const fixRegion = fixStart >= 0 ? doctor.slice(fixStart, fixStart + 3200) : '';
-  assert(/forge-prefs-migrate\.js[\s\S]{0,180}--local-only/.test(fixRegion),
-    '(b) forge-doctor --fix invokes forge-prefs-migrate.js --local-only', doctorRel);
+  assert(/forge-doctor\.js --check all/.test(doctor) && /reason_code/.test(doctor),
+    '(b) forge-doctor delegates runtime diagnostics to the versioned engine', doctorRel);
+  assert(/--fix/.test(doctor) && /reparos|revers[ií]veis/i.test(doctor),
+    '(b) forge-doctor limits --fix to declared reversible repairs', doctorRel);
   assert(!doctor.includes('source: "md-legacy"'),
     '(b) forge-doctor has no md-legacy source label', doctorRel);
 
@@ -7870,6 +7887,9 @@ function smokePrefsCutoverGuards() {
     'scripts/forge-prefs-migrate.js', 'scripts/forge-prefs.test.js',
     'scripts/forge-prefs-migrate.test.js', 'scripts/forge-prefs-schema.test.js',
     'scripts/forge-routing.test.js', 'scripts/forge-verifier.test.js',
+    'scripts/forge-home.js', 'scripts/forge-home.test.js',
+    'scripts/forge-installer.js', 'scripts/forge-installer.test.js',
+    'scripts/forge-maintenance.js', 'scripts/forge-package.test.js',
     'scripts/forge-smoke.js', 'install.sh', 'install.ps1',
     'commands/forge-update.md', 'shared/forge-prefs-cutover.md',
     // Existing compatibility entry points are deliberately audited rather
@@ -8157,6 +8177,11 @@ function smokeSidecarGptCap() {
   process.stdout.write('\n▸ Sidecar cap counts gpt and codex family members\n');
   const REPO = path.dirname(SCRIPTS);
   const mirrors = ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md'];
+  const bashProbe = spawnSync('bash', ['--version'], { encoding: 'utf8' });
+  if (bashProbe.status !== 0) {
+    skip('sidecar cap executable shell snippets', 'bash não está disponível neste host');
+    return;
+  }
   for (const rel of mirrors) {
     const text = readRepoText(path.join(REPO, rel));
     const matches = text.match(/CODEX_MEMBERS=\$\(node -e "[^"]*filter\(m=>m\.engine==='gpt'\|\|m\.engine==='codex'\)[^"]*" \"\$ROUTE_JSON\"[^\n]*/g) || [];
@@ -8200,8 +8225,13 @@ function smokeSidecarEnvContract() {
   nodeAssert.deepStrictEqual(buildSidecarEnv('yolo', fixture, 'darwin'), minimal);
   pass('(a) invalid policy securely defaults to minimal');
 
-  nodeAssert.deepStrictEqual(buildSidecarEnv('inherit', fixture, 'darwin'), fixture);
-  pass('(b) inherit is deep-equal to the source env, including denylisted keys');
+  const inherited = buildSidecarEnv('inherit', fixture, 'darwin');
+  assert(denied.every(key => !Object.prototype.hasOwnProperty.call(inherited, key)),
+    '(b) inherit preserves non-sensitive env but strips credentials',
+    `leaked=${denied.filter(key => Object.prototype.hasOwnProperty.call(inherited, key)).join(',')}`);
+  assert(inherited.PATH === fixture.PATH && inherited.HOME === fixture.HOME
+      && inherited.FORGE_XLLM_CODEX_BIN === fixture.FORGE_XLLM_CODEX_BIN,
+    '(b) inherit keeps routing and platform inputs after sanitization');
 
   const forgeFixture = { PATH: '/bin', FORGE_ONE: 'one', FORGE_TWO: 'two', RANDOM_SECRET: 'no' };
   const forgeMinimal = buildSidecarEnv('minimal', forgeFixture, 'darwin');
@@ -8231,10 +8261,11 @@ function smokeSidecarEnvContract() {
       && !('FORGE_CLAUDE_CODE_OAUTH_TOKEN' in teethMinimal),
     '(a2) denylist strips denylisted prefixes embedded after a FORGE_ underscore boundary',
     `leaked=${Object.keys(teethMinimal).filter(k => k.startsWith('FORGE_') && /(^|_)(AWS_|AZURE_|GCP_|DATABASE_|ANTHROPIC_|CLAUDE_)/.test(k)).join(',')}`);
-  assert(teethMinimal.FORGE_XLLM_CODEX_BIN === 'mock-codex.js' && teethMinimal.FORGE_ACCOUNT === 'work'
-      && teethMinimal.FORGE_ENGINE === 'codex' && teethMinimal.FORGE_NEW_WINDOW_DRYRUN === '1'
-      && teethMinimal.FORGE_SESSION_ID === 'sess-1',
-    '(a2) real FORGE_* vocabulary passes through unaffected by the tightened denylist');
+  assert(teethMinimal.FORGE_XLLM_CODEX_BIN === 'mock-codex.js'
+      && teethMinimal.FORGE_ENGINE === 'codex' && teethMinimal.FORGE_NEW_WINDOW_DRYRUN === '1',
+    '(a2) non-sensitive FORGE_* routing vocabulary passes through the tightened denylist');
+  assert(!('FORGE_ACCOUNT' in teethMinimal) && !('FORGE_SESSION_ID' in teethMinimal),
+    '(a2) account/session-shaped FORGE_* values are stripped as sensitive');
 
   const platformFixture = {
     SystemRoot: 'win', COMSPEC: 'win', PATHEXT: 'win', APPDATA: 'win',
@@ -8346,9 +8377,9 @@ function smokeSidecarEnvContract() {
     assert(minimalRun.env.FORGE_XLLM_CODEX_BIN === mockJs && minimalRun.env.PATH,
       '(e) minimal child env dump receives FORGE_XLLM_CODEX_BIN and PATH');
     const inheritRun = runPolicy('inherit');
-    assert(inheritRun.result.status === 0 && inheritRun.env.ANTHROPIC_AUTH_TOKEN === 'child-anthropic-planted'
-        && inheritRun.env.CLAUDE_CODE_OAUTH_TOKEN === 'child-claude-planted',
-      '(e) inherit CLI run re-exposes planted tokens as the explicit escape hatch', inheritRun.result.stderr);
+    assert(inheritRun.result.status === 0 && !inheritRun.env.ANTHROPIC_AUTH_TOKEN
+        && !inheritRun.env.CLAUDE_CODE_OAUTH_TOKEN,
+      '(e) inherit CLI run strips planted tokens at the sidecar boundary', inheritRun.result.stderr);
     const bogusRun = runPolicy('bogus');
     assert(bogusRun.result.status === 2,
       '(e) invalid --env-policy exits 2', `status=${bogusRun.result.status}`);
@@ -8535,10 +8566,11 @@ function smokeSchemaExtraction() {
 
   const installSh = fs.readFileSync(path.join(REPO, 'install.sh'), 'utf8');
   const installPs1 = fs.readFileSync(path.join(REPO, 'install.ps1'), 'utf8');
-  assert(/shared\/schemas[\s\S]{0,300}?schemas\/\$\{name\}/.test(installSh),
-    '(f) install.sh copies shared/schemas JSON files into schemas/');
-  assert(/Join-Path[ \t]+\$RepoDir[ \t]+'shared'[\s\S]{0,300}?Join-Path[ \t]+\$ClaudeDir[ \t]+'schemas'/.test(installPs1),
-    '(f) install.ps1 copies shared/schemas JSON files into schemas/');
+  const managedCore = require('./forge-installer.js').MANAGED_CORE;
+  assert(/forge-installer\.js/.test(installSh) && managedCore.includes('schemas'),
+    '(f) install.sh delegates schema copying to the shared Node core');
+  assert(/forge-installer\.js/.test(installPs1) && managedCore.includes('schemas'),
+    '(f) install.ps1 delegates schema copying to the shared Node core');
 
   pass('(final) Section 52: schema files, single-source wiring, installed layout, additive protocol, and installers verified (baseline 1248)');
 }
@@ -10007,14 +10039,13 @@ function smokeSharedGlob() {
   const expected = fs.readdirSync(path.join(repo, 'shared'))
     .filter((name) => name.endsWith('.md'));
 
-  // PowerShell is not available on the Unix smoke runner, so sh↔ps1
-  // behavioral parity is checked here by source-level grep guards only.
-  assert(/for f in .*shared\/\*\.md/.test(sh),
-    '(a) install.sh iterates shared/*.md with one glob loop', sh);
+  const installer = require('./forge-installer.js');
+  assert(/forge-installer\.js/.test(sh) && installer.MANAGED_CORE.includes('shared'),
+    '(a) install.sh delegates shared-tree installation to the Node core', sh);
   assert(!/^\s*copy "\$\{REPO_DIR\}\/shared\/forge-[^"]+\.md"/m.test(sh),
     '(b) install.sh has no individual shared forge copy blocks', sh);
-  assert(/Get-ChildItem[\s\S]*-Path \$SharedSrc[\s\S]*-Filter '\*\.md'/m.test(ps),
-    '(c) install.ps1 iterates shared/*.md with Get-ChildItem', ps);
+  assert(/forge-installer\.js/.test(ps) && installer.MANAGED_CORE.includes('shared'),
+    '(c) install.ps1 delegates shared-tree installation to the Node core', ps);
   assert(!/^\s*if \(Test-Path "\$RepoDir\\shared\\forge-[^"]+\.md"\)/m.test(ps),
     '(d) install.ps1 has no individual shared forge Test-Path blocks', ps);
   assert(!fs.readFileSync(psPath).includes(0x0c),

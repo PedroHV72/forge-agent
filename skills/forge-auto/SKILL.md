@@ -4,6 +4,21 @@ description: "Executa o milestone inteiro de forma autonoma ate concluir."
 allowed-tools: Read, Write, Edit, Bash, Agent, Skill, TaskCreate, TaskUpdate, TaskList, TaskStop, SendMessage, WebSearch, WebFetch
 ---
 
+## Provider-neutral loop authority (S07)
+
+Read `shared/forge-lifecycle.md` before entering the unit loop. Resolve the
+current host explicitly as `claude|codex`, then call
+`scripts/forge-long-workflow-adapter.js` with `--mode auto`. Preserve the
+returned `snapshot` across iterations/compaction; it is the loop identity.
+
+The adapter action is authoritative: `dispatch` permits the existing body below
+to execute only the selected unit; `pause` persists/yields at its boundary;
+`continue` requests the next iteration; `stop` ends. The prose below may render
+prompts and invoke the selected host, but it must not re-select a unit, acquire a
+second lease, invent a boundary, or change host. Only an explicit `resume` with
+the durable boundary may change `host_runtime`. This adapter never spawns or
+implements fallback; dispatch remains the S06 boundary.
+
 ## Bootstrap guard
 
 ```bash

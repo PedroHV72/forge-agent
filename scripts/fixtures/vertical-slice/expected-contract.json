@@ -1,0 +1,11 @@
+{
+  "protocol_version": "1.0.0",
+  "operations": {
+    "init": { "outcome": "completed", "reason_code": "initialized" },
+    "status": { "outcome": "completed", "reason_code": "status-ready" },
+    "next": { "outcome": "completed", "reason_code": "unit-selected", "unit": "execute-task/T01" },
+    "needs_input": { "outcome": "needs_input", "reason_code": "needs-input", "boundary_kind": "paused" },
+    "handoff": { "outcome": "completed", "reason_code": "handoff-ready" },
+    "resume": { "outcome": "completed", "reason_code": "handoff-ready" }
+  }
+}

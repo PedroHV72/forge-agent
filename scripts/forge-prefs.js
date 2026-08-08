@@ -2,8 +2,8 @@
 'use strict';
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const { resolvePreferencePaths } = require('./forge-home.js');
 
 // Markdown catalogs are intentionally not parsed by this engine. Their exact
 // descriptor filenames remain below for cache invalidation and structured
@@ -242,23 +242,28 @@ function existingFiles(files) {
   });
 }
 
-function resolveLayer(jsoncFile, markdownFiles, errors, cwd) {
-  if (existingFiles([jsoncFile]).length === 1) {
+function resolveLayer(jsoncFile, markdownFiles, errors, cwd, descriptor) {
+  const candidates = descriptor && Array.isArray(descriptor.jsoncCandidates)
+    ? descriptor.jsoncCandidates
+    : [jsoncFile];
+  const presentJsonc = existingFiles(candidates);
+  if (presentJsonc.length > 0) {
+    const resolvedJsonc = presentJsonc[0];
     let raw;
     try {
-      raw = fs.readFileSync(jsoncFile, 'utf8');
+      raw = fs.readFileSync(resolvedJsonc, 'utf8');
     } catch (error) {
-      errors.push({ file: jsoncFile, line: null, message: error.message });
-      return { prefs: {}, source: 'jsonc', files: [jsoncFile] };
+      errors.push({ file: resolvedJsonc, line: null, message: error.message });
+      return { prefs: {}, source: 'jsonc', files: [resolvedJsonc] };
     }
     const parsed = parseJsonc(raw);
     if (!parsed.ok) {
-      errors.push({ file: jsoncFile, line: parsed.error.line, message: parsed.error.message });
+      errors.push({ file: resolvedJsonc, line: parsed.error.line, message: parsed.error.message });
       // A broken JSONC layer contributes nothing.  In particular, do not fall
       // back to its Markdown files: JSONC's shadow remains in force.
-      return { prefs: {}, source: 'jsonc', files: [jsoncFile] };
+      return { prefs: {}, source: 'jsonc', files: [resolvedJsonc] };
     }
-    return { prefs: parsed.value, source: 'jsonc', files: [jsoncFile] };
+    return { prefs: parsed.value, source: 'jsonc', files: [resolvedJsonc] };
   }
 
   const files = existingFiles(markdownFiles);
@@ -284,22 +289,26 @@ function resolveLayer(jsoncFile, markdownFiles, errors, cwd) {
  * legacy preference filenames (guarded by smoke Section 39e). Consumers such
  * as forge-prefs-migrate.js import this instead of re-declaring paths.
  * `opts.globalDir` / `opts.localDir` exist for test isolation (never touch the
- * operator's real ~/.claude from a test).
+ * operator's real runtime home from a test).
  */
 function preferenceLayerDescriptors(cwd, opts) {
   const options = opts || {};
-  const claudeDir = options.globalDir || path.join(os.homedir(), '.claude');
-  const gsdDir = options.localDir || path.join(cwd || process.cwd(), '.gsd');
+  const paths = resolvePreferencePaths(cwd || process.cwd(), options);
   return [
     {
       name: 'global',
-      jsoncPath: path.join(claudeDir, 'forge-agent-prefs.jsonc'),
-      mdFiles: [path.join(claudeDir, 'forge-agent-prefs.md')],
+      jsoncPath: paths.canonical.jsoncPath,
+      jsoncCandidates: paths.jsoncCandidates,
+      mdFiles: paths.mdCandidates,
+      legacyMdFiles: paths.legacyMdFiles,
+      legacyJsoncPath: paths.legacy && paths.legacy.jsoncPath,
     },
     {
       name: 'local',
-      jsoncPath: path.join(gsdDir, 'forge-prefs.jsonc'),
-      mdFiles: [path.join(gsdDir, 'claude-agent-prefs.md'), path.join(gsdDir, 'prefs.local.md')],
+      jsoncPath: paths.local.jsoncPath,
+      jsoncCandidates: [paths.local.jsoncPath],
+      mdFiles: paths.local.mdFiles,
+      legacyMdFiles: [],
     },
   ];
 }
@@ -312,7 +321,7 @@ function readPrefs(cwd, opts) {
   const targetCwd = path.resolve(cwd || process.cwd());
   const errors = [];
   const [globalDescriptor, localDescriptor] = preferenceLayerDescriptors(targetCwd, opts);
-  const globalLayer = resolveLayer(globalDescriptor.jsoncPath, globalDescriptor.mdFiles, errors, targetCwd);
+  const globalLayer = resolveLayer(globalDescriptor.jsoncPath, globalDescriptor.mdFiles, errors, targetCwd, globalDescriptor);
   // R3 fix (S04 review): `--global-only` skips the local layer entirely, so
   // callers that must resolve a per-operator setting (e.g. `app.*` in the
   // desktop app) never let a project-local .gsd/ override it, regardless of
@@ -328,7 +337,7 @@ function readPrefs(cwd, opts) {
       },
     };
   }
-  const localLayer = resolveLayer(localDescriptor.jsoncPath, localDescriptor.mdFiles, errors, targetCwd);
+  const localLayer = resolveLayer(localDescriptor.jsoncPath, localDescriptor.mdFiles, errors, targetCwd, localDescriptor);
   const merged = deepMerge(globalLayer.prefs, localLayer.prefs);
   return {
     ok: errors.length === 0,
@@ -347,15 +356,8 @@ const prefsCache = new Map();
 
 function preferenceLayerFiles(cwd) {
   const targetCwd = cwd || process.cwd();
-  const claudeDir = path.join(os.homedir(), '.claude');
-  const gsdDir = path.join(targetCwd, '.gsd');
-  return [
-    path.join(claudeDir, 'forge-agent-prefs.jsonc'),
-    path.join(claudeDir, 'forge-agent-prefs.md'),
-    path.join(gsdDir, 'forge-prefs.jsonc'),
-    path.join(gsdDir, 'claude-agent-prefs.md'),
-    path.join(gsdDir, 'prefs.local.md'),
-  ];
+  return preferenceLayerDescriptors(targetCwd).flatMap((layer) =>
+    (layer.jsoncCandidates || [layer.jsoncPath]).concat(layer.mdFiles || []));
 }
 
 function preferenceFileSignature(file) {
@@ -517,7 +519,7 @@ function parseCliArgs(argv) {
     else if (argv[index] === '--cwd') args.cwd = path.resolve(argv[++index] || process.cwd());
     // Test/round-trip isolation: point either layer at a scratch dir so the
     // migration proof can resolve the freshly-written file instead of the
-    // operator's real ~/.claude. Mirrors preferenceLayerDescriptors' opts.
+    // operator's real runtime home. Mirrors preferenceLayerDescriptors' opts.
     else if (argv[index] === '--global-dir') args.globalDir = path.resolve(argv[++index] || '');
     else if (argv[index] === '--local-dir') args.localDir = path.resolve(argv[++index] || '');
   }
@@ -527,7 +529,9 @@ function parseCliArgs(argv) {
 function readProvenanceLayer(cwd, source, files) {
   if (source === 'jsonc') {
     try {
-      const parsed = parseJsonc(fs.readFileSync(files[0], 'utf8'));
+      const file = existingFiles(files)[0];
+      if (!file) return {};
+      const parsed = parseJsonc(fs.readFileSync(file, 'utf8'));
       return parsed.ok ? parsed.value : {};
     } catch { return {}; }
   }
@@ -629,11 +633,12 @@ function runCli(argv) {
   if (schemaWarning) warnings.push(schemaWarning);
   const output = { ok: result.errors.length === 0, prefs: result.prefs, errors: result.errors, warnings, layers: result.layers };
   if (args.explain) {
-    const globalDir = args.globalDir || path.join(os.homedir(), '.claude');
-    const localDir = args.localDir || path.join(args.cwd, '.gsd');
+    const descriptors = preferenceLayerDescriptors(args.cwd, dirOpts);
+    const globalDescriptor = descriptors.find((entry) => entry.name === 'global');
+    const localDescriptor = descriptors.find((entry) => entry.name === 'local');
     output.provenance = buildProvenance(
-      readProvenanceLayer(args.cwd, result.layers.global.source, [path.join(globalDir, 'forge-agent-prefs.jsonc'), path.join(globalDir, 'forge-agent-prefs.md')]),
-      readProvenanceLayer(args.cwd, result.layers.local.source, [path.join(localDir, 'forge-prefs.jsonc'), path.join(localDir, 'claude-agent-prefs.md'), path.join(localDir, 'prefs.local.md')]),
+      readProvenanceLayer(args.cwd, result.layers.global.source, globalDescriptor.jsoncCandidates.concat(globalDescriptor.mdFiles)),
+      readProvenanceLayer(args.cwd, result.layers.local.source, [localDescriptor.jsoncPath].concat(localDescriptor.mdFiles)),
     );
   }
   if (args.key !== null) {

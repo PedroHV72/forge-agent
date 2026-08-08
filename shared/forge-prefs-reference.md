@@ -464,7 +464,7 @@ Eixo sidecars: isolamento do ambiente entregue aos processos externos codex e ag
 - **Tipo:** string
 - **Default:** `"minimal"`
 - **Valores permitidos:** `minimal`, `inherit`
-- **Descrição:** Política de ambiente dos sidecars. minimal repassa apenas allowlist e remove prefixos de credenciais; inherit preserva todo o ambiente como escape hatch inseguro.
+- **Descrição:** Política de ambiente dos sidecars. minimal repassa apenas a allowlist; inherit preserva variáveis não sensíveis como escape hatch. Ambas removem tokens, segredos, credenciais e prefixos de provedores antes do spawn.
 
 ## routing
 
