@@ -45,7 +45,15 @@ assert.strictEqual((workflow.match(/platform:\s*darwin/g) || []).length, 2);
 assert.strictEqual((workflow.match(/platform:\s*linux/g) || []).length, 2);
 assert.match(workflow, /windows-latest/);
 assert.match(workflow, /platform:\s*win32/);
-assert.match(workflow, /shell:\s*pwsh/);
+// This assertion replaces `assert.match(workflow, /shell:\s*pwsh/)`, which is exactly the
+// kind of guard that proves the wrong property: it matched the TEXT of a workflow GitHub
+// refused to schedule, so it stayed green across two runs on PR #71 that died at the
+// workflow-file level before a single job started. `shell: ${{ ... }}` at step level was
+// the invalid construct; the runner defaults already give bash on Linux/macOS and pwsh on
+// Windows, so naming the shell bought nothing and cost the whole gate. Guard the defect
+// that actually happened, not the string that was present while it happened.
+assert(!/shell:\s*\$\{\{/.test(workflow),
+  'step-level `shell:` with an expression makes GitHub reject the workflow file outright');
 assert.match(workflow, /node scripts\/forge-offline-ci\.js/);
 assert(!/(?:claude|codex)\s+(?:exec|--version|--help)/.test(workflow), 'CI must never invoke paid provider CLIs');
 

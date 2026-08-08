@@ -18,27 +18,21 @@ jobs:
           - host: claude
             os: ubuntu-latest
             platform: linux
-            shell: bash
           - host: codex
             os: ubuntu-latest
             platform: linux
-            shell: bash
           - host: claude
             os: macos-latest
             platform: darwin
-            shell: bash
           - host: codex
             os: macos-latest
             platform: darwin
-            shell: bash
           - host: claude
             os: windows-latest
             platform: win32
-            shell: pwsh
           - host: codex
             os: windows-latest
             platform: win32
-            shell: pwsh
 
     steps:
       - name: Check out repository
@@ -50,7 +44,6 @@ jobs:
           node-version: 22
 
       - name: Run deterministic offline operational gate
-        shell: ${{ matrix.shell }}
         run: node scripts/forge-offline-ci.js --host ${{ matrix.host }} --platform ${{ matrix.platform }}
 
   test:
