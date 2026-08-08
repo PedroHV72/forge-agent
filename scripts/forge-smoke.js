@@ -9141,7 +9141,12 @@ function smokeXllmStateSliceQualified() {
   const task = readRepoText(path.join(repo, 'skills', 'forge-task', 'SKILL.md'));
   const spec = readRepoText(path.join(repo, 'shared', 'forge-dispatch.md'));
 
-  const EXPECTED_HELPER_COUNT = { 'forge-auto': 5, 'forge-next': 4 };
+  // Exact counts, still — the pin's job is that the helper is the ONLY reader and
+  // that no inline fallback creeps back in, not that the number never moves. Bumped
+  // by TASK-022 (+1 each): the Branch D dispatch-emitter fence now re-resolves
+  // $XLLM_STATE in its own fence, because shell state does not survive a Bash-tool
+  // boundary and reading it next door produced a permanently-empty field.
+  const EXPECTED_HELPER_COUNT = { 'forge-auto': 6, 'forge-next': 5 };
   for (const [name, mirror] of [['forge-auto', auto], ['forge-next', next]]) {
     const count = mirror.split('forge-xllm-state.js').length - 1;
     assert(count === EXPECTED_HELPER_COUNT[name], `(a) ${name} has exact helper count ${EXPECTED_HELPER_COUNT[name]}`);
@@ -15166,6 +15171,137 @@ function smokeInertRoutes() {
     + 'forge-task declarada em vez de silenciosa');
 }
 
+// ── Section 100: o campo `transport` chega aos 9 emissores ────────────────
+// Um campo decidido num helper e não emitido pelo emissor é o defeito de classe
+// da TASK-021: a decisão existe, o consumidor nunca a vê. Aqui a prova é feita
+// com LEITURA IN-PROCESS (`fs`), NUNCA com `grep` de shell — o `grep` deste
+// ambiente é `ugrep --ignore-files` e honra `.gitignore`, então pode varrer nada
+// e ainda assim reportar sucesso (achado da S06).
+// Três armadilhas medidas, cada uma com controle positivo (o assert é rodado
+// contra uma cópia MUTADA em memória, provando que ele morde de verdade):
+//   (a) censo — exatamente 9 linhas de emissor, TODAS com `transport`. Contagem
+//       e predicado juntos: acrescentar um 10º emissor sem o campo falha.
+//   (b) fence — nos sites 2 e 4 (Branch D) o fence do `echo` precisa RESOLVER
+//       $RESULT_FILE ele mesmo; estado de shell não sobrevive à fronteira do
+//       Bash tool (foi o que produziu o `hint` permanentemente vazio).
+//   (c) sem default otimista — `:-app-server` (ou qualquer default que não seja
+//       `unknown`) num fence de emissor transforma "não observei" em "observei".
+function smokeTransportField() {
+  process.stdout.write('\n▸ Section 100: o campo `transport` chega aos 9 emissores\n');
+  const ROOT = path.dirname(SCRIPTS);
+  const FILES = [
+    path.join(ROOT, 'skills', 'forge-auto', 'SKILL.md'),
+    path.join(ROOT, 'skills', 'forge-next', 'SKILL.md'),
+    path.join(ROOT, 'skills', 'forge-task', 'SKILL.md'),
+  ];
+  const EMITTER = '\\"event\\":\\"dispatch\\"';
+
+  const emitterLines = (text) => text.split('\n').filter(l => l.includes(EMITTER) && l.includes('echo '));
+
+  // ── (a) censo: 9 emissores, todos com transport ──────────────────────────
+  const all = [];
+  for (const file of FILES) all.push(...emitterLines(readRepoText(file)).map(line => ({ file, line })));
+  assert(all.length === 9,
+    `(a) exatamente 9 linhas de emissor de dispatch nos três SKILL.md (achadas: ${all.length})`,
+    all.map(e => path.basename(path.dirname(e.file))).join(', '));
+  // Case-insensitive on purpose: the codex emitters carry the field through the
+  // shell variable ${TRANSPORT_TAIL}, the claude ones through the literal key.
+  const withoutField = all.filter(e => !/transport/i.test(e.line));
+  assert(withoutField.length === 0,
+    '(a) TODOS os 9 emissores carregam `transport` — contagem e predicado juntos, para que um 10º emissor sem o campo falhe',
+    `${withoutField.length} sem o campo`);
+
+  const claudeLines = all.filter(e => e.line.includes('\\"transport\\":\\"in-process\\"'));
+  const codexLines = all.filter(e => e.line.includes('${TRANSPORT_TAIL}'));
+  assert(claudeLines.length === 4,
+    `(a) os 4 emissores do caminho claude carregam a constante in-process (achados: ${claudeLines.length})`);
+  assert(codexLines.length === 5,
+    `(a) os 5 emissores do caminho codex carregam o TRANSPORT_TAIL derivado do result file (achados: ${codexLines.length})`);
+  assert(claudeLines.length + codexLines.length === all.length,
+    '(a) o censo PARTICIONA os 9 emissores — nenhum fica fora das duas classes');
+  for (const e of claudeLines) {
+    assert(!e.line.includes('transport_version') && !e.line.includes('transport_reason'),
+      '(a) o caminho claude NÃO emite transport_version nem transport_reason — versão só faz sentido com processo remoto, razão só com kind unknown',
+      e.file);
+  }
+
+  // ── (b) fence trap: sites 2 e 4 resolvem o estado no próprio fence ───────
+  // Um fence é delimitado por ```bash … ```; a busca é pelo bloco que CONTÉM o
+  // echo do plan-slice, e o teste é sobre esse bloco, não sobre o arquivo.
+  const fenceContaining = (text, needle) => {
+    const blocks = text.split('```');
+    return blocks.find(b => b.includes(needle) && b.includes('echo '));
+  };
+  for (const file of FILES.slice(0, 2)) {
+    const text = readRepoText(file);
+    const fence = fenceContaining(text, 'plan-slice/${S##}');
+    assert(!!fence, `(b) fence do emissor plan-slice encontrado em ${path.basename(path.dirname(file))}`);
+    assert(/forge-xllm-state\.js"? --mode read/.test(fence),
+      '(b) o fence do echo plan-slice RE-RESOLVE o state file nele mesmo — estado de shell não cruza a fronteira do Bash tool',
+      file);
+    assert(/RESULT_FILE=/.test(fence),
+      '(b) e atribui RESULT_FILE no mesmo fence — sem isso o transporte nasce permanentemente vazio (forma da TASK-021)',
+      file);
+  }
+
+  // ── (c) sem default otimista ─────────────────────────────────────────────
+  const OPTIMISTIC = /\$\{TRANSPORT[A-Z_]*:-(?!unknown)[^}]*\}/;
+  for (const file of FILES) {
+    const text = readRepoText(file);
+    assert(!OPTIMISTIC.test(text),
+      '(c) nenhum default de shell para o transporte além de `unknown` — `:-app-server` transformaria "não observei" em "observei"',
+      file);
+    assert(text.includes(':-unknown}') || !text.includes('TRANSPORT'),
+      '(c) o default nomeado `unknown` está presente onde o transporte é lido');
+  }
+
+  // ── controles positivos: cada assert acima morde ─────────────────────────
+  // Um gate que reporta a própria inatividade como boa notícia é o defeito que
+  // este repo já pagou três vezes. Cada predicado é rodado contra uma cópia
+  // MUTADA que deveria reprová-lo.
+  const autoText = readRepoText(FILES[0]);
+  const strippedField = autoText.replace(/,\$\{TRANSPORT_TAIL\}/g, '').replace(/,\\"transport\\":\\"in-process\\"/g, '');
+  assert(emitterLines(strippedField).some(l => !/transport/i.test(l)),
+    '(controle) o predicado do censo REPROVA uma cópia em que o campo foi removido');
+  const strippedFence = autoText.replace(/XLLM_STATE=\$\(node "\$FORGE_SCRIPTS_DIR\/forge-xllm-state\.js" --mode read[^\n]*\n/g, '');
+  const brokenFence = fenceContaining(strippedFence, 'plan-slice/${S##}');
+  assert(!!brokenFence && !/forge-xllm-state\.js"? --mode read/.test(brokenFence),
+    '(controle) o predicado do fence REPROVA uma cópia em que a re-resolução foi "simplificada" para fora');
+  assert(OPTIMISTIC.test('TRANSPORT_TAIL="\\"transport\\":\\"${TRANSPORT:-app-server}\\""'),
+    '(controle) o predicado do default otimista REPROVA um `:-app-server` de verdade');
+  assert(!OPTIMISTIC.test('X="${TRANSPORT:-unknown}"'),
+    '(controle) e NÃO reprova o default nomeado `unknown` — o predicado distingue os dois');
+
+  // ── o helper existe, exporta o contrato e a doc bate com o emitido ───────
+  const transport = require('./forge-transport.js');
+  assert(transport.TRANSPORT_KINDS.includes('app-server')
+    && transport.TRANSPORT_KINDS.includes('in-process')
+    && transport.TRANSPORT_KINDS.includes('unknown'),
+    '(d) o enum de kinds do helper cobre os três valores que os emissores escrevem');
+  assert(transport.deriveTransport({ initializeResult: {}, threadStartResult: {} }).kind === 'app-server',
+    '(d) o kind vem da PRESENÇA — objetos de handshake vazios ainda são app-server (imune à divergência mock × servidor real)');
+  assert(transport.deriveTransport({ initializeResult: {}, threadStartResult: null }).kind === 'unknown',
+    '(d) e um handshake ausente é `unknown`, nomeado, nunca otimista');
+
+  const doc = readRepoText(path.join(ROOT, 'shared', 'forge-dispatch.md'));
+  assert(/\| `transport` \|/.test(doc) && /\| `transport_version` \|/.test(doc) && /\| `transport_reason` \|/.test(doc),
+    '(e) as três linhas do contrato estão na tabela de campos de shared/forge-dispatch.md');
+  assert(/[Aa]bsence of `transport` means the record predates TASK-022/.test(doc),
+    '(e) a doc DIZ que ausência = registro anterior à TASK-022 — nunca in-process, nunca unknown');
+  assert(/never the raw `userAgent`/.test(doc),
+    '(e) e que só a versão extraída é logada, nunca o userAgent cru (que carrega SO e arquitetura)');
+
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeTransportField\(\); \}/.test(mainBody),
+    '(f) Section 100 está registrada em main() por closure — seção não-registrada é seção que some em silêncio');
+
+  pass('(final) Section 100: os 9 emissores de dispatch carregam `transport` (5 do codex derivados do result file, 4 do '
+    + 'claude com a constante in-process e sem os companheiros), os fences da Branch D re-resolvem $RESULT_FILE neles '
+    + 'mesmos, nenhum default de shell é otimista, o kind vem da presença do handshake, e a doc declara o significado da '
+    + 'ausência — com controle positivo provando que cada predicado morde');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -15280,6 +15416,7 @@ async function main() {
       () => { smokeEnvCoverage(); },
       async () => { await smokeTurnInterrupt(); },
       () => { smokeInertRoutes(); },
+      () => { smokeTransportField(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {

@@ -1011,7 +1011,16 @@ When `REASON` is `sidecar-cap-exceeded` or one of the two `CODE_DIR` refusals (`
   mkdir -p "$WORKING_DIR/.gsd/forge/"
   # shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)
   DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
-  echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/${T##}\",\"model\":\"${CODEX_MODEL:-codex-default}\",\"reason\":\"${ENGINE_REASON}\",\"engine\":\"codex\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":0,\"output_tokens\":0,\"vcs\":\"${DISPATCH_VCS:-git}\"}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+  # shared/forge-dispatch.md § transport prelude — read in THIS fence, from $RESULT_FILE.
+  # The ONLY shell default permitted is the named degraded value `unknown`; never
+  # `:-app-server`, which would claim an observation nobody made.
+  TRANSPORT=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport 2>/dev/null || echo "unknown")
+  TRANSPORT_VERSION=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport_version 2>/dev/null)
+  TRANSPORT_REASON=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport_reason 2>/dev/null)
+  TRANSPORT_TAIL="\"transport\":\"${TRANSPORT:-unknown}\""
+  [ -n "$TRANSPORT_VERSION" ] && TRANSPORT_TAIL="$TRANSPORT_TAIL,\"transport_version\":\"$TRANSPORT_VERSION\""
+  [ -n "$TRANSPORT_REASON" ] && TRANSPORT_TAIL="$TRANSPORT_TAIL,\"transport_reason\":\"$TRANSPORT_REASON\""
+  echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/${T##}\",\"model\":\"${CODEX_MODEL:-codex-default}\",\"reason\":\"${ENGINE_REASON}\",\"engine\":\"codex\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":0,\"output_tokens\":0,\"vcs\":\"${DISPATCH_VCS:-git}\",${TRANSPORT_TAIL}}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
   ```
   (`output_tokens` may be `0` — the adapter's token channel is git-derived, not SDK usage; no `tier`/`effort` fields on the codex path since Claude Tier/Effort Resolution was skipped.)
 
@@ -1196,9 +1205,24 @@ When `REASON == sidecar-cap-exceeded` here, **skip the timeline task, dispatch a
   **Path-traversal guard (untrusted codex output):** `task_plans[].id`/`.filename` are UNTRUSTED (codex is external/potentially-compromised). `validatePlanResult` in `forge-xllm.js` is the gate — it rejects (exit 2 → Fallback) any `id` not `^T\d+$` or `filename` not `^[A-Za-z0-9._-]+\.md$` (no `/`, `\`, `..`). Defense in depth: **re-derive the path from the validated `id` alone** (`tasks/{id}/{id}-PLAN.md`); treat `filename` only as an optional equality-check against `{id}-PLAN.md` — **never concatenate the raw `filename` into the path.**
   Then **emit the dispatch event with `engine:"codex"`, unit `plan-slice/{S##}`**:
   ```bash
+  # State is RE-RESOLVED here, in the same fence as the echo, on purpose: neither
+  # $XLLM_STATE nor $RESULT_FILE is assigned in this fence, and shell state does NOT
+  # survive a Bash-tool boundary. Reading the transport in a neighbouring fence is the
+  # exact form that produced TASK-021's permanently-empty `hint` and the `auto-mode
+  # started_at` bug — a field that is empty on every run and looks like "not observed".
+  # Do not "simplify" these two lines away.
+  XLLM_STATE=$(node "$FORGE_SCRIPTS_DIR/forge-xllm-state.js" --mode read --dir "$WORKING_DIR/.gsd/forge" --milestone "{M###}" --slice "{S##}" --attempt "$N")
+  RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null)
   # shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)
   DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
-  echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"plan-slice/${S##}\",\"model\":\"${CODEX_MODEL:-codex-default}\",\"reason\":\"${ENGINE_REASON}\",\"engine\":\"codex\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":0,\"output_tokens\":0,\"vcs\":\"${DISPATCH_VCS:-git}\"}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+  # shared/forge-dispatch.md § transport prelude — only `unknown` may be a shell default.
+  TRANSPORT=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport 2>/dev/null || echo "unknown")
+  TRANSPORT_VERSION=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport_version 2>/dev/null)
+  TRANSPORT_REASON=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport_reason 2>/dev/null)
+  TRANSPORT_TAIL="\"transport\":\"${TRANSPORT:-unknown}\""
+  [ -n "$TRANSPORT_VERSION" ] && TRANSPORT_TAIL="$TRANSPORT_TAIL,\"transport_version\":\"$TRANSPORT_VERSION\""
+  [ -n "$TRANSPORT_REASON" ] && TRANSPORT_TAIL="$TRANSPORT_TAIL,\"transport_reason\":\"$TRANSPORT_REASON\""
+  echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"plan-slice/${S##}\",\"model\":\"${CODEX_MODEL:-codex-default}\",\"reason\":\"${ENGINE_REASON}\",\"engine\":\"codex\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":0,\"output_tokens\":0,\"vcs\":\"${DISPATCH_VCS:-git}\",${TRANSPORT_TAIL}}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
   ```
   and **rejoin the normal `plan-slice` completion path**: the **plan-check gate**, the **symbol-check gate** and the interactive **plan_gate** all run over the materialized files exactly as they would after a Claude `forge-planner` — nothing in those gates changes, agnostic of origin. No `T##-SUMMARY`/`---GSD-WORKER-RESULT---` is synthesized here — plan-slice produces plan files, not a task result; skip Step 5 (Process result) and Post-unit housekeeping for this dispatch, going straight to the plan-check gate below.
 
@@ -1391,7 +1415,7 @@ mkdir -p .gsd/forge/
 MODEL_APPLIED_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || printf 'null')
 # shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)
 DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
-echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"${unitType}/${unitId}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"${ENGINE:-claude}\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":${INPUT_TOKENS},\"output_tokens\":${OUTPUT_TOKENS},\"model_applied\":${MODEL_APPLIED_JSON},\"vcs\":\"${DISPATCH_VCS:-git}\"}" >> .gsd/forge/events.jsonl
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"${unitType}/${unitId}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"${ENGINE:-claude}\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":${INPUT_TOKENS},\"output_tokens\":${OUTPUT_TOKENS},\"model_applied\":${MODEL_APPLIED_JSON},\"vcs\":\"${DISPATCH_VCS:-git}\",\"transport\":\"in-process\"}" >> .gsd/forge/events.jsonl
 ```
 
 **Guarded dispatch — apply the Retry Handler section of `shared/forge-dispatch.md`:** Wrap the `Agent()` call in a try/catch. On throw:
@@ -1513,7 +1537,7 @@ for each task in BATCH:
   OUTPUT_TOKENS_T##=$(node "$FORGE_SCRIPTS_DIR/forge-tokens.js" --inline "$result_T##")
   # shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)
   DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
-  echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/T##\",\"model\":\"$MODEL_ID_T##\",\"tier\":\"$TIER_T##\",\"reason\":\"$REASON_T##\",\"effort\":\"$EFFORT_T##\",\"effort_reason\":\"$EFFORT_REASON_T##\",\"engine\":\"claude\",\"domain\":\"$DOMAIN_USED_T##\",\"route_source\":\"$ROUTE_SOURCE_T##\",\"chain_len\":$CHAIN_LEN_T##,\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":$INPUT_TOKENS_T##,\"output_tokens\":$OUTPUT_TOKENS_T##,\"batch_size\":${BATCH_LENGTH},\"vcs\":\"${DISPATCH_VCS:-git}\"}" >> .gsd/forge/events.jsonl
+  echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/T##\",\"model\":\"$MODEL_ID_T##\",\"tier\":\"$TIER_T##\",\"reason\":\"$REASON_T##\",\"effort\":\"$EFFORT_T##\",\"effort_reason\":\"$EFFORT_REASON_T##\",\"engine\":\"claude\",\"domain\":\"$DOMAIN_USED_T##\",\"route_source\":\"$ROUTE_SOURCE_T##\",\"chain_len\":$CHAIN_LEN_T##,\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":$INPUT_TOKENS_T##,\"output_tokens\":$OUTPUT_TOKENS_T##,\"batch_size\":${BATCH_LENGTH},\"vcs\":\"${DISPATCH_VCS:-git}\",\"transport\":\"in-process\"}" >> .gsd/forge/events.jsonl
 ```
 
 The extra `batch_size` field lets post-hoc analysis separate parallel from sequential dispatches without breaking S03 telemetry readers (which ignore unknown fields).

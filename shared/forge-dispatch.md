@@ -860,10 +860,17 @@ Each dispatch event is a single newline-terminated JSON object appended to `.gsd
 | `input_tokens` | integer | `countTokens(finalPrompt)` | `12345` |
 | `output_tokens` | integer | SDK usage or `countTokens(text)` | `3421` |
 | `token_method` | string | counting method; currently `heuristic-chars-4` | `"heuristic-chars-4"` |
+| `transport` | `"app-server" \| "in-process" \| "unknown"` | handshake **presence** in the sidecar result file (`appserver.transport`, derived by `scripts/forge-transport.js`) / the constant `"in-process"` on the Claude path | `"app-server"` |
+| `transport_version` | string | observed CLI version — `thread.cliVersion` → the leading `name/version` token of `initializeResult.userAgent` → `"unknown"`. Present **only** when `transport == "app-server"`, and then **never omitted** | `"0.144.4"` |
+| `transport_reason` | closed set: `no-result-file`, `no-transport-field`, `handshake-not-observed`, `invalid-transport-value` | why the transport could not be observed. Present **only** when `transport == "unknown"` | `"no-result-file"` |
 
-Routing adds `tier`, `reason`, `engine`, `domain`, `route_source`, `chain_len`, `effort`, and `effort_reason` fields additively; `vcs` is likewise additive. Implementors must treat the schema as open for extension: old readers ignore unknown fields and no existing field is renamed, retyped, or removed.
+Routing adds `tier`, `reason`, `engine`, `domain`, `route_source`, `chain_len`, `effort`, `effort_reason`, `transport`, `transport_version`, and `transport_reason` fields additively; `vcs` is likewise additive. Implementors must treat the schema as open for extension: old readers ignore unknown fields and no existing field is renamed, retyped, or removed.
 
-Do NOT include: raw prompt text, worker output, file paths, exception messages, or any PII.
+**Absence of `transport` means the record predates TASK-022** — it does not mean `"in-process"` and it does not mean `"unknown"`. Both of those are values a live emitter writes on purpose; absence is the only thing that says "nobody asked". This is why the Claude path emits the constant `"in-process"` instead of omitting the field: omission would give the absence two meanings (legacy record × Claude path), and a reader could not separate them.
+
+There is deliberately **no optimistic default**: the only value a shell fence may fall back to is `unknown`, never `app-server`. `transport_version` is likewise never omitted while `transport == "app-server"` — an absent version there would be indistinguishable from a broken extractor.
+
+Do NOT include: raw prompt text, worker output, file paths, exception messages, or any PII. `transport_version` honours this: only the **extracted version token** is logged, never the raw `userAgent`, which carries the operating system and CPU architecture of the operator's machine.
 
 #### Prefs contract
 
@@ -886,7 +893,7 @@ Worker returns approximately 1 200 characters of output. Token estimate: `countT
 Event appended to `.gsd/forge/events.jsonl`:
 
 ```json
-{"ts":"2026-04-16T10:00:05Z","event":"dispatch","dispatch_id":"execute-task-T03-a91c4e-a1","prompt_id":"execute-task-T03-a91c4e","attempt":1,"status":"done","unit":"execute-task/T03","model":"claude-sonnet-5","input_tokens":2000,"output_tokens":300,"token_method":"heuristic-chars-4","vcs":"git"}
+{"ts":"2026-04-16T10:00:05Z","event":"dispatch","dispatch_id":"execute-task-T03-a91c4e-a1","prompt_id":"execute-task-T03-a91c4e","attempt":1,"status":"done","unit":"execute-task/T03","model":"claude-sonnet-5","input_tokens":2000,"output_tokens":300,"token_method":"heuristic-chars-4","vcs":"git","transport":"in-process"}
 ```
 
 #### Budgeted Section Injection
@@ -1623,7 +1630,7 @@ Rules by member-failure kind:
 The `dispatch` event schema (Token Telemetry + Tier Resolution) is extended **additively** with four routing fields: `engine ∈ {claude, codex, gemini}`, `domain` (the `domain_used` from the resolver — a domain name or `default`), `route_source ∈ {frontmatter, routing, tier_models}` (the `source` from the resolver), and `chain_len` (the number of members in the resolved chain, an integer ≥1). No existing field is renamed or removed. S03/M006/M005 readers that parse by known field names and ignore unknowns continue to work; events lacking any of these fields are valid (treat as `undefined`, not error) — the M006 `slice`/`milestone` discriminators and the M005 `engine` field are preserved alongside.
 
 ```json
-{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4","tier":"heavy","reason":"unit-type:execute-task","engine":"codex","domain":"backend","route_source":"routing","chain_len":3}
+{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4","tier":"heavy","reason":"unit-type:execute-task","engine":"codex","domain":"backend","route_source":"routing","chain_len":3,"transport":"app-server","transport_version":"0.144.4"}
 ```
 
 On the codex path `model` carries the codex model id (or the CLI default label when `$CODEX_MODEL` is unset). The adapter estimates both token fields with `chars/4` over its exact built prompt and raw returned text; this is observability, not provider billing usage. On the Claude path `engine` is `"claude"`. `domain`/`route_source`/`chain_len` come from the single resolver call and are emitted on both paths. Legacy dispatch events without the additive fields remain valid.
@@ -1633,7 +1640,7 @@ On the codex path `model` carries the codex model id (or the CLI default label w
 O schema `dispatch` é estendido **aditivamente** com dois campos nos **execute-task dispatch events** de `forge-auto` e `forge-next`: `slice` (ex.: `"S02"`) e `milestone` (ex.: `"M006"` ou o `RUN_ID` do run multi-run). Nenhum campo existente é renomeado ou removido. Readers S01/S03 que parseiam por nomes de campos conhecidos e ignoram desconhecidos continuam funcionando; eventos legados sem os campos permanecem JSON válido (tratar `slice`/`milestone` ausentes como `undefined`, nunca erro).
 
 ```json
-{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","reason":"unit-type:execute-task","engine":"codex","slice":"S02","milestone":"M006","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4"}
+{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","reason":"unit-type:execute-task","engine":"codex","slice":"S02","milestone":"M006","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4","transport":"app-server","transport_version":"0.144.4"}
 ```
 
 Estes campos são consumidos por `scripts/forge-review-pairing.js § isAuthorshipEvent` para escopar a autoria de review por slice/milestone (filtro **lenient-when-absent**: um evento sem o campo ainda conta, então o pré-escopo estrito exclui eventos legados sem discriminador antes de chamar o CLI — ver `shared/forge-review.md § Step 0`). Emitidos em ambos os caminhos claude e codex de `execute-task`. `forge-task` emite um único `execute-task/{TASK_ID}` (unit já único) e portanto **não** carrega os discriminadores.
@@ -1992,7 +1999,7 @@ THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thin
 
 # Extend the dispatch event (append after Token Telemetry builds dispatchEvent) with the resolver's
 # fields — additive, no existing field renamed/removed:
-echo "{\"ts\":\"$TS\",\"event\":\"dispatch\",\"dispatch_id\":\"$ATTEMPT_DISPATCH_ID\",\"prompt_id\":\"$PROMPT_DISPATCH_ID\",\"attempt\":${attempt:-1},\"status\":\"done\",\"unit\":\"$UNIT_TYPE/$UNIT_ID\",\"model\":\"$MODEL_ID\",\"input_tokens\":$IN_TOK,\"output_tokens\":$OUT_TOK,\"token_method\":\"heuristic-chars-4\",\"tier\":\"$TIER\",\"reason\":\"$REASON\",\"effort\":\"$EFFORT\",\"effort_reason\":\"$EFFORT_REASON\",\"model_applied\":$MODEL_ALIAS_JSON,\"engine\":\"$ENGINE\",\"domain\":\"$DOMAIN_USED\",\"route_source\":\"$ROUTE_SOURCE\",\"chain_len\":$CHAIN_LEN}" >> .gsd/forge/events.jsonl
+echo "{\"ts\":\"$TS\",\"event\":\"dispatch\",\"dispatch_id\":\"$ATTEMPT_DISPATCH_ID\",\"prompt_id\":\"$PROMPT_DISPATCH_ID\",\"attempt\":${attempt:-1},\"status\":\"done\",\"unit\":\"$UNIT_TYPE/$UNIT_ID\",\"model\":\"$MODEL_ID\",\"input_tokens\":$IN_TOK,\"output_tokens\":$OUT_TOK,\"token_method\":\"heuristic-chars-4\",\"tier\":\"$TIER\",\"reason\":\"$REASON\",\"effort\":\"$EFFORT\",\"effort_reason\":\"$EFFORT_REASON\",\"model_applied\":$MODEL_ALIAS_JSON,\"engine\":\"$ENGINE\",\"domain\":\"$DOMAIN_USED\",\"route_source\":\"$ROUTE_SOURCE\",\"chain_len\":$CHAIN_LEN,\"transport\":\"in-process\"}" >> .gsd/forge/events.jsonl
 ```
 
 `MODEL_ID` is always the resolver's `model` field — `chain[0].id`, the primary member (identical to

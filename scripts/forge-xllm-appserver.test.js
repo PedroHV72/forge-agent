@@ -136,6 +136,88 @@ setInterval(() => {}, 1000);
   return file;
 }
 
+/**
+ * TASK-022 — a SECOND mock, added ALONGSIDE the one above, never replacing it.
+ *
+ * Every pre-existing mock in this repo answers `initialize` with
+ * `{serverInfo:{name:'mock'}}`; a real `codex-cli 0.144.4` answers with
+ * `{userAgent, codexHome, platformFamily, platformOs}` and NO `serverInfo`, and
+ * carries the CLI version on `thread.cliVersion`. Proving the version extraction
+ * against the OLD mocks would prove nothing about production — it would prove the
+ * extractor agrees with a fixture that does not resemble the server. So this mock
+ * speaks the MEASURED shape, and the serverInfo mock stays byte-unchanged as the
+ * tolerance fixture (`forge-appserver-client.test.js` asserts serverInfo.name).
+ */
+function writeRealShapeMock(dir) {
+  const source = String.raw`'use strict';
+const fs = require('fs');
+const mode = process.env.FORGE_MOCK_MODE || 'execute';
+let initialized = false;
+function send(value) { process.stdout.write(JSON.stringify(value) + '\n'); }
+const TASK_PLAN = [
+  '---',
+  'id: T01',
+  'must_haves:',
+  '  truths:',
+  '    - "it works"',
+  '  artifacts:',
+  '    - path: "scripts/foo.js"',
+  '      provides: "does stuff"',
+  '      min_lines: 10',
+  '  key_links: []',
+  'expected_output:',
+  '  - scripts/foo.js',
+  '---',
+  '',
+  '# T01',
+].join('\n');
+function answer() {
+  if (mode === 'plan') {
+    return JSON.stringify({
+      status: 'done',
+      summary: 'plan',
+      slice_plan: { filename: 'S01-PLAN.md', content: '# Slice plan\n' },
+      task_plans: [{ id: 'T01', filename: 'T01-PLAN.md', content: TASK_PLAN }],
+    });
+  }
+  return JSON.stringify({ status: 'done', summary: 'real-shape mock', must_haves_status: [], files_changed: [] });
+}
+let pending = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  pending += chunk;
+  let end;
+  while ((end = pending.indexOf('\n')) >= 0) {
+    const line = pending.slice(0, end); pending = pending.slice(end + 1);
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === 'initialize') {
+      // The MEASURED shape: userAgent, no serverInfo.
+      send({ id: message.id, result: {
+        userAgent: 'codex-cli/0.144.4 (Mac OS 26.5.2; arm64)',
+        codexHome: '/h',
+        platformFamily: 'mac',
+        platformOs: 'Mac OS 26.5.2',
+      } });
+    } else if (message.method === 'initialized') initialized = true;
+    else if (message.method === 'thread/start') {
+      if (!initialized) process.exit(92);
+      send({ id: message.id, result: { thread: { id: 't1', cliVersion: '0.144.4' } } });
+    } else if (message.method === 'turn/start') {
+      if (!initialized) process.exit(93);
+      send({ id: message.id, result: { turn: { id: 'turn-1' } } });
+      send({ method: 'item/completed', params: { item: { type: 'agentMessage', phase: 'final_answer', text: answer() } } });
+      send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`;
+  const file = path.join(dir, 'mock-real-shape-app-server.js');
+  fs.writeFileSync(file, source, 'utf8');
+  return file;
+}
+
 function planFile(dir) {
   const file = path.join(dir, 'T03-PLAN.md');
   fs.writeFileSync(file, '# fixture plan\n\nExecute this fixture task.\n');
@@ -391,9 +473,84 @@ async function testSvnTurnCarriesExplicitSandboxPolicy(mock, root) {
   );
 }
 
+/**
+ * TASK-022 — the transport field, end to end, in BOTH directions (D10).
+ *
+ * Positive: a real-shape session yields `app-server` + the observed version.
+ * Tolerance: the serverInfo-shaped mock — which answers NEITHER `userAgent` NOR
+ * `cliVersion` — still yields `app-server`, with the version at the named floor
+ * `unknown` rather than an absent field (D4). An extractor that always matched
+ * would pass the first leg and fail the second; one that never matched, the reverse.
+ */
+async function testTransportField(mock, realMock, root) {
+  const { readTransportFromResult } = require('./forge-transport.js');
+
+  // ── positive: execute, real shape ──────────────────────────────────────────
+  const repo = fixtureRepo(root);
+  const resultFile = path.join(root, 'transport-result.json');
+  const withMode = (mode, action) => {
+    const previous = process.env.FORGE_MOCK_MODE;
+    process.env.FORGE_MOCK_MODE = mode;
+    return Promise.resolve().then(action).finally(() => {
+      if (previous === undefined) delete process.env.FORGE_MOCK_MODE; else process.env.FORGE_MOCK_MODE = previous;
+    });
+  };
+  const result = await withMock(realMock, 'conforming', path.join(root, 'transport-capture.json'),
+    () => withMode('execute', () => runExecute(executeOptions(repo, planFile(root), resultFile, 'transport-model'))));
+  assert.strictEqual(result.appserver.transport, 'app-server');
+  assert.strictEqual(result.appserver.transport_version, '0.144.4',
+    'the version must come from the REAL shape (thread.cliVersion / userAgent), not from a serverInfo fixture');
+
+  // The emitter reads the FILE, not the in-memory object — assert the file too.
+  const fromFile = readTransportFromResult(resultFile);
+  assert.deepStrictEqual(fromFile, { transport: 'app-server', transport_version: '0.144.4' });
+  assert(!Object.prototype.hasOwnProperty.call(fromFile, 'transport_reason'),
+    'transport_reason must be absent when the kind is app-server (D5)');
+
+  // ── the additive-safety invariant, asserted here too ──────────────────────
+  assert(!Object.prototype.hasOwnProperty.call(result, 'transport'),
+    'transport must ride INSIDE appserver — a new top-level key fails BASELINE_RESULT_KEYS');
+
+  // ── positive: plan (Branch D), real shape ─────────────────────────────────
+  const planRepo = fixtureRepo(root);
+  const contextFile = path.join(root, 'transport-plan-context.md');
+  fs.writeFileSync(contextFile, '# Plan context\n\nPlan this fixture slice.\n');
+  const planResultFile = path.join(root, 'transport-plan-result.json');
+  const plan = await withMock(realMock, 'conforming', path.join(root, 'transport-plan-capture.json'),
+    () => withMode('plan', () => require('./forge-xllm').runPlan({
+      cwd: planRepo, planContextFile: contextFile, resultFile: planResultFile, timeoutSecs: 5, dispatchId: 'S01-test',
+    })));
+  assert.strictEqual(plan.appserver.transport, 'app-server',
+    'runPlan must carry the transport — without it Branch D emits no-transport-field forever');
+  assert.strictEqual(plan.appserver.transport_version, '0.144.4');
+  assert.deepStrictEqual(readTransportFromResult(planResultFile),
+    { transport: 'app-server', transport_version: '0.144.4' });
+
+  // ── tolerance: the pre-existing serverInfo mock, untouched ────────────────
+  const legacyRepo = fixtureRepo(root);
+  const legacyResult = path.join(root, 'transport-legacy-result.json');
+  const legacy = await withMock(mock, 'conforming', path.join(root, 'transport-legacy-capture.json'),
+    () => runExecute(executeOptions(legacyRepo, planFile(root), legacyResult, 'legacy-model')));
+  assert.strictEqual(legacy.appserver.transport, 'app-server',
+    'kind is decided by PRESENCE — a session without userAgent/cliVersion is still an app-server session');
+  assert.strictEqual(legacy.appserver.transport_version, 'unknown',
+    "the version must be the named floor 'unknown', NEVER omitted (D4)");
+  assert.deepStrictEqual(readTransportFromResult(legacyResult),
+    { transport: 'app-server', transport_version: 'unknown' });
+
+  // ── negative: the emitter's view of a result file that never carried it ───
+  const preTaskFile = path.join(root, 'transport-pre-task-result.json');
+  fs.writeFileSync(preTaskFile, JSON.stringify({ status: 'done', appserver: { discarded_count: 0 } }));
+  assert.deepStrictEqual(readTransportFromResult(preTaskFile),
+    { transport: 'unknown', transport_reason: 'no-transport-field' });
+  assert.deepStrictEqual(readTransportFromResult(path.join(root, 'no-such-result.json')),
+    { transport: 'unknown', transport_reason: 'no-result-file' });
+}
+
 async function main() {
   const root = tempDir('forge-xllm-appserver-test-');
   const mock = writeMock(root);
+  const realMock = writeRealShapeMock(root);
   try {
     testPolicies();
     testValidatorBoundary();
@@ -404,6 +561,7 @@ async function main() {
     await testGuards(mock, root);
     await testResultFileContract(mock, root);
     await testSvnTurnCarriesExplicitSandboxPolicy(mock, root);
+    await testTransportField(mock, realMock, root);
     testNonGitWriteProbeStaysRegistered();
     process.stdout.write('forge-xllm-appserver.test.js: ok\n');
   } finally {

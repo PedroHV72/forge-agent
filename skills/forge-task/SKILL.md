@@ -984,7 +984,15 @@ CODEX_MODEL_LABEL="${SIDECAR_MODEL:-codex-default}"
 # event carried only engine/reason/model).
 # shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)
 DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
-echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${CODEX_MODEL_LABEL}\",\"tier\":\"${TIER}\",\"reason\":\"${ENGINE_REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"codex\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"milestone\":\"\",\"input_tokens\":0,\"output_tokens\":0,\"model_applied\":${MODEL_APPLIED_JSON},\"vcs\":\"${DISPATCH_VCS:-git}\"}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+# shared/forge-dispatch.md § transport prelude — read in THIS fence, from $RESULT_FILE.
+# The ONLY shell default permitted is the named degraded value `unknown`.
+TRANSPORT=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport 2>/dev/null || echo "unknown")
+TRANSPORT_VERSION=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport_version 2>/dev/null)
+TRANSPORT_REASON=$(node "$FORGE_SCRIPTS_DIR/forge-transport.js" --result "$RESULT_FILE" --field transport_reason 2>/dev/null)
+TRANSPORT_TAIL="\"transport\":\"${TRANSPORT:-unknown}\""
+[ -n "$TRANSPORT_VERSION" ] && TRANSPORT_TAIL="$TRANSPORT_TAIL,\"transport_version\":\"$TRANSPORT_VERSION\""
+[ -n "$TRANSPORT_REASON" ] && TRANSPORT_TAIL="$TRANSPORT_TAIL,\"transport_reason\":\"$TRANSPORT_REASON\""
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${CODEX_MODEL_LABEL}\",\"tier\":\"${TIER}\",\"reason\":\"${ENGINE_REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"codex\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"milestone\":\"\",\"input_tokens\":0,\"output_tokens\":0,\"model_applied\":${MODEL_APPLIED_JSON},\"vcs\":\"${DISPATCH_VCS:-git}\",${TRANSPORT_TAIL}}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 # → proceed to "Process result" below. Do NOT run the Claude machinery below.
 ```
 
@@ -1156,7 +1164,7 @@ Do NOT modify STATE.md. Return ---GSD-WORKER-RESULT---.
 mkdir -p "$WORKING_DIR/.gsd/forge/"
 # shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)
 DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
-echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"claude\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"milestone\":\"\",\"input_tokens\":${INPUT_TOKENS:-0},\"output_tokens\":${OUTPUT_TOKENS:-0},\"model_applied\":${MODEL_APPLIED_JSON},\"vcs\":\"${DISPATCH_VCS:-git}\"}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"claude\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"milestone\":\"\",\"input_tokens\":${INPUT_TOKENS:-0},\"output_tokens\":${OUTPUT_TOKENS:-0},\"model_applied\":${MODEL_APPLIED_JSON},\"vcs\":\"${DISPATCH_VCS:-git}\",\"transport\":\"in-process\"}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 ```
 
 **Process result:**

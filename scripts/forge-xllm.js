@@ -103,6 +103,7 @@ const {
 const vcs = require('./forge-vcs.js');
 const { classifyError, isTransient } = require('./forge-classify-error.js');
 const { countTokens, truncateAtSectionBoundary } = require('./forge-tokens.js');
+const { deriveTransport } = require('./forge-transport.js');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1046,6 +1047,14 @@ function invokeCodexAppServer(opts) {
       // the rest of `items` was read for the final answer and DISCARDED — this
       // is the whole reason runtime evidence did not exist.
       evidence: collectRuntimeEvidence(items, session.notifications, opts.evidenceUnit),
+      // TASK-022: `initializeResult` and `threadStartResult` are resolved by
+      // forge-appserver-client.js:578-593 and, before this line existed, DIED HERE —
+      // the seam returned four keys and both handshake results were dropped, which is
+      // why no dispatch record could ever say which transport carried the turn.
+      // deriveTransport reads only their PRESENCE (never a key inside them), so the
+      // measured mock × real-server divergence (serverInfo vs userAgent) cannot make a
+      // live app-server session report as `unknown`.
+      transport: deriveTransport(session),
       diagnostics: {
         discarded: session.discarded || { count: 0, kinds: {} },
         inbound_requests: (session.inboundRequests || []).length,
@@ -1938,6 +1947,10 @@ async function runExecute(opts) {
   assertNoProtectedSidecarChanges(derived);
   const finishedAt = new Date().toISOString();
 
+  // Never optional-chained into a bare `undefined`: a seam that stopped reporting the
+  // transport must degrade to the NAMED floor, not to an absent field that a reader
+  // cannot tell apart from a pre-TASK-022 adapter.
+  const appServerTransport = appServerOutput.transport || { kind: 'unknown', version: 'unknown' };
   const result = {
     status: parsed.status,
     protocol_version: PROTOCOL_VERSION,
@@ -1965,6 +1978,15 @@ async function runExecute(opts) {
       discarded_count: appServerOutput.diagnostics.discarded.count,
       discarded_kinds: appServerOutput.diagnostics.discarded.kinds,
       inbound_requests: appServerOutput.diagnostics.inbound_requests,
+      // TASK-022: NESTED HERE, NOT AT THE TOP LEVEL, and that is load-bearing.
+      // forge-xllm-evidence.test.js:53-58,209-213 freezes BASELINE_RESULT_KEYS (20
+      // keys) and asserts the only added top-level key is `runtime_evidence`; a new
+      // top-level `transport` fails that suite. `appserver` is already in the
+      // baseline and is inspected field-by-field (:221), not by key set, so adding
+      // fields inside it is additive by construction. Moving these two keys up one
+      // level breaks the additive-safety invariant, not just a test.
+      transport: appServerTransport.kind,
+      transport_version: appServerTransport.version,
     },
     // ADDITIVE, same mold as parse_path/degradation/capability/appserver above:
     // no existing key changes name or shape, and validateExecuteResult does NOT
@@ -2074,6 +2096,11 @@ async function runPlan(opts) {
   // (a read-only turn produces no fileChange, and materializing it would require
   // touching the 3 mirrors — forbidden by R6) and `parse_path`/`degradation`
   // (plan has always parsed through extractLastJsonBlock alone — D9).
+  // Deliberately INCLUDED since TASK-022 (D8): an `appserver` sub-object carrying
+  // `transport`/`transport_version`. It is the only field of runExecute's envelope
+  // whose absence here would be READ by a consumer — the Branch D emitters read the
+  // transport off this result file, so omitting it would make every plan-slice
+  // dispatch report `no-transport-field` forever.
   const appServerOutput = await invokeCodexAppServer({
     prompt,
     schema: planSchema,
@@ -2130,12 +2157,23 @@ async function runPlan(opts) {
   }
 
   const finishedAt = new Date().toISOString();
+  const planTransport = appServerOutput.transport || { kind: 'unknown', version: 'unknown' };
   const result = {
     status: parsed.status,
     protocol_version: PROTOCOL_VERSION,
     summary: parsed.summary,
     slice_plan: parsed.slice_plan,
     task_plans: parsed.task_plans,
+    // TASK-022 / D8: the plan envelope gets an `appserver` sub-object it never had,
+    // for one reason — emitter sites forge-auto:1201 and forge-next:1165 read the
+    // transport off this file. Without it, Branch D would emit `no-transport-field`
+    // on every plan-slice forever: degraded BY CONSTRUCTION, which is precisely the
+    // silence this field exists to end. There is no key-set pin on this envelope
+    // (measured: the BASELINE_RESULT_KEYS pin is runExecute-only).
+    appserver: {
+      transport: planTransport.kind,
+      transport_version: planTransport.version,
+    },
     started_at: startedAt,
     finished_at: finishedAt,
     duration_secs: Math.round((Date.now() - startedMs) / 1000),
