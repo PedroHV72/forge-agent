@@ -54,7 +54,10 @@
 //      `'\n## Unreleased'` this guard used ran green across the six tags from
 //      v4.2.0 to v4.6.1 while line 1 read `## [Unreleased]`. Two brackets
 //      evaded the only mechanism that existed against exactly that regression,
-//      so the guard is paired with a case proving it bites.
+//      so the guard is paired with a case proving it bites. Section ids are
+//      guarded on the same footing: `ReleaseSection.id` identifies a section
+//      inside the card, and while every heading outside the enum collapsed to
+//      `.other` ("Outros") eight releases handed `ForEach` repeated ids.
 //
 // Pure file reading, like forge-app-update.test.js and unlike forge-app.test.js:
 // no swift invocation, so it NEVER skips and runs everywhere, Windows included.
@@ -766,6 +769,42 @@ check('o detector de Unreleased morde as formas que já apareceram no arquivo', 
   ]) {
     assert(unreleasedHeadings(linha).length === 0, `falso positivo: ${linha}`);
   }
+});
+
+check('nenhuma release repete um heading `### <seção>` em CHANGELOG.md (D36)', () => {
+  // Um nível abaixo da checagem de versão: `ReleaseSection.id` é a identidade da
+  // seção dentro do card. Enquanto todo heading fora do enum virava `.other`
+  // (id "Outros"), OITO releases deste arquivo entregavam ids repetidos ao
+  // `ForEach` — `Breaking` + `Notes` na mesma release bastava. Agora `.other`
+  // carrega o próprio heading (Changelog.swift), então a colisão exige o MESMO
+  // heading literal duas vezes na mesma release, que é o que se assere aqui.
+  // Espelha o teste Swift porque este arquivo roda sem swift, Windows incluído.
+  const src = read(changelogMd);
+  let release = null;
+  let sections = 0;
+  const perRelease = new Map();
+  for (const line of src.split('\n')) {
+    if (line.startsWith('## ')) {
+      release = line.slice(3).split(/ — | - /)[0].trim();
+      perRelease.set(release, new Map());
+    } else if (line.startsWith('### ') && release) {
+      const heading = line.slice(4).trim();
+      const seen = perRelease.get(release);
+      seen.set(heading, (seen.get(heading) || 0) + 1);
+      sections++;
+    }
+  }
+  const dupes = [];
+  for (const [rel, seen] of perRelease) {
+    for (const [heading, n] of seen) if (n > 1) dupes.push(`${rel} › ${heading} (${n}x)`);
+  }
+  assert(
+    dupes.length === 0,
+    `heading de seção repetido na mesma release: ${dupes.join(', ')} — dois ids iguais `
+      + 'num ForEach é comportamento indefinido em SwiftUI. Funda as duas seções ou '
+      + 'renomeie uma delas para o que ela de fato é'
+  );
+  assert(sections > 10, `só ${sections} seções \`###\` lidas em CHANGELOG.md — o formato mudou`);
 });
 
 check('as entradas que a D36 nomeia existem em CHANGELOG.md', () => {
