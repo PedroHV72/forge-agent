@@ -523,7 +523,14 @@ function parseMustHaves(content) {
   if (domainRaw === undefined || domainRaw === null) {
     domain = null;
   } else if (typeof domainRaw === 'string') {
-    const trimmed = domainRaw.trim();
+    // Inline-comment strip, applied here AND in forge-dispatch-resolve.js's
+    // reader of the same key, from this one helper. Neither reader stripped, so
+    // the two agreed — on the wrong value: `domain: payments  # cross-repo`
+    // routed to the domain literally named "payments  # cross-repo", which no
+    // routing cell matches, so the unit fell to `default` with no error. Fixing
+    // one reader alone would have replaced a shared wrong answer with a
+    // divergence, which is worse; they move together or not at all.
+    const trimmed = stripInlineComment(domainRaw).trim();
     domain = trimmed === '' ? null : trimmed;
   } else {
     throw new Error('malformed must_haves schema: domain — must be a string when present');
@@ -613,7 +620,9 @@ function resolveCapability(planText) {
 
 // ── Exports ───────────────────────────────────────────────────────────────────
 
-module.exports = { hasStructuredMustHaves, parseMustHaves, resolveCapability };
+// stripInlineComment is exported so the OTHER reader of the same frontmatter
+// keys (forge-dispatch-resolve.js) shares this rule instead of copying it.
+module.exports = { hasStructuredMustHaves, parseMustHaves, resolveCapability, stripInlineComment };
 
 // ── CLI entrypoint ────────────────────────────────────────────────────────────
 

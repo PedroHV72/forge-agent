@@ -3084,10 +3084,27 @@ test("linesTouched soma só o que está fora dos ignore-globs") {
 
 test("Glob fala exatamente o vocabulário da lista default") {
     assertTrue(GitActivity.Glob.matches(".gsd/**", ".gsd/forge/events.jsonl"),
-               "sufixo /** casa o prefixo de diretório em qualquer profundidade")
+               "sufixo /** casa abaixo do diretório na raiz")
     assertFalse(GitActivity.Glob.matches("dist/**", "mydist/a.js"),
                 "dist/** é um diretório, não um prefixo de nome — mydist/ não é dist/")
     assertTrue(GitActivity.Glob.matches("dist/**", "dist/a/b.js"))
+
+    // A regra de profundidade, exercitada onde o comentário antigo dizia que
+    // era exercitada e não era: o diretório NÃO na raiz. Sem estes casos o
+    // matcher ancorado na raiz passava no teste que afirmava o contrário.
+    assertTrue(GitActivity.Glob.matches("node_modules/**", "packages/app/node_modules/x.js"),
+               "/** casa o segmento em qualquer profundidade — node_modules aninhado de monorepo")
+    assertTrue(GitActivity.Glob.matches("dist/**", "packages/app/dist/a.js"),
+               "a regra é geral, não só node_modules")
+    assertTrue(GitActivity.Glob.matches(".gsd/**", "sub/repo/.gsd/forge/events.jsonl"))
+    // O lado negativo do alargamento: segmento, jamais substring.
+    assertFalse(GitActivity.Glob.matches("node_modules/**", "packages/app/my_node_modules/x.js"),
+                "profundidade não pode virar substring — my_node_modules não é node_modules")
+    assertFalse(GitActivity.Glob.matches("dist/**", "a/mydist/b.js"),
+                "mydist aninhado continua fora, como mydist na raiz")
+    assertFalse(GitActivity.Glob.matches("dist/**", "a/distal/b.js"))
+    assertFalse(GitActivity.Glob.matches("dist/**", "src/a.js"),
+                "um matcher que casa tudo é tão errado quanto um que casa pouco")
     assertTrue(GitActivity.Glob.matches("package-lock.json", "app/nested/package-lock.json"),
                "padrão sem / casa o basename em qualquer diretório")
     assertTrue(GitActivity.Glob.matches("package-lock.json", "package-lock.json"))

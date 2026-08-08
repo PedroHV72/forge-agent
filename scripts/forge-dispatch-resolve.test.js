@@ -437,6 +437,48 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  // Two modules parse `domain:` out of the same frontmatter: this resolver and
+  // scripts/forge-must-haves.js. Neither stripped a YAML inline comment, so they
+  // agreed on a value no routing cell can match (`payments  # cross-repo`), and
+  // the unit silently fell to `default`. The bite has to be two-sided: the value
+  // must be stripped (behaviour), AND the two readers must return the same thing
+  // (parity) — fixing one reader alone turns a shared wrong answer into a
+  // divergence, which is the failure this pair exists to prevent.
+  runCase('domain strips an inline comment, and both readers agree', () => {
+    const { parseMustHaves } = require('./forge-must-haves.js');
+    const plan = [
+      '---',
+      'id: T01',
+      'domain: payments  # cross-repo, see CONTEXT',
+      'must_haves:',
+      '  truths:',
+      '    - it routes',
+      '  artifacts: []',
+      '  key_links: []',
+      'expected_output: [a.js]',
+      '---',
+      '',
+      '# T01',
+      '',
+    ].join('\n');
+    const f = mkFixture({ plan });
+    const resolved = dispatch(f, { unitType: 'execute-task' }).domain_input;
+    const gate = parseMustHaves(fs.readFileSync(f.planPath, 'utf8')).domain;
+    assertEqual(resolved, 'payments', 'resolver strips the inline comment from domain');
+    assertEqual(gate, 'payments', 'the must-haves gate strips the inline comment from domain');
+    assertEqual(resolved, gate, 'both readers of `domain:` return the identical value');
+
+    // A `#` with no whitespace before it is part of the value, not a comment —
+    // the discriminator the shared helper is built on. Asserted so a future
+    // "simplification" to /#.*$/ cannot pass.
+    const hashPlan = plan.replace('domain: payments  # cross-repo, see CONTEXT', 'domain: pay#1');
+    const g = mkFixture({ plan: hashPlan });
+    assertEqual(dispatch(g, { unitType: 'execute-task' }).domain_input, 'pay#1', 'a `#` inside the value survives in the resolver');
+    assertEqual(parseMustHaves(fs.readFileSync(g.planPath, 'utf8')).domain, 'pay#1', 'a `#` inside the value survives at the gate');
+    cleanup(g);
+    cleanup(f);
+  });
+
   runCase('CLI matches in-process resolver and degrades on missing plan', () => {
     const f = mkFixture({});
     const expected = dispatch(f, { unitType: 'execute-task', planPath: path.join(f.dir, 'missing-PLAN.md') });

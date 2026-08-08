@@ -1678,6 +1678,8 @@ Domain-first routing keys on a `domain` string per unit. The format is **fixed h
 - **Task-level (for `execute-task`):** a `domain:` field in the T##-PLAN.md frontmatter. Read when dispatching `execute-task`.
 - **Slice-level (for `plan-slice`):** a `` `domain:<name>` `` tag on the slice's checkbox line in `{M###}-ROADMAP.md`, alongside `risk:` / `depends:`. Read by the orchestrator when dispatching `plan-slice`.
 
+**Canonical reader:** `scripts/forge-dispatch-resolve.js` (`readPlanFrontmatter`), which strips a YAML inline comment from the value via `stripInlineComment` imported from `scripts/forge-must-haves.js` — the same helper the must-haves gate uses on the same key, so the two readers cannot disagree about `domain: payments  # cross-repo`. The snippet below illustrates the shape; it is not the source of truth and must not be copied into a new reader.
+
 **Extraction (precedence for `execute-task`):** frontmatter `domain:` → else the slice's `domain:<name>` ROADMAP tag → else `default`. `plan-slice` greps the slice line in the ROADMAP for `domain:<name>`. Absent/invalid → `default` (the resolver uses the `routing.default.*` cell, or the legacy path with no error).
 
 ```bash

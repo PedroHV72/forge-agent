@@ -95,6 +95,33 @@ function testResolution() {
     'stack detection precedes the CODING-STANDARDS fallback');
 }
 
+// I-20260729180247-forge-init-template-nao. The CODING-STANDARDS fallback above
+// only fires if the file being read actually carries the line — and `/forge-init`,
+// which writes that file for every new project, emitted Lint/Format/Type check and
+// no Test. Zero-dep projects (no package.json, no go.mod) are exactly the ones the
+// fallback exists for, and they were initialised without it.
+//
+// Asserting only "the string appears in the template" would pass on a line the
+// consumer cannot read, so the second half renders the template's own section
+// through resolveVerifyCommand: the guard fails both when the line is deleted and
+// when it is present in a shape the parser does not accept.
+function testForgeInitEmitsTestLine() {
+  const template = fs.readFileSync(path.join(__dirname, '..', 'commands', 'forge-init.md'), 'utf8');
+  const header = template.match(/^## Lint & Format Commands[ \t]*$/m);
+  assert(Boolean(header), 'forge-init.md still has a `## Lint & Format Commands` section to render');
+  const section = header ? template.slice(header.index + header[0].length).split(/^## /m)[0] : '';
+  assert(/^- \*\*Test:\*\*/m.test(section), 'forge-init CODING-STANDARDS template emits a `- **Test:**` line');
+
+  const dir = fixture();
+  const gsd = path.join(dir, 'external-gsd');
+  fs.mkdirSync(gsd, { recursive: true });
+  const rendered = `## Lint & Format Commands\n${section.replace(/\{detected test command or "\(none detected\)"\}/, 'node scripts/run-tests.js')}`;
+  fs.writeFileSync(path.join(gsd, 'CODING-STANDARDS.md'), rendered, 'utf8');
+  assert(JSON.stringify(resolveVerifyCommand(dir, gsd)) === JSON.stringify(['node', 'scripts/run-tests.js']),
+    'a CODING-STANDARDS rendered from the forge-init template is readable by resolveVerifyCommand',
+    JSON.stringify(resolveVerifyCommand(dir, gsd)));
+}
+
 function testRunAndApply() {
   const cwd = fixture();
   assert(runVerification({ argv: [process.execPath, '-e', 'process.exit(0)'], codeDir: cwd }).verdict === 'verified', 'runVerification reports verified');
@@ -296,6 +323,7 @@ function testPlatformRouting() {
 try {
   testTrigger();
   testResolution();
+  testForgeInitEmitsTestLine();
   testRunAndApply();
   testModeAndCli();
   testAmbiguousMultiCommand();
