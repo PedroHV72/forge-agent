@@ -82,6 +82,7 @@ public enum GitActivity {
         "build/**",
         ".next/**",
         ".gsd/**",
+        "node_modules/**",
     ]
 
     /// Caller-resolved value wins; empty or absent falls back to the engine

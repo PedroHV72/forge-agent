@@ -9,6 +9,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const {
   needsReverification, resolveVerifyCommand, runVerification, applyVerdict, reverify, spawnPlan, resolveExecutable,
+  hasDivergentCommandNotes,
 } = require('./forge-reverify.js');
 
 const SCRIPT = path.join(__dirname, 'forge-reverify.js');
@@ -176,6 +177,38 @@ function testAmbiguousMultiCommand() {
     'entries naming the same command still promote in bulk', JSON.stringify(sameCommandOutcome));
 }
 
+// I-20260729180247-hasdivergentcommandnotes (TASK-020 review R1, 2026-08-06):
+// a note that names no runner token at all used to be filtered out of the
+// comparison instead of gating it. It must now gate a multi-entry payload
+// unconditionally, while a single-entry payload with the same note is
+// unaffected and still applies its normal verdict.
+function testTokenlessNoteGates() {
+  const dir = fixture();
+  write(dir, 'package.json', '{"scripts":{"test":"node -e \\\"process.exit(0)\\\""}}');
+  write(dir, 'package-lock.json', '{}');
+
+  const mixed = result([
+    entry({ note: 'ran `npm test`: EPERM: operation not permitted' }),
+    entry({ note: 'blocked by the environment' }),
+  ]);
+  const mixedOutcome = reverify({ result: mixed, codeDir: dir, apply: true });
+  assert(mixedOutcome.verdict === 'ambiguous-multi-command' && mixedOutcome.entries === 2,
+    'a token-less note gates a multi-entry payload', JSON.stringify(mixedOutcome));
+  assert(mixed.must_haves_status.every(e => e.scope === 'environment'),
+    'ambiguous-multi-command from a token-less note leaves every entry untouched');
+
+  const single = result([entry({ note: 'blocked by the environment' })]);
+  const singleOutcome = reverify({ result: single, codeDir: dir, apply: true });
+  assert(singleOutcome.verdict === 'verified',
+    'a single-entry payload with a token-less note still applies the normal verdict', JSON.stringify(singleOutcome));
+
+  assert(hasDivergentCommandNotes([entry({ note: 'blocked by the environment' })]) === false,
+    'hasDivergentCommandNotes([oneEntry]) stays false — cardinality guard preserved');
+
+  assert(typeof hasDivergentCommandNotes === 'function',
+    'hasDivergentCommandNotes is exported from forge-reverify.js');
+}
+
 // TASK-020 review R1: gsd-write-refused alleges a .gsd/** write was refused —
 // only fs.existsSync + content can prove that, never a project suite's exit
 // code. These guards prove the trigger/promotion gate is seletive: it must
@@ -266,6 +299,7 @@ try {
   testRunAndApply();
   testModeAndCli();
   testAmbiguousMultiCommand();
+  testTokenlessNoteGates();
   testGsdWriteRefusedSeparation();
   testPlatformRouting();
 } finally {

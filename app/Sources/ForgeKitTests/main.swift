@@ -3105,8 +3105,9 @@ test("resolveIgnoreList: caller manda; ausente ou vazio cai no default do engine
                 "lista vazia da cascata significa 'chave não definida', como no completer")
     assertEqual(GitActivity.resolveIgnoreList(prefValue: ["só-isto"]), ["só-isto"],
                 "valor resolvido pelo caller ganha")
-    assertEqual(GitActivity.defaultIgnoreList.count, 7,
-                "os 7 defaults do engine — divergir de agents/forge-completer.md é o que "
+    assertEqual(GitActivity.defaultIgnoreList.count, 8,
+                "os 8 defaults do engine (inclui node_modules/** desde TASK-repair S03-T03) — "
+                + "divergir de agents/forge-completer.md é o que "
                 + "scripts/forge-app-progress.test.js existe para pegar")
 }
 

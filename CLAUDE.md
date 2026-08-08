@@ -506,7 +506,7 @@ Conjunto de 5 componentes que substituem "self-reported done" por verificação 
 evidence:
   mode: lenient           # lenient | strict | disabled   (default lenient)
 file_audit:
-  ignore_list: [package-lock.json, yarn.lock, pnpm-lock.yaml, dist/**, build/**, .next/**, .gsd/**]
+  ignore_list: [package-lock.json, yarn.lock, pnpm-lock.yaml, dist/**, build/**, .next/**, .gsd/**, node_modules/**]
 plan_check:
   mode: advisory          # advisory | blocking | disabled   (default advisory)
 ```
