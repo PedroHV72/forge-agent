@@ -9328,16 +9328,12 @@ function smokeRoutingDomains() {
   const NEEDLE = 'ROUTING_DOMAINS';
   const EXPECTED = {
     'shared/forge-dispatch.md': 2,
-    'skills/forge-auto/SKILL.md': 1,
-    'skills/forge-next/SKILL.md': 1,
     'skills/forge-task/SKILL.md': 1,
     'skills/forge-new-milestone/SKILL.md': 1,
     'agents/forge-planner.md': 2,
   };
   const files = {
     'shared/forge-dispatch.md': path.join(repo, 'shared', 'forge-dispatch.md'),
-    'skills/forge-auto/SKILL.md': path.join(repo, 'skills', 'forge-auto', 'SKILL.md'),
-    'skills/forge-next/SKILL.md': path.join(repo, 'skills', 'forge-next', 'SKILL.md'),
     'skills/forge-task/SKILL.md': path.join(repo, 'skills', 'forge-task', 'SKILL.md'),
     'skills/forge-new-milestone/SKILL.md': path.join(repo, 'skills', 'forge-new-milestone', 'SKILL.md'),
     'agents/forge-planner.md': path.join(repo, 'agents', 'forge-planner.md'),
@@ -9352,12 +9348,20 @@ function smokeRoutingDomains() {
       `(a) ${name} has exact "ROUTING_DOMAINS" count (expected ${EXPECTED[name]}, got ${count})`);
   }
 
-  // (b) canonical templates carry the placeholder form, not a hardcoded value.
-  assert(contents['shared/forge-dispatch.md'].includes('ROUTING_DOMAINS: {routing_domains}'),
-    '(b) canonical templates use the {routing_domains} placeholder');
+  // (b) The EXECUTABLE templates carry the placeholder form, not a hardcoded value.
+  // Repointed (review R1, conceded): this assert used to read shared/forge-dispatch.md and call it
+  // "canonical templates". That file is prose documentation — its own header calls its template
+  // bodies compatibility reference. The renderer reads shared/templates/dispatch/ (forge-prompt.js
+  // candidateTemplateRoots), so the old target could stay green while the shipping template lost
+  // the declaration. Section 92 covers the rendered output; this covers the declaration at rest.
+  for (const rel of ['plan-slice.md', 'plan-milestone.md']) {
+    const tpl = fs.readFileSync(path.join(repo, 'shared', 'templates', 'dispatch', rel), 'utf8');
+    assert(tpl.includes('ROUTING_DOMAINS: {routing_domains}'),
+      `(b) executable template ${rel} declares the {routing_domains} placeholder`);
+  }
 
-  // (c) mirrors derive via the canonical forge-routing.js --list-domains helper, never hand-rolled.
-  for (const name of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md', 'skills/forge-new-milestone/SKILL.md']) {
+  // (c) Inline-path mirrors derive via the canonical helper. The renderer now owns auto/next injection.
+  for (const name of ['skills/forge-task/SKILL.md', 'skills/forge-new-milestone/SKILL.md']) {
     assert(contents[name].includes('forge-routing.js" --list-domains'),
       `(c) ${name} derives ROUTING_DOMAINS via forge-routing.js --list-domains`);
   }
@@ -9723,8 +9727,6 @@ function smokeWorkspaceRepos() {
   const repoRoot = path.dirname(SCRIPTS);
   const expected = {
     'shared/forge-dispatch.md': 1,
-    'skills/forge-auto/SKILL.md': 1,
-    'skills/forge-next/SKILL.md': 1,
     'skills/forge-task/SKILL.md': 1,
     'agents/forge-planner.md': 2,
   };
@@ -9734,9 +9736,18 @@ function smokeWorkspaceRepos() {
     const got = contents[file].split('WORKSPACE_REPOS').length - 1;
     assert(got === count, `(a) ${file} has exact WORKSPACE_REPOS count (expected ${count}, got ${got})`);
   }
-  assert(contents['shared/forge-dispatch.md'].includes('WORKSPACE_REPOS: {workspace_repos}'),
-    '(b) canonical plan-slice template uses the workspace repo placeholder');
-  for (const file of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+  // Repointed (review R1, conceded) — same reasoning as Section 61(b): assert the EXECUTABLE
+  // template, not the prose doc. Also pins the asymmetry at rest: plan-milestone must NOT declare
+  // it, because repo: is a T##-PLAN frontmatter field and T##-PLAN only exists at plan-slice.
+  {
+    const dispatchTpl = rel => fs.readFileSync(path.join(repoRoot, 'shared', 'templates', 'dispatch', rel), 'utf8');
+    assert(dispatchTpl('plan-slice.md').includes('WORKSPACE_REPOS: {workspace_repos}'),
+      '(b) executable plan-slice template declares the {workspace_repos} placeholder');
+    assert(!dispatchTpl('plan-milestone.md').includes('WORKSPACE_REPOS'),
+      '(b) executable plan-milestone template declares NO workspace repo placeholder (asymmetry is substantive)');
+  }
+  // The renderer now owns auto/next injection; only forge-task remains an inline path.
+  for (const file of ['skills/forge-task/SKILL.md']) {
     assert(/forge-repos\.js" --list/.test(contents[file]),
       `(c) ${file} derives the injected repo list via forge-repos.js --list`);
   }
@@ -9744,11 +9755,11 @@ function smokeWorkspaceRepos() {
   assert(/Omit `repo:` when the injected repo list says single repo or is absent/.test(planner),
     '(d) planner documents omitting repo: for a single/absent list');
 
-  // (f) anti-inertia: a presence guard cannot catch a pipeline that silently no-ops.
+  // (f) anti-inertia for the remaining inline path: a presence guard cannot catch a pipeline that silently no-ops.
   // Extract the actual `node -e '...'` one-liner from each mirror and EXECUTE it against
   // a synthetic 2-line multi-repo list — asserting it splits/derives, not just that it
   // "mentions" forge-repos.js. This must fail against the pre-fix double-escaped split.
-  for (const file of ['skills/forge-auto/SKILL.md', 'skills/forge-next/SKILL.md', 'skills/forge-task/SKILL.md']) {
+  for (const file of ['skills/forge-task/SKILL.md']) {
     const body = contents[file];
     const m = body.match(/\| node -e '(const l=require\("fs"\)[\s\S]*?)'\)/);
     assert(m, `(f) ${file} has an extractable node -e workspace-repos pipeline`);
@@ -15333,6 +15344,84 @@ function smokeTransportField() {
     + 'ausência — com controle positivo provando que cada predicado morde');
 }
 
+// ── Section 101: routing domains reach the planner through rendered prompts ──
+function smokeRoutingDomainsRendered() {
+  process.stdout.write('\n▸ Section 101: rendered routing/repository planner headers\n');
+  const { renderPrompt, _private } = require('./forge-prompt.js');
+  const repoRoot = path.dirname(SCRIPTS);
+  const dir = mkTmp('routing-domains-rendered');
+  const home = path.join(dir, 'home');
+  const templateDir = path.join(dir, 'templates');
+  const options = unitType => ({ cwd: dir, unitType, milestoneId: 'M001', sliceId: 'S01', description: 'x', templateDir });
+  const inspectRendered = prompt => {
+    const reasons = [];
+    // Horizontal whitespace ONLY ([^\S\r\n]), never \s — \s matches \n, so on a bare
+    // "ROUTING_DOMAINS:\nWORKSPACE_REPOS: api, web" it would swallow the newline and
+    // capture the NEXT line, making the value look populated. That silently disables
+    // the bare-line check, which is one of the three degenerate forms this predicate
+    // exists to reject (CONTEXT Q4) — a verde-inerte guard by construction.
+    const domain = prompt.match(/^ROUTING_DOMAINS:[^\S\r\n]*(.*)$/m);
+    const repos = prompt.match(/^WORKSPACE_REPOS:[^\S\r\n]*(.*)$/m);
+    if (!domain) reasons.push('missing-routing-domains');
+    else if (!domain[1]) reasons.push('bare-routing-domains');
+    else if (domain[1].includes('{routing_domains}')) reasons.push('raw-routing-token');
+    else if (domain[1] === _private.NO_DOMAINS_NOTICE) reasons.push('routing-notice');
+    if (!repos) reasons.push('missing-workspace-repos');
+    else if (!repos[1]) reasons.push('bare-workspace-repos');
+    else if (repos[1].includes('{workspace_repos}')) reasons.push('raw-repos-token');
+    else if (repos[1] === _private.SINGLE_REPO_NOTICE) reasons.push('repos-notice');
+    return { ok: reasons.length === 0, reasons };
+  };
+  const oldHome = process.env.HOME;
+  const oldUserProfile = process.env.USERPROFILE;
+  try {
+    fs.mkdirSync(path.join(dir, 'api', '.git'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'web', '.git'), { recursive: true });
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    fs.mkdirSync(home, { recursive: true });
+    // jsonc, not legacy .md: after the prefs cutover a bare claude-agent-prefs.md is a
+    // deliberate hard-stop (`legacy-md-without-jsonc`), so readPrefsCached returns
+    // ok:false and listDomains() returns []. A .md fixture would therefore exercise the
+    // DEGRADATION path while claiming to be the positive case — the section would be
+    // asserting the opposite of what it says. See shared/forge-prefs-cutover.md.
+    fs.writeFileSync(path.join(dir, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({ routing: { alpha: {}, beta: {} } }, null, 2));
+    fs.mkdirSync(templateDir, { recursive: true });
+    for (const name of ['plan-slice.md', 'plan-milestone.md']) fs.copyFileSync(path.join(repoRoot, 'shared', 'templates', 'dispatch', name), path.join(templateDir, name));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const slice = renderPrompt(options('plan-slice'));
+    const checked = inspectRendered(slice.prompt);
+    assert(slice.template_scope === 'explicit', '(a) plan-slice uses the explicitly pinned template root');
+    assert(checked.ok, `(a-d) rendered plan-slice headers are populated: ${checked.reasons.join(', ')}`);
+    assert(/ROUTING_DOMAINS: alpha, beta/.test(slice.prompt), '(a) rendered domains use fixture routing keys');
+    assert(/WORKSPACE_REPOS: (?:api, web|web, api)/.test(slice.prompt), '(a) rendered repositories list both fixture repos');
+    assert(!slice.prompt.includes('{routing_domains}') && !slice.prompt.includes('{workspace_repos}'), '(b) rendered slice retains no raw placeholder tokens');
+    assert(!slice.prompt.includes(_private.NO_DOMAINS_NOTICE) && !slice.prompt.includes(_private.SINGLE_REPO_NOTICE), '(c) rendered slice retains no degradation notices');
+    const milestone = renderPrompt(options('plan-milestone'));
+    assert(/^ROUTING_DOMAINS:\s*alpha, beta$/m.test(milestone.prompt) && !milestone.prompt.includes('WORKSPACE_REPOS'), '(e) milestone has populated routing domains and no workspace repos header');
+
+    for (const name of ['plan-slice.md', 'plan-milestone.md']) {
+      const target = path.join(templateDir, name);
+      fs.writeFileSync(target, fs.readFileSync(target, 'utf8').replace(/^ROUTING_DOMAINS:.*\r?\n|^WORKSPACE_REPOS:.*\r?\n/gm, ''));
+    }
+    assert(!inspectRendered(renderPrompt(options('plan-slice')).prompt).ok, '(f) predicate goes RED when injected headers are removed');
+    fs.copyFileSync(path.join(repoRoot, 'shared', 'templates', 'dispatch', 'plan-slice.md'), path.join(templateDir, 'plan-slice.md'));
+    assert(inspectRendered(renderPrompt(options('plan-slice')).prompt).ok, '(f) predicate returns GREEN when headers are restored');
+    for (const [prompt, reason] of [
+      ['ROUTING_DOMAINS: {routing_domains}\nWORKSPACE_REPOS: api, web\n', 'raw-routing-token'],
+      [`ROUTING_DOMAINS: ${_private.NO_DOMAINS_NOTICE}\nWORKSPACE_REPOS: api, web\n`, 'routing-notice'],
+      ['ROUTING_DOMAINS:\nWORKSPACE_REPOS: api, web\n', 'bare-routing-domains'],
+    ]) assert(inspectRendered(prompt).reasons.includes(reason), `(f) predicate rejects ${reason}`);
+    const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+    assert(/smokeRoutingDomainsRendered\(\);/.test(mainBody), '(g) Section 101 is registered in main()');
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+    if (oldUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = oldUserProfile;
+    cleanup(dir);
+  }
+  pass('(final) Section 101: real rendered planner prompts carry routing and repository values with a biting fixture guard');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -15448,6 +15537,7 @@ async function main() {
       async () => { await smokeTurnInterrupt(); },
       () => { smokeInertRoutes(); },
       () => { smokeTransportField(); },
+      () => { smokeRoutingDomainsRendered(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {

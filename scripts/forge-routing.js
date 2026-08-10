@@ -396,6 +396,7 @@ function resolveRoute(opts) {
 
 module.exports = {
   readRoutingConfig,
+  listDomains,
   resolveRoute,
   mapPhase,
   resolveCell,
@@ -555,6 +556,19 @@ function explainRoute(r, o) {
 }
 
 // ── runCli — resolve, then emit the requested view. exit 0 handled by caller ─
+function listDomains(cwd) {
+  let domains = [];
+  try {
+    const cfg = readRoutingConfig(cwd);
+    if (cfg.present && cfg.ok && cfg.routing) {
+      domains = Object.keys(cfg.routing);
+    }
+  } catch {
+    domains = [];
+  }
+  return domains;
+}
+
 function runCli(args) {
   const o = parseArgs(args);
 
@@ -563,16 +577,7 @@ function runCli(args) {
   // JSON array of routing: domain keys, or '[]' on absent/parse-error
   // (silent-fail — exit 0 always, handled by the caller).
   if (o.listDomains) {
-    let domains = [];
-    try {
-      const cfg = readRoutingConfig(o.cwd);
-      if (cfg.present && cfg.ok && cfg.routing) {
-        domains = Object.keys(cfg.routing);
-      }
-    } catch {
-      domains = [];
-    }
-    process.stdout.write(JSON.stringify(domains) + '\n');
+    process.stdout.write(JSON.stringify(listDomains(o.cwd)) + '\n');
     return;
   }
 

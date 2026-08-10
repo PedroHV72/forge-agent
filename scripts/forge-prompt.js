@@ -47,6 +47,8 @@ const ALLOWED_PLACEHOLDERS = new Set([
   'description',
   'PLAN_CHECK_MODE',
   'MUST_HAVES_CHECK_RESULTS',
+  'routing_domains',
+  'workspace_repos',
 ]);
 
 const PLACEHOLDER_RE = /\{([A-Za-z][A-Za-z0-9_.#-]*)\}/g;
@@ -59,6 +61,8 @@ const MAX_DATA_BYTES = 512 * 1024;
 const MAX_CONTEXT_TOKENS = 16000;
 const DEFAULT_STANDARDS_REL = '.gsd/CODING-STANDARDS.md';
 const MEMORY_FRAGMENT_POINTER = '.gsd/memory/';
+const NO_DOMAINS_NOTICE = '(none — omit domain:)';
+const SINGLE_REPO_NOTICE = '(single repo — omit repo:)';
 
 // Section names as they appear in CODING-STANDARDS.md, per injected placeholder.
 // CS_STRUCTURE concatenates three sections (see extractStandards).
@@ -473,6 +477,36 @@ function applyIsolationHeader(prompt, options) {
   return prompt.slice(0, insertAt) + header + prompt.slice(insertAt);
 }
 
+function resolveRoutingDomains(cwd) {
+  let list = [];
+  try {
+    // Lazy optional sibling: prompt rendering remains usable in partial installs.
+    const { listDomains } = require('./forge-routing');
+    try { list = listDomains(cwd); } catch (_) { list = []; }
+  } catch (err) {
+    const absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-routing');
+    if (!absent) throw err;
+  }
+  const s = Array.isArray(list) && list.length ? list.join(', ') : NO_DOMAINS_NOTICE;
+  if (!s || !s.trim()) return NO_DOMAINS_NOTICE;
+  return s;
+}
+
+function resolveWorkspaceRepos(cwd) {
+  let names = [];
+  try {
+    // Lazy optional sibling: prompt rendering remains usable in partial installs.
+    const { repoNames } = require('./forge-repos');
+    try { names = repoNames(cwd); } catch (_) { names = []; }
+  } catch (err) {
+    const absent = require('./forge-optional-require').isAbsentModuleError(err, './forge-repos');
+    if (!absent) throw err;
+  }
+  const s = Array.isArray(names) && names.length > 1 ? names.join(', ') : SINGLE_REPO_NOTICE;
+  if (!s || !s.trim()) return SINGLE_REPO_NOTICE;
+  return s;
+}
+
 function buildValues(options, template) {
   const scriptsDir = __dirname;
   const usesStandards = /\{CS_(?:LINT|STRUCTURE|RULES)\}/.test(template);
@@ -486,6 +520,18 @@ function buildValues(options, template) {
     })
     : { CS_LINT: '', CS_STRUCTURE: '', CS_RULES: '' };
   const memories = template.includes('{TOP_MEMORIES}') ? resolveMemories(options) : '';
+  const routingOverride = typeof options.routingDomains === 'string' && options.routingDomains.trim()
+    ? options.routingDomains
+    : null;
+  const reposOverride = typeof options.workspaceRepos === 'string' && options.workspaceRepos.trim()
+    ? options.workspaceRepos
+    : null;
+  const resolvedRoutingDomains = template.includes('{routing_domains}')
+    ? (routingOverride || resolveRoutingDomains(options.cwd))
+    : '';
+  const resolvedWorkspaceRepos = template.includes('{workspace_repos}')
+    ? (reposOverride || resolveWorkspaceRepos(options.cwd))
+    : '';
   return {
     WORKING_DIR: options.cwd,
     FORGE_SCRIPTS_DIR: scriptsDir,
@@ -503,6 +549,8 @@ function buildValues(options, template) {
     description: options.description,
     PLAN_CHECK_MODE: options.planCheckMode,
     MUST_HAVES_CHECK_RESULTS: options.mustHavesCheckResults,
+    routing_domains: resolvedRoutingDomains,
+    workspace_repos: resolvedWorkspaceRepos,
   };
 }
 
@@ -644,6 +692,7 @@ function parseArgs(argv) {
     'must-haves-file', 'memories-file', 'memories', 'memory-query',
     'memory-query-file', 'memory-limit', 'memory-max-tokens', 'standards-max-tokens',
     'isolation-mode', 'branch', 'code-dir', 'vars-json', 'cleanup',
+    'routing-domains', 'workspace-repos',
   ]);
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -711,6 +760,8 @@ function cliOptions(args) {
     memoryLimit: args['memory-limit'] || base.memoryLimit || base.memory_limit,
     memoryMaxTokens: args['memory-max-tokens'] || base.memoryMaxTokens || base.memory_max_tokens,
     standardsMaxTokens: args['standards-max-tokens'] || base.standardsMaxTokens || base.standards_max_tokens,
+    routingDomains: args['routing-domains'] || base.routingDomains || base.routing_domains,
+    workspaceRepos: args['workspace-repos'] || base.workspaceRepos || base.workspace_repos,
   };
   if (args['must-haves-file']) options.mustHavesCheckResults = readFileWithinCwd(cwd, args['must-haves-file'], 'must-haves');
   if (args['memories-file']) options.memories = readFileWithinCwd(cwd, args['memories-file'], 'memories');
@@ -752,6 +803,8 @@ Core options:
   --memory-limit N       Maximum selected memory entries (default: 12)
   --memory-max-tokens N  Selected-memory budget (default: 1200)
   --standards-max-tokens N Combined coding-standards budget (default: 3000)
+  --routing-domains TEXT Test/deterministic routing-domains override
+  --workspace-repos TEXT  Test/deterministic workspace-repos override
   --stdin-json           Read all options as JSON from stdin
   --print-prompt         Print the rendered body instead of result metadata
   --cleanup ID           Safely remove exactly one rendered prompt artifact
@@ -791,7 +844,7 @@ module.exports = {
   materializePrompt,
   cleanupPrompt,
   validateDispatchId,
-  _private: { truncateChars, truncateContext, boundStandards, standardsPointer },
+  _private: { truncateChars, truncateContext, boundStandards, standardsPointer, NO_DOMAINS_NOTICE, SINGLE_REPO_NOTICE, resolveRoutingDomains, resolveWorkspaceRepos },
 };
 
 if (require.main === module) {
