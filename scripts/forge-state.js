@@ -20,6 +20,8 @@
 
 const fs   = require('fs');
 const path = require('path');
+const lock = require('./forge-lock.js');
+const { normalizeHostRuntime } = require('./forge-runtime.js');
 
 const VALID_PHASES = new Set([
   'idle',
@@ -83,6 +85,12 @@ function read(cwd, milestoneId) {
     created: frontmatter.created,
     last_updated: frontmatter.last_updated,
     isolation_mode: frontmatter.isolation_mode || 'shared',
+    owner: frontmatter.owner,
+    host_runtime: frontmatter.host_runtime,
+    worker_engine: frontmatter.worker_engine,
+    session: frontmatter.session,
+    heartbeat: frontmatter.heartbeat,
+    expires_at: frontmatter.expires_at,
 
     active_slice: extractBoldField(body, 'Active Slice') || '—',
     active_task:  extractBoldField(body, 'Active Task')  || '—',
@@ -94,10 +102,18 @@ function read(cwd, milestoneId) {
     notes:        extractSection(body, 'Notes'),
 
     _raw: raw,
+    _frontmatter: frontmatter,
   };
 }
 
-function write(cwd, state) {
+function writeAtomic(file, content) {
+  const dir = path.dirname(file);
+  const temp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`);
+  fs.writeFileSync(temp, content, 'utf8');
+  fs.renameSync(temp, file);
+}
+
+function render(cwd, state) {
   if (!state.milestone) throw new Error('forge-state.write: state.milestone required');
   const milestoneId = state.milestone;
   const dir = path.dirname(statePath(cwd, milestoneId));
@@ -108,13 +124,22 @@ function write(cwd, state) {
   }
 
   const nowIso = new Date().toISOString();
-  const fm = {
+  const fm = Object.assign({}, state._frontmatter || {}, {
     milestone: milestoneId,
     kind: state.kind || 'milestone',
     created: state.created || nowIso,
     last_updated: nowIso,
     isolation_mode: state.isolation_mode || 'shared',
-  };
+  });
+  // Metadata is additive. Omitted legacy values are neither inferred nor
+  // backfilled; supplied hosts validate at this persistence boundary.
+  for (const key of ['owner', 'worker_engine', 'session', 'heartbeat', 'expires_at']) {
+    if (Object.prototype.hasOwnProperty.call(state, key)) fm[key] = state[key];
+  }
+  if (Object.prototype.hasOwnProperty.call(state, 'host_runtime')) {
+    fm.host_runtime = state.host_runtime === undefined || state.host_runtime === null || state.host_runtime === ''
+      ? state.host_runtime : normalizeHostRuntime(state.host_runtime);
+  }
 
   const lines = [];
   lines.push(`# ${milestoneId} State`);
@@ -140,28 +165,46 @@ function write(cwd, state) {
     lines.push('');
   }
 
-  const file = statePath(cwd, milestoneId);
   const content = serializeFrontmatter(fm) + '\n' + lines.join('\n');
-  fs.writeFileSync(file, content, 'utf8');
-  return file;
+  return { file: statePath(cwd, milestoneId), content };
+}
+
+function write(cwd, state) {
+  const handle = lock.acquireSync(cwd, `state-${state.milestone}`, { holderRunId: state.milestone, retries: 80 });
+  try {
+    const current = read(cwd, state.milestone);
+    const merged = current ? Object.assign({}, current, state) : state;
+    const rendered = render(cwd, merged);
+    writeAtomic(rendered.file, rendered.content);
+    return rendered.file;
+  } finally { handle.release(); }
 }
 
 function updateFields(cwd, milestoneId, patch) {
-  const current = read(cwd, milestoneId);
-  if (!current) throw new Error(`forge-state.updateFields: ${milestoneId} not found`);
-  const next = Object.assign({}, current, patch);
-  write(cwd, next);
-  return next;
+  const handle = lock.acquireSync(cwd, `state-${milestoneId}`, { holderRunId: milestoneId, retries: 80 });
+  try {
+    const current = read(cwd, milestoneId);
+    if (!current) throw new Error(`forge-state.updateFields: ${milestoneId} not found`);
+    const next = Object.assign({}, current, patch);
+    const rendered = render(cwd, next);
+    writeAtomic(rendered.file, rendered.content);
+    return read(cwd, milestoneId);
+  } finally { handle.release(); }
 }
 
 // Push a one-line entry to "Recent units" section, keep last 10
 function pushRecentUnit(cwd, milestoneId, entry) {
-  const current = read(cwd, milestoneId);
-  if (!current) throw new Error(`forge-state.pushRecentUnit: ${milestoneId} not found`);
-  const existing = (current.recent_units || '').split('\n').map(l => l.trim()).filter(Boolean);
-  existing.push(entry);
-  const trimmed = existing.slice(-10).join('\n');
-  return updateFields(cwd, milestoneId, { recent_units: trimmed });
+  const handle = lock.acquireSync(cwd, `state-${milestoneId}`, { holderRunId: milestoneId, retries: 80 });
+  try {
+    const current = read(cwd, milestoneId);
+    if (!current) throw new Error(`forge-state.pushRecentUnit: ${milestoneId} not found`);
+    const existing = (current.recent_units || '').split('\n').map(l => l.trim()).filter(Boolean);
+    existing.push(entry);
+    const next = Object.assign({}, current, { recent_units: existing.slice(-10).join('\n') });
+    const rendered = render(cwd, next);
+    writeAtomic(rendered.file, rendered.content);
+    return read(cwd, milestoneId);
+  } finally { handle.release(); }
 }
 
 // Read legacy .gsd/STATE.md (pre-M004 single-run format) — for migration support
@@ -280,5 +323,5 @@ if (require.main === module) cliMain();
 
 module.exports = {
   read, write, updateFields, pushRecentUnit, readLegacyStateFile,
-  statePath, VALID_PHASES,
+  statePath, VALID_PHASES, writeAtomic,
 };

@@ -194,6 +194,60 @@ test('updateFields: repeated writes do not erode the sections', () => {
   });
 });
 
+test('write: runtime metadata is additive and survives a disk round-trip', () => {
+  withSandbox(dir => {
+    state.updateFields(dir, MILESTONE, {
+      owner: 'worker-opaque-token', host_runtime: 'codex', worker_engine: 'native',
+      session: 'provider-independent-value', heartbeat: '2026-08-01T10:00:00.000Z',
+    });
+    const saved = state.read(dir, MILESTONE);
+    assertEq(saved.host_runtime, 'codex');
+    assertEq(saved.session, 'provider-independent-value');
+    assertEq(saved.phase, 'execute-task', 'metadata must not alter phase');
+    assertEq(saved.next_action, 'executar T04', 'metadata must not alter next action');
+  });
+});
+
+test('read/write: a 3.1.4 fixture remains free of runtime backfill', () => {
+  withSandbox(dir => {
+    state.updateFields(dir, MILESTONE, { active_task: 'T04' });
+    const raw = fs.readFileSync(state.statePath(dir, MILESTONE), 'utf8');
+    assert(!raw.includes('host_runtime:'), 'legacy fixture must not gain host_runtime');
+    assert(!raw.includes('session:'), 'legacy fixture must not gain session');
+  });
+});
+
+test('write: rejects an unknown supplied host runtime', () => {
+  withSandbox(dir => {
+    let threw = false;
+    try { state.updateFields(dir, MILESTONE, { host_runtime: 'other-provider' }); }
+    catch (error) { threw = /invalid-host-runtime/.test(error.code || '') || /host_runtime/.test(error.message); }
+    assert(threw, 'unknown host must be rejected by forge-runtime');
+  });
+});
+
+test('write: publication leaves no temporary STATE files', () => {
+  withSandbox(dir => {
+    state.updateFields(dir, MILESTONE, { active_task: 'T04' });
+    const names = fs.readdirSync(path.dirname(state.statePath(dir, MILESTONE)));
+    assertEq(names.filter(name => name.includes('.tmp')).length, 0);
+  });
+});
+
+test('metadata patches preserve each other across sequential durable updates', () => {
+  withSandbox(dir => {
+    state.updateFields(dir, MILESTONE, { owner: 'first-owner', heartbeat: 'h1' });
+    state.updateFields(dir, MILESTONE, { worker_engine: 'codex', session: 'opaque session' });
+    const stored = state.read(dir, MILESTONE);
+    assertEq(stored.owner, 'first-owner');
+    assertEq(stored.heartbeat, 'h1');
+    assertEq(stored.worker_engine, 'codex');
+    assertEq(stored.session, 'opaque session');
+    assertEq(stored.active_slice, 'S03');
+    assertEq(stored.active_task, 'T03');
+  });
+});
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 console.log(`\n=== Result: ${passed} passed, ${failed} failed ===`);
 

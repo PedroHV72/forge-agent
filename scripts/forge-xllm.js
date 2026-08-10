@@ -55,15 +55,15 @@
  * The orchestrator owns fallback behavior, not this adapter.
  *
  * Execute-mode contract (LOCKED — M005-CONTEXT / S01):
- *  - START_SHA ownership: the CALLER captures its own START_SHA BEFORE invoking the
- *    adapter and OWNS the post-failure reset (`git checkout {START_SHA} -- . && git
- *    clean -fd`, done in S02). The adapter exposes `start_sha` in the result JSON for
- *    audit ONLY — it NEVER resets, cleans, checks out, commits, or runs ANY git write.
+ *  - START_SHA ownership: the adapter captures START_SHA and the pre-dirty snapshot as
+ *    one attempt record before invoking the worker. The caller owns any post-failure
+ *    surgical reset. The adapter NEVER resets, cleans, checks out, commits, or runs a
+ *    git write.
  *  - no-commit invariant: if codex moves HEAD (commits) despite the prompt prohibition,
  *    the adapter detects HEAD ≠ START_SHA post-run and exits 2.
  *  - no-.gsd/ invariant: the prompt forbids touching `.gsd/**`; if derived changes still
- *    touch `.gsd/`, the adapter emits a stderr WARNING (advisory) — the orchestrator's
- *    file audit is the real safety net (S02).
+ *    touch `.gsd/`, the adapter fails the dispatch (`assertNoProtectedSidecarChanges`).
+ *    The orchestrator's file audit remains the final safety net.
  *  - workspace network is DISABLED under workspace-write: execute tasks must be
  *    self-contained (no installs / no network fetches). Documented limitation.
  *  - `--plan` / `--result-file` come SOLELY from the orchestrator (same trust class as
@@ -97,9 +97,10 @@ const crypto = require('crypto');
 const { spawnSync, execSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
 const {
-  captureSnapshot,
+  captureAttemptSnapshot,
   parseSvnBaseline,
 } = require('./forge-surgical-reset.js');
+const dispatchPolicy = require('./forge-dispatch-policy.js');
 const vcs = require('./forge-vcs.js');
 const { classifyError, isTransient } = require('./forge-classify-error.js');
 const { countTokens, truncateAtSectionBoundary } = require('./forge-tokens.js');
@@ -1259,6 +1260,7 @@ function invokeAgy(opts) {
     }
     const res = spawnSync(cmd, [...prefixArgs, ...args], {
       cwd,
+      shell: false,
       // agy's own --print-timeout fires first and lets it exit cleanly; the spawn
       // timeout is a 5s-grace hard backstop for a hung process (the non-TTY hang).
       timeout: timeoutSecs * 1000 + 5000,
@@ -1494,38 +1496,124 @@ function readWorkersTimeout(baseDir) {
 }
 
 /**
- * Construct the environment for a sidecar process. `minimal` is an allowlist minus
- * a credential denylist; `inherit` is a byte-identical shallow copy without a denylist.
- * macOS probe (2026-07-19): Codex ChatGPT keychain auth works with the minimal base.
+ * Is this env key credential-bearing for a THIRD-PARTY sidecar process?
+ *
+ * Generalizes the old prefix list (`AWS_`/`AZURE_`/`GCP_`/`DATABASE_`/`ANTHROPIC_`/
+ * `CLAUDE_`), which named vendors and therefore missed the shape: a plain
+ * `MY_SERVICE_TOKEN` or `DB_PASSWORD` walked straight through. `FORGE_ACCOUNT` and
+ * `FORGE_SESSION_ID` are named explicitly — they are Forge's own account identity and
+ * arrive via the `FORGE_*` sweep below, not via the allowlist.
+ *
+ * `DBUS_SESSION_BUS_ADDRESS` is exempted because it matches `SESSION` while being a
+ * platform socket path, not a credential.
+ */
+function isSensitiveSidecarEnvKey(key) {
+  const upper = String(key || '').toUpperCase();
+  if (upper === 'FORGE_ACCOUNT' || upper === 'FORGE_SESSION_ID') return true;
+  if (upper !== 'DBUS_SESSION_BUS_ADDRESS' && /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|AUTH|COOKIE|SESSION)(?:_|$)/.test(upper)) return true;
+  return /^(?:AWS|AZURE|GCP|DATABASE|ANTHROPIC|CLAUDE)_/.test(upper)
+    || /^FORGE_(?:AWS|AZURE|GCP|DATABASE|ANTHROPIC|CLAUDE|OPENAI|GEMINI|ANTIGRAVITY)_/.test(upper);
+}
+
+/**
+ * Construct the environment for a sidecar process. `minimal` is an allowlist; `inherit`
+ * starts from a shallow copy. BOTH now pass through the credential denylist — `inherit`
+ * used to be an unfiltered `{...sourceEnv}`, so a caller who chose it handed the
+ * third-party process every secret in the ambient environment.
+ *
+ * The denylist is applied ONLY to keys that did not come from the explicit allowlist.
+ * An allowlist entry is a deliberate decision with a probe behind it; the `FORGE_*`
+ * sweep and the `inherit` shallow copy are the wildcard paths, and wildcards are where
+ * smuggling happens.
+ *
+ * NO provider API key is allowlisted, deliberately. Auth here is by SUBSCRIPTION, not by
+ * key — macOS probe (2026-07-19): Codex ChatGPT keychain auth works with the minimal base.
+ * So a key is never needed, and forwarding a stray `OPENAI_API_KEY` that happens to be set
+ * for some other tool is worse than useless: it can make the sidecar bill the metered API
+ * instead of the subscription. `*_API_KEY` is caught by the generic denylist below, with no
+ * vendor named.
+ *
+ * `CODEX_HOME` IS allowlisted, and it is not a counterexample: it is a config PATH, not a
+ * credential. Nothing in this repo sets it for the spawn — it is only forwarded from the
+ * operator's environment — and `forge-codex-renderer` materializes skills/commands under
+ * `$CODEX_HOME`, so a sidecar that cannot see it cannot see its own projections.
  * @param {'minimal'|'inherit'} [policy]
  * @param {NodeJS.ProcessEnv} [sourceEnv]
  * @param {NodeJS.Platform} [platform]
  * @returns {NodeJS.ProcessEnv}
  */
 function buildSidecarEnv(policy = 'minimal', sourceEnv = process.env, platform = process.platform) {
-  if (policy === 'inherit') return { ...sourceEnv };
-
   const common = [
     'PATH', 'HOME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM', 'CODEX_HOME',
-    'OPENAI_API_KEY', 'GEMINI_API_KEY', 'ANTIGRAVITY_API_KEY', 'HTTP_PROXY',
-    'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
   ];
   const platformKeys = platform === 'win32'
     ? ['SystemRoot', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'TEMP', 'TMP']
     : platform === 'linux'
       ? ['DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME']
       : [];
-  const env = {};
-  for (const key of [...common, ...platformKeys]) {
-    if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
-  }
-  for (const [key, value] of Object.entries(sourceEnv)) {
-    if (key.startsWith('FORGE_') && value !== undefined) env[key] = value;
+  const allowlist = new Set([...common, ...platformKeys]);
+  const env = policy === 'inherit' ? { ...sourceEnv } : {};
+  if (policy !== 'inherit') {
+    for (const key of allowlist) {
+      if (sourceEnv[key] !== undefined) env[key] = sourceEnv[key];
+    }
+    for (const [key, value] of Object.entries(sourceEnv)) {
+      if (key.startsWith('FORGE_') && value !== undefined) env[key] = value;
+    }
   }
   for (const key of Object.keys(env)) {
-    if (/(^|_)(AWS_|AZURE_|GCP_|DATABASE_|ANTHROPIC_|CLAUDE_)/.test(key)) delete env[key];
+    if (!allowlist.has(key) && isSensitiveSidecarEnvKey(key)) delete env[key];
   }
   return env;
+}
+
+function boundaryError(code, message) { const error = new Error(message); error.code = code; return error; }
+
+/** Kill only the process tree rooted at the ChildProcess object created here. */
+function terminateOwnedProcessTree(child, platform = process.platform, runner = spawnSync) {
+  if (!child || !Number.isInteger(child.pid) || child.pid <= 0) return { ok: false, reason_code: 'process-termination-invalid-owner' };
+  let treeKilled = false;
+  if (platform === 'win32') {
+    try { const result = runner('taskkill', ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore' }); treeKilled = !result.error && result.status === 0; } catch { /* best-effort */ }
+  } else {
+    try { process.kill(-child.pid, 'SIGKILL'); treeKilled = true; } catch { /* group gone */ }
+  }
+  try { child.kill('SIGKILL'); treeKilled = true; } catch { /* already dead */ }
+  return { ok: treeKilled, reason_code: treeKilled ? 'process-tree-terminated' : 'process-termination-failed' };
+}
+
+/**
+ * Assert that spawning this sidecar is permitted by the dispatch policy, and that the
+ * grant it returns is the empty one: no extra grants, no credential env. Throws with a
+ * named `reason_code` rather than degrading — a sidecar that may not run must not run.
+ */
+function authorizeSidecar(mode, opts = {}) {
+  const readOnly = mode !== 'execute';
+  const workerEngine = opts.engine || 'codex';
+  const decision = dispatchPolicy.decide({
+    role: readOnly ? 'orchestrator' : 'worker',
+    host_runtime: opts.hostRuntime || 'claude', worker_engine: workerEngine,
+    worker_mode: 'sidecar', sidecar_declared: true, operation: 'spawn',
+    sandbox_mode: readOnly ? 'read-only' : 'workspace-write',
+    required_capabilities: readOnly ? ['process.spawn'] : ['process.spawn', 'workspace.write'],
+    available_capabilities: readOnly ? ['process.spawn'] : ['process.spawn', 'workspace.write'],
+    workspace_root: opts.workspaceRoot || opts.cwd, spawn_cwd: opts.cwd,
+  });
+  if (decision.decision !== 'allow' || decision.grants.length !== 0 || decision.permissions.credential_env !== false) {
+    throw boundaryError(decision.reason_code || 'role-permission-denied', `sidecar policy denied: ${decision.reason_code}`);
+  }
+  return decision;
+}
+
+/**
+ * The sidecar's output is untrusted input. Dispatch control data appearing in it means
+ * the third-party model is trying to describe its own permissions — refuse the whole
+ * result rather than let any field of it reach the orchestrator.
+ */
+function assertUntrustedOutputBarrier(value) {
+  if (dispatchPolicy.containsControlData(value)) throw boundaryError('untrusted-output-barrier', 'sidecar output contains dispatch control data');
+  return value;
 }
 
 /** Read sidecars.env_policy from the merged prefs cascade, or null when invalid. */
@@ -1553,6 +1641,7 @@ async function runChallenge(opts) {
   const timeoutSecs = opts.timeoutSecs || DEFAULT_TIMEOUT_SECS;
   const engine = opts.engine || 'codex';
   if (!opts.diffCmd) throw new Error('challenge mode requires --diff-cmd');
+  authorizeSidecar('challenge', { ...opts, cwd, engine });
 
   const diffText = acquireDiff(opts.diffCmd, cwd);
   const prompt = buildChallengePrompt(diffText);
@@ -1564,6 +1653,7 @@ async function runChallenge(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error(`no parseable JSON block found in ${engine} output`);
+  assertUntrustedOutputBarrier(parsed);
   if (!validateObjections(parsed)) throw new Error(`${engine} output failed objections validation`);
 
   return normalizeChallenge(parsed);
@@ -1598,6 +1688,7 @@ async function runDefend(opts) {
   const timeoutSecs = opts.timeoutSecs || DEFAULT_TIMEOUT_SECS;
   const engine = opts.engine || 'codex';
   if (!opts.inputFile) throw new Error('defend mode requires --input <file>');
+  authorizeSidecar('defend', { ...opts, cwd, engine });
 
   let inputText;
   try {
@@ -1624,6 +1715,7 @@ async function runDefend(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error(`no parseable JSON block found in ${engine} output`);
+  assertUntrustedOutputBarrier(parsed);
   if (!validateVerdicts(parsed, DEFEND_VERDICT_ENUM)) {
     throw new Error(`${engine} output failed defense verdicts validation`);
   }
@@ -1647,6 +1739,7 @@ async function runRebuttal(opts) {
   const timeoutSecs = opts.timeoutSecs || DEFAULT_TIMEOUT_SECS;
   const engine = opts.engine || 'codex';
   if (!opts.inputFile) throw new Error('rebuttal mode requires --input <file>');
+  authorizeSidecar('rebuttal', { ...opts, cwd, engine });
 
   let inputText;
   try {
@@ -1669,6 +1762,7 @@ async function runRebuttal(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error(`no parseable JSON block found in ${engine} output`);
+  assertUntrustedOutputBarrier(parsed);
   if (!validateVerdicts(parsed)) throw new Error(`${engine} output failed verdicts validation`);
 
   return normalizeRebuttal(parsed);
@@ -1771,6 +1865,7 @@ async function runExecute(opts) {
 
   if (!opts.planFile) throw new Error('execute mode requires --plan <file>');
   if (!opts.resultFile) throw new Error('execute mode requires --result-file <path>');
+  authorizeSidecar('execute', { ...opts, cwd, engine: opts.engine || 'codex' });
 
   // Validate the result channel before the first heartbeat write. This resolves the
   // real parent and rejects symlink/junction tricks, including case-folded Windows
@@ -1809,12 +1904,17 @@ async function runExecute(opts) {
 
   // Pre-dispatch dirty SNAPSHOT (refuse→snapshot, M013 S01): the adapter no longer
   // refuses on a pre-existing dirty tree (auto_commit:false leaves prior work uncommitted).
-  // Instead it captures the pre-dispatch snapshot via forge-surgical-reset.captureSnapshot
-  // ([{path,hash}], .gsd/** excluded; empty on a clean tree) and proceeds with the dispatch.
+  // Instead it captures START_SHA and the pre-dispatch snapshot atomically via
+  // forge-surgical-reset.captureAttemptSnapshot ([{path,hash}], .gsd/** excluded; empty on
+  // a clean tree) and proceeds with the dispatch. Capturing both as ONE attempt record is
+  // what makes the pair trustworthy: the helper re-reads the baseline afterwards and throws
+  // `snapshot-baseline-moved` if it shifted mid-capture, so `start_sha` can never describe a
+  // different tree than `pre_dirty` does.
   // This snapshot is AUDIT ONLY — exposed as `pre_dirty` in the result JSON for the
   // orchestrator to cross-check. The AUTHORITATIVE snapshot that drives the post-failure
   // surgical reset lives in the orchestrator's state file (T03/T04); the adapter NEVER resets.
-  const preDirty = captureSnapshot(cwd, vcsName);
+  const attemptSnapshot = captureAttemptSnapshot(cwd, { attemptId: dispatchId, vcsName });
+  const preDirty = attemptSnapshot.pre_dirty;
   const preDirtyAll = captureDirtySnapshot(cwd, vcsName);
 
   let securityText = '';
@@ -1826,16 +1926,8 @@ async function runExecute(opts) {
   if (contextText.trim()) contextText = truncateAtSectionBoundary(contextText, CONTEXT_BUDGET_CHARS);
   else contextText = '';
 
-  let startSha;
-  if (vcsName === 'svn') {
-    const baseline = vcs.baselineId(cwd, { ...VCS_OPTS, vcs: 'svn' });
-    if (!baseline.ok) throw new Error(baseline.error);
-    const parsedBaseline = parseSvnBaseline(baseline.id);
-    if (!parsedBaseline.ok) throw new Error(parsedBaseline.error);
-    startSha = parsedBaseline.range;
-  } else {
-    startSha = gitRead('rev-parse HEAD', cwd, 'git rev-parse HEAD');
-  }
+  // Same attempt record as `pre_dirty` above — never a second, independent read.
+  const startSha = attemptSnapshot.start_sha;
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
   const prompt = buildExecutePrompt(planText, { securityText, contextText, capability: cap.capability });
@@ -1940,6 +2032,9 @@ async function runExecute(opts) {
     }
   }
   if (parsed === null) throw new Error('no parseable/valid execute result in app-server output');
+  // Applied to whichever candidate was accepted (outputSchema or the fallback block) —
+  // both come from the same untrusted process, so both cross the same barrier.
+  assertUntrustedOutputBarrier(parsed);
 
   const derived = deriveFilesChanged(cwd, preDirtyAll, startSha, vcsName);
   // Protected metadata is outside the surgical reset set. A sidecar-owned `.gsd`
@@ -2032,6 +2127,7 @@ async function runPlan(opts) {
 
   if (!opts.planContextFile) throw new Error('plan mode requires --plan-context <file>');
   if (!opts.resultFile) throw new Error('plan mode requires --result-file <path>');
+  authorizeSidecar('plan', { ...opts, cwd, engine: opts.engine || 'codex' });
 
   const resultFile = validateResultFileTarget(opts.resultFile, cwd);
 
@@ -2139,6 +2235,7 @@ async function runPlan(opts) {
 
   const parsed = extractLastJsonBlock(rawContent);
   if (parsed === null) throw new Error('no parseable JSON block found in codex output');
+  assertUntrustedOutputBarrier(parsed);
   if (!validatePlanResult(parsed)) throw new Error('codex output failed plan-result validation');
 
   // In-sidecar must_haves validation (ENFORCING gate — S03 requirement #1). Every
@@ -2219,6 +2316,10 @@ module.exports = {
   readSidecarsEnvPolicy,
   resolveCodexCommand,
   buildSidecarEnv,
+  isSensitiveSidecarEnvKey,
+  authorizeSidecar,
+  assertUntrustedOutputBarrier,
+  terminateOwnedProcessTree,
   buildExecutePrompt,
   buildAppServerSandboxPolicy,
   capabilityToSandboxMode,

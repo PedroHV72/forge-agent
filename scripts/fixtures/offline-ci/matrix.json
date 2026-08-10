@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0.0",
+  "hosts": ["claude", "codex"],
+  "platforms": ["win32", "darwin", "linux"],
+  "suites": [
+    "forge-operational-parity.test.js",
+    "forge-dispatch-policy.test.js",
+    "forge-dispatch-security.test.js",
+    "forge-headless.test.js",
+    "forge-mcp.test.js",
+    "forge-installer.test.js",
+    "forge-update.test.js",
+    "forge-package.test.js",
+    "forge-operations-doc.test.js",
+    "forge-release-gate.test.js"
+  ]
+}

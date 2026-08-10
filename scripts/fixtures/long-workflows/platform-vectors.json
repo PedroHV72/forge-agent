@@ -1,0 +1,7 @@
+{
+  "platforms": ["win32", "darwin", "linux"],
+  "hosts": ["claude", "codex"],
+  "modes": ["auto", "task"],
+  "path_suffix": "workspace espaço – Ω",
+  "crlf_description": "linha 1\r\nlinha 2"
+}

@@ -1,0 +1,19 @@
+{
+  "protocol_version": "1.0.0",
+  "max_codex_members": 3,
+  "required_event_fields": ["protocol_version", "dispatch_id", "engine", "reason_code", "error_class", "security_decision", "attempt", "state_snapshot"],
+  "forbidden_event_fields": ["credential", "credentials", "env", "prompt", "transcript", "token", "session"],
+  "failures": [
+    {"signal":"host-unavailable","reason_code":"host-unavailable","legacy_reason_codes":["invalid-host-runtime"],"error_class":"terminal","retry":"none","next":"stop-human","reset":"none"},
+    {"signal":"worker-refused","reason_code":"worker-refused","legacy_reason_codes":["sidecar-declaration-required","implicit-recursion-refused","native-engine-host-mismatch"],"error_class":"terminal","retry":"none","next":"stop-human","reset":"none"},
+    {"signal":"output-invalid","reason_code":"output-invalid","legacy_reason_codes":["codex-invalid-json"],"error_class":"terminal","retry":"none","next":"configured-member","reset":"execute-only"},
+    {"signal":"timeout","reason_code":"codex-timeout","legacy_reason_codes":["process-timeout"],"error_class":"terminal","retry":"none","next":"configured-member","reset":"execute-only"},
+    {"signal":"orphan","reason_code":"codex-orphan","legacy_reason_codes":["process-termination-failed"],"error_class":"terminal","retry":"none","next":"configured-member","reset":"execute-only"},
+    {"signal":"sandbox-denied","reason_code":"sandbox-permission-denied","legacy_reason_codes":["role-permission-denied","sandbox-escalation-denied"],"error_class":"terminal","retry":"none","next":"stop-human","reset":"none"},
+    {"signal":"capability-denied","reason_code":"capability-missing","legacy_reason_codes":["capability-missing"],"error_class":"terminal","retry":"none","next":"stop-human","reset":"none"},
+    {"signal":"protected-state","reason_code":"protected-state-path","legacy_reason_codes":["protected-state-path","codex-exit-nonzero"],"error_class":"terminal","retry":"none","next":"stop-human","reset":"execute-only"},
+    {"signal":"reset-overlap","reason_code":"surgical-reset-overlap","legacy_reason_codes":["reset-overlap"],"error_class":"terminal","retry":"none","next":"stop-human","reset":"abort"},
+    {"signal":"verification-failed","reason_code":"verification-failed","legacy_reason_codes":["verified-reset-failed","reset-unverified"],"error_class":"terminal","retry":"none","next":"stop-human","reset":"abort"},
+    {"signal":"provider-transient","reason_code":"provider-transient","legacy_reason_codes":["rate-limit","network","server","stream","connection"],"error_class":"transient","retry":"same-attempt-bounded","next":"configured-member","reset":"execute-only"}
+  ]
+}

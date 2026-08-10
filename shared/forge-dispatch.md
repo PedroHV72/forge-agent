@@ -987,6 +987,73 @@ Placeholder classification:
 
 > **`dispatch_engine` is the canonical branch trigger.** The resolver's chain carries model-family metadata (`claude|gpt|gemini`); `dispatch_engine` normalizes it (`gpt→codex`, `gemini→agy`, otherwise `claude`). Sidecar branches gate only on `$DISPATCH_ENGINE`. Event field `engine` records the normalized engine that actually ran so review pairing and cost aggregation see `claude|codex|agy` consistently.
 
+#### Runtime-neutral host and worker contract (S01/T02)
+
+`scripts/forge-dispatch-resolve.js` also carries the versioned host/worker
+projection from [`scripts/forge-runtime.js`](../scripts/forge-runtime.js).
+This is one resolver call, not a second routing parser. The host is an input to
+the resolver; it is never inferred from `model`, `engine`, `dispatch_engine`,
+or a member of `chain`.
+
+Library callers may use the existing camel-case option names (`hostRuntime`,
+`workerEngine`, `workerMode`, `sidecarDeclared`); JSON/wire callers may use
+the equivalent snake-case keys. The CLI accepts `--host-runtime`,
+`--worker-engine`, `--worker-mode`, and the boolean `--sidecar-declared`.
+
+```text
+node scripts/forge-dispatch-resolve.js --json --unit-type execute-task \
+  --host-runtime codex --worker-engine codex --worker-mode sidecar \
+  --sidecar-declared --cwd "$WORKING_DIR"
+```
+
+The following fields are additive and appear after the established resolver
+fields. The ordered legacy prefix remains `engine, model, alias, tier, domain,
+route_source, chain, chain_len, reason, effort, effort_reason`.
+
+| Field | Meaning |
+|-------|---------|
+| `runtime_protocol_version` | Version emitted by the canonical runtime contract. |
+| `host_runtime` | The current Forge host: `claude` or `codex`; omitted input defaults to `claude`. |
+| `worker_engine` / `worker_mode` | Requested neutral worker target and delivery mode. Omitted values remain `native` / `native`. |
+| `resolved_worker_engine` | Actual target after resolving `worker_engine:native` solely from `host_runtime`. |
+| `sidecar_declared` | Explicit caller assertion needed for any sidecar combination. It is not a permission grant. |
+| `worker_reason_code` | Stable success or refusal reason from `forge-runtime.js`. |
+| `dispatch_allowed` / `dispatch_reason_code` | Pre-dispatch gate. `false` means do not launch a worker and report the stable reason. |
+
+`native` has no cross-provider fallback: on `{host_runtime:"codex",
+worker_engine:"native"}` the `resolved_worker_engine` is `codex`, even if the
+routed model is Claude. Conversely, a `gpt-*` model does not change the host.
+The model-routing fields continue to describe their legacy concerns:
+`engine` remains a model family, `dispatch_engine` remains the sidecar branch
+trigger, and `chain`/`route_source` retain their existing meanings. No runtime
+field removes, renames, or reinterprets any of them.
+
+Before dispatch, consumers must gate on `dispatch_allowed` in addition to
+their existing preferences/error gate. A refused runtime contract never
+silently selects Claude (or another host). In particular,
+`host_runtime:codex + worker_engine:codex + worker_mode:sidecar` without the
+explicit declaration returns `dispatch_allowed:false` and
+`dispatch_reason_code:"implicit-recursion-refused"`. Supplying
+`sidecar_declared:true` makes the same-host sidecar combination representable;
+an adapter/security layer may still deny it. An undeclared cross-host sidecar
+returns `sidecar-declaration-required` instead.
+
+For a legacy caller that supplies none of these inputs, the additive values
+are `host_runtime:"claude"`, `worker_engine:"native"`,
+`worker_mode:"native"`, and `resolved_worker_engine:"claude"`. Routing,
+`engine`, `dispatch_engine`, and all existing consumers therefore retain the
+Claude-first behavior observed in 3.1.4.
+
+When a caller supplies either worker axis, that explicit value wins over the
+routed model family. A Codex route may project its legacy sidecar only when
+both worker fields are omitted; it must never rewrite an explicit Claude,
+Codex, or `agy` target. This keeps a host/worker mismatch observable and lets
+the policy layer decide whether a declared sidecar is permitted. The resolver
+uses only Node path/process-neutral operations and accepts paths containing
+spaces, Unicode, and either LF or CRLF. The same contract and reason codes are
+therefore used unchanged by native Windows, macOS, and Linux adapters; no
+shell quoting, PID, or platform-specific fallback participates in resolution.
+
 #### When to apply
 
 Engine Routing runs at the **top** of the Step 4 dispatch for a worker, **before** Tier Resolution (and therefore before Effort Resolution, which depends on `$MODEL_ID`). The ordering is deliberate: when `dispatch_engine == codex` the Claude Tier/Effort Resolution is **skipped entirely** (Codex resolves its own model), and only runs on the Claude path — including the fallback path, where the fallback re-enters Tier/Effort Resolution as a normal Claude dispatch.
@@ -1422,6 +1489,69 @@ RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf
 **Path-traversal guard (untrusted codex output).** `task_plans[].id` and `.filename` are UNTRUSTED — codex is an external, potentially-compromised model. `validatePlanResult` in `forge-xllm.js` is the gate: it rejects (exit 2 → Fallback) any task plan whose `id` isn't `^T\d+$` or whose `filename` isn't a plain `.md` basename (`^[A-Za-z0-9._-]+\.md$` — no `/`, `\`, or `..`). Defense in depth: **re-derive the task plan path from the validated `id` alone** — `.gsd/milestones/{M###}/slices/{S##}/tasks/{id}/{id}-PLAN.md`. Treat `filename` only as an optional equality-check against `{id}-PLAN.md`; **never concatenate the raw `filename` into a filesystem path.**
 
 After materializing, the orchestrator emits the `dispatch` event (`engine:"codex"`, unit `plan-slice/{S##}`) and control **rejoins the normal `plan-slice` completion path** exactly as if a Claude `forge-planner` had just written the files: the **plan-check gate**, the **symbol-check gate** and the interactive **plan_gate** all run over the materialized files, agnostic of origin (locked — **nothing in those gates changes**). No `T##-SUMMARY`/`---GSD-WORKER-RESULT---` is synthesized here — plan-slice produces plan files, not a task result.
+
+#### Canonical dispatch failure taxonomy (S06/T04)
+
+This table is the single control-flow vocabulary for native and sidecar dispatches. The
+machine-readable mirror is `scripts/fixtures/dispatch-security/failure-taxonomy.json`.
+Older reason strings remain additive as `legacy_reason_code`; they never replace the
+canonical `reason_code`, and an unknown signal fails closed as `error_class: terminal`.
+
+| signal | `reason_code` | `error_class` | same-member retry | next action | reset |
+|--------|---------------|---------------|-------------------|-------------|-------|
+| host unavailable / invalid host | `host-unavailable` | terminal | never | stop → human | none |
+| worker/runtime refusal | `worker-refused` | terminal | never | stop → human | none |
+| malformed or schema-invalid output | `output-invalid` | terminal | never | configured next member | execute only |
+| timeout | `codex-timeout` | terminal | never | configured next member | execute only |
+| orphan / failed tree termination | `codex-orphan` | terminal | never | configured next member | execute only |
+| sandbox or permission denial | `sandbox-permission-denied` | terminal | never | stop → human | none |
+| missing capability | `capability-missing` | terminal | never | stop → human | none |
+| new protected `.gsd/**` delta | `protected-state-path` | terminal | never | stop → human | execute only |
+| pre-dirty overlap | `surgical-reset-overlap` | terminal | never | stop → human | abort, nothing reset |
+| reset/post-run verification failure | `verification-failed` | terminal | never | stop → human | abort |
+| provider rate/network/server/stream failure | `provider-transient` | transient | bounded, same attempt | configured next member after exhaustion | execute only |
+
+Legacy mappings are preserved for diagnosis: `invalid-host-runtime` →
+`host-unavailable`; `sidecar-declaration-required` / `implicit-recursion-refused` /
+`native-engine-host-mismatch` → `worker-refused`; `codex-invalid-json` →
+`output-invalid`; `process-timeout` → `codex-timeout`; `process-termination-failed` →
+`codex-orphan`; `role-permission-denied` / `sandbox-escalation-denied` →
+`sandbox-permission-denied`; `verified-reset-failed` / `reset-unverified` →
+`verification-failed`. Consumers may show both fields but branch only on the canonical one.
+
+**Bounded cursor and attempt identity.** Keep one state snapshot per configured member:
+`{sidecar_attempt, transient_retry_count, current_member, snapshot_id}`. A transient retry
+increments only `transient_retry_count`, allocates a fresh `dispatch_id`, and reuses the
+same `sidecar_attempt`, member, START_SHA/pre-dirty snapshot and state file. Exhaustion or
+a terminal member failure calls `forge-routing.js --next-after "$CURRENT_ID"` exactly once.
+Only the returned configured member may run. The failure handler never manufactures
+`claude`, never changes `host_runtime`, and never reads the other host's home. The returned
+member is passed back through the T01 runtime contract and T02 policy; refusal stops for a
+human instead of silently substituting another host. An empty cursor stops the loop.
+
+`SIDECAR_ATTEMPT` increments only when control enters a configured Codex member. Its hard
+limit is `min(3, count(chain members whose engine is gpt/codex))`; Layer-1 retries do not
+consume this budget. The resolver-supplied category fallback is part of the same deduped
+cursor and may run once. There is no fourth member, recursive Codex host, or second fallback.
+
+**Normalized telemetry.** Emit one `dispatch` event for every actual call and one `retry`
+decision event before every retry. Both preserve `protocol_version`, `dispatch_id`,
+`engine`, `reason_code`, `error_class`, `security_decision`, `attempt`, and a bounded
+`state_snapshot` containing only the counters/current member/snapshot id. A retry event
+references the new call's unique `dispatch_id`; it does not replace that call's event.
+Never emit credentials, environment values, prompt text, transcript/model output, session
+or token secrets, exception bodies, or provider homes. Telemetry append failure is loud.
+
+Offline gate (PowerShell, cmd, macOS and Linux use the same Node entry points):
+
+```text
+node scripts/forge-dispatch-security.test.js
+node scripts/forge-dispatch-resolve.test.js
+node scripts/forge-routing.test.js
+node scripts/forge-xllm.test.js
+```
+
+The paid/real-provider smoke is deliberately outside this mandatory gate.
 
 #### Layer-1 transient retry (sidecar parity with the Claude Retry Handler)
 
@@ -2399,3 +2529,25 @@ When decomposing a slice:
 3. **If two tasks share a file in `writes`** (e.g., both registering exports in a barrel file), either (a) order them with `depends`, or (b) split the shared-file responsibility into a third task that both depend on.
 
 `writes` conflicts are checked bidirectionally — glob on either side matches literal path on the other, and vice versa. `src/auth/**` conflicts with `src/auth/jwt.ts`.
+
+## Pre-dispatch capability policy
+
+`scripts/forge-dispatch-policy.js` is the pure, fail-closed decision boundary
+between runtime resolution and process enforcement. It receives the explicit
+`host_runtime`, `worker_engine`, role, operation and required/available
+capabilities. It does not inspect provider homes, credentials or ambient OS
+permissions and never spawns a process.
+
+Roles have fixed maxima: orchestrator may manage state and materialize results;
+worker/executor may read, write, apply and spawn only inside its declared
+workspace/worktree; reviewer and observer are read-only with no subprocess or
+execution lease. `.gsd/**` remains orchestrator-owned, and a selected host may
+not target the other host's home.
+
+Every decision conforms to `schemas/forge-dispatch-policy.schema.json`, returns
+exactly `allow|deny`, a stable reason code, `grants: []`, and the least native
+projection: Claude tool allowlist or Codex `sandbox_mode`. Missing capabilities,
+custom-agent sandbox escalation and ad-hoc grants deny rather than inherit.
+Structured worker output is untrusted data: fields that resemble role,
+capability, tools, sandbox, grants, credentials, prompt or transcript trigger
+`untrusted-output-barrier` and can never influence a subsequent dispatch.

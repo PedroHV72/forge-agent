@@ -1,3 +1,45 @@
+## v4.8.0 — One core, two hosts, and a sidecar that gets nothing it doesn't need
+
+### Added
+
+- **Forge Agent multi-runtime:** um único core em `FORGE_HOME` com projeções selecionáveis
+  para Claude Code e Codex CLI, instaladores compartilhados para Windows, macOS e Linux,
+  diagnóstico/capabilities offline por host e handoff auditável sem copiar login, keychain
+  ou credenciais entre runtimes. Integra a PR #71, reautorada sobre o transporte
+  `codex app-server` que a v4.6.0 introduziu depois que aquela branch partiu do `master`.
+- **Barreira de saída não-confiável no sidecar** (`assertUntrustedOutputBarrier`): dispatch
+  control data aparecendo no JSON devolvido pelo modelo de terceiro passa a **recusar o
+  resultado inteiro**, em vez de deixar qualquer campo dele chegar ao orquestrador. Aplicada
+  nos cinco modos (`challenge`, `defend`, `rebuttal`, `execute`, `plan`) — inclusive no
+  caminho do app-server, onde vale para o candidato aceito, venha ele do `outputSchema` ou
+  do bloco de fallback.
+- **`authorizeSidecar`**: todo spawn de sidecar passa antes pela política de dispatch e
+  exige a concessão vazia (zero grants, `credential_env: false`), lançando com
+  `reason_code` nomeado em vez de degradar.
+
+### Fixed
+
+- **A política de env `inherit` deixa de contrabandear segredo.** Era um `{...sourceEnv}`
+  cru, sem denylist nenhuma: quem escolhesse `inherit` entregava ao processo de terceiro
+  todo segredo do ambiente. Agora as duas políticas passam pelo mesmo filtro, e o filtro
+  deixou de nomear fornecedores (`AWS_`/`ANTHROPIC_`/…) — um `MY_SERVICE_TOKEN` ou
+  `DB_PASSWORD` atravessava intacto. A regra é **allowlist vence**: entrada explícita
+  passa, tudo que chega por caminho curinga é filtrado.
+- **Nenhuma chave de API é repassada ao sidecar.** A auth aqui é por **assinatura**, não
+  por chave (sonda macOS de 2026-07-19: o keychain do ChatGPT autentica o codex com a base
+  mínima). Repassar uma `OPENAI_API_KEY` que esteja setada no ambiente por causa de outra
+  ferramenta é pior que inútil: faz o sidecar cobrar da API medida em vez da assinatura.
+  `*_API_KEY` cai pelo padrão genérico, sem nomear fornecedor. `CODEX_HOME` continua
+  passando e não é exceção à regra — é caminho de configuração, não credencial, e o
+  `forge-codex-renderer` materializa skills/commands sob `$CODEX_HOME`.
+- **`START_SHA` e `pre_dirty` viram um registro só** (`captureAttemptSnapshot`), que relê a
+  baseline depois da captura e lança `snapshot-baseline-moved` se ela mudou no meio — o par
+  não pode mais descrever duas árvores diferentes.
+- **`invokeAgy` passa a spawnar com `shell: false`**, alinhando-o aos demais spawns.
+- O cabeçalho do `forge-xllm.js` dizia que tocar `.gsd/` emite "a stderr WARNING
+  (advisory)". O código lança desde o M018 (`assertNoProtectedSidecarChanges`); só o
+  comentário ficou para trás.
+
 ## v4.6.1 — Three copies of one rule stop disagreeing
 
 Follow-up batch to M018. Every item here has the same shape: a rule written in more than

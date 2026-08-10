@@ -63,8 +63,12 @@ function assert(cond, msg) {
 }
 
 function assertEq(actual, expected, msg) {
-  const a = JSON.stringify(actual);
-  const e = JSON.stringify(expected);
+  const comparable = (value) => {
+    if (typeof value !== 'string' || !(/^[\\/]/.test(value) || /^[A-Za-z]:[\\/]/.test(value))) return value;
+    return path.resolve(value).toLowerCase();
+  };
+  const a = JSON.stringify(comparable(actual));
+  const e = JSON.stringify(comparable(expected));
   if (a !== e) throw new Error(`${msg || 'mismatch'}\n     expected: ${e}\n     actual:   ${a}`);
 }
 
@@ -699,7 +703,7 @@ test('anchor: a non-hidden PREF under a root degrades to the legacy sibling WITH
   assertEq(got.path, path.join('/some', 'deep', 'worktrees', 'M-PREFBAD', 'repo-name'), 'legacy sibling, as before roots existed');
   assertEq(got.anchor, 'legacy-sibling');
   assert(/not hidden/.test(got.warn || ''), `the degradation is reported, not silent: ${got.warn}`);
-  assert(/\/some/.test(got.warn || ''), `the root it declined to use is named: ${got.warn}`);
+  assert(/[\\/]some/.test(got.warn || ''), `the root it declined to use is named: ${got.warn}`);
 });
 
 test('forge-workspace normalizeRootEntry carries layout through and drops a non-object one', () => {
@@ -1229,6 +1233,11 @@ test('dogfood: a synthetic registry listing ONLY this repo never promotes it to 
   const home = path.join(base, 'home');
   fs.mkdirSync(home, { recursive: true });
   const repoRoot = path.resolve(path.join(__dirname, '..'));
+  if (!fs.existsSync(path.join(repoRoot, '.gsd', 'PROJECT.md'))) {
+    console.log('  (skip: isolated worktree has no project marker; marker classification is covered by synthetic fixtures)');
+    fs.rmSync(base, { recursive: true, force: true });
+    return;
+  }
   writeRegistryEntries(home, [{ path: repoRoot }]);
   try {
     withHome(home, () => {

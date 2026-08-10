@@ -47,7 +47,11 @@ function assert(cond, msg) {
 }
 
 function assertEqual(actual, expected, msg) {
-  if (actual !== expected) {
+  const comparable = (value) => {
+    if (typeof value !== 'string' || !(/^[\\/]/.test(value) || /^[A-Za-z]:[\\/]/.test(value))) return value;
+    return path.resolve(value).toLowerCase();
+  };
+  if (comparable(actual) !== comparable(expected)) {
     throw new Error(`${msg || 'mismatch'}: esperado ${JSON.stringify(expected)}, veio ${JSON.stringify(actual)}`);
   }
 }
@@ -339,8 +343,9 @@ test('saída humana nomeia repo e os dois caminhos numa divergência', () => {
   ]);
   assertEqual(res.status, 0, 'exit code');
   assert(res.stdout.includes('freyr'), 'saída deve nomear o repo');
-  assert(res.stdout.includes(f.freyrReal), 'saída deve conter o caminho do registry');
-  assert(res.stdout.includes(path.join(f.ws, 'other', 'freyr')), 'saída deve conter o caminho do marcador');
+  const output = res.stdout.replace(/[\\/]/g, path.sep).toLowerCase();
+  assert(output.includes(path.normalize(f.freyrReal).toLowerCase()), 'saída deve conter o caminho do registry');
+  assert(output.includes(path.normalize(path.join(f.ws, 'other', 'freyr')).toLowerCase()), 'saída deve conter o caminho do marcador');
 });
 
 // ── R4: forge-doctor wiring ───────────────────────────────────────────────

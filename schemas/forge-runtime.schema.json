@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge-agent.dev/schemas/forge-runtime.schema.json",
+  "title": "Forge runtime-neutral protocol",
+  "description": "Provider-neutral contracts. Security metadata describes required capabilities only; it grants nothing.",
+  "type": "object",
+  "required": ["protocol_version", "worker", "unit", "result", "lifecycle", "security"],
+  "properties": {
+    "protocol_version": { "const": "1.0.0" },
+    "worker": { "$ref": "#/$defs/worker" },
+    "unit": { "$ref": "#/$defs/unit" },
+    "result": { "$ref": "#/$defs/result" },
+    "lifecycle": { "$ref": "#/$defs/lifecycle" },
+    "security": { "$ref": "#/$defs/security" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "hostRuntime": {
+      "type": "string",
+      "enum": ["claude", "codex"]
+    },
+    "workerEngine": {
+      "type": "string",
+      "enum": ["native", "claude", "codex", "agy"]
+    },
+    "workerMode": {
+      "type": "string",
+      "enum": ["native", "sidecar"]
+    },
+    "worker": {
+      "type": "object",
+      "required": ["protocol_version", "host_runtime", "worker_engine", "worker_mode", "resolved_engine", "sidecar_declared", "reason_code"],
+      "properties": {
+        "protocol_version": { "const": "1.0.0" },
+        "host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "worker_engine": { "$ref": "#/$defs/workerEngine" },
+        "worker_mode": { "$ref": "#/$defs/workerMode" },
+        "resolved_engine": { "enum": ["claude", "codex", "agy"] },
+        "sidecar_declared": { "type": "boolean" },
+        "reason_code": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "unit": {
+      "type": "object",
+      "required": ["protocol_version", "id", "type", "state"],
+      "properties": {
+        "protocol_version": { "const": "1.0.0" },
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "state": { "enum": ["queued", "leased", "running", "completed", "failed", "cancelled"] }
+      },
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "required": ["protocol_version", "status", "reason_code", "output"],
+      "properties": {
+        "protocol_version": { "const": "1.0.0" },
+        "status": { "enum": ["succeeded", "failed", "cancelled"] },
+        "reason_code": { "type": "string" },
+        "output": {}
+      },
+      "additionalProperties": false
+    },
+    "lifecycle": {
+      "type": "object",
+      "required": ["protocol_version", "state", "reason_code"],
+      "properties": {
+        "protocol_version": { "const": "1.0.0" },
+        "state": { "enum": ["created", "dispatched", "accepted", "running", "terminal"] },
+        "reason_code": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "security": {
+      "type": "object",
+      "required": ["protocol_version", "role", "required_capabilities"],
+      "properties": {
+        "protocol_version": { "const": "1.0.0" },
+        "role": { "enum": ["orchestrator", "worker", "reviewer", "observer"] },
+        "required_capabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

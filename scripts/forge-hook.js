@@ -643,14 +643,32 @@ process.stdin.on('end', () => {
             const r = resolveRunForSession(cwd, sessionId);
             if (r && r.active) {
               const rel = path.isAbsolute(filePath) ? path.relative(cwd, filePath) : filePath;
-              const result = filelock.acquireFileLock(cwd, rel, r.id, sessionId, { intent: toolName.toLowerCase() });
+              // The persisted token is the ownership proof.  Run/session IDs
+              // remain diagnostic and are only used to discover this run's
+              // identity for a reentrant edit.  The status API intentionally
+              // never exposes the persisted owner token.
+              const current = filelock.checkFileLock(cwd, rel);
+              const sameSession = current && current.held && current.holder &&
+                current.holder.run_id === r.id && current.holder.session_id === sessionId;
+              // A hook invocation cannot safely recover a private token from a
+              // public status read.  Treat the same active run/session as a
+              // reentrant owner and let the file-lock layer continue to fence
+              // competing run/session identities.
+              const result = sameSession ? { acquired: true, reentrant: true } :
+                filelock.acquireFileLock(cwd, rel, r.id, sessionId, { intent: toolName.toLowerCase() });
               if (!result.acquired) {
-                const h = result.holder;
-                const ageS = Math.round((h.age_ms || 0) / 1000);
-                blockMessage = `[forge-hook] Bloqueado: arquivo "${rel}" em uso por run ${h.run_id} há ${ageS}s. Aguarde ou execute /forge-pause ${h.run_id}.`;
+                if (result.reason === 'guard_busy') {
+                  blockMessage = `[forge-hook] Bloqueado: mutex do arquivo "${rel}" está ocupado; tente novamente.`;
+                } else {
+                  const h = result.holder || {};
+                  const ageS = Math.round((h.age_ms || 0) / 1000);
+                  blockMessage = `[forge-hook] Bloqueado: arquivo "${rel}" em uso por run ${h.run_id || 'desconhecido'} há ${ageS}s. Aguarde ou execute /forge-pause ${h.run_id || ''}.`;
+                }
               }
             }
-          } catch { /* silent — filelock is defensive, never crash hook */ }
+          } catch (error) {
+            blockMessage = `[forge-hook] Bloqueado: não foi possível validar o file-lock de "${filePath}" (${error.message}). Tente novamente.`;
+          }
         }
       }
 

@@ -11,10 +11,10 @@
  */
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { countTokens } = require('./forge-tokens.js');
+const { resolveForgePaths } = require('./forge-home.js');
 
 const TEMPLATE_FILES = Object.freeze({
   'execute-task': 'execute-task.md',
@@ -250,8 +250,24 @@ function candidateTemplateRoots(cwd, options = {}) {
   roots.push({ scope: 'script-coupled', dir: path.resolve(scriptDir, '..', 'shared', 'templates', 'dispatch') });
   roots.push({ scope: 'installed-coupled', dir: path.resolve(scriptDir, '..', 'templates', 'dispatch') });
 
-  const homeDir = path.resolve(options.homeDir || os.homedir());
-  roots.push({ scope: 'global', dir: path.join(homeDir, '.claude', 'templates', 'dispatch') });
+  const forgePaths = resolveForgePaths({
+    cwd,
+    forgeHome: options.forgeHome,
+    userHome: options.homeDir,
+    env: options.env,
+  });
+  const canonicalRoot = path.join(forgePaths.forgeHome, 'templates', 'dispatch');
+  const legacyRoot = path.join(forgePaths.claudeHome, 'templates', 'dispatch');
+  // `homeDir` was the test/embedding override before Forge home existed. Keep
+  // its historical global scope when no explicit forgeHome is supplied; all
+  // normal calls still prefer the canonical Forge tree.
+  if (options.homeDir && !options.forgeHome) roots.push({ scope: 'global', dir: legacyRoot });
+  else roots.push({ scope: 'global', dir: canonicalRoot });
+  // A legacy Claude projection remains a read-only fallback while an upgrade
+  // is in progress. New writes and generated prompts always use Forge home.
+  if (options.includeLegacy !== false && !(options.homeDir && !options.forgeHome)) {
+    roots.push({ scope: 'legacy-claude', dir: legacyRoot });
+  }
 
   const seen = new Set();
   return roots.filter(({ dir }) => {

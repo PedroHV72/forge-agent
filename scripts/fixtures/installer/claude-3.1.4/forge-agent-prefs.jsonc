@@ -1,0 +1,4 @@
+{
+  "fixture_version": "3.1.4",
+  "legacy": true, // comments and CRLF are preserved by the installer
+}

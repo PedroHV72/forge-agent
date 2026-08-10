@@ -29,6 +29,8 @@ const { execFileSync } = require('child_process');
 // ── Imports from forge-ignore ─────────────────────────────────────────────────
 const { PROJECTION_IGNORE_PATHS, detectVcs } = require('./forge-ignore');
 const { audit: auditReview } = require('./forge-review-audit');
+const { detect: detectCapabilities } = require('./forge-capabilities');
+const maintenance = require('./forge-maintenance');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const CURRENT_SCHEMA = 'fragment-store@3.0.0';
@@ -37,7 +39,7 @@ const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 // Single source of truth for the check names this CLI accepts via `--check`.
 // `runCheck` dispatches these; the unknown-check message and `--help` text
 // must both be derived from this array — never hand-repeated.
-const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'workspace-consistency', 'run-overlap'];
+const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap'];
 
 // ── checkSchema ───────────────────────────────────────────────────────────────
 /**
@@ -253,6 +255,48 @@ function checkPlanRepoDeclared(cwd) {
   };
 }
 
+/** Runtime capability diagnostics retained alongside the v4.2 workspace checks. */
+function checkCapabilities(cwd, options = {}) {
+  let legacy = { probes: {} };
+  try { legacy = detectCapabilities(cwd, options); } catch (error) {
+    // `--check all` remains useful in a minimal fixture or an uninitialised
+    // directory; the richer maintenance report below carries the actionable
+    // diagnostic when a catalog is present.
+    legacy = { probes: {}, error: error.message };
+  }
+  const report = maintenance.diagnose({
+    ...options,
+    repo: options.repo || path.resolve(__dirname, '..'),
+    cwd,
+    runtime: options.runtime || 'claude',
+  });
+  const failures = (report.required_failures || []).map((id) => {
+    const probe = report.probes && report.probes[id];
+    return { id, status: probe && probe.status, reason_code: probe && probe.reason_code };
+  });
+  const warnings = Object.keys(report.probes || {}).sort()
+    .map((id) => report.probes[id])
+    .filter((probe) => probe.reason_code === 'not-selected'
+      || (probe.status !== 'available' && !(report.required_failures || []).includes(probe.id)))
+    .map((probe) => ({ id: probe.id, status: probe.status, reason_code: probe.reason_code }));
+  const message = report.ok
+    ? `Capabilities ${report.runtime}: required capabilities available (${warnings.length} conditional warning(s)).`
+    : `Capabilities ${report.runtime}: ${failures.length} required failure(s); see reason_code.`;
+  return {
+    check: 'capabilities',
+    ok: report.ok,
+    protocol_version: report.protocol_version,
+    runtime: report.runtime,
+    // Keep legacy probe fields byte-compatible; richer maintenance diagnostics
+    // are additive and do not change existing doctor consumers.
+    probes: report.probes || legacy.probes || {},
+    diagnostics: report.diagnostics || [],
+    failures,
+    warnings,
+    message,
+  };
+}
+
 // ── checkWorkspaceConsistency ─────────────────────────────────────────────────
 /**
  * Advisory guard (D3, T04): confronts the registry (~/.claude) against the
@@ -404,6 +448,7 @@ module.exports = {
   checkSchema,
   checkProjectionVersioned,
   checkPlanRepoDeclared,
+  checkCapabilities,
   checkWorkspaceConsistency,
   checkRunOverlap,
 };
@@ -422,8 +467,9 @@ function parseArgs(argv) {
   return args;
 }
 
-function runCheck(name, cwd) {
+function runCheck(name, cwd, options = {}) {
   const checks = name === 'all' ? VALID_CHECKS.slice() : [name];
+  const explicit = name !== 'all';
 
   let allOk = true;
   const results = [];
@@ -445,6 +491,13 @@ function runCheck(name, cwd) {
       results.push({ check: c, ...r });
       // Advisory: `r.ok` is always true, so this never flips `allOk`.
       if (!r.ok) allOk = false;
+    } else if (c === 'capabilities') {
+      const r = checkCapabilities(cwd, options);
+      results.push(r);
+      // Capability availability is actionable when explicitly requested, but
+      // remains advisory in the aggregate doctor dashboard so missing paid
+      // CLIs do not block unrelated schema/workspace diagnostics.
+      if (!r.ok && explicit) allOk = false;
     } else if (c === 'workspace-consistency') {
       const r = checkWorkspaceConsistency(cwd);
       results.push({ check: c, ...r });
@@ -476,6 +529,7 @@ function formatResults(results) {
     const label = r.check === 'schema' ? 'Layer 2 — Schema version'
       : r.check === 'review-model-drift' ? 'Advisory — Review model drift'
       : r.check === 'plan-repo-declared' ? 'Advisory — Plan repo declaration'
+      : r.check === 'capabilities' ? 'Runtime — Capabilities'
       : r.check === 'workspace-consistency' ? 'Advisory — Workspace registry × marker consistency'
       : r.check === 'run-overlap' ? 'Advisory — Cross-run overlap'
       : 'Layer 3 — Projection versioned';
@@ -486,6 +540,10 @@ function formatResults(results) {
     }
     if (advisoryWarn && r.check === 'plan-repo-declared') {
       for (const p of r.plans) lines.push(`      - ${p}`);
+    }
+    if (r.check === 'capabilities') {
+      for (const failure of r.failures || []) lines.push(`      - ${failure.id}: ${failure.status} (${failure.reason_code})`);
+      for (const warning of r.warnings || []) if (warning.reason_code !== 'not-selected') lines.push(`      - warning ${warning.id}: ${warning.status} (${warning.reason_code})`);
     }
   }
   return lines.join('\n');
@@ -500,6 +558,8 @@ function cliMain() {
 Flags:
   --check <name> [--cwd <dir>]   run check: ${VALID_CHECKS.join(' | ')} |
                                  all
+  --runtime <name>               capabilities host: claude | codex | both
+  --json                         emit deterministic JSON for capability checks
   --fix [--cwd <dir>] [--migrate]  write SCHEMA-VERSION if missing; suggest ignore
                                  fixes. Refuses to stamp an unmigrated store unless
                                  --migrate is given (then runs forge-migrate first).
@@ -635,7 +695,12 @@ Exit codes:
   }
 
   if (args.check) {
-    const { allOk, results } = runCheck(args.check, cwdArg);
+    const { allOk, results } = runCheck(args.check, cwdArg, { runtime: args.runtime });
+    if (args.json) {
+      process.stdout.write(`${JSON.stringify({ ok: allOk, results })}\n`);
+      process.exit(allOk ? 0 : 1);
+      return;
+    }
     process.stdout.write('Forge Doctor\n============\n\n');
     process.stdout.write(formatResults(results) + '\n');
     const passed = results.filter(r => r.ok).length;

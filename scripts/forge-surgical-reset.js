@@ -309,31 +309,61 @@ function parseSvnBaseline(raw) {
   return { ok: true, range: hi === null ? String(lo) : `${lo}:${hi}` };
 }
 
+/** Capture baseline and dirty hashes as one attempt boundary. A second baseline
+ * read closes the commit/update race before an external worker is spawned. */
+function captureAttemptSnapshot(cwd, options = {}) {
+  const vcsName = options.vcsName || (vcs.detectVcs(cwd) === 'svn' ? 'svn' : 'git');
+  const readBaseline = () => {
+    const baseline = vcs.baselineId(cwd, { ...OPTS, vcs: vcsName });
+    if (!baseline.ok) throw new Error(baseline.error || 'baseline-unavailable');
+    if (vcsName !== 'svn') return baseline.id;
+    const parsed = parseSvnBaseline(baseline.id);
+    if (!parsed.ok) throw new Error(parsed.error);
+    return parsed.range;
+  };
+  const before = readBaseline();
+  const preDirty = captureSnapshot(cwd, vcsName);
+  const after = readBaseline();
+  if (before !== after) {
+    const error = new Error(`baseline moved while capturing attempt (${before} -> ${after})`);
+    error.code = 'snapshot-baseline-moved'; throw error;
+  }
+  return { attempt_id: options.attemptId || null, start_sha: before, pre_dirty: preDirty, code_dir: path.resolve(cwd), vcs: vcsName };
+}
+
 /**
  * Capture START_SHA + the pre-dirty snapshot and write BOTH in ONE atomic write.
  * @returns {object} the written state
  */
 function initState(stateFile, { cwd, attempt }) {
-  const detected = vcs.detectVcs(cwd);
-  const vcsName = detected === 'svn' ? 'svn' : 'git';
-  const b = vcs.baselineId(cwd, { ...OPTS, vcs: vcsName });
-  if (!b.ok) throw new Error(vcsName === 'svn' ? b.error : `git rev-parse failed: ${b.error}`);
-  const parsed = vcsName === 'svn' ? parseSvnBaseline(b.id) : null;
-  if (parsed && !parsed.ok) throw new Error(parsed.error);
-  const startSha = parsed ? parsed.range : b.id;
-  const preDirty = captureSnapshot(cwd, vcsName);
+  const snapshot = captureAttemptSnapshot(cwd, { attemptId: attempt });
   const state = {
     attempt: attempt == null ? 1 : attempt,
-    start_sha: startSha,
-    pre_dirty: preDirty,
+    start_sha: snapshot.start_sha,
+    pre_dirty: snapshot.pre_dirty,
     reason: '',
     result_file: '',
-    code_dir: cwd,
+    code_dir: snapshot.code_dir,
     transient_retry_count: 0,
-    vcs: vcsName,
+    vcs: snapshot.vcs,
   };
   writeJsonAtomic(stateFile, state);
   return state;
+}
+
+/** Reset only a failed execute attempt owned by one declared repository. */
+function resetFailedAttempt(stateFile, context = {}) {
+  const state = readState(stateFile);
+  if (context.mode !== 'execute') return { ok: false, reason_code: 'reset-refused-read-only' };
+  if (context.failed !== true) return { ok: false, reason_code: 'reset-refused-not-failed' };
+  if (!Array.isArray(context.repoRoots) || context.repoRoots.length !== 1) return { ok: false, reason_code: 'reset-refused-multirepo' };
+  if (!context.codeDir || path.resolve(context.codeDir) !== path.resolve(state.code_dir) || path.resolve(context.codeDir) !== path.resolve(context.repoRoots[0])) {
+    return { ok: false, reason_code: 'reset-refused-code-dir' };
+  }
+  const reset = resetFromState(stateFile);
+  if (reset.code === 3) return { ok: false, reason_code: reset.result.overlap && reset.result.overlap.length ? 'reset-overlap' : (reset.result.abort || 'reset-refused'), reset: reset.result };
+  if (reset.code !== 0 || !reset.result.verified) return { ok: false, reason_code: 'reset-unverified', reset: reset.result };
+  return { ok: true, reason_code: 'reset-verified', reset: reset.result };
 }
 
 /** Initialize the durable read-only plan-sidecar state without shell-built JSON.
@@ -478,6 +508,7 @@ module.exports = {
   parsePorcelainZ,
   parseNameStatusZ,
   parseSvnBaseline,
+  captureAttemptSnapshot,
   hashObject,
   captureSnapshot,
   computePostChanges,
@@ -492,6 +523,7 @@ module.exports = {
   initReadOnlyState,
   updateState,
   resetFromState,
+  resetFailedAttempt,
 };
 
 // ── CLI (manual argv parse, no deps — mold: forge-xllm.js) ───────────────────────
