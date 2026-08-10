@@ -4,6 +4,19 @@
 `auto` and `task`. It delegates selection, leases, durable boundaries and
 resume/handoff to `forge-orchestrate`; it does not spawn or choose workers.
 
+Both modes are milestone-scoped: `task` is the same controller with a one-unit
+budget and a terminal resume, not a second selection domain. Selection lives in
+`forge-orchestrate` → `forge-unit-controller.selectNextUnit`, whose every branch
+reads a milestone's roadmap/slices, over state that `forge-state` reads only from
+`.gsd/milestones/<id>/<id>-STATE.md`. A **standalone task** (`/forge-task`, whose
+artifacts live in `.gsd/tasks/<id>/` with no STATE and no roadmap) is therefore
+outside this boundary, and `next`/`pause` refuse it by name: `outcome: blocked`,
+`reason_code: task-scope-unsupported`, `action: stop`, snapshot unchanged. That
+refusal is the defined answer, not a malfunction — the caller proceeds under its
+own authority. Supplying an unrelated milestone id to reach a dispatch is never
+the workaround: it selects that milestone's next unit and commits a lease and a
+transaction against it.
+
 States are `idle → dispatch_required | paused | completed | blocked | failed`.
 `next` returns a dispatch intent while the S02 lease remains authoritative.
 `pause` creates a durable boundary through `forge-orchestrate`. Only `resume`

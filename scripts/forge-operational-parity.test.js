@@ -67,7 +67,11 @@ async function exercise(platform, host, root, runtimeProbe) {
   manifest(forgeHome, host);
   const workflow = {};
   for (const mode of ['auto', 'task']) {
-    const input = { workflow_id: `${mode}-parity`, description: 'linha α\r\nlinha β Ω', max_steps: mode === 'task' ? 1 : 4 };
+    // `milestone` is load-bearing, not decoration: both modes of the real layer
+    // are milestone-scoped, and without it `task` is refused up front
+    // (task-scope-unsupported) and `auto` throws — either way the next/pause/
+    // resume/handoff chain below would stop being exercised for that mode.
+    const input = { workflow_id: `${mode}-parity`, milestone: 'M-20260804000000-parity', description: 'linha α\r\nlinha β Ω', max_steps: mode === 'task' ? 1 : 4 };
     const first = adapter.invoke(host, mode, 'next', input, null, { orchestrate: fakeController() }).result;
     const retry = adapter.invoke(host, mode, 'next', input, first.snapshot, { orchestrate: fakeController() }).result;
     assert.deepStrictEqual(retry, first, `${platform}/${host}/${mode}: retry must be idempotent`);
