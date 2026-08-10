@@ -50,17 +50,40 @@ function originHeader(sourceId, sourcePath) {
   return `${ORIGIN_PREFIX}${sourceId} source=${sourcePath} version=${VERSION}${ORIGIN_SUFFIX}`;
 }
 
+// A leading YAML frontmatter block must stay on line 1: Claude Code only parses
+// `name`, `description`, `model` and `allowed-tools` when the fence opens the
+// file. The marker therefore goes immediately after the closing fence, and is
+// only prepended when the document has no frontmatter at all.
+const FRONTMATTER = /^---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|$)/;
+const MARKER_AT_TOP = /^<!-- forge-source:[^\n]* -->[ \t]*\n\n?/;
+const MARKER_AFTER_FRONTMATTER = /^(---[ \t]*\n[\s\S]*?\n---[ \t]*\n)\n?<!-- forge-source:[^\n]* -->[ \t]*\n/;
+
 function addOriginHeader(content, source, sourcePath) {
   const normalized = normalizeNewlines(content);
   if (!isMarkdown(sourcePath)) return normalized;
   const marker = originHeader(source.source_id, sourcePath);
-  if (normalized.startsWith(marker)) return normalized;
-  if (normalized.startsWith(`${ORIGIN_PREFIX}`)) return `${marker}\n\n${stripOriginHeader(normalized)}`;
-  return `${marker}\n\n${normalized}`;
+  const body = stripOriginHeader(normalized);
+  const fence = FRONTMATTER.exec(body);
+  if (fence) return `${body.slice(0, fence[0].length)}\n${marker}\n${body.slice(fence[0].length)}`;
+  return `${marker}\n\n${body}`;
 }
 
+// Strips the marker from either accepted position — the top (pre-4.8.1 layout,
+// and documents without frontmatter) or right below the frontmatter fence — so
+// re-rendering never stacks a second marker. Deliberately anchored: a mention of
+// the marker elsewhere in the body is left untouched.
 function stripOriginHeader(content) {
-  return String(content).replace(/^<!-- forge-source:[^\n]* -->\n(?:\n)?/, '');
+  const text = String(content);
+  if (MARKER_AT_TOP.test(text)) return text.replace(MARKER_AT_TOP, '');
+  if (MARKER_AFTER_FRONTMATTER.test(text)) return text.replace(MARKER_AFTER_FRONTMATTER, '$1');
+  return text;
+}
+
+// Ownership probe: a managed projection carries the marker on its own line near
+// the top, in either accepted position. Using startsWith here would classify
+// every frontmatter-first projection as user-owned and silently stop updates.
+function hasOriginMarker(content) {
+  return /^<!-- forge-source:[^\n]* -->/m.test(String(content).slice(0, 4096));
 }
 
 function walk(root) {
@@ -208,7 +231,7 @@ function write(options = {}) {
     const current = exists(destination) ? fs.readFileSync(destination, 'utf8') : null;
     const generated = artifact.content;
     if (current !== null && current === generated) { preserved.push({ ...artifact, reason: 'already-current' }); continue; }
-    if (current !== null && !String(current).startsWith(`${ORIGIN_PREFIX}`) && !(options.update && options.migrateLegacy)) {
+    if (current !== null && !hasOriginMarker(current) && !(options.update && options.migrateLegacy)) {
       preserved.push({ ...artifact, reason: REASON.USER_OWNED });
       conflicts.push({ destination, source_id: artifact.source_id, reason: REASON.USER_OWNED });
       continue;
@@ -221,7 +244,7 @@ function write(options = {}) {
     }
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.writeFileSync(destination, generated, 'utf8');
-    written.push(options.migrateLegacy && current !== null && !String(current).startsWith(`${ORIGIN_PREFIX}`)
+    written.push(options.migrateLegacy && current !== null && !hasOriginMarker(current)
       ? { ...artifact, reason: 'legacy-migrated' }
       : artifact);
   }
@@ -262,4 +285,4 @@ function main(argv = process.argv.slice(2), writeOutput = process.stdout.write.b
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { VERSION, RUNTIME, REASON, ORIGIN_PREFIX, normalizeNewlines, isProtectedPath, originHeader, addOriginHeader, stripOriginHeader, roots, render, write, parseArgs, main };
+module.exports = { VERSION, RUNTIME, REASON, ORIGIN_PREFIX, normalizeNewlines, isProtectedPath, originHeader, addOriginHeader, stripOriginHeader, hasOriginMarker, roots, render, write, parseArgs, main };
