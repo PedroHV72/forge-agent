@@ -7,17 +7,17 @@
     {
       "source_id": "agents",
       "target": "agents",
-      "sha256": "a731772a86391bb14869332c740408ae35a465d613be290ea4a7685d3ec1bac6"
+      "sha256": "ddbdccc3f8b5a5b639f709ef0fc9dabdd8bbc6fd9d983498b00baa78bad0baf5"
     },
     {
       "source_id": "commands",
       "target": "commands",
-      "sha256": "616f224bc27e299aac0cfe0daf25f0d443eadef247fd474b5025a7fe7bd3578c"
+      "sha256": "da87e8818a14b72037f5a5b11c3a7b9cba72faff42164a6d7f51519d02bbd947"
     },
     {
       "source_id": "skills",
       "target": "skills",
-      "sha256": "b074d83fd3d0f43f1872c3545688dee5f5840140cd8b702840d2768cc7c6b967"
+      "sha256": "9c84d55cbd70e2323dc5f94e3cf01220e9306251d71c393d29bc5d897ee02eb7"
     },
     {
       "source_id": "dispatch-templates",

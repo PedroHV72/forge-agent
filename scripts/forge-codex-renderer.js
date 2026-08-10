@@ -16,7 +16,27 @@ const REASON = Object.freeze({ unavailable: 'unavailable', user_owned: 'user_own
 
 function norm(value) { return String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
 function tomlOrigin(kind) { return `${TOML_ORIGIN}-${kind} version=${VERSION}`; }
-function hasOrigin(value) { return String(value).startsWith(ORIGIN) || String(value).startsWith(TOML_ORIGIN); }
+// YAML frontmatter must remain on line 1, so the marker sits below the closing
+// fence when there is one. Ownership therefore probes the accepted positions
+// rather than requiring the marker to be the very first byte.
+const FRONTMATTER = /^---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|$)/;
+// The three positions a managed projection can carry its marker in — markdown at
+// the top (no frontmatter), markdown right below the closing fence, and TOML on
+// line 1. Anchored on purpose: a USER file that merely quotes the marker in a
+// fenced block is not a projection, and classifying it as one overwrites it.
+const MD_MARKER_AT_TOP = /^<!-- forge-source:[^\n]* -->[ \t]*\n\n?/;
+const MD_MARKER_AFTER_FRONTMATTER = /^(---[ \t]*\n[\s\S]*?\n---[ \t]*\n)\n?<!-- forge-source:[^\n]* -->[ \t]*\n/;
+const TOML_MARKER_AT_TOP = /^# forge-source:[^\n]*\n/;
+function withOrigin(value) {
+  const body = norm(value);
+  const fence = FRONTMATTER.exec(body);
+  if (fence) return `${body.slice(0, fence[0].length)}\n${ORIGIN}\n${body.slice(fence[0].length)}`;
+  return `${ORIGIN}\n\n${body}`;
+}
+function hasOrigin(value) {
+  const text = norm(String(value));
+  return MD_MARKER_AT_TOP.test(text) || MD_MARKER_AFTER_FRONTMATTER.test(text) || TOML_MARKER_AT_TOP.test(text);
+}
 function exists(file) { try { return fs.existsSync(file); } catch (_) { return false; } }
 function walk(root) {
   if (!exists(root)) return [];
@@ -71,12 +91,12 @@ function render(options = {}) {
   }
   const commandSource = sources.find((source) => source.source_id === 'commands');
   if (commandSource) for (const file of walk(path.join(root.repo, commandSource.inputs[0])).filter((item) => item.endsWith('.md'))) {
-    add('commands', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'commands', path.basename(file)), `${ORIGIN}\n\n${norm(fs.readFileSync(file, 'utf8'))}`, 'command');
+    add('commands', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'commands', path.basename(file)), withOrigin(fs.readFileSync(file, 'utf8')), 'command');
   }
   const skillsSource = sources.find((source) => source.source_id === 'skills');
   if (skillsSource) for (const file of walk(path.join(root.repo, skillsSource.inputs[0])).filter((item) => /SKILL\.md$/i.test(item))) {
     const relative = path.relative(path.join(root.repo, skillsSource.inputs[0]), file);
-    add('skills', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'skills', relative), `${ORIGIN}\n\n${norm(fs.readFileSync(file, 'utf8'))}`, 'skill');
+    add('skills', path.relative(root.repo, file).replace(/\\/g, '/'), path.join(root.codexHome, 'skills', relative), withOrigin(fs.readFileSync(file, 'utf8')), 'skill');
   }
   const dispatchSource = sources.find((source) => source.source_id === 'dispatch-templates');
   if (dispatchSource) for (const file of walk(path.join(root.repo, dispatchSource.inputs[0])).filter((item) => item.endsWith('.md'))) {

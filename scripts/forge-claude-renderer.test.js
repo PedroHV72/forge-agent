@@ -26,6 +26,10 @@ function fixtureRepo() {
   return root;
 }
 function manifestFor(root) { return JSON.parse(fs.readFileSync(path.join(root, 'forge-source-manifest.json'), 'utf8')); }
+// Sources are checked out with native newlines; the renderer emits LF, so the
+// comparison has to normalize before asking whether a fence opens the file.
+function normalize(value) { return String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
+function markers(value) { return (String(value).match(/^<!-- forge-source:/gm) || []).length; }
 function cleanup() { for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true }); }
 
 try {
@@ -38,6 +42,61 @@ try {
   assert(first.artifacts.some((item) => item.destination.endsWith(path.join('CLAUDE.md'))));
   assert(first.artifacts.every((item) => !item.content.includes('\r')));
   assert(first.artifacts.find((item) => item.source === 'CLAUDE.md').content.startsWith('<!-- forge-source:claude-instructions'));
+
+  // Frontmatter has to open the projected document. Claude Code reads `name`,
+  // `description`, `model` and `allowed-tools` only when the fence is on line 1,
+  // so the origin marker goes below the closing fence — a marker above it costs
+  // every agent its model and tools, and every skill and command its description.
+  const fenced = first.artifacts.filter((item) => /\.md$/i.test(item.source)
+    && normalize(fs.readFileSync(path.join(root, item.source), 'utf8')).startsWith('---'));
+  assert(fenced.length > 0, 'nenhuma fonte com frontmatter no inventário');
+  for (const artifact of fenced) {
+    assert(artifact.content.startsWith('---'), `frontmatter deslocado: ${artifact.source}`);
+    assert.match(artifact.content, /^<!-- forge-source:[^\n]* -->$/m, `marcador ausente: ${artifact.source}`);
+    assert.strictEqual(markers(artifact.content), 1, `marcador duplicado: ${artifact.source}`);
+    assert(renderer.hasOriginMarker(artifact.content), `projeção não reconhecida como gerada: ${artifact.source}`);
+  }
+
+  // A projection written by the pre-fix renderer (marker above the fence) is
+  // still recognized as generated — otherwise every installed file would flip to
+  // user-owned and updates would silently stop — and re-rendering relocates the
+  // marker instead of stacking a second one.
+  const sample = fenced[0];
+  const sourceText = normalize(fs.readFileSync(path.join(root, sample.source), 'utf8'));
+  const aboveFence = `<!-- forge-source:${sample.source_id} source=${sample.source} version=0.0.0 -->\n\n${sourceText}`;
+  assert(renderer.hasOriginMarker(aboveFence));
+  const relocated = renderer.addOriginHeader(aboveFence, { source_id: sample.source_id }, sample.source);
+  assert(relocated.startsWith('---'), 'layout antigo não foi realocado');
+  assert.strictEqual(markers(relocated), 1, 'marcador empilhado ao realocar');
+  assert.strictEqual(renderer.addOriginHeader(relocated, { source_id: sample.source_id }, sample.source), relocated);
+  assert.strictEqual(relocated, sample.content);
+
+  // Ownership stays conservative: a file with no marker is the operator's.
+  assert.strictEqual(renderer.hasOriginMarker('{\n  "operator": true\n}\n'), false);
+  assert.strictEqual(renderer.hasOriginMarker(`${'x\n'.repeat(4096)}<!-- forge-source:agents -->`), false);
+
+  // The probe is ANCHORED to the two accepted positions, not "a marker line
+  // somewhere near the top". A user-owned document that merely QUOTES the marker —
+  // documentation of this very mechanism is the obvious case — must stay theirs;
+  // classifying it as generated overwrites a file the ownership check exists to
+  // protect. An unanchored /m over the first 4096 chars gets both of these wrong.
+  assert.strictEqual(renderer.hasOriginMarker(
+    '# Como as projeções são marcadas\n\n```md\n<!-- forge-source:agents source=x -->\n```\n'), false,
+  'marcador citado em bloco de código não torna o arquivo uma projeção');
+  assert.strictEqual(renderer.hasOriginMarker(
+    `# Doc do operador\n${'texto\n'.repeat(38)}<!-- forge-source:agents source=x -->\n`), false,
+  'marcador no meio do corpo não torna o arquivo uma projeção');
+
+  // ...and it survives CRLF, because unlike stripOriginHeader this probe runs on
+  // raw bytes read off disk. Reading a CRLF projection as user-owned would stop
+  // updates silently — the same failure mode the marker move had to avoid.
+  for (const [label, text] of [
+    ['topo', '<!-- forge-source:agents source=x -->\r\n\r\n---\r\nname: x\r\n---\r\n'],
+    ['abaixo da cerca', '---\r\nname: x\r\n---\r\n<!-- forge-source:agents source=x -->\r\nCorpo\r\n'],
+  ]) {
+    assert.strictEqual(renderer.hasOriginMarker(text), true, `projeção CRLF (${label}) lida como user-owned`);
+  }
+
   const golden = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'claude-renderer', 'claude-4.8.0.golden.json'), 'utf8'));
   assert.strictEqual(golden.runtime, first.runtime);
   assert.strictEqual(golden.version, renderer.VERSION);
