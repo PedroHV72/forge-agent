@@ -62,6 +62,71 @@ Templates do not repeat this header — `forge-prompt.js` injects it at render t
 
 ---
 
+## Security Gate — Keyword Pattern
+
+Canonical, formula-once source for the keyword regex the `execute-task` security gate (and the `forge-task` Step 4 planning gate) uses to decide whether a plan needs `Skill("forge-security")`. Mirrors (`skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md`, `skills/forge-task/SKILL.md`) reference this section — they do not restate the pattern, matching the `sidecar_env_promotion` convention.
+
+**History:** the original pattern had no word boundaries and matched raw substrings. M018 measured 8 consecutive false positives from this — `role` inside `controle` (pt-BR "controle sintético/positivo/negativo"), `auth` inside "model-**auth**ored", `session` matching the app-server turn object (`session.items`, `session.notifications`), `token` matching LLM billing vocabulary ("output tokens", "tokens gastos"), a "runner token" (a lexical token in a command note, not a credential), and `hash`/`session` inside identifiers/quoted text unrelated to security. Every one of those 8 triggered a `forge-security` analysis that found nothing. A first fix (plain `\b` word boundaries) killed all 8, but `\b` treats `_` as a word character and never fires on a case transition — so it silently reopened a false-**negative** class: `sessionToken`, `authToken`, `refreshTokenStore`, `session_token`, `AUTH_TOKEN` stopped matching `session`/`auth`/`token` entirely, even though task plans in this repo routinely name identifiers when describing auth/token-handling scope. A missed real security scope is strictly worse than a wasted `forge-security` run, so this section replaces the plain `\b` boundary with three passes that keep the false positives suppressed while closing the identifier gap.
+
+**Three-pass pattern (each pass is a separate regex; the gate fires if ANY pass matches and no exception applies):**
+
+Pass 1 — whole word / snake_case / ALL_CAPS (case-insensitive; boundary is "not alnum", so `_` counts as a boundary unlike plain `\b`):
+```
+(?<![A-Za-z0-9])(?:auth|tokens?|crypto|password|secret|api.?key|jwt|oauth|permission|role|hash|salt|encrypt|decrypt|session|cookie|credential|sanitize|xss|sql|inject)(?![A-Za-z0-9])
+```
+flags: `gi`
+
+Pass 2 — keyword as a Title-Case **mid-identifier** segment (case-**sensitive** — do not add `i`, it would defeat the case-transition check by making `[A-Z]`/`[a-z]` match either case):
+```
+(?<=[a-z0-9])(?:Auth|Tokens?|Crypto|Password|Secret|Api.?Key|Jwt|Oauth|Permission|Role|Hash|Salt|Encrypt|Decrypt|Session|Cookie|Credential|Sanitize|Xss|Sql|Inject)
+```
+flags: `g` (no `i`)
+
+Pass 3 — keyword as the **first**, literal-lowercase segment of an identifier, immediately followed by an uppercase letter (case-sensitive, no `i`):
+```
+(?<![A-Za-z0-9])(?:auth|tokens?|crypto|password|secret|api.?key|jwt|oauth|permission|role|hash|salt|encrypt|decrypt|session|cookie|credential|sanitize|xss|sql|inject)(?=[A-Z])
+```
+flags: `g` (no `i`)
+
+Why three passes and not one combined regex: mixing the `i` flag with an explicit `[A-Z]`/`[a-z]` case-transition check is a trap — `i` makes those character classes match either case, silently turning the camelCase detector into a no-op (measured directly: a first draft of a single `/i`-flagged pattern reported `role` firing inside `controle` again, because `(?=[A-Z])` under `/i` matched the lowercase `o` that follows). Pass 1 stays case-insensitive (prose is mixed-case); passes 2–3 must not be, because they exist specifically to detect a case transition.
+
+`tokens?`/`Tokens?` keeps the plural reachable ("store the API tokens") without narrowing coverage; `api.?key`/`Api.?Key` keeps `apikey`/`api key`/`api-key` reachable.
+
+**Exception list (narrow, named — suppress a hit ONLY when the same text also matches one of these; never delete the underlying keyword):**
+```
+\bsession\.(items|notifications)\b   # app-server turn/session object, not an HTTP/auth session — measured M018
+\brunner\s+token\b                   # a lexical token in a command note (parsing sense), not a credential — measured M018
+\boutput\s+tokens?\b                 # LLM billing/telemetry vocabulary, not a secret — measured M018
+\btokens?\s+gastos\b                 # pt-BR "tokens spent" (billing), not a secret — measured M018
+```
+These four are the only measured, repeat-offending phrases from M018. Do not grow this list speculatively — a new false positive needs its own measured case before it earns an exception, per the "false negative is worse than false positive" rule below.
+
+**Procedure:** a plan matches the security gate when pass 1, 2, or 3 matches **and** none of the exception patterns match the same text. When in doubt (an ambiguous case not covered by an exception, e.g. a standalone quoted mention of "hash" with no crypto context) — fire the gate anyway. A spurious `forge-security` run is cheap; a missed real security scope is not.
+
+**Documented residue — `sessionError` (and any `{keyword}Error`/`{keyword}Manager`-shaped identifier with no second security keyword):** pass 3 cannot mechanically tell `sessionToken` (a real credential-shaped identifier — should fire) apart from `sessionError` (a plain function name — noise). Both are "lowercase keyword segment immediately followed by an uppercase letter." Measured directly and the ambiguity is real, not a coverage bug: no combination of these three passes separates them without either (a) hand-listing suffixes like `Error`/`Manager` as exceptions — which reintroduces the same "grow the exception list speculatively" risk the M018 fix was built to avoid, since the next real name (`sessionErrorHandler` wrapping actual token logic) would silently defeat it — or (b) a semantic read of the surrounding code, which a keyword-regex gate cannot do. Per the "false negative is worse than false positive" rule, this residue is left to **fire** (fail-safe direction) rather than suppressed: `sessionError`-shaped identifiers cost one occasional spurious `forge-security` run, same accepted trade-off as the standalone-`hash` residue below. Do not add `Error`/`Manager`/etc. to the exception list to silence this — it has not been measured as a repeat offender, unlike the four exceptions above.
+
+**Residual, accepted gap (unrelated to the camelCase fix, carried over from the original fix):** a bare quoted mention of the word "hash" with no crypto context has no safe narrow fix — any exclusion broad enough to catch it would also blind the gate to a real crypto-hash mention phrased similarly. Left reachable; same cost/asymmetry reasoning as above.
+
+**Positive-control corpus (must still fire):**
+- "validate the JWT before trusting the claim" — matches `jwt`
+- "store the API key in the environment" — matches `api.?key`
+- "hash the password with argon2" — matches `hash`, `password`
+- "sanitize user input before the SQL query" — matches `sanitize`, `sql`
+- "check the role for permission before granting access" — matches `role`, `permission`
+- "use a refresh token to get a new session" — matches `token`, `session`
+- "encrypt the data at rest" — matches `encrypt`
+
+**camelCase / snake_case corpus (must fire — closed by passes 2–3, M018 triage-fix):**
+- `const sessionToken = mint()` — pass 2 matches `Token`
+- `authToken rotation` — pass 2 matches `Token`
+- `refreshTokenStore` — pass 2 matches `Token`
+- `session_token` — pass 1 matches (underscore is a boundary)
+- `AUTH_TOKEN` — pass 1 matches (case-insensitive + underscore boundary)
+- `authConfig module` — pass 3 matches `auth` (first segment, followed by `C`)
+- `sessionManager singleton` — pass 3 matches `session` (first segment, followed by `M`)
+
+---
+
 ## Spawn Liveness Banner
 
 When dispatching a subagent to execute a work unit (task, slice planning, research, etc.), the orchestrator/skill **must** present a liveness message to the user immediately before the spawn, so they understand that the absence of output is expected and not a freeze or hang. This section defines the canonical pt-BR phrasing and a static reference table of estimated durations by unit type.
@@ -795,10 +860,17 @@ Each dispatch event is a single newline-terminated JSON object appended to `.gsd
 | `input_tokens` | integer | `countTokens(finalPrompt)` | `12345` |
 | `output_tokens` | integer | SDK usage or `countTokens(text)` | `3421` |
 | `token_method` | string | counting method; currently `heuristic-chars-4` | `"heuristic-chars-4"` |
+| `transport` | `"app-server" \| "in-process" \| "unknown"` | handshake **presence** in the sidecar result file (`appserver.transport`, derived by `scripts/forge-transport.js`) / the constant `"in-process"` on the Claude path | `"app-server"` |
+| `transport_version` | string | observed CLI version — `thread.cliVersion` → the leading `name/version` token of `initializeResult.userAgent` → `"unknown"`. Present **only** when `transport == "app-server"`, and then **never omitted** | `"0.144.4"` |
+| `transport_reason` | closed set: `no-result-file`, `no-transport-field`, `handshake-not-observed`, `invalid-transport-value` | why the transport could not be observed. Present **only** when `transport == "unknown"` | `"no-result-file"` |
 
-Routing adds `tier`, `reason`, `engine`, `domain`, `route_source`, `chain_len`, `effort`, and `effort_reason` fields additively; `vcs` is likewise additive. Implementors must treat the schema as open for extension: old readers ignore unknown fields and no existing field is renamed, retyped, or removed.
+Routing adds `tier`, `reason`, `engine`, `domain`, `route_source`, `chain_len`, `effort`, `effort_reason`, `transport`, `transport_version`, and `transport_reason` fields additively; `vcs` is likewise additive. Implementors must treat the schema as open for extension: old readers ignore unknown fields and no existing field is renamed, retyped, or removed.
 
-Do NOT include: raw prompt text, worker output, file paths, exception messages, or any PII.
+**Absence of `transport` means the record predates TASK-022** — it does not mean `"in-process"` and it does not mean `"unknown"`. Both of those are values a live emitter writes on purpose; absence is the only thing that says "nobody asked". This is why the Claude path emits the constant `"in-process"` instead of omitting the field: omission would give the absence two meanings (legacy record × Claude path), and a reader could not separate them.
+
+There is deliberately **no optimistic default**: the only value a shell fence may fall back to is `unknown`, never `app-server`. `transport_version` is likewise never omitted while `transport == "app-server"` — an absent version there would be indistinguishable from a broken extractor.
+
+Do NOT include: raw prompt text, worker output, file paths, exception messages, or any PII. `transport_version` honours this: only the **extracted version token** is logged, never the raw `userAgent`, which carries the operating system and CPU architecture of the operator's machine.
 
 #### Prefs contract
 
@@ -821,7 +893,7 @@ Worker returns approximately 1 200 characters of output. Token estimate: `countT
 Event appended to `.gsd/forge/events.jsonl`:
 
 ```json
-{"ts":"2026-04-16T10:00:05Z","event":"dispatch","dispatch_id":"execute-task-T03-a91c4e-a1","prompt_id":"execute-task-T03-a91c4e","attempt":1,"status":"done","unit":"execute-task/T03","model":"claude-sonnet-5","input_tokens":2000,"output_tokens":300,"token_method":"heuristic-chars-4","vcs":"git"}
+{"ts":"2026-04-16T10:00:05Z","event":"dispatch","dispatch_id":"execute-task-T03-a91c4e-a1","prompt_id":"execute-task-T03-a91c4e","attempt":1,"status":"done","unit":"execute-task/T03","model":"claude-sonnet-5","input_tokens":2000,"output_tokens":300,"token_method":"heuristic-chars-4","vcs":"git","transport":"in-process"}
 ```
 
 #### Budgeted Section Injection
@@ -914,6 +986,73 @@ Placeholder classification:
 > **Fonte executável única (M012):** as of M012 S02, engine resolution described here no longer has its own standalone bash block in the skills — it is one of the fields (`engine`/`engine_reason`) emitted by the **same** `scripts/forge-dispatch-resolve.js --json` call that resolves Tier + Effort + Alias (see § Tier Resolution → Wiring snippet). This section remains the canonical spec for *what* the engine decision means (route_source table, sidecar state machine, BLOCKER contract, fallback); the *executable* implementation of the decision logic lives in the resolver.
 
 > **`dispatch_engine` is the canonical branch trigger.** The resolver's chain carries model-family metadata (`claude|gpt|gemini`); `dispatch_engine` normalizes it (`gpt→codex`, `gemini→agy`, otherwise `claude`). Sidecar branches gate only on `$DISPATCH_ENGINE`. Event field `engine` records the normalized engine that actually ran so review pairing and cost aggregation see `claude|codex|agy` consistently.
+
+#### Runtime-neutral host and worker contract (S01/T02)
+
+`scripts/forge-dispatch-resolve.js` also carries the versioned host/worker
+projection from [`scripts/forge-runtime.js`](../scripts/forge-runtime.js).
+This is one resolver call, not a second routing parser. The host is an input to
+the resolver; it is never inferred from `model`, `engine`, `dispatch_engine`,
+or a member of `chain`.
+
+Library callers may use the existing camel-case option names (`hostRuntime`,
+`workerEngine`, `workerMode`, `sidecarDeclared`); JSON/wire callers may use
+the equivalent snake-case keys. The CLI accepts `--host-runtime`,
+`--worker-engine`, `--worker-mode`, and the boolean `--sidecar-declared`.
+
+```text
+node scripts/forge-dispatch-resolve.js --json --unit-type execute-task \
+  --host-runtime codex --worker-engine codex --worker-mode sidecar \
+  --sidecar-declared --cwd "$WORKING_DIR"
+```
+
+The following fields are additive and appear after the established resolver
+fields. The ordered legacy prefix remains `engine, model, alias, tier, domain,
+route_source, chain, chain_len, reason, effort, effort_reason`.
+
+| Field | Meaning |
+|-------|---------|
+| `runtime_protocol_version` | Version emitted by the canonical runtime contract. |
+| `host_runtime` | The current Forge host: `claude` or `codex`; omitted input defaults to `claude`. |
+| `worker_engine` / `worker_mode` | Requested neutral worker target and delivery mode. Omitted values remain `native` / `native`. |
+| `resolved_worker_engine` | Actual target after resolving `worker_engine:native` solely from `host_runtime`. |
+| `sidecar_declared` | Explicit caller assertion needed for any sidecar combination. It is not a permission grant. |
+| `worker_reason_code` | Stable success or refusal reason from `forge-runtime.js`. |
+| `dispatch_allowed` / `dispatch_reason_code` | Pre-dispatch gate. `false` means do not launch a worker and report the stable reason. |
+
+`native` has no cross-provider fallback: on `{host_runtime:"codex",
+worker_engine:"native"}` the `resolved_worker_engine` is `codex`, even if the
+routed model is Claude. Conversely, a `gpt-*` model does not change the host.
+The model-routing fields continue to describe their legacy concerns:
+`engine` remains a model family, `dispatch_engine` remains the sidecar branch
+trigger, and `chain`/`route_source` retain their existing meanings. No runtime
+field removes, renames, or reinterprets any of them.
+
+Before dispatch, consumers must gate on `dispatch_allowed` in addition to
+their existing preferences/error gate. A refused runtime contract never
+silently selects Claude (or another host). In particular,
+`host_runtime:codex + worker_engine:codex + worker_mode:sidecar` without the
+explicit declaration returns `dispatch_allowed:false` and
+`dispatch_reason_code:"implicit-recursion-refused"`. Supplying
+`sidecar_declared:true` makes the same-host sidecar combination representable;
+an adapter/security layer may still deny it. An undeclared cross-host sidecar
+returns `sidecar-declaration-required` instead.
+
+For a legacy caller that supplies none of these inputs, the additive values
+are `host_runtime:"claude"`, `worker_engine:"native"`,
+`worker_mode:"native"`, and `resolved_worker_engine:"claude"`. Routing,
+`engine`, `dispatch_engine`, and all existing consumers therefore retain the
+Claude-first behavior observed in 3.1.4.
+
+When a caller supplies either worker axis, that explicit value wins over the
+routed model family. A Codex route may project its legacy sidecar only when
+both worker fields are omitted; it must never rewrite an explicit Claude,
+Codex, or `agy` target. This keeps a host/worker mismatch observable and lets
+the policy layer decide whether a declared sidecar is permitted. The resolver
+uses only Node path/process-neutral operations and accepts paths containing
+spaces, Unicode, and either LF or CRLF. The same contract and reason codes are
+therefore used unchanged by native Windows, macOS, and Linux adapters; no
+shell quoting, PID, or platform-specific fallback participates in resolution.
 
 #### When to apply
 
@@ -1224,9 +1363,11 @@ RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf
 | `failed` | Continue with the amended task-scope unmet entry and follow Failure. |
 | `no-command` | Leave the payload untouched and follow the existing boundary. |
 
-Before the success/failure boundary, a valid result with `status:"partial"` runs `node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json`. **`scripts/forge-env-promote.js` is the canonical M016 S01 formula-once source** for its closed allowlist and corroboration rules; mirrors call it and never restate its rules. The allowlist is closed to five environment reason classes — `git-commit-required`, `gsd-write-refused`, `out-of-scope-test-failure`, `network-required`, `sandbox-exec-blocked` — named here for readers/greps; the checker remains the sole source of the corroboration criteria for each. `promote:true` treats this result as `done` and continues to step 6; `promote:false` follows the existing failure path unchanged. A legacy payload lacking `scope` is rejected by the checker, therefore preserves the prior behavior byte-for-byte. For a promotion, write `## Env Constraints` into `T##-SUMMARY.md` (one `item + reason + note` line per entry), synthesize the additive `env_constraints[]` result-block field, omit those entries from `must_haves_status.dropped`, and append `{"event":"sidecar_env_promotion","unit":"execute-task/{T##}","count":N,"reasons":[...],"ts":"<ISO>"}` to events.jsonl.
+Before the success/failure boundary, a valid result with `status:"partial"` runs `node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json`. **`scripts/forge-env-promote.js` is the canonical M016 S01 formula-once source** for its closed allowlist and corroboration rules; mirrors call it and never restate its rules. The allowlist is closed to five environment reason classes — `git-commit-required`, `gsd-write-refused`, `out-of-scope-test-failure`, `network-required`, `sandbox-exec-blocked` — named here for readers/greps; the checker remains the sole source of the corroboration criteria for each. `scripts/forge-env-coverage.js` owns the per-reason coverage verdict (`promotable` | `measured-gap` | `categorical`) for each of the five allowlist reasons — this section does not restate the verdicts. `promote:true` treats this result as `done` and continues to step 6; `promote:false` follows the existing failure path unchanged. A legacy payload lacking `scope` is rejected by the checker, therefore preserves the prior behavior byte-for-byte. For a promotion, write `## Env Constraints` into `T##-SUMMARY.md` (one `item + reason + note` line per entry), synthesize the additive `env_constraints[]` result-block field, omit those entries from `must_haves_status.dropped`, and append `{"event":"sidecar_env_promotion","unit":"execute-task/{T##}","count":N,"reasons":[...],"ts":"<ISO>"}` to events.jsonl.
 
 **`status:"done"` with unmet environment-scope entries (M016 S01 review R1).** The same checker ALSO runs when `status:"done"` and `must_haves_status` still carries unmet entries — a worker is instructed to return `done` once only `scope:"environment"` items remain, and that label is never trusted at face value. Run the identical `forge-env-promote.js` invocation; the checker returns `verdict:"done-with-verified-env"` (every unmet entry corroborates) or `verdict:"done-with-unverified-env"` (at least one `rejected` entry). Only `done-with-verified-env` is accepted as success — write `## Env Constraints` exactly as above. `done-with-unverified-env` is **never** a silent accept: the orchestrator treats the result as `partial` and follows the existing failure path (classifier → repair strategy), discarding the worker's `done` label.
+
+**`sidecar_env_corroboration_fallback` (canonical, M018 S06/T04).** Whenever `corroborateEnvEntries` (`scripts/forge-env-promote.js`) returns a non-empty `fallbacks[]` — in any of the three outcomes above (`promote:true`, `done-with-verified-env`, `done-with-unverified-env`), because the fallback describes *how* an entry was corroborated, not the outcome — append one `{"event":"sidecar_env_corroboration_fallback","unit":"execute-task/{T##}","reason":"<ENV_REASON_ENUM>","fallback":"<runtime-evidence state>","count":N,"ts":"<ISO>"}` line per `fallbacks[]` entry to events.jsonl, where `count` is `fallbacks.length` for this result. `fallback` is a closed, five-value vocabulary owned by `scripts/forge-env-promote.js`, declared here and only here: `not-collected` (no runtime-evidence stream present), `collector-failed` (the collector errored), `malformed` (the stream did not parse), `no-command-entries` (a stream was collected but has zero `kind:"command"` entries), `coverage-unavailable` (S06 review R4 — `scripts/forge-env-coverage.js` failed to load, so WHICH reasons are runtime-first is unknown; the checker names it here instead of silently disabling the gate, and refuses to decide textually while a runtime stream exists). Without this event a textual corroboration is indistinguishable in the log from a runtime-evidence corroboration — the exact silence this slice exists to close.
 
 #### DISPATCH_VCS prelude (canonical — VCS-agnostic)
 
@@ -1263,9 +1404,32 @@ On `status: done` with exit 0 (including that promoted `partial`), the orchestra
 | `dispatch_id` | globally unique model-call ID, identical to the heartbeat/state value |
 | `input_tokens` / `output_tokens` | `heuristic-chars-4` estimates over the exact sidecar prompt and raw returned text |
 
+**Mark the plan `DONE` — same edit as the Claude path, performed on the sidecar's behalf.** Writing `T##-SUMMARY.md` is only half the bookkeeping. On the Claude path the worker itself closes the plan: `agents/forge-executor.md` step 13 — *add or update `status: DONE` in the frontmatter of `T##-PLAN.md`*. The sidecar is contractually barred from `.gsd/**`, so it can never run that step, and Branch C used to leave it undone. The orchestrator therefore performs **that identical frontmatter edit** on `$PLAN_PATH` right next to the SUMMARY write — no new mechanism, no new field, no script: the same `status: DONE` line the Claude path sets. **Measured (M018):** sidecar-executed plans stayed statusless while their Claude-executed siblings were marked, so every `status:`-reading consumer (`forge-doctor` C3a and C9, the *Crash detection* step of `skills/forge-auto`/`forge-next`) read a finished slice as unfinished, and a task already done was re-dispatchable. Applies to Branch C only — Branch D produces plan files, not a task result, and has no plan of its own to close.
+
 After assembling the SUMMARY + result block, control **rejoins the normal Process-result path** exactly as if a Claude `forge-executor` had returned — downstream verification (must_haves, verifier, file-audit, review dialético) runs **byte-identical** on codex-authored code. Nothing downstream changes.
 
-**7. Synthesized evidence (advisory).** Because the PostToolUse hook only logs the orchestrator's own tool calls — not the detached codex process — append synthesized evidence lines to `.gsd/forge/evidence-{unitId}.jsonl` from the named canonical post-run change set above, tagged `source: codex-sidecar`. This is a **documented gap**, advisory only — it never blocks.
+**7. Evidence lines into `.gsd/forge/evidence-{unitId}.jsonl`.** The PostToolUse hook only logs the orchestrator's own tool calls, never the detached codex process, so the sidecar's work reaches that artifact through two producers — both written by the **orchestrator**, both non-blocking. They are named apart and neither replaces the other (M018 D7 retires nothing).
+
+**7a. Synthesized lines (legacy, advisory — preserved).** Append lines derived from the named canonical post-run change set above, tagged `source: codex-sidecar`. These are inferred from the VCS delta, not observed while the run happened — a **documented gap**, advisory only, and kept exactly as it was.
+
+**7b. Runtime-observed lines (materialized).** The adapter carries what the codex app-server stream actually reported as `runtime_evidence` — an **additive result-file field** (`{census, entries}`, classified by `scripts/forge-evidence-admit.js`). The adapter still has **no write path into `.gsd/**`** (route (a)): the orchestrator materializes the lines itself with
+
+```bash
+node "$FORGE_SCRIPTS_DIR/forge-evidence-materialize.js" \
+  --result "$RESULT_FILE" --unit "execute-task/{T##}" --cwd "$WORKING_DIR" --json
+```
+
+`scripts/forge-evidence-materialize.js` is the formula-once owner of the outcome enum, the naming, the 512-byte stepped truncation and the census shape; mirrors call it and restate none of them. Every written line carries `source: codex-runtime` — **never** `codex-sidecar`, which stays the marker of 7a, so a strict-equality filter separates the two in the same file. **Every invocation appends exactly one `kind:"census"` line**, including when nothing else is written: silence in the artifact a human reads is indistinguishable from a broken collector. The outcome enum is closed at three, and none is an omission:
+
+| Result-file input | `outcome` | jsonl written |
+|---|---|---|
+| `runtime_evidence` present, `census.outcome: collected` | `collected` | 1 census + N entries (N may be 0 → **collected-and-empty**) |
+| `runtime_evidence` **absent** | `not-collected` (`reason: field-absent`) | 1 census, 0 entries |
+| `census.outcome: collector-failed`, malformed field, or unreadable result file | `collector-failed` (named `reason`) | 1 census, 0 entries |
+
+**Where it is invoked (S06 review R9).** At the **terminal outcome of the dispatch**, before the Success/Failure split — never only from Success. Invoked from Success alone, the third row of the table above (unreadable result file → `collector-failed`) was unreachable from every call site, which is a row that documents a detector nothing can trigger. The invariant is **one census per terminal outcome, never one per retry**: a Layer-1 in-place retry has not settled a terminal outcome and does not invoke it. A Layer-2 chain walk is a *different* dispatch with its own result file, so its own census is a second dispatch's census, not a duplicate of this one.
+
+`collected` with zero entries **never** collapses into `not-collected` (precedent: S07's `pairs_compared === 0` is `inconclusive`, never `clean`). Exit is **0 always** — advisory, never blocks the loop, same posture as `forge-route-audit.js`. Paths inside `entries[]` are data: nothing resolves, stats or opens them.
 
 #### Sidecar dispatch state machine — Branch D (`dispatch_engine == codex && UNIT_TYPE == plan-slice`)
 
@@ -1325,6 +1489,69 @@ RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf
 **Path-traversal guard (untrusted codex output).** `task_plans[].id` and `.filename` are UNTRUSTED — codex is an external, potentially-compromised model. `validatePlanResult` in `forge-xllm.js` is the gate: it rejects (exit 2 → Fallback) any task plan whose `id` isn't `^T\d+$` or whose `filename` isn't a plain `.md` basename (`^[A-Za-z0-9._-]+\.md$` — no `/`, `\`, or `..`). Defense in depth: **re-derive the task plan path from the validated `id` alone** — `.gsd/milestones/{M###}/slices/{S##}/tasks/{id}/{id}-PLAN.md`. Treat `filename` only as an optional equality-check against `{id}-PLAN.md`; **never concatenate the raw `filename` into a filesystem path.**
 
 After materializing, the orchestrator emits the `dispatch` event (`engine:"codex"`, unit `plan-slice/{S##}`) and control **rejoins the normal `plan-slice` completion path** exactly as if a Claude `forge-planner` had just written the files: the **plan-check gate**, the **symbol-check gate** and the interactive **plan_gate** all run over the materialized files, agnostic of origin (locked — **nothing in those gates changes**). No `T##-SUMMARY`/`---GSD-WORKER-RESULT---` is synthesized here — plan-slice produces plan files, not a task result.
+
+#### Canonical dispatch failure taxonomy (S06/T04)
+
+This table is the single control-flow vocabulary for native and sidecar dispatches. The
+machine-readable mirror is `scripts/fixtures/dispatch-security/failure-taxonomy.json`.
+Older reason strings remain additive as `legacy_reason_code`; they never replace the
+canonical `reason_code`, and an unknown signal fails closed as `error_class: terminal`.
+
+| signal | `reason_code` | `error_class` | same-member retry | next action | reset |
+|--------|---------------|---------------|-------------------|-------------|-------|
+| host unavailable / invalid host | `host-unavailable` | terminal | never | stop → human | none |
+| worker/runtime refusal | `worker-refused` | terminal | never | stop → human | none |
+| malformed or schema-invalid output | `output-invalid` | terminal | never | configured next member | execute only |
+| timeout | `codex-timeout` | terminal | never | configured next member | execute only |
+| orphan / failed tree termination | `codex-orphan` | terminal | never | configured next member | execute only |
+| sandbox or permission denial | `sandbox-permission-denied` | terminal | never | stop → human | none |
+| missing capability | `capability-missing` | terminal | never | stop → human | none |
+| new protected `.gsd/**` delta | `protected-state-path` | terminal | never | stop → human | execute only |
+| pre-dirty overlap | `surgical-reset-overlap` | terminal | never | stop → human | abort, nothing reset |
+| reset/post-run verification failure | `verification-failed` | terminal | never | stop → human | abort |
+| provider rate/network/server/stream failure | `provider-transient` | transient | bounded, same attempt | configured next member after exhaustion | execute only |
+
+Legacy mappings are preserved for diagnosis: `invalid-host-runtime` →
+`host-unavailable`; `sidecar-declaration-required` / `implicit-recursion-refused` /
+`native-engine-host-mismatch` → `worker-refused`; `codex-invalid-json` →
+`output-invalid`; `process-timeout` → `codex-timeout`; `process-termination-failed` →
+`codex-orphan`; `role-permission-denied` / `sandbox-escalation-denied` →
+`sandbox-permission-denied`; `verified-reset-failed` / `reset-unverified` →
+`verification-failed`. Consumers may show both fields but branch only on the canonical one.
+
+**Bounded cursor and attempt identity.** Keep one state snapshot per configured member:
+`{sidecar_attempt, transient_retry_count, current_member, snapshot_id}`. A transient retry
+increments only `transient_retry_count`, allocates a fresh `dispatch_id`, and reuses the
+same `sidecar_attempt`, member, START_SHA/pre-dirty snapshot and state file. Exhaustion or
+a terminal member failure calls `forge-routing.js --next-after "$CURRENT_ID"` exactly once.
+Only the returned configured member may run. The failure handler never manufactures
+`claude`, never changes `host_runtime`, and never reads the other host's home. The returned
+member is passed back through the T01 runtime contract and T02 policy; refusal stops for a
+human instead of silently substituting another host. An empty cursor stops the loop.
+
+`SIDECAR_ATTEMPT` increments only when control enters a configured Codex member. Its hard
+limit is `min(3, count(chain members whose engine is gpt/codex))`; Layer-1 retries do not
+consume this budget. The resolver-supplied category fallback is part of the same deduped
+cursor and may run once. There is no fourth member, recursive Codex host, or second fallback.
+
+**Normalized telemetry.** Emit one `dispatch` event for every actual call and one `retry`
+decision event before every retry. Both preserve `protocol_version`, `dispatch_id`,
+`engine`, `reason_code`, `error_class`, `security_decision`, `attempt`, and a bounded
+`state_snapshot` containing only the counters/current member/snapshot id. A retry event
+references the new call's unique `dispatch_id`; it does not replace that call's event.
+Never emit credentials, environment values, prompt text, transcript/model output, session
+or token secrets, exception bodies, or provider homes. Telemetry append failure is loud.
+
+Offline gate (PowerShell, cmd, macOS and Linux use the same Node entry points):
+
+```text
+node scripts/forge-dispatch-security.test.js
+node scripts/forge-dispatch-resolve.test.js
+node scripts/forge-routing.test.js
+node scripts/forge-xllm.test.js
+```
+
+The paid/real-provider smoke is deliberately outside this mandatory gate.
 
 #### Layer-1 transient retry (sidecar parity with the Claude Retry Handler)
 
@@ -1533,7 +1760,7 @@ Rules by member-failure kind:
 The `dispatch` event schema (Token Telemetry + Tier Resolution) is extended **additively** with four routing fields: `engine ∈ {claude, codex, gemini}`, `domain` (the `domain_used` from the resolver — a domain name or `default`), `route_source ∈ {frontmatter, routing, tier_models}` (the `source` from the resolver), and `chain_len` (the number of members in the resolved chain, an integer ≥1). No existing field is renamed or removed. S03/M006/M005 readers that parse by known field names and ignore unknowns continue to work; events lacking any of these fields are valid (treat as `undefined`, not error) — the M006 `slice`/`milestone` discriminators and the M005 `engine` field are preserved alongside.
 
 ```json
-{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4","tier":"heavy","reason":"unit-type:execute-task","engine":"codex","domain":"backend","route_source":"routing","chain_len":3}
+{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4","tier":"heavy","reason":"unit-type:execute-task","engine":"codex","domain":"backend","route_source":"routing","chain_len":3,"transport":"app-server","transport_version":"0.144.4"}
 ```
 
 On the codex path `model` carries the codex model id (or the CLI default label when `$CODEX_MODEL` is unset). The adapter estimates both token fields with `chars/4` over its exact built prompt and raw returned text; this is observability, not provider billing usage. On the Claude path `engine` is `"claude"`. `domain`/`route_source`/`chain_len` come from the single resolver call and are emitted on both paths. Legacy dispatch events without the additive fields remain valid.
@@ -1543,7 +1770,7 @@ On the codex path `model` carries the codex model id (or the CLI default label w
 O schema `dispatch` é estendido **aditivamente** com dois campos nos **execute-task dispatch events** de `forge-auto` e `forge-next`: `slice` (ex.: `"S02"`) e `milestone` (ex.: `"M006"` ou o `RUN_ID` do run multi-run). Nenhum campo existente é renomeado ou removido. Readers S01/S03 que parseiam por nomes de campos conhecidos e ignoram desconhecidos continuam funcionando; eventos legados sem os campos permanecem JSON válido (tratar `slice`/`milestone` ausentes como `undefined`, nunca erro).
 
 ```json
-{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","reason":"unit-type:execute-task","engine":"codex","slice":"S02","milestone":"M006","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4"}
+{"ts":"2026-07-15T10:00:05Z","event":"dispatch","dispatch_id":"055f72ac-09cb-4d10-b234-fef01247a8ca","attempt":1,"status":"done","unit":"execute-task/T04","model":"gpt-5-codex","reason":"unit-type:execute-task","engine":"codex","slice":"S02","milestone":"M006","input_tokens":2100,"output_tokens":487,"token_method":"heuristic-chars-4","transport":"app-server","transport_version":"0.144.4"}
 ```
 
 Estes campos são consumidos por `scripts/forge-review-pairing.js § isAuthorshipEvent` para escopar a autoria de review por slice/milestone (filtro **lenient-when-absent**: um evento sem o campo ainda conta, então o pré-escopo estrito exclui eventos legados sem discriminador antes de chamar o CLI — ver `shared/forge-review.md § Step 0`). Emitidos em ambos os caminhos claude e codex de `execute-task`. `forge-task` emite um único `execute-task/{TASK_ID}` (unit já único) e portanto **não** carrega os discriminadores.
@@ -1587,6 +1814,8 @@ Domain-first routing keys on a `domain` string per unit. The format is **fixed h
 
 - **Task-level (for `execute-task`):** a `domain:` field in the T##-PLAN.md frontmatter. Read when dispatching `execute-task`.
 - **Slice-level (for `plan-slice`):** a `` `domain:<name>` `` tag on the slice's checkbox line in `{M###}-ROADMAP.md`, alongside `risk:` / `depends:`. Read by the orchestrator when dispatching `plan-slice`.
+
+**Canonical reader:** `scripts/forge-dispatch-resolve.js` (`readPlanFrontmatter`), which strips a YAML inline comment from the value via `stripInlineComment` imported from `scripts/forge-must-haves.js` — the same helper the must-haves gate uses on the same key, so the two readers cannot disagree about `domain: payments  # cross-repo`. The snippet below illustrates the shape; it is not the source of truth and must not be copied into a new reader.
 
 **Extraction (precedence for `execute-task`):** frontmatter `domain:` → else the slice's `domain:<name>` ROADMAP tag → else `default`. `plan-slice` greps the slice line in the ROADMAP for `domain:<name>`. Absent/invalid → `default` (the resolver uses the `routing.default.*` cell, or the legacy path with no error).
 
@@ -1900,7 +2129,7 @@ THINKING_HEADER=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).thin
 
 # Extend the dispatch event (append after Token Telemetry builds dispatchEvent) with the resolver's
 # fields — additive, no existing field renamed/removed:
-echo "{\"ts\":\"$TS\",\"event\":\"dispatch\",\"dispatch_id\":\"$ATTEMPT_DISPATCH_ID\",\"prompt_id\":\"$PROMPT_DISPATCH_ID\",\"attempt\":${attempt:-1},\"status\":\"done\",\"unit\":\"$UNIT_TYPE/$UNIT_ID\",\"model\":\"$MODEL_ID\",\"input_tokens\":$IN_TOK,\"output_tokens\":$OUT_TOK,\"token_method\":\"heuristic-chars-4\",\"tier\":\"$TIER\",\"reason\":\"$REASON\",\"effort\":\"$EFFORT\",\"effort_reason\":\"$EFFORT_REASON\",\"model_applied\":$MODEL_ALIAS_JSON,\"engine\":\"$ENGINE\",\"domain\":\"$DOMAIN_USED\",\"route_source\":\"$ROUTE_SOURCE\",\"chain_len\":$CHAIN_LEN}" >> .gsd/forge/events.jsonl
+echo "{\"ts\":\"$TS\",\"event\":\"dispatch\",\"dispatch_id\":\"$ATTEMPT_DISPATCH_ID\",\"prompt_id\":\"$PROMPT_DISPATCH_ID\",\"attempt\":${attempt:-1},\"status\":\"done\",\"unit\":\"$UNIT_TYPE/$UNIT_ID\",\"model\":\"$MODEL_ID\",\"input_tokens\":$IN_TOK,\"output_tokens\":$OUT_TOK,\"token_method\":\"heuristic-chars-4\",\"tier\":\"$TIER\",\"reason\":\"$REASON\",\"effort\":\"$EFFORT\",\"effort_reason\":\"$EFFORT_REASON\",\"model_applied\":$MODEL_ALIAS_JSON,\"engine\":\"$ENGINE\",\"domain\":\"$DOMAIN_USED\",\"route_source\":\"$ROUTE_SOURCE\",\"chain_len\":$CHAIN_LEN,\"transport\":\"in-process\"}" >> .gsd/forge/events.jsonl
 ```
 
 `MODEL_ID` is always the resolver's `model` field — `chain[0].id`, the primary member (identical to
@@ -2300,3 +2529,25 @@ When decomposing a slice:
 3. **If two tasks share a file in `writes`** (e.g., both registering exports in a barrel file), either (a) order them with `depends`, or (b) split the shared-file responsibility into a third task that both depend on.
 
 `writes` conflicts are checked bidirectionally — glob on either side matches literal path on the other, and vice versa. `src/auth/**` conflicts with `src/auth/jwt.ts`.
+
+## Pre-dispatch capability policy
+
+`scripts/forge-dispatch-policy.js` is the pure, fail-closed decision boundary
+between runtime resolution and process enforcement. It receives the explicit
+`host_runtime`, `worker_engine`, role, operation and required/available
+capabilities. It does not inspect provider homes, credentials or ambient OS
+permissions and never spawns a process.
+
+Roles have fixed maxima: orchestrator may manage state and materialize results;
+worker/executor may read, write, apply and spawn only inside its declared
+workspace/worktree; reviewer and observer are read-only with no subprocess or
+execution lease. `.gsd/**` remains orchestrator-owned, and a selected host may
+not target the other host's home.
+
+Every decision conforms to `schemas/forge-dispatch-policy.schema.json`, returns
+exactly `allow|deny`, a stable reason code, `grants: []`, and the least native
+projection: Claude tool allowlist or Codex `sandbox_mode`. Missing capabilities,
+custom-agent sandbox escalation and ad-hoc grants deny rather than inherit.
+Structured worker output is untrusted data: fields that resemble role,
+capability, tools, sandbox, grants, credentials, prompt or transcript trigger
+`untrusted-output-barrier` and can never influence a subsequent dispatch.

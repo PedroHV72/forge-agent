@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge-agent.dev/schemas/forge-unit-lease.schema.json",
+  "title": "Forge persistent unit lease protocol",
+  "description": "Provider-neutral durable authorization for one normalized unit key. owner_token and request_id are storage/write credentials and must not be returned by observe.",
+  "oneOf": [
+    { "$ref": "#/$defs/leaseRecord" },
+    { "$ref": "#/$defs/publicLease" },
+    { "$ref": "#/$defs/result" }
+  ],
+  "$defs": {
+    "protocolVersion": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "hostRuntime": {
+      "type": "string",
+      "enum": ["claude", "codex"]
+    },
+    "reasonCode": {
+      "type": "string",
+      "enum": [
+        "acquired",
+        "already-acquired",
+        "lease-active",
+        "owner-mismatch",
+        "renewed",
+        "released",
+        "already-released",
+        "expired-awaiting-grace",
+        "recovered",
+        "contended-recovery",
+        "invalid-request",
+        "guard-busy"
+      ]
+    },
+    "opaqueToken": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duration": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "leaseRecord": {
+      "type": "object",
+      "description": "Durable storage form. This object is never an observer response.",
+      "required": [
+        "protocol_version",
+        "unit",
+        "owner_token",
+        "host_runtime",
+        "session",
+        "generation",
+        "acquired_at",
+        "heartbeat_at",
+        "expires_at",
+        "grace_ms"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "owner_token": { "$ref": "#/$defs/opaqueToken" },
+        "host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "session": { "anyOf": [{ "$ref": "#/$defs/opaqueToken" }, { "type": "null" }] },
+        "request_id": { "anyOf": [{ "$ref": "#/$defs/opaqueToken" }, { "type": "null" }] },
+        "generation": { "$ref": "#/$defs/opaqueToken" },
+        "acquired_at": { "$ref": "#/$defs/timestamp" },
+        "heartbeat_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "grace_ms": { "$ref": "#/$defs/duration" }
+      },
+      "additionalProperties": false
+    },
+    "publicLease": {
+      "type": "object",
+      "description": "Sanitized observe/status form. It deliberately has no owner_token or request_id.",
+      "required": [
+        "protocol_version",
+        "unit",
+        "generation",
+        "owner",
+        "host_runtime",
+        "session",
+        "acquired_at",
+        "heartbeat_at",
+        "expires_at",
+        "grace_ms",
+        "expired",
+        "recoverable"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "generation": { "$ref": "#/$defs/opaqueToken" },
+        "owner": { "const": "redacted" },
+        "host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "session": { "anyOf": [{ "$ref": "#/$defs/opaqueToken" }, { "type": "null" }] },
+        "acquired_at": { "$ref": "#/$defs/timestamp" },
+        "heartbeat_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "grace_ms": { "$ref": "#/$defs/duration" },
+        "expired": { "type": "boolean" },
+        "recoverable": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "required": ["ok", "reason"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/reasonCode" },
+        "unit": { "type": "string" },
+        "owner_token": { "$ref": "#/$defs/opaqueToken" },
+        "generation": { "$ref": "#/$defs/opaqueToken" },
+        "lease": { "anyOf": [{ "$ref": "#/$defs/publicLease" }, { "type": "null" }] },
+        "previous": { "anyOf": [{ "$ref": "#/$defs/publicLease" }, { "type": "null" }] },
+        "recovered": { "anyOf": [{ "$ref": "#/$defs/publicLease" }, { "type": "null" }] },
+        "corrupt": { "type": "boolean" },
+        "recovered_corrupt": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "acquireRequest": {
+      "type": "object",
+      "required": ["unit", "host_runtime"],
+      "properties": {
+        "unit": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "host_runtime": { "$ref": "#/$defs/hostRuntime" },
+        "session": { "anyOf": [{ "$ref": "#/$defs/opaqueToken" }, { "type": "null" }] },
+        "owner_token": { "$ref": "#/$defs/opaqueToken" },
+        "request_id": { "$ref": "#/$defs/opaqueToken" },
+        "ttl_ms": { "$ref": "#/$defs/duration" },
+        "grace_ms": { "$ref": "#/$defs/duration" }
+      },
+      "additionalProperties": false
+    },
+    "ownerRequest": {
+      "type": "object",
+      "required": ["unit", "owner_token", "generation"],
+      "properties": {
+        "unit": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "owner_token": { "$ref": "#/$defs/opaqueToken" },
+        "generation": { "$ref": "#/$defs/opaqueToken" },
+        "ttl_ms": { "$ref": "#/$defs/duration" },
+        "grace_ms": { "$ref": "#/$defs/duration" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

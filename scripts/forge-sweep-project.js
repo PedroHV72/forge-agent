@@ -4,6 +4,37 @@
 // The project-facing sweep command is deliberately a thin wire: planning and
 // filesystem changes belong to forge-epoch-group, while VCS policy belongs to
 // forge-sweep-eligibility.
+//
+// ── Invocation policy (operator decision, 2026-08-05) ────────────────────────
+// This command is HUMAN-INVOKED ONLY. There is deliberately no skill and no
+// slash command for it, and its absence is the design — not an oversight.
+//
+// Compare with `skills/forge-sweep/SKILL.md`, which carries its own
+// `## Invocation policy` declaring the opposite: that one IS model-invocable at
+// the end of a task or milestone, once the human has validated the work.
+//
+// The two are destructive at different scales, so they get different owners for
+// the decision. `/forge-sweep` prunes know-how files at the close of one cycle,
+// where the human validation gate already happened in conversation. This command
+// rewrites the whole fragment store (ledger + decisions + memory) into grouped
+// containers — in a real project that is hundreds of fragments at once. Having to
+// name the command is itself the safety gate: it demonstrates deliberate intent
+// in a way no skill can, because a skill exists precisely to be invocable without
+// the user asking for it by name.
+//
+// Consequences, so a future reader does not "fix" the gap:
+//   - Ambiguous phrasing ("run the sweep", "clean this up") ALWAYS means
+//     /forge-sweep, never this command. Treating a vague request as a possible
+//     sweep-project — even only to ask which one — already weakens the gate.
+//   - An agent must not offer this as a natural next step at the end of a cycle.
+//     Running the read-only preview on request is fine (it is the default); only
+//     --apply and --undo require the operator to ask explicitly.
+//   - A proposal to add a /forge-sweep-project skill, or any auto-invocation
+//     surface, contradicts this decision.
+//
+// The confirmation prompt below (askForConfirmation) implements the same policy
+// at runtime: --apply and --undo require typing "sim", and --yes is the explicit
+// opt-out for non-interactive callers.
 
 const fs = require('fs');
 const path = require('path');

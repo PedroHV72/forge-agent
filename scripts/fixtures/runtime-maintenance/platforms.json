@@ -1,0 +1,10 @@
+{
+  "platforms": ["win32", "darwin", "linux"],
+  "offline": true,
+  "legacy_claude_release": "3.1.4",
+  "invariants": [
+    "selected-home-only",
+    "backup-before-write",
+    "preserve-user-config"
+  ]
+}

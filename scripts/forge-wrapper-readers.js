@@ -113,6 +113,13 @@ const WRAPPER_DIR_READERS = Object.freeze([
     why: 'No directory enumeration exists in this script, so an epoch container cannot be selected by it.',
   },
   {
+    file: 'forge-unit-controller.js',
+    dirs: Object.freeze(['.gsd/milestones']),
+    evidence: 'forge-unit-controller.js:227-232 — discoverInventory receives one milestone id, builds .gsd/milestones/<id>, and enumerates only inside that selected milestone and its slices/tasks.',
+    verdict: 'safe-by-construction',
+    why: 'The specific caller-selected milestone id is joined before firstExisting enumerates; the controller never lists the .gsd/milestones wrapper root, so an epoch.md container cannot be consumed as a milestone directory.',
+  },
+  {
     file: 'forge-verifier.js',
     dirs: Object.freeze(['.gsd/milestones']),
     evidence: 'forge-verifier.js:922-935 — discoverTaskPlans uses fs.readdirSync(sliceDir/tasks), below a caller-selected milestone and slice.',

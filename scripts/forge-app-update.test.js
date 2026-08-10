@@ -12,8 +12,8 @@
 //
 // Three invariants, all cheap to check and all silent when they break:
 //
-//   1. The installer command passes `--with-app`. Without it the installer skips
-//      the Swift build entirely (install.sh gates it on WITH_APP) and the update
+//   1. The installer command passes `--with-app`. Without it the shared Node
+//      installer skips the Swift build and the update
 //      appears to have worked.
 //   2. Replacing the bundle does not replace the running process, so the app
 //      must offer a relaunch after an update rather than letting a stale window
@@ -28,9 +28,8 @@
 // ForgeKit), so the asserts that used to read `runUpdate()`'s body now read
 // whichever of the two actually owns the property.
 //
-// It also pins the gating itself: if `install.sh` ever stopped gating the app
-// build on `--with-app`, invariant 1 would be vacuous and this suite would be
-// guarding nothing — so the gate is asserted rather than assumed.
+// It also pins the Node core that owns the gate. install.sh is intentionally a
+// thin cross-platform wrapper and must not duplicate this implementation.
 //
 // Like forge-app-workspace.test.js and unlike forge-app.test.js, this is pure
 // file reading — no swift invocation — so it NEVER skips and runs everywhere,
@@ -46,6 +45,7 @@ const updatesSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'Updates.swi
 const updateCoreSwift = path.join(repoRoot, 'app', 'Sources', 'ForgeKit', 'UpdateCore.swift');
 const forgeAppSwift = path.join(repoRoot, 'app', 'Sources', 'Forge', 'ForgeApp.swift');
 const installSh = path.join(repoRoot, 'install.sh');
+const installerJs = path.join(repoRoot, 'scripts', 'forge-installer.js');
 
 let passed = 0;
 let failed = 0;
@@ -138,18 +138,21 @@ const updatesCode = stripLineComments(updatesSource);
 const coreCode = stripLineComments(read(updateCoreSwift));
 const appCode = stripLineComments(read(forgeAppSwift));
 const installSource = read(installSh);
+const installerSource = read(installerJs);
 
-check('install.sh ainda gateia o build do app atrás de --with-app', () => {
-  // If this stops being true the flag is no longer load-bearing and invariant 1
-  // below is guarding nothing. Assert the gate rather than assuming it.
+check('o core Node mantém --with-app load-bearing e o shell permanece fino', () => {
   assert(
-    /--with-app\)\s*WITH_APP=true/.test(installSource),
-    'install.sh não mapeia mais --with-app para WITH_APP=true'
+    /arg === ['"]--with-app['"]\) result\.withApp = true/.test(installerSource),
+    'forge-installer.js não mapeia --with-app para withApp=true'
   );
   assert(
-    /^if \$WITH_APP; then/m.test(installSource),
-    'o build do app não está mais gated em `if $WITH_APP`'
+    /const app = installApp\(repo, plan, options, paths\.platform\)/.test(installerSource),
+    'o instalador não encaminha a instalação concluída ao build do app'
   );
+  assert(/exec node .*forge-installer\.js/.test(installSource),
+    'install.sh deixou de delegar ao core Node');
+  assert(!/swift build|app\/build\.sh/.test(installSource),
+    'install.sh voltou a duplicar o build do app');
 });
 
 const buildBody = bodyOf(coreCode, 'static func build(');
@@ -163,7 +166,7 @@ check('InstallerCommand.build passa --update E --with-app nos dois modos', () =>
   assert(
     buildBody.includes('--with-app'),
     'o comando do instalador não passa --with-app — o app atualizaria tudo menos ' +
-      'ele mesmo (install.sh gateia o build do app em WITH_APP)'
+      'ele mesmo (forge-installer.js gateia o build do app em withApp)'
   );
 });
 

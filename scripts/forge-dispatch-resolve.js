@@ -23,6 +23,12 @@ const { resolveRoute } = require('./forge-routing.js');
 const { modelToAlias, modelFamily } = require('./forge-model-alias.js');
 const { readPrefsCached } = require('./forge-prefs.js');
 const { readTierChain } = require('./forge-tier-chain.js');
+// Imported, not re-typed: forge-must-haves.js reads the same `domain:` key from
+// the same frontmatter, and a second copy of the strip rule is how the two
+// readers drift apart. Requires whitespace before the `#`, which is what
+// separates a comment from a `#` inside the value.
+const { stripInlineComment } = require('./forge-must-haves.js');
+const { resolveWorker, RuntimeContractError } = require('./forge-runtime.js');
 
 const TIER_DEFAULTS = {
   'memory-extract': 'light',
@@ -90,7 +96,11 @@ function readPlanFrontmatter(planPath) {
   return {
     tier: frontmatterValue(block, /^tier:\s*(.+)$/m),
     tag: frontmatterValue(block, /^tag:\s*(.+)$/m),
-    domain: frontmatterValue(block, /^domain:[ \t]*(.+)$/m),
+    // Only `domain` is stripped here: it is the sole key on this line-up that a
+    // SECOND module also parses, so it is the sole one where a comment can make
+    // two readers disagree. tier/tag/effort/slice have one reader each and are
+    // left exactly as they were rather than changed by resemblance.
+    domain: stripInlineComment(frontmatterValue(block, /^domain:[ \t]*(.+)$/m)).trim(),
     effort: frontmatterValue(block, /^effort:\s*(.+)$/m),
     worker: worker === 'claude' || worker === 'codex' ? worker : '',
     slice: frontmatterValue(block, /^slice:\s*(.+)$/m),
@@ -168,6 +178,70 @@ function sidecarModelFor(dispatchEngine, chain, codexModel) {
   const first = Array.isArray(chain) ? chain[0] : null;
   if (dispatchEngine === 'codex' && first && first.id) return first.id;
   return codexModel || '';
+}
+
+// The dispatch resolver retains its legacy model/routing contract, but also
+// projects the host/worker axes introduced by forge-runtime.  Accept both the
+// library's camelCase convention and the wire-format snake_case names: this
+// keeps direct JSON callers from needing a second adapter.
+function runtimeInputValue(opts, camel, snake) {
+  if (Object.prototype.hasOwnProperty.call(opts, camel)) return opts[camel];
+  return opts[snake];
+}
+
+function runtimeFields(opts, dispatchEngine) {
+  const o = opts || {};
+  const input = {
+    host_runtime: runtimeInputValue(o, 'hostRuntime', 'host_runtime'),
+    worker_engine: runtimeInputValue(o, 'workerEngine', 'worker_engine'),
+    worker_mode: runtimeInputValue(o, 'workerMode', 'worker_mode'),
+    sidecar_declared: runtimeInputValue(o, 'sidecarDeclared', 'sidecar_declared'),
+    sidecar: o.sidecar,
+  };
+  // The legacy dispatch branch still treats a routed Codex member as a
+  // sidecar. On a Codex host that would recurse unless the caller declared
+  // it, so project that effective worker before asking the canonical runtime
+  // validator. The omitted-host Claude path remains byte-compatible.
+  // A routed Codex member is the legacy default sidecar only when the caller
+  // omitted both worker axes.  Never overwrite an explicit worker target or
+  // mode: the host/worker contract must be able to diagnose a mismatch (or
+  // represent a declared cross-host sidecar) instead of silently rewriting it
+  // from the model family.
+  const workerAxesOmitted = input.worker_engine === undefined && input.worker_mode === undefined;
+  if (workerAxesOmitted && text(input.host_runtime).toLowerCase() === 'codex' && dispatchEngine === 'codex') {
+    input.worker_engine = 'codex';
+    input.worker_mode = 'sidecar';
+  }
+  try {
+    const worker = resolveWorker(input);
+    return {
+      runtime_protocol_version: worker.protocol_version,
+      host_runtime: worker.host_runtime,
+      worker_engine: worker.worker_engine,
+      worker_mode: worker.worker_mode,
+      resolved_worker_engine: worker.resolved_engine,
+      sidecar_declared: worker.sidecar_declared,
+      worker_reason_code: worker.reason_code,
+      dispatch_allowed: true,
+      dispatch_reason_code: '',
+    };
+  } catch (error) {
+    // Invalid runtime input must be visible to the caller as a deterministic
+    // pre-dispatch refusal. Do not turn it into a Claude fallback: that would
+    // violate the native-host and recursion guarantees of the core contract.
+    const code = error instanceof RuntimeContractError || error.code ? error.code : 'invalid-runtime-contract';
+    return {
+      runtime_protocol_version: '',
+      host_runtime: text(input.host_runtime).toLowerCase(),
+      worker_engine: text(input.worker_engine).toLowerCase(),
+      worker_mode: text(input.worker_mode).toLowerCase(),
+      resolved_worker_engine: '',
+      sidecar_declared: input.sidecar === true || input.sidecar_declared === true,
+      worker_reason_code: code,
+      dispatch_allowed: false,
+      dispatch_reason_code: code,
+    };
+  }
 }
 
 function resolveDispatch(opts) {
@@ -261,6 +335,10 @@ function resolveDispatch(opts) {
   // this orchestration layer aligned with alias/routing model semantics.
   const family = modelFamily(model);
   if (family === null && route.source === 'routing' && !chain[0]) engine = 'claude';
+  // Resolve this after routing/model-family work. The result is deliberately
+  // additive: legacy engine/dispatch_engine/chain retain their 3.1.4 meaning.
+  const dispatchEngine = dispatchEngineFor(engine);
+  const runtime = runtimeFields(o, dispatchEngine);
   return {
     engine,
     model,
@@ -289,19 +367,20 @@ function resolveDispatch(opts) {
     // Additive dispatch trigger: normalized from the resolved top-level `engine`
     // (family). gpt→codex, gemini→agy, else→claude. Orchestrator branches gate
     // on this (`== "codex"`), NOT on `engine`/`chain[].engine` (kept family).
-    dispatch_engine: dispatchEngineFor(engine),
+    dispatch_engine: dispatchEngine,
     // codex_model remains emitted separately as the legacy flat preference.
-    sidecar_model: sidecarModelFor(dispatchEngineFor(engine), chain, workers.codex_model),
+    sidecar_model: sidecarModelFor(dispatchEngine, chain, workers.codex_model),
     // Additive loud-stop surface (M008-CONTEXT #2): a malformed prefs layer must
     // not silently degrade to the claude/effort-default fallback. Callers inspect
     // prefs_ok; the CLI turns prefs_ok:false into a non-zero exit.
     prefs_ok: prefsResult ? prefsResult.ok !== false : true,
     prefs_errors: (prefsResult && prefsResult.errors) || [],
+    ...runtime,
   };
 }
 
 function parseArgs(args) {
-  const parsed = { unitType: '', planPath: null, unitId: '', milestoneId: '', roadmapPath: null, domain: '', cwd: process.cwd(), asJson: false, effortMap: {} };
+  const parsed = { unitType: '', planPath: null, unitId: '', milestoneId: '', roadmapPath: null, domain: '', cwd: process.cwd(), asJson: false, effortMap: {}, hostRuntime: undefined, workerEngine: undefined, workerMode: undefined, sidecarDeclared: undefined };
   for (let i = 0; i < args.length; i += 1) {
     const flag = args[i];
     const value = args[i + 1];
@@ -312,6 +391,10 @@ function parseArgs(args) {
     else if (flag === '--roadmap' && value !== undefined) { parsed.roadmapPath = value; i += 1; }
     else if (flag === '--domain' && value !== undefined) { parsed.domain = value; i += 1; }
     else if (flag === '--cwd' && value !== undefined) { parsed.cwd = value; i += 1; }
+    else if (flag === '--host-runtime' && value !== undefined) { parsed.hostRuntime = value; i += 1; }
+    else if (flag === '--worker-engine' && value !== undefined) { parsed.workerEngine = value; i += 1; }
+    else if (flag === '--worker-mode' && value !== undefined) { parsed.workerMode = value; i += 1; }
+    else if (flag === '--sidecar-declared') parsed.sidecarDeclared = true;
     else if (flag === '--json') parsed.asJson = true;
     else if (flag.startsWith('--effort-') && value !== undefined) { parsed.effortMap[flag.slice('--effort-'.length)] = value; i += 1; }
   }
@@ -338,6 +421,7 @@ function degradedContract(args) {
   } catch { /* minimal ordered contract below */ }
   const model = chain[0] ? chain[0].id : '';
   const alias = modelToAlias(model).alias;
+  const runtime = runtimeFields(parsed, dispatchEngineFor('claude'));
   return {
     engine: 'claude', model, alias, tier, domain: 'default', route_source: 'tier_models',
     chain, chain_len: chain.length, reason: 'routing-runtime-error; tier_models',
@@ -351,10 +435,11 @@ function degradedContract(args) {
     dispatch_engine: dispatchEngineFor('claude'),
     sidecar_model: sidecarModelFor(dispatchEngineFor('claude'), chain, ''),
     prefs_ok: true, prefs_errors: [],
+    ...runtime,
   };
 }
 
-module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, thinkingHeaderFor, TIER_DEFAULTS, EFFORT_DEFAULTS };
+module.exports = { resolveDispatch, parseArgs, runCli, degradedContract, dispatchEngineFor, sidecarModelFor, thinkingHeaderFor, runtimeFields, TIER_DEFAULTS, EFFORT_DEFAULTS };
 
 if (require.main === module) {
   // Exit 0 on success; exit 1 ONLY on a prefs loud-stop (M008-CONTEXT #2 — a

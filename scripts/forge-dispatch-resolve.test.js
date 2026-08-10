@@ -103,6 +103,11 @@ withHermeticHome((cliEnv) => {
     assertEqual(r.effort_reason, 'unit-type:execute-task', 'defaults effort reason');
     assertEqual(r.engine, 'claude', 'defaults engine claude');
     assertEqual(r.sidecar_model, '', 'claude route has empty sidecar model');
+    assertEqual(r.host_runtime, 'claude', 'legacy omission keeps Claude host compatibility');
+    assertEqual(r.worker_engine, 'native', 'legacy omission keeps native worker target');
+    assertEqual(r.worker_mode, 'native', 'legacy omission keeps native worker mode');
+    assertEqual(r.resolved_worker_engine, 'claude', 'legacy native worker resolves to Claude host');
+    assertEqual(r.dispatch_allowed, true, 'legacy contract remains dispatchable');
     cleanup(f);
   });
 
@@ -354,6 +359,131 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  // ── Family-only `worker:` must NOT leak into the model slot ───────────────
+  // Measured (M018/S02/T01): `worker: claude` produced model 'claude' /
+  // alias null, so the orchestrator omitted `model:` from Agent() and the
+  // worker silently ran on its agent-frontmatter default instead of the
+  // tier's model — and the effort clamp (keyed on `claude-(haiku|sonnet)`)
+  // never matched the bare token, so a `standard` task could be dispatched
+  // at `high` effort (HTTP 400 on Sonnet). A family token pins the ENGINE;
+  // the MODEL still comes from the tier.
+  runCase('family-only worker: claude keeps tier resolution (heavy → opus)', () => {
+    const f = mkFixture({ plan: '---\nworker: claude\ntier: heavy\neffort: high\n---\n# task\n' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.engine, 'claude', 'engine still pinned to claude by the frontmatter worker');
+    assertEqual(r.route_source, 'frontmatter', 'frontmatter still wins the source label');
+    assertEqual(r.model, 'claude-opus-5', 'model comes from tier heavy, not from the token');
+    assertEqual(r.alias, 'opus', 'alias is mapped — Agent() gets a real model:');
+    assertEqual(r.model_applied, 'opus', 'model_applied is the mapped alias');
+    assertEqual(r.effort, 'high', 'heavy tier keeps high effort');
+    assert(r.chain.length === 1 && r.chain[0].id === 'claude-opus-5',
+      'chain carries the tier model, not the family token', JSON.stringify(r.chain));
+    cleanup(f);
+  });
+
+  runCase('family-only worker: claude on a standard task clamps effort (the HTTP-400 hazard)', () => {
+    const f = mkFixture({ plan: '---\nworker: claude\neffort: high\n---\n# task\n' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.model, 'claude-sonnet-5', 'standard tier model, not the token');
+    assertEqual(r.alias, 'sonnet', 'alias mapped');
+    assertEqual(r.effort, 'medium', 'effort clamped down by the sonnet cap');
+    assertEqual(r.effort_reason, 'frontmatter-effort:high|clamped:model-cap', 'clamp is recorded, never silent');
+    cleanup(f);
+  });
+
+  runCase('family worker: codex filters the routed chain to the gpt member', () => {
+    const f = mkFixture({
+      plan: '---\nworker: codex\nslice: S01\n---\n# task\n',
+      prefsJsonc: '{"routing":{"default":{"executor":{"standard":["claude-sonnet-5","gpt-5.6-luna"]}}}}',
+    });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.engine, 'gpt', 'engine pinned to the gpt family');
+    assertEqual(r.dispatch_engine, 'codex', 'dispatch trigger normalizes to codex');
+    assertEqual(r.model, 'gpt-5.6-luna', 'chain filtered to the routed gpt member, not the token');
+    assertEqual(r.sidecar_model, 'gpt-5.6-luna', 'sidecar gets the real routed model');
+    cleanup(f);
+  });
+
+  runCase('family worker: claude filters a mixed routed chain to the claude member', () => {
+    const f = mkFixture({
+      plan: '---\nworker: claude\nslice: S01\n---\n# task\n',
+      prefsJsonc: '{"routing":{"default":{"executor":{"standard":["gpt-5.6-luna","claude-sonnet-5"]}}}}',
+    });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.engine, 'claude', 'engine claude');
+    assertEqual(r.dispatch_engine, 'claude', 'no sidecar dispatch');
+    assertEqual(r.model, 'claude-sonnet-5', 'gpt head skipped, claude member selected');
+    assertEqual(r.alias, 'sonnet', 'alias mapped');
+    cleanup(f);
+  });
+
+  runCase('unmatchable family pin degrades to the literal token, never to an empty chain', () => {
+    // No routing block → the legacy tier chain is all-claude, so a codex pin
+    // has nothing to select. Behavior is byte-identical to the pre-fix path
+    // (literal token chain) and the degradation is named in `reason`.
+    const f = mkFixture({ plan: '---\nworker: codex\n---\n# task\n' });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.engine, 'gpt', 'engine still gpt');
+    assertEqual(r.dispatch_engine, 'codex', 'still routes to the sidecar');
+    assertEqual(r.chain_len, 1, 'exactly one member — never an empty chain');
+    assertEqual(r.model, 'codex', 'degrades to the literal token as before the fix');
+    cleanup(f);
+  });
+
+  runCase('a CONCRETE worker id still short-circuits tier resolution (precedence unchanged)', () => {
+    const { resolveRoute } = require('./forge-routing.js');
+    const f = mkFixture({});
+    const r = resolveRoute({ unitType: 'execute-task', tier: 'standard', domain: 'default', frontmatterWorker: 'gpt-5.6-terra', cwd: f.dir });
+    assertEqual(r.source, 'frontmatter', 'source frontmatter');
+    assertEqual(r.chain.length, 1, 'single pinned member');
+    assertEqual(r.chain[0].id, 'gpt-5.6-terra', 'the concrete id IS the chain — tier never consulted');
+    assert(/\bfrontmatter-worker\b/.test(r.reason) && !/frontmatter-worker-family/.test(r.reason),
+      'concrete id keeps the frontmatter-worker discriminator, not the family one', r.reason);
+    cleanup(f);
+  });
+
+  // Two modules parse `domain:` out of the same frontmatter: this resolver and
+  // scripts/forge-must-haves.js. Neither stripped a YAML inline comment, so they
+  // agreed on a value no routing cell can match (`payments  # cross-repo`), and
+  // the unit silently fell to `default`. The bite has to be two-sided: the value
+  // must be stripped (behaviour), AND the two readers must return the same thing
+  // (parity) — fixing one reader alone turns a shared wrong answer into a
+  // divergence, which is the failure this pair exists to prevent.
+  runCase('domain strips an inline comment, and both readers agree', () => {
+    const { parseMustHaves } = require('./forge-must-haves.js');
+    const plan = [
+      '---',
+      'id: T01',
+      'domain: payments  # cross-repo, see CONTEXT',
+      'must_haves:',
+      '  truths:',
+      '    - it routes',
+      '  artifacts: []',
+      '  key_links: []',
+      'expected_output: [a.js]',
+      '---',
+      '',
+      '# T01',
+      '',
+    ].join('\n');
+    const f = mkFixture({ plan });
+    const resolved = dispatch(f, { unitType: 'execute-task' }).domain_input;
+    const gate = parseMustHaves(fs.readFileSync(f.planPath, 'utf8')).domain;
+    assertEqual(resolved, 'payments', 'resolver strips the inline comment from domain');
+    assertEqual(gate, 'payments', 'the must-haves gate strips the inline comment from domain');
+    assertEqual(resolved, gate, 'both readers of `domain:` return the identical value');
+
+    // A `#` with no whitespace before it is part of the value, not a comment —
+    // the discriminator the shared helper is built on. Asserted so a future
+    // "simplification" to /#.*$/ cannot pass.
+    const hashPlan = plan.replace('domain: payments  # cross-repo, see CONTEXT', 'domain: pay#1');
+    const g = mkFixture({ plan: hashPlan });
+    assertEqual(dispatch(g, { unitType: 'execute-task' }).domain_input, 'pay#1', 'a `#` inside the value survives in the resolver');
+    assertEqual(parseMustHaves(fs.readFileSync(g.planPath, 'utf8')).domain, 'pay#1', 'a `#` inside the value survives at the gate');
+    cleanup(g);
+    cleanup(f);
+  });
+
   runCase('CLI matches in-process resolver and degrades on missing plan', () => {
     const f = mkFixture({});
     const expected = dispatch(f, { unitType: 'execute-task', planPath: path.join(f.dir, 'missing-PLAN.md') });
@@ -369,6 +499,150 @@ withHermeticHome((cliEnv) => {
       assertEqual(parsed.route_source, expected.route_source, 'CLI and library route source agree');
       assertEqual(Object.keys(parsed).slice(0, 11).join(','), 'engine,model,alias,tier,domain,route_source,chain,chain_len,reason,effort,effort_reason', 'CLI contract keys are ordered');
     }
+    cleanup(f);
+  });
+
+  runCase('host_runtime is an additive input and does not reinterpret legacy routing fields', () => {
+    const f = mkFixture({ prefsJsonc: '{"tier_models":{"standard":"claude-opus-4-8"}}' });
+    const legacy = dispatch(f, { unitType: 'execute-task' });
+    const codexHost = dispatch(f, { unitType: 'execute-task', host_runtime: 'codex' });
+    for (const key of ['engine', 'model', 'alias', 'tier', 'domain', 'route_source', 'chain', 'chain_len', 'reason', 'effort', 'effort_reason', 'dispatch_engine']) {
+      assertEqual(JSON.stringify(codexHost[key]), JSON.stringify(legacy[key]), `host input preserves legacy ${key}`);
+    }
+    assertEqual(codexHost.host_runtime, 'codex', 'explicit snake_case host is emitted');
+    assertEqual(codexHost.worker_engine, 'native', 'worker engine remains native when omitted');
+    assertEqual(codexHost.resolved_worker_engine, 'codex', 'native resolves to explicit Codex host');
+    cleanup(f);
+  });
+
+  runCase('CLI accepts --host-runtime and retains the ordered legacy prefix', () => {
+    const f = mkFixture({});
+    const cli = spawnSync('node', [SCRIPT, '--json', '--unit-type', 'execute-task', '--host-runtime', 'codex', '--cwd', f.dir], { encoding: 'utf8', env: cliEnv });
+    let parsed = null;
+    try { parsed = JSON.parse(cli.stdout); } catch (error) { fail('host-runtime CLI stdout is valid JSON', error.message); }
+    assertEqual(cli.status, 0, 'host-runtime CLI exits zero');
+    assert(parsed && parsed.host_runtime === 'codex', 'host-runtime CLI exposes Codex host', cli.stdout);
+    assert(parsed && parsed.resolved_worker_engine === 'codex', 'host-runtime CLI resolves native to Codex', cli.stdout);
+    assertEqual(Object.keys(parsed || {}).slice(0, 11).join(','), 'engine,model,alias,tier,domain,route_source,chain,chain_len,reason,effort,effort_reason', 'host-runtime preserves ordered legacy prefix');
+    cleanup(f);
+  });
+
+  runCase('native target never falls back to a routed model family', () => {
+    const f = mkFixture({ prefsJsonc: '{"routing":{"default":{"executor":{"standard":"claude-opus-4-8"}}}}' });
+    const r = dispatch(f, { unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'native' });
+    assertEqual(r.engine, 'claude', 'route still classifies the Claude model family');
+    assertEqual(r.resolved_worker_engine, 'codex', 'native target remains the Codex host');
+    assertEqual(r.dispatch_allowed, true, 'native host target is allowed');
+    cleanup(f);
+  });
+
+  runCase('routed Codex sidecar is refused on a Codex host until explicitly declared', () => {
+    const f = mkFixture({ prefsJsonc: '{"routing":{"default":{"executor":{"standard":["gpt-5-codex"]}}}}' });
+    const implicit = dispatch(f, { unitType: 'execute-task', hostRuntime: 'codex' });
+    assertEqual(implicit.dispatch_engine, 'codex', 'routing still exposes the legacy Codex dispatch trigger');
+    assertEqual(implicit.dispatch_allowed, false, 'effective routed same-host sidecar is refused');
+    assertEqual(implicit.dispatch_reason_code, 'implicit-recursion-refused', 'routed recursion uses stable reason code');
+    const declared = dispatch(f, { unitType: 'execute-task', hostRuntime: 'codex', sidecarDeclared: true });
+    assertEqual(declared.dispatch_allowed, true, 'declared routed same-host sidecar remains allowed');
+    assertEqual(declared.worker_mode, 'sidecar', 'routed Codex dispatch projects sidecar mode');
+    cleanup(f);
+  });
+
+  runCase('explicit worker axes are never rewritten by the routed model family', () => {
+    const f = mkFixture({ prefsJsonc: '{"routing":{"default":{"executor":{"standard":["gpt-5-codex"]}}}}' });
+    const crossHost = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'claude', workerMode: 'sidecar', sidecarDeclared: true,
+    });
+    assertEqual(crossHost.worker_engine, 'claude', 'explicit Claude worker survives Codex routing');
+    assertEqual(crossHost.worker_mode, 'sidecar', 'explicit sidecar mode survives Codex routing');
+    assertEqual(crossHost.resolved_worker_engine, 'claude', 'explicit worker target is resolved without family fallback');
+    assertEqual(crossHost.dispatch_allowed, true, 'declared cross-engine sidecar remains representable');
+
+    const mismatch = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'claude', workerMode: 'native',
+    });
+    assertEqual(mismatch.worker_engine, 'claude', 'native mismatch preserves requested worker');
+    assertEqual(mismatch.dispatch_allowed, false, 'native cross-host mismatch is refused');
+    assertEqual(mismatch.dispatch_reason_code, 'native-engine-host-mismatch', 'native mismatch reason is stable');
+    cleanup(f);
+  });
+
+  runCase('runtime decision is stable for CRLF and Unicode/space paths on each supported platform', () => {
+    const f = mkFixture({});
+    const portableDir = path.join(f.dir, 'unicode espaço – runtime');
+    fs.mkdirSync(portableDir, { recursive: true });
+    const planPath = path.join(portableDir, 'T01 – PLAN.md');
+    fs.writeFileSync(planPath, '---\r\ntier: standard\r\nworker: Codex\r\n---\r\n# task\r\n', 'utf8');
+    const results = ['win32', 'darwin', 'linux'].map((platform) => resolveDispatch({
+      cwd: portableDir,
+      planPath,
+      unitType: 'execute-task',
+      hostRuntime: 'codex',
+      workerEngine: 'native',
+      platform,
+    }));
+    for (const [index, result] of results.entries()) {
+      assertEqual(result.host_runtime, 'codex', `platform ${['win32', 'darwin', 'linux'][index]} keeps host`);
+      assertEqual(result.resolved_worker_engine, 'codex', `platform ${['win32', 'darwin', 'linux'][index]} resolves native`);
+      assertEqual(result.dispatch_allowed, true, `platform ${['win32', 'darwin', 'linux'][index]} allows dispatch`);
+    }
+    assertEqual(JSON.stringify(results[0]), JSON.stringify(results[1]), 'Windows/macOS decisions are identical');
+    assertEqual(JSON.stringify(results[1]), JSON.stringify(results[2]), 'macOS/Linux decisions are identical');
+    cleanup(f);
+  });
+
+  runCase('implicit Codex-to-Codex sidecar is refused before dispatch', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'codex', workerMode: 'sidecar',
+    });
+    assertEqual(r.dispatch_allowed, false, 'implicit same-host sidecar is refused');
+    assertEqual(r.dispatch_reason_code, 'implicit-recursion-refused', 'recursion refusal uses stable reason code');
+    assertEqual(r.worker_reason_code, 'implicit-recursion-refused', 'worker diagnostic matches dispatch refusal');
+    cleanup(f);
+  });
+
+  runCase('explicitly declared same-host sidecar remains representable', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'codex', workerEngine: 'codex', workerMode: 'sidecar', sidecarDeclared: true,
+    });
+    assertEqual(r.dispatch_allowed, true, 'declared same-host sidecar is allowed by the contract');
+    assertEqual(r.sidecar_declared, true, 'declaration is emitted');
+    assertEqual(r.resolved_worker_engine, 'codex', 'declared sidecar keeps its Codex target');
+    assertEqual(r.worker_reason_code, 'sidecar-declared', 'declared sidecar reason is stable');
+    cleanup(f);
+  });
+
+  runCase('cross-host sidecar requires an explicit declaration without fallback', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, {
+      unitType: 'execute-task', hostRuntime: 'claude', workerEngine: 'codex', workerMode: 'sidecar',
+    });
+    assertEqual(r.dispatch_allowed, false, 'undeclared cross-host sidecar is refused');
+    assertEqual(r.dispatch_reason_code, 'sidecar-declaration-required', 'cross-host refusal is stable');
+    assertEqual(r.resolved_worker_engine, '', 'refusal does not choose a fallback worker');
+    cleanup(f);
+  });
+
+  runCase('unknown host is a deterministic resolver refusal, never a Claude fallback', () => {
+    const f = mkFixture({});
+    const r = dispatch(f, { unitType: 'execute-task', hostRuntime: 'unknown-host' });
+    assertEqual(r.dispatch_allowed, false, 'unknown host is refused');
+    assertEqual(r.dispatch_reason_code, 'invalid-host-runtime', 'unknown host reason is stable');
+    assertEqual(r.host_runtime, 'unknown-host', 'refusal echoes the requested host for diagnosis');
+    assertEqual(r.resolved_worker_engine, '', 'unknown host does not fall back to Claude');
+    cleanup(f);
+  });
+
+  runCase('CLI represents an explicitly declared sidecar', () => {
+    const f = mkFixture({});
+    const cli = spawnSync('node', [SCRIPT, '--json', '--unit-type', 'execute-task', '--host-runtime', 'codex', '--worker-engine', 'codex', '--worker-mode', 'sidecar', '--sidecar-declared', '--cwd', f.dir], { encoding: 'utf8', env: cliEnv });
+    let parsed = null;
+    try { parsed = JSON.parse(cli.stdout); } catch (error) { fail('sidecar CLI stdout is valid JSON', error.message); }
+    assertEqual(cli.status, 0, 'declared sidecar CLI exits zero');
+    assert(parsed && parsed.dispatch_allowed === true, 'declared sidecar CLI permits dispatch', cli.stdout);
+    assert(parsed && parsed.worker_reason_code === 'sidecar-declared', 'declared sidecar CLI reports its reason', cli.stdout);
     cleanup(f);
   });
 });

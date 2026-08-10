@@ -281,12 +281,14 @@ function acquireWithRetry(cwd, filePath, runId, sessionId, opts) {
     if (result.acquired) {
       const capturedRunId = runId;
       const capturedCwd   = cwd;
+      const capturedOwnerToken = result.owner_token;
+      const capturedGeneration = result.generation;
       return {
         acquired:  true,
         runId,
         sessionId,
         release: function() {
-          return releaseFileLock(capturedCwd, filePath, capturedRunId);
+          return releaseFileLock(capturedCwd, filePath, capturedRunId, capturedOwnerToken, capturedGeneration);
         },
       };
     }

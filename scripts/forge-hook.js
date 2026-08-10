@@ -244,10 +244,22 @@ const validateForgeSubagentResult = (data) => {
   if (!message.includes('---GSD-WORKER-RESULT---')) {
     return {
       ok: false,
+      // The wording matters more than it looks. The previous text said "only
+      // inspect your current result and emit the missing structured block",
+      // which a compliant agent obeys literally: it emits the result block
+      // ALONE. For agents whose deliverable is inline prose in that same
+      // message (forge-advocate's per-objection verdicts, forge-reviewer's
+      // findings), the orchestrator then reads a scoreboard with the payload
+      // stripped off. That is a measured failure mode, not a hypothetical:
+      // M018 lost six advocate defenses this way, three of them returning
+      // exactly `refuted=3 conceded=2 open=1` and nothing else. So the repair
+      // instruction must ask for the COMPLETE answer while still forbidding
+      // the expensive part (re-running tools).
       reason: [
         `Forge contract missing for ${agentType}.`,
-        'Before stopping, append the required ---GSD-WORKER-RESULT--- block from your agent instructions.',
-        'Do not redo completed work; only inspect your current result and emit the missing structured block.',
+        'Re-emit your COMPLETE final answer in ONE message: every inline deliverable your agent instructions require (per-objection verdicts, findings, summary prose), followed by the ---GSD-WORKER-RESULT--- block.',
+        'Do not re-run tools or redo investigation — restate the conclusions you already reached.',
+        'A message containing only the result block discards your work: the orchestrator reads this message and nothing else.',
       ].join(' '),
     };
   }
@@ -631,14 +643,32 @@ process.stdin.on('end', () => {
             const r = resolveRunForSession(cwd, sessionId);
             if (r && r.active) {
               const rel = path.isAbsolute(filePath) ? path.relative(cwd, filePath) : filePath;
-              const result = filelock.acquireFileLock(cwd, rel, r.id, sessionId, { intent: toolName.toLowerCase() });
+              // The persisted token is the ownership proof.  Run/session IDs
+              // remain diagnostic and are only used to discover this run's
+              // identity for a reentrant edit.  The status API intentionally
+              // never exposes the persisted owner token.
+              const current = filelock.checkFileLock(cwd, rel);
+              const sameSession = current && current.held && current.holder &&
+                current.holder.run_id === r.id && current.holder.session_id === sessionId;
+              // A hook invocation cannot safely recover a private token from a
+              // public status read.  Treat the same active run/session as a
+              // reentrant owner and let the file-lock layer continue to fence
+              // competing run/session identities.
+              const result = sameSession ? { acquired: true, reentrant: true } :
+                filelock.acquireFileLock(cwd, rel, r.id, sessionId, { intent: toolName.toLowerCase() });
               if (!result.acquired) {
-                const h = result.holder;
-                const ageS = Math.round((h.age_ms || 0) / 1000);
-                blockMessage = `[forge-hook] Bloqueado: arquivo "${rel}" em uso por run ${h.run_id} há ${ageS}s. Aguarde ou execute /forge-pause ${h.run_id}.`;
+                if (result.reason === 'guard_busy') {
+                  blockMessage = `[forge-hook] Bloqueado: mutex do arquivo "${rel}" está ocupado; tente novamente.`;
+                } else {
+                  const h = result.holder || {};
+                  const ageS = Math.round((h.age_ms || 0) / 1000);
+                  blockMessage = `[forge-hook] Bloqueado: arquivo "${rel}" em uso por run ${h.run_id || 'desconhecido'} há ${ageS}s. Aguarde ou execute /forge-pause ${h.run_id || ''}.`;
+                }
               }
             }
-          } catch { /* silent — filelock is defensive, never crash hook */ }
+          } catch (error) {
+            blockMessage = `[forge-hook] Bloqueado: não foi possível validar o file-lock de "${filePath}" (${error.message}). Tente novamente.`;
+          }
         }
       }
 
