@@ -43,6 +43,18 @@ try {
   assert(relocated.written.some((item) => item.destination === legacySkill), 'layout antigo tratado como user-owned');
   assert(fs.readFileSync(legacySkill, 'utf8').startsWith('---'));
   fs.writeFileSync(path.join(codex, 'config.toml'), 'operator = true\n'); const preserved = renderer.write({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge }); assert(preserved.conflicts.some((item) => item.destination.endsWith(path.join('Codex Home Ω', 'config.toml')))); assert.match(fs.readFileSync(path.join(codex, 'config.toml'), 'utf8'), /operator/);
+
+  // The ownership probe is anchored to the accepted positions, so a user-owned
+  // document that merely QUOTES the marker stays theirs. Behavioural on purpose:
+  // hasOrigin is internal, and what has to hold is that write() refuses to touch
+  // the file — an unanchored probe classifies it as a projection and overwrites it.
+  const operatorDoc = path.join(codex, 'skills', 'forge-help', 'SKILL.md');
+  const operatorText = '# Notas do operador\n\nO marcador tem esta forma:\n\n```md\n<!-- forge-source:codex -->\n```\n';
+  fs.writeFileSync(operatorDoc, operatorText);
+  const quoted = renderer.write({ repo: root, projectRoot: project, codexHome: codex, forgeHome: forge });
+  assert(quoted.conflicts.some((item) => item.destination === operatorDoc), 'documento que apenas cita o marcador foi tratado como projeção');
+  assert.strictEqual(fs.readFileSync(operatorDoc, 'utf8'), operatorText, 'arquivo do operador foi sobrescrito');
+  fs.rmSync(operatorDoc, { force: true });
   const dry = renderer.write({ repo: root, projectRoot: project, codexHome: path.join(temp, 'dry codex'), forgeHome: path.join(temp, 'dry forge'), dryRun: true }); assert.strictEqual(dry.dry_run, true); assert(!fs.existsSync(path.join(temp, 'dry codex')));
   assert.throws(() => renderer.render({ repo: root, codexHome: path.join(temp, '.claude') }), error => error.code === 'invalid_options' || error.code === 'host-isolation');
   console.log('forge-codex-renderer tests passed');

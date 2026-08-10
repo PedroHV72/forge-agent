@@ -79,11 +79,20 @@ function stripOriginHeader(content) {
   return text;
 }
 
-// Ownership probe: a managed projection carries the marker on its own line near
-// the top, in either accepted position. Using startsWith here would classify
-// every frontmatter-first projection as user-owned and silently stop updates.
+// Ownership probe: a managed projection carries the marker in one of the two
+// accepted positions, and nowhere else. Using startsWith here would classify every
+// frontmatter-first projection as user-owned and silently stop updates; using a
+// bare /m would do the opposite damage, classifying a USER file that merely quotes
+// the marker (a doc with it in a fenced block) as generated, and overwriting it.
+// So this reuses the same two anchors stripOriginHeader uses — one rule, one pair
+// of regexes, no second copy to drift.
+//
+// The content is normalized first because this probe, unlike stripOriginHeader,
+// runs against raw bytes read off disk: a CRLF file would fail `[ \t]*\n` and be
+// misread as user-owned, which is the exact silent-stop this fix exists to avoid.
 function hasOriginMarker(content) {
-  return /^<!-- forge-source:[^\n]* -->/m.test(String(content).slice(0, 4096));
+  const text = normalizeNewlines(String(content));
+  return MARKER_AT_TOP.test(text) || MARKER_AFTER_FRONTMATTER.test(text);
 }
 
 function walk(root) {

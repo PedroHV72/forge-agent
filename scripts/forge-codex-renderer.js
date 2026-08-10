@@ -17,9 +17,16 @@ const REASON = Object.freeze({ unavailable: 'unavailable', user_owned: 'user_own
 function norm(value) { return String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
 function tomlOrigin(kind) { return `${TOML_ORIGIN}-${kind} version=${VERSION}`; }
 // YAML frontmatter must remain on line 1, so the marker sits below the closing
-// fence when there is one. Ownership therefore probes for a marker line near the
-// top instead of requiring it to be the very first byte.
+// fence when there is one. Ownership therefore probes the accepted positions
+// rather than requiring the marker to be the very first byte.
 const FRONTMATTER = /^---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|$)/;
+// The three positions a managed projection can carry its marker in — markdown at
+// the top (no frontmatter), markdown right below the closing fence, and TOML on
+// line 1. Anchored on purpose: a USER file that merely quotes the marker in a
+// fenced block is not a projection, and classifying it as one overwrites it.
+const MD_MARKER_AT_TOP = /^<!-- forge-source:[^\n]* -->[ \t]*\n\n?/;
+const MD_MARKER_AFTER_FRONTMATTER = /^(---[ \t]*\n[\s\S]*?\n---[ \t]*\n)\n?<!-- forge-source:[^\n]* -->[ \t]*\n/;
+const TOML_MARKER_AT_TOP = /^# forge-source:[^\n]*\n/;
 function withOrigin(value) {
   const body = norm(value);
   const fence = FRONTMATTER.exec(body);
@@ -27,8 +34,8 @@ function withOrigin(value) {
   return `${ORIGIN}\n\n${body}`;
 }
 function hasOrigin(value) {
-  const head = String(value).slice(0, 4096);
-  return /^<!-- forge-source:/m.test(head) || /^# forge-source:/m.test(head);
+  const text = norm(String(value));
+  return MD_MARKER_AT_TOP.test(text) || MD_MARKER_AFTER_FRONTMATTER.test(text) || TOML_MARKER_AT_TOP.test(text);
 }
 function exists(file) { try { return fs.existsSync(file); } catch (_) { return false; } }
 function walk(root) {
