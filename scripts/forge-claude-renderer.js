@@ -42,6 +42,28 @@ function isProtectedPath(value) {
   return relativeParts(value).some((part) => part === '.gsd');
 }
 
+// Destinations Forge AUGMENTS but does not own, keyed by basename so a manifest rename
+// cannot silently retire the guard.
+//
+// `--migrate-legacy` exists to adopt an unmarked file that IS ours — a projection
+// installed before markers existed. It must never adopt a file that was never a
+// projection. `settings.json` is the operator's own Claude Code config: Forge contributes
+// its `hooks`/`statusLine` keys through `scripts/merge-settings.js`, which is idempotent
+// and preserves every other key by design.
+//
+// Measured 2026-08-11, on a real `install.sh --update --migrate-legacy`: rendering this
+// destination wholesale replaced a 60-line operator config with the 16-line template,
+// destroying `statusLine`, seven of the eight hook events, `permissions` and
+// `skipDangerousModePermissionPrompt`. The file was NOT in either backup the same run
+// created — it was overwritten without ever being copied, so the loss was unrecoverable.
+// The template's own comment claimed "Operator settings remain user-owned" while this
+// happened, which is why the guard lives in code and not in prose.
+const OPERATOR_OWNED_BASENAMES = new Set(['settings.json']);
+
+function isOperatorOwned(destination) {
+  return OPERATOR_OWNED_BASENAMES.has(path.basename(String(destination)));
+}
+
 function isMarkdown(file) {
   return /\.(?:md|markdown)$/i.test(file);
 }
@@ -240,6 +262,15 @@ function write(options = {}) {
     const current = exists(destination) ? fs.readFileSync(destination, 'utf8') : null;
     const generated = artifact.content;
     if (current !== null && current === generated) { preserved.push({ ...artifact, reason: 'already-current' }); continue; }
+    // Checked BEFORE the user-owned branch, and deliberately NOT subject to the
+    // `--migrate-legacy` escape below: migrate-legacy adopts unmarked files that are ours,
+    // and this destination is never ours to adopt. Only an existing file is protected —
+    // a fresh install with nothing on disk still gets the projection.
+    if (current !== null && isOperatorOwned(destination)) {
+      preserved.push({ ...artifact, reason: REASON.USER_OWNED });
+      conflicts.push({ destination, source_id: artifact.source_id, reason: REASON.USER_OWNED });
+      continue;
+    }
     if (current !== null && !hasOriginMarker(current) && !(options.update && options.migrateLegacy)) {
       preserved.push({ ...artifact, reason: REASON.USER_OWNED });
       conflicts.push({ destination, source_id: artifact.source_id, reason: REASON.USER_OWNED });

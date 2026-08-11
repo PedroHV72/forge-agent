@@ -310,10 +310,17 @@ function render(report) {
   else lines.push(`${report.changed ? 'Installed' : 'No changes'}; ${report.plan.length} operation(s).`);
   if (report.app) lines.push(`App: ${report.app.status}${report.app.reason ? ` (${report.app.reason})` : ''}`);
   if (report.backup) lines.push(`Backup: ${report.backup}`);
-  const conflicts = report.manifest && report.manifest.adapters
-    ? Object.values(report.manifest.adapters).reduce((total, adapter) => total + (Array.isArray(adapter.conflicts) ? adapter.conflicts.length : 0), 0)
-    : 0;
-  if (conflicts) lines.push(`Conflicts preserved: ${conflicts}; use --migrate-legacy to replace unmarked legacy projections.`);
+  // Two kinds of preserved conflict, and only ONE of them has `--migrate-legacy` as its
+  // remedy. An operator-owned destination (settings.json) is preserved even WITH that flag,
+  // so pointing the operator at it there would promise a fix that cannot work — and would
+  // invite exactly the re-run that destroys the file the guard just saved.
+  const allConflicts = report.manifest && report.manifest.adapters
+    ? Object.values(report.manifest.adapters).flatMap((adapter) => (Array.isArray(adapter.conflicts) ? adapter.conflicts : []))
+    : [];
+  const operatorOwned = allConflicts.filter((item) => path.basename(String(item && item.destination || '')) === 'settings.json');
+  const legacy = allConflicts.length - operatorOwned.length;
+  if (legacy) lines.push(`Conflicts preserved: ${legacy}; use --migrate-legacy to replace unmarked legacy projections.`);
+  if (operatorOwned.length) lines.push(`Operator-owned preserved: ${operatorOwned.length} (settings.json) — Forge never replaces it; use scripts/merge-settings.js to add Forge's hooks/statusLine keys.`);
   return lines.join('\n') + '\n';
 }
 
