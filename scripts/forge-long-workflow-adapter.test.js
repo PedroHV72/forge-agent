@@ -40,6 +40,25 @@ const exit = adapter.main(['--host', 'codex', '--mode', 'auto', '--command', 'st
 assert.strictEqual(exit, 0, stderr);
 assert.strictEqual(JSON.parse(stdout).adapter_runtime, 'codex');
 
+// The exact standalone-task repro from the field report. Before the named
+// refusal this exited 1 with `invalid-request` thrown by the delegate, leaving
+// the operator to choose between ignoring the authority layer and borrowing an
+// unrelated milestone. The CLI must answer, not throw — and answer without
+// reaching forge-orchestrate (no fixture, no cwd, no fake controller here).
+const refusals = {};
+for (const host of ['claude', 'codex']) {
+  let looseStdout = ''; let looseStderr = '';
+  const looseExit = adapter.main(['--host', host, '--mode', 'task', '--command', 'next', '--json', '{"workflow_id":"loose"}'], (value) => { looseStdout += value; }, (value) => { looseStderr += value; });
+  assert.strictEqual(looseExit, 0, looseStderr);
+  const looseResult = JSON.parse(looseStdout).result;
+  assert.strictEqual(looseResult.reason_code, 'task-scope-unsupported');
+  assert.strictEqual(looseResult.outcome, 'blocked');
+  assert.strictEqual(looseResult.action, 'stop');
+  assert.strictEqual(looseResult.controller_result, null);
+  refusals[host] = { ...looseResult, host_runtime: null, snapshot: { ...looseResult.snapshot, host_runtime: null } };
+}
+assert.deepStrictEqual(refusals.claude, refusals.codex, 'the refusal must not depend on the host');
+
 const source = require('fs').readFileSync(require('path').join(__dirname, 'forge-long-workflow-adapter.js'), 'utf8');
 assert.strictEqual(/child_process|\bspawn(?:Sync)?\s*\(/.test(source), false, 'adapter must not spawn');
 const executableSource = source.replace(/^\s*\/\/.*$/gm, '');

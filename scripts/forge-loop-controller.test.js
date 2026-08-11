@@ -66,7 +66,11 @@ try {
   assert.strictEqual(ownerB.outcome, 'blocked');
   assert.strictEqual(ownerB.reason_code, 'lease-active');
 
-  // Task mode is the same controller with a one-unit budget and terminal resume.
+  // Task mode over a MILESTONE unit: the same controller with a one-unit budget
+  // and terminal resume. `input()` supplies a milestone and a milestone-shaped
+  // inventory, so this covers the budget/terminal semantics only — never a
+  // standalone task. That gap is what let the missing selection path ship green;
+  // the block further below is what actually exercises it.
   const taskCwd = setup('darwin', 'codex');
   const task = loop.advance(loop.create({ mode: 'task', workflow_id: 'task-one', host_runtime: 'codex' }), 'pause', input(taskCwd, 'task-owner', 'task-one'));
   assert.strictEqual(task.lifecycle, 'paused');
@@ -74,6 +78,36 @@ try {
   assert.strictEqual(taskDone.lifecycle, 'completed');
   assert.strictEqual(taskDone.action, 'stop');
   assert.strictEqual(loop.advance(taskDone.snapshot, 'next', input(taskCwd)).reason_code, 'workflow-terminal');
+
+  // A STANDALONE task (no milestone) has no selectable unit in this layer and is
+  // refused by name — not by a generic invalid-request thrown from the delegate.
+  const looseCwd = setup('linux', 'claude');
+  const loose = { cwd: looseCwd, owner_token: 'loose-owner', idempotency_key: 'loose-1', prefsReader };
+  const refused = loop.advance(loop.create({ mode: 'task', workflow_id: 'loose-task', host_runtime: 'claude' }), 'next', loose);
+  assert.strictEqual(refused.outcome, 'blocked');
+  assert.strictEqual(refused.reason_code, 'task-scope-unsupported');
+  assert.strictEqual(refused.action, 'stop');
+  assert.strictEqual(refused.unit, null);
+  assert.strictEqual(refused.controller_result, null, 'refusal must never reach forge-orchestrate');
+  // The request is refused, the workflow is untouched: no transition, no step
+  // consumed, and a repeat answers identically instead of decaying to terminal.
+  assert.strictEqual(refused.lifecycle, 'idle');
+  assert.strictEqual(refused.snapshot.step_count, 0);
+  assert.deepStrictEqual(loop.advance(refused.snapshot, 'next', loose), refused);
+  assert.strictEqual(loop.advance(loop.create({ mode: 'task', workflow_id: 'loose-pause', host_runtime: 'claude' }), 'pause', loose).reason_code, 'task-scope-unsupported');
+  // Nothing durable may be written for a request that was never delegated.
+  for (const dir of ['leases', 'transactions', 'boundaries', 'results']) {
+    assert.strictEqual(fs.existsSync(path.join(looseCwd, '.gsd', 'forge', dir)), false, `refusal must not write .gsd/forge/${dir}`);
+  }
+  // `auto` deliberately keeps throwing: there a milestone always exists, so its
+  // absence is a caller bug. Asserted so nobody quiets it for symmetry.
+  assert.throws(() => loop.advance(loop.create({ mode: 'auto', workflow_id: 'auto-no-milestone', host_runtime: 'claude' }), 'next', loose), (error) => error.code === 'invalid-request');
+  // Positive control: the guard must not blanket-refuse task mode. A task unit
+  // scoped to a milestone still dispatches exactly as before.
+  const scopedCwd = setup('win32', 'codex');
+  const scoped = loop.advance(loop.create({ mode: 'task', workflow_id: 'scoped-task', host_runtime: 'codex' }), 'next', input(scopedCwd, 'scoped-owner', 'scoped-1'));
+  assert.strictEqual(scoped.outcome, 'dispatch_required');
+  assert.strictEqual(scoped.unit.key, 'execute-task/T01');
 
   assert.throws(() => loop.advance(loop.create({ mode: 'auto', workflow_id: 'host-lock', host_runtime: 'claude' }), 'next', { ...input(setup('linux', 'claude')), host_runtime: 'codex' }), (error) => error.code === 'host-runtime-mismatch');
   assert.throws(() => loop.create({ mode: 'unknown', workflow_id: 'bad', host_runtime: 'claude' }), (error) => error.code === 'invalid-mode');

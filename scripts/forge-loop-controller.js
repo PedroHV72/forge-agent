@@ -69,10 +69,29 @@ function delegateInput(input, state) {
   delete payload.max_steps; delete payload.maxSteps; delete payload.snapshot;
   return payload;
 }
+// forge-orchestrate selects units *inside* a milestone: every branch of
+// selectNextUnit reads that milestone's roadmap/slices, and forge-state only
+// knows `.gsd/milestones/<id>/<id>-STATE.md`. A standalone task lives in
+// `.gsd/tasks/<id>/` with no STATE and no roadmap, so this layer has nothing to
+// select for it. Borrowing a real milestone id is worse than useless: measured,
+// it dispatches THAT milestone's next unit and commits a lease + transaction
+// against it. Name the refusal instead of letting the delegate throw a generic
+// `invalid-request` — an unreachable path has to be readable by machine, not
+// only by prose. `auto` is deliberately NOT guarded: there a milestone always
+// exists, so its absence is a caller bug and must stay loud.
+// What is refused is the request shape, not the workflow — no lease was taken
+// and no step consumed, so the snapshot does not transition and a repeat
+// returns the same answer (the idempotency invariant in shared/forge-lifecycle.md).
+function taskScopeRefusal(state, input, command) {
+  if (state.mode !== 'task' || (input && input.milestone)) return null;
+  return publicResult(command, state, 'blocked', 'task-scope-unsupported', 'stop', null);
+}
 function next(state, input, orchestrate) {
   if (state.lifecycle === 'dispatch_required' && state.last_decision) return { ...state.last_decision, snapshot: state };
   if (state.lifecycle === 'paused') return publicResult('next', state, 'needs_input', 'pause-active', 'pause', null);
   if (TERMINAL.has(state.lifecycle)) return publicResult('next', state, state.lifecycle, 'workflow-terminal', 'stop', null);
+  const refusedNext = taskScopeRefusal(state, input, 'next');
+  if (refusedNext) return refusedNext;
   if (state.step_count >= state.max_steps) {
     state.lifecycle = 'blocked';
     return publicResult('next', state, 'blocked', 'step-budget-exhausted', 'stop', null);
@@ -99,6 +118,8 @@ function next(state, input, orchestrate) {
 function pause(state, input, orchestrate) {
   if (state.lifecycle === 'paused') return publicResult('pause', state, 'needs_input', 'already-paused', 'pause', null);
   if (TERMINAL.has(state.lifecycle)) return publicResult('pause', state, state.lifecycle, 'workflow-terminal', 'stop', null);
+  const refusedPause = taskScopeRefusal(state, input, 'pause');
+  if (refusedPause) return refusedPause;
   const delegated = orchestrate.run('next', { ...delegateInput(input, state), needs_input: true });
   if (delegated.outcome !== 'needs_input' || !delegated.boundary) {
     state.lifecycle = delegated.outcome === 'failed' ? 'failed' : 'blocked';

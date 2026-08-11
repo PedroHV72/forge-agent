@@ -4,20 +4,33 @@ description: "Task autonoma sem milestone — brainstorm, discuss, plan, execute
 allowed-tools: Read, Write, Edit, Bash, Agent, Skill, AskUserQuestion, TaskCreate, TaskUpdate, TaskList, TaskStop, SendMessage, WebSearch, WebFetch
 ---
 
-## Provider-neutral loop authority (S07)
+## Provider-neutral loop authority (S07) — does NOT govern this skill
 
-Read `shared/forge-lifecycle.md` before task intake. Resolve the current host
-explicitly as `claude|codex`, then call
-`scripts/forge-long-workflow-adapter.js` with `--mode task`. Preserve the
-returned `snapshot`; task mode has a one-unit budget and reaches a terminal
-boundary after resume/completion.
+Read `shared/forge-lifecycle.md § milestone-scoped`. The S07 loop authority
+(`scripts/forge-long-workflow-adapter.js`, `--mode auto|task`) is **milestone-
+scoped in both modes**: `task` there means a milestone unit with a one-unit
+budget, not a second selection domain. A standalone task — everything this skill
+creates, under `.gsd/tasks/{TASK_ID}/` — has no STATE file and no roadmap, and
+`forge-orchestrate` has no branch that can select it. **So this skill owns its
+own lifecycle, start to finish.** Dispatch authority for S07 lives in
+`/forge-auto` and `/forge-next`, never here.
 
-The adapter action is authoritative: `dispatch` permits the existing body below
-to execute only that unit; `pause` yields at its durable boundary; `stop` ends.
-The host-specific prose may collect/present data and invoke the chosen host, but
-must not select again, acquire another lease, infer a worker/model or fall back
-to another host. A host change is valid only through explicit `resume` with the
-persisted boundary. Lifecycle ownership remains in `forge-orchestrate`.
+That is a declared boundary, not an omission to route around:
+
+- **Never pass a milestone id to reach a dispatch.** Measured: the adapter then
+  selects *that milestone's* next unit and commits a lease + transaction against
+  it — unrelated work dispatched, and a durable trace left on someone else's run.
+- Calling `--mode task --command next` **without** a milestone returns
+  `outcome: blocked`, `reason_code: task-scope-unsupported`, `action: stop`,
+  snapshot unchanged. That is the layer answering correctly. Treat it as
+  confirmation to continue with the body below — not as an error to retry, and
+  not as a cue to improvise a milestone.
+
+The provider rules that still bind the body are S06's, not S07's: run the task on
+one explicitly resolved host, and never infer a worker/model or silently fall
+back to another host. Any future dispatch path for standalone tasks has to be
+built in `forge-orchestrate` (task-shaped state + selector + lease keying) and
+declared here — never simulated from this prose.
 
 ## Parse arguments
 
