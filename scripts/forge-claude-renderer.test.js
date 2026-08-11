@@ -168,6 +168,42 @@ try {
   const unsafe = manifestFor(root);
   unsafe.sources[0].render_targets[0].path = '../outside';
   assert.throws(() => renderer.render({ repo: root, manifest: unsafe }), /destino|path inseguro/);
+
+  // settings.json is the operator's Claude Code config, not a Forge projection. This is
+  // the ONLY assertion standing between a `--migrate-legacy` and an unrecoverable wipe of
+  // the operator's statusLine/hooks/permissions — measured on a real run, 2026-08-11, with
+  // no backup taken. The `--migrate-legacy` flag is what makes this a separate guard from
+  // the user-owned check beside it: that check alone is bypassed by exactly this flag.
+  {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-settings-owned-'));
+    const claudeHome = path.join(home, 'Claude Home Ω');
+    const operatorSettings = path.join(claudeHome, 'settings.json');
+    const operatorText = JSON.stringify({
+      statusLine: { type: 'command', command: 'node ~/.claude/forge-statusline.js' },
+      permissions: { allow: ['Bash(node:*)'] },
+      hooks: { PostToolUse: [{ matcher: 'Agent', hooks: [] }] },
+    }, null, 2);
+    fs.mkdirSync(claudeHome, { recursive: true });
+    fs.writeFileSync(operatorSettings, operatorText, 'utf8');
+
+    const opts = { repo: root, projectRoot: path.join(home, 'proj'), claudeHome, forgeHome: path.join(home, 'Forge Home Ω') };
+    for (const [label, extra] of [['update', { update: true }], ['migrate-legacy', { update: true, migrateLegacy: true }]]) {
+      const report = renderer.write({ ...opts, ...extra });
+      assert.strictEqual(fs.readFileSync(operatorSettings, 'utf8'), operatorText,
+        `${label} sobrescreveu settings.json do operador`);
+      assert(report.conflicts.some((item) => item.destination === operatorSettings),
+        `${label} não reportou settings.json como conflito preservado`);
+    }
+
+    // The other half of the contract: a FRESH install (nothing on disk) still projects it,
+    // so the guard protects an existing operator file without disabling the surface.
+    fs.rmSync(operatorSettings, { force: true });
+    renderer.write({ ...opts, update: true, migrateLegacy: true });
+    assert(fs.existsSync(operatorSettings), 'instalação limpa deixou de projetar settings.json');
+    JSON.parse(fs.readFileSync(operatorSettings, 'utf8')); // strict JSON — a `//` comment here is a defect
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+
   console.log('forge-claude-renderer tests passed');
 } finally {
   cleanup();

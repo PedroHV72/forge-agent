@@ -1,5 +1,4 @@
 {
-  // Forge owns only this hook entry. Operator settings remain user-owned.
   "hooks": {
     "PreToolUse": [
       {
