@@ -5342,6 +5342,13 @@ function smokeDomainEmission() {
   assert(!/Dimension 11/.test(planCheckerTxt),
     '(j) agents/forge-plan-checker.md NÃO contém "Dimension 11" (extensão aditiva à dim-7, sem 11ª dimensão)',
     'ocorrência inesperada de "Dimension 11"');
+
+  // (k) CRLF real em disco (T-20260811190103) — extractFrontmatter normaliza
+  // \r\n?/\n na entrada; um arquivo CRLF real (formato exato da repro do
+  // brief), não apenas conteúdo sintetizado LF, deve ler legacy:false/valid:true.
+  const rK = runCheck(structuredWith('domain: backend').replace(/\n/g, '\r\n'));
+  assert(rK.status === 0 && rK.parsed && rK.parsed.legacy === false && rK.parsed.valid === true && rK.parsed.domain === 'backend',
+    '(k) plano CRLF real em disco → legacy:false, valid:true, domain:"backend" preservado', JSON.stringify(rK));
 }
 
 // ── Section 35: guard de integração 3-família (gemini) + R5 whitelist ──────
