@@ -5342,6 +5342,26 @@ function smokeDomainEmission() {
   assert(!/Dimension 11/.test(planCheckerTxt),
     '(j) agents/forge-plan-checker.md NÃO contém "Dimension 11" (extensão aditiva à dim-7, sem 11ª dimensão)',
     'ocorrência inesperada de "Dimension 11"');
+
+  // (k) CRLF real em disco (T-20260811190103) — extractFrontmatter normaliza
+  // \r\n?/\n na entrada; um arquivo CRLF real (formato exato da repro do
+  // brief), não apenas conteúdo sintetizado LF, deve ler legacy:false/valid:true.
+  const rK = runCheck(structuredWith('domain: backend').replace(/\n/g, '\r\n'));
+  assert(rK.status === 0 && rK.parsed && rK.parsed.legacy === false && rK.parsed.valid === true && rK.parsed.domain === 'backend',
+    '(k) plano CRLF real em disco → legacy:false, valid:true, domain:"backend" preservado', JSON.stringify(rK));
+
+  // (l) BOM real em disco — a outra metade da mesma classe. Um editor Windows
+  // grava UTF-8 com BOM; `^---` erra, o plano lê como legacy, o gate enforcing
+  // desliga E o `domain` some (degradando o routing de `routing.<domain>`).
+  // Cobre BOM+LF e BOM+CRLF, que é o que Notepad + autocrlf produzem juntos.
+  for (const [rotulo, transform] of [
+    ['BOM+LF', (t) => '\uFEFF' + t],
+    ['BOM+CRLF', (t) => '\uFEFF' + t.replace(/\n/g, '\r\n')],
+  ]) {
+    const rL = runCheck(transform(structuredWith('domain: backend')));
+    assert(rL.status === 0 && rL.parsed && rL.parsed.legacy === false && rL.parsed.valid === true && rL.parsed.domain === 'backend',
+      `(l) plano ${rotulo} real em disco → legacy:false, valid:true, domain:"backend" preservado`, JSON.stringify(rL));
+  }
 }
 
 // ── Section 35: guard de integração 3-família (gemini) + R5 whitelist ──────
