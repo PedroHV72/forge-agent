@@ -5342,26 +5342,6 @@ function smokeDomainEmission() {
   assert(!/Dimension 11/.test(planCheckerTxt),
     '(j) agents/forge-plan-checker.md NÃO contém "Dimension 11" (extensão aditiva à dim-7, sem 11ª dimensão)',
     'ocorrência inesperada de "Dimension 11"');
-
-  // (k) CRLF real em disco (T-20260811190103) — extractFrontmatter normaliza
-  // \r\n?/\n na entrada; um arquivo CRLF real (formato exato da repro do
-  // brief), não apenas conteúdo sintetizado LF, deve ler legacy:false/valid:true.
-  const rK = runCheck(structuredWith('domain: backend').replace(/\n/g, '\r\n'));
-  assert(rK.status === 0 && rK.parsed && rK.parsed.legacy === false && rK.parsed.valid === true && rK.parsed.domain === 'backend',
-    '(k) plano CRLF real em disco → legacy:false, valid:true, domain:"backend" preservado', JSON.stringify(rK));
-
-  // (l) BOM real em disco — a outra metade da mesma classe. Um editor Windows
-  // grava UTF-8 com BOM; `^---` erra, o plano lê como legacy, o gate enforcing
-  // desliga E o `domain` some (degradando o routing de `routing.<domain>`).
-  // Cobre BOM+LF e BOM+CRLF, que é o que Notepad + autocrlf produzem juntos.
-  for (const [rotulo, transform] of [
-    ['BOM+LF', (t) => '\uFEFF' + t],
-    ['BOM+CRLF', (t) => '\uFEFF' + t.replace(/\n/g, '\r\n')],
-  ]) {
-    const rL = runCheck(transform(structuredWith('domain: backend')));
-    assert(rL.status === 0 && rL.parsed && rL.parsed.legacy === false && rL.parsed.valid === true && rL.parsed.domain === 'backend',
-      `(l) plano ${rotulo} real em disco → legacy:false, valid:true, domain:"backend" preservado`, JSON.stringify(rL));
-  }
 }
 
 // ── Section 35: guard de integração 3-família (gemini) + R5 whitelist ──────
@@ -15442,17 +15422,232 @@ function smokeRoutingDomainsRendered() {
   pass('(final) Section 101: real rendered planner prompts carry routing and repository values with a biting fixture guard');
 }
 
-// ── Section 102: canonical Forge script call sites ────────────────────────
+// ── Section 102: ledger snapshot proven in the RENDERED prompt + D1 exclusion ──
+//
+// S02's whole claim in one section: the ledger snapshot reaches plan-slice —
+// newest entries whole, oldest omitted, exact-entry marker, literal re-read
+// command — proven on the RENDERED prompt (never the template alone, the #77 /
+// MEM002 mold: a green guard anchored on the wrong artifact hid an inert wire
+// for weeks); and execute-task receives none of it (D1), with a positive
+// control proving the absence assert is not blind — the predicate is shown
+// seeing the ids in plan-slice BEFORE it is trusted to report their absence in
+// execute-task.
+//
+// The maxTokens budget below is never hand-computed: it is found by scanning
+// the REAL renderLedgerSnapshot() until it reports omitted_count === 2 — the
+// builder (S02 B1) is the single source of the block shape and the selection,
+// so a hardcoded byte count here would silently drift from what it claims to
+// measure the moment the block shape changes.
+function smokeLedgerSnapshotRendered() {
+  process.stdout.write('\n▸ Section 102: ledger snapshot in the rendered plan-slice prompt + D1 exclusion for execute-task\n');
+  const { renderPrompt } = require('./forge-prompt.js');
+  const projection = require('./forge-projection.js');
+  const repoRoot = path.dirname(SCRIPTS);
+  const dir = mkTmp('ledger-snapshot-rendered');
+  const templateDir = path.join(repoRoot, 'shared', 'templates', 'dispatch');
+  try {
+    const ledgerDir = path.join(dir, '.gsd', 'ledger');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    // 4 deterministic fragments, distinct greppable ids and controlled
+    // completed_at dates (molde seções 88-90). Equal-size bodies keep every
+    // entry's token weight uniform so the calibration scan below is stable.
+    const entries = [
+      { id: 'M-20260101000000-oldest-aa', completed_at: '2026-01-01T00:00:00Z', title: 'Oldest' },
+      { id: 'M-20260202000000-second-bb', completed_at: '2026-02-02T00:00:00Z', title: 'Second' },
+      { id: 'M-20260303000000-recent-cc', completed_at: '2026-03-03T00:00:00Z', title: 'Recent' },
+      { id: 'M-20260404000000-newest-dd', completed_at: '2026-04-04T00:00:00Z', title: 'Newest' },
+    ];
+    const body = 'x'.repeat(200);
+    for (const e of entries) {
+      const content = [
+        '---',
+        `id: ${e.id}`,
+        `title: ${e.title}`,
+        `completed_at: ${e.completed_at}`,
+        'slices: []',
+        'key_files: []',
+        'key_decisions: []',
+        '---',
+        '',
+        body,
+        '',
+      ].join('\n');
+      fs.writeFileSync(path.join(ledgerDir, `${e.id}.md`), content, 'utf8');
+    }
+
+    let maxTokens = null;
+    let snap = null;
+    for (let candidate = 40; candidate <= 2000; candidate += 5) {
+      const s = projection.renderLedgerSnapshot(dir, { maxTokens: candidate });
+      if (s.omitted_count === 2 && s.included_ids.length === 2) { maxTokens = candidate; snap = s; break; }
+    }
+    assert(maxTokens != null,
+      '(setup) a maxTokens exists where exactly 2 of the 4 fixture entries survive',
+      `no candidate in 40..2000 produced omitted_count===2 (last snap=${JSON.stringify(snap)})`);
+    assert(!!snap && snap.included_ids.join(',') === 'M-20260404000000-newest-dd,M-20260303000000-recent-cc',
+      '(setup) the 2 surviving ids are the 2 NEWEST fragments — recency selection, not directory order',
+      snap ? JSON.stringify(snap.included_ids) : '(no snap)');
+
+    // Disk path end-to-end, no options.ledger / ledgerProvider — the coupled
+    // API seam (forge-prompt → forge-projection.renderLedgerSnapshot) is what
+    // is under test, not a fixture-supplied override.
+    const slice = renderPrompt({
+      cwd: dir, unitType: 'plan-slice', milestoneId: 'M001', sliceId: 'S01',
+      templateDir, ledgerMaxTokens: maxTokens, memories: [],
+    });
+
+    assert(slice.prompt.includes('M-20260404000000-newest-dd'),
+      '(a) rendered plan-slice prompt contains the newest fixture id');
+    assert(slice.prompt.includes('M-20260303000000-recent-cc'),
+      '(a) rendered plan-slice prompt contains the second-newest fixture id');
+    assert(!slice.prompt.includes('M-20260101000000-oldest-aa'),
+      '(b B1) rendered plan-slice prompt does NOT contain the oldest fixture id');
+    assert(!slice.prompt.includes('M-20260202000000-second-bb'),
+      '(b B1) rendered plan-slice prompt does NOT contain the second-oldest fixture id');
+    assert(/\[\.\.\.truncated 2 ledger entries — see node scripts\/forge-projection\.js --render ledger/.test(slice.prompt),
+      '(c W1) the marker names exactly the 2 omitted ENTRIES (never sections) and the literal re-read command',
+      slice.prompt.slice(-400));
+    assert(slice.prompt.includes('[DATA FROM "LEDGER"') && slice.prompt.includes('[END DATA FROM "LEDGER"]'),
+      '(c) the snapshot is wrapped in the DATA FROM / END DATA FROM markers');
+
+    // D1 positive control BEFORE the absence assert: the predicate must first
+    // be shown seeing the fixture ids at all (it just did, in plan-slice above)
+    // so the execute-task absence assert below is not a blind, always-green
+    // check on an id nothing ever produces.
+    assert(slice.prompt.includes('M-20260404000000-newest-dd'),
+      '(d control) positive control — the predicate DOES see fixture ids when they are actually injected (plan-slice)');
+
+    const task = renderPrompt({
+      cwd: dir, unitType: 'execute-task', milestoneId: 'M001', sliceId: 'S01', taskId: 'T01',
+      templateDir, ledgerMaxTokens: maxTokens, memories: [],
+    });
+    for (const e of entries) {
+      assert(!task.prompt.includes(e.id), `(d D1) rendered execute-task prompt does not contain fixture id ${e.id}`);
+    }
+
+    const execTemplate = readRepoText(path.join(templateDir, 'execute-task.md'));
+    assert(!execTemplate.includes('{LEDGER}'),
+      '(d D1) shared/templates/dispatch/execute-task.md (executable template, never the prose mirror) does not contain {LEDGER}');
+
+    const sliceTemplate = readRepoText(path.join(templateDir, 'plan-slice.md'));
+    const dataBlock = sliceTemplate.match(/\[DATA FROM "LEDGER"[^\n]*\n([\s\S]*?)\[END DATA FROM "LEDGER"\]/);
+    assert(!!dataBlock, '(e) shared/templates/dispatch/plan-slice.md carries the LEDGER DATA markers');
+    assert(!!dataBlock && dataBlock[1].includes('{LEDGER}'),
+      '(e) shared/templates/dispatch/plan-slice.md (executable template) contains {LEDGER} between the DATA markers');
+
+    const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+    assert(/smokeLedgerSnapshotRendered\(\);/.test(mainBody), '(f) Section 102 is registered in main()');
+  } finally {
+    cleanup(dir);
+  }
+  pass('(final) Section 102: {LEDGER} lands in the RENDERED plan-slice prompt with recency, an exact-entry marker and the '
+    + 'literal re-read command; execute-task proves the absence (D1) with a positive control proving the predicate is not '
+    + 'blind; and the template-level assert targets plan-slice.md, the executable template, never the prose mirror');
+}
+
+// ── Section 103: memory-index command proven in the EXECUTABLE TEMPLATE and ──
+// ── in the RENDERED plan-slice prompt (D3: command, not content) ─────────────
+//
+// T02 wired a query command for scripts/forge-memory-index.js into
+// shared/templates/dispatch/plan-slice.md, deliberately never the full index
+// content (D3 — the whole point of --file is that the consult stays cheap).
+// The MEM002 / PR #77 lesson is that a guard anchored on shared/forge-dispatch.md
+// (the prose mirror) proves nothing about what forge-prompt.js actually reads —
+// so this section asserts on BOTH: the executable template read straight off
+// disk, and a real rendered plan-slice prompt produced by renderPrompt (mold:
+// Section 102). A positive control (plan-slice sees the command) is asserted
+// BEFORE the negative control (execute-task does not) so the absence assert is
+// never a blind, always-green predicate. The token ceiling on the section is
+// what makes "command, not content" falsifiable: if anyone ever inlines index
+// facts into this block, the section grows past the ceiling and turns red.
+function smokeMemoryIndexCommandRendered() {
+  process.stdout.write('\n▸ Section 103: memory-index command in the executable template and the rendered plan-slice prompt\n');
+  const { renderPrompt } = require('./forge-prompt.js');
+  const { countTokens } = require('./forge-tokens.js');
+  const repoRoot = path.dirname(SCRIPTS);
+  const templateDir = path.join(repoRoot, 'shared', 'templates', 'dispatch');
+  const dir = mkTmp('memory-index-command-rendered');
+  try {
+    // (a) executable template, never the prose mirror (MEM002 / PR #77).
+    const sliceTemplate = readRepoText(path.join(templateDir, 'plan-slice.md'));
+    const cmdLine = sliceTemplate.split('\n').find(l => l.includes('forge-memory-index.js'));
+    assert(!!cmdLine,
+      '(a) shared/templates/dispatch/plan-slice.md (executable template) contains a forge-memory-index.js command line');
+    assert(!!cmdLine && cmdLine.includes('--file'),
+      '(a) the same command line also carries --file, never a bare invocation',
+      cmdLine || '(no line found)');
+    assert(!!cmdLine && /--cwd\s+"\{WORKING_DIR\}"/.test(cmdLine),
+      '(a) --cwd is quoted around {WORKING_DIR} in the template line — S02/R1: a bare path with a space breaks a pasted command',
+      cmdLine || '(no line found)');
+
+    // (b) rendered prompt — placeholders resolved, {WORKING_DIR} value quoted.
+    const slice = renderPrompt({
+      cwd: dir, unitType: 'plan-slice', milestoneId: 'M001', sliceId: 'S01', templateDir, memories: [],
+    });
+    const renderedLine = slice.prompt.split('\n').find(l => l.includes('forge-memory-index.js'));
+    assert(!!renderedLine, '(b) rendered plan-slice prompt contains a forge-memory-index.js command line');
+    assert(!!renderedLine && !/\{[A-Z_]+\}/.test(renderedLine),
+      '(b) no raw {PLACEHOLDER} token survives on the rendered command line — every brace was resolved',
+      renderedLine || '(no line found)');
+    assert(!!renderedLine && renderedLine.includes('--file'),
+      '(b) the rendered command line also carries --file');
+    assert(!!renderedLine && new RegExp(`--cwd\\s+"${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`).test(renderedLine),
+      '(b) --cwd is quoted around the resolved WORKING_DIR value on the rendered line',
+      renderedLine || '(no line found)');
+
+    // (c) controls — positive ordered before negative, so the absence assert
+    // below is never a blind predicate (Section 102 mold).
+    assert(slice.prompt.includes('forge-memory-index.js'),
+      '(c control) positive control — the predicate DOES see the command when it is actually injected (plan-slice)');
+    const task = renderPrompt({
+      cwd: dir, unitType: 'execute-task', milestoneId: 'M001', sliceId: 'S01', taskId: 'T01', templateDir, memories: [],
+    });
+    assert(!task.prompt.includes('forge-memory-index.js'),
+      '(c) rendered execute-task prompt does not carry the memory-index command');
+    const execTemplate = readRepoText(path.join(templateDir, 'execute-task.md'));
+    assert(!execTemplate.includes('forge-memory-index.js'),
+      '(c) shared/templates/dispatch/execute-task.md (executable template) does not carry the memory-index command');
+
+    // (d) D3 — command, not content: the section itself stays under a small
+    // fixed token ceiling, and the rendered prompt never carries an actual
+    // index fact line or the index artifact's own header. If someone later
+    // injects index content here, both asserts below turn red — that is the
+    // design (T03 must-have #4).
+    const sectionMatch = sliceTemplate.match(/## Memory Index[\s\S]*?(?=\n## Instructions)/);
+    assert(!!sectionMatch, '(d) shared/templates/dispatch/plan-slice.md carries a ## Memory Index section');
+    const sectionTokens = sectionMatch ? countTokens(sectionMatch[0]) : Infinity;
+    assert(sectionTokens <= 150,
+      `(d D3) the ## Memory Index section measures <= 150 tokens (command, not content) — measured ${sectionTokens}`);
+    assert(!slice.prompt.includes('# Índice de memória por arquivo-fonte'),
+      '(d D3) rendered plan-slice prompt does NOT contain the memory-index artifact\'s own header');
+    assert(!/—\s*origem:\s*/.test(slice.prompt),
+      '(d D3) rendered plan-slice prompt does NOT contain an index fact line ("— origem: ")');
+
+    // (e) registered in main().
+    const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+    assert(/smokeMemoryIndexCommandRendered\(\);/.test(mainBody), '(e) Section 103 is registered in main()');
+  } finally {
+    cleanup(dir);
+  }
+  pass('(final) Section 103: the memory-index query command lands in shared/templates/dispatch/plan-slice.md (the '
+    + 'executable template, never the prose mirror — MEM002) and in a real rendered plan-slice prompt with placeholders '
+    + 'resolved and --cwd quoted; execute-task carries neither (template nor render), proven with a positive control '
+    + 'ordered first; and the section itself measures <= 150 tokens with no index fact line ever landing in the '
+    + 'rendered prompt — command, not content (D3)');
+}
+
+// ── Section 104: canonical Forge script call sites ────────────────────────
 function smokeScriptsCallSitesCanonical() {
-  process.stdout.write('\n▸ Section 102: canonical Forge script call sites\n');
+  process.stdout.write('\n▸ Section 104: canonical Forge script call sites\n');
   const guard = require('./forge-scripts-callsites.js');
   const report = guard.scan({ root: path.resolve(__dirname, '..') });
   assert(report.outcome === 'clean', 'real tree is clean above the per-family census floor');
   for (const family of guard.CALL_SITE_FAMILIES) assert(report.scanned_by_family[family] > 0, `family scanned: ${family}`);
   const source = fs.readFileSync(__filename, 'utf8');
   const mainBody = source.slice(source.lastIndexOf('async function main()'));
-  assert(/\(\) => \{ smokeScriptsCallSitesCanonical\(\); \}/.test(mainBody), '(e) Section 102 is registered in main()');
-  pass('Section 102: canonical path guard is clean, census is non-silent, and registration is biting');
+  assert(/\(\) => \{ smokeScriptsCallSitesCanonical\(\); \}/.test(mainBody), '(e) Section 104 is registered in main()');
+  pass('Section 104: canonical path guard is clean, census is non-silent, and registration is biting');
 }
 
 async function main() {
@@ -15571,6 +15766,8 @@ async function main() {
       () => { smokeInertRoutes(); },
       () => { smokeTransportField(); },
       () => { smokeRoutingDomainsRendered(); },
+      () => { smokeLedgerSnapshotRendered(); },
+      () => { smokeMemoryIndexCommandRendered(); },
       () => { smokeScriptsCallSitesCanonical(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);

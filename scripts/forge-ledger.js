@@ -311,6 +311,38 @@ function writeFragment(cwd, entry, opts) {
   return { path: fpath, created: true };
 }
 
+// ── D4 rendered-block cap ─────────────────────────────────────────────────────
+// D4 caps a NEW ledger entry at 15 lines of its RENDERED block — the cap lives
+// on what a reader (and a prompt budget) actually pays for, not on `body`:
+// slices[] + key_files[] + key_decisions[] are what make an entry fat.
+// Advisory only: measured AFTER a successful write, reported inside the exit-0
+// JSON, never trimming and never refusing. Existing entries are never rewritten.
+const LEDGER_LINE_CAP = 15;
+
+// Counts the lines of one rendered ledger block, excluding the block-separation
+// punctuation ('', '---', '') that renderLedgerBlock appends — the cap is about
+// the entry's own content, not the separators between entries. Measured on a
+// real store (this repo, 2026-08-11): 8 entries measure 14–22 content lines,
+// with M-20260804003633-forge-sweep-project-pr2 at 22 — over the cap.
+function measureRenderedBlock(content, id) {
+  // Lazy require: forge-projection requires this module at the top level, so a
+  // top-level require here would close the cycle and leave one of the two
+  // module objects half-initialized. Same reason as forge-memory.js:718 and
+  // forge-doctor.js:398 — do not "promote" it to the top because it seems to work.
+  const projection = require('./forge-projection');
+  const frag = parseFragment(content);
+  const block = projection.renderLedgerBlock(frag, id);
+  // Count PHYSICAL lines, not array elements: renderLedgerBlock pushes
+  // `frag.body` as ONE element even when it carries embedded newlines, so an
+  // unstructured entry with a 16-newline body used to measure 6. Join the
+  // content portion back into the exact text the reader sees and split on
+  // real line breaks. renderLedgerBlock itself is untouched — renderLedger's
+  // byte-for-byte output must not change.
+  const contentLines = block.slice(0, Math.max(0, block.length - projection.LEDGER_BLOCK_SEPARATOR_LINES));
+  if (contentLines.length === 0) return 0;
+  return contentLines.join('\n').split(/\r?\n/).length;
+}
+
 // ── readFragment ──────────────────────────────────────────────────────────────
 // Reads and parses a LEDGER fragment (milestone or task). Returns null if the
 // file does not exist.
@@ -483,7 +515,26 @@ function cliMain(argv) {
         process.stderr.write(`${e.message}\n`);
         process.exit(1);
       }
-      console.log(JSON.stringify(result));
+      // D4 advisory cap — measured on the block as rendered, after the write
+      // succeeded. Additive fields only: {path, created} stays untouched, so
+      // existing consumers are unaffected and new ones read `d.over_cap || false`.
+      // A failure to MEASURE must never look like a failure to WRITE: warn on
+      // stderr and emit the envelope without the new fields.
+      let envelope = result;
+      try {
+        const written = fs.readFileSync(result.path, 'utf8');
+        const renderedLines = measureRenderedBlock(written, entry.id);
+        const overCap = renderedLines > LEDGER_LINE_CAP;
+        envelope = { ...result, rendered_lines: renderedLines, cap: LEDGER_LINE_CAP, over_cap: overCap };
+        if (overCap) {
+          process.stderr.write(
+            `[forge-ledger] warn: ledger entry ${entry.id} renders ${renderedLines} lines, over the D4 cap of ${LEDGER_LINE_CAP} — entry written unchanged; trim slices/key_files/key_decisions before it lands\n`
+          );
+        }
+      } catch (e) {
+        process.stderr.write(`[forge-ledger] warn: could not measure rendered block for ${entry.id}: ${e.message}\n`);
+      }
+      console.log(JSON.stringify(envelope));
       process.exit(0);
     });
     return; // async — do not fall through
@@ -666,6 +717,8 @@ function runSmokeRegression() {
 // --smoke-regression → forge-projection → forge-ledger) get a complete exports object.
 module.exports = {
   LEDGER_DIR,
+  LEDGER_LINE_CAP,
+  measureRenderedBlock,
   ledgerDir,
   fragmentPath,
   writeFragment,

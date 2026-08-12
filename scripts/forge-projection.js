@@ -39,6 +39,9 @@ const memoryMod    = require('./forge-memory');
 const checkerMod   = require('./forge-checker-memory');
 const storeStateMod = require('./forge-store-state');
 const itemsMod     = require('./forge-items');
+// Same heuristic the renderer charges the prompt with — the snapshot budget has
+// to be measured in the very unit forge-prompt.js later reports as input_tokens.
+const { countTokens } = require('./forge-tokens');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -161,45 +164,271 @@ function renderLedger(cwd) {
   });
 
   for (const { id, frag } of parsed) {
-    // Emit block header
-    lines.push(`## ${frag.id || id}`);
-    if (frag.title) lines.push(`**${frag.title}**`);
-    if (frag.completed_at) lines.push(`Completed: ${frag.completed_at}`);
-    lines.push('');
-
-    const hasStructured = (frag.slices && frag.slices.length > 0)
-      || (frag.key_files && frag.key_files.length > 0)
-      || (frag.key_decisions && frag.key_decisions.length > 0);
-
-    if (frag.slices && frag.slices.length > 0) {
-      lines.push(`**Slices:** ${frag.slices.join(', ')}`);
-    }
-    if (frag.key_files && frag.key_files.length > 0) {
-      lines.push('**Key files:**');
-      for (const kf of frag.key_files) {
-        lines.push(`  - ${kf}`);
-      }
-    }
-    if (frag.key_decisions && frag.key_decisions.length > 0) {
-      lines.push('**Key decisions:**');
-      for (const kd of frag.key_decisions) {
-        lines.push(`  - ${kd}`);
-      }
-    }
-
-    // Only emit body when no structured fields were parsed — body is derived
-    // from the raw block and duplicates structured fields when they are present.
-    if (!hasStructured && frag.body) {
-      lines.push('');
-      lines.push(frag.body);
-    }
-
-    lines.push('');
-    lines.push('---');
-    lines.push('');
+    lines.push(...renderLedgerBlock(frag, id));
   }
 
   return lines.join('\n');
+}
+
+// ── renderLedgerBlock ─────────────────────────────────────────────────────────
+// The shape of ONE ledger entry as it appears in LEDGER.md, extracted from
+// renderLedger so the D4 line cap in forge-ledger.js measures the very same
+// bytes the reader sees. A second copy of this shape would let the cap drift
+// away from the thing it claims to measure, so this function is the only place
+// the block shape exists.
+//
+// Returns the block lines INCLUDING the trailing separation ('', '---', '') —
+// renderLedger relies on them. The cap is about the entry's own content, not
+// the punctuation between entries, so callers measuring size subtract
+// LEDGER_BLOCK_SEPARATOR_LINES (see forge-ledger.js).
+const LEDGER_BLOCK_SEPARATOR_LINES = 3;
+
+function renderLedgerBlock(frag, id) {
+  const lines = [];
+
+  // Emit block header
+  lines.push(`## ${frag.id || id}`);
+  if (frag.title) lines.push(`**${frag.title}**`);
+  if (frag.completed_at) lines.push(`Completed: ${frag.completed_at}`);
+  lines.push('');
+
+  const hasStructured = (frag.slices && frag.slices.length > 0)
+    || (frag.key_files && frag.key_files.length > 0)
+    || (frag.key_decisions && frag.key_decisions.length > 0);
+
+  if (frag.slices && frag.slices.length > 0) {
+    lines.push(`**Slices:** ${frag.slices.join(', ')}`);
+  }
+  if (frag.key_files && frag.key_files.length > 0) {
+    lines.push('**Key files:**');
+    for (const kf of frag.key_files) {
+      lines.push(`  - ${kf}`);
+    }
+  }
+  if (frag.key_decisions && frag.key_decisions.length > 0) {
+    lines.push('**Key decisions:**');
+    for (const kd of frag.key_decisions) {
+      lines.push(`  - ${kd}`);
+    }
+  }
+
+  // Only emit body when no structured fields were parsed — body is derived
+  // from the raw block and duplicates structured fields when they are present.
+  if (!hasStructured && frag.body) {
+    lines.push('');
+    lines.push(frag.body);
+  }
+
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+
+  return lines;
+}
+
+// ── renderLedgerSnapshot ──────────────────────────────────────────────────────
+// The ledger as it enters a dispatch prompt: the most recently completed
+// milestones, WHOLE, until the token budget runs out, closing with a marker that
+// says how many ENTRIES were left out and the exact command that prints them.
+//
+// Why the selection lives here and not in a truncator (S02 B1): renderLedger
+// emits ASCENDING completed_at (oldest first) because forge-dashboard's
+// readLedgerTail takes the file tail as "most recent". Handing that string to
+// any tail-cutting truncator therefore retains the OLDEST entries — the literal
+// opposite of what a prompt wants. Recency is a property of the selection, so
+// the selector owns it, and renderLedger is NOT reordered.
+//
+// Display order is newest-first: this artifact is new and has no legacy reader,
+// so the most valuable entry can come first.
+const LEDGER_SNAPSHOT_EMPTY = '(none)';
+
+// POSIX separators and no newlines: the pointer is embedded in a one-line
+// marker read by models on every platform, and must not break out of it.
+function snapshotPointer(value) {
+  if (typeof value !== 'string') return '';
+  // Double quotes are dropped, not escaped: the pointer is emitted inside a
+  // quoted argument, and an embedded quote would end it mid-path.
+  return value.replace(/\\/g, '/').replace(/[\r\n]+/g, ' ').replace(/"/g, '').trim();
+}
+
+// Marker builders in decreasing order of information, sharing the
+// `[...truncated ` family with forge-prompt.js and forge-tokens.js. The unit is
+// ENTRIES, never sections — the builder is the only place that knows how many
+// whole entries it dropped (S02 W1).
+// The pointer differs BY ORIGIN because it has to lead to the entries that were
+// actually counted. When the snapshot came from the monolith, the fragment store
+// is empty, so `--render ledger` against that same cwd renders an empty ledger —
+// a pointer that denies the entries the marker just counted (PR #87 F1). The
+// monolith case therefore points at .gsd/LEDGER.md, the file the entries came
+// from. `empty` never reaches here (renderLedgerSnapshot returns early), so no
+// third form exists. The invariant is held by the budget sweep in
+// scripts/forge-ledger-snapshot.test.js, not by this comment.
+function snapshotMarkerBuilders(cwd, source) {
+  const pointer = snapshotPointer(cwd);
+  const command = 'node scripts/forge-projection.js --render ledger';
+  const noun = n => (n === 1 ? 'ledger entry' : 'ledger entries');
+  const builders = [];
+  // The pointer is QUOTED: a workspace path with a space (or a shell
+  // metacharacter) would otherwise emit a re-read command that breaks when
+  // pasted. Double quotes are valid in POSIX sh and PowerShell alike. The
+  // reserve in accumulateSnapshot is computed from these same builders, so the
+  // two extra characters are budgeted for, never added after the fact.
+  if (source === 'monolith') {
+    // Same three-rung shape, same decreasing information: absolute (resolvable
+    // from any cwd) → relative (resolvable inside the workspace) → bare.
+    const file = snapshotPointer(LEDGER_FILE);
+    if (pointer) builders.push(n => `[...truncated ${n} ${noun(n)} — see "${pointer}/${file}"]`);
+    builders.push(n => `[...truncated ${n} ${noun(n)} — see ${file}]`);
+  } else {
+    if (pointer) builders.push(n => `[...truncated ${n} ${noun(n)} — see ${command} --cwd "${pointer}"]`);
+    builders.push(n => `[...truncated ${n} ${noun(n)} — see ${command}]`);
+  }
+  builders.push(n => `[...truncated ${n} ${noun(n)}]`);
+  return builders;
+}
+
+// Accumulate whole blocks newest-first until maxTokens, reserving the marker
+// space UP FRONT from the same budget it protects (MEM002). The reserve uses
+// the worst-case count (every entry omitted) so the marker finally emitted —
+// built from the real, smaller count — can only be shorter than budgeted for.
+function accumulateSnapshot(units, maxTokens, cwd, source) {
+  const total = units.length;
+  const builders = snapshotMarkerBuilders(cwd, source);
+  const build = builders.find(fn => countTokens(fn(total)) <= maxTokens) || null;
+
+  const selected = [];
+  for (const unit of units) {
+    const projectedOmitted = total - (selected.length + 1);
+    const body = selected.concat([unit]).map(item => item.text).join('\n');
+    const reserve = projectedOmitted > 0 && build ? `\n\n${build(total)}` : '';
+    if (countTokens(`${body}${reserve}`) > maxTokens) break;
+    selected.push(unit);
+  }
+
+  const omitted = total - selected.length;
+  const body = selected.map(item => item.text).join('\n');
+  let markdown = body;
+  if (omitted > 0 && build) markdown = body ? `${body}\n\n${build(omitted)}` : build(omitted);
+  // Degenerate budget: not even the shortest marker fits. Never exceed the
+  // budget we were handed — an over-budget "honest" marker is still over budget.
+  if (countTokens(markdown) > maxTokens) markdown = markdown.slice(0, maxTokens * 4);
+
+  return {
+    markdown: markdown || LEDGER_SNAPSHOT_EMPTY,
+    included_ids: selected.map(item => item.id),
+    omitted_count: omitted,
+    source: null,
+  };
+}
+
+// Fragments, newest first. Missing completed_at sorts LAST here (unknown recency
+// is not evidence of recency); id breaks ties so the output is deterministic.
+// Returns { discovered, units }: `discovered` is the count of fragments FOUND
+// on disk, which is what gates the monolith fallback — a populated but
+// unreadable store must never be read as an empty one (R2).
+function snapshotUnitsFromFragments(cwd) {
+  const fragments = ledgerMod.listFragments(cwd);
+  const parsed = [];
+  for (const entry of fragments) {
+    const { id } = entry;
+    try {
+      const text = ledgerMod.readFragmentText(cwd, entry);
+      parsed.push({ id, frag: ledgerMod.parseFragment(text) });
+    } catch (e) {
+      // One bad fragment degrades to a warning; the snapshot still ships.
+      process.stderr.write(`[forge-projection] warn: skipping ledger fragment ${id}: ${e.message}\n`);
+    }
+  }
+
+  parsed.sort((a, b) => {
+    const ca = String(a.frag.completed_at || '');
+    const cb = String(b.frag.completed_at || '');
+    if (ca === cb) return a.id.localeCompare(b.id);
+    if (!ca) return 1;
+    if (!cb) return -1;
+    return ca < cb ? 1 : -1;
+  });
+
+  return {
+    discovered: fragments.length,
+    units: parsed.map(({ id, frag }) => ({
+      id,
+      // renderLedgerBlock is the single source of the block shape (S01).
+      text: renderLedgerBlock(frag, id).join('\n'),
+    })),
+  };
+}
+
+// Fallback ONLY when the fragment store is empty: .gsd/LEDGER.md is a stale
+// projection whenever fragments exist (measured 3 entries vs 8). The monolith is
+// append-only, so its LAST blocks are the newest — we take from the end and
+// reverse into the same newest-first display order.
+function snapshotUnitsFromMonolith(cwd) {
+  const target = path.join(cwd || process.cwd(), LEDGER_FILE);
+  let text;
+  try {
+    if (!fs.existsSync(target)) return [];
+    text = fs.readFileSync(target, 'utf8');
+  } catch (e) {
+    process.stderr.write(`[forge-projection] warn: skipping ledger monolith: ${e.message}\n`);
+    return [];
+  }
+
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n');
+  const units = [];
+  let current = null;
+  for (const line of lines) {
+    const header = line.match(/^##\s+(.+?)\s*$/);
+    if (header) {
+      if (current) units.push(current);
+      current = { id: header[1], lines: [line] };
+      continue;
+    }
+    if (current) current.lines.push(line);
+  }
+  if (current) units.push(current);
+
+  return units
+    .map(unit => ({ id: unit.id, text: unit.lines.join('\n').trimEnd() }))
+    .reverse();
+}
+
+/**
+ * renderLedgerSnapshot(cwd, { maxTokens }) →
+ *   { markdown, included_ids, omitted_count, source }
+ *
+ * `markdown` is what enters the prompt; `included_ids`/`omitted_count` let a
+ * caller (and the tests) assert WHICH entries survived without parsing prose.
+ */
+function renderLedgerSnapshot(cwd, options = {}) {
+  guardReadHere(cwd);
+  const maxTokens = Number.isSafeInteger(options.maxTokens) && options.maxTokens > 0
+    ? options.maxTokens
+    : 1500;
+
+  let source = 'fragments';
+  const fromFragments = snapshotUnitsFromFragments(cwd);
+  let units = fromFragments.units;
+  // Gated on fragments DISCOVERED, not parsed: a store that exists but cannot be
+  // read is not evidence of an empty store, and injecting the stale monolith
+  // during corruption would break the store-wins rule exactly when it matters.
+  // Discovered > 0 with 0 parsed degrades to an empty snapshot, keeping the
+  // per-fragment warnings already written to stderr (R2).
+  if (units.length === 0 && fromFragments.discovered === 0) {
+    units = snapshotUnitsFromMonolith(cwd);
+    source = units.length > 0 ? 'monolith' : 'empty';
+  } else if (units.length === 0) {
+    source = 'fragments';
+  }
+  if (units.length === 0) {
+    return { markdown: LEDGER_SNAPSHOT_EMPTY, included_ids: [], omitted_count: 0, source };
+  }
+
+  // `source` travels as a PARAMETER: the marker is built inside accumulateSnapshot,
+  // so the assignment below is an output field of the API, never the channel (D1).
+  const result = accumulateSnapshot(units, maxTokens, cwd, source);
+  result.source = source;
+  return result;
 }
 
 // ── renderDecisions ───────────────────────────────────────────────────────────
@@ -923,6 +1152,9 @@ function writeAll(cwd, opts) {
 // ── Module exports ────────────────────────────────────────────────────────────
 module.exports = {
   renderLedger,
+  renderLedgerBlock,
+  renderLedgerSnapshot,
+  LEDGER_BLOCK_SEPARATOR_LINES,
   renderDecisions,
   projectMemoryEntries,
   queryMemoryEntries,
