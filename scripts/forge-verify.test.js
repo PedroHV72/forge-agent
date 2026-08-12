@@ -137,6 +137,14 @@ for (const [label, lfContent] of Object.entries(SHAPES)) {
   test(`CR-only: ${label} returns the same value as LF`, () => {
     assertEqual(parsePlanVerify(toCROnly(lfContent)), expected, `${label} under CR-only`);
   });
+
+  test(`BOM+LF: ${label} returns the same value as LF`, () => {
+    assertEqual(parsePlanVerify('\uFEFF' + lfContent), expected, `${label} under BOM+LF`);
+  });
+
+  test(`BOM+CRLF: ${label} returns the same value as LF`, () => {
+    assertEqual(parsePlanVerify('\uFEFF' + toCRLF(lfContent)), expected, `${label} under BOM+CRLF`);
+  });
 }
 
 test('CRLF: multi-line list join has no residual \\r in any item', () => {

@@ -97,7 +97,10 @@ function stripInlineComment(value) {
  * @returns {string|null}
  */
 function extractFrontmatter(content) {
-  const m = String(content).replace(/\r\n?/g, '\n').match(/^---\n([\s\S]*?)\n---/);
+  const m = String(content)
+    .replace(/^﻿/, '')
+    .replace(/\r\n?/g, '\n')
+    .match(/^---\n([\s\S]*?)\n---/);
   return m ? m[1] : null;
 }
 

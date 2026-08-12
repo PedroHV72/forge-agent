@@ -1023,7 +1023,8 @@ const CRLF_NESTED_LF = mkPlan(`must_haves:
   key_links: []
   expected_output: []`);
 
-for (const [label, toEol] of [['CRLF', toCRLF], ['CR-only', toCROnly]]) {
+const BOM = '\uFEFF';
+for (const [label, toEol] of [['CRLF', toCRLF], ['CR-only', toCROnly], ['BOM+LF', s => BOM + s], ['BOM+CRLF', s => BOM + toCRLF(s)]]) {
   test(`${label}: valid plan → hasStructuredMustHaves true + CLI exit 0, legacy:false, valid:true`, () => {
     const content = toEol(CRLF_VALID_LF);
     assertEq(hasStructuredMustHaves(content), true, `hasStructuredMustHaves must see must_haves: under ${label}`);
