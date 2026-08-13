@@ -137,6 +137,119 @@ test('qualified call inside a comment line is not flagged', () => {
   assertEqual(result.violations.length, 0, 'comment line excluded');
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// R4/R5 — whitespace-evadable detection (reproduced by the advocate, then
+// fixed by matching whole file content instead of line-by-line)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('R4: qualified call split across whitespace within one line ("os . freemem()") is flagged', () => {
+  const content = `${OS_WORD} . ${FREE}();`;
+  const result = classifyFile({ path: '/virtual/r4a.js', content });
+  assertEqual(result.violations.length, 1, 'whitespace-separated qualified call is caught');
+  assertEqual(result.violations[0].form, VIOLATION_FORMS.QUALIFIED, 'form');
+});
+
+test('R4: qualified call split across a line break ("os\\n  .freemem()") is flagged', () => {
+  const content = [
+    'function check() {',
+    `  return ${OS_WORD}`,
+    `    .${FREE}();`,
+    '}',
+  ].join('\n');
+  const result = classifyFile({ path: '/virtual/r4b.js', content });
+  assertEqual(result.violations.length, 1, 'call split across a newline is caught');
+  assertEqual(result.violations[0].form, VIOLATION_FORMS.QUALIFIED, 'form');
+});
+
+test('R5: multiline destructuring ("const {\\n freemem\\n} = require(\'os\')") followed by a call is flagged', () => {
+  const content = [
+    'const {',
+    `  ${FREE}`,
+    `} = require('${OS_WORD}');`,
+    `console.log(${FREE}());`,
+  ].join('\n');
+  const result = classifyFile({ path: '/virtual/r5.js', content });
+  assertEqual(result.violations.length, 1, 'multiline destructuring is still caught');
+  assertEqual(result.violations[0].form, VIOLATION_FORMS.DESTRUCTURED, 'form');
+  assertEqual(result.violations[0].line, 4, 'call line');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R8 — string literal / comment regions must not produce false positives,
+// verified WITHOUT weakening R4/R5 (the operator's tie-break: false-negative
+// safety wins over false-positive noise; the critical assert below proves
+// both properties hold simultaneously, not one traded for the other).
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('R8: a call site mentioned inside a string literal is not flagged', () => {
+  const content = `const msg = "call ${OS_WORD}.${FREE}() and it lies under swap pressure";`;
+  const result = classifyFile({ path: '/virtual/r8a.js', content });
+  assertEqual(result.violations.length, 0, 'string-literal mention is not a call site');
+});
+
+test('R8: a call site mentioned inside a block comment is not flagged', () => {
+  const content = `/* do not call ${OS_WORD}.${FREE}() here, it lies under swap */\nconst x = 1;`;
+  const result = classifyFile({ path: '/virtual/r8b.js', content });
+  assertEqual(result.violations.length, 0, 'block-comment mention is not a call site');
+});
+
+test('R8: an inline trailing comment mentioning the call is not flagged', () => {
+  const content = `const x = 1; // never call ${OS_WORD}.${FREE}() here`;
+  const result = classifyFile({ path: '/virtual/r8c.js', content });
+  assertEqual(result.violations.length, 0, 'inline trailing comment mention is not a call site');
+});
+
+test('CRITICAL (R4/R5 vs R8 tie-break): a genuine call adjacent to, and on the same line as, a string and a comment containing the same text is still caught', () => {
+  // Same line carries: a string literal mentioning the banned call, a real
+  // call site, and a trailing comment also mentioning the banned call. Only
+  // the real call site (unquoted, uncommented) may produce a violation.
+  const content = `const msg = "${OS_WORD}.${FREE}() in a string"; ${OS_WORD}.${FREE}(); // also ${OS_WORD}.${FREE}() in a comment`;
+  const result = classifyFile({ path: '/virtual/r8-critical.js', content });
+  assertEqual(result.violations.length, 1, 'exactly one real call site is caught, string/comment mentions are not');
+  assertEqual(result.violations[0].line, 1, 'violation reported on the correct line');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R7 — fixtures dirs and every SKIP_DIRS hit are recorded with a closed
+// named reason in the census, never silently dropped
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('R7: a fixtures/ directory with real .js files is recorded in skipped[] with a distinct named reason', () => {
+  const dir = mkTmpDir();
+  writeFile(dir, 'fixtures/planted.js', `${QUALIFIED_CALL}\n`);
+  writeFile(dir, 'ok.js', 'const x = 1;\n');
+  const result = scanFreemem([dir]);
+  const fixtureSkips = result.skipped.filter((s) => s.reason === SKIP_REASONS.FIXTURES_DIR_EXCLUDED);
+  assert(fixtureSkips.length >= 1, 'fixtures dir recorded with its own named reason', JSON.stringify(result.skipped));
+  assertEqual(result.violations.length, 0, 'files inside fixtures/ are not scanned (exemption is explicit, not silent)');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('R7: node_modules is recorded in skipped[] with a named reason (never a silent drop)', () => {
+  const dir = mkTmpDir();
+  writeFile(dir, 'node_modules/pkg/index.js', 'const x = 1;\n');
+  writeFile(dir, 'ok.js', 'const x = 1;\n');
+  const result = scanFreemem([dir]);
+  const nmSkips = result.skipped.filter((s) => s.reason === SKIP_REASONS.VCS_OR_DEPENDENCY_DIR_EXCLUDED);
+  assert(nmSkips.length >= 1, 'node_modules dir recorded with a named reason', JSON.stringify(result.skipped));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R6 — self-referential-assertion exclusion narrowed to an EXACT path, not
+// any file sharing the basename
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('R6: a file sharing the basename "forge-resources.test.js" but NOT under scripts/ is NOT exempted', () => {
+  const dir = mkTmpDir();
+  writeFile(dir, 'not-scripts/forge-resources.test.js', `${QUALIFIED_CALL}\n`);
+  const result = scanFreemem([dir]);
+  assertEqual(result.outcome, 'violations', 'a same-basename file outside scripts/ is scanned, not exempted');
+  const exemptSkips = result.skipped.filter((s) => s.reason === SKIP_REASONS.SELF_REFERENTIAL_ASSERTION);
+  assertEqual(exemptSkips.length, 0, 'no self-referential-assertion exemption recorded for the wrong directory');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('unreadable file returns scanned:0, unreadable:true', () => {
   const result = classifyFile('/definitely/does/not/exist/xyz.js');
   assertEqual(result.scanned, 0, 'scanned');

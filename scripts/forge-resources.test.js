@@ -78,7 +78,7 @@ function cleanup(dir) {
 // ── Forced pressure (D1/B1): admit:false under forced critical ───────────
 (function testForcedCritical() {
   resetResourceCache();
-  const result = resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '4' }, cwd: mkTmpDirNoop() });
+  const result = resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '4' }, cwd: mkTmpDirNoop(), noEvents: true });
   assertEqual(result.admit, false, 'forced critical pressure -> admit:false');
   assertEqual(result.reason, REASON_CODES.PRESSURE_CRITICAL_FORCED, 'forced critical reason names the forced source');
   assert(result.reason !== REASON_CODES.PRESSURE_CRITICAL_MEASURED, 'forced reason is distinct from the measured reason');
@@ -92,7 +92,7 @@ function mkTmpDirNoop() {
 // ── Forced pressure: admit:true under forced normal ───────────────────────
 (function testForcedNormal() {
   resetResourceCache();
-  const result = resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '1' } });
+  const result = resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '1' }, cwd: mkTmpDirNoop(), noEvents: true });
   assertEqual(result.admit, true, 'forced normal pressure -> admit:true');
   assert(result.workers >= 1, 'forced normal workers >= 1', `got ${result.workers}`);
   assert(result.heapMb > 0, 'forced normal heapMb > 0', `got ${result.heapMb}`);
@@ -109,14 +109,14 @@ function mkTmpDirNoop() {
   let clock = 1000;
   const now = () => clock;
 
-  const first = resolveResourceBudget({ platform: 'darwin', readSignal: injectedReader, now, cacheKey: 'test-batch' });
+  const first = resolveResourceBudget({ platform: 'darwin', readSignal: injectedReader, now, cacheKey: 'test-batch', noEvents: true });
   assertEqual(spawnCount, 1, 'first resolve invokes the reader exactly once');
-  const second = resolveResourceBudget({ platform: 'darwin', readSignal: injectedReader, now, cacheKey: 'test-batch' });
+  const second = resolveResourceBudget({ platform: 'darwin', readSignal: injectedReader, now, cacheKey: 'test-batch', noEvents: true });
   assertEqual(spawnCount, 1, 'second resolve inside TTL reuses the cache (reader NOT re-invoked)');
   assertEqual(first.reason, second.reason, 'cached resolve returns the same reason');
 
   clock += 5000; // advance well past the ~2s TTL
-  resolveResourceBudget({ platform: 'darwin', readSignal: injectedReader, now, cacheKey: 'test-batch' });
+  resolveResourceBudget({ platform: 'darwin', readSignal: injectedReader, now, cacheKey: 'test-batch', noEvents: true });
   assertEqual(spawnCount, 2, 'resolve after TTL expiry re-invokes the reader');
 })();
 
@@ -159,15 +159,15 @@ function mkTmpDirNoop() {
 // ── Non-darwin platform degrades fail-open with a named enum reason ──────
 (function testPlatformDegradation() {
   resetResourceCache();
-  const linux = resolveResourceBudget({ platform: 'linux' });
+  const linux = resolveResourceBudget({ platform: 'linux', noEvents: true });
   assertEqual(linux.admit, true, 'linux degrades fail-open (admit:true)');
   assertEqual(linux.reason, REASON_CODES.PLATFORM_UNSUPPORTED_LINUX, 'linux reason names platform-unsupported:linux');
 
-  const win = resolveResourceBudget({ platform: 'win32' });
+  const win = resolveResourceBudget({ platform: 'win32', noEvents: true });
   assertEqual(win.admit, true, 'win32 degrades fail-open (admit:true)');
   assertEqual(win.reason, REASON_CODES.PLATFORM_UNSUPPORTED_WIN32, 'win32 reason names platform-unsupported:win32');
 
-  const other = resolveResourceBudget({ platform: 'freebsd' });
+  const other = resolveResourceBudget({ platform: 'freebsd', noEvents: true });
   assertEqual(other.admit, true, 'unknown platform degrades fail-open (admit:true)');
   assertEqual(other.reason, REASON_CODES.PLATFORM_UNSUPPORTED_OTHER, 'unknown platform falls back to the generic named reason');
 })();
@@ -206,11 +206,11 @@ function mkTmpDirNoop() {
   const enumValues = new Set(Object.values(REASON_CODES));
   resetResourceCache();
   const cases = [
-    resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '4' } }),
-    resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '1' } }),
-    resolveResourceBudget({ platform: 'linux' }),
-    resolveResourceBudget({ platform: 'win32' }),
-    resolveResourceBudget({ platform: 'darwin', readSignal: () => ({ ok: false, reason: REASON_CODES.SYSCTL_SPAWN_FAILED }), now: () => Date.now(), cacheKey: 'enum-test-1' }),
+    resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '4' }, noEvents: true }),
+    resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '1' }, noEvents: true }),
+    resolveResourceBudget({ platform: 'linux', noEvents: true }),
+    resolveResourceBudget({ platform: 'win32', noEvents: true }),
+    resolveResourceBudget({ platform: 'darwin', readSignal: () => ({ ok: false, reason: REASON_CODES.SYSCTL_SPAWN_FAILED }), now: () => Date.now(), cacheKey: 'enum-test-1', noEvents: true }),
   ];
   cases.forEach((result, i) => {
     assert(enumValues.has(result.reason), `case[${i}] reason "${result.reason}" is a frozen enum member`);
@@ -222,7 +222,7 @@ function mkTmpDirNoop() {
   const src = fs.readFileSync(path.join(__dirname, 'forge-resources.js'), 'utf8');
   assert(!/weightTable|runnerWeights|weight_table/i.test(src), 'no per-runner weight table symbol exists in the module source');
   resetResourceCache();
-  const normal = resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '1' } });
+  const normal = resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '1' }, noEvents: true });
   assert(typeof normal.playwrightWorkers === 'number', 'playwrightWorkers is a single numeric cap field', JSON.stringify(normal));
 })();
 
@@ -231,7 +231,12 @@ function mkTmpDirNoop() {
   // Written NEXT TO forge-resources.js (not a separate tmp dir) so its
   // `require('./forge-prefs.js')` still resolves — only the CLI entrypoint
   // is patched to force an internal throw; the module body is untouched.
-  const brokenScript = path.join(__dirname, '__forge-resources-broken-test-tmp.js');
+  // Unique per-process/per-run suffix (PID + timestamp): this repo's own
+  // premise is concurrent runs on one machine, so a fixed scratch filename
+  // is a self-collision hazard, not a hypothetical (R10). Must stay next to
+  // forge-resources.js (not moved to a tmp dir) so `require('./forge-prefs.js')`
+  // still resolves relative to this file.
+  const brokenScript = path.join(__dirname, `__forge-resources-broken-test-tmp.${process.pid}-${Date.now()}.js`);
   const realSrc = fs.readFileSync(SCRIPT, 'utf8');
   const injected = realSrc.replace(
     'function runCli(args) {\n  const parsed = parseArgs(args || []);',
@@ -253,7 +258,11 @@ function mkTmpDirNoop() {
 
 // ── CLI happy path on the real darwin machine ─────────────────────────────
 (function testCliHappyPath() {
-  const cli = spawnSync('node', [SCRIPT, '--json'], { encoding: 'utf8', env: { ...process.env, FORGE_RESOURCES_PRESSURE: '1' } });
+  // --cwd points at a fresh tmp dir with no .gsd/ so this run cannot append
+  // to the real dogfood events.jsonl (R9): resource-admission/degradation
+  // events are only written when `<cwd>/.gsd` exists.
+  const dir = mkTmpDir();
+  const cli = spawnSync('node', [SCRIPT, '--json', '--cwd', dir], { encoding: 'utf8', env: { ...process.env, FORGE_RESOURCES_PRESSURE: '1' } });
   assertEqual(cli.status, 0, 'real CLI exits 0');
   let parsed = null;
   try { parsed = JSON.parse(cli.stdout.trim()); } catch (error) { fail('real CLI stdout is valid one-line JSON', `${error.message}\nstdout=${cli.stdout}`); }
@@ -264,6 +273,7 @@ function mkTmpDirNoop() {
     });
     assertEqual(parsed.admit, true, 'real CLI forced-normal run admits');
   }
+  cleanup(dir);
 })();
 
 // ── degradedContract() direct shape check ─────────────────────────────────
@@ -286,14 +296,19 @@ function mkTmpDirNoop() {
   const originalWrite = process.stdout.write;
   let captured = '';
   process.stdout.write = (chunk) => { captured += chunk; return true; };
+  // --cwd points at a fresh tmp dir with no .gsd/ so this call cannot append
+  // to the real dogfood events.jsonl (R9) — resolveResourceBudget only
+  // writes events when `<cwd>/.gsd` exists.
+  const dir = mkTmpDir();
   let result;
   try {
-    result = runCli(['--platform', 'linux']);
+    result = runCli(['--platform', 'linux', '--cwd', dir]);
   } finally {
     process.stdout.write = originalWrite;
   }
   assertEqual(result.reason, REASON_CODES.PLATFORM_UNSUPPORTED_LINUX, 'runCli() as a library call returns the resolved contract');
   assert(captured.trim().length > 0, 'runCli() also wrote a JSON line to stdout');
+  cleanup(dir);
 })();
 
 process.stdout.write(`\nResults: ${passes} passed, ${fails} failed\n`);

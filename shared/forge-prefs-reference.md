@@ -376,13 +376,13 @@ Controle de recursos sob pressão do host — dimensionamento de concorrência e
 
 - **Tipo:** boolean
 - **Default:** `true`
-- **Descrição:** true = espera sob pressão crítica roda em modo sombra, registrando "teria esperado Xs" como evento sem bloquear (D3); false = espera real bloqueante (flip após milestone de medição).
+- **Descrição:** true = espera sob pressão crítica roda em modo sombra, registrando "teria esperado Xs" como evento sem bloquear (D3, único modo implementado no v1). false = **RESERVADO/INERTE no v1** — nenhum código deste milestone (nem planejado) implementa espera real bloqueante; setar `false` hoje apenas desliga o evento de telemetria de shadow-wait sem substituí-lo por uma espera de verdade (D3 trava shadow-only para v1).
 
 ### `resources.wait_cap_ms`
 
 - **Tipo:** integer
 - **Default:** `30000`
-- **Descrição:** Teto da espera (sombra ou real) sob pressão crítica, em milissegundos.
+- **Descrição:** Teto da espera (sombra ou real) sob pressão crítica, em milissegundos. Deve ser `>= 1`; o reader (`readResourcePrefs`) substitui silenciosamente qualquer valor `<= 0` pelo default — não há semântica de "sem espera" via `0`/negativo.
 
 ## retry
 

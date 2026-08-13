@@ -44,6 +44,24 @@
  * Scope is deliberately narrow: `os.totalmem()` is untouched (D1 bans
  * freemem-as-admission-signal, not capacity reads).
  *
+ * MATCHING IS WHOLE-CONTENT, NOT LINE-BY-LINE (R4/R5, S01 review-fix): a
+ * per-line regex test is evadable by putting whitespace between `os`, `.`,
+ * and `freemem`, or by splitting the member access across a line break.
+ * Both call-site regexes are matched against the FULL FILE CONTENT (after
+ * string/comment stripping — see below), with a whitespace-tolerant
+ * pattern, so neither evasion works.
+ *
+ * STRING/COMMENT BLINDNESS FOR CALL SITES (R8, S01 review-fix): a match
+ * landing inside a string literal or a comment (line, block, or inline
+ * trailing) must not be flagged as a real call site — see
+ * `stripStringsAndComments` below. This is in tension with R4/R5 (every
+ * layer added to avoid false positives is a layer where a real call could
+ * get masked); the operator's explicit tie-break is that false-negative
+ * safety (R4/R5) wins over false-positive noise (R8) if the two cannot both
+ * hold. They are proven to hold simultaneously by a dedicated test: a
+ * genuine call adjacent to, and on the same line as, a string and a comment
+ * containing the same text is still caught.
+ *
  * SELF-EXCLUSION — explicit and enumerated, not an invisible skip. This
  * scanner and its paired test both CONTAIN the forbidden patterns (as regex
  * source / fixture strings) and are excluded by basename, recorded in
@@ -63,11 +81,27 @@
  * (`self-referential-assertion`, distinct from `self-fixture`) — still
  * counted and enumerated in `skipped[]`, never silently dropped.
  *
+ * R6 (operator-arbitrated, S01 review-fix): this exclusion originally
+ * matched by BASENAME ALONE — any file anywhere named
+ * `forge-resources.test.js` was excluded, a pattern-wide blind spot. It is
+ * now an EXACT path check (directory AND basename both checked:
+ * `scripts/forge-resources.test.js`), narrowing the surface from "any file
+ * with this name" to "one specific, known, enumerated file". This does not
+ * close the core hole (that one file is still blind to a genuine call site
+ * smuggled into it) — that is a deliberate, named trade-off, not an
+ * oversight. No parser was added.
+ *
  * CENSUS, NOT VERDICT-ONLY: the scan always reports `scanned` (files
- * actually read) alongside the verdict. Every file the walk encounters but
- * does not scan (wrong extension, unreadable, this scanner's own fixture
- * files) is recorded in `skipped[{path, reason}]` with a reason drawn from a
- * CLOSED enum — never silently dropped.
+ * actually read) alongside the verdict. Every file/dir the walk encounters
+ * but does not scan (wrong extension, unreadable, this scanner's own
+ * fixture files, VCS/dependency dirs, `fixtures/` dirs) is recorded in
+ * `skipped[{path, reason}]` with a reason drawn from a CLOSED enum — never
+ * silently dropped. (R7, S01 review-fix: `fixtures/` dirs were previously
+ * skipped via `SKIP_DIRS` with no census entry at all — a real, contentful
+ * skip contradicting this module's own documented contract. Every
+ * `SKIP_DIRS` hit is now recorded, with `fixtures/` carrying its own
+ * distinct named reason so the exemption is a decision on record, not an
+ * omission.)
  */
 
 const fs = require('fs');
@@ -81,6 +115,13 @@ const SKIP_REASONS = Object.freeze({
   SELF_FIXTURE: 'self-fixture',
   SELF_REFERENTIAL_ASSERTION: 'self-referential-assertion',
   ROOT_NOT_FOUND: 'root-not-found',
+  // R7: `fixtures` dirs hold real, readable .js files — a distinct named
+  // reason from the generic VCS/dependency dir skip below, so the
+  // exemption is a decision on record, not an omission.
+  FIXTURES_DIR_EXCLUDED: 'fixtures-dir-excluded',
+  // .git / node_modules — never source we own; still recorded (R7: "record
+  // every SKIP_DIRS hit with a closed named reason", not just fixtures).
+  VCS_OR_DEPENDENCY_DIR_EXCLUDED: 'vcs-or-dependency-dir-excluded',
 });
 
 // ── Closed enum of violation forms ──────────────────────────────────────────
@@ -92,7 +133,10 @@ const VIOLATION_FORMS = Object.freeze({
 
 const DEFAULT_ROOT = 'scripts';
 const SCANNED_EXTENSIONS = Object.freeze(['.js']);
-const SKIP_DIRS = new Set(['.git', 'node_modules', 'fixtures']);
+// 'fixtures' is intentionally NOT in this set — it is checked and recorded
+// separately, with its own reason (FIXTURES_DIR_EXCLUDED), so the exemption
+// is explicit rather than folded into the generic VCS/dependency skip.
+const SKIP_DIRS = new Set(['.git', 'node_modules']);
 
 // This scanner and its paired suite deliberately CONTAIN the forbidden
 // pattern (as regex source and as fixture strings) — self-matching would be
@@ -102,30 +146,129 @@ const SELF_FIXTURE_BASENAMES = new Set([
   'forge-freemem-callsites.test.js',
 ]);
 
-// A separate, distinct exclusion set (see SELF-EXCLUSION doc above): files
-// whose only match is a self-referential assertion proving the ban, not a
-// real call site. Kept apart from SELF_FIXTURE_BASENAMES so the two reasons
-// never collapse into one — a future reader must be able to tell "this
-// scanner's own fixture" from "a consumer's proof-of-absence test" by
-// reason alone.
-const SELF_REFERENTIAL_ASSERTION_BASENAMES = new Set([
-  'forge-resources.test.js',
+// See R6 doc above — exact path exclusion, not basename-wide.
+const SELF_REFERENTIAL_ASSERTION_EXACT_PATHS = new Set([
+  path.join('scripts', 'forge-resources.test.js'),
 ]);
+
+function isSelfReferentialAssertionFile(dir, name) {
+  if (name !== 'forge-resources.test.js') return false;
+  return path.basename(dir) === 'scripts';
+}
 
 // Built by concatenation so this file's own source does not contain the
 // literal call it forbids.
 const OS_WORD = 'os';
 const FREE = 'free' + 'mem';
-const QUALIFIED_RE = new RegExp('\\b' + OS_WORD + '\\.' + FREE + '\\s*\\(');
-const DESTRUCTURE_RE = new RegExp(
+// R4: whitespace-tolerant between `os`, the `.`, and `freemem` — a reader
+// (and a formatter) can legally write `os . freemem()` or split the member
+// access across a line break; the ban must not be evadable by whitespace.
+const QUALIFIED_RE_SRC = '\\b' + OS_WORD + '\\s*\\.\\s*' + FREE + '\\s*\\(';
+const DESTRUCTURE_RE_SRC =
   '(?:const|let|var)\\s*\\{[^}]*\\b' + FREE + '\\b[^}]*\\}\\s*=\\s*require\\(\\s*[\'"]node:' + OS_WORD + '[\'"]\\s*\\)'
-  + '|(?:const|let|var)\\s*\\{[^}]*\\b' + FREE + '\\b[^}]*\\}\\s*=\\s*require\\(\\s*[\'"]' + OS_WORD + '[\'"]\\s*\\)'
-);
-const BARE_CALL_RE = new RegExp('\\b' + FREE + '\\s*\\(');
+  + '|(?:const|let|var)\\s*\\{[^}]*\\b' + FREE + '\\b[^}]*\\}\\s*=\\s*require\\(\\s*[\'"]' + OS_WORD + '[\'"]\\s*\\)';
+const BARE_CALL_RE_SRC = '\\b' + FREE + '\\s*\\(';
 
-function isCommentLine(line) {
-  const trimmed = line.trim();
-  return trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*');
+// ── R4/R5/R8 — whole-content matching, string/comment-blind, never
+// whitespace-evadable ──────────────────────────────────────────────────────
+//
+// Two properties this scanner must hold AT THE SAME TIME, and the tension
+// between them is the entire point:
+//   R4/R5 (false-negative safety): matching must run against the FULL FILE
+//     CONTENT, not line-by-line — `os . freemem()`, `os\n  .freemem()`, and
+//     a multiline destructure+call pair must all be caught.
+//   R8 (false-positive noise): a match landing inside a string literal or a
+//     comment (line or block, including an inline trailing comment) must
+//     NOT be flagged.
+// Per the operator's explicit tie-break: every layer added for R8 is a
+// layer where a REAL call could get masked. If the two properties cannot
+// both hold, R4/R5 (safety) wins over R8 (noise) — see the paired test
+// `a genuine call adjacent to a string and a comment on one line is still
+// caught` below, which is the assert proving they DO both hold here.
+//
+// `stripStringsAndComments` walks the content once, character by character,
+// and replaces every character inside a string/template literal or a
+// comment with a space (newlines are preserved as newlines) — so byte
+// OFFSETS and LINE NUMBERS in the stripped text still line up with the
+// original file, and regex matching against the stripped text can never see
+// into a string or comment, no matter how the call is split across
+// whitespace.
+//
+// `keepStrings` — when true, string/template literal CONTENT (and its
+// quotes) is passed through unmodified; only comments are blanked. This is
+// used for the DESTRUCTURE_RE pass: `require('os')` / `require('node:os')`
+// legitimately needs its literal quotes to match, and that quoted module
+// name is structural code, not free-form prose the R8 masking rule is
+// aimed at. Call-site detection (QUALIFIED_RE / BARE_CALL_RE) always uses
+// `keepStrings: false` — those are the patterns R8 is about.
+function stripStringsAndComments(content, keepStrings) {
+  let out = '';
+  const n = content.length;
+  let i = 0;
+  while (i < n) {
+    const c = content[i];
+    const c2 = i + 1 < n ? content[i + 1] : '';
+
+    // Line comment: // ... to end of line.
+    if (c === '/' && c2 === '/') {
+      while (i < n && content[i] !== '\n') { out += ' '; i++; }
+      continue;
+    }
+
+    // Block comment: /* ... */ (may span multiple lines).
+    if (c === '/' && c2 === '*') {
+      out += '  ';
+      i += 2;
+      while (i < n && !(content[i] === '*' && i + 1 < n && content[i + 1] === '/')) {
+        out += content[i] === '\n' ? '\n' : ' ';
+        i++;
+      }
+      if (i < n) { out += '  '; i += 2; }
+      continue;
+    }
+
+    // String / template literal: '...', "...", `...` — backslash escapes
+    // (including an escaped newline) are consumed without ending the
+    // literal early.
+    if (c === '"' || c === '\'' || c === '`') {
+      const quote = c;
+      out += keepStrings ? c : ' ';
+      i++;
+      while (i < n && content[i] !== quote) {
+        if (content[i] === '\\' && i + 1 < n) {
+          out += keepStrings ? content[i] : (content[i] === '\n' ? '\n' : ' ');
+          i++;
+          out += keepStrings ? content[i] : (content[i] === '\n' ? '\n' : ' ');
+          i++;
+          continue;
+        }
+        out += keepStrings ? content[i] : (content[i] === '\n' ? '\n' : ' ');
+        i++;
+      }
+      if (i < n) { out += keepStrings ? content[i] : ' '; i++; } // closing quote
+      continue;
+    }
+
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+// 1-indexed line number of a byte offset into `text` (works for both the
+// original content and either stripped variant — they are the same length
+// with the same newline positions).
+function lineNumberAtOffset(text, offset) {
+  let line = 1;
+  for (let i = 0; i < offset; i++) {
+    if (text[i] === '\n') line++;
+  }
+  return line;
+}
+
+function lineTextAt(content, lineNumber) {
+  const lines = content.split('\n');
+  return (lines[lineNumber - 1] || '').trim();
 }
 
 // ── collectFiles — impure, in-process walk under a single root, no shell ───
@@ -157,7 +300,14 @@ function collectFiles(rootDir) {
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) continue;
+        if (entry.name === 'fixtures') {
+          skipped.push({ path: full, reason: SKIP_REASONS.FIXTURES_DIR_EXCLUDED });
+          continue;
+        }
+        if (SKIP_DIRS.has(entry.name)) {
+          skipped.push({ path: full, reason: SKIP_REASONS.VCS_OR_DEPENDENCY_DIR_EXCLUDED });
+          continue;
+        }
         walk(full);
         continue;
       }
@@ -168,7 +318,7 @@ function collectFiles(rootDir) {
         continue;
       }
 
-      if (SELF_REFERENTIAL_ASSERTION_BASENAMES.has(entry.name)) {
+      if (isSelfReferentialAssertionFile(dir, entry.name)) {
         skipped.push({ path: full, reason: SKIP_REASONS.SELF_REFERENTIAL_ASSERTION });
         continue;
       }
@@ -207,41 +357,44 @@ function classifyFile(record) {
     }
   }
 
-  const lines = content.split('\n');
   const violations = [];
+  // Call-site detection (R8): strings AND comments blanked — these are the
+  // patterns the false-positive-noise rule is about.
+  const strippedForCalls = stripStringsAndComments(content, false);
+  // Destructure declaration detection: only comments blanked. The quoted
+  // module name (`'os'` / `'node:os'`) is structural code the pattern needs
+  // to match literally — not prose R8 is aimed at.
+  const strippedForDestructure = stripStringsAndComments(content, true);
 
-  let sawDestructure = false;
-  let destructureLine = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (isCommentLine(line)) continue;
-
-    if (QUALIFIED_RE.test(line)) {
-      violations.push({ file: filePath, line: i + 1, form: VIOLATION_FORMS.QUALIFIED, text: line.trim() });
-    }
-
-    if (DESTRUCTURE_RE.test(line)) {
-      sawDestructure = true;
-      destructureLine = i + 1;
-    }
+  // ── Qualified form: os.freemem( — whitespace-tolerant, whole-content ────
+  const qualifiedRe = new RegExp(QUALIFIED_RE_SRC, 'g');
+  let m;
+  while ((m = qualifiedRe.exec(strippedForCalls)) !== null) {
+    const line = lineNumberAtOffset(strippedForCalls, m.index);
+    violations.push({ file: filePath, line, form: VIOLATION_FORMS.QUALIFIED, text: lineTextAt(content, line) });
+    if (m[0].length === 0) qualifiedRe.lastIndex++; // guard against zero-width infinite loop
   }
 
-  // Second pass: a destructured `freemem` used anywhere later (file-scoped,
-  // not line-windowed) as a bare call.
+  // ── Destructured form: const { freemem } = require('os') ... freemem() ──
+  // File-scoped, not line-windowed — the declaration and the bare call can
+  // be arbitrarily far apart, including across a line boundary.
+  const destructureRe = new RegExp(DESTRUCTURE_RE_SRC);
+  const dMatch = destructureRe.exec(strippedForDestructure);
+  const sawDestructure = dMatch !== null;
+  const destructureLine = sawDestructure ? lineNumberAtOffset(strippedForDestructure, dMatch.index) : -1;
+
   if (sawDestructure) {
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (isCommentLine(line)) continue;
-      if (BARE_CALL_RE.test(line)) {
-        violations.push({
-          file: filePath,
-          line: i + 1,
-          form: VIOLATION_FORMS.DESTRUCTURED,
-          text: line.trim(),
-          destructuredAt: destructureLine,
-        });
-      }
+    const bareCallRe = new RegExp(BARE_CALL_RE_SRC, 'g');
+    while ((m = bareCallRe.exec(strippedForCalls)) !== null) {
+      const line = lineNumberAtOffset(strippedForCalls, m.index);
+      violations.push({
+        file: filePath,
+        line,
+        form: VIOLATION_FORMS.DESTRUCTURED,
+        text: lineTextAt(content, line),
+        destructuredAt: destructureLine,
+      });
+      if (m[0].length === 0) bareCallRe.lastIndex++;
     }
   }
 
@@ -366,7 +519,7 @@ module.exports = {
   DEFAULT_ROOT,
   SCANNED_EXTENSIONS,
   SELF_FIXTURE_BASENAMES,
-  SELF_REFERENTIAL_ASSERTION_BASENAMES,
+  SELF_REFERENTIAL_ASSERTION_EXACT_PATHS,
   collectFiles,
   classifyFile,
   scanFreemem,
