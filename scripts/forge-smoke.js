@@ -15650,6 +15650,119 @@ function smokeScriptsCallSitesCanonical() {
   pass('Section 104: canonical path guard is clean, census is non-silent, and registration is biting');
 }
 
+// ── Section 105: resolver + scanner bite bidirectionally, no real pressure ──
+// Verified against the file's ACTUAL highest section (grep -n "^// ── Section
+// [0-9]" | tail -3 → 102, 103, 104 — 104 is the real max at authoring time,
+// matching the verification convention of Sections 96-98/99/104), NOT the
+// number the task plan guessed (100) — the plan predates three later slices'
+// sections landing on this file concurrently. Both mordidas asserted via
+// real CLI spawns, never in-process require() of the resolver/scanner
+// modules — a spawn is the same boundary a real caller crosses.
+function smokeResourcesFoundation() {
+  process.stdout.write('\n▸ Section 105: resolver (T01) + scanner (T03) bite both ways, no real pressure\n');
+  const NODE = process.execPath;
+
+  // ── (a) resolver: forced critical pressure -> admit:false, named reason ──
+  const forcedCritical = spawnSync(NODE, [path.join(SCRIPTS, 'forge-resources.js'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, FORGE_RESOURCES_PRESSURE: '4' },
+  });
+  assert(forcedCritical.status === 0, '(a) resolver CLI always exits 0 (advisory posture) even under forced critical', String(forcedCritical.status));
+  let forcedCriticalContract;
+  try { forcedCriticalContract = JSON.parse(forcedCritical.stdout); } catch (e) { forcedCriticalContract = null; }
+  assert(!!forcedCriticalContract, '(a) forced-critical CLI output parses as JSON', forcedCritical.stdout);
+  if (forcedCriticalContract) {
+    assert(forcedCriticalContract.admit === false, '(a) FORGE_RESOURCES_PRESSURE=4 -> admit:false (forced, never real pressure)', JSON.stringify(forcedCriticalContract));
+    assert(forcedCriticalContract.reason === 'pressure-critical:forced-env',
+      '(a) reason names the FORCED source, distinct from a measured-pressure reason', forcedCriticalContract.reason);
+    assert(forcedCriticalContract.reason !== 'pressure-critical:measured',
+      '(a) forced reason is never confusable with the measured-critical reason', forcedCriticalContract.reason);
+  }
+
+  // ── (b) resolver: forced normal pressure -> admit:true, sized budget ─────
+  const forcedNormal = spawnSync(NODE, [path.join(SCRIPTS, 'forge-resources.js'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, FORGE_RESOURCES_PRESSURE: '1' },
+  });
+  assert(forcedNormal.status === 0, '(b) resolver CLI exits 0 under forced normal pressure', String(forcedNormal.status));
+  let forcedNormalContract;
+  try { forcedNormalContract = JSON.parse(forcedNormal.stdout); } catch (e) { forcedNormalContract = null; }
+  assert(!!forcedNormalContract, '(b) forced-normal CLI output parses as JSON', forcedNormal.stdout);
+  if (forcedNormalContract) {
+    assert(forcedNormalContract.admit === true, '(b) FORGE_RESOURCES_PRESSURE=1 -> admit:true (forced, never real pressure)', JSON.stringify(forcedNormalContract));
+    assert(Number.isInteger(forcedNormalContract.workers) && forcedNormalContract.workers >= 1,
+      '(b) admitted budget sizes at least one worker', String(forcedNormalContract.workers));
+    assert(Number.isFinite(forcedNormalContract.heapMb) && forcedNormalContract.heapMb > 0,
+      '(b) admitted budget sizes a positive heapMb', String(forcedNormalContract.heapMb));
+  }
+
+  // ── (c) scanner: real scripts/ tree -> clean, scanned > 0 ────────────────
+  const realScan = spawnSync(NODE, [path.join(SCRIPTS, 'forge-freemem-callsites.js'), '--check', '--json'], { encoding: 'utf8' });
+  let realScanResult;
+  try { realScanResult = JSON.parse(realScan.stdout); } catch (e) { realScanResult = null; }
+  assert(!!realScanResult, '(c) real-tree scanner CLI output parses as JSON', realScan.stdout);
+  if (realScanResult) {
+    assert(realScanResult.scanned > 0, '(c) real scripts/ tree scan reaches scanned > 0 (anti-silence floor cleared)', String(realScanResult.scanned));
+    assert(realScanResult.outcome === 'clean', '(c) real scripts/ tree has zero banned call sites -> clean', JSON.stringify(realScanResult));
+    assert(realScan.status === 0, '(c) clean outcome exits 0', String(realScan.status));
+  }
+
+  // ── (d) scanner: temp tree with a planted violation -> non-zero, named file ──
+  const violDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-freemem-viol-'));
+  const violFile = path.join(violDir, 'planted.js');
+  // Built by concatenation so this smoke section's own source is not itself a
+  // false positive against forge-freemem-callsites.js's own ban.
+  const plantedCall = 'os' + '.' + 'free' + 'mem' + '(';
+  try {
+    fs.writeFileSync(violFile, `'use strict';\nconst fs = require('fs');\nfunction reportFree() { return ${plantedCall}); }\nmodule.exports = { reportFree };\n`);
+    const violScan = spawnSync(NODE, [path.join(SCRIPTS, 'forge-freemem-callsites.js'), '--check', '--json', '--root', violDir], { encoding: 'utf8' });
+    assert(violScan.status !== 0, '(d) planted-violation temp tree exits non-zero', String(violScan.status));
+    let violResult;
+    try { violResult = JSON.parse(violScan.stdout); } catch (e) { violResult = null; }
+    assert(!!violResult, '(d) planted-violation CLI output parses as JSON', violScan.stdout);
+    if (violResult) {
+      assert(violResult.outcome === 'violations', '(d) outcome is violations, not clean and not anti-silence', violResult.outcome);
+      assert(violResult.violations.some((v) => v.file === violFile),
+        '(d) the violation names the planted file exactly', JSON.stringify(violResult.violations));
+    }
+  } finally {
+    try { fs.rmSync(violDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (e) scanner: empty temp dir -> non-zero, anti-silence reason ─────────
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-freemem-empty-'));
+  try {
+    const emptyScan = spawnSync(NODE, [path.join(SCRIPTS, 'forge-freemem-callsites.js'), '--check', '--json', '--root', emptyDir], { encoding: 'utf8' });
+    assert(emptyScan.status !== 0, '(e) empty temp dir scan exits non-zero (never a silent pass)', String(emptyScan.status));
+    let emptyResult;
+    try { emptyResult = JSON.parse(emptyScan.stdout); } catch (e) { emptyResult = null; }
+    assert(!!emptyResult, '(e) empty-dir CLI output parses as JSON', emptyScan.stdout);
+    if (emptyResult) {
+      assert(emptyResult.outcome === 'anti-silence', '(e) empty dir outcome is anti-silence, never clean', emptyResult.outcome);
+      assert(emptyResult.scanned === 0, '(e) empty dir scanned count is 0', String(emptyResult.scanned));
+      assert(typeof emptyResult.reason === 'string' && emptyResult.reason.length > 0
+        && emptyResult.reason !== (realScanResult && realScanResult.reason),
+        '(e) anti-silence reason is present and distinct from a violations-found reason', emptyResult.reason);
+      if (realScanResult === null || realScanResult === undefined) {
+        // no-op — real scan already asserted above; this branch only guards
+        // against a null-vs-string comparison silently passing.
+      }
+    }
+  } finally {
+    try { fs.rmSync(emptyDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (f) registration: the section verifies it is wired into main() ───────
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeResourcesFoundation\(\); \}/.test(mainBody),
+    '(f) Section 105 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass('Section 105: forge-resources.js resolver admits/refuses on forced env (never real pressure), and '
+    + 'forge-freemem-callsites.js scanner is clean on the real tree, red on a planted violation naming the '
+    + 'file, and red-with-anti-silence-reason on an empty directory — all three via real CLI spawns');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -15769,6 +15882,7 @@ async function main() {
       () => { smokeLedgerSnapshotRendered(); },
       () => { smokeMemoryIndexCommandRendered(); },
       () => { smokeScriptsCallSitesCanonical(); },
+      () => { smokeResourcesFoundation(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {

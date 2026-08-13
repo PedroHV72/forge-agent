@@ -49,6 +49,20 @@
  * source / fixture strings) and are excluded by basename, recorded in
  * `skipped[]` with reason `self-fixture` — never silently dropped.
  *
+ * A second, distinct exclusion class: `forge-resources.test.js` (T01's
+ * test suite) contains the line
+ * `assert(!/os\.freemem\(/.test(src), 'forge-resources.js never calls
+ * os.freemem()')` — a self-referential assertion that PROVES the absence of
+ * the call, not a call site itself. Text-matching cannot tell "this line
+ * calls os.freemem()" apart from "this line is a string/regex literal
+ * asserting that nothing else does" without a real JS parser, which this
+ * scanner deliberately does not carry (D-none: no new parse dependency for
+ * one file). Rather than weaken the ban (unacceptable — it would let a real
+ * call site through) or delete the D1 guard in the test (load-bearing), the
+ * file is named in a SECOND closed exclusion set with its own reason
+ * (`self-referential-assertion`, distinct from `self-fixture`) — still
+ * counted and enumerated in `skipped[]`, never silently dropped.
+ *
  * CENSUS, NOT VERDICT-ONLY: the scan always reports `scanned` (files
  * actually read) alongside the verdict. Every file the walk encounters but
  * does not scan (wrong extension, unreadable, this scanner's own fixture
@@ -65,6 +79,7 @@ const SKIP_REASONS = Object.freeze({
   EXTENSION_NOT_SCANNED: 'extension-not-scanned',
   UNREADABLE: 'unreadable',
   SELF_FIXTURE: 'self-fixture',
+  SELF_REFERENTIAL_ASSERTION: 'self-referential-assertion',
   ROOT_NOT_FOUND: 'root-not-found',
 });
 
@@ -85,6 +100,16 @@ const SKIP_DIRS = new Set(['.git', 'node_modules', 'fixtures']);
 const SELF_FIXTURE_BASENAMES = new Set([
   'forge-freemem-callsites.js',
   'forge-freemem-callsites.test.js',
+]);
+
+// A separate, distinct exclusion set (see SELF-EXCLUSION doc above): files
+// whose only match is a self-referential assertion proving the ban, not a
+// real call site. Kept apart from SELF_FIXTURE_BASENAMES so the two reasons
+// never collapse into one — a future reader must be able to tell "this
+// scanner's own fixture" from "a consumer's proof-of-absence test" by
+// reason alone.
+const SELF_REFERENTIAL_ASSERTION_BASENAMES = new Set([
+  'forge-resources.test.js',
 ]);
 
 // Built by concatenation so this file's own source does not contain the
@@ -140,6 +165,11 @@ function collectFiles(rootDir) {
 
       if (SELF_FIXTURE_BASENAMES.has(entry.name)) {
         skipped.push({ path: full, reason: SKIP_REASONS.SELF_FIXTURE });
+        continue;
+      }
+
+      if (SELF_REFERENTIAL_ASSERTION_BASENAMES.has(entry.name)) {
+        skipped.push({ path: full, reason: SKIP_REASONS.SELF_REFERENTIAL_ASSERTION });
         continue;
       }
 
@@ -335,6 +365,8 @@ module.exports = {
   VIOLATION_FORMS,
   DEFAULT_ROOT,
   SCANNED_EXTENSIONS,
+  SELF_FIXTURE_BASENAMES,
+  SELF_REFERENTIAL_ASSERTION_BASENAMES,
   collectFiles,
   classifyFile,
   scanFreemem,
