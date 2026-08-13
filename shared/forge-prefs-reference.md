@@ -361,6 +361,29 @@ Execução paralela de execute-task dentro do mesmo slice + comportamento em ove
 - **Valores permitidos:** `defer`, `block`
 - **Descrição:** Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff).
 
+## resources
+
+Controle de recursos sob pressão do host — dimensionamento de concorrência e espera sob pressão crítica. `enforcement` decide se o clamp/recusa é advisory ou enforcing (D2); `shadow_wait`/`wait_cap_ms` decidem se a espera sob pressão crítica é sombra (só registra evento) ou bloqueante de verdade (D3). Postura v1: `clamp` enforcing dia 1, recusa e espera ficam advisory/sombra até uma milestone de calibração medir o comportamento real.
+
+### `resources.enforcement`
+
+- **Tipo:** string
+- **Default:** `"clamp"`
+- **Valores permitidos:** `off`, `clamp`, `full`
+- **Descrição:** off = tudo advisory/desligado (necessário para S06 medir com o controle desligado); clamp = dimensionamento enforcing, recusa advisory (D2, postura do v1); full = recusa também enforcing (flip pós-calibração).
+
+### `resources.shadow_wait`
+
+- **Tipo:** boolean
+- **Default:** `true`
+- **Descrição:** true = espera sob pressão crítica roda em modo sombra, registrando "teria esperado Xs" como evento sem bloquear (D3); false = espera real bloqueante (flip após milestone de medição).
+
+### `resources.wait_cap_ms`
+
+- **Tipo:** integer
+- **Default:** `30000`
+- **Descrição:** Teto da espera (sombra ou real) sob pressão crítica, em milissegundos.
+
 ## retry
 
 Retry Handler para falhas transitórias do Agent() (rate-limit, network, server, stream, connection). Classes permanentes/unknown falham imediatamente; model_refusal/context_overflow/tooling_failure são da Failure Taxonomy, não deste handler.
