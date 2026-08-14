@@ -15763,6 +15763,129 @@ function smokeResourcesFoundation() {
     + 'file, and red-with-anti-silence-reason on an empty directory — all three via real CLI spawns');
 }
 
+// ── Section 106: resource pool (S02) — CLI census, two-process sum, resolver byte-stability ──
+// Section number MEASURED at execution time (MEM013), not assumed: grepped
+// "Section [0-9]+" across this file and took max+1 (105 was the real max —
+// three later sections had already landed on this file by the time this
+// section was authored, same drift class MEM013 documents). All three
+// mordidas spawn real CLIs (child_process.spawn/spawnSync), never
+// require() of forge-resource-pool.js / forge-resources.js in-process — a
+// spawn is the same boundary a real caller (and forge-resource-pool.concurrency.test.js)
+// crosses.
+async function smokeResourcePool() {
+  process.stdout.write('\n▸ Section 106: resource pool CLI census, real two-process sum, resolver byte-stability\n');
+  const NODE = process.execPath;
+  const POOL_CLI = path.join(SCRIPTS, 'forge-resource-pool.js');
+  const RESOURCES_CLI = path.join(SCRIPTS, 'forge-resources.js');
+
+  // ── (a) pool CLI --status --json census on a seeded temp pool ────────────
+  const censusDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-pool-census-'));
+  try {
+    fs.mkdirSync(path.join(censusDir, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(censusDir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 3, written_at: Date.now() }), 'utf8');
+    const status = spawnSync(NODE, [POOL_CLI, '--status', '--json', '--pool-dir', censusDir], { encoding: 'utf8' });
+    assert(status.status === 0, '(a) pool CLI --status --json exits 0 on a seeded temp pool', String(status.status));
+    let statusContract;
+    try { statusContract = JSON.parse(status.stdout); } catch (e) { statusContract = null; }
+    assert(!!statusContract, '(a) pool CLI --status --json output parses as JSON', status.stdout);
+    if (statusContract) {
+      assert(statusContract.ok === true, '(a) census on a seeded pool is ok:true', JSON.stringify(statusContract));
+      assert(statusContract.ceiling === 3, '(a) census reports the seeded ceiling (3), not a recomputed value', String(statusContract.ceiling));
+      assert(statusContract.held === 0, '(a) census reports 0 held on a fresh pool', String(statusContract.held));
+      assert(statusContract.free === 3, '(a) census reports free === ceiling on a fresh pool', String(statusContract.free));
+      assert(Array.isArray(statusContract.slots) && statusContract.slots.length === 3, '(a) census enumerates one slot entry per ceiling unit', JSON.stringify(statusContract.slots));
+    }
+  } finally {
+    try { fs.rmSync(censusDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (b) two-process real dispute (compact version of the concurrency suite) ──
+  // Ceiling 4, each of two real spawned node processes requests 3 (< ceiling,
+  // matches the concurrency test's design — see that file's comment: this
+  // keeps the assertion out of the separately-named
+  // pool-exhausted-minimum-grant floor and inside the positive grant path).
+  const disputeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-pool-dispute-'));
+  try {
+    fs.mkdirSync(path.join(disputeDir, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(disputeDir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 4, written_at: Date.now() }), 'utf8');
+    const outA = path.join(disputeDir, 'out-a.json');
+    const outB = path.join(disputeDir, 'out-b.json');
+    const readyA = path.join(disputeDir, 'ready-a');
+    const readyB = path.join(disputeDir, 'ready-b');
+    const goFile = path.join(disputeDir, 'go');
+    const workerSrc = `
+      'use strict';
+      const fs = require('fs');
+      const pool = require(process.env.POOL_MODULE);
+      const start = Date.now();
+      fs.writeFileSync(process.env.READY_FILE, String(process.pid));
+      while (!fs.existsSync(process.env.GO_FILE)) {
+        if (Date.now() - start > 5000) throw new Error('go barrier deadline exceeded');
+      }
+      const result = pool.acquireSlots(3, { poolDir: process.env.FORGE_RESOURCE_POOL_DIR, ownerToken: 'owner-' + process.pid });
+      fs.writeFileSync(process.env.OUT_FILE, JSON.stringify(result));
+    `;
+    const { spawn } = require('child_process');
+    const envBase = { ...process.env, POOL_MODULE: POOL_CLI, FORGE_RESOURCE_POOL_DIR: disputeDir, GO_FILE: goFile };
+    const childA = spawn(NODE, ['-e', workerSrc], { env: { ...envBase, OUT_FILE: outA, READY_FILE: readyA } });
+    const childB = spawn(NODE, ['-e', workerSrc], { env: { ...envBase, OUT_FILE: outB, READY_FILE: readyB } });
+    const exitedA = new Promise((resolve) => childA.once('exit', resolve));
+    const exitedB = new Promise((resolve) => childB.once('exit', resolve));
+    const deadline = Date.now() + 8000;
+    while (!(fs.existsSync(readyA) && fs.existsSync(readyB))) {
+      if (Date.now() > deadline) throw new Error('(b) both dispute children failed to reach the ready barrier in time');
+    }
+    fs.writeFileSync(goFile, 'go');
+    const outDeadline = Date.now() + 8000;
+    while (!(fs.existsSync(outA) && fs.existsSync(outB))) {
+      if (Date.now() > outDeadline) throw new Error('(b) both dispute children failed to write output in time');
+    }
+    await exitedA; await exitedB;
+    const resultA = JSON.parse(fs.readFileSync(outA, 'utf8'));
+    const resultB = JSON.parse(fs.readFileSync(outB, 'utf8'));
+    assert(resultA.ok === true && resultB.ok === true, '(b) both real dispute processes report ok:true', JSON.stringify({ resultA, resultB }));
+    const sum = resultA.granted + resultB.granted;
+    assert(sum === 4, '(b) two real processes disputing a shared ceiling-4 pool sum to exactly the ceiling', String(sum));
+  } finally {
+    try { fs.rmSync(disputeDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (c) forge-resources.js CLI: stable prefix keys + maxConcurrentClamp, pool absent without the seam ──
+  const resourcesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-pool-resources-'));
+  try {
+    fs.mkdirSync(path.join(resourcesDir, '.gsd'), { recursive: true });
+    const resources = spawnSync(NODE, [RESOURCES_CLI, '--json', '--cwd', resourcesDir], { encoding: 'utf8' });
+    assert(resources.status === 0, '(c) forge-resources.js CLI always exits 0 (advisory posture)', String(resources.status));
+    let contract;
+    try { contract = JSON.parse(resources.stdout); } catch (e) { contract = null; }
+    assert(!!contract, '(c) forge-resources.js CLI output parses as JSON', resources.stdout);
+    if (contract) {
+      for (const key of ['admit', 'workers', 'heapMb', 'playwrightWorkers', 'reason', 'pressureLevel', 'enforcement', 'shadowWait', 'source']) {
+        assert(Object.prototype.hasOwnProperty.call(contract, key), `(c) S01 stable prefix key present: ${key}`, JSON.stringify(contract));
+      }
+      assert(Object.prototype.hasOwnProperty.call(contract, 'maxConcurrentClamp'), '(c) additive maxConcurrentClamp key is always present (S02)', JSON.stringify(contract));
+      assert(!Object.prototype.hasOwnProperty.call(contract, 'pool'), '(c) additive pool key is ABSENT via the CLI, which never injects opts.pool — proves the seam stays optional', JSON.stringify(contract));
+    }
+  } finally {
+    try { fs.rmSync(resourcesDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (d) real-default-root guard ────────────────────────────────────────
+  const realRoot = path.join(os.homedir(), '.claude', 'forge', 'resource-pool');
+  assert(!fs.existsSync(realRoot) || fs.statSync(realRoot).isDirectory(),
+    '(d) this section never creates the real machine pool root under an unexpected shape (sanity)', realRoot);
+
+  // ── (e) registration: the section verifies it is wired into main() ───────
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ await smokeResourcePool\(\); \}/.test(mainBody),
+    '(e) Section 106 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass('Section 106: pool CLI census on a seeded temp pool, two REAL spawned processes disputing a shared '
+    + 'ceiling sum to exactly it, and forge-resources.js CLI keeps the S01 prefix stable with maxConcurrentClamp '
+    + 'always present and pool absent without the opts.pool seam — all via real CLI/process spawns');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -15883,6 +16006,7 @@ async function main() {
       () => { smokeMemoryIndexCommandRendered(); },
       () => { smokeScriptsCallSitesCanonical(); },
       () => { smokeResourcesFoundation(); },
+      async () => { await smokeResourcePool(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
