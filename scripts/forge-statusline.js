@@ -816,11 +816,46 @@ process.stdin.on('end', () => {
     // rendering (MEM008), including legacy-md-without-jsonc.
     if (resolvedPrefs.hadError) forgeVersionTail += ' │ ⚠ prefs';
 
+    // --- Resource clamp indicator (🧮) ---
+    // Zero spawn on this path — the statusline renders continuously, and the
+    // sysctl-backed pressure probe in forge-resources.js shells out on every
+    // call. Allowed sources only: `poolStatus()` (small fs reads, no spawn —
+    // forge-resource-pool.js) and `readLastResourceEvent` (bounded tail read
+    // of `events.jsonl`, export of T01 — forge-resources-census.js).
+    // MEM008: any failure here (missing module, corrupt log, unreadable
+    // pool) must never stop the render.
+    let resourceSegment = '';
+    try {
+      let poolStatus = null;
+      try { ({ poolStatus } = require(path.join(__dirname, 'scripts', 'forge-resource-pool.js'))); }
+      catch { ({ poolStatus } = require(path.join(__dirname, 'forge-resource-pool.js'))); }
+      let readLastResourceEvent = null;
+      try { ({ readLastResourceEvent } = require(path.join(__dirname, 'scripts', 'forge-resources-census.js'))); }
+      catch { ({ readLastResourceEvent } = require(path.join(__dirname, 'forge-resources-census.js'))); }
+
+      const pool = poolStatus({});
+      const held = pool && pool.ok ? pool.held : 0;
+      const ceiling = pool && pool.ok ? pool.ceiling : 0;
+
+      const lastEvent = cwd ? readLastResourceEvent(cwd, { tailBytes: 8192 }) : null;
+      const degradedReason = lastEvent && lastEvent.reason ? lastEvent.reason : '';
+
+      // Gate: show only when clamp is active — pool holding a slot OR a
+      // recent event carrying a degradation reason. Silence otherwise keeps
+      // the rendered line byte-identical to before this change.
+      if (held > 0 || degradedReason) {
+        const parts = [`🧮 ${held}/${ceiling}`];
+        if (degradedReason) parts.push(`${c.dim}${degradedReason}${c.reset}`);
+        resourceSegment = parts.join(' ');
+      }
+    } catch { /* MEM008 — resource indicator never blocks a render */ }
+
     // --- Model segment: only when NOT auto (tier icon covers "what's running" in auto mode) ---
     const segments = [];
     if (!autoMode) segments.push(model);
     segments.push(middleSegment, ctxStr, costDisplay);
     if (usageSegment) segments.push(usageSegment);
+    if (resourceSegment) segments.push(resourceSegment);
 
     const line1 = autoPrefix + segments.join(' │ ') + forgeVersionTail;
 
