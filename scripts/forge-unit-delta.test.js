@@ -393,6 +393,200 @@ test('com o eixo de ref removido, o assert-isca FALHA (mordida provada)', () => 
   assertEqual(fs.readFileSync(MODULE, 'utf8'), src, 'o módulo original mudou — a mordida não pode escrever nele');
 });
 
+// ── R8 — as objeções concedidas do review de S02 (R2, R4, R5) ─────────────
+//
+// Cada teste aqui nasce de uma medição do review, não de uma hipótese; o
+// comentário de cada um diz o que a versão anterior devolvia.
+console.log('\nR8 — review de S02: reader que lança, paths por NUL, refs por ancestralidade');
+
+// R2 — o reader svn LANÇA. Antes: a exceção escapava de writtenByUnit inteira
+// (sem skipped, sem relatório), e o main a engolia em exit 0.
+test('R2 reader svn que LANÇA degrada para svn-log-failed com detail — nunca escapa', () => {
+  let rep;
+  try {
+    rep = writtenByUnit(REPO, { vcs: 'svn', svnLog: () => { throw new Error('spawn svn ENOENT'); } });
+  } catch (e) {
+    throw new Error(`a exceção escapou de writtenByUnit: ${e.message}`);
+  }
+  assertEqual(rep.units_measured, 0, 'sem log não há medição');
+  assertEqual(rep.skipped[0].reason, 'svn-log-failed', 'razão nomeada');
+  assert(/ENOENT/.test(rep.skipped[0].detail), `a mensagem do throw precisa chegar ao detail: ${rep.skipped[0].detail}`);
+  observe(rep.skipped);
+});
+
+// R2 (metade CLI) — um run que NÃO produziu relatório não pode sair 0. O throw
+// é injetado numa CÓPIA descartável (mesma técnica do R7): a única forma de
+// exercitar o catch do main de fora do processo.
+test('R2 sem relatório o PROCESSO sai não-zero (e a mordida do exit code)', () => {
+  const src = fs.readFileSync(MODULE, 'utf8');
+  const CALL = '    const rep = writtenByUnit(cwd, {});';
+  assert(src.includes(CALL), 'a chamada do main mudou de forma — a mordida ficaria inerte');
+  const THROW = "    const rep = (() => { throw new Error('boom sem relatorio'); })();";
+  const boomPath = path.join(path.dirname(MODULE), '__boom-unit-delta.js');
+  const boomZeroPath = path.join(path.dirname(MODULE), '__boom-zero-unit-delta.js');
+  try {
+    fs.writeFileSync(boomPath, src.replace(CALL, THROW));
+    const r = spawnSync(process.execPath, [boomPath, '--cwd', REPO, '--json'], { encoding: 'utf8' });
+    assertEqual(r.status, 2, `exit do PROCESSO com relatório ausente; stderr=${r.stderr}`);
+    assert(/boom sem relatorio/.test(r.stderr), 'a causa vai nomeada ao stderr');
+    assertEqual(r.stdout.trim(), '', 'nenhum relatório foi emitido');
+
+    // MORDIDA: com `return 2` revertido para `return 0`, o assert acima fica verde
+    // sobre um run que não mediu nada — que é exatamente o defeito de origem.
+    const reverted = src.replace(CALL, THROW).replace(
+      "    process.stderr.write(`forge-unit-delta: ${e.message}\\n`);\n    return 2;",
+      "    process.stderr.write(`forge-unit-delta: ${e.message}\\n`);",
+    );
+    assert(reverted !== src.replace(CALL, THROW), 'a reversão do exit code não aplicou — a mordida seria no-op');
+    fs.writeFileSync(boomZeroPath, reverted);
+    const r0 = spawnSync(process.execPath, [boomZeroPath, '--cwd', REPO, '--json'], { encoding: 'utf8' });
+    assertEqual(r0.status, 0, 'a reversão precisa reproduzir o exit 0 antigo (senão a mordida não mordeu)');
+  } finally {
+    try { fs.unlinkSync(boomPath); } catch {}
+    try { fs.unlinkSync(boomZeroPath); } catch {}
+  }
+  assertEqual(fs.readFileSync(MODULE, 'utf8'), src, 'o módulo original mudou — a mordida não pode escrever nele');
+});
+
+// R4 — path com LF. Git C-QUOTA esse path na saída não-`-z` (o mecanismo é
+// mangling, não split), então sem `-z` ele chega como literal escapado que não
+// casa nenhum path declarado. O arquivo é criado pelo ÍNDICE (update-index
+// --cacheinfo), nunca pelo working tree: Win32 proíbe LF em nome de arquivo, e
+// esperar a máquina permitir seria não testar.
+test('R4 path com LF sobrevive: diff-tree -z entrega o nome exato, sem trim', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'unit-delta-lf-'));
+  const ID_LF = 'M-20990106000000-lf';
+  try {
+    g(root, ['init', '-q', '--initial-branch=master', '.']);
+    g(root, ['config', 'user.email', 't@example.com']);
+    g(root, ['config', 'user.name', 'T']);
+    g(root, ['config', 'commit.gpgsign', 'false']);
+    g(root, ['config', 'core.quotepath', 'true']);
+    // Win32 rejects LF in a path name, and git enforces that with protectNTFS.
+    // Disabled HERE ONLY, on a throwaway fixture, so the parser can be exercised
+    // against the shape it exists to survive — the alternative is a test that
+    // silently never runs on the platform this repo is developed on.
+    g(root, ['config', 'core.protectNTFS', 'false']);
+    commitFile(root, 'README.md', 'base\n', 'chore: base');
+    const weird = 'src/a\nb.txt';
+    const sha = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: root, input: 'x\n', encoding: 'utf8' }).trim();
+    g(root, ['update-index', '--add', '--cacheinfo', `100644,${sha},${weird}`]);
+    const tree = g(root, ['write-tree']).trim();
+    const parent = g(root, ['rev-parse', 'HEAD']).trim();
+    const commit = execFileSync('git', ['commit-tree', tree, '-p', parent, '-m', 'feat(S01/T01): escreve path com LF'], {
+      cwd: root, encoding: 'utf8',
+      env: { ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com' },
+    }).trim();
+    g(root, ['update-ref', `refs/heads/forge/${ID_LF}`, commit]);
+    g(root, ['read-tree', 'HEAD']); // deixa o índice consistente com master
+
+    const rep = writtenByUnit(root, { defaultBranch: 'master' });
+    const u = rep.units.find((x) => x.unit === `${ID_LF}::S01/T01`);
+    assert(u, `unidade ausente: ${JSON.stringify(rep.units.map((x) => x.unit))}`);
+    assertDeep(u.files, [weird], 'o path com LF chega inteiro — sem C-quoting, sem split, sem trim');
+    observe(rep.skipped);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// R5 — o desempate local × origin. Medido no forge-agent real:
+// `controle-contexto-gsd` é 0/5 (local ATRÁS), e a regra antiga "local vence"
+// descartava cinco commits de escrita daquela unidade, INFLANDO a cobertura.
+function makeDupRefFixture(tag, build) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `unit-delta-${tag}-`));
+  g(root, ['init', '-q', '--initial-branch=master', '.']);
+  g(root, ['config', 'user.email', 't@example.com']);
+  g(root, ['config', 'user.name', 'T']);
+  g(root, ['config', 'commit.gpgsign', 'false']);
+  commitFile(root, 'README.md', 'base\n', 'chore: base');
+  build(root);
+  g(root, ['checkout', '-q', 'master']);
+  return root;
+}
+
+const ID_BEHIND = 'M-20990107000000-behind';
+const ID_DIVERG = 'M-20990108000000-diverg';
+
+test('R5 local ATRÁS de origin: o descendente vence e a escrita do origin é medida', () => {
+  const root = makeDupRefFixture('behind', (r) => {
+    g(r, ['checkout', '-q', '-b', `forge/${ID_BEHIND}`]);
+    commitFile(r, 'local.txt', 'l\n', 'feat(S01/T01): commit que o local tem');
+    const localSha = g(r, ['rev-parse', 'HEAD']).trim();
+    commitFile(r, 'somente-no-origin.txt', 'o\n', 'feat(S01/T02): commit só no origin');
+    const aheadSha = g(r, ['rev-parse', 'HEAD']).trim();
+    // origin fica À FRENTE; a branch local recua.
+    g(r, ['update-ref', `refs/remotes/origin/forge/${ID_BEHIND}`, aheadSha]);
+    g(r, ['checkout', '-q', 'master']);
+    g(r, ['update-ref', `refs/heads/forge/${ID_BEHIND}`, localSha]);
+  });
+  try {
+    const refs = listUnitRefs(root);
+    const chosen = refs.find((x) => x.id === ID_BEHIND);
+    assert(chosen, 'ref não listado');
+    assertEqual(chosen.resolution, 'remote-descendant', 'o descendente é o origin, não o local');
+    assertEqual(chosen.ref, `refs/remotes/origin/forge/${ID_BEHIND}`, 'ref escolhido');
+
+    const rep = writtenByUnit(root, { defaultBranch: 'master' });
+    const t2 = rep.units.find((u) => u.unit === `${ID_BEHIND}::S01/T02`);
+    // ESTE é o assert que a regra antiga deixava vermelho: com "local vence",
+    // S01/T02 não existe e sua escrita some da medição.
+    assert(t2, `a escrita que só o origin carrega sumiu da medição: ${JSON.stringify(rep.units.map((u) => u.unit))}`);
+    assertDeep(t2.files, ['somente-no-origin.txt'], 'arquivos da unidade que só o origin carrega');
+    observe(rep.skipped);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('R5 refs DIVERGENTES: skip nomeado carregando os DOIS refs — nunca uma escolha silenciosa', () => {
+  const root = makeDupRefFixture('diverg', (r) => {
+    g(r, ['checkout', '-q', '-b', `forge/${ID_DIVERG}`]);
+    commitFile(r, 'so-local.txt', 'l\n', 'feat(S01/T01): só no local');
+    const localSha = g(r, ['rev-parse', 'HEAD']).trim();
+    g(r, ['checkout', '-q', 'master']);
+    g(r, ['checkout', '-q', '-b', 'tmp-origin']);
+    commitFile(r, 'so-origin.txt', 'o\n', 'feat(S01/T01): só no origin');
+    const remoteSha = g(r, ['rev-parse', 'HEAD']).trim();
+    g(r, ['checkout', '-q', 'master']);
+    g(r, ['update-ref', `refs/heads/forge/${ID_DIVERG}`, localSha]);
+    g(r, ['update-ref', `refs/remotes/origin/forge/${ID_DIVERG}`, remoteSha]);
+    g(r, ['branch', '-q', '-D', 'tmp-origin']);
+  });
+  try {
+    const entry = listUnitRefs(root).find((x) => x.id === ID_DIVERG);
+    assert(entry, 'ref não listado');
+    assertEqual(entry.divergent, true, 'divergência reconhecida');
+    assertEqual(entry.ref, null, 'nenhum dos dois pode ser escolhido');
+    assertDeep(entry.refs_seen.slice().sort(), [
+      `refs/heads/forge/${ID_DIVERG}`,
+      `refs/remotes/origin/forge/${ID_DIVERG}`,
+    ].sort(), 'os dois refs viajam juntos');
+
+    const rep = writtenByUnit(root, { defaultBranch: 'master' });
+    const s = rep.skipped.find((x) => x.unit === ID_DIVERG);
+    assert(s, `skip ausente: ${JSON.stringify(rep.skipped)}`);
+    assertEqual(s.reason, 'ref-divergent', 'razão nomeada');
+    assertEqual((s.refs || []).length, 2, 'o skip carrega os dois refs');
+    assertEqual(rep.units.length, 0, 'nenhuma unidade nasce de um par divergente');
+    observe(rep.skipped);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('R5 refs idênticos ou ref único não viram divergência', () => {
+  const ID_SAME = 'M-20990109000000-same';
+  const root = makeDupRefFixture('same', (r) => {
+    g(r, ['checkout', '-q', '-b', `forge/${ID_SAME}`]);
+    commitFile(r, 'x.txt', 'x\n', 'feat(S01/T01): trabalho');
+    const sha = g(r, ['rev-parse', 'HEAD']).trim();
+    g(r, ['update-ref', `refs/remotes/origin/forge/${ID_SAME}`, sha]);
+  });
+  try {
+    const entry = listUnitRefs(root).find((x) => x.id === ID_SAME);
+    assertEqual(entry.resolution, 'identical', 'refs idênticos');
+    assert(!entry.divergent, 'idêntico nunca é divergente');
+    const rep = writtenByUnit(root, { defaultBranch: 'master' });
+    assert(rep.units.find((u) => u.unit === `${ID_SAME}::S01/T01`), 'a unidade continua medida');
+    observe(rep.skipped);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 // ── R3 — DELTA_REASONS cruzado nos dois sentidos ──────────────────────────
 console.log('\nR3 — razões: declaradas ⇄ produzidas');
 

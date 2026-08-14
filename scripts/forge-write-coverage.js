@@ -75,8 +75,10 @@ const SKIP_REASONS = [
   'no-branch-ref',         // the unit has a PLAN but its owner has no `forge/*` ref. forge-unit-delta deliberately does not declare this reason: it starts from refs and never sees the plan side. The join is where the absence becomes visible, so the reason lives here.
   'no-attributed-commits', // the ref EXISTS but carries no commit with this unit's scope (e.g. a batch commit aggregating several tasks). Neither 0% nor 100% — an honest "cannot measure this one".
   'legacy-plan-schema',    // the plan carries no readable structured `must_haves:` block, so its declared side cannot be read the way this measurement defines it.
-  'plan-swept',            // a milestone/archive directory that exists but holds no `T##-PLAN.md` at all (the plans were swept). One synthetic entry per directory — never a percentage over nothing.
+  'plan-swept',            // a milestone/archive directory that exists but holds NO `T##-PLAN.md` FILE AT ALL (the plans were swept). Keyed on plan files SEEN, never on units admitted — see discoverCorpus. One synthetic entry per directory — never a percentage over nothing.
+  'plans-all-excluded',    // a milestone/archive directory whose `T##-PLAN.md` files EXIST but none survived admission: every one was `status: DECOMPOSED` (a container, not a writer) or unreadable. Distinct from `plan-swept` because the plans are right there — saying they are absent would be a false statement about the directory (S02 review R3).
   'ambiguous-unit-owner',  // svn side: the revision names a unit scope but more than one milestone candidate and no full id, so ownership is unknowable. Refused, never guessed.
+  'ref-divergent',         // the owner carries a local AND an origin ref and neither contains the other, so `forge-unit-delta` refused to pick a range to walk. Distinct from `no-attributed-commits`: there IS a ref and it may well carry the commits — the pair just cannot be resolved (S02 review R5).
 ];
 
 // Sub-reasons of `no-code-writes`. Both are true instances of the reason ("this
@@ -144,9 +146,11 @@ function isDecomposed(content) {
 function discoverCorpus(cwd) {
   const units = [];
   const swept = [];
+  const allExcluded = [];
   const excluded = { decomposed: 0 };
   const rootsScanned = [];
   let milestoneDirs = 0;
+  let plansSeenTotal = 0;
 
   for (const bucket of ['milestones', 'archive']) {
     const root = path.join(cwd, '.gsd', bucket);
@@ -158,6 +162,16 @@ function discoverCorpus(cwd) {
       if (entityKind(ownerId) !== 'milestone') continue;
       milestoneDirs++;
       const before = units.length;
+      // Plan FILES seen, counted apart from units ADMITTED. Before the S02
+      // review R3 the two were the same number, so a milestone whose plans all
+      // exist but are all `DECOMPOSED` was emitted as `plan-swept` with the
+      // detail "sem nenhum T##-PLAN.md" — a false statement about a directory
+      // whose plans are sitting right there, and one that inflates `skipped`
+      // (hence the `instrument_warning`) on top of already being counted in
+      // `excluded.decomposed`.
+      let plansSeen = 0;
+      let decomposedHere = 0;
+      let unreadableHere = 0;
       const slicesRoot = path.join(root, ownerId, 'slices');
       for (const s of listDir(slicesRoot)) {
         if (!s.isDirectory() || !/^S\d{2}$/.test(s.name)) continue;
@@ -166,9 +180,11 @@ function discoverCorpus(cwd) {
           if (!t.isDirectory() || !/^T\d{2}(\.\d+)?$/.test(t.name)) continue;
           const planPath = path.join(tasksRoot, t.name, `${t.name}-PLAN.md`);
           if (!fs.existsSync(planPath)) continue;
+          plansSeen++;
+          plansSeenTotal++;
           const content = readText(planPath);
-          if (content === null) continue;
-          if (isDecomposed(content)) { excluded.decomposed++; continue; }
+          if (content === null) { unreadableHere++; continue; }
+          if (isDecomposed(content)) { excluded.decomposed++; decomposedHere++; continue; }
           units.push({
             unit: unitKeyFor(ownerId, s.name, t.name),
             owner: ownerId, owner_kind: 'milestone',
@@ -178,7 +194,15 @@ function discoverCorpus(cwd) {
           });
         }
       }
-      if (units.length === before) swept.push({ owner: ownerId, bucket });
+      // Keyed on plan FILES, not on contribution: zero plans is `plan-swept`;
+      // plans present but none admitted is its own named outcome.
+      if (plansSeen === 0) swept.push({ owner: ownerId, bucket, plans_seen: 0 });
+      else if (units.length === before) {
+        allExcluded.push({
+          owner: ownerId, bucket, plans_seen: plansSeen,
+          decomposed: decomposedHere, unreadable: unreadableHere,
+        });
+      }
     }
   }
 
@@ -194,6 +218,7 @@ function discoverCorpus(cwd) {
         // Exact suffix: `*-PLAN.md`. `*-PLAN-GATE.md` ends in `-GATE.md` and
         // therefore cannot match — proved by test, not by reading.
         if (!/-PLAN\.md$/.test(f.name)) continue;
+        plansSeenTotal++;
         const planPath = path.join(tasksRoot, taskId, f.name);
         const content = readText(planPath);
         if (content === null) continue;
@@ -211,7 +236,12 @@ function discoverCorpus(cwd) {
 
   units.sort((a, b) => a.unit.localeCompare(b.unit));
   swept.sort((a, b) => a.owner.localeCompare(b.owner));
-  return { units, swept, excluded, roots_scanned: rootsScanned, milestone_dirs: milestoneDirs };
+  allExcluded.sort((a, b) => a.owner.localeCompare(b.owner));
+  return {
+    units, swept, all_excluded: allExcluded, excluded,
+    roots_scanned: rootsScanned, milestone_dirs: milestoneDirs,
+    plan_files_seen: plansSeenTotal,
+  };
 }
 
 // ── Declared side ──────────────────────────────────────────────────────────
@@ -382,8 +412,14 @@ function measureCoverage(cwd, opts) {
   const refAxisAvailable = delta.vcs === 'git';
 
   const ambiguous = new Set();
+  const divergentOwners = new Map();
   for (const s of (delta.skipped || [])) {
     if (s.reason === 'ambiguous-unit-owner' && s.unit) ambiguous.add(s.unit);
+    // The delta refused to pick between a local and an origin ref that diverged
+    // (S02 review R5). Propagated as its own reason: calling it
+    // `no-attributed-commits` would assert "ref presente, nenhum commit com o
+    // escopo desta unidade" about refs nobody walked.
+    if (s.reason === 'ref-divergent' && s.unit) divergentOwners.set(s.unit, s.refs || []);
   }
 
   const measured = [];
@@ -392,6 +428,16 @@ function measureCoverage(cwd, opts) {
 
   for (const sw of corpus.swept) {
     skipped.push({ unit: sw.owner, reason: 'plan-swept', detail: `${sw.bucket} sem nenhum T##-PLAN.md` });
+  }
+  for (const ax of (corpus.all_excluded || [])) {
+    const parts = [];
+    if (ax.decomposed) parts.push(`${ax.decomposed} DECOMPOSED`);
+    if (ax.unreadable) parts.push(`${ax.unreadable} ilegível(is)`);
+    skipped.push({
+      unit: ax.owner,
+      reason: 'plans-all-excluded',
+      detail: `${ax.bucket} com ${ax.plans_seen} T##-PLAN.md, nenhum admitido (${parts.join(', ')})`,
+    });
   }
 
   for (const u of corpus.units) {
@@ -416,7 +462,13 @@ function measureCoverage(cwd, opts) {
       continue;
     }
     if (!written.has(u.unit)) {
-      if (u.slice && u.task && ambiguous.has(`${u.slice}/${u.task}`)) {
+      if (divergentOwners.has(u.owner)) {
+        const refs = divergentOwners.get(u.owner);
+        skipped.push({
+          unit: u.unit, reason: 'ref-divergent',
+          detail: `refs divergentes, nenhum contém o outro: ${refs.filter(Boolean).join(' × ') || '(refs não nomeados pelo delta)'}`,
+        });
+      } else if (u.slice && u.task && ambiguous.has(`${u.slice}/${u.task}`)) {
         skipped.push({ unit: u.unit, reason: 'ambiguous-unit-owner', detail: 'delta svn recusou o dono desta unidade' });
       } else if (refAxisAvailable && !refOwners.has(u.owner)) {
         skipped.push({ unit: u.unit, reason: 'no-branch-ref', detail: `nenhum ref forge/${u.owner}` });
@@ -455,7 +507,7 @@ function measureCoverage(cwd, opts) {
   }
 
   const totals = computeCoverage(measured.map((r) => ({ declared: r.declared, written: r.written, declared_hits: r.declared_hits })));
-  const unitsConsidered = corpus.units.length + corpus.swept.length;
+  const unitsConsidered = corpus.units.length + corpus.swept.length + (corpus.all_excluded || []).length;
   const verdict = verdictFor(totals.coverage, measured.length);
 
   const refRows = reconcileRefs(cwd, delta, { walkRefs: !o.delta && delta.vcs === 'git' });
@@ -467,8 +519,13 @@ function measureCoverage(cwd, opts) {
     corpus: {
       roots_scanned: corpus.roots_scanned,
       milestone_dirs: corpus.milestone_dirs,
+      // `plans_found` = plans ADMITTED as units. `plan_files_seen` = plan FILES
+      // on disk. They differ by exclusions, and keeping both visible is what
+      // stops `plan-swept` from meaning two different things (S02 review R3).
       plans_found: corpus.units.length,
+      plan_files_seen: corpus.plan_files_seen,
       excluded: corpus.excluded,
+      dirs_all_excluded: (corpus.all_excluded || []).length,
     },
     units_considered: unitsConsidered,
     units_measured: measured.length,
@@ -545,7 +602,7 @@ function renderMarkdown(rep) {
   const rc = rep.reconciliation.commits;
   L.push(`- Unidades: \`${ru.units_considered} considerada(s) === ${ru.units_measured} medida(s) + ${ru.skipped} skipped\` → **${ru.balances ? 'fecha' : 'NÃO FECHA'}**`);
   L.push(`- Commits: \`${rc.commits_walked} caminhado(s) === ${rc.attributed} atribuído(s) + ${rc.unattributed} não-atribuído(s)\` → **${rc.balances ? 'fecha' : 'NÃO FECHA'}**`);
-  L.push(`- Corpus: ${rep.corpus.plans_found} plano(s) em ${rep.corpus.milestone_dirs} diretório(s) de milestone; excluídos: ${rep.corpus.excluded.decomposed} DECOMPOSED`);
+  L.push(`- Corpus: ${rep.corpus.plans_found} plano(s) admitido(s) de ${rep.corpus.plan_files_seen} arquivo(s) \`T##-PLAN.md\` vistos, em ${rep.corpus.milestone_dirs} diretório(s) de milestone; excluídos: ${rep.corpus.excluded.decomposed} DECOMPOSED; diretórios com planos mas nenhum admitido: ${rep.corpus.dirs_all_excluded}`);
   L.push('');
   L.push('| ref | commits caminhados | atribuídos | não-atribuídos | fecha | fonte |');
   L.push('|---|---:|---:|---:|---|---|');

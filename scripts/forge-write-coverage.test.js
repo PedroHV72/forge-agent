@@ -327,6 +327,58 @@ test('R3 ambiguous-unit-owner: o delta svn recusou o dono → a unidade sai nome
   assertEqual(s.unit, `${M_AMBIG}::S04/T01`, 'a unidade é nomeada pela chave COMPOSTA');
 });
 
+// ── R8 — objeções concedidas do review de S02 (R3 e a propagação de R5) ────
+console.log('\nR8 — review de S02: plan-swept keyed no que existe, ref-divergent propagado');
+
+test('R8/R3 milestone toda DECOMPOSED sai como plans-all-excluded — nunca "sem nenhum T##-PLAN.md"', () => {
+  const M_DEC = 'M-20990108000000-decomposed';
+  const root = newRepo('alldec');
+  writeUnitPlan(root, M_DEC, 'S01', 'T01', { writes: ['src/**'], expected: [], decomposed: true });
+  writeUnitPlan(root, M_DEC, 'S01', 'T02', { writes: ['src/**'], expected: [], decomposed: true });
+  const rep = observe(measureCoverage(root, {}));
+  const s = rep.skipped.find((x) => x.unit === M_DEC);
+  assert(s, `o diretório precisa sair nomeado: ${JSON.stringify(rep.skipped)}`);
+  assertEqual(s.reason, 'plans-all-excluded', 'razão própria, não plan-swept');
+  // O assert que morde: a string antiga afirmava ausência sobre planos presentes.
+  assert(!/sem nenhum T##-PLAN\.md/.test(s.detail), `detail afirma ausência sobre planos que existem: ${s.detail}`);
+  assert(/2 T##-PLAN\.md/.test(s.detail), `detail precisa contar os planos vistos: ${s.detail}`);
+  assertEqual(rep.corpus.plan_files_seen, 2, 'arquivos de plano vistos contados à parte dos admitidos');
+  assertEqual(rep.corpus.plans_found, 0, 'nenhum admitido');
+  assertEqual(rep.corpus.excluded.decomposed, 2, 'e continuam contados como DECOMPOSED');
+  assert(rep.reconciliation.units.balances, 'a reconciliação fecha com o desfecho novo');
+});
+
+test('R8/R3 plan-swept continua reservado ao diretório sem NENHUM plano', () => {
+  const root = newRepo('swept-only');
+  sweptMilestone(root, M_SWEPT);
+  const rep = observe(measureCoverage(root, {}));
+  const s = rep.skipped.find((x) => x.unit === M_SWEPT);
+  assertEqual(s.reason, 'plan-swept', 'zero planos → plan-swept');
+  assert(/sem nenhum T##-PLAN\.md/.test(s.detail), 'e aqui a afirmação é verdadeira');
+  assertEqual(rep.corpus.plan_files_seen, 0, 'nenhum arquivo de plano visto');
+});
+
+test('R8/R5 ref-divergent do delta vira razão própria, não "no-attributed-commits"', () => {
+  const M_DIV = 'M-20990109000000-divergente';
+  const root = newRepo('divergente');
+  writeUnitPlan(root, M_DIV, 'S01', 'T01', { writes: ['src/**'], expected: [] });
+  const delta = {
+    vcs: 'git', units: [], units_measured: 0,
+    commits_walked: 0, attributed: 0, unattributed: [],
+    skipped: [{
+      unit: M_DIV, ref: null, reason: 'ref-divergent',
+      refs: [`refs/heads/forge/${M_DIV}`, `refs/remotes/origin/forge/${M_DIV}`],
+    }],
+  };
+  const rep = observe(measureCoverage(root, { delta, refs: [{ id: M_DIV }] }));
+  const s = rep.skipped.find((x) => x.unit === `${M_DIV}::S01/T01`);
+  assert(s, `unidade não nomeada: ${JSON.stringify(rep.skipped)}`);
+  assertEqual(s.reason, 'ref-divergent', 'a razão do delta é propagada, não reetiquetada');
+  assert(s.detail.includes('refs/heads/forge/'), `os dois refs viajam no detail: ${s.detail}`);
+  assert(s.detail.includes('refs/remotes/origin/forge/'), `os dois refs viajam no detail: ${s.detail}`);
+  assert(!/nenhum commit com o escopo/.test(s.detail), 'não pode afirmar que se caminhou ref nenhum');
+});
+
 test('R3 as razões cruzam nos DOIS sentidos com SKIP_REASONS', () => {
   const produced = Array.from(reasonsSeen).sort();
   const undeclaredProduced = produced.filter((r) => !SKIP_REASONS.includes(r));

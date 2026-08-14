@@ -153,19 +153,55 @@ function parseSvnStatusXml(xml) {
  *
  * Returns { ok: true, revisions: [{ rev, msg, paths: [{ action, path }] }] }
  *      or { ok: false, error: 'svn-log-malformed' }.
+ *
+ * ── S02 review R1: the four inputs that used to answer `ok: true` ──────────
+ *
+ * The posture above was DECLARED here and not implemented: four malformed
+ * inputs were executed during the S02 review and ALL FOUR returned
+ * `{ ok: true }` with a silently shrunken answer — an unclosed `<path>` inside
+ * a closed `<paths>` (a written file becomes a file nobody wrote),
+ * `revision="12junk"` (`parseInt` prefix-parses, `Number.isFinite` never
+ * fires), a truncated stream and outright garbage (both collapse "could not
+ * ask" into "asked and there is nothing"). Four guards close them, and each
+ * one names the input it exists for:
+ *
+ *   1. ROOT     — a non-empty payload with no `<log …>` opening tag, or with
+ *                 no `</log>` closing tag, is not a log this parser read to the
+ *                 end. Truncation and garbage both land here.
+ *   2. REVISION — `/^\d+$/` strict. `12junk` is malformed, not revision 12.
+ *   3. PATH COUNT — inside a MATCHED `<paths>…</paths>`, the number of `<path`
+ *                 opening tags must equal the number of fully parsed entries.
+ *                 An unclosed `<path>` no longer evaporates.
+ *   4. RESIDUE  — any `<logentry`/`<paths`/`<path` left OUTSIDE every matched
+ *                 `<logentry>` block is unconsumed structure; returning a
+ *                 shorter `revisions[]` while ignoring it is exactly the
+ *                 silent-shrink this function claims not to do.
  */
 function parseSvnLogXml(xml) {
   const source = Buffer.isBuffer(xml) ? xml.toString('utf8') : String(xml);
+
+  // 1. ROOT. `svn log --xml` always emits `<log>…</log>`, even for an empty
+  // log (`<log>\n</log>`). Absence of either end means the payload is not a
+  // complete log — never an empty one.
+  if (!/<log\b[^>]*>/.test(source) || !/<\/log\s*>/.test(source)) {
+    return { ok: false, error: 'svn-log-malformed' };
+  }
+
   const revisions = [];
   const entryRe = /<logentry\b[^>]*>[\s\S]*?<\/logentry\s*>/g;
   let entryMatch;
+  let consumedUpTo = 0;
+  let residue = '';
   while ((entryMatch = entryRe.exec(source))) {
+    residue += source.slice(consumedUpTo, entryMatch.index);
+    consumedUpTo = entryMatch.index + entryMatch[0].length;
     const block = entryMatch[0];
     const open = /^<logentry\b[^>]*>/.exec(block);
     if (!open) return { ok: false, error: 'svn-log-malformed' };
     const revRaw = xmlAttribute(open[0], 'revision');
-    if (revRaw === null) return { ok: false, error: 'svn-log-malformed' };
-    const rev = Number.parseInt(revRaw, 10);
+    // 2. REVISION: strict. A prefix-parse would admit `12junk` as 12.
+    if (revRaw === null || !/^\d+$/.test(revRaw.trim())) return { ok: false, error: 'svn-log-malformed' };
+    const rev = Number.parseInt(revRaw.trim(), 10);
     if (!Number.isFinite(rev)) return { ok: false, error: 'svn-log-malformed' };
 
     const msgMatch = /<msg\b[^>]*>([\s\S]*?)<\/msg\s*>/.exec(block);
@@ -181,9 +217,15 @@ function parseSvnLogXml(xml) {
         if (action === null) return { ok: false, error: 'svn-log-malformed' };
         paths.push({ action, path: decodeXmlEntities(pathMatch[2]) });
       }
+      // 3. PATH COUNT: every `<path` that opened must have been parsed.
+      const opened = (pathsBlock[0].match(/<path\b/g) || []).length;
+      if (opened !== paths.length) return { ok: false, error: 'svn-log-malformed' };
     }
     revisions.push({ rev, msg, paths });
   }
+  residue += source.slice(consumedUpTo);
+  // 4. RESIDUE: structure outside every matched entry was never consumed.
+  if (/<logentry\b|<paths\b|<path\b/.test(residue)) return { ok: false, error: 'svn-log-malformed' };
   return { ok: true, revisions };
 }
 

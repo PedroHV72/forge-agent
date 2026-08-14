@@ -82,8 +82,9 @@ const DELTA_REASONS = [
   'no-merge-base',        // `git merge-base <ref> <default>` failed (unrelated histories) — the ref's range cannot be bounded, so the ref is skipped rather than walked whole
   'git-command-failed',   // a read-only git invocation threw for this ref (corrupt repo, permissions) — this ref is skipped, other refs continue
   'ambiguous-unit-owner', // svn only: >1 milestone candidate in context and the message names no full id. There is no ref axis in svn, so the honest answer is "I cannot say who owns this"
-  'svn-log-failed',       // `svn log --xml -v` could not be read (non-zero exit, or malformed XML)
+  'svn-log-failed',       // `svn log --xml -v` could not be read (non-zero exit, malformed XML, or the reader THREW — see writtenByUnit)
   'vcs-unsupported',      // detectVcs returned something this module has no adapter for
+  'ref-divergent',        // a unit id carries BOTH a local and an origin ref and NEITHER contains the other. There is no "the" range to walk, so the unit is skipped carrying both refs — never one of them picked in silence (S02 review R5)
 ];
 // Deliberately ABSENT: `no-branch-ref`. It names a unit that has a PLAN but no
 // ref, and this module never sees the plan side — it starts from refs. It
@@ -126,12 +127,38 @@ function git(repoRoot, args) {
  * shape knowledge in exactly one module and a second copy here would be the
  * defect, not the convenience.
  *
- * Dedup is by id, LOCAL PREFERRED: a local `forge/M-x` and `origin/forge/M-x`
- * are the same unit of work, and the local ref is the one that can be ahead.
+ * Dedup is by id, resolved by ANCESTRY — never by a blanket preference.
+ *
+ * The previous rule preferred the local ref, justified by the claim that "the
+ * local ref is the one that can be ahead". That claim is FALSIFIED BY THE VERY
+ * REPOSITORY THIS MODULE MEASURES (S02 review R5, `rev-list --left-right`):
+ * `controle-contexto-gsd` is 0/5 — the local ref is five commits BEHIND origin,
+ * and preferring it silently dropped five commits of that unit's writes from
+ * the measurement, raising coverage. `varredura-classe-eol` is 12/1 —
+ * DIVERGENT, so "take the one that is ahead" has no answer at all there.
+ *
+ * So: ask git which one contains the other and take the DESCENDANT; when
+ * neither contains the other, refuse — the pair comes back marked
+ * `divergent: true` carrying BOTH refs, and `writtenByUnit` turns that into a
+ * named `ref-divergent` skip. A silent pick between two divergent histories is
+ * a measurement nobody can reproduce.
+ *
  * Refs whose id `entityKind` cannot classify as milestone or task are dropped
  * from the ref list on purpose — they are not unit refs, so they carry no
  * unit to skip (`skipped[]` is for units, not for arbitrary branch names).
  */
+function isAncestorOf(repoRoot, a, b) {
+  try {
+    git(repoRoot, ['merge-base', '--is-ancestor', a, b]);
+    return true;
+  } catch {
+    // Non-zero exit is the ANSWER ("not an ancestor"). A git failure answers
+    // the same way here on purpose: the caller's fallback for "cannot tell" is
+    // `ref-divergent`, a named skip — never a pick.
+    return false;
+  }
+}
+
 function listUnitRefs(repoRoot) {
   let out = '';
   try {
@@ -149,11 +176,29 @@ function listUnitRefs(repoRoot) {
     if (!id) continue;
     const kind = entityKind(id);
     if (kind !== 'milestone' && kind !== 'task') continue;
-    const prev = byId.get(id);
-    if (prev && prev.scope === 'local') continue; // local already won
-    byId.set(id, { id, kind, ref: line, scope: local ? 'local' : 'remote', idForm: classify(id) });
+    if (!byId.has(id)) byId.set(id, { id, kind, idForm: classify(id), local: null, remote: null });
+    const slot = byId.get(id);
+    if (local) slot.local = line; else slot.remote = line;
   }
-  return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
+
+  const refs = [];
+  for (const slot of byId.values()) {
+    const base = { id: slot.id, kind: slot.kind, idForm: slot.idForm };
+    if (slot.local && !slot.remote) { refs.push({ ...base, ref: slot.local, scope: 'local', resolution: 'only-ref' }); continue; }
+    if (slot.remote && !slot.local) { refs.push({ ...base, ref: slot.remote, scope: 'remote', resolution: 'only-ref' }); continue; }
+    const localInRemote = isAncestorOf(repoRoot, slot.local, slot.remote);
+    const remoteInLocal = isAncestorOf(repoRoot, slot.remote, slot.local);
+    if (localInRemote && remoteInLocal) {
+      refs.push({ ...base, ref: slot.local, scope: 'local', resolution: 'identical', refs_seen: [slot.local, slot.remote] });
+    } else if (localInRemote) {
+      refs.push({ ...base, ref: slot.remote, scope: 'remote', resolution: 'remote-descendant', refs_seen: [slot.local, slot.remote] });
+    } else if (remoteInLocal) {
+      refs.push({ ...base, ref: slot.local, scope: 'local', resolution: 'local-descendant', refs_seen: [slot.local, slot.remote] });
+    } else {
+      refs.push({ ...base, ref: null, scope: null, resolution: 'divergent', divergent: true, refs_seen: [slot.local, slot.remote] });
+    }
+  }
+  return refs.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /**
@@ -213,8 +258,18 @@ function commitsForRef(repoRoot, ref, opts) {
     let files = [];
     if (!merge) {
       try {
-        files = git(repoRoot, ['diff-tree', '-r', '--no-commit-id', '--name-only', sha])
-          .split('\n').map((l) => l.trim()).filter(Boolean);
+        // `-z` is load-bearing, and the mechanism is narrower than "newlines
+        // split a path in two": git C-QUOTES a path containing LF in non-`-z`
+        // output, so such a path arrives MANGLED (an escaped literal matching
+        // no declared path) rather than split. A trailing space is genuinely
+        // mutated by `trim()`. Both push coverage down, not up — conceded in
+        // the S02 review anyway because the fix is two lines and the repo
+        // already fixed this pattern next door: `gitListTracked`
+        // (forge-vcs.js) uses `ls-files -z` for exactly this reason. No
+        // `trim()` here: with NUL delimitation there is nothing to trim, and
+        // trimming is the mutation.
+        files = git(repoRoot, ['diff-tree', '-r', '--no-commit-id', '--name-only', '-z', sha])
+          .split('\0').filter(Boolean);
       } catch {
         return { ok: false, ref, base, reason: 'git-command-failed', commits: [] };
       }
@@ -350,12 +405,25 @@ function writtenByUnit(repoRoot, opts) {
 
   if (vcs === 'svn') {
     const reader = typeof o.svnLog === 'function' ? o.svnLog : svnLogChangedPaths;
-    const log = reader(repoRoot, o);
+    // The reader is allowed to THROW (svn binary absent → `spawn svn ENOENT`),
+    // and before the S02 review R1 that exception escaped this function
+    // entirely: no `skipped` entry, no report, and the CLI's `main` swallowed
+    // it into exit 0 — a consumer reading exit code + stdout could not tell
+    // failure from success. The comment above promises the opposite in so many
+    // words ("the reason must be provable, not asserted"), so the throw is
+    // caught here and degrades to the SAME structured `svn-log-failed` shape a
+    // non-zero exit produces, carrying the message in `detail`.
+    let log;
+    try {
+      log = reader(repoRoot, o);
+    } catch (e) {
+      log = { ok: false, error: 'svn-log-failed', detail: (e && e.message) || String(e) };
+    }
     if (!log || !log.ok) {
       return {
         vcs: 'svn', repo: repoRoot, units: [], units_measured: 0,
         refs_examined: 0, commits_walked: 0, attributed: 0, unattributed: [],
-        skipped: [{ unit: null, reason: 'svn-log-failed', detail: (log && log.error) || 'svn-log-failed' }],
+        skipped: [{ unit: null, reason: 'svn-log-failed', detail: (log && (log.detail || log.error)) || 'svn-log-failed' }],
       };
     }
     const a = attributeSvnRevisions(log.revisions, o);
@@ -385,6 +453,13 @@ function writtenByUnit(repoRoot, opts) {
   let attributed = 0;
 
   for (const r of refs) {
+    if (r.divergent || !r.ref) {
+      // Two refs for one id and neither contains the other: there is no single
+      // range to walk. Both spellings ride along so the reader can reproduce
+      // the refusal instead of taking it on faith.
+      skipped.push({ unit: r.id, ref: null, refs: r.refs_seen || [], reason: 'ref-divergent' });
+      continue;
+    }
     const got = commitsForRef(repoRoot, r.ref, { defaultBranch });
     if (!got.ok) {
       skipped.push({ unit: r.id, ref: r.ref, reason: got.reason });
@@ -431,7 +506,11 @@ Flags:
   --json         emit JSON instead of the human-readable form
   --help         this text
 
-Read-only VCS access. Advisory: exit code is always 0.
+Read-only VCS access. Advisory about WHAT it finds — exit 0 whenever a report
+was produced, including one that is entirely skipped. Exit 2 ONLY when no
+report exists at all (an exception escaped the measurement): a run that
+produced nothing must not be indistinguishable from a run that measured and
+found nothing (S02 review R2).
 `;
 
 function formatReport(rep) {
@@ -452,7 +531,10 @@ function main(argv) {
     const rep = writtenByUnit(cwd, {});
     process.stdout.write(args.json ? `${JSON.stringify(rep, null, 2)}\n` : `${formatReport(rep)}\n`);
   } catch (e) {
+    // No report was written. Exit 0 here would render "the measurement never
+    // ran" identically to "the measurement ran and found nothing".
     process.stderr.write(`forge-unit-delta: ${e.message}\n`);
+    return 2;
   }
   return 0;
 }
@@ -471,5 +553,5 @@ module.exports = {
   parseArgs,
   main,
   USAGE,
-  _private: { git, formatReport },
+  _private: { git, formatReport, isAncestorOf },
 };
