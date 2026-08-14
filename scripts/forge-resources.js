@@ -16,6 +16,12 @@
  *   enforcement, shadowWait, source
  * Additional keys may be appended later without breaking existing readers —
  * this block is the stable prefix, the rest of the object is additive.
+ * S02 additive keys (present on every contract, pool key only when
+ * `opts.pool` — pure — or a lifecycle call actually engaged the pool):
+ *   maxConcurrentClamp (always), pool (only when `opts.pool.status` was
+ *   supplied, or via the acquireCommandBudget/releaseCommandBudget
+ *   lifecycle). Absent `opts.pool` -> output is byte-identical to S01 plus
+ *   the always-present `maxConcurrentClamp` key.
  *
  * D5 (hard boundary): this module NEVER suspends or kills a running process.
  * It only answers whether the NEXT command should be admitted.
@@ -52,11 +58,17 @@
  * with `shadow_wait` on, WITHOUT ever calling a real sleep — always
  * computed from the injectable clock and the `wait_cap_ms` pref.
  *
- * Seam for S02 (documented, no dead code): the cross-run pool blueprint is
- * `scripts/forge-unit-lease.js` (TTL+grace+quarantine, ABA-safe) — S02 will
- * pass pool state in as an ADDITIVE `opts.pool` field. This contract's keys
- * are stable-ordered with additive fields permitted; nothing here assumes
- * `opts.pool` exists yet, and nothing here reimplements locking/leasing.
+ * S02 wiring (D10: sizing rule lives HERE, slot mechanics live in
+ * `forge-resource-pool.js` — consumers stay thin): `opts.pool = { status }`
+ * (a pre-fetched `poolStatus()` shape) discounts `workers` down to
+ * `max(1, min(formulaWorkers, status.free))`, pure — no I/O added to this
+ * function, and `forge-resource-pool.js` is required lazily only inside the
+ * branch that actually needs its `POOL_REASON_CODES` (or, for the lifecycle
+ * functions below, its `acquireSlots`/`releaseSlots`) — so the pure resolver
+ * path with no `opts.pool` pays zero import cost. `acquireCommandBudget` /
+ * `releaseCommandBudget` are the explicit lifecycle S04's consumers call;
+ * they wrap `forge-resource-pool.js`'s `acquireSlots`/`releaseSlots` and
+ * feed the grant back through this same discount so both paths agree.
  */
 
 'use strict';
@@ -206,6 +218,49 @@ function readResourcePrefs(opts, cwd) {
   }
 }
 
+// Fail-open reader for `parallelism.max_concurrent` — same shape/defaults
+// convention as readResourcePrefs above (T02's maxConcurrentClamp source of
+// truth). Any failure to read prefs, or a non-positive-integer value, falls
+// back to the documented default 3.
+const DEFAULT_MAX_CONCURRENT = 3;
+function readParallelismPref(opts, cwd) {
+  try {
+    const prefsResult = (opts && opts.prefsResult) || readPrefsCached(cwd);
+    const parallelism = (prefsResult && prefsResult.prefs && prefsResult.prefs.parallelism) || {};
+    const maxConcurrent = parallelism.max_concurrent;
+    return Number.isInteger(maxConcurrent) && maxConcurrent > 0 ? maxConcurrent : DEFAULT_MAX_CONCURRENT;
+  } catch {
+    return DEFAULT_MAX_CONCURRENT;
+  }
+}
+
+// Pure pool discount (D10: the min(formula, grant) sizing rule lives HERE).
+// `status` is a pre-fetched `poolStatus()` shape ({ ceiling, free, ... }).
+// When the formula already refused admission (admit:false / workers:0) the
+// pool NEVER raises that refusal — it reports a zero-requested/zero-granted
+// pool key and leaves `workers` untouched (0).
+function applyPoolDiscount(workers, admit, status) {
+  const { POOL_REASON_CODES } = require('./forge-resource-pool.js');
+  const ceiling = Number.isFinite(status && status.ceiling) ? status.ceiling : 0;
+  const free = Number.isFinite(status && status.free) ? status.free : 0;
+  if (!admit || workers <= 0) {
+    return { workers, pool: { ceiling, free, granted: 0, reason: POOL_REASON_CODES.POOL_GRANTED } };
+  }
+  let granted;
+  let reason;
+  if (free >= workers) {
+    granted = workers;
+    reason = POOL_REASON_CODES.POOL_GRANTED;
+  } else if (free > 0) {
+    granted = free;
+    reason = POOL_REASON_CODES.POOL_CLAMPED_BY_POOL;
+  } else {
+    granted = 1;
+    reason = POOL_REASON_CODES.POOL_EXHAUSTED_MINIMUM_GRANT;
+  }
+  return { workers: granted, pool: { ceiling, free, granted, reason } };
+}
+
 // Builds a forced snapshot from the FORGE_RESOURCES_PRESSURE override. A
 // forced value is NEVER confusable with a measured reading — it carries its
 // own dedicated reason (only the critical level has a distinct forced enum
@@ -347,6 +402,19 @@ function resolveResourceBudget(opts) {
     const memBytes = signal.memBytes || os.totalmem();
     const budget = budgetForLevel(level === null ? 1 : level, ncpu, memBytes);
 
+    // S02 additive pure discount: only engages when the caller injects an
+    // already-fetched pool status — no I/O added here (D10, see comment on
+    // applyPoolDiscount above).
+    let poolKey = null;
+    if (o.pool && o.pool.status) {
+      const discounted = applyPoolDiscount(budget.workers, budget.admit, o.pool.status);
+      budget.workers = discounted.workers;
+      poolKey = discounted.pool;
+    }
+
+    // S02 additive key, present on every contract (pure and lifecycle).
+    const maxConcurrentClamp = Math.max(1, Math.min(readParallelismPref(o, cwd), budget.workers));
+
     let shadowWait = null;
     if (level === 4 && prefs.shadow_wait) {
       shadowWait = { triggered: true, wouldWaitMs: prefs.wait_cap_ms };
@@ -367,7 +435,9 @@ function resolveResourceBudget(opts) {
       enforcement: prefs.enforcement,
       shadowWait,
       source,
+      maxConcurrentClamp,
     };
+    if (poolKey) contract.pool = poolKey;
 
     appendEvent(o, cwd, contract.admit ? 'resource-admission' : 'resource-degradation', {
       reason: contract.reason,
@@ -379,6 +449,93 @@ function resolveResourceBudget(opts) {
     return contract;
   } catch {
     return degradedContract();
+  }
+}
+
+// ── Lifecycle (S02): the explicit acquire/release pair S04's consumers ────
+// call. Lazy-requires forge-resource-pool.js so the pure resolveResourceBudget
+// path above never pays this module's import cost.
+function acquireCommandBudget(opts) {
+  const o = opts || {};
+  const cwd = o.cwd || process.cwd();
+  const contract = resolveResourceBudget(o);
+  if (!contract.admit) {
+    // A refused command holds no slots (step 4 of T02-PLAN).
+    return contract;
+  }
+  let pool;
+  try {
+    pool = require('./forge-resource-pool.js');
+  } catch {
+    const degraded = { ...contract, pool: { reason: 'pool-unavailable-fail-open' } };
+    return degraded;
+  }
+  try {
+    const bootstrap = pool.ensurePoolRoot(o);
+    if (!bootstrap.ok) {
+      return { ...contract, pool: { reason: pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN } };
+    }
+    const grant = pool.acquireSlots(contract.workers, {
+      poolDir: o.poolDir,
+      env: o.env,
+      now: typeof o.now === 'function' ? o.now : undefined,
+      cwd,
+      commandTimeoutMs: o.commandTimeoutMs,
+      ownerToken: o.ownerToken,
+      session: o.session,
+      ncpu: o.ncpu,
+    });
+    if (!grant || !grant.ok) {
+      return { ...contract, pool: { reason: pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN } };
+    }
+    // Feed the real grant back through the SAME pure discount step 2 uses
+    // (D10: one sizing-rule implementation, not two that could diverge) —
+    // the grant's own `.slots` (the real leases) still ride along as the
+    // release handle regardless of how the discount names the reason.
+    const discounted = applyPoolDiscount(contract.workers, contract.admit, {
+      ceiling: grant.ceiling,
+      free: grant.free_before,
+    });
+    const finalContract = {
+      ...contract,
+      workers: discounted.workers,
+      maxConcurrentClamp: Math.max(1, Math.min(readParallelismPref(o, cwd), discounted.workers)),
+      pool: {
+        ...discounted.pool,
+        handle: { slots: grant.slots, ttlMs: grant.ttlMs },
+      },
+    };
+    appendEvent(o, cwd, 'resource-pool-granted', {
+      granted: finalContract.pool.granted,
+      ceiling: finalContract.pool.ceiling,
+      reason: finalContract.pool.reason,
+    });
+    return finalContract;
+  } catch {
+    return { ...contract, pool: { reason: 'pool-unavailable-fail-open' } };
+  }
+}
+
+// `handle` is the `{ slots, ttlMs }` shape returned as `contract.pool.handle`
+// by acquireCommandBudget (step 5 of T02-PLAN: `releaseSlots(handle.slots, ...)`).
+function releaseCommandBudget(handle, opts) {
+  const o = opts || {};
+  const cwd = o.cwd || process.cwd();
+  try {
+    if (!handle || !Array.isArray(handle.slots) || handle.slots.length === 0) {
+      return { ok: true, released: [], reason: 'already-released' };
+    }
+    const pool = require('./forge-resource-pool.js');
+    const result = pool.releaseSlots(handle.slots, { poolDir: o.poolDir, env: o.env });
+    appendEvent(o, cwd, 'resource-pool-released', {
+      granted: handle.slots.length,
+      reason: pool.POOL_REASON_CODES.POOL_RELEASED,
+    });
+    return { ok: true, released: result.released, reason: pool.POOL_REASON_CODES.POOL_RELEASED };
+  } catch {
+    // Silent-fail (MEM008): release never throws, an already-released or
+    // broken pool degrades to a no-op success.
+    return { ok: true, released: [], reason: 'already-released' };
   }
 }
 
@@ -424,4 +581,6 @@ module.exports = {
   runCli,
   degradedContract,
   resetResourceCache,
+  acquireCommandBudget,
+  releaseCommandBudget,
 };

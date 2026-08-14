@@ -19,7 +19,10 @@ const {
   runCli,
   degradedContract,
   resetResourceCache,
+  acquireCommandBudget,
+  releaseCommandBudget,
 } = require('./forge-resources.js');
+const { POOL_REASON_CODES } = require('./forge-resource-pool.js');
 
 const SCRIPT = path.join(__dirname, 'forge-resources.js');
 let passes = 0;
@@ -309,6 +312,152 @@ function mkTmpDirNoop() {
   assertEqual(result.reason, REASON_CODES.PLATFORM_UNSUPPORTED_LINUX, 'runCli() as a library call returns the resolved contract');
   assert(captured.trim().length > 0, 'runCli() also wrote a JSON line to stdout');
   cleanup(dir);
+})();
+
+// ── T02: pool-absent byte-stability (S01 contract stays byte-identical) ──
+(function testPoolAbsentByteStability() {
+  resetResourceCache();
+  const result = resolveResourceBudget({ env: { FORGE_RESOURCES_PRESSURE: '1' }, cacheKey: 'pool-absent-1', noEvents: true });
+  const s01StablePrefix = ['admit', 'workers', 'heapMb', 'playwrightWorkers', 'reason', 'pressureLevel', 'enforcement', 'shadowWait', 'source'];
+  const expectedKeys = new Set([...s01StablePrefix, 'maxConcurrentClamp']);
+  const actualKeys = new Set(Object.keys(result));
+  assertEqual(actualKeys.size, expectedKeys.size, 'pool-absent contract key COUNT matches S01 stable prefix + maxConcurrentClamp exactly');
+  let allPresent = true;
+  expectedKeys.forEach((key) => { if (!actualKeys.has(key)) allPresent = false; });
+  assert(allPresent, 'pool-absent contract has every expected key', JSON.stringify([...actualKeys]));
+  assert(!Object.prototype.hasOwnProperty.call(result, 'pool'), 'pool-absent contract carries NO "pool" key', JSON.stringify(Object.keys(result)));
+})();
+
+// ── T02: injected opts.pool.status discount (pure — no I/O) ──────────────
+(function testPoolStatusDiscount() {
+  const fixedNcpuReader = (ncpu) => () => ({
+    ok: true, pressureLevel: 1, ncpu, memBytes: 8 * 1024 * 1024 * 1024, memstatusLevel: 10,
+    swap: { totalM: 100, usedM: 10, freeM: 90 },
+  });
+
+  // free < formula -> clamped
+  resetResourceCache();
+  let r = resolveResourceBudget({
+    platform: 'darwin', readSignal: fixedNcpuReader(8), now: Date.now, cacheKey: 'pool-clamp', noEvents: true,
+    pool: { status: { ceiling: 8, free: 3 } },
+  });
+  assertEqual(r.workers, 3, 'free(3) < formula(8) clamps workers down to free');
+  assertEqual(r.pool.reason, POOL_REASON_CODES.POOL_CLAMPED_BY_POOL, 'clamped case names pool-clamped-by-pool');
+  assertEqual(r.pool.free, 3, 'clamped pool key reports the injected free count');
+
+  // free >= formula -> uncut
+  resetResourceCache();
+  r = resolveResourceBudget({
+    platform: 'darwin', readSignal: fixedNcpuReader(4), now: Date.now, cacheKey: 'pool-uncut', noEvents: true,
+    pool: { status: { ceiling: 8, free: 8 } },
+  });
+  assertEqual(r.workers, 4, 'free(8) >= formula(4) leaves workers uncut');
+  assertEqual(r.pool.reason, POOL_REASON_CODES.POOL_GRANTED, 'uncut case names pool-granted');
+
+  // free = 0 -> floor 1
+  resetResourceCache();
+  r = resolveResourceBudget({
+    platform: 'darwin', readSignal: fixedNcpuReader(4), now: Date.now, cacheKey: 'pool-floor', noEvents: true,
+    pool: { status: { ceiling: 8, free: 0 } },
+  });
+  assertEqual(r.workers, 1, 'free=0 floors workers at the minimum grant of 1');
+  assertEqual(r.pool.reason, POOL_REASON_CODES.POOL_EXHAUSTED_MINIMUM_GRANT, 'floor case names pool-exhausted-minimum-grant');
+
+  // critical pressure + pool -> admit:false, workers:0 (pool never raises a refusal)
+  resetResourceCache();
+  r = resolveResourceBudget({
+    env: { FORGE_RESOURCES_PRESSURE: '4' }, noEvents: true,
+    pool: { status: { ceiling: 8, free: 8 } },
+  });
+  assertEqual(r.admit, false, 'critical pressure still refuses admission even with a wide-open pool injected');
+  assertEqual(r.workers, 0, 'the pool NEVER raises a refused budget above 0 workers');
+})();
+
+// ── T02: lifecycle acquire -> release round-trip against a real temp pool ─
+(function testLifecycleRoundTrip() {
+  const dir = mkTmpDir();
+  const poolDir = path.join(dir, 'pool');
+  resetResourceCache();
+  const acquired = acquireCommandBudget({
+    platform: 'darwin',
+    readSignal: () => ({ ok: true, pressureLevel: 1, ncpu: 4, memBytes: 8 * 1024 * 1024 * 1024, memstatusLevel: 10, swap: { totalM: 100, usedM: 10, freeM: 90 } }),
+    now: Date.now,
+    cacheKey: 'lifecycle-round-trip',
+    noEvents: true,
+    poolDir,
+    ncpu: 8,
+    commandTimeoutMs: 5000,
+  });
+  assertEqual(acquired.admit, true, 'lifecycle acquire admits under normal pressure');
+  assert(acquired.pool && acquired.pool.handle && Array.isArray(acquired.pool.handle.slots) && acquired.pool.handle.slots.length > 0,
+    'lifecycle acquire holds at least one real lease slot', JSON.stringify(acquired.pool));
+
+  const { poolStatus } = require('./forge-resource-pool.js');
+  const statusHeld = poolStatus({ poolDir });
+  assert(statusHeld.held >= acquired.pool.handle.slots.length, 'poolStatus() shows held slots after acquire', JSON.stringify(statusHeld));
+
+  const released = releaseCommandBudget(acquired.pool.handle, { poolDir });
+  assertEqual(released.ok, true, 'release reports ok:true');
+
+  const statusFree = poolStatus({ poolDir });
+  assertEqual(statusFree.held, 0, 'poolStatus() shows 0 held slots after release', JSON.stringify(statusFree));
+  cleanup(dir);
+})();
+
+// ── T02: fail-open when the pool root is broken (poolDir points at a file) ─
+(function testAcquireFailOpen() {
+  const dir = mkTmpDir();
+  const brokenPoolDir = path.join(dir, 'not-a-dir');
+  fs.writeFileSync(brokenPoolDir, 'this is a file, not a pool root\n');
+  resetResourceCache();
+  let threw = false;
+  let acquired;
+  try {
+    acquired = acquireCommandBudget({
+      platform: 'darwin',
+      readSignal: () => ({ ok: true, pressureLevel: 1, ncpu: 4, memBytes: 8 * 1024 * 1024 * 1024, memstatusLevel: 10, swap: { totalM: 100, usedM: 10, freeM: 90 } }),
+      now: Date.now,
+      cacheKey: 'lifecycle-fail-open',
+      noEvents: true,
+      poolDir: brokenPoolDir,
+    });
+  } catch {
+    threw = true;
+  }
+  assert(!threw, 'a broken pool root never throws out of acquireCommandBudget');
+  assertEqual(acquired.admit, true, 'fail-open still returns the formula-only admitted contract');
+  assertEqual(acquired.workers, 4, 'fail-open workers fall back to the formula budget (unpooled)');
+  assert(acquired.pool && acquired.pool.reason === 'pool-unavailable-fail-open', 'fail-open pool key names pool-unavailable-fail-open', JSON.stringify(acquired.pool));
+  cleanup(dir);
+})();
+
+// ── T02: maxConcurrentClamp both directions + unreadable-prefs default ───
+(function testMaxConcurrentClamp() {
+  resetResourceCache();
+  let r = resolveResourceBudget({
+    platform: 'darwin', readSignal: () => ({ ok: true, pressureLevel: 1, ncpu: 8, memBytes: 8 * 1024 * 1024 * 1024, memstatusLevel: 10, swap: { totalM: 100, usedM: 10, freeM: 90 } }),
+    now: Date.now, cacheKey: 'clamp-8', noEvents: true,
+    prefsResult: { prefs: { parallelism: { max_concurrent: 3 } } },
+  });
+  assertEqual(r.workers, 8, 'sanity: formula workers is 8 before clamp assertion');
+  assertEqual(r.maxConcurrentClamp, 3, 'pref max_concurrent=3 with workers=8 clamps maxConcurrentClamp to 3');
+
+  resetResourceCache();
+  r = resolveResourceBudget({
+    platform: 'darwin', readSignal: () => ({ ok: true, pressureLevel: 2, ncpu: 2, memBytes: 8 * 1024 * 1024 * 1024, memstatusLevel: 10, swap: { totalM: 100, usedM: 10, freeM: 90 } }),
+    now: Date.now, cacheKey: 'clamp-1', noEvents: true,
+    prefsResult: { prefs: { parallelism: { max_concurrent: 3 } } },
+  });
+  assertEqual(r.workers, 1, 'sanity: formula workers is 1 (level-2, ncpu=2, floor(2/2)=1) before clamp assertion');
+  assertEqual(r.maxConcurrentClamp, 1, 'workers=1 with pref max_concurrent=3 clamps to workers (1), never above it');
+
+  resetResourceCache();
+  r = resolveResourceBudget({
+    platform: 'darwin', readSignal: () => ({ ok: true, pressureLevel: 1, ncpu: 8, memBytes: 8 * 1024 * 1024 * 1024, memstatusLevel: 10, swap: { totalM: 100, usedM: 10, freeM: 90 } }),
+    now: Date.now, cacheKey: 'clamp-unreadable', noEvents: true,
+    prefsResult: { prefs: {} },
+  });
+  assertEqual(r.maxConcurrentClamp, 3, 'unreadable/missing parallelism.max_concurrent falls back to the documented default (3)');
 })();
 
 process.stdout.write(`\nResults: ${passes} passed, ${fails} failed\n`);
