@@ -794,16 +794,23 @@ function runWatch(cwd, args) {
     }
   }
 
-  frame();
-  if (stopped) return;
-  timer = setInterval(frame, intervalMs);
-
+  // Race-safety requirement: the SIGINT handler MUST be registered BEFORE the
+  // first observable output (frame()). A caller that waits for stdout output
+  // as a "child is ready" signal is only correct if the handler installation
+  // precedes that output — otherwise a signal delivered right after the first
+  // frame can still hit the process before the handler exists, falling back
+  // to the POSIX default disposition (terminate with 130 instead of a clean
+  // exit 0). See scripts/forge-status.test.js R2.
   process.on('SIGINT', () => {
     stopped = true;
     if (timer) clearInterval(timer);
     process.stdout.write('\n');
     process.exit(0);
   });
+
+  frame();
+  if (stopped) return;
+  timer = setInterval(frame, intervalMs);
 }
 
 // Color mode: --no-color > --color > NO_COLOR env > TTY autodetect.
