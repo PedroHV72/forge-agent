@@ -778,6 +778,24 @@ process.stdin.on('end', () => {
                   }
                   if (fault === 'pool') throw new Error('forced-fault:pool');
 
+                  if (contract && contract.enforcement === 'off') {
+                    // `resources.enforcement: off` (S06/T03) — same bypass as
+                    // forge-verify.js / forge-reverify.js. Releases the lease
+                    // (W5) and returns WITHOUT writing the `updatedInput`
+                    // stdout payload, so the executor's command passes
+                    // through byte-identical. FAIL-SAFE: only the exact
+                    // string `off` bypasses; any other value leaves the
+                    // rewrite ON. D10: reads, never derives.
+                    if (acquiredHandle) {
+                      try {
+                        recordRewriteStage('release-enforcement-off');
+                        resourcesMod.releaseCommandBudget(acquiredHandle, { cwd });
+                      } catch { /* MEM008 */ }
+                    }
+                    appendRewriteEvent(cwd, 'rewrite-skipped', { reason: 'intact:enforcement-off' });
+                    return;
+                  }
+
                   const plan = rewriteMod.planRewrite(cmd, contract, { cwd });
                   if (plan.outcome === 'rewritten') {
                     if (fault === 'emission') throw new Error('forced-fault:emission');

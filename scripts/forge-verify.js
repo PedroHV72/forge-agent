@@ -321,6 +321,25 @@ function acquireClampForCommand(opts) {
       handle = contract.pool.handle;
     }
 
+    if (contract && contract.enforcement === "off") {
+      // `resources.enforcement: off` (S06/T03). The pref is documented as
+      // "everything advisory/off" and S06's measurement matrix needs the
+      // control-off half to be REAL — before this bypass the field travelled
+      // in the contract and no consumer read it, so `off` clamped exactly
+      // like `clamp`. Checked BEFORE `admit === false` so the emitted reason
+      // names the operator's toggle, not the pressure that happened to
+      // coincide with it. FAIL-SAFE: only the exact string `off` bypasses —
+      // any other/unknown value leaves the control ON. D10: this reads the
+      // value the resolver already returns; it derives nothing.
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.cwd }); } catch { /* MEM008 */ }
+      }
+      appendResourceEvent(opts.cwd, opts.gsdDir, "resource-clamp-skipped", {
+        reason: "intact:enforcement-off",
+      });
+      return passthrough;
+    }
+
     if (contract && contract.admit === false) {
       // Critical pressure: admission refused. D3 is LOCKED — never refuse
       // the spawn. Skip the rewrite entirely and run the command

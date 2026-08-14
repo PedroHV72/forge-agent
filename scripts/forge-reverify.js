@@ -214,6 +214,22 @@ function acquireReverifyClamp(argv, opts) {
       handle = contract.pool.handle;
     }
 
+    if (contract && contract.enforcement === 'off') {
+      // `resources.enforcement: off` (S06/T03) — same bypass as
+      // forge-verify.js. Placed BEFORE the NODE_OPTIONS overlay is computed
+      // so `off` yields the full passthrough: argv byte-identical AND no
+      // heap NODE_OPTIONS injected (env stays null, the spawn inherits the
+      // parent environment untouched). FAIL-SAFE: only the exact string
+      // `off` bypasses. D10: reads, never derives.
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.codeDir }); } catch { /* MEM008 */ }
+      }
+      appendReverifyResourceEvent(opts.codeDir, opts.gsdDir, 'resource-clamp-skipped', {
+        reason: 'intact:enforcement-off',
+      });
+      return passthrough;
+    }
+
     // NODE_OPTIONS overlay from the contract's heapMb — never overwrites a
     // parent-defined NODE_OPTIONS (a human's choice always wins, same rule
     // T02 uses). Applies on BOTH outcomes below — T03-PLAN step 2d: env is
