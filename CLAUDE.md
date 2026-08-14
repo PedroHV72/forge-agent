@@ -598,13 +598,10 @@ Containers `YYYY-QN` legados continuam **lidos**, nunca escritos ou migrados.
 
 ## Estado atual
 
-- **Milestone ativo:** M-20260813221024-controle-recursos — Controle de recursos de máquina (CPU/memória) na execução de testes.
-- **Slice ativo:** S02 — Lease de admissão cross-run — pool por máquina, não constante por run (`risk:high`, `depends:[S01]`).
-- **Fase:** execute.
-- **Última entrega:** S01 (1/6), branch `forge/M-20260813221024-controle-recursos` — ainda **não mergeada** (slice 1 de 6; branch fica viva até a milestone fechar). `scripts/forge-resources.js` nasce dono único (D10) da admissão/dimensionamento: probe darwin batched (um `spawnSync('sysctl', ...)`), enum fechado de razões, budget `{admit, workers, heapMb, reason, enforcement, shadow_wait}`, espera-sombra que nunca dorme de verdade. `os.freemem()` banido por scanner in-process com piso anti-silêncio (`scanned===0` é falha, nunca `violations===0`). Bloco `resources:` aditivo no trio de prefs. Review dialético: 10 objeções (challenger codex), 7 concedidas + 2 abertas arbitradas ao vivo, todas corrigidas em `fcd9e78`, verificadas independentemente pelo orquestrador pós-fix.
-- **Commits do branch (não mergeados):** `c6e68d4`, `22b09dd`, `f4eda20`, `954c318`, `fcd9e78`.
-- **Suites deliberadamente não rodadas no fecho de S01:** `node scripts/run-tests.js` / `node scripts/forge-smoke.js` (full suite) — rodar a suíte inteira no fecho de cada slice é exatamente o comportamento de sobrecarga que esta milestone existe para consertar; ficam para a fronteira de milestone/checkpoint deliberado do operador.
-- **Próxima ação:** Executar `/forge-next` para iniciar S02.
+- **Milestone ativo:** M-20260813221024-controle-recursos — **Concluído** (6/6 slices).
+- **Fase:** complete — todos os 6 slices terminados, LEDGER entry gravada, branch pronto para PR.
+- **Status:** 32 commits no branch `forge/M-20260813221024-controle-recursos` (intentionally unmerged per operator's documented PR workflow). Medição honesta-negativa: baseline não reproduziu, ganho não apareceu, enforcement provado ativo 12/12 child-side. Review dialético: 46 objections, 38 concedidas, 0 abertas ao fecho. Flakies I-20260802213721 e I-20260814113610 consertados na raiz.
+- **Próxima ação:** Operador abre PR de `forge/M-20260813221024-controle-recursos` para master.
 
 ## GSD — Início de sessão obrigatório (dogfood)
 
