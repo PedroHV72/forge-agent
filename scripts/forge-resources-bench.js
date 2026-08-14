@@ -9,9 +9,21 @@
  * incremental JSONL so a run interrupted by the 10-minute Bash ceiling (A4)
  * leaves every already-finished corrida on disk.
  *
- * D5 (hard boundary, inherited): this harness only times. `spawnSync`'s
- * `timeout` option kills ONLY the process this module itself created (the
- * corrida under measurement) — it never signals a process it did not spawn.
+ * D5 (hard boundary, inherited): this harness only times. It signals ONLY
+ * processes it itself created and THEIR descendants — each child is spawned
+ * as a process-group leader (`detached`) and reaped with a group kill, so an
+ * in-flight grandchild cannot survive as an orphan and contaminate later
+ * cells. It never signals a process it did not spawn.
+ *
+ * Execution-side evidence (S06 review, R2): the measured corrida is routed
+ * through the REAL enforcement entrypoint (`forge-reverify.js`'s
+ * `acquireReverifyClamp` — the production consumer of `acquireCommandBudget`
+ * + `planRewriteArgv`) and the child preloads
+ * `forge-resources-bench-dump.js`, which writes argv/NODE_OPTIONS/heap
+ * ceiling FROM INSIDE the child. A cell is reported as enforced only when
+ * that child-written line corroborates it; every other outcome carries a
+ * named `unapplied:*` reason and an `/on` cell with zero corroborated
+ * corridas summarizes as `inconclusive:enforcement-unapplied:<reason>`.
  *
  * D10: sizing/enforcement resolution is never reimplemented here. The
  * witness is collected by requiring `forge-doctor.js`'s `checkResources`,
@@ -84,16 +96,41 @@ function restorePrefsFile(filePath, snapshot) {
   }
 }
 
-// Best-effort merge: preserve any other keys already in the local prefs
-// file, overwrite only `resources.enforcement`. Falls back to a minimal
-// object when the existing file is absent or not parseable JSON — the local
-// layer is `.jsonc` in name, but this harness only ever writes/reads plain
-// JSON (mirrors the enforcement suite fixture).
+// Surgically update ONLY `resources.enforcement`, preserving every other
+// namespace already in the operator's local prefs file. That file is the
+// project-local layer of the standard cascade and legally carries full JSONC
+// (comments, trailing commas) plus unrelated blocks such as
+// `forge_isolation` — so it is read with the SAME JSONC-tolerant parser the
+// resolvers use (`forge-prefs.js#parseJsonc`), never `JSON.parse`.
+//
+// R1 (S06 review): the previous `JSON.parse` + `catch { base = {} }` threw on
+// any real JSONC and then REPLACED the document with a file containing only
+// `resources.enforcement` — it destroyed the operator's `forge_isolation`
+// block in T06's live run. Unparseable input now ABORTS before any write:
+// refusing to proceed is the only safe posture, because "start fresh" here
+// means "delete the operator's configuration".
 function writeEnforcement(filePath, value) {
   let base = {};
-  try {
-    base = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch { /* absent or unparsable — start fresh */ }
+  let raw = null;
+  try { raw = fs.readFileSync(filePath, 'utf8'); } catch { raw = null; }
+  if (raw !== null && raw.trim() !== '') {
+    const { parseJsonc } = require('./forge-prefs.js');
+    const parsed = parseJsonc(raw);
+    if (!parsed.ok) {
+      const err = parsed.error || {};
+      throw new Error(
+        `forge-resources-bench: recusa escrever ${filePath} — JSONC não parseável`
+        + `${err.line ? ` (linha ${err.line})` : ''}: ${err.message || 'erro desconhecido'}.`
+        + ' Nada foi modificado.',
+      );
+    }
+    if (!parsed.value || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+      throw new Error(
+        `forge-resources-bench: recusa escrever ${filePath} — o documento não é um objeto JSON. Nada foi modificado.`,
+      );
+    }
+    base = parsed.value;
+  }
   base.resources = Object.assign({}, base.resources, { enforcement: value });
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(base, null, 2)}\n`, 'utf8');
@@ -155,52 +192,178 @@ function collectContractWitness(cwd) {
   };
 }
 
-// ── Corrida execution ──────────────────────────────────────────────────────
-function runChild(cmd, args, cwd, timeoutMs) {
-  const start = Date.now();
-  const result = spawnSync(cmd, args, {
-    cwd,
-    timeout: timeoutMs,
-    killSignal: 'SIGKILL',
-    encoding: 'utf8',
+// ── Process-group cleanup (R3) ────────────────────────────────────────────
+// Every process this harness spawns is made a group leader (`detached`), so
+// killing `-pid` reaps the whole subtree. Without this, SIGKILL on the
+// immediate PID reparents any in-flight grandchild to PID 1, where it keeps
+// burning CPU into subsequent interleaved cells and past harness exit (23
+// such orphans were measured on this machine at load average 55.77).
+//
+// D5 is NOT weakened: these are descendants of processes this module itself
+// created. It still never signals a process it did not spawn.
+const liveChildren = new Set();
+
+function killTree(child) {
+  if (!child || child.killed || typeof child.pid !== 'number') return;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      process.kill(-child.pid, 'SIGKILL');
+    }
+  } catch {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+}
+
+function killAllLive() {
+  for (const child of Array.from(liveChildren)) killTree(child);
+  liveChildren.clear();
+}
+
+// Spawn one child in its own process group, resolving with a classified
+// outcome. Async (never `spawnSync`) for two reasons: the event loop stays
+// free so the SIGINT/SIGTERM prefs-restore handlers actually run mid-corrida
+// (R1's signal-path hole — `spawnSync` blocked them until the child exited),
+// and the group-kill path is shared with the competitors.
+function spawnTracked(cmd, args, { cwd, timeoutMs, env }) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let settled = false;
+    let timedOut = false;
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        cwd,
+        stdio: 'ignore',
+        detached: process.platform !== 'win32',
+        ...(env ? { env } : {}),
+      });
+    } catch (e) {
+      resolve({ wallMs: 0, exitCode: null, signal: 'spawn-error', timedOut: false, error: e.message });
+      return;
+    }
+    liveChildren.add(child);
+    const killer = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      killTree(child);
+    }, timeoutMs);
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killer);
+      liveChildren.delete(child);
+      resolve({ wallMs: Date.now() - start, timedOut, ...payload });
+    };
+    child.on('exit', (code, signal) => finish({ exitCode: code, signal: signal || null }));
+    child.on('error', (e) => finish({ exitCode: null, signal: 'spawn-error', error: e.message }));
   });
-  const wallMs = Date.now() - start;
-  if (result.error && result.error.code === 'ETIMEDOUT') {
-    return { wallMs, exitCode: null, status: 'aborted:timeout-exceeded' };
-  }
-  if (result.signal) {
-    return { wallMs, exitCode: null, status: `aborted:killed-${result.signal}` };
-  }
-  if (result.status === 0) {
-    return { wallMs, exitCode: 0, status: 'ok' };
-  }
-  return { wallMs, exitCode: result.status, status: `aborted:non-zero-exit-${result.status}` };
+}
+
+async function runChild(cmd, args, cwd, timeoutMs, opts = {}) {
+  const r = await spawnTracked(cmd, args, { cwd, timeoutMs, env: opts.env });
+  if (r.timedOut) return { wallMs: r.wallMs, exitCode: null, status: 'aborted:timeout-exceeded' };
+  if (r.signal === 'spawn-error') return { wallMs: r.wallMs, exitCode: null, status: 'aborted:spawn-error' };
+  if (r.signal) return { wallMs: r.wallMs, exitCode: null, status: `aborted:killed-${r.signal}` };
+  if (r.exitCode === 0) return { wallMs: r.wallMs, exitCode: 0, status: 'ok' };
+  return { wallMs: r.wallMs, exitCode: r.exitCode, status: `aborted:non-zero-exit-${r.exitCode}` };
 }
 
 // Competitors are fire-and-forget context (S06-PLAN.md: "o wall-clock dos
 // competidores é registrado como contexto, não como o número"). They are
 // spawned async, never synchronously blocking the measured corrida's start.
-function spawnCompetitor(cmd, args, cwd, timeoutMs) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    let settled = false;
-    const child = spawn(cmd, args, { cwd, stdio: 'ignore' });
-    const killer = setTimeout(() => {
-      if (!settled) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
-    }, timeoutMs);
-    child.on('exit', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(killer);
-      resolve({ wallMs: Date.now() - start, exitCode: code, signal: signal || null });
+async function spawnCompetitor(cmd, args, cwd, timeoutMs) {
+  const r = await spawnTracked(cmd, args, { cwd, timeoutMs });
+  return { wallMs: r.wallMs, exitCode: r.exitCode, signal: r.signal || null };
+}
+
+// ── Enforcement wiring (R2) ───────────────────────────────────────────────
+// The measured child is routed through the REAL enforcement entrypoint —
+// `forge-reverify.js#acquireReverifyClamp`, which is the production consumer
+// of `acquireCommandBudget` + `planRewriteArgv` — instead of being spawned
+// raw. Nothing about sizing, rewriting or leasing is reimplemented here
+// (D10); this module only calls the consumer and then asks the CHILD what it
+// received.
+const DUMP_MODULE = path.join(__dirname, 'forge-resources-bench-dump.js');
+const PARENT_NODE_OPTIONS = process.env.NODE_OPTIONS || null;
+
+// Frozen enum — a cell is only ever reported as enforced under an `applied:*`
+// reason, and every other outcome is NAMED rather than silently labelled by
+// the cell's requested state.
+const ENFORCEMENT_REASONS = Object.freeze({
+  APPLIED_HEAP: 'applied:heap-clamped',
+  APPLIED_RUNNER: 'applied:runner-flags',
+  APPLIED_BOTH: 'applied:heap-and-runner-flags',
+  OFF: 'unapplied:enforcement-off',
+  PARENT_NODE_OPTIONS: 'unapplied:node-options-parent-defined',
+  NO_DUMP_PATH: 'unapplied:no-child-dump:dump-path-unsafe',
+  NO_DUMP_CHILD: 'unapplied:no-child-dump:child-wrote-nothing',
+  UNKNOWN: 'unapplied:unknown',
+});
+
+function acquireClamp(argv, cwd, timeoutMs) {
+  try {
+    const { acquireReverifyClamp, releaseReverifyClamp } = require('./forge-reverify.js');
+    const clamp = acquireReverifyClamp(argv, {
+      codeDir: cwd,
+      timeoutMs,
+      gsdDir: path.join(cwd, '.gsd'),
     });
-    child.on('error', () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(killer);
-      resolve({ wallMs: Date.now() - start, exitCode: null, signal: 'spawn-error' });
-    });
-  });
+    return { clamp, release: () => { try { releaseReverifyClamp(clamp, cwd); } catch { /* MEM008 */ } } };
+  } catch {
+    return { clamp: { argv, env: null, handle: null, resourcesMod: null }, release: () => {} };
+  }
+}
+
+// `NODE_OPTIONS` is space-separated and unquotable in practice, so a path
+// containing whitespace cannot carry the preload — that refuses with a named
+// reason instead of pretending the child was observed.
+function withDumpPreload(env, dumpFile) {
+  if (/\s/.test(dumpFile) || /\s/.test(DUMP_MODULE)) {
+    return { env, disabledReason: ENFORCEMENT_REASONS.NO_DUMP_PATH };
+  }
+  const base = env ? { ...env } : { ...process.env };
+  base.NODE_OPTIONS = `${base.NODE_OPTIONS ? `${base.NODE_OPTIONS} ` : ''}--require ${DUMP_MODULE}`;
+  base.FORGE_BENCH_DUMP = dumpFile;
+  return { env: base, disabledReason: null };
+}
+
+// Decides `applied` from the CHILD's own dump line — never from the parent's
+// intent. `probeReason` is the rewrite planner's own outcome code, used only
+// to name WHY nothing was applied.
+function evaluateEnforcement({
+  cell, argvBefore, argvAfter, dumpRecords, disabledReason, probeReason,
+}) {
+  const requested = cellEnforcement(cell);
+  const argvChanged = argvBefore.join(' ') !== argvAfter.join(' ');
+  const base = { requested, argvChanged, childObserved: false, applied: false };
+
+  if (disabledReason) return { ...base, reason: disabledReason };
+  const first = (dumpRecords || [])[0];
+  if (!first) return { ...base, reason: ENFORCEMENT_REASONS.NO_DUMP_CHILD };
+
+  const heapMatch = /--max-old-space-size=(\d+)/.exec(first.nodeOptions || '');
+  const childHeapMb = heapMatch ? Number(heapMatch[1]) : null;
+  const injected = argvAfter.filter((t) => !argvBefore.includes(t));
+  const childArgv = Array.isArray(first.argv) ? first.argv : [];
+  const runnerApplied = argvChanged && injected.length > 0 && injected.every((t) => childArgv.includes(t));
+
+  const observed = {
+    ...base,
+    childObserved: true,
+    childHeapMb,
+    childHeapLimitMb: first.heapLimitMb === undefined ? null : first.heapLimitMb,
+    childPid: first.pid,
+    injectedTokens: injected,
+  };
+
+  if (childHeapMb !== null && runnerApplied) return { ...observed, applied: true, reason: ENFORCEMENT_REASONS.APPLIED_BOTH };
+  if (childHeapMb !== null) return { ...observed, applied: true, reason: ENFORCEMENT_REASONS.APPLIED_HEAP };
+  if (runnerApplied) return { ...observed, applied: true, reason: ENFORCEMENT_REASONS.APPLIED_RUNNER };
+  if (requested === 'off') return { ...observed, reason: ENFORCEMENT_REASONS.OFF };
+  if (PARENT_NODE_OPTIONS) return { ...observed, reason: ENFORCEMENT_REASONS.PARENT_NODE_OPTIONS };
+  return { ...observed, reason: probeReason ? `unapplied:${probeReason}` : ENFORCEMENT_REASONS.UNKNOWN };
 }
 
 async function runOneCorrida(opts) {
@@ -217,7 +380,44 @@ async function runOneCorrida(opts) {
     competitorPromises = Array.from({ length: competitors }, () => spawnCompetitor(cmd, args, cwd, timeoutMs));
   }
 
-  const measured = runChild(cmd, args, cwd, timeoutMs);
+  // Route the measured workload through the real enforcement entrypoint and
+  // give the child a way to testify about what it received.
+  const { clamp, release } = acquireClamp(command, cwd, timeoutMs);
+  const dumpFile = path.join(
+    path.dirname(outFile),
+    `.bench-dump-${cell.replace(/\//g, '-')}-${rep}-${process.pid}.jsonl`,
+  );
+  const { env, disabledReason } = withDumpPreload(clamp.env, dumpFile);
+
+  let probeReason = null;
+  try {
+    const { planRewriteArgv } = require('./forge-command-rewrite.js');
+    // Read-only probe over the SAME planner the clamp used — for the failure
+    // reason only, never to decide what the child runs.
+    const plan = planRewriteArgv(command, witness, { cwd });
+    if (plan.outcome !== 'rewritten') probeReason = plan.reason;
+  } catch { /* diagnostic only */ }
+
+  let measured;
+  try {
+    const [runCmd, ...runArgs] = clamp.argv;
+    measured = await runChild(runCmd, runArgs, cwd, timeoutMs, { env });
+  } finally {
+    release();
+  }
+
+  const dumpRecords = readJsonlRecords(dumpFile);
+  try { fs.unlinkSync(dumpFile); } catch { /* best effort */ }
+
+  const enforcement = evaluateEnforcement({
+    cell,
+    argvBefore: command,
+    argvAfter: clamp.argv,
+    dumpRecords,
+    disabledReason,
+    probeReason,
+  });
+
   const competitorResults = competitorPromises.length ? await Promise.all(competitorPromises) : undefined;
 
   const record = {
@@ -228,6 +428,7 @@ async function runOneCorrida(opts) {
     exitCode: measured.exitCode,
     status: measured.status,
     witness,
+    enforcement,
   };
   if (competitorResults) record.competitors = competitorResults;
 
@@ -302,6 +503,21 @@ function summarizeRecords(records, cells) {
       continue;
     }
 
+    // R2: a cell may only be reported as `measured` under the enforcement it
+    // requested when a CHILD-written dump corroborates that something was
+    // actually applied. Zero corroborated corridas in an `/on` cell is
+    // `inconclusive:enforcement-unapplied:<named reason>` — never a silent
+    // `on` label over a child that received nothing.
+    const enf = recs.map((r) => r.enforcement).filter(Boolean);
+    const nApplied = enf.filter((e) => e.applied).length;
+    const reasons = Array.from(new Set(enf.map((e) => e.reason)));
+    const enforcement = {
+      nApplied,
+      nObserved: enf.filter((e) => e.childObserved).length,
+      reasons,
+    };
+    const unapplied = cell.endsWith('/on') && nApplied === 0;
+
     summary[cell] = {
       n: recs.length,
       nOk: ok.length,
@@ -310,7 +526,10 @@ function summarizeRecords(records, cells) {
       max: ok[ok.length - 1],
       aborted: aborted.map((r) => ({ rep: r.rep, status: r.status })),
       witness: lastWitness,
-      verdict: 'measured',
+      enforcement,
+      verdict: unapplied
+        ? `inconclusive:enforcement-unapplied:${reasons[0] || ENFORCEMENT_REASONS.NO_DUMP_CHILD}`
+        : 'measured',
     };
   }
   return summary;
@@ -324,15 +543,18 @@ function formatSummary(summary) {
   const lines = [];
   for (const cell of Object.keys(summary)) {
     const s = summary[cell];
-    if (s.verdict !== 'measured') {
+    if (!s.nOk) {
       lines.push(`${cell}: ${s.verdict} (n=${s.n}, ok=${s.nOk})`);
       continue;
     }
     const w = s.witness || {};
+    const e = s.enforcement || {};
     lines.push(
       `${cell}: n=${s.n} ok=${s.nOk} mediana=${s.median}ms min=${s.min}ms max=${s.max}ms`
       + ` aborted=${s.aborted.length}`
-      + `${w.enforcement ? ` enforcement=${w.enforcement} workers=${w.workers} heapMb=${w.heapMb} agregado=${w.aggregateMb}MB RAM=${w.totalMb}MB` : ''}`,
+      + `${w.enforcement ? ` enforcement=${w.enforcement} workers=${w.workers} heapMb=${w.heapMb} agregado=${w.aggregateMb}MB RAM=${w.totalMb}MB` : ''}`
+      + `${e.reasons ? ` aplicado-no-filho=${e.nApplied}/${s.n} (${e.reasons.join('|')})` : ''}`
+      + `${s.verdict === 'measured' ? '' : ` → ${s.verdict}`}`,
     );
   }
   return lines.join('\n');
@@ -369,7 +591,13 @@ async function runMatrix(opts) {
     }
   };
 
+  // The measured corrida and the competitors are now spawned asynchronously
+  // (never `spawnSync`), so the event loop is free and these handlers run
+  // MID-corrida instead of only after the child returned — that was the
+  // signal-path hole T06 reported under SIGTERM. Children live in their own
+  // process groups, so they must be reaped explicitly (R3) before exit.
   const onSignal = (sig) => () => {
+    killAllLive();
     doRestore();
     process.exit(sig === 'SIGINT' ? 130 : 143);
   };
@@ -386,6 +614,7 @@ async function runMatrix(opts) {
     }
     return summarizeFile(outFile, cells);
   } finally {
+    killAllLive();
     doRestore();
   }
 }
@@ -442,6 +671,11 @@ module.exports = {
   parseCommand,
   runChild,
   spawnCompetitor,
+  killTree,
+  ENFORCEMENT_REASONS,
+  evaluateEnforcement,
+  withDumpPreload,
+  DUMP_MODULE,
   runOneCorrida,
   planRuns,
   median,

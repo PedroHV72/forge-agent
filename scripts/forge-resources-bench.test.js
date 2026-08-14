@@ -145,6 +145,43 @@ test('writeEnforcement: preserves unrelated keys already in the file', () => {
   assertEqual(parsed.resources.enforcement, 'off');
 });
 
+test('writeEnforcement: preserves a real JSONC document (comments + unrelated namespaces) — R1', () => {
+  const dir = tmpDir('forge-bench-jsonc-');
+  const prefsPath = bench.localPrefsPath(dir);
+  fs.mkdirSync(path.dirname(prefsPath), { recursive: true });
+  // Exactly the shape that destroyed the operator's file in T06: JSONC with
+  // a comment and a `forge_isolation` block alongside `resources`.
+  fs.writeFileSync(prefsPath, [
+    '{',
+    '  // isolation mode chosen by the operator',
+    '  "forge_isolation": { "mode": "branch" },',
+    '  "resources": { "enforcement": "clamp" },',
+    '}',
+    '',
+  ].join('\n'), 'utf8');
+
+  bench.writeEnforcement(prefsPath, 'off');
+  const parsed = JSON.parse(fs.readFileSync(prefsPath, 'utf8'));
+  assertEqual(parsed.forge_isolation.mode, 'branch', 'the operator\'s unrelated namespace must survive the write');
+  assertEqual(parsed.resources.enforcement, 'off', 'only resources.enforcement may change');
+});
+
+test('writeEnforcement: ABORTS on an unparseable document instead of replacing it — R1', () => {
+  const dir = tmpDir('forge-bench-jsonc-bad-');
+  const prefsPath = bench.localPrefsPath(dir);
+  fs.mkdirSync(path.dirname(prefsPath), { recursive: true });
+  const broken = '{ "forge_isolation": { "mode": "branch" }  <<< not json';
+  fs.writeFileSync(prefsPath, broken, 'utf8');
+
+  let threw = false;
+  try { bench.writeEnforcement(prefsPath, 'off'); } catch (e) {
+    threw = true;
+    assert(/recusa escrever/.test(e.message), `expected an explicit refusal, got: ${e.message}`);
+  }
+  assert(threw, 'writeEnforcement must refuse, never fall back to a fresh document');
+  assertEqual(fs.readFileSync(prefsPath, 'utf8'), broken, 'the file must be byte-identical after the refusal');
+});
+
 test('summarizeRecords: anti-silence floor — zero ok runs is inconclusive, never clean, never absent', () => {
   const records = [
     { cell: 'solo/off', rep: 1, status: 'aborted:timeout-exceeded', wallMs: 5000, witness: null },
@@ -308,39 +345,146 @@ await testAsync('runMatrix / --dry-run: the CLI plans without executing anything
   assertEqual(plan.plan.length, 6, 'dry-run must still report the full interleaved plan');
 });
 
-await testAsync('runMatrix (via CLI subprocess): SIGINT mid-run leaves already-finished JSONL lines intact and restores prefs byte-identically', async () => {
+await testAsync('runMatrix (via CLI subprocess): SIGINT mid-run leaves an already-finished JSONL line intact and restores prefs byte-identically', async () => {
   const dir = tmpDir('forge-bench-sigint-');
   const prefsPath = bench.localPrefsPath(dir);
   const original = JSON.stringify({ resources: { enforcement: 'clamp' } });
   fs.writeFileSync(prefsPath, original, 'utf8');
   const outFile = path.join(dir, 'out.jsonl');
+  const marker = path.join(dir, 'first-done.marker');
 
-  // First corrida is fast (completes and gets appended); later corridas use
-  // a slow sleep so the process is reliably still mid-run when SIGINT lands.
+  // The claim under test is that a COMPLETED record survives the interrupt,
+  // so the fixture must guarantee one exists before SIGINT lands: rep 1
+  // exits immediately (dropping a marker), every later rep blocks. The old
+  // fixture slept 2000ms on every rep and fired SIGINT at 400ms, so the
+  // first append deterministically never happened and the assertion — gated
+  // on the file existing — passed over ZERO records.
+  const fixture = ['node', '-e',
+    `const fs=require('fs');const m=${JSON.stringify(marker)};`
+    + 'if(fs.existsSync(m)){setTimeout(()=>{},60000);}else{fs.writeFileSync(m,"1");}'];
+
   const child = spawn(process.execPath, [
     BENCH_PATH, '--cwd', dir, '--reps', '3', '--cells', 'solo/off',
-    '--command', JSON.stringify(sleepCommand(2000)),
-    '--out', outFile, '--timeout-ms', '15000',
+    '--command', JSON.stringify(fixture),
+    '--out', outFile, '--timeout-ms', '30000',
   ], { stdio: 'ignore' });
 
-  await new Promise((resolve) => setTimeout(resolve, 400));
+  // Poll until the first completed corrida is actually on disk — never a
+  // fixed sleep, which is what made the old test vacuous.
+  const deadline = Date.now() + 20000;
+  let firstLine = null;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(outFile)) {
+      const lines = fs.readFileSync(outFile, 'utf8').split('\n').filter(Boolean);
+      if (lines.length >= 1) { firstLine = lines[0]; break; }
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert(firstLine !== null, 'precondition: a completed corrida must be on disk BEFORE the interrupt');
+  const before = JSON.parse(firstLine);
+  assertEqual(before.status, 'ok', 'precondition: the completed corrida must be an ok record');
+  assertEqual(before.rep, 1);
+
   child.kill('SIGINT');
   await new Promise((resolve) => child.on('exit', resolve));
 
   const restored = fs.readFileSync(prefsPath, 'utf8');
   assertEqual(restored, original, 'prefs must be restored to original bytes after SIGINT mid-run');
 
-  // The interrupted run may or may not have completed its first slow
-  // corrida in 400ms; either way any line already on disk must be valid
-  // JSON — proving the harness never leaves a torn/partial JSONL line.
-  if (fs.existsSync(outFile)) {
-    const raw = fs.readFileSync(outFile, 'utf8');
-    const lines = raw.split('\n').filter(Boolean);
-    for (const line of lines) {
-      assert(() => JSON.parse(line) || true, 'every line on disk must be valid JSON');
-      JSON.parse(line);
-    }
-  }
+  assert(fs.existsSync(outFile), 'the JSONL file must still exist after the interrupt');
+  const lines = fs.readFileSync(outFile, 'utf8').split('\n').filter(Boolean);
+  assert(lines.length >= 1, 'the finished record must survive the interrupt (never zero records)');
+  for (const line of lines) JSON.parse(line); // no torn/partial line
+  assertEqual(lines[0], firstLine, 'the exact finished record must survive byte-identically');
+});
+
+// ── R2: the instrument must observe the CHILD, not the parent's intent ─────
+
+await testAsync('runOneCorrida: an `on` cell is backed by child-written evidence, and the same dump lacks it when enforcement is off', async () => {
+  const dir = tmpDir('forge-bench-childevidence-');
+  const outFile = path.join(dir, 'out.jsonl');
+
+  await bench.runMatrix({
+    cwd: dir,
+    cells: ['solo/on', 'solo/off'],
+    reps: 3,
+    competitors: 0,
+    command: sleepCommand(10),
+    timeoutMs: 15000,
+    outFile,
+  });
+
+  const records = bench.readJsonlRecords(outFile);
+  const on = records.filter((r) => r.cell === 'solo/on');
+  const off = records.filter((r) => r.cell === 'solo/off');
+  assertEqual(on.length, 3);
+  assertEqual(off.length, 3);
+
+  assert(on.every((r) => r.enforcement && r.enforcement.childObserved),
+    `every corrida must carry a child-written dump, got ${JSON.stringify(on.map((r) => r.enforcement))}`);
+  assert(on.every((r) => r.enforcement.applied && r.enforcement.reason.startsWith('applied:')),
+    `an \`on\` corrida must be corroborated BY THE CHILD, got ${JSON.stringify(on.map((r) => r.enforcement.reason))}`);
+  assert(on.every((r) => Number.isFinite(r.enforcement.childHeapMb)),
+    'the child must report the heap ceiling it actually received');
+
+  // Control negative on the SAME observation channel: with enforcement off,
+  // the child dump exists and carries NO clamp.
+  assert(off.every((r) => r.enforcement.childObserved), 'the off cell must also be observed from inside the child');
+  assert(off.every((r) => !r.enforcement.applied), 'an off corrida must never be reported as enforced');
+  assert(off.every((r) => r.enforcement.reason === bench.ENFORCEMENT_REASONS.OFF),
+    `off corridas must name the reason, got ${JSON.stringify(off.map((r) => r.enforcement.reason))}`);
+  assert(off.every((r) => r.enforcement.childHeapMb === null),
+    'the child must show NO heap clamp when enforcement is off');
+});
+
+test('summarizeRecords: an `/on` cell with zero child-corroborated corridas is inconclusive with a named reason, never `measured`', () => {
+  const unapplied = [1, 2, 3].map((rep) => ({
+    cell: 'solo/on', rep, status: 'ok', wallMs: 100, witness: null,
+    enforcement: { applied: false, childObserved: false, reason: bench.ENFORCEMENT_REASONS.NO_DUMP_CHILD },
+  }));
+  const summary = bench.summarizeRecords(unapplied, ['solo/on']);
+  assertEqual(summary['solo/on'].verdict, `inconclusive:enforcement-unapplied:${bench.ENFORCEMENT_REASONS.NO_DUMP_CHILD}`);
+  assertEqual(summary['solo/on'].nOk, 3, 'the wall-clocks are still real and still counted');
+
+  // control negative: one corroborated corrida is enough to be `measured`.
+  const applied = unapplied.map((r, i) => (i === 0
+    ? { ...r, enforcement: { applied: true, childObserved: true, reason: bench.ENFORCEMENT_REASONS.APPLIED_HEAP } }
+    : r));
+  assertEqual(bench.summarizeRecords(applied, ['solo/on'])['solo/on'].verdict, 'measured');
+});
+
+test('evaluateEnforcement: a missing child dump is a named reason, never an `applied` label', () => {
+  const e = bench.evaluateEnforcement({
+    cell: 'solo/on', argvBefore: ['node', 'x'], argvAfter: ['node', 'x'], dumpRecords: [], disabledReason: null, probeReason: null,
+  });
+  assertEqual(e.applied, false);
+  assertEqual(e.reason, bench.ENFORCEMENT_REASONS.NO_DUMP_CHILD);
+  assertEqual(e.childObserved, false);
+});
+
+// ── R3: descendants of our own competitors are our cleanup responsibility ──
+
+await testAsync('spawnCompetitor: a timed-out competitor takes its grandchild with it (no orphan survives)', async () => {
+  const dir = tmpDir('forge-bench-orphan-');
+  const pidFile = path.join(dir, 'grandchild.pid');
+  // Parent spawns a long-lived grandchild that records its own pid, then
+  // blocks. The harness timeout kills the parent; without a group kill the
+  // grandchild would be reparented to PID 1 and keep running.
+  const cmd = ['node', '-e',
+    `const {spawn}=require('child_process');const fs=require('fs');`
+    + `const g=spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{stdio:'ignore'});`
+    + `fs.writeFileSync(${JSON.stringify(pidFile)},String(g.pid));setTimeout(()=>{},60000);`];
+
+  await bench.spawnCompetitor(cmd[0], cmd.slice(1), dir, 1200);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert(fs.existsSync(pidFile), 'precondition: the grandchild must have been spawned and recorded');
+  const gpid = Number(fs.readFileSync(pidFile, 'utf8'));
+  let alive = true;
+  try { process.kill(gpid, 0); } catch { alive = false; }
+  if (alive) { try { process.kill(gpid, 'SIGKILL'); } catch { /* cleanup */ } }
+  assert(!alive, `grandchild pid ${gpid} survived the competitor timeout — orphan contaminates later cells`);
 });
 
 }
