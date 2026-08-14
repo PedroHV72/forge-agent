@@ -64,19 +64,25 @@ Given all `T##-SUMMARY.md` files from the slice:
        const entries=[];let cur=null;
        for(const l of lines){
          const m=l.match(/^\\s+-\\s+command:\\s*\"?([^\"]*)\"?/);
-         if(m){if(cur)entries.push(cur);cur={command:m[1],exit_code:null,matched_line:null};continue}
+         if(m){if(cur)entries.push(cur);cur={command:m[1],exit_code:null,matched_line:null,evidence_file:null};continue}
          const e=l.match(/^\\s+exit_code:\\s*(-?\\d+)/);if(e&&cur){cur.exit_code=+e[1];continue}
          const ml=l.match(/^\\s+matched_line:\\s*(-?\\d+)/);if(ml&&cur){cur.matched_line=+ml[1];continue}
+         const ef=l.match(/^\\s+evidence_file:\\s*\"?([^\"]*)\"?/);if(ef&&cur){cur.evidence_file=ef[1]||null;continue}
        }
        if(cur)entries.push(cur);
        process.stdout.write(JSON.stringify(entries));
        "
        ```
-       Output: `[{command, exit_code, matched_line}, ...]` or `[]`.
-    b. **Read `.gsd/forge/evidence-{T##}.jsonl`.** If the file does not exist AND `verification_evidence:` is non-empty → that is **condition (c)** — record a flag with reason `evidence_log_missing` for each claimed entry.
+       Output: `[{command, exit_code, matched_line, evidence_file}, ...]` or `[]`.
+    b. **Resolve the evidence-log FILE SET for this unit** — never consult the bare `.gsd/forge/evidence-{T##}.jsonl` name alone; one logical unit can be spread across the new composite name and 3 legacy forms (S01/T04):
+       ```bash
+       node "$FORGE_SCRIPTS_DIR/forge-evidence-path.js" --resolve --milestone "{M###}" --slice "{S##}" --unit "{T##}" --json --cwd "{WORKING_DIR}"
+       ```
+       (same `$FORGE_SCRIPTS_DIR` resolved above, checking for `scripts/forge-prefs.js` — both scripts live side by side). Output: `{files:[{name, form}, ...], by_form:{...}, skipped:[...]}`.
+       If `files` is empty AND `verification_evidence:` is non-empty → that is **condition (c)** — record a flag with reason `evidence_log_missing` for each claimed entry. This is the ONLY legitimate trigger for `evidence_log_missing`: an empty resolved **set**, never the absence of one bare-named file.
     c. **For each entry, classify:**
-       - `matched_line === 0` → **condition (a)** — flag reason `command_not_in_log`.
-       - `matched_line > 0` → read line N of the JSONL (`sed -n "<N>p" <evidence-file>`), parse JSON, check whether the log line's `cmd` field contains the claimed `command` as a substring (case-sensitive, first 80 chars). If NO substring match → **condition (b)** — flag reason `command_mismatch_at_line`.
+       - `matched_line === 0` → **condition (a)** — flag reason `command_not_in_log`. Name the file the worker checked in the flag body (`entry.evidence_file`, or "unresolved" if the field is absent — older SUMMARY entries predate S01/T04) so the claim stays diagnosable instead of a bare zero.
+       - `matched_line > 0` → resolve the file to check: prefer `entry.evidence_file` if it names a file present in the resolved `files` set from (b); otherwise fall back to checking every file in the set. Read line N of the chosen file (`sed -n "<N>p" <evidence-file>`), parse JSON, check whether the log line's `cmd` field contains the claimed `command` as a substring (case-sensitive, first 80 chars). If NO substring match in any candidate file → **condition (b)** — flag reason `command_mismatch_at_line`, naming the file actually consulted.
        - `matched_line > 0` and substring match → no flag.
     d. **Collect all flags from all tasks.** If flags is non-empty, append a `## Evidence Flags` section to `S##-SUMMARY.md`:
        ```markdown
@@ -86,9 +92,9 @@ Given all `T##-SUMMARY.md` files from the slice:
 
        | Task | Claim (command) | Reason |
        |------|-----------------|--------|
-       | T01  | `npm run typecheck` | `command_not_in_log` (matched_line=0) |
-       | T02  | `npm test` | `command_mismatch_at_line` (line 3 of evidence-T02.jsonl has cmd="echo hello") |
-       | T03  | `npm run lint` | `evidence_log_missing` (file not found: .gsd/forge/evidence-T03.jsonl) |
+       | T01  | `npm run typecheck` | `command_not_in_log` (matched_line=0, file: evidence~M###~S01~T01.jsonl) |
+       | T02  | `npm test` | `command_mismatch_at_line` (line 3 of evidence~M###~S01~T02.jsonl has cmd="echo hello") |
+       | T03  | `npm run lint` | `evidence_log_missing` (resolved set empty for milestone=M### slice=S01 unit=T03) |
        ```
 
        If flags is empty → do NOT write the section at all (absence is good news, no noise).
