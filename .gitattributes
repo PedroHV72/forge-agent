@@ -1,0 +1,27 @@
+# Line endings are normalized to LF in the working tree on every platform.
+#
+# Why this file exists: dozens of guards in this repo are *structural tests over
+# source text* — they read files such as `app/Sources/**/*.swift`, `scripts/*.js`
+# and `shared/*.md` and assert on their content with LF-anchored patterns. With no
+# `.gitattributes`, a Windows checkout under the default `core.autocrlf=true`
+# hands those guards CRLF and they break for a reason that has nothing to do with
+# the property under test (measured: converting the 58 sources under `app/Sources`
+# to CRLF reproduces the exact Windows CI failures; restoring LF makes them pass).
+#
+# Scope check performed before writing this rule: an in-process scan of all 544
+# tracked files found **zero** files containing CRLF and zero containing a lone CR.
+# The repo's deliberate CRLF fixtures (PR #85, plan files in CRLF/BOM) are built at
+# test runtime under a temp dir — they are never tracked, so this rule cannot reach
+# them. Should a CRLF fixture ever need to be committed, exclude it explicitly here
+# with `-text` (or `eol=crlf`) rather than weakening the blanket rule.
+
+* text=auto eol=lf
+
+# Binary assets: never touched by EOL conversion.
+*.icns binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary
