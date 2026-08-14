@@ -363,7 +363,7 @@ Execução paralela de execute-task dentro do mesmo slice + comportamento em ove
 
 ## resources
 
-Controle de recursos sob pressão do host — dimensionamento de concorrência e espera sob pressão crítica. `enforcement` decide se o clamp/recusa é advisory ou enforcing (D2); `shadow_wait`/`wait_cap_ms` decidem se a espera sob pressão crítica é sombra (só registra evento) ou bloqueante de verdade (D3). Postura v1: `clamp` enforcing dia 1, recusa e espera ficam advisory/sombra até uma milestone de calibração medir o comportamento real.
+Controle de recursos sob pressão do host — dimensionamento de concorrência e espera sob pressão crítica (D2/D3).
 
 ### `resources.enforcement`
 
@@ -376,13 +376,13 @@ Controle de recursos sob pressão do host — dimensionamento de concorrência e
 
 - **Tipo:** boolean
 - **Default:** `true`
-- **Descrição:** true = espera sob pressão crítica roda em modo sombra, registrando "teria esperado Xs" como evento sem bloquear (D3, único modo implementado no v1). false = **RESERVADO/INERTE no v1** — nenhum código deste milestone (nem planejado) implementa espera real bloqueante; setar `false` hoje apenas desliga o evento de telemetria de shadow-wait sem substituí-lo por uma espera de verdade (D3 trava shadow-only para v1).
+- **Descrição:** true = espera sob pressão crítica roda em modo sombra, registrando 'teria esperado Xs' como evento sem bloquear (D3, único modo implementado no v1). false = RESERVADO/INERTE no v1 — nenhum código deste milestone implementa espera real bloqueante; setar false hoje apenas desliga o evento de telemetria de shadow-wait sem substituí-lo por nada (D3 trava shadow-only).
 
 ### `resources.wait_cap_ms`
 
 - **Tipo:** integer
 - **Default:** `30000`
-- **Descrição:** Teto da espera (sombra ou real) sob pressão crítica, em milissegundos. Deve ser `>= 1`; o reader (`readResourcePrefs`) substitui silenciosamente qualquer valor `<= 0` pelo default — não há semântica de "sem espera" via `0`/negativo.
+- **Descrição:** Teto da espera (sombra ou real) sob pressão crítica, em milissegundos. Deve ser >= 1; não há semântica de 'sem espera' via 0 ou negativo — o reader substitui qualquer valor fora do range pelo default (30000).
 
 ## retry
 
