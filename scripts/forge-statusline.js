@@ -830,15 +830,24 @@ process.stdin.on('end', () => {
       try { ({ poolStatus } = require(path.join(__dirname, 'scripts', 'forge-resource-pool.js'))); }
       catch { ({ poolStatus } = require(path.join(__dirname, 'forge-resource-pool.js'))); }
       let readLastResourceEvent = null;
-      try { ({ readLastResourceEvent } = require(path.join(__dirname, 'scripts', 'forge-resources-census.js'))); }
-      catch { ({ readLastResourceEvent } = require(path.join(__dirname, 'forge-resources-census.js'))); }
+      let DEGRADATION_REASONS = null;
+      try {
+        ({ readLastResourceEvent, DEGRADATION_REASONS } = require(path.join(__dirname, 'scripts', 'forge-resources-census.js')));
+      } catch {
+        ({ readLastResourceEvent, DEGRADATION_REASONS } = require(path.join(__dirname, 'forge-resources-census.js')));
+      }
 
       const pool = poolStatus({});
       const held = pool && pool.ok ? pool.held : 0;
       const ceiling = pool && pool.ok ? pool.ceiling : 0;
 
       const lastEvent = cwd ? readLastResourceEvent(cwd, { tailBytes: 8192 }) : null;
-      const degradedReason = lastEvent && lastEvent.reason ? lastEvent.reason : '';
+      // R4 fix: the comment above promises "a recent event carrying a
+      // degradation reason" — but ANY last resource event has a `.reason`
+      // (pool-released, pressure-normal included). Only a reason registered
+      // in DEGRADATION_REASONS is actually degradation.
+      const degradedReason = (lastEvent && lastEvent.reason && DEGRADATION_REASONS
+        && DEGRADATION_REASONS.has(lastEvent.reason)) ? lastEvent.reason : '';
 
       // Gate: show only when clamp is active — pool holding a slot OR a
       // recent event carrying a degradation reason. Silence otherwise keeps

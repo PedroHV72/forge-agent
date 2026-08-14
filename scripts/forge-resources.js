@@ -467,12 +467,24 @@ function acquireCommandBudget(opts) {
   try {
     pool = require('./forge-resource-pool.js');
   } catch {
+    // R1 fix: a pool bootstrap/acquire failure must be visible in the event
+    // stream — without this the census sees only healthy admission records
+    // and reports `clean`, leaving POOL_UNAVAILABLE_FAIL_OPEN an inert
+    // DEGRADATION_REASONS member no producer can ever write.
+    appendEvent(o, cwd, 'resource-degradation', {
+      reason: 'pool-unavailable-fail-open',
+      source: 'pool-require-failed',
+    });
     const degraded = { ...contract, pool: { reason: 'pool-unavailable-fail-open' } };
     return degraded;
   }
   try {
     const bootstrap = pool.ensurePoolRoot(o);
     if (!bootstrap.ok) {
+      appendEvent(o, cwd, 'resource-degradation', {
+        reason: pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN,
+        source: 'pool-bootstrap-failed',
+      });
       return { ...contract, pool: { reason: pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN } };
     }
     const grant = pool.acquireSlots(contract.workers, {
@@ -486,6 +498,10 @@ function acquireCommandBudget(opts) {
       ncpu: o.ncpu,
     });
     if (!grant || !grant.ok) {
+      appendEvent(o, cwd, 'resource-degradation', {
+        reason: pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN,
+        source: 'pool-acquire-failed',
+      });
       return { ...contract, pool: { reason: pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN } };
     }
     // R2 fix: `workers`/`pool.granted`/`pool.reason` MUST derive from the
@@ -517,6 +533,10 @@ function acquireCommandBudget(opts) {
     });
     return finalContract;
   } catch {
+    appendEvent(o, cwd, 'resource-degradation', {
+      reason: 'pool-unavailable-fail-open',
+      source: 'pool-acquire-threw',
+    });
     return { ...contract, pool: { reason: 'pool-unavailable-fail-open' } };
   }
 }

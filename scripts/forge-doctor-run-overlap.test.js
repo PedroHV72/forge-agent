@@ -110,6 +110,54 @@ test('--check all stays exit 0 with overlap present (advisory never flips allOk)
   }
 });
 
+// ── R5 (S05 review, arbitrated): inconclusive/overlap warn, never show ✓ ────
+
+test('--check run-overlap shows ⚠ (never ✓) on an inconclusive verdict', () => {
+  const root = mkTmp('t03-inconclusive-glyph');
+  try {
+    fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+    // Exactly one comparable run -> n*(n-1)/2 === 0 pairs -> inconclusive.
+    writeRun(root, 'RUN-A', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/inconclusive/.test(r.stdout), 'setup: verdict must actually be inconclusive');
+    assert.ok(/⚠ Advisory — Cross-run overlap/.test(r.stdout), 'inconclusive must warn, never show ✓');
+    assert.ok(!/✓ Advisory — Cross-run overlap/.test(r.stdout), 'inconclusive must not render ✓');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--check run-overlap shows ⚠ (never ✓) when overlap is present', () => {
+  const root = mkTmp('t03-overlap-glyph');
+  try {
+    fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+    writeRun(root, 'RUN-A', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    writeRun(root, 'RUN-B', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/⚠ Advisory — Cross-run overlap/.test(r.stdout), 'overlap must warn (unchanged behavior)');
+    assert.ok(!/✓ Advisory — Cross-run overlap/.test(r.stdout), 'overlap must not render ✓');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--check run-overlap shows ✓ (positive control) on a genuinely clean verdict', () => {
+  const root = mkTmp('t03-clean-glyph');
+  try {
+    fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+    writeRun(root, 'RUN-A', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    writeRun(root, 'RUN-B', { touched: touchedOf([repoEntry('freyr', ['src/z.ts'])]) });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/\bclean\b/.test(r.stdout), 'setup: verdict must actually be clean');
+    assert.ok(/✓ Advisory — Cross-run overlap/.test(r.stdout), 'a real clean verdict DOES still show ✓ (positive control)');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── 2. ok:true on all three paths ───────────────────────────────────────────
 
 test('checkRunOverlap ok:true — no runs registry (skip path)', () => {

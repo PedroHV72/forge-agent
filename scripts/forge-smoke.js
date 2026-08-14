@@ -16498,6 +16498,15 @@ function smokeResourcesObservabilityCensus() {
   const dualFieldRoot = mkTmp('dualfield');
   const platformRoot = mkTmp('platform');
   const pollutionRoot = mkTmp('pollution');
+  // R6 fix: every doctor spawn below reads through `checkResources ->
+  // poolStatus`, which without `--pool-dir` resolves to the REAL machine-wide
+  // `~/.claude/forge/resource-pool`. Reads are harmless (poolStatus/observe
+  // never mutate), but they still touch an unowned machine surface, and
+  // assertion (i) below claims every fixture used an isolated pool dir — a
+  // claim that must be true, not just plausible. Give each doctor fixture its
+  // own tmp pool dir, same isolation discipline the statusline fixtures (f)
+  // already use.
+  const doctorPoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke109-doctor-pool-'));
   let stlHeldDir = null;
   let stlEmptyDir = null;
   let stlPoolHeldRoot = null;
@@ -16506,7 +16515,7 @@ function smokeResourcesObservabilityCensus() {
   try {
     // ── (a) advisory absolute: real spawn exit 0, degraded fixture ─────────
     appendEvent(degradedRoot, { ts: new Date().toISOString(), kind: 'resource-admission', reason: 'platform-unsupported:linux' });
-    const resA1 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', degradedRoot], { encoding: 'utf8' });
+    const resA1 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', degradedRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
     assert(resA1.status === 0, '(a) `--check resources` exits 0 by real spawn, with a degraded fixture present', String(resA1.status) + resA1.stderr);
     assert(/degraded/.test(resA1.stdout), '(a) degraded fixture surfaces the degraded verdict in stdout', resA1.stdout);
     // `--check all` also runs the (unrelated) non-advisory schema check —
@@ -16515,12 +16524,12 @@ function smokeResourcesObservabilityCensus() {
     // own `--check all` case; derived from the module, never hand-written).
     const { CURRENT_SCHEMA: DOCTOR_CURRENT_SCHEMA } = require(path.join(SCRIPTS, 'forge-doctor.js'));
     fs.writeFileSync(path.join(degradedRoot, '.gsd', 'SCHEMA-VERSION'), `${DOCTOR_CURRENT_SCHEMA}\n`, 'utf8');
-    const resA2 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'all', '--cwd', degradedRoot], { encoding: 'utf8' });
+    const resA2 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'all', '--cwd', degradedRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
     assert(resA2.status === 0, '(a) `--check all` also exits 0 by real spawn with the same degraded fixture', String(resA2.status) + resA2.stderr);
     assert(/Resource control/.test(resA2.stdout), '(a) `--check all` output includes the resources check', resA2.stdout);
 
     // ── (b) anti-silence floor: zero events -> inconclusive, never clean ───
-    const resB = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', cleanRoot], { encoding: 'utf8' });
+    const resB = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', cleanRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
     assert(resB.status === 0, '(b) zero-events fixture still exits 0', String(resB.status) + resB.stderr);
     assert(/inconclusive/.test(resB.stdout), '(b) zero events examined reads inconclusive', resB.stdout);
     assert(!/\bclean\b/.test(resB.stdout), '(b) zero events examined NEVER reads clean — the floor is first in verdict order', resB.stdout);
@@ -16528,21 +16537,21 @@ function smokeResourcesObservabilityCensus() {
     // ── (c) positive bite: BOTH field names (`kind` and `event`), reason count >= 1 ──
     appendEvent(dualFieldRoot, { ts: new Date().toISOString(), kind: 'resource-admission', reason: 'platform-unsupported:linux' });
     appendEvent(dualFieldRoot, { ts: new Date().toISOString(), event: 'resource-degradation', reason: 'platform-unsupported:linux' });
-    const resC = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', dualFieldRoot], { encoding: 'utf8' });
+    const resC = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', dualFieldRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
     assert(resC.status === 0, '(c) dual-field-name fixture exits 0', String(resC.status) + resC.stderr);
     assert(/platform-unsupported:linux/.test(resC.stdout) && /2/.test(resC.stdout),
       '(c) BOTH `kind` and `event` field names are counted into the same reason with count >= 1 (a `kind`-only reader would see half the stream — the exact S03 rewrite-event blind spot this slice exists to close)',
       resC.stdout);
 
     // ── (d) forced platform degradation is NAMED, not passed clean ─────────
-    const resD = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', platformRoot, '--platform', 'linux'], { encoding: 'utf8' });
+    const resD = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', platformRoot, '--platform', 'linux', '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
     assert(resD.status === 0, '(d) forced-platform fixture exits 0', String(resD.status) + resD.stderr);
     assert(/platform-unsupported:linux/.test(resD.stdout), '(d) --platform linux is NAMED in the live pressure line, never silently passed', resD.stdout);
 
     // ── (e) non-pollution: events.jsonl is byte-identical before/after ─────
     appendEvent(pollutionRoot, { ts: new Date().toISOString(), kind: 'shadow-wait', reason: 'shadow-wait' });
     const beforeHash = sha256File(eventsPath(pollutionRoot));
-    const resE = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', pollutionRoot], { encoding: 'utf8' });
+    const resE = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', pollutionRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
     assert(resE.status === 0, '(e) non-pollution fixture check exits 0', String(resE.status) + resE.stderr);
     const afterHash = sha256File(eventsPath(pollutionRoot));
     assert(beforeHash !== null && beforeHash === afterHash,
@@ -16574,6 +16583,11 @@ function smokeResourcesObservabilityCensus() {
     // restore step is needed — the copy is simply discarded.
     const mutCopyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke109-mutcopy-'));
     const mutScriptsDir = path.join(mutCopyRoot, 'scripts');
+    // R7 fix: hoisted to the outer scope (was declared inside the inner try,
+    // whose `finally` removed only `mutCopyRoot`) — every smoke run leaked a
+    // `smoke109-mut-fixture-*` tmpdir. Cleaned up in this block's own
+    // `finally` below, alongside `mutCopyRoot`.
+    let mutRoot = null;
     try {
       fs.cpSync(SCRIPTS, mutScriptsDir, { recursive: true });
       const censusPath = path.join(mutScriptsDir, 'forge-resources-census.js');
@@ -16591,8 +16605,8 @@ function smokeResourcesObservabilityCensus() {
       assert(neuteredSrc !== originalSrc, '(g) the floor-neutering replacement actually changed the source (not a no-op substitution)', 'replace() produced no change');
       fs.writeFileSync(censusPath, neuteredSrc, 'utf8');
       const mutDoctorCli = path.join(mutScriptsDir, 'forge-doctor.js');
-      const mutRoot = mkTmp('mut-fixture');
-      const resG = spawnSync(NODE, [mutDoctorCli, '--check', 'resources', '--cwd', mutRoot], { encoding: 'utf8' });
+      mutRoot = mkTmp('mut-fixture');
+      const resG = spawnSync(NODE, [mutDoctorCli, '--check', 'resources', '--cwd', mutRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
       assert(resG.status === 0, '(g) mutated-copy CLI still exits 0 (advisory posture survives the mutation)', String(resG.status) + resG.stderr);
       assert(!/inconclusive/.test(resG.stdout),
         '(g) MORDIDA NEGATIVA: with the anti-silence floor neutered, a zero-events fixture NO LONGER reads inconclusive — the assertion in (b) would FAIL against this build, proving the floor is what makes (b) pass, not coincidence',
@@ -16603,6 +16617,7 @@ function smokeResourcesObservabilityCensus() {
       assert(stillOnDisk === originalOnDisk, '(g) the REAL checkout file is byte-identical before/after this mutation exercise — only the tmp copy was ever written', 'checkout file drifted');
     } finally {
       try { fs.rmSync(mutCopyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      if (mutRoot) { try { fs.rmSync(mutRoot, { recursive: true, force: true }); } catch { /* best-effort */ } }
     }
 
     // ── (h) registration: the section verifies it is wired into main() ─────
@@ -16611,16 +16626,20 @@ function smokeResourcesObservabilityCensus() {
     assert(/\(\) => \{ smokeResourcesObservabilityCensus\(\); \}/.test(mainBody),
       '(h) Section 109 is registered in main() by closure — an unregistered section vanishes silently');
   } finally {
-    for (const d of [degradedRoot, cleanRoot, dualFieldRoot, platformRoot, pollutionRoot, stlHeldDir, stlEmptyDir, stlPoolHeldRoot, stlPoolEmptyRoot]) {
+    for (const d of [degradedRoot, cleanRoot, dualFieldRoot, platformRoot, pollutionRoot, stlHeldDir, stlEmptyDir, stlPoolHeldRoot, stlPoolEmptyRoot, doctorPoolDir]) {
       if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ } }
     }
   }
 
   // ── (i) real pool root and real .gsd/ never touched by any fixture above ─
+  // R6 fix: the doctor-CLI fixtures (a)-(e)/(g) now also pass `--pool-dir`
+  // pointed at `doctorPoolDir` — this label previously overclaimed
+  // ("every fixture above used ...") while those spawns actually read the
+  // real machine-wide pool root via `poolStatus`'s default resolution.
   const realPoolExistedAfter = fs.existsSync(realPoolRoot);
   const realPoolListingAfter = realPoolExistedAfter ? fs.readdirSync(realPoolRoot).sort() : null;
   assert(realPoolExistedBefore === realPoolExistedAfter && JSON.stringify(realPoolListingBefore) === JSON.stringify(realPoolListingAfter),
-    '(i) the real machine pool root (~/.claude/forge/resource-pool) is untouched — every fixture above used FORGE_RESOURCE_POOL_DIR/--cwd pointed at a tmpdir',
+    '(i) the real machine pool root (~/.claude/forge/resource-pool) is untouched — every statusline fixture used FORGE_RESOURCE_POOL_DIR and every doctor-CLI fixture used --pool-dir, all pointed at a tmpdir',
     JSON.stringify({ before: realPoolListingBefore, after: realPoolListingAfter }));
 
   pass('Section 109: forge-doctor --check resources and the statusline clamp indicator proven exit-0-always by real spawn, '

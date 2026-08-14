@@ -621,10 +621,15 @@ function runCheck(name, cwd, options = {}) {
 function formatResults(results) {
   const lines = [];
   for (const r of results) {
+    // R5 (S05 review, arbitrated): an `inconclusive`/errored advisory result
+    // rendering ✓ invites the wrong inference — this milestone's whole thesis
+    // is that inconclusive != clean. Both `resources` and `run-overlap` now
+    // warn on anything short of a genuinely clean/measured result; exit code
+    // stays 0 in every case (advisory posture unchanged).
     const advisoryWarn = (r.check === 'plan-repo-declared' && Array.isArray(r.plans) && r.plans.length > 0)
       || (r.check === 'workspace-consistency' && r.divergentCount > 0)
-      || (r.check === 'run-overlap' && r.verdict === 'overlap')
-      || (r.check === 'resources' && r.verdict === 'degraded');
+      || (r.check === 'run-overlap' && (r.verdict === 'overlap' || r.verdict === 'inconclusive'))
+      || (r.check === 'resources' && ((r.verdict && r.verdict !== 'clean') || Boolean(r.skipped)));
     const icon = advisoryWarn ? '⚠' : (r.ok ? '✓' : '✗');
     const label = r.check === 'schema' ? 'Layer 2 — Schema version'
       : r.check === 'review-model-drift' ? 'Advisory — Review model drift'

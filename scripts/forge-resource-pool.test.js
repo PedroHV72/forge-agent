@@ -86,6 +86,50 @@ test('shared ceiling: pool-config.json is authority, not local ncpu recomputatio
   assert.strictEqual(result.granted, 4);
 });
 
+// ── R3 fix: readPoolConfig rejects out-of-range/non-integer ceilings ──────
+test('readPoolConfig: rejects a ceiling above POOL_MAX_CEILING (named invalid config, never a stall)', () => {
+  const dir = tmpPoolDir();
+  fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 1e15, written_at: 1 }), 'utf8');
+  const parsed = pool.readPoolConfig({ poolDir: dir });
+  assert.strictEqual(parsed, null, 'an absurd ceiling must be rejected, not accepted as a bounded loop');
+});
+
+test('readPoolConfig: rejects a non-integer ceiling', () => {
+  const dir = tmpPoolDir();
+  fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 4.5, written_at: 1 }), 'utf8');
+  const parsed = pool.readPoolConfig({ poolDir: dir });
+  assert.strictEqual(parsed, null);
+});
+
+test('readPoolConfig: rejects a zero/negative ceiling', () => {
+  const dir = tmpPoolDir();
+  fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 0, written_at: 1 }), 'utf8');
+  assert.strictEqual(pool.readPoolConfig({ poolDir: dir }), null);
+});
+
+test('readPoolConfig: accepts a ceiling at exactly POOL_MAX_CEILING (positive control, boundary)', () => {
+  const dir = tmpPoolDir();
+  fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: pool.POOL_MAX_CEILING, written_at: 1 }), 'utf8');
+  const parsed = pool.readPoolConfig({ poolDir: dir });
+  assert.ok(parsed && parsed.ceiling === pool.POOL_MAX_CEILING, 'the exact cap value must still be accepted');
+});
+
+test('poolStatus: an invalid ceiling degrades to pool-unavailable-fail-open, never a hang', () => {
+  const dir = tmpPoolDir();
+  fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 1e15, written_at: 1 }), 'utf8');
+  const start = Date.now();
+  const status = pool.poolStatus({ poolDir: dir });
+  const elapsedMs = Date.now() - start;
+  assert.strictEqual(status.ok, false);
+  assert.strictEqual(status.reason, pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN);
+  assert.ok(elapsedMs < 5000, `poolStatus must not stall on an absurd ceiling (elapsed=${elapsedMs}ms)`);
+});
+
 // ── Grant formula: both directions + exhausted minimum-grant path ──
 test('grant formula: uncontended full grant (negative control)', () => {
   const dir = tmpPoolDir();

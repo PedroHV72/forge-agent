@@ -219,5 +219,56 @@ process.stdout.write('forge-statusline-resources.test.js\n');
   }
 })();
 
+// ── Case F (R4): free pool + trailing NORMAL event → indicator absent ──────
+// A completed healthy cycle's last event carries a non-degradation reason
+// (pool-released / pressure-normal). Before the fix, `degradedReason` took
+// ANY last event's reason and lit 🧮 for this exact case.
+(() => {
+  const dir = mkTmp('case-f');
+  const poolDir = mkTmp('case-f-pool');
+  try {
+    appendEvent(path.join(dir, '.gsd'), { ts: new Date().toISOString(), kind: 'resource-pool-released', reason: 'pool-released', granted: 1 });
+    const r = runStatusline(dir, poolDir);
+    assert(r.status === 0, '(F) statusline exits 0', JSON.stringify(r));
+    assert(!r.stdout.includes('🧮'), '(F) no indicator for a free pool + trailing normal event', r.stdout);
+  } finally {
+    cleanup(dir);
+    cleanup(poolDir);
+  }
+})();
+
+// ── Case F2 (R4 positive control): a real degradation reason DOES light the indicator ──
+(() => {
+  const dir = mkTmp('case-f2');
+  const poolDir = mkTmp('case-f2-pool');
+  try {
+    appendEvent(path.join(dir, '.gsd'), { ts: new Date().toISOString(), kind: 'resource-degradation', reason: 'pool-unavailable-fail-open' });
+    const r = runStatusline(dir, poolDir);
+    assert(r.status === 0, '(F2) statusline exits 0', JSON.stringify(r));
+    assert(r.stdout.includes('🧮'), '(F2) positive control: a real degradation reason DOES light the indicator', r.stdout);
+  } finally {
+    cleanup(dir);
+    cleanup(poolDir);
+  }
+})();
+
+// ── Case G (R3): oversized ceiling in pool-config.json is a named invalid config, never a stall ──
+(() => {
+  const dir = mkTmp('case-g');
+  const poolDir = mkTmp('case-g-pool');
+  try {
+    fs.writeFileSync(path.join(poolDir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 1e15, written_at: Date.now() }));
+    const start = Date.now();
+    const r = runStatusline(dir, poolDir);
+    const elapsedMs = Date.now() - start;
+    assert(r.status === 0, '(G) statusline exits 0 with oversized ceiling', JSON.stringify(r));
+    assert(elapsedMs < 10000, '(G) render does not stall on an absurd ceiling', `elapsed=${elapsedMs}ms`);
+    assert(!r.stdout.includes('🧮'), '(G) no indicator when the pool config is rejected as invalid', r.stdout);
+  } finally {
+    cleanup(dir);
+    cleanup(poolDir);
+  }
+})();
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

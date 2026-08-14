@@ -379,12 +379,20 @@ function buildCensus(collected) {
         // unregistered; only the reader can tell which matters.
         from_event_name: fromEventName,
         kinds: [],
+        // R2 fix: per-kind counts, not just a merged set of kind names — a
+        // reason can span kinds (e.g. `intact:not-runner-command` under both
+        // `resource-clamp-skipped` and `rewrite-skipped`), and a caller that
+        // sums "whole row count when ANY kind matches" overcounts. Callers
+        // needing a rewrite-only count must sum `kind_counts` for the kinds
+        // they care about, never `row.count`.
+        kind_counts: {},
       };
       byReason.set(key, row);
       if (!known) unregistered_reasons += 1;
     }
     row.count += 1;
     if (!row.kinds.includes(e.name)) row.kinds.push(e.name);
+    row.kind_counts[e.name] = (row.kind_counts[e.name] || 0) + 1;
     if (known && DEGRADATION_REASONS.has(rawReason)) degraded_count += 1;
   }
 
@@ -468,9 +476,15 @@ function reconcileW3(cwd, censusOrCollected, opts) {
       if (REWRITE_EVENT_NAMES.has(e.name)) rewrite_events += 1;
     }
   } else if (Array.isArray(src.reasons)) {
+    // R2 fix: sum only the counts of rewrite kinds within each row, never the
+    // whole row's `count` — a reason can span both rewrite and non-rewrite
+    // kinds (`intact:not-runner-command` under `resource-clamp-skipped` AND
+    // `rewrite-skipped`), and adding the merged row once any kind matches
+    // overcounts against the `entries` branch above.
     for (const r of src.reasons) {
-      for (const k of (r.kinds || [])) {
-        if (REWRITE_EVENT_NAMES.has(k)) { rewrite_events += r.count; break; }
+      const kc = r.kind_counts || {};
+      for (const k of Object.keys(kc)) {
+        if (REWRITE_EVENT_NAMES.has(k)) rewrite_events += kc[k];
       }
     }
   }

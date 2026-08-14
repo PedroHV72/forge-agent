@@ -35,6 +35,13 @@ const lease = require('./forge-unit-lease.js');
 const POOL_TTL_MARGIN_MS = 30_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const POOL_PROTOCOL = 1;
+// R3 fix: `readPoolConfig` feeds `for (index < config.ceiling)` loops that run
+// on the continuously-rendered statusline (poolStatus) and inside acquire/reap.
+// A corrupted/hand-edited pool-config.json with an absurd `ceiling` (e.g.
+// 1e15, which passes `Number.isFinite`) turns those into a stall. No real
+// machine has anywhere close to this many cores; a sane cap makes the value
+// a NAMED invalid-config failure instead of an unbounded read.
+const POOL_MAX_CEILING = 4096;
 
 const POOL_REASON_CODES = Object.freeze({
   POOL_GRANTED: 'pool-granted',
@@ -115,7 +122,13 @@ function readPoolConfig(opts) {
   try {
     const raw = fs.readFileSync(configPath(root), 'utf8');
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || !Number.isFinite(parsed.ceiling)) return null;
+    if (!parsed || typeof parsed !== 'object') return null;
+    // R3 fix: only a positive integer within POOL_MAX_CEILING is a valid
+    // ceiling. `Number.isFinite` alone accepted 1e15 and non-integers, both
+    // of which corrupt the bounded-loop guarantee every caller relies on.
+    if (!Number.isInteger(parsed.ceiling) || parsed.ceiling <= 0 || parsed.ceiling > POOL_MAX_CEILING) {
+      return null;
+    }
     return parsed;
   } catch {
     return null;
@@ -315,6 +328,7 @@ module.exports = {
   poolStatus,
   POOL_REASON_CODES,
   POOL_TTL_MARGIN_MS,
+  POOL_MAX_CEILING,
   parseArgs,
   runCli,
 };

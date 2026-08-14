@@ -65,6 +65,9 @@ test('--check resources exits 0 with no .gsd/ at all', () => {
     const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'resources', '--cwd', root], { encoding: 'utf8' });
     assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
     assert.ok(/inconclusive/.test(r.stdout), 'no log at all must read inconclusive, never clean');
+    // R5: inconclusive must never render the success glyph.
+    assert.ok(/⚠ Advisory — Resource control/.test(r.stdout), 'inconclusive must warn, never show ✓');
+    assert.ok(!/✓ Advisory — Resource control/.test(r.stdout), 'inconclusive must not render ✓');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -79,6 +82,7 @@ test('--check resources exits 0 with empty events.jsonl (inconclusive, never cle
     assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
     assert.ok(/inconclusive/.test(r.stdout), 'zero events must read inconclusive');
     assert.ok(!/\bclean\b/.test(r.stdout), 'zero events must never read clean');
+    assert.ok(/⚠ Advisory — Resource control/.test(r.stdout), 'inconclusive must warn, never show ✓');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -91,6 +95,35 @@ test('--check resources exits 0 with a degraded log (platform-unsupported entrie
     const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'resources', '--cwd', root], { encoding: 'utf8' });
     assert.strictEqual(r.status, 0, `must exit 0 with degradation present, got ${r.status}: ${r.stderr}`);
     assert.ok(/degraded/.test(r.stdout), 'stdout must surface the degraded verdict');
+    assert.ok(/⚠ Advisory — Resource control/.test(r.stdout), 'degraded must warn, never show ✓');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--check resources shows ⚠ (never ✓) on the internal-error/skipped result', () => {
+  const root = mkTmp('t02-error-glyph');
+  try {
+    // Directory-as-file trick (same fixture as the internal-error test below)
+    // forces checkResources' own try/catch branch — `skipped: error(...)`.
+    fs.mkdirSync(eventsPath(root), { recursive: true });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'resources', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/⚠ Advisory — Resource control/.test(r.stdout), 'skipped/error result must warn, never show ✓');
+    assert.ok(!/✓ Advisory — Resource control/.test(r.stdout), 'skipped/error result must not render ✓');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--check resources shows ✓ (positive control) on a genuinely clean verdict', () => {
+  const root = mkTmp('t02-clean-glyph');
+  try {
+    writeEventsLine(root, { ts: new Date().toISOString(), kind: 'resource-admission', reason: 'pressure-normal' });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'resources', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/\bclean\b/.test(r.stdout), 'setup: verdict must actually be clean');
+    assert.ok(/✓ Advisory — Resource control/.test(r.stdout), 'a real clean verdict DOES still show ✓ (positive control)');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

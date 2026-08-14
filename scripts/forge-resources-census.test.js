@@ -399,6 +399,31 @@ test('R7: caso normal → reconciled com non_candidates = bash_total - rewrite_e
   assertEqual(w.non_candidates, 1, 'reconciliação de CONTAGEM, nunca de string');
 });
 
+test('R2: reason que atravessa kinds não faz reconcileW3(census) divergir de reconcileW3(collected)', () => {
+  const cwd = fixture(
+    [
+      // Same reason, one non-rewrite kind and one rewrite kind — the
+      // fallback branch must count only the rewrite-kind occurrence, never
+      // the whole merged row.
+      { kind: 'resource-clamp-skipped', reason: REWRITE_REASON_CODES.INTACT_NOT_RUNNER },
+      { kind: 'rewrite-skipped', reason: REWRITE_REASON_CODES.INTACT_NOT_RUNNER },
+      { event: 'rewrite-applied' },
+    ],
+    [
+      { tool: 'Bash', cmd: 'npm test', ok: true },
+      { tool: 'Bash', cmd: 'ls', ok: true },
+    ],
+  );
+  const collected = collectResourceEvents(cwd, {});
+  const c = buildCensus(collected);
+  const wFromCollected = reconcileW3(cwd, collected, {});
+  const wFromCensus = reconcileW3(cwd, c, {});
+  assertEqual(wFromCollected.rewrite_events, 2, 'via entries: 1 rewrite-skipped + 1 rewrite-applied');
+  assertEqual(wFromCensus.rewrite_events, wFromCollected.rewrite_events,
+    'via reasons (fallback) deve concordar com via entries — sem overcounting por kind cruzado');
+  assertEqual(wFromCensus.status, wFromCollected.status, 'os dois caminhos públicos devem concordar em status');
+});
+
 // ── R8: bounded tail ────────────────────────────────────────────────────────
 
 test('R8: cauda limitada — fixture MAIOR que a janela devolve só o evento final', () => {
