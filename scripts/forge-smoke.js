@@ -16457,6 +16457,177 @@ function smokeVerifyReverifyChildSideE2E() {
     + 'with the rewrite module genuinely absent from disk (both consumers), and the real machine pool root never touched');
 }
 
+// ── Section 109: S05/T04 — forge-doctor --check resources + statusline clamp indicator, census bite both ways ──
+// Section number MEASURED at execution time (`grep -o "Section [0-9]\+"
+// scripts/forge-smoke.js | sort -n -k2 | tail -1` -> 108 was the real max),
+// never assumed (MEM013: S01 assumed 100/real 104, S04 measured 107->108).
+// Every claim here is proven by spawning the REAL `forge-doctor.js` and
+// `forge-statusline.js` CLIs as child processes — never by requiring their
+// modules in-process and reading return values, and never by reading a
+// source comment.
+function smokeResourcesObservabilityCensus() {
+  process.stdout.write('\n▸ Section 109: forge-doctor --check resources + statusline clamp indicator, census bite both ways\n');
+  const NODE = process.execPath;
+  const DOCTOR_CLI = path.join(SCRIPTS, 'forge-doctor.js');
+  const STATUSLINE_CLI = path.join(SCRIPTS, 'forge-statusline.js');
+
+  function mkTmp(label) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `smoke109-${label}-`));
+    fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
+    return dir;
+  }
+  function eventsPath(root) { return path.join(root, '.gsd', 'forge', 'events.jsonl'); }
+  function appendEvent(root, obj) { fs.appendFileSync(eventsPath(root), `${JSON.stringify(obj)}\n`, 'utf8'); }
+  function sha256File(p) {
+    if (!fs.existsSync(p)) return null;
+    return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+  }
+  function runStatusline(cwd, poolDir) {
+    const input = JSON.stringify({ cwd, model: { display_name: 'smoke109' }, context_window: { used_percentage: 1 } });
+    const env = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: poolDir });
+    return spawnSync(NODE, [STATUSLINE_CLI], { input, encoding: 'utf8', env, cwd: SCRIPTS });
+  }
+
+  // ── Real machine surfaces: never touched by anything in this section ─────
+  const realPoolRoot = path.join(os.homedir(), '.claude', 'forge', 'resource-pool');
+  const realPoolExistedBefore = fs.existsSync(realPoolRoot);
+  const realPoolListingBefore = realPoolExistedBefore ? fs.readdirSync(realPoolRoot).sort() : null;
+
+  const degradedRoot = mkTmp('degraded');
+  const cleanRoot = mkTmp('empty');
+  const dualFieldRoot = mkTmp('dualfield');
+  const platformRoot = mkTmp('platform');
+  const pollutionRoot = mkTmp('pollution');
+  let stlHeldDir = null;
+  let stlEmptyDir = null;
+  let stlPoolHeldRoot = null;
+  let stlPoolEmptyRoot = null;
+
+  try {
+    // ── (a) advisory absolute: real spawn exit 0, degraded fixture ─────────
+    appendEvent(degradedRoot, { ts: new Date().toISOString(), kind: 'resource-admission', reason: 'platform-unsupported:linux' });
+    const resA1 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', degradedRoot], { encoding: 'utf8' });
+    assert(resA1.status === 0, '(a) `--check resources` exits 0 by real spawn, with a degraded fixture present', String(resA1.status) + resA1.stderr);
+    assert(/degraded/.test(resA1.stdout), '(a) degraded fixture surfaces the degraded verdict in stdout', resA1.stdout);
+    // `--check all` also runs the (unrelated) non-advisory schema check —
+    // stamp SCHEMA-VERSION so THIS assertion isolates the resources check
+    // specifically (same fixture shape as forge-doctor-resources.test.js's
+    // own `--check all` case; derived from the module, never hand-written).
+    const { CURRENT_SCHEMA: DOCTOR_CURRENT_SCHEMA } = require(path.join(SCRIPTS, 'forge-doctor.js'));
+    fs.writeFileSync(path.join(degradedRoot, '.gsd', 'SCHEMA-VERSION'), `${DOCTOR_CURRENT_SCHEMA}\n`, 'utf8');
+    const resA2 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'all', '--cwd', degradedRoot], { encoding: 'utf8' });
+    assert(resA2.status === 0, '(a) `--check all` also exits 0 by real spawn with the same degraded fixture', String(resA2.status) + resA2.stderr);
+    assert(/Resource control/.test(resA2.stdout), '(a) `--check all` output includes the resources check', resA2.stdout);
+
+    // ── (b) anti-silence floor: zero events -> inconclusive, never clean ───
+    const resB = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', cleanRoot], { encoding: 'utf8' });
+    assert(resB.status === 0, '(b) zero-events fixture still exits 0', String(resB.status) + resB.stderr);
+    assert(/inconclusive/.test(resB.stdout), '(b) zero events examined reads inconclusive', resB.stdout);
+    assert(!/\bclean\b/.test(resB.stdout), '(b) zero events examined NEVER reads clean — the floor is first in verdict order', resB.stdout);
+
+    // ── (c) positive bite: BOTH field names (`kind` and `event`), reason count >= 1 ──
+    appendEvent(dualFieldRoot, { ts: new Date().toISOString(), kind: 'resource-admission', reason: 'platform-unsupported:linux' });
+    appendEvent(dualFieldRoot, { ts: new Date().toISOString(), event: 'resource-degradation', reason: 'platform-unsupported:linux' });
+    const resC = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', dualFieldRoot], { encoding: 'utf8' });
+    assert(resC.status === 0, '(c) dual-field-name fixture exits 0', String(resC.status) + resC.stderr);
+    assert(/platform-unsupported:linux/.test(resC.stdout) && /2/.test(resC.stdout),
+      '(c) BOTH `kind` and `event` field names are counted into the same reason with count >= 1 (a `kind`-only reader would see half the stream — the exact S03 rewrite-event blind spot this slice exists to close)',
+      resC.stdout);
+
+    // ── (d) forced platform degradation is NAMED, not passed clean ─────────
+    const resD = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', platformRoot, '--platform', 'linux'], { encoding: 'utf8' });
+    assert(resD.status === 0, '(d) forced-platform fixture exits 0', String(resD.status) + resD.stderr);
+    assert(/platform-unsupported:linux/.test(resD.stdout), '(d) --platform linux is NAMED in the live pressure line, never silently passed', resD.stdout);
+
+    // ── (e) non-pollution: events.jsonl is byte-identical before/after ─────
+    appendEvent(pollutionRoot, { ts: new Date().toISOString(), kind: 'shadow-wait', reason: 'shadow-wait' });
+    const beforeHash = sha256File(eventsPath(pollutionRoot));
+    const resE = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', pollutionRoot], { encoding: 'utf8' });
+    assert(resE.status === 0, '(e) non-pollution fixture check exits 0', String(resE.status) + resE.stderr);
+    const afterHash = sha256File(eventsPath(pollutionRoot));
+    assert(beforeHash !== null && beforeHash === afterHash,
+      '(e) events.jsonl is byte-identical before/after `--check resources` — the diagnostic never contaminates the census it reports (noEvents:true)',
+      `before=${beforeHash} after=${afterHash}`);
+
+    // ── (f) statusline: pool occupied -> indicator present; empty -> absent ──
+    stlHeldDir = mkTmp('stl-held-dir');
+    stlPoolHeldRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke109-stl-pool-held-'));
+    let acquireSlots = null;
+    try { ({ acquireSlots } = require(path.join(SCRIPTS, 'forge-resource-pool.js'))); } catch { /* asserted below */ }
+    const granted = acquireSlots ? acquireSlots(1, { poolDir: stlPoolHeldRoot, ncpu: 4, commandTimeoutMs: 120000, ownerToken: 'smoke109' }) : null;
+    assert(!!granted && granted.ok, '(f) setup: real pool grant succeeds via forge-resource-pool.js (never a hand-authored lease file)', JSON.stringify(granted));
+    const resF1 = runStatusline(stlHeldDir, stlPoolHeldRoot);
+    assert(resF1.status === 0, '(f) statusline exits 0 with a held slot', JSON.stringify({ status: resF1.status, stderr: resF1.stderr }));
+    assert((resF1.stdout || '').includes('\u{1F9EE}'), '(f) clamp indicator glyph is PRESENT when the pool holds a slot, by real spawn with JSON on stdin', resF1.stdout);
+
+    stlEmptyDir = mkTmp('stl-empty-dir');
+    stlPoolEmptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke109-stl-pool-empty-'));
+    const resF2 = runStatusline(stlEmptyDir, stlPoolEmptyRoot);
+    assert(resF2.status === 0, '(f) statusline exits 0 with an empty pool', JSON.stringify({ status: resF2.status, stderr: resF2.stderr }));
+    assert(!(resF2.stdout || '').includes('\u{1F9EE}'), '(f) clamp indicator glyph is ABSENT when the pool is free and no degradation event exists — bite reverses on the SAME code path', resF2.stdout);
+
+    // ── (g) negative-direction bite: neuter the anti-silence floor in a COPY,
+    // never in the real checkout (precedent: S04/T04 R10 — copy to tmp, mutate
+    // the copy, never rename/edit the tracked tree). Confirm the mutated copy
+    // FAILS to read inconclusive on a zero-events fixture, proving assertion
+    // (b) above actually bites; the real checkout is never touched, so no
+    // restore step is needed — the copy is simply discarded.
+    const mutCopyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke109-mutcopy-'));
+    const mutScriptsDir = path.join(mutCopyRoot, 'scripts');
+    try {
+      fs.cpSync(SCRIPTS, mutScriptsDir, { recursive: true });
+      const censusPath = path.join(mutScriptsDir, 'forge-resources-census.js');
+      const originalSrc = fs.readFileSync(censusPath, 'utf8');
+      const originalOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-census.js'), 'utf8');
+      // Both halves of the floor are neutered (buildCensus's own header names
+      // both as "proven to BITE" — neutering only the first would still catch
+      // a truly-empty fixture on the second `resource_events === 0` branch and
+      // produce a false-negative bite that looks like a real one).
+      assert(/if \(events_scanned === 0\) \{/.test(originalSrc) && /else if \(resource_events === 0\) \{/.test(originalSrc),
+        '(g) precondition: BOTH halves of the anti-silence floor exist verbatim in the copy before mutation', 'floor lines not found');
+      const neuteredSrc = originalSrc
+        .replace('if (events_scanned === 0) {', 'if (false) {')
+        .replace('else if (resource_events === 0) {', 'else if (false) {');
+      assert(neuteredSrc !== originalSrc, '(g) the floor-neutering replacement actually changed the source (not a no-op substitution)', 'replace() produced no change');
+      fs.writeFileSync(censusPath, neuteredSrc, 'utf8');
+      const mutDoctorCli = path.join(mutScriptsDir, 'forge-doctor.js');
+      const mutRoot = mkTmp('mut-fixture');
+      const resG = spawnSync(NODE, [mutDoctorCli, '--check', 'resources', '--cwd', mutRoot], { encoding: 'utf8' });
+      assert(resG.status === 0, '(g) mutated-copy CLI still exits 0 (advisory posture survives the mutation)', String(resG.status) + resG.stderr);
+      assert(!/inconclusive/.test(resG.stdout),
+        '(g) MORDIDA NEGATIVA: with the anti-silence floor neutered, a zero-events fixture NO LONGER reads inconclusive — the assertion in (b) would FAIL against this build, proving the floor is what makes (b) pass, not coincidence',
+        resG.stdout);
+      // Real checkout on disk is provably untouched by this mutation (we only
+      // ever wrote to mutScriptsDir, a tmp copy) — restore is implicit.
+      const stillOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-census.js'), 'utf8');
+      assert(stillOnDisk === originalOnDisk, '(g) the REAL checkout file is byte-identical before/after this mutation exercise — only the tmp copy was ever written', 'checkout file drifted');
+    } finally {
+      try { fs.rmSync(mutCopyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+
+    // ── (h) registration: the section verifies it is wired into main() ─────
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeResourcesObservabilityCensus\(\); \}/.test(mainBody),
+      '(h) Section 109 is registered in main() by closure — an unregistered section vanishes silently');
+  } finally {
+    for (const d of [degradedRoot, cleanRoot, dualFieldRoot, platformRoot, pollutionRoot, stlHeldDir, stlEmptyDir, stlPoolHeldRoot, stlPoolEmptyRoot]) {
+      if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    }
+  }
+
+  // ── (i) real pool root and real .gsd/ never touched by any fixture above ─
+  const realPoolExistedAfter = fs.existsSync(realPoolRoot);
+  const realPoolListingAfter = realPoolExistedAfter ? fs.readdirSync(realPoolRoot).sort() : null;
+  assert(realPoolExistedBefore === realPoolExistedAfter && JSON.stringify(realPoolListingBefore) === JSON.stringify(realPoolListingAfter),
+    '(i) the real machine pool root (~/.claude/forge/resource-pool) is untouched — every fixture above used FORGE_RESOURCE_POOL_DIR/--cwd pointed at a tmpdir',
+    JSON.stringify({ before: realPoolListingBefore, after: realPoolListingAfter }));
+
+  pass('Section 109: forge-doctor --check resources and the statusline clamp indicator proven exit-0-always by real spawn, '
+    + 'dual event-field-name census bite proven positive, anti-silence floor bite proven negative via copy-mutation, '
+    + 'zero pollution of events.jsonl, and the real machine pool root never touched');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -16580,6 +16751,7 @@ async function main() {
       async () => { await smokeResourcePool(); },
       () => { smokeRewriteCeilingAndE2E(); },
       () => { smokeVerifyReverifyChildSideE2E(); },
+      () => { smokeResourcesObservabilityCensus(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
