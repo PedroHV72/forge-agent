@@ -83,6 +83,15 @@ const REWRITE_REASON_CODES = Object.freeze({
   INTACT_EXPLICIT_CONCURRENCY: 'intact:explicit-concurrency',
   INTACT_SCRIPT_UNRESOLVABLE: 'intact:script-unresolvable',
   INTACT_UNRECOGNIZED_RUNNER_FORM: 'intact:unrecognized-runner-form',
+  // planRewriteArgv-only reasons (T01/S04) — the argv adapter never
+  // reimplements tokenization/sizing; these name every point where it
+  // refuses rather than guess at an unprovable argv<->string equivalence.
+  INTACT_ARGV_EMPTY: 'intact:argv-empty',
+  INTACT_ARGV_UNSAFE_TOKEN: 'intact:argv-unsafe-token',
+  INTACT_ARGV_MULTI_SEGMENT: 'intact:argv-multi-segment',
+  INTACT_ARGV_RETOKENIZE_FAILED: 'intact:argv-retokenize-failed',
+  INTACT_ARGV_ROUNDTRIP_UNPROVEN: 'intact:argv-roundtrip-unproven',
+  INTACT_ARGV_EMPTY_AFTER_ENV_STRIP: 'intact:argv-empty-after-env-strip',
 });
 
 // ── Character-walking tokenizer ─────────────────────────────────────────────
@@ -541,10 +550,107 @@ function planRewrite(cmd, budget, opts = {}) {
   };
 }
 
+// A token that would need shell quoting to survive a lossless space-join is
+// unprovable by this adapter — the same posture `forge-reverify.js`'s
+// `resolveVerifyCommand` already takes for its own space-split (MEM004).
+// This recusa COMPOSES with that upstream one; it does not replace it —
+// planRewriteArgv is called on whatever argv already survived that filter,
+// and re-checks the same property independently (defense in depth, not
+// duplication of authority: this module owns the tokenizer/rewrite rules,
+// `resolveVerifyCommand` owns which commands are eligible to reach here).
+const ARGV_UNSAFE_TOKEN_RE = /[\s'"\\$`|&;<>()]/;
+
+/**
+ * planRewriteArgv(argv, budget, opts) — argv-shaped adapter over
+ * planRewrite/tokenizeCommand, for callers that spawn with `shell:false`
+ * and an explicit argv array (`forge-reverify.js`) instead of a shell
+ * command string. NEVER reimplements tokenization or sizing (D10): budget
+ * is passed straight through to `planRewrite`. Returns exactly one outcome
+ * from the frozen enum:
+ *   { outcome:'rewritten', argv, env, runner, reason }
+ *   { outcome:'intact', reason }
+ *
+ * Env-prefix assignments produced by the underlying string rewrite (e.g.
+ * `VITEST_MAX_FORKS='4'`) are split into `env` (a plain name->value map,
+ * quoting undone, ready to merge into a child_process `env` option) —
+ * NEVER left as an argv[0]-shaped `NAME=value` element, which `shell:false`
+ * would execute as the binary name rather than treat as an assignment.
+ *
+ * Before returning a `rewritten` outcome, the adapter proves the round
+ * trip at runtime: it re-renders the exact bytes it sliced out of
+ * `planRewrite`'s output (assignments `NAME=<raw-value>` in front, argv
+ * tokens after, joined by one space) and compares that reconstruction,
+ * byte-for-byte, against the string `planRewrite` actually produced. Any
+ * mismatch refuses (`intact:argv-roundtrip-unproven`) rather than return an
+ * argv/env split that was never verified equivalent to what was rewritten.
+ */
+function planRewriteArgv(argv, budget, opts = {}) {
+  if (!Array.isArray(argv) || argv.length === 0 || !argv.every((t) => typeof t === 'string')) {
+    return { outcome: 'intact', reason: REWRITE_REASON_CODES.INTACT_ARGV_EMPTY };
+  }
+  if (argv.some((t) => ARGV_UNSAFE_TOKEN_RE.test(t))) {
+    return { outcome: 'intact', reason: REWRITE_REASON_CODES.INTACT_ARGV_UNSAFE_TOKEN };
+  }
+
+  const cmd = argv.join(' ');
+  const plan = planRewrite(cmd, budget, opts);
+  if (plan.outcome !== 'rewritten') {
+    return { outcome: 'intact', reason: plan.reason };
+  }
+
+  const retok = tokenizeCommand(plan.command);
+  if (!retok.ok) {
+    return { outcome: 'intact', reason: REWRITE_REASON_CODES.INTACT_ARGV_RETOKENIZE_FAILED };
+  }
+  // The adapter never composes an argv-shaped chain (`&&`/`||`/`;`) — a
+  // rewritten command that now spans more than one segment cannot be
+  // represented as a single argv invocation, so it refuses rather than
+  // pick one segment and silently drop the rest.
+  if (retok.segments.length !== 1) {
+    return { outcome: 'intact', reason: REWRITE_REASON_CODES.INTACT_ARGV_MULTI_SEGMENT };
+  }
+
+  const segTokens = retok.segments[0];
+  const env = {};
+  const renderParts = [];
+  let idx = 0;
+  while (idx < segTokens.length) {
+    const raw = segTokens[idx].raw;
+    if (!ENV_ASSIGNMENT_RE.test(raw)) break;
+    const eq = raw.indexOf('=');
+    env[raw.slice(0, eq)] = unquoteSimple(raw.slice(eq + 1));
+    renderParts.push(raw);
+    idx += 1;
+  }
+
+  const outArgv = [];
+  for (; idx < segTokens.length; idx += 1) {
+    outArgv.push(unquoteSimple(segTokens[idx].raw));
+    renderParts.push(segTokens[idx].raw);
+  }
+
+  if (outArgv.length === 0) {
+    return { outcome: 'intact', reason: REWRITE_REASON_CODES.INTACT_ARGV_EMPTY_AFTER_ENV_STRIP };
+  }
+
+  // Prove the round trip against the RAW sliced bytes (quoting intact) —
+  // not the unquoted `env`/`outArgv` values returned to the caller. This
+  // catches any bug in the env/argv split above (off-by-one, dropped
+  // token, mis-stripped quote) rather than asserting a property that would
+  // be true by construction if it compared against itself.
+  const rendered = renderParts.join(' ');
+  if (rendered !== plan.command) {
+    return { outcome: 'intact', reason: REWRITE_REASON_CODES.INTACT_ARGV_ROUNDTRIP_UNPROVEN };
+  }
+
+  return { outcome: 'rewritten', argv: outArgv, env, runner: plan.runner, reason: plan.reason };
+}
+
 module.exports = {
   tokenizeCommand,
   looksLikeRunnerCommand,
   planRewrite,
+  planRewriteArgv,
   REWRITE_REASON_CODES,
   TOKENIZE_REFUSAL_REASONS,
   // Exported for the test suite's internal-shape assertions (classifySegment
