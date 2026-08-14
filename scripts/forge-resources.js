@@ -488,20 +488,25 @@ function acquireCommandBudget(opts) {
     if (!grant || !grant.ok) {
       return { ...contract, pool: { reason: pool.POOL_REASON_CODES.POOL_UNAVAILABLE_FAIL_OPEN } };
     }
-    // Feed the real grant back through the SAME pure discount step 2 uses
-    // (D10: one sizing-rule implementation, not two that could diverge) —
-    // the grant's own `.slots` (the real leases) still ride along as the
-    // release handle regardless of how the discount names the reason.
-    const discounted = applyPoolDiscount(contract.workers, contract.admit, {
-      ceiling: grant.ceiling,
-      free: grant.free_before,
-    });
+    // R2 fix: `workers`/`pool.granted`/`pool.reason` MUST derive from the
+    // leases actually held (`grant.granted`/`grant.reason`), never from a
+    // discount recomputed over `grant.free_before` — that field is a
+    // pre-acquire census taken before the (non-atomic, cross-process)
+    // acquire loop, and a rival can consume slots in the window between the
+    // two. Recomputing over the stale census can authorize more workers
+    // than leases are held for (over-subscription), which is exactly what
+    // this pool exists to prevent. `applyPoolDiscount` remains the sole
+    // sizing-rule implementation (D10) for the pure `opts.pool.status` path
+    // above; it is not used here.
     const finalContract = {
       ...contract,
-      workers: discounted.workers,
-      maxConcurrentClamp: Math.max(1, Math.min(readParallelismPref(o, cwd), discounted.workers)),
+      workers: grant.granted,
+      maxConcurrentClamp: Math.max(1, Math.min(readParallelismPref(o, cwd), grant.granted)),
       pool: {
-        ...discounted.pool,
+        ceiling: grant.ceiling,
+        free: grant.free_before,
+        granted: grant.granted,
+        reason: grant.reason,
         handle: { slots: grant.slots, ttlMs: grant.ttlMs },
       },
     };

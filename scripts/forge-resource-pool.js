@@ -74,22 +74,26 @@ function ncpuOf(opts) {
 
 function writeConfigOnce(root, ceiling) {
   const file = configPath(root);
-  const temp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
   const record = { protocol: POOL_PROTOCOL, ceiling, written_at: Date.now() };
-  fs.writeFileSync(temp, JSON.stringify(record, null, 2) + '\n', 'utf8');
   try {
-    fs.renameSync(temp, file);
+    // Exclusive create: `wx` throws EEXIST if the file already exists,
+    // rather than the rename(2)/MoveFileExW replace-existing semantics
+    // `fs.renameSync` has (which silently overwrite the winner on both
+    // POSIX and Windows and never throw EEXIST for this race).
+    fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n', { encoding: 'utf8', flag: 'wx' });
     return record;
-  } catch {
-    try { fs.unlinkSync(temp); } catch { /* best-effort cleanup */ }
-    const winner = readPoolConfig({ poolDir: root });
-    return winner || record;
+  } catch (err) {
+    if (err && err.code === 'EEXIST') {
+      const winner = readPoolConfig({ poolDir: root });
+      return winner || record;
+    }
+    throw err;
   }
 }
 
-// First-writer-wins: whoever's temp file lands via renameSync first defines
-// the ceiling; the file — never local recomputation — is the authority
-// afterward (W2). On an EEXIST-style race, the loser re-reads the winner.
+// First-writer-wins: whoever's `wx` exclusive create lands first defines the
+// ceiling; the file — never local recomputation — is the authority
+// afterward (W2). On the EEXIST race, the loser re-reads the winner.
 function ensurePoolRoot(opts) {
   const root = poolRootDir(opts);
   try {
@@ -303,6 +307,7 @@ module.exports = {
   poolRootDir,
   ensurePoolRoot,
   readPoolConfig,
+  writeConfigOnce,
   deriveSlotTtlMs,
   acquireSlots,
   releaseSlots,

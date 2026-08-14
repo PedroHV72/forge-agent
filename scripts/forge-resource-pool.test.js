@@ -239,6 +239,31 @@ test('CLI: parseArgs / runCli --status --json exits cleanly and returns a census
   assert.ok(Number.isFinite(parsed.ceiling));
 });
 
+// ── R3 fix: writeConfigOnce is first-writer-wins via exclusive create ──────
+// fs.renameSync silently REPLACES an existing destination (rename(2) on
+// POSIX, MoveFileExW-with-replace on Windows) — it never throws EEXIST, so a
+// documented "on an EEXIST-style race, the loser re-reads the winner"
+// protocol built on renameSync was dead code (last-writer-wins in practice).
+test('writeConfigOnce: exclusive create — second writer loses and reads back the first writer\'s record', () => {
+  const dir = tmpPoolDir();
+  const first = pool.writeConfigOnce(dir, 4);
+  assert.strictEqual(first.ceiling, 4, 'first writer\'s record carries its own ceiling');
+
+  const second = pool.writeConfigOnce(dir, 9);
+  assert.strictEqual(second.ceiling, 4, 'second writer (the loser) reads back the FIRST writer\'s ceiling, never its own');
+
+  const onDisk = pool.readPoolConfig({ poolDir: dir });
+  assert.strictEqual(onDisk.ceiling, 4, 'the file on disk still holds the first writer\'s ceiling — the loser never overwrote it');
+});
+
+test('writeConfigOnce: a fresh root has no rival — the write always wins', () => {
+  const dir = tmpPoolDir();
+  const record = pool.writeConfigOnce(dir, 6);
+  assert.strictEqual(record.ceiling, 6);
+  const onDisk = pool.readPoolConfig({ poolDir: dir });
+  assert.strictEqual(onDisk.ceiling, 6);
+});
+
 // ── real-default-root guard: the suite itself never touches ~/.claude/forge/resource-pool ──
 test('real-default-root guard: suite never creates the real default pool root', () => {
   const realRoot = path.join(os.homedir(), '.claude', 'forge', 'resource-pool');

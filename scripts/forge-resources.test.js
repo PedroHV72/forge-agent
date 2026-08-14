@@ -460,5 +460,50 @@ function mkTmpDirNoop() {
   assertEqual(r.maxConcurrentClamp, 3, 'unreadable/missing parallelism.max_concurrent falls back to the documented default (3)');
 })();
 
+// ── R2 fix: acquireCommandBudget must never authorize more workers than
+// leases it actually holds. `grant.free_before` is a pre-acquire census,
+// separated from the acquire loop by a non-atomic cross-process window; a
+// rival can consume slots inside that window. Reproduce deterministically
+// by injecting a fake forge-resource-pool.js module whose acquireSlots()
+// returns exactly that race shape: free_before(3) > slots actually leased(1).
+(function testAcquireNeverExceedsLeasedSlots() {
+  const poolPath = require.resolve('./forge-resource-pool.js');
+  const real = require(poolPath);
+  const fakeGrant = {
+    ok: true,
+    granted: 1,
+    reason: POOL_REASON_CODES.POOL_CLAMPED_BY_POOL,
+    ceiling: 4,
+    free_before: 3, // stale census: a rival grabbed 2 of these 3 mid-race
+    slots: [{ key: 'resource-pool/slot-0', owner_token: 'fake-owner', generation: 1 }],
+    ttlMs: 5000,
+  };
+  const fakePool = {
+    ...real,
+    ensurePoolRoot: () => ({ ok: true, root: '/tmp/fake-root', ceiling: 4, created: false }),
+    acquireSlots: () => fakeGrant,
+    releaseSlots: (slots) => ({ ok: true, released: (slots || []).map((s) => ({ key: s.key, ok: true, reason: POOL_REASON_CODES.POOL_RELEASED })) }),
+  };
+  const originalModule = require.cache[poolPath];
+  require.cache[poolPath] = { id: poolPath, filename: poolPath, loaded: true, exports: fakePool };
+  try {
+    resetResourceCache();
+    const r = acquireCommandBudget({
+      platform: 'darwin',
+      readSignal: () => ({ ok: true, pressureLevel: 1, ncpu: 4, memBytes: 8 * 1024 * 1024 * 1024, memstatusLevel: 10, swap: { totalM: 100, usedM: 10, freeM: 90 } }),
+      now: Date.now,
+      cacheKey: 'r2-race',
+      noEvents: true,
+    });
+    assertEqual(r.workers, 1, 'workers follows grant.granted (1 leased), never the stale free_before(3) census');
+    assertEqual(r.pool.granted, 1, 'pool.granted reflects the real lease count, not the stale census');
+    assertEqual(r.pool.reason, POOL_REASON_CODES.POOL_CLAMPED_BY_POOL, 'pool.reason reflects the real clamped grant, not a recomputed pool-granted');
+    assertEqual(r.pool.handle.slots.length, 1, 'the release handle carries exactly the leases actually held');
+  } finally {
+    if (originalModule) require.cache[poolPath] = originalModule;
+    else delete require.cache[poolPath];
+  }
+})();
+
 process.stdout.write(`\nResults: ${passes} passed, ${fails} failed\n`);
 process.exitCode = fails > 0 ? 1 : 0;
