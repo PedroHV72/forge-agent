@@ -777,17 +777,23 @@ process.stdin.on('end', () => {
     }
 
     // ── PostToolUse: evidence capture (Bash/Write/Edit only) ─────────────────
-    // M004: file is evidence-{runId}-{unitId}.jsonl when session resolves to a run.
-    // Legacy: evidence-{unitId}.jsonl when no run resolution possible.
+    // S01/T03: file name is owned by forge-evidence-path.js's composite key
+    // (milestone~slice~unit), built from the three axes resolveUnitContext
+    // (S01/T02) now returns. `evidencePath` is the same lazy/tolerant
+    // require used by every sibling module in this file — module missing →
+    // this branch degrades to the legacy bare/adhoc name and NEVER aborts
+    // the tool call (MEM008).
     if (phase === 'post' && (toolName === 'Bash' || toolName === 'Write' || toolName === 'Edit')) {
       try {
         const mode = readEvidenceMode(cwd);
         if (mode !== 'disabled') {
           const ctx = resolveUnitContext(cwd, sessionId);
           const evidenceDir  = path.join(cwd, '.gsd', 'forge');
-          const fileSlug = ctx.runId
-            ? `evidence-${sanitizeRunId(ctx.runId)}-${ctx.unitId}.jsonl`
-            : `evidence-${ctx.unitId}.jsonl`;
+          const fileSlug = evidencePath && typeof evidencePath.buildEvidenceFileName === 'function'
+            ? evidencePath.buildEvidenceFileName({ milestone: ctx.milestone, slice: ctx.slice, unit: ctx.unit })
+            : (ctx.runId
+                ? `evidence-${sanitizeRunId(ctx.runId)}-${ctx.unitId}.jsonl`
+                : `evidence-${ctx.unitId}.jsonl`);
           const evidenceFile = path.join(evidenceDir, fileSlug);
 
           const toolResponse = data.tool_response || {};

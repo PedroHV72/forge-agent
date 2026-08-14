@@ -72,7 +72,7 @@ function testCliContract() {
   const run = runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
 
   equal(run.status, 0, 'CLI exits 0 on a collected payload');
-  const expectedFile = path.join(dir, '.gsd', 'forge', 'evidence-execute-task-T02.jsonl');
+  const expectedFile = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
   check(fs.existsSync(expectedFile), `CLI writes the §7 file name: ${expectedFile}`);
 
   const out = JSON.parse(run.stdout);
@@ -101,7 +101,7 @@ function scenario(label, payload) {
   const dir = tempDir(label);
   const result = writeResult(dir, payload);
   const run = runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
-  const file = path.join(dir, '.gsd', 'forge', 'evidence-execute-task-T02.jsonl');
+  const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
   const lines = readLines(file);
   const census = JSON.parse(lines[0]);
   // The volatile `ts` is stripped before comparison so that a difference found
@@ -171,7 +171,7 @@ function testCensusAlwaysExactlyOne() {
     const result = payload === null ? path.join(dir, 'missing.json') : writeResult(dir, payload);
     const run = runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
     equal(run.status, 0, `${label}: exit 0 (advisory, never blocks)`);
-    const file = path.join(dir, '.gsd', 'forge', 'evidence-execute-task-T02.jsonl');
+    const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
     check(fs.existsSync(file), `${label}: the jsonl exists even when nothing else is written`);
     equal(censusLines(file).length, 1, `${label}: exactly one census line`);
   }
@@ -189,7 +189,7 @@ function testCensusAlwaysExactlyOne() {
   const resultFile = writeResult(twice, COLLECTED_PAYLOAD);
   runCli(['--result', resultFile, '--unit', 'execute-task/T02', '--cwd', twice, '--json']);
   runCli(['--result', resultFile, '--unit', 'execute-task/T02', '--cwd', twice, '--json']);
-  equal(censusLines(path.join(twice, '.gsd', 'forge', 'evidence-execute-task-T02.jsonl')).length, 2,
+  equal(censusLines(path.join(twice, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl')).length, 2,
     'each invocation contributes exactly one census line');
 }
 
@@ -218,7 +218,7 @@ function testKindIsDerivedNotTrusted() {
   };
   const result = writeResult(dir, payload);
   runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
-  const file = path.join(dir, '.gsd', 'forge', 'evidence-execute-task-T02.jsonl');
+  const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
   const objs = readLines(file).map((l) => JSON.parse(l));
 
   equal(censusLines(file).length, 1, 'a payload entry claiming kind:census does NOT become a second census line');
@@ -244,7 +244,7 @@ function testSourcesCoexist() {
   const dir = tempDir('sources');
   const evidenceDir = path.join(dir, '.gsd', 'forge');
   fs.mkdirSync(evidenceDir, { recursive: true });
-  const file = path.join(evidenceDir, 'evidence-execute-task-T02.jsonl');
+  const file = path.join(evidenceDir, 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
 
   // A pre-existing LEGACY synthesized line (D7: nothing is retired).
   const legacy = { ts: '2026-08-06T09:00:00.000Z', tool: 'codex-sidecar', action: 'M', file: 'scripts/a.js', source: 'codex-sidecar', unit: 'execute-task/T02' };
@@ -288,7 +288,7 @@ function testLineCap() {
   const result = writeResult(dir, payload);
   runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
 
-  const file = path.join(dir, '.gsd', 'forge', 'evidence-execute-task-T02.jsonl');
+  const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
   const lines = readLines(file);
   equal(lines.length, 3, 'oversized input still yields census + both entries');
   for (const line of lines) {
@@ -411,7 +411,7 @@ function testPathIsDataNotInstruction() {
 
   // And the hostile value IS written, verbatim, as text — dropping it would be
   // the silence this script exists to prevent.
-  const written = readLines(path.join(dir, '.gsd', 'forge', 'evidence-execute-task-T02.jsonl'));
+  const written = readLines(path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl'));
   const entry = JSON.parse(written[1]);
   equal(entry.file, hostile, 'the path is serialised as data, unchanged');
 
@@ -420,7 +420,8 @@ function testPathIsDataNotInstruction() {
   const name = mat.evidenceFileName('../../escape/T02');
   check(!name.includes('/') && !name.includes('\\') && !name.includes('..'),
     `unit ids are flattened into a file name (got ${name})`);
-  equal(mat.evidenceFileName('execute-task/T02'), 'evidence-execute-task-T02.jsonl', 'the §7 naming convention is preserved');
+  equal(mat.evidenceFileName('execute-task/T02'), 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl',
+    'the naming convention is now the composite key (S01/T03), delegated to forge-evidence-path.js');
 }
 
 // ── 7. Kind coverage is confronted with T01, not assumed ───────────────────

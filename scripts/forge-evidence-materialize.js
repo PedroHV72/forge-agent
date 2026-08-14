@@ -3,7 +3,8 @@
 
 /**
  * forge-evidence-materialize.js — writes the RUNTIME-OBSERVED evidence the
- * codex adapter collected into `.gsd/forge/evidence-{unitId}.jsonl`.
+ * codex adapter collected into the composite-key evidence file resolved by
+ * `forge-evidence-path.js` (S01/T03) — `.gsd/forge/evidence~{milestone}~{slice}~{unit}.jsonl`.
  *
  * Why a separate script instead of letting the adapter append the lines
  * (route (a), not route (b), S04-PLAN § Rota de gravação escolhida): the
@@ -41,6 +42,13 @@ const path = require('path');
 // per-field cap. Re-declaring either here would let the two drift while both
 // still looked well-formed.
 const { ADMISSIBLE_TYPES, MAX_FIELD_CHARS } = require('./forge-evidence-admit');
+
+// S01/T03: the file NAME (never the path — argv must not steer the write
+// outside `.gsd/forge/`) is owned by forge-evidence-path.js's composite key.
+// A sibling module in the same package, required directly (not lazy) — this
+// script already requires forge-evidence-admit.js the same way, and unlike
+// forge-hook.js this is a standalone CLI, not a tool-call gate MEM008 protects.
+const { buildEvidenceFileName } = require('./forge-evidence-path');
 
 // The closed outcome enum shared with T01's census. A fourth value must be
 // declared here, never improvised at a call site.
@@ -86,23 +94,17 @@ function admissibleKindCoverage() {
 
 // ── File naming ────────────────────────────────────────────────────────────
 //
-// Same convention §7 already uses: `evidence-{unitId}.jsonl`. A unit id like
-// `execute-task/T02` carries a separator, so it is sanitised to a flat name —
-// and sanitised rather than joined, because a value arriving from argv must
-// never be able to steer the write outside `.gsd/forge/` (`..`, absolute
-// prefixes, nested dirs). The result is a file NAME, not a path.
-function evidenceFileName(unit) {
-  const flat = String(unit == null ? '' : unit)
-    .replace(/[^A-Za-z0-9._-]+/g, '-')
-    // Dot RUNS are collapsed on top of the class filter: `..` survives the
-    // filter (a dot is legal in a name) and, while it can no longer traverse
-    // once separators are gone, a file literally named `evidence-..-x.jsonl`
-    // reads like an escape attempt succeeded. Leave nothing that has to be
-    // re-reasoned about later.
-    .replace(/\.{2,}/g, '-')
-    .replace(/^[-.]+|[-.]+$/g, '')
-    .slice(0, 120);
-  return `evidence-${flat || 'unknown'}.jsonl`;
+// Delegates to forge-evidence-path.js's `buildEvidenceFileName` (S01/T01 —
+// the single owner of the evidence-log file-name shape, S01/T03). The
+// module already holds every invariant this function used to duplicate
+// locally: the result is a NAME, never a path (argv can never steer the
+// write outside `.gsd/forge/`), an absent milestone/slice axis resolves to
+// the module's own named sentinel (never an empty string spliced into the
+// name), and the length cap. `milestone`/`slice` are optional — a caller
+// that only ever had `unit` (the CLI's original contract) still gets a
+// well-formed composite name with both axes named-absent.
+function evidenceFileName(unit, milestone, slice) {
+  return buildEvidenceFileName({ milestone, slice, unit });
 }
 
 function truncateField(value, max) {
@@ -279,7 +281,7 @@ function materialize(options) {
   const nowIso = typeof opts.now === 'string' ? opts.now : new Date().toISOString();
 
   const evidenceDir = path.join(cwd, '.gsd', 'forge');
-  const fileName = evidenceFileName(unit);
+  const fileName = evidenceFileName(unit, opts.milestone, opts.slice);
   const evidenceFile = path.join(evidenceDir, fileName);
 
   let verdict = classifyPayload(opts.result);
@@ -372,11 +374,11 @@ function materialize(options) {
 // ── CLI ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { result: null, unit: null, cwd: null, json: false };
+  const out = { result: null, unit: null, cwd: null, json: false, milestone: null, slice: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--json') { out.json = true; continue; }
-    if (arg === '--result' || arg === '--unit' || arg === '--cwd') {
+    if (arg === '--result' || arg === '--unit' || arg === '--cwd' || arg === '--milestone' || arg === '--slice') {
       const value = argv[i + 1];
       if (!value || value.startsWith('--')) return { error: `${arg} requires a value` };
       out[arg.slice(2)] = value;
@@ -399,7 +401,7 @@ function main() {
     process.exit(2);
   }
 
-  const result = materialize({ result: args.result, unit: args.unit, cwd: args.cwd || process.cwd() });
+  const result = materialize({ result: args.result, unit: args.unit, cwd: args.cwd || process.cwd(), milestone: args.milestone, slice: args.slice });
 
   if (args.json) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
