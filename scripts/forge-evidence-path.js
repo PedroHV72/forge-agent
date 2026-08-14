@@ -72,21 +72,47 @@ const MAX_NAME_LEN = 200;
 // through when applied to the wrong axis). Devolves a NAME fragment, never a
 // path: the disallowed-char class strips `/`, `\`, and any traversal
 // structure before `..`-collapse even runs.
+// S01 review R3: the fingerprint is applied HERE, per axis, not later on the
+// assembled name. Sanitization is lossy in two independent ways — the
+// disallowed-char class collapses distinct values onto the same text
+// (`a/b` and `a_b` both become `a_b`), and the 60-char cut collapses any two
+// values sharing a prefix — and BOTH happened before any fingerprint existed,
+// so two distinct logical units could land on one file and mix their
+// evidence. The suffix is reserved INSIDE the 60-char budget (never appended
+// past it), so the per-axis cap still holds, and its presence is itself the
+// signal "this axis was altered", never a silent collision.
+//
+// The fingerprint is taken over the ORIGINAL value, not the cleaned one:
+// fingerprinting the cleaned text would give `a/b` and `a_b` the same mark
+// and preserve the exact collision this exists to break.
 function sanitizeAxis(value) {
-  const flat = String(value == null ? '' : value)
+  const original = String(value == null ? '' : value);
+  const cleaned = original
     .replace(/[^A-Za-z0-9._-]+/g, '_')
     .replace(/\.{2,}/g, '_')
-    .replace(/^[-.]+|[-.]+$/g, '')
-    .slice(0, MAX_AXIS_LEN);
-  return flat || 'unknown';
+    .replace(/^[-.]+|[-.]+$/g, '');
+  const altered = cleaned !== original;
+  const truncated = cleaned.length > MAX_AXIS_LEN;
+  if (!altered && !truncated) return cleaned || 'unknown';
+  const mark = `+${fingerprint(original)}`;
+  const budget = Math.max(1, MAX_AXIS_LEN - mark.length);
+  const head = cleaned.slice(0, budget) || 'unknown';
+  return `${head}${mark}`;
 }
 
-// Deterministic, talking truncation for the assembled name: trims the
-// CURRENTLY-longest axis by one char per iteration and appends a short
-// decimal fingerprint (sum of char codes mod 1296, base36) once truncation
-// actually happens — so two distinct long values that would otherwise
-// truncate to the same prefix keep differing, and the presence of the `+NN`
-// suffix itself signals "this axis was cut", never a silent collision.
+// Deterministic, talking fingerprint (sum of position-weighted char codes mod
+// 1296, base36 → 1-2 chars). Two consumers, and the difference between them
+// is measured, not assumed:
+//
+//   1. `sanitizeAxis` (the reachable one) — stamps `+NN` on any axis that
+//      sanitization altered or truncated. This is what actually keeps two
+//      distinct values from sharing a file name.
+//   2. `capAssembledName` — the whole-name floor. From
+//      `buildEvidenceFileName` this loop is UNREACHABLE by construction: the
+//      largest emittable name is 8+1+60+1+60+1+60+6 = 197 chars against
+//      MAX_NAME_LEN=200. It is kept as a floor for any future caller that
+//      assembles from unsanitized parts or widens MAX_AXIS_LEN — not as the
+//      collision defence, which it never was from this entry point.
 function fingerprint(value) {
   let sum = 0;
   for (let i = 0; i < value.length; i++) sum = (sum + value.charCodeAt(i) * (i + 1)) % 1296;
@@ -233,9 +259,51 @@ function parseEvidenceFileName(name, opts) {
 // ── resolveEvidenceFiles ─────────────────────────────────────────────────────
 // Union: the exact composite name PLUS every legacy form compatible with the
 // same logical unit (milestone-qualified sharing milestone+unit;
-// slice-qualified sharing slice+unit; bare sharing unit). Molded on
+// slice-qualified sharing slice+unit; bare sharing unit — the last two only
+// when their missing milestone axis has exactly one compatible owner, see
+// `admitMissingMilestoneAxis`). Molded on
 // forge-route-audit.js: strict filter first, aggregation by composite key
 // after — an absent field is never a wildcard.
+// S01 review R4: a legacy name that lacks an axis the TARGET declares is not
+// a wildcard match — it is a file whose owner is unknown. The old branches
+// (`matches = parsed.unit === target.unit` for bare) made every
+// `evidence-T01.jsonl` belong to every milestone with a T01, which is how a
+// unit's evidence can validate a claim from an unrelated run (measured: 8 bare
+// files live in this repo's .gsd/forge, and the Layer-0 salvage probe returned
+// two false `done` verdicts of exactly this shape on the same day).
+//
+// Rule: the legacy forms are still READ forever (ROADMAP § Notes (f)), but a
+// missing axis is admitted only when exactly ONE owner is compatible with it.
+// The candidate set for the milestone axis is the workspace's known-ids set —
+// the only evidence available about who could own an unqualified file. With
+// 0 or 1 known milestone there is nothing to confuse it with; with 2+ the file
+// is reported in `skipped` under a NAMED reason, never dropped silently and
+// never counted in `files`.
+//
+// When the target itself declares no milestone, there is no ambiguity to
+// resolve — the caller did not ask for that axis — so admission stands.
+// A parsed axis comes back in its SANITIZED form (that is what the name
+// holds); a target axis arrives raw from the caller (`execute-task/T02`, which
+// no file name can ever contain verbatim). Comparing the two by `===` alone
+// made every unit id carrying a disallowed char — i.e. every real
+// `execute-task/T##` — permanently unresolvable: written, then never found.
+// Surfaced by the R2 test that invokes the CLI the way the caller does and
+// then resolves the result, which is precisely why that test is written that
+// way rather than asserting the file exists.
+function axisEq(parsedValue, targetValue) {
+  const target = targetValue == null ? null : targetValue;
+  if (parsedValue === target) return true;
+  if (target === null || parsedValue === null || parsedValue === undefined) return false;
+  return parsedValue === sanitizeAxis(target);
+}
+
+function admitMissingMilestoneAxis(target, knownMilestoneIds) {
+  if (!target.milestone) return { admit: true };
+  const candidates = (knownMilestoneIds || []).filter(Boolean);
+  if (candidates.length <= 1) return { admit: true, sole_candidate: candidates[0] || null };
+  return { admit: false, reason: 'ambiguous-owner-milestone-axis', candidates: candidates.length };
+}
+
 function resolveEvidenceFiles(cwd, ctx) {
   const target = ctx || {};
   const dir = path.join(cwd, '.gsd', 'forge');
@@ -259,19 +327,37 @@ function resolveEvidenceFiles(cwd, ctx) {
       continue;
     }
     let matches = false;
+    let inferred = [];
     if (parsed.form === 'composite') {
-      matches = parsed.milestone === (target.milestone || null)
-        && parsed.slice === (target.slice || null)
-        && parsed.unit === target.unit;
+      matches = axisEq(parsed.milestone, target.milestone || null)
+        && axisEq(parsed.slice, target.slice || null)
+        && axisEq(parsed.unit, target.unit);
     } else if (parsed.form === 'milestone-qualified') {
-      matches = parsed.milestone === target.milestone && parsed.unit === target.unit;
+      matches = axisEq(parsed.milestone, target.milestone) && axisEq(parsed.unit, target.unit);
     } else if (parsed.form === 'slice-qualified') {
-      matches = parsed.slice === target.slice && parsed.unit === target.unit;
+      matches = axisEq(parsed.slice, target.slice) && axisEq(parsed.unit, target.unit);
+      inferred = ['milestone'];
     } else if (parsed.form === 'bare') {
-      matches = parsed.unit === target.unit;
+      matches = axisEq(parsed.unit, target.unit);
+      inferred = ['milestone', 'slice'];
+    }
+    if (matches && inferred.includes('milestone')) {
+      const admission = admitMissingMilestoneAxis(target, knownMilestoneIds);
+      if (!admission.admit) {
+        skipped.push({
+          file: entry.name,
+          form: parsed.form,
+          reason: admission.reason,
+          candidates: admission.candidates,
+        });
+        continue;
+      }
     }
     if (matches) {
-      files.push({ name: entry.name, form: parsed.form });
+      // `inferred` travels with whatever is admitted: a consumer must be able
+      // to tell a file that PROVED its owner from one admitted because only
+      // one owner was compatible.
+      files.push({ name: entry.name, form: parsed.form, inferred_axes: inferred });
       by_form[parsed.form] = (by_form[parsed.form] || 0) + 1;
     }
   }
@@ -368,7 +454,7 @@ module.exports = {
   resolveEvidenceFiles,
   censusEvidenceDir,
   collectKnownMilestoneIds,
-  _private: { sanitizeAxis, findMilestonePrefix, capAssembledName, fingerprint },
+  _private: { sanitizeAxis, findMilestonePrefix, capAssembledName, fingerprint, admitMissingMilestoneAxis, axisEq },
 };
 
 if (require.main === module) cliMain();

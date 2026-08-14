@@ -71,6 +71,13 @@ const OUTCOMES = Object.freeze({
 });
 const OUTCOME_VALUES = Object.freeze(Object.values(OUTCOMES));
 
+// S01 review R1. Deliberately NOT a fourth member of OUTCOMES: that enum is
+// the closed set a PAYLOAD's census may declare, and widening it would let a
+// sidecar payload claim this value and fall through `classifyPayload`'s
+// else-branch as `collected`. This one is emitted only by this script, about
+// this script's own refusal to write, and is never accepted as input.
+const SKIPPED_OUTCOME = 'skipped';
+
 // Entry `kind` per admissible variant. Confronted with ADMISSIBLE_TYPES below
 // rather than assumed: if T01 makes a third variant admissible without a kind
 // landing here, that must fail loudly instead of silently writing entries this
@@ -292,18 +299,48 @@ function materialize(options) {
   const cwd = String(opts.cwd || process.cwd());
   const nowIso = typeof opts.now === 'string' ? opts.now : new Date().toISOString();
 
-  // Same guard as forge-hook.js (S01/T06): never let a drifted `cwd` mkdirSync
-  // a fresh `.gsd/` outside the real owner. `--cwd` is caller-controlled here
-  // (lower risk than the hook's shell-derived cwd), so a missing/failed
-  // workspace module falls back to the pre-existing `cwd`-based path instead
-  // of refusing outright — this is the CLI the orchestrator invokes with an
-  // already-known-good `$WORKING_DIR`, not a tool-call gate reacting to drift.
-  let ownerDir = cwd;
+  // Same guard as forge-hook.js's PostToolUse branch (`:857`): when no owner
+  // resolves, `mkdirSync` below is UNREACHABLE — never "create one here".
+  //
+  // S01 review R1: the previous shape (`let ownerDir = cwd`, overwritten only
+  // on a truthy `resolveOwner`) kept the raw `cwd` as a fallback, so
+  // `--cwd <any-writable-dir>` still manufactured `<dir>/.gsd/forge` — exactly
+  // the orphan-workspace behaviour the owner-resolution invariant exists to
+  // eliminate, in the writer that was supposed to adopt it. The `cwd` fallback
+  // survives only for the case it was defended for (the workspace module
+  // missing or throwing) AND only when `cwd` is itself a real project; a
+  // non-project `cwd` with no resolvable owner returns the advisory skipped
+  // outcome below and touches nothing. Same trade accepted in D-S01-1
+  // (`S01-CONTEXT.md`): a lost line is the cost, a manufactured orphan is not.
+  let ownerDir = null;
   if (workspaceMod && typeof workspaceMod.resolveOwner === 'function') {
     try {
       const owner = workspaceMod.resolveOwner(cwd, { stopAt: os.homedir() });
       if (owner) ownerDir = owner;
-    } catch { /* keep cwd — this CLI's cwd is caller-controlled, not drift-prone */ }
+    } catch { /* fall through to the isProject check below */ }
+  }
+  if (!ownerDir) {
+    let cwdIsProject = false;
+    try {
+      cwdIsProject = !!(workspaceMod && typeof workspaceMod.isProject === 'function' && workspaceMod.isProject(cwd));
+    } catch { cwdIsProject = false; }
+    if (cwdIsProject) ownerDir = cwd;
+  }
+  if (!ownerDir) {
+    return {
+      outcome: SKIPPED_OUTCOME,
+      reason: 'owner-unresolved',
+      detail: `no .gsd owner at or above ${cwd}; refusing to create one`,
+      unit,
+      file: null,
+      written: 0,
+      entries_written: 0,
+      census_written: 0,
+      items_received: 0,
+      types_seen: {},
+      admitted: 0,
+      write_error: null,
+    };
   }
 
   const evidenceDir = path.join(ownerDir, '.gsd', 'forge');
@@ -432,7 +469,7 @@ function main() {
   if (args.json) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } else {
-    process.stdout.write(`${result.outcome}${result.reason ? ` (${result.reason})` : ''} — ${result.written} line(s) → ${result.file}\n`);
+    process.stdout.write(`${result.outcome}${result.reason ? ` (${result.reason})` : ''} — ${result.written} line(s) → ${result.file || result.detail || 'nothing written'}\n`);
   }
   process.exit(0); // advisory, always
 }
@@ -442,6 +479,7 @@ if (require.main === module) main();
 module.exports = {
   OUTCOMES,
   OUTCOME_VALUES,
+  SKIPPED_OUTCOME,
   KIND_BY_ADMISSIBLE_TYPE,
   MAX_LINE_BYTES,
   SOURCE,

@@ -25,14 +25,31 @@ const mat = require('./forge-evidence-materialize');
 const { ADMISSIBLE_TYPES } = require('./forge-evidence-admit');
 
 const SCRIPT = path.join(__dirname, 'forge-evidence-materialize.js');
+// The file name is derived from the naming authority, never restated as a
+// literal here: since the S01 review R3 fix a unit id carrying a disallowed
+// char (every real `execute-task/T##`) also carries the per-axis fingerprint
+// mark, and a literal would silently pin an outdated shape.
+const FILE_T02 = require('./forge-evidence-path').buildEvidenceFileName({ unit: 'execute-task/T02' });
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 let assertions = 0;
 function check(condition, message) { assertions += 1; assert(condition, message); }
 function equal(actual, expected, message) { assertions += 1; assert.deepStrictEqual(actual, expected, message); }
 
+// A REAL project dir: since the S01 review R1 fix the materializer refuses to
+// write when no `.gsd` owner resolves at or above `--cwd`, so a bare tmpdir is
+// no longer a valid fixture for the write paths — it is the fixture for the
+// REFUSAL path (testOwnerGuardRefusesOrphan below). `PROJECT.md` is a
+// WORK_ENTRY (forge-workspace.js), which is what makes a dir a project;
+// `.gsd/forge` alone is runtime-only and deliberately does not qualify.
 function tempDir(label) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `forge-evidence-mat-${label}-`));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-evidence-mat-${label}-`));
+  fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.gsd', 'PROJECT.md'), '# fixture project\n', 'utf8');
+  return dir;
+}
+function tempOrphanDir(label) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), `forge-evidence-orphan-${label}-`));
 }
 function writeResult(dir, payload) {
   const file = path.join(dir, 'result.json');
@@ -72,7 +89,7 @@ function testCliContract() {
   const run = runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
 
   equal(run.status, 0, 'CLI exits 0 on a collected payload');
-  const expectedFile = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
+  const expectedFile = path.join(dir, '.gsd', 'forge', FILE_T02);
   check(fs.existsSync(expectedFile), `CLI writes the §7 file name: ${expectedFile}`);
 
   const out = JSON.parse(run.stdout);
@@ -101,7 +118,7 @@ function scenario(label, payload) {
   const dir = tempDir(label);
   const result = writeResult(dir, payload);
   const run = runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
-  const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
+  const file = path.join(dir, '.gsd', 'forge', FILE_T02);
   const lines = readLines(file);
   const census = JSON.parse(lines[0]);
   // The volatile `ts` is stripped before comparison so that a difference found
@@ -171,7 +188,7 @@ function testCensusAlwaysExactlyOne() {
     const result = payload === null ? path.join(dir, 'missing.json') : writeResult(dir, payload);
     const run = runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
     equal(run.status, 0, `${label}: exit 0 (advisory, never blocks)`);
-    const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
+    const file = path.join(dir, '.gsd', 'forge', FILE_T02);
     check(fs.existsSync(file), `${label}: the jsonl exists even when nothing else is written`);
     equal(censusLines(file).length, 1, `${label}: exactly one census line`);
   }
@@ -189,7 +206,7 @@ function testCensusAlwaysExactlyOne() {
   const resultFile = writeResult(twice, COLLECTED_PAYLOAD);
   runCli(['--result', resultFile, '--unit', 'execute-task/T02', '--cwd', twice, '--json']);
   runCli(['--result', resultFile, '--unit', 'execute-task/T02', '--cwd', twice, '--json']);
-  equal(censusLines(path.join(twice, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl')).length, 2,
+  equal(censusLines(path.join(twice, '.gsd', 'forge', FILE_T02)).length, 2,
     'each invocation contributes exactly one census line');
 }
 
@@ -218,7 +235,7 @@ function testKindIsDerivedNotTrusted() {
   };
   const result = writeResult(dir, payload);
   runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
-  const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
+  const file = path.join(dir, '.gsd', 'forge', FILE_T02);
   const objs = readLines(file).map((l) => JSON.parse(l));
 
   equal(censusLines(file).length, 1, 'a payload entry claiming kind:census does NOT become a second census line');
@@ -244,7 +261,7 @@ function testSourcesCoexist() {
   const dir = tempDir('sources');
   const evidenceDir = path.join(dir, '.gsd', 'forge');
   fs.mkdirSync(evidenceDir, { recursive: true });
-  const file = path.join(evidenceDir, 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
+  const file = path.join(evidenceDir, FILE_T02);
 
   // A pre-existing LEGACY synthesized line (D7: nothing is retired).
   const legacy = { ts: '2026-08-06T09:00:00.000Z', tool: 'codex-sidecar', action: 'M', file: 'scripts/a.js', source: 'codex-sidecar', unit: 'execute-task/T02' };
@@ -288,7 +305,7 @@ function testLineCap() {
   const result = writeResult(dir, payload);
   runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', dir, '--json']);
 
-  const file = path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl');
+  const file = path.join(dir, '.gsd', 'forge', FILE_T02);
   const lines = readLines(file);
   equal(lines.length, 3, 'oversized input still yields census + both entries');
   for (const line of lines) {
@@ -411,7 +428,7 @@ function testPathIsDataNotInstruction() {
 
   // And the hostile value IS written, verbatim, as text — dropping it would be
   // the silence this script exists to prevent.
-  const written = readLines(path.join(dir, '.gsd', 'forge', 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl'));
+  const written = readLines(path.join(dir, '.gsd', 'forge', FILE_T02));
   const entry = JSON.parse(written[1]);
   equal(entry.file, hostile, 'the path is serialised as data, unchanged');
 
@@ -420,7 +437,7 @@ function testPathIsDataNotInstruction() {
   const name = mat.evidenceFileName('../../escape/T02');
   check(!name.includes('/') && !name.includes('\\') && !name.includes('..'),
     `unit ids are flattened into a file name (got ${name})`);
-  equal(mat.evidenceFileName('execute-task/T02'), 'evidence~_no-milestone_~_no-slice_~execute-task_T02.jsonl',
+  equal(mat.evidenceFileName('execute-task/T02'), FILE_T02,
     'the naming convention is now the composite key (S01/T03), delegated to forge-evidence-path.js');
 }
 
@@ -479,6 +496,108 @@ function testMirrorsInvokeAtStepSeven() {
   }
 }
 
+// ── 12. S01 review R1: no owner → no mkdirSync, ever ───────────────────────
+//
+// The pre-fix shape (`let ownerDir = cwd`, overwritten only on a truthy
+// resolveOwner) manufactured `<cwd>/.gsd/forge` in ANY writable directory.
+// The floor is not "usually resolves an owner" — it is that the refusal path
+// creates NOTHING and still reports itself with a named reason.
+
+function testOwnerGuardRefusesOrphan() {
+  const orphan = tempOrphanDir('r1');
+  const result = writeResult(orphan, COLLECTED_PAYLOAD);
+
+  const run = runCli(['--result', result, '--unit', 'execute-task/T02', '--cwd', orphan, '--json']);
+  equal(run.status, 0, 'the refusal is advisory — exit 0, never a blocked loop');
+
+  const out = JSON.parse(run.stdout);
+  equal(out.outcome, mat.SKIPPED_OUTCOME, 'the refusal carries the skipped outcome, not a fake collected');
+  equal(out.reason, 'owner-unresolved', 'and a NAMED reason — silence here is the defect');
+  equal(out.written, 0, 'nothing was written');
+
+  check(!fs.existsSync(path.join(orphan, '.gsd')),
+    'no .gsd was manufactured in a directory that is not a project');
+
+  // Control: the SAME payload in a real project still writes — proving the
+  // guard discriminates and is not just refusing everything.
+  const project = tempDir('r1-control');
+  const controlResult = writeResult(project, COLLECTED_PAYLOAD);
+  const controlRun = runCli(['--result', controlResult, '--unit', 'execute-task/T02', '--cwd', project, '--json']);
+  const controlOut = JSON.parse(controlRun.stdout);
+  equal(controlOut.outcome, 'collected', 'control: a real project still materialises');
+  check(controlOut.written > 0, 'control: lines were actually written');
+
+  equal(mat.OUTCOME_VALUES.includes(mat.SKIPPED_OUTCOME), false,
+    'the skipped outcome is NOT in the payload-accepted enum — a payload must never be able to claim it');
+}
+
+// ── 13. S01 review R2: the caller's invocation must be resolvable ──────────
+//
+// Invokes the CLI exactly the way the canonical site and the two milestone
+// mirrors do, then resolves the resulting file the way the completer does.
+// A file written under the sentinels can never match a real {M###,S##,T##},
+// so "it was written" is not the property under test — "it is findable" is.
+
+function testCallerInvocationIsResolvable() {
+  const evidencePath = require('./forge-evidence-path');
+  const project = tempDir('r2');
+  const milestone = 'M-20260813133328-lease-escrita-cross-run';
+  const slice = 'S01';
+  const unit = 'execute-task/T02';
+  fs.mkdirSync(path.join(project, '.gsd', 'milestones', milestone), { recursive: true });
+  const result = writeResult(project, COLLECTED_PAYLOAD);
+
+  const run = runCli([
+    '--result', result, '--unit', unit,
+    '--milestone', milestone, '--slice', slice,
+    '--cwd', project, '--json',
+  ]);
+  equal(run.status, 0, 'CLI exits 0 with both axes passed');
+  const out = JSON.parse(run.stdout);
+  check(out.written > 0, 'lines were written');
+  check(!out.file.includes('_no-milestone_') && !out.file.includes('_no-slice_'),
+    `the written file carries the real axes, not the sentinels (got ${out.file})`);
+
+  const resolved = evidencePath.resolveEvidenceFiles(project, { milestone, slice, unit });
+  equal(resolved.files.length, 1, 'the completer resolving the REAL unit finds exactly the file the caller wrote');
+  equal(resolved.files[0].form, 'composite');
+
+  // Bite: the pre-fix invocation (unit only) writes a file the same resolution
+  // can NEVER find. This is the defect R2 names, asserted rather than described.
+  const orphanProject = tempDir('r2-prefix');
+  fs.mkdirSync(path.join(orphanProject, '.gsd', 'milestones', milestone), { recursive: true });
+  const r2 = writeResult(orphanProject, COLLECTED_PAYLOAD);
+  runCli(['--result', r2, '--unit', unit, '--cwd', orphanProject, '--json']);
+  const unresolvable = evidencePath.resolveEvidenceFiles(orphanProject, { milestone, slice, unit });
+  equal(unresolvable.files.length, 0,
+    'control: an axis-less invocation lands under the sentinels and is unfindable — exactly why the call sites changed');
+}
+
+// ── 14. S01 review R2: the call sites actually pass the axes ───────────────
+
+function testCallSitesPassBothAxes() {
+  const sites = [
+    ['shared/forge-dispatch.md', true],
+    ['skills/forge-auto/SKILL.md', true],
+    ['skills/forge-next/SKILL.md', true],
+    // A loose task has no milestone/slice: the sentinels are the TRUTH there,
+    // and the resolution target carries the same absence. Asserted as an
+    // explicit expectation, not left unstated.
+    ['skills/forge-task/SKILL.md', false],
+  ];
+  for (const [rel, expectsAxes] of sites) {
+    const text = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+    check(text.length > 1000, `${rel} was actually read`);
+    const idx = text.indexOf('forge-evidence-materialize.js');
+    check(idx > -1, `${rel} names the materializer`);
+    const invocation = text.slice(idx, idx + 400);
+    equal(/--milestone/.test(invocation), expectsAxes,
+      `${rel}: --milestone presence must be ${expectsAxes}`);
+    equal(/--slice/.test(invocation), expectsAxes,
+      `${rel}: --slice presence must be ${expectsAxes}`);
+  }
+}
+
 // ── Runner ─────────────────────────────────────────────────────────────────
 
 const tests = [
@@ -493,6 +612,9 @@ const tests = [
   ['kind coverage confronted with T01', testKindCoverage],
   ['§7 rewritten in 7a + 7b', testDocSevenRewritten],
   ['the three mirrors invoke at step 7', testMirrorsInvokeAtStepSeven],
+  ['R1: no owner → no mkdirSync, named skipped outcome', testOwnerGuardRefusesOrphan],
+  ['R2: the caller invocation is resolvable by the completer', testCallerInvocationIsResolvable],
+  ['R2: the call sites pass both axes (loose task excepted)', testCallSitesPassBothAxes],
 ];
 
 let failed = 0;

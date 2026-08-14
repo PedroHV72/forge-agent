@@ -305,6 +305,93 @@ test('parseEvidenceFileName never throws on hostile input, always returns a form
   }
 });
 
+// ── Section 10: S01 review R3 — per-axis fingerprint, no lossy collision ─────
+console.log('\nSection 10: review R3 — sanitizeAxis collisions\n');
+
+test('R3(a): two values that sanitize to the same text produce DIFFERENT file names', () => {
+  const viaSlash = buildEvidenceFileName({ milestone: 'a/b', slice: 'S01', unit: 'T01' });
+  const viaUnderscore = buildEvidenceFileName({ milestone: 'a_b', slice: 'S01', unit: 'T01' });
+  assert(viaSlash !== viaUnderscore,
+    `char-class equivalence collision: both 'a/b' and 'a_b' produced ${viaSlash}`);
+});
+
+test('R3(b): two values diverging only AFTER the 60-char axis cap produce DIFFERENT file names', () => {
+  const head = 'M-'.padEnd(60, 'x');            // exactly MAX_AXIS_LEN chars
+  const a = buildEvidenceFileName({ milestone: `${head}AAAA`, slice: 'S01', unit: 'T01' });
+  const b = buildEvidenceFileName({ milestone: `${head}BBBB`, slice: 'S01', unit: 'T01' });
+  assert(a !== b, `truncation collision: both long ids produced ${a}`);
+});
+
+test('R3: the per-axis budget still holds — a fingerprinted axis never exceeds MAX_AXIS_LEN', () => {
+  const name = buildEvidenceFileName({ milestone: 'M-'.padEnd(400, 'z'), slice: 'S01', unit: 'T01' });
+  const axes = name.slice('evidence~'.length, -'.jsonl'.length).split('~');
+  assertEq(axes.length, 3);
+  for (const axis of axes) {
+    assert(axis.length <= 60, `axis exceeded the 60-char budget: ${axis.length} chars (${axis})`);
+  }
+});
+
+test('R3: an untouched axis is NOT fingerprinted — the mark means "this was altered", not noise', () => {
+  const name = buildEvidenceFileName({ milestone: 'M-20260813133328-lease', slice: 'S01', unit: 'T01' });
+  assert(!name.includes('+'), `clean axes must round-trip unmarked, got ${name}`);
+  assertEq(parseEvidenceFileName(name).milestone, 'M-20260813133328-lease');
+});
+
+// ── Section 11: S01 review R4 — a missing axis is not a wildcard ─────────────
+console.log('\nSection 11: review R4 — unqualified legacy names\n');
+
+test('R4: a bare file is NOT admitted when 2+ milestones could own it — it is skipped with a NAMED reason', () => {
+  const root = mkWorkspace();
+  registerMilestoneId(root, 'M-alpha');
+  registerMilestoneId(root, 'M-beta');
+  touchEvidence(root, ['evidence-T01.jsonl']);
+  const result = resolveEvidenceFiles(root, { milestone: 'M-alpha', slice: 'S01', unit: 'T01' });
+  assertEq(result.files.length, 0, 'a bare file with two candidate owners must not validate either of them');
+  assertEq(result.skipped.length, 1, 'and must never be dropped silently');
+  assertEq(result.skipped[0].file, 'evidence-T01.jsonl');
+  assertEq(result.skipped[0].reason, 'ambiguous-owner-milestone-axis');
+  assert(typeof result.skipped[0].candidates === 'number', 'the census names how many owners were compatible');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('R4: a slice-qualified file is skipped under the same rule — its milestone axis is missing too', () => {
+  const root = mkWorkspace();
+  registerMilestoneId(root, 'M-alpha');
+  registerMilestoneId(root, 'M-beta');
+  touchEvidence(root, ['evidence-S01-T01.jsonl']);
+  const result = resolveEvidenceFiles(root, { milestone: 'M-alpha', slice: 'S01', unit: 'T01' });
+  assertEq(result.files.length, 0);
+  assertEq(result.skipped[0].form, 'slice-qualified');
+  assertEq(result.skipped[0].reason, 'ambiguous-owner-milestone-axis');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('R4: legacy forms are still READ — exactly one compatible owner admits them, carrying the inferred axes', () => {
+  const root = mkWorkspace();
+  registerMilestoneId(root, 'M-only');
+  touchEvidence(root, ['evidence-T01.jsonl', 'evidence-S01-T01.jsonl']);
+  const result = resolveEvidenceFiles(root, { milestone: 'M-only', slice: 'S01', unit: 'T01' });
+  assertEq(result.files.length, 2, 'the sole-owner case must still resolve — reading legacy forms never stops');
+  const bare = result.files.find((f) => f.form === 'bare');
+  assertEq(bare.inferred_axes, ['milestone', 'slice'], 'an admitted file carries which axes were inferred, not proven');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('R4: reconciliation — every considered file lands in files OR skipped, never nowhere', () => {
+  const root = mkWorkspace();
+  registerMilestoneId(root, 'M-alpha');
+  registerMilestoneId(root, 'M-beta');
+  touchEvidence(root, [
+    buildEvidenceFileName({ milestone: 'M-alpha', slice: 'S01', unit: 'T01' }),
+    'evidence-T01.jsonl',
+    'evidence-S01-T01.jsonl',
+  ]);
+  const result = resolveEvidenceFiles(root, { milestone: 'M-alpha', slice: 'S01', unit: 'T01' });
+  assertEq(result.files.length + result.skipped.length, 3, 'a file that matched the unit must appear somewhere');
+  for (const s of result.skipped) assert(!!s.reason, 'every exclusion carries a named reason');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 // ── Section 9: CLI ────────────────────────────────────────────────────────────
 console.log('\nSection 9: CLI\n');
 
