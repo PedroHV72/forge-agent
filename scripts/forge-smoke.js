@@ -16149,7 +16149,6 @@ function smokeVerifyReverifyChildSideE2E() {
   const VERIFY_CLI = path.join(SCRIPTS, 'forge-verify.js');
   const REVERIFY_CLI = path.join(SCRIPTS, 'forge-reverify.js');
   const POOL_CLI = path.join(SCRIPTS, 'forge-resource-pool.js');
-  const REWRITE_MOD_PATH = path.join(SCRIPTS, 'forge-command-rewrite.js');
   const isPosix = process.platform !== 'win32';
 
   function tmpWorkspace(prefix) {
@@ -16177,16 +16176,32 @@ function smokeVerifyReverifyChildSideE2E() {
   function hasMakeBinary() {
     try { return spawnSync('make', ['--version'], { encoding: 'utf8' }).status === 0; } catch { return false; }
   }
-  // Temporarily removes forge-command-rewrite.js from disk so a FRESHLY
-  // spawned child's require() throws MODULE_NOT_FOUND — the strongest form
-  // of "wiring disabled": the module genuinely absent, the exact pre-S04
-  // condition on disk, not a stubbed in-process injection (which the CLI
-  // boundary does not expose). Only ever touched synchronously, restored in
-  // `finally` before any other code in this single-threaded process runs.
+  // Runs `fn` against a COPY of scripts/ (in tmp) with
+  // forge-command-rewrite.js deleted from the copy — so a FRESHLY spawned
+  // child's require() throws MODULE_NOT_FOUND (the strongest form of
+  // "wiring disabled": the module genuinely absent from disk), WITHOUT ever
+  // mutating the real tracked checkout (R10, S04 review). The original
+  // in-place rename left a window — covered by `finally`, but not SIGKILL —
+  // where a concurrent Forge process on the same machine (this milestone's
+  // own premise) could observe the module missing, or a killed smoke run
+  // could leave the checkout without it. `fn` receives the copy's scripts/
+  // dir so callers can build CLI paths (`path.join(copyScriptsDir, ...)`)
+  // that resolve `require()`s inside the copy, never the real tree. Some
+  // scripts reach up to `../shared/**` (e.g. forge-xllm.js's
+  // `../shared/schemas/*.json`) — a symlink from the copy root back to the
+  // REAL `shared/` dir preserves that relative resolution read-only,
+  // without copying (or ever writing to) it.
   function withRewriteModuleDisabled(fn) {
-    const disabledPath = `${REWRITE_MOD_PATH}.smoke108-disabled`;
-    fs.renameSync(REWRITE_MOD_PATH, disabledPath);
-    try { return fn(); } finally { fs.renameSync(disabledPath, REWRITE_MOD_PATH); }
+    const copyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-repo-copy-'));
+    const copyScriptsDir = path.join(copyRoot, 'scripts');
+    try {
+      fs.cpSync(SCRIPTS, copyScriptsDir, { recursive: true });
+      fs.rmSync(path.join(copyScriptsDir, 'forge-command-rewrite.js'), { force: true });
+      fs.symlinkSync(path.join(SCRIPTS, '..', 'shared'), path.join(copyRoot, 'shared'), 'dir');
+      return fn(copyScriptsDir);
+    } finally {
+      try { fs.rmSync(copyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   }
   function writeResultFile(p) {
     const result = { must_haves_status: [{ status: 'unmet', scope: 'environment', reason: 'sandbox-exec-blocked', note: 'run the test suite' }] };
@@ -16294,7 +16309,7 @@ function smokeVerifyReverifyChildSideE2E() {
     writeShim(unrecBin, dumpUnrec1);
     const resE1 = spawnSync(NODE, [VERIFY_CLI, '--plan', planE, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-e1'], { encoding: 'utf8', env: envE });
     writeShim(unrecBin, dumpUnrec2);
-    const resE2 = withRewriteModuleDisabled(() => spawnSync(NODE, [VERIFY_CLI, '--plan', planE, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-e2'], { encoding: 'utf8', env: envE }));
+    const resE2 = withRewriteModuleDisabled((copyScriptsDir) => spawnSync(NODE, [path.join(copyScriptsDir, 'forge-verify.js'), '--plan', planE, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-e2'], { encoding: 'utf8', env: envE }));
 
     assert(resE1.status === 0 && resE2.status === 0, '(e) both unrecognized-command runs (wiring present/absent) exit 0', `${resE1.status}/${resE2.status}`);
     const dumpUnrec1Json = JSON.parse(fs.readFileSync(dumpUnrec1, 'utf8'));
@@ -16399,7 +16414,7 @@ function smokeVerifyReverifyChildSideE2E() {
 
       const resultJ2 = writeResultFile(path.join(makeDir, 'result-j2.json'));
       const envJ2 = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolMake, FORGE_RESOURCES_PRESSURE: '1', SMOKE108_DUMP_FILE: dumpJ2 });
-      const resJ2 = withRewriteModuleDisabled(() => spawnSync(NODE, [REVERIFY_CLI, '--result', resultJ2, '--code-dir', makeDir, '--gsd-dir', path.join(makeDir, '.gsd')], { encoding: 'utf8', cwd: makeDir, env: envJ2 }));
+      const resJ2 = withRewriteModuleDisabled((copyScriptsDir) => spawnSync(NODE, [path.join(copyScriptsDir, 'forge-reverify.js'), '--result', resultJ2, '--code-dir', makeDir, '--gsd-dir', path.join(makeDir, '.gsd')], { encoding: 'utf8', cwd: makeDir, env: envJ2 }));
 
       assert(resJ1.status === 0 && resJ2.status === 0, '(j) both make-test runs (wiring present/absent) exit 0', `${resJ1.status}/${resJ2.status}`);
       const parsedJ1 = JSON.parse(resJ1.stdout);

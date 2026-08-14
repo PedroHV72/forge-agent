@@ -529,30 +529,22 @@ test('planRewriteArgv: non-string element in argv refuses', () => {
 // refuse rather than pick one segment and drop the rest.
 test('planRewriteArgv: a rewritten multi-segment chain refuses — never composes a chain in argv', () => {
   // argv itself cannot literally contain '&&' as a token under the unsafe
-  // filter (metacharacter), so this exercises the retokenize path via a
-  // manager script body that itself expands into a chain post-rewrite is
-  // not reachable — instead prove the guard directly against a plan whose
-  // rewritten command has more than one segment, by rewriting a manager
-  // script chain: npm run test2, where the *script* is a single-segment
-  // jest, so drive the multi-segment path through the underlying command
-  // string directly to confirm tokenizeCommand + segment-count logic used
-  // by the adapter agrees with what planRewrite would produce.
-  const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'forge-cmd-rewrite-argv-chain-'));
-  try {
-    // planRewrite only ever rewrites a single chain SEGMENT (never composes
-    // insertions across segments into a multi-segment string), so there is
-    // no live production path from a single-segment argv input to a
-    // multi-segment plan.command. Assert that invariant holds (defends the
-    // refusal's premise) and separately unit-test the adapter's own
-    // segment-count guard against a synthetic post-rewrite string.
-    const chainResult = planRewrite('echo hi && jest', BUDGET);
-    assert.strictEqual(chainResult.outcome, 'rewritten');
-    const retok = tokenizeCommand(chainResult.command);
-    assert.strictEqual(retok.ok, true);
-    assert.strictEqual(retok.segments.length, 2, 'sanity: chain rewrite output is intentionally multi-segment');
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+  // filter (metacharacter), so the adapter's own segment-count guard
+  // (`retok.segments.length !== 1` at forge-command-rewrite.js:609) is
+  // unreachable through a legitimate chain-in-argv input — it is
+  // defense-in-depth. `budget` IS a legitimate seam though: planRewriteArgv
+  // never validates it, and `vitestEnvPrefix` interpolates `budget.workers`
+  // inside a single-quoted shell string with no escaping. A budget whose
+  // `workers` value contains an unescaped `'` breaks out of that quoting and
+  // injects a live `;` into `plan.command` — genuinely producing a
+  // multi-segment rewritten command through the SAME code path a real
+  // (if malformed/compromised) budget object would take. This proves the
+  // guard bites for real, not just that its premise holds.
+  const maliciousBudget = { ...BUDGET, workers: "1'; touch /tmp/forge-r6-pwned #" };
+  const result = planRewriteArgv(['vitest', 'run'], maliciousBudget, {});
+  assert.strictEqual(result.outcome, 'intact');
+  assert.strictEqual(result.reason, REWRITE_REASON_CODES.INTACT_ARGV_MULTI_SEGMENT,
+    'a budget-injected chain must refuse via the multi-segment guard, not silently compose one');
 });
 
 test('planRewriteArgv: env-prefix token with a pre-existing user assignment round-trips (mixed generated + user env)', () => {

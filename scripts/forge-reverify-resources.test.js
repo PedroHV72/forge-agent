@@ -95,6 +95,8 @@ let poolDir;
 let originalPath;
 let originalPressure;
 let originalNodeOptions;
+let originalVitestMaxForks;
+let originalVitestMaxThreads;
 
 function setup() {
   codeDir = mkTmpDir('forge-reverify-resources-work-');
@@ -103,10 +105,19 @@ function setup() {
   originalPath = process.env.PATH;
   originalPressure = process.env.FORGE_RESOURCES_PRESSURE;
   originalNodeOptions = process.env.NODE_OPTIONS;
+  originalVitestMaxForks = process.env.VITEST_MAX_FORKS;
+  originalVitestMaxThreads = process.env.VITEST_MAX_THREADS;
   process.env.FORGE_RESOURCE_POOL_DIR = poolDir;
   // Deterministic admission: level 1 (normal), admit:true, cross-platform
   // (honored regardless of process.platform — forge-resources.js#resolveResourceBudget).
   process.env.FORGE_RESOURCES_PRESSURE = '1';
+  // Hermetic to inherited env (R3) — several tests assert ABSENCE of
+  // NODE_OPTIONS/VITEST_MAX_FORKS/VITEST_MAX_THREADS on the clamp-OFF path,
+  // or an exact clamp-ON regex match; an inherited value would make either
+  // assert fail against otherwise-correct preservation/clamp behavior.
+  delete process.env.NODE_OPTIONS;
+  delete process.env.VITEST_MAX_FORKS;
+  delete process.env.VITEST_MAX_THREADS;
 }
 
 function teardown() {
@@ -115,6 +126,10 @@ function teardown() {
   else process.env.FORGE_RESOURCES_PRESSURE = originalPressure;
   if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
   else process.env.NODE_OPTIONS = originalNodeOptions;
+  if (originalVitestMaxForks === undefined) delete process.env.VITEST_MAX_FORKS;
+  else process.env.VITEST_MAX_FORKS = originalVitestMaxForks;
+  if (originalVitestMaxThreads === undefined) delete process.env.VITEST_MAX_THREADS;
+  else process.env.VITEST_MAX_THREADS = originalVitestMaxThreads;
   delete process.env.FORGE_RESOURCE_POOL_DIR;
   try { fs.rmSync(codeDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   try { fs.rmSync(poolDir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -167,6 +182,12 @@ process.exit(0);
   // Worker/runner-specific clamp never applies to a non-runner command.
   assert(dump.env.VITEST_MAX_FORKS === undefined, 'VITEST_MAX_FORKS should be absent when the argv is not a runner form');
   assert(dump.env.VITEST_MAX_THREADS === undefined, 'VITEST_MAX_THREADS should be absent when the argv is not a runner form');
+  // T03-PLAN 2d (R4): the NODE_OPTIONS overlay is still explicit on the
+  // intact path — proven directly against the CHILD dump, not just
+  // asserted-by-title. Removing the overlay in acquireReverifyClamp's
+  // intact branch must fail this assert.
+  assert(typeof dump.env.NODE_OPTIONS === 'string' && /--max-old-space-size=\d+/.test(dump.env.NODE_OPTIONS),
+    `NODE_OPTIONS overlay missing/malformed on the intact path: ${dump.env.NODE_OPTIONS}`);
   // The argv itself is byte-identical to what was passed in (no assignment/flag inserted).
   assertEqual(dump.argv[dump.argv.length - 1], binPath, 'argv must remain byte-identical on the intact path');
   assertEqual(outcome.verdict, 'verified');
@@ -317,6 +338,19 @@ test('verdict table (no-command empty argv / no-command spawnPlan-null / verifie
   assertEqual(emptyOn.verdict, 'no-command');
   assertEqual(emptyOff.verdict, 'no-command');
 
+  // no-command: spawnPlan-null (guard #2). POSIX spawnPlan() never returns
+  // null, so this leg is only reachable on win32 in production — the R5
+  // fix (S04 review) injects a fake spawnPlanFn via the test-only seam
+  // added to runVerification, proving the guard bites on ANY host without
+  // asserting more than what's exercised.
+  const nullPlanOn = runVerification({ argv: ['whatever'], codeDir, timeoutMs: 5000, spawnPlanFn: () => null });
+  const nullPlanOff = runVerification({
+    argv: ['whatever'], codeDir, timeoutMs: 5000, spawnPlanFn: () => null,
+    requireCommandRewrite: () => { throw new Error('off'); },
+  });
+  assertEqual(nullPlanOn.verdict, 'no-command');
+  assertEqual(nullPlanOff.verdict, 'no-command');
+
   // Project's own exit code, via a plain non-runner command.
   const cwdExit = mkTmpDir('forge-reverify-resources-exit-');
   try {
@@ -332,6 +366,24 @@ test('verdict table (no-command empty argv / no-command spawnPlan-null / verifie
     assertEqual(exOff.exit_code, 3);
   } finally {
     fs.rmSync(cwdExit, { recursive: true, force: true });
+  }
+
+  // verified: exit 0, clamp ON vs OFF. Covered jointly by tests 1/2 (whose
+  // fixtures assert env/argv shape) — this leg only needs the verdict.
+  if (isPosix) {
+    const cwdOk = mkTmpDir('forge-reverify-resources-ok-');
+    try {
+      const okArgv = [process.execPath, '-e', 'process.exit(0)'];
+      const okOn = runVerification({ argv: okArgv, codeDir: cwdOk, timeoutMs: 5000 });
+      const okOff = runVerification({
+        argv: okArgv, codeDir: cwdOk, timeoutMs: 5000,
+        requireCommandRewrite: () => { throw new Error('off'); },
+      });
+      assertEqual(okOn.verdict, 'verified');
+      assertEqual(okOff.verdict, 'verified');
+    } finally {
+      fs.rmSync(cwdOk, { recursive: true, force: true });
+    }
   }
 });
 

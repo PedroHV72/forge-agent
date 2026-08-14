@@ -226,6 +226,19 @@ function acquireReverifyClamp(argv, opts) {
       overlay.NODE_OPTIONS = `--max-old-space-size=${contract.heapMb}`;
     }
 
+    if (contract && contract.admit === false) {
+      // Critical pressure: admission refused. D3 is LOCKED — never refuse
+      // the spawn. Skip the rewrite entirely and run argv byte-identical
+      // rather than hand a zero-worker contract to the planner.
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.codeDir }); } catch { /* MEM008 */ }
+      }
+      appendReverifyResourceEvent(opts.codeDir, opts.gsdDir, 'resource-clamp-skipped', {
+        reason: 'intact:admission-refused-advisory',
+      });
+      return { argv, env: { ...process.env, ...overlay }, handle: null, resourcesMod: null };
+    }
+
     const plan = rewriteMod.planRewriteArgv(argv, contract, { cwd: opts.codeDir });
 
     if (plan.outcome !== 'rewritten') {
@@ -271,9 +284,15 @@ function releaseReverifyClamp(clamp, codeDir) {
   }
 }
 
-function runVerification({ argv, codeDir, timeoutMs, gsdDir, session, requireResources, requireCommandRewrite }) {
+function runVerification({ argv, codeDir, timeoutMs, gsdDir, session, requireResources, requireCommandRewrite, spawnPlanFn }) {
   if (!Array.isArray(argv) || !argv.length) return { verdict: 'no-command', command: '', exit_code: null };
-  const originalPlanned = spawnPlan(argv);
+  // `spawnPlanFn` is a test-only injection seam (S04 review R5) — production
+  // callers never pass it, so `spawnPlan` (POSIX: never null; win32: null
+  // when the executable can't be resolved) is unchanged for every real
+  // invocation. It exists solely so the `spawnPlan === null` leg of the
+  // verdict table is provable on any host, not just win32.
+  const plan = typeof spawnPlanFn === 'function' ? spawnPlanFn : spawnPlan;
+  const originalPlanned = plan(argv);
   if (!originalPlanned) return { verdict: 'no-command', command: commandText(argv), exit_code: null };
 
   // MEM008: any throw anywhere in the clamp path degrades to the exact
@@ -291,7 +310,7 @@ function runVerification({ argv, codeDir, timeoutMs, gsdDir, session, requireRes
   // reuses the plan already validated above, so that path stays exactly
   // byte-identical to before this wiring.
   const rewrote = clamp.argv !== argv;
-  const planned = rewrote ? spawnPlan(clamp.argv) : originalPlanned;
+  const planned = rewrote ? plan(clamp.argv) : originalPlanned;
   if (!planned) {
     releaseReverifyClamp(clamp, codeDir); // W5
     return { verdict: 'no-command', command: commandText(argv), exit_code: null };

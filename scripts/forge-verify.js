@@ -321,6 +321,21 @@ function acquireClampForCommand(opts) {
       handle = contract.pool.handle;
     }
 
+    if (contract && contract.admit === false) {
+      // Critical pressure: admission refused. D3 is LOCKED — never refuse
+      // the spawn. Skip the rewrite entirely and run the command
+      // byte-identical rather than hand a zero-worker contract to the
+      // planner (which would silently produce full parallelism, since
+      // `--maxWorkers=0`/`VITEST_MAX_FORKS=0` are falsy to the runners).
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.cwd }); } catch { /* MEM008 */ }
+      }
+      appendResourceEvent(opts.cwd, opts.gsdDir, "resource-clamp-skipped", {
+        reason: "intact:admission-refused-advisory",
+      });
+      return passthrough;
+    }
+
     const plan = rewriteMod.planRewrite(opts.command, contract, { cwd: opts.cwd });
 
     if (plan.outcome !== "rewritten") {

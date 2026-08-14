@@ -106,6 +106,11 @@ function setup() {
   // (this env override is honored regardless of process.platform/darwin —
   // see forge-resources.js#resolveResourceBudget).
   process.env.FORGE_RESOURCES_PRESSURE = '1';
+  // Hermetic to any NODE_OPTIONS the outer environment/CI defines — several
+  // tests below assert its ABSENCE (clamp OFF) or an exact PARENT-set value
+  // (test 3), and an inherited value would make both asserts fail against
+  // otherwise-correct preservation behavior (R2).
+  delete process.env.NODE_OPTIONS;
 }
 
 function teardown() {
@@ -189,18 +194,26 @@ test('parent NODE_OPTIONS is never overwritten — child sees the PARENT value, 
   const dumpFile = path.join(workDir, 'dump-nodeopts.json');
   writeFakeVitest(binDir, dumpFile);
   process.env.PATH = binDir + path.delimiter + originalPath;
+  const savedNodeOptions = process.env.NODE_OPTIONS;
   process.env.NODE_OPTIONS = '--max-old-space-size=42';
 
-  runVerificationGate({
-    cwd: workDir,
-    taskPlanVerify: 'vitest',
-    gsdDir: path.join(workDir, '.gsd'),
-    commandTimeoutMs: 15000,
-  });
+  try {
+    runVerificationGate({
+      cwd: workDir,
+      taskPlanVerify: 'vitest',
+      gsdDir: path.join(workDir, '.gsd'),
+      commandTimeoutMs: 15000,
+    });
 
-  const dump = JSON.parse(fs.readFileSync(dumpFile, 'utf-8'));
-  assertEqual(dump.env.NODE_OPTIONS, '--max-old-space-size=42', 'parent NODE_OPTIONS was overwritten by the contract');
-  delete process.env.NODE_OPTIONS;
+    const dump = JSON.parse(fs.readFileSync(dumpFile, 'utf-8'));
+    assertEqual(dump.env.NODE_OPTIONS, '--max-old-space-size=42', 'parent NODE_OPTIONS was overwritten by the contract');
+  } finally {
+    // Self-contained (R2): restore whatever NODE_OPTIONS held before this
+    // test, rather than blindly deleting it, so the rest of the suite
+    // (and teardown) sees exactly the value it started with.
+    if (savedNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = savedNodeOptions;
+  }
 });
 
 // ── 4. Variável arbitrária do pai continua chegando ao filho (env não truncado) ──
