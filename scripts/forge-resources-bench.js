@@ -336,7 +336,7 @@ function evaluateEnforcement({
   cell, argvBefore, argvAfter, dumpRecords, disabledReason, probeReason,
 }) {
   const requested = cellEnforcement(cell);
-  const argvChanged = argvBefore.join(' ') !== argvAfter.join(' ');
+  const argvChanged = argvBefore.join('\0') !== argvAfter.join('\0');
   const base = { requested, argvChanged, childObserved: false, applied: false };
 
   if (disabledReason) return { ...base, reason: disabledReason };
