@@ -16647,6 +16647,230 @@ function smokeResourcesObservabilityCensus() {
     + 'zero pollution of events.jsonl, and the real machine pool root never touched');
 }
 
+// ── Section 110: S06/T01-T04 guard — signal-not-clock SIGINT, enforcement:off ─
+// bypass contrast, bench JSONL+prefs-restore, and anti-silence floor bite on
+// the bench harness — number MEASURED at execution time (max observed was
+// 109; 110 is the first free slot), never assumed (MEM013). Every claim is
+// proven by spawning the REAL `forge-status.js` and `forge-resources-bench.js`
+// CLIs (and `forge-verify.js`'s CLI entrypoint for the enforcement contrast)
+// as child processes — never by requiring the modules under test in-process.
+function smokeResourcesFlakeAndBenchGuard() {
+  process.stdout.write('\n▸ Section 110: T01 signal-not-clock SIGINT, T03 enforcement:off contrast, T04 bench JSONL+restore, T04 anti-silence bite\n');
+  const NODE = process.execPath;
+  const STATUS_CLI = path.join(SCRIPTS, 'forge-status.js');
+  const VERIFY_CLI = path.join(SCRIPTS, 'forge-verify.js');
+  const BENCH_CLI = path.join(SCRIPTS, 'forge-resources-bench.js');
+
+  // ── shared fixture helpers ────────────────────────────────────────────────
+  const ROADMAP_TEXT = [
+    '# M-20260101120000-alpha: Alpha Milestone — Roadmap',
+    '',
+    '- [x] **S01: Done one** `risk:low`',
+    '- [ ] **S02: Active one** `risk:high`',
+    '',
+  ].join('\n');
+  const PLAN_TEXT = [
+    '# S02 Plan',
+    '',
+    '- [x] T01: plain done',
+    '- [ ] T02: plain active',
+    '',
+  ].join('\n');
+  function stateText(milestoneId) {
+    const nowIso = new Date().toISOString();
+    return [
+      '---',
+      `milestone: ${milestoneId}`,
+      'kind: milestone',
+      `created: ${nowIso}`,
+      `last_updated: ${nowIso}`,
+      'isolation_mode: shared',
+      '---',
+      '',
+      `# ${milestoneId} State`,
+      '',
+      '**Active Slice:** S02',
+      '**Active Task:** T02',
+      '**Phase:** execute-task',
+      '**Auto-mode:** on',
+      '**Next Action:** Continue T02',
+      '',
+    ].join('\n');
+  }
+  function makeStatusFixture() {
+    const milestoneId = 'M-20260101120000-alpha';
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-status-'));
+    const mDir = path.join(dir, '.gsd', 'milestones', milestoneId);
+    fs.mkdirSync(path.join(mDir, 'slices', 'S02'), { recursive: true });
+    fs.writeFileSync(path.join(mDir, `${milestoneId}-ROADMAP.md`), ROADMAP_TEXT, 'utf8');
+    fs.writeFileSync(path.join(mDir, `${milestoneId}-STATE.md`), stateText(milestoneId), 'utf8');
+    fs.writeFileSync(path.join(mDir, 'slices', 'S02', 'S02-PLAN.md'), PLAN_TEXT, 'utf8');
+    return dir;
+  }
+
+  const isPosix = process.platform !== 'win32';
+  const dirsToClean = [];
+
+  try {
+    // ── (a) T01: flaky-by-order fixed — wait for an OBSERVABLE readiness ────
+    // signal (the child's own "refresh #1" output), never a fixed-duration
+    // sleep. Named-reason ceiling (READY_TIMEOUT) replaces the sleep-0.2
+    // gamble the original R2 test used — same mechanism forge-status.test.js
+    // R2 introduced, read from there, not re-invented here.
+    if (!isPosix) {
+      skip('Section 110(a): forge-status --watch SIGINT-after-readiness-signal', 'posix-only /bin/sh + kill fixture (mirrors forge-status.test.js R2)');
+    } else {
+      const statusDir = makeStatusFixture();
+      dirsToClean.push(statusDir);
+      const outFile = path.join(statusDir, '.watch-out.txt');
+      const script = `"${NODE}" "${STATUS_CLI}" --watch=0.5 --cwd "${statusDir}" >"${outFile}" 2>&1 & pid=$!; i=0; while ! grep -q "refresh #1" "${outFile}" 2>/dev/null; do i=$((i+1)); if [ "$i" -ge 150 ]; then echo READY_TIMEOUT; kill -INT "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; exit 0; fi; sleep 0.02; done; kill -INT "$pid"; wait "$pid"; echo "EXIT:$?"`;
+      const resA = spawnSync('/bin/sh', ['-c', script], { encoding: 'utf8', timeout: 8000 });
+      assert(!/READY_TIMEOUT/.test(resA.stdout || ''),
+        '(a) child signaled readiness ("refresh #1" observed) within the named ceiling — never a fixed-duration sleep',
+        `stdout=${resA.stdout} stderr=${resA.stderr}`);
+      const m = (resA.stdout || '').match(/EXIT:(\d+)/);
+      assert(m, '(a) EXIT:<code> marker present in stdout', String(resA.stdout));
+      assert(!!m && m[1] === '0', '(a) real spawn: --watch child exits 0 on SIGINT sent right after the readiness signal, by a REAL spawned CLI (D5: only a process this block itself created)', String(resA.stdout));
+    }
+
+    // ── (b) T03: resources.enforcement:off bypass — CONTRAST with `clamp` on ─
+    // the exact same entry (positive control). Only the `off` cell would pass
+    // green under a bypass that is always-on; only `clamp` would pass green
+    // under a bypass that is inert — asserting both is what proves the toggle
+    // actually gates the rewrite (S06-PLAN.md A1).
+    if (!isPosix) {
+      skip('Section 110(b): forge-verify.js CLI enforcement:off/clamp contrast', 'posix-only shebang fixture (mirrors forge-resources-enforcement.test.js)');
+    } else {
+      function runVerifyCell(enforcement) {
+        const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `smoke110-enf-${enforcement}-`));
+        dirsToClean.push(cwd);
+        fs.mkdirSync(path.join(cwd, '.gsd', 'forge'), { recursive: true });
+        fs.writeFileSync(path.join(cwd, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({ resources: { enforcement } }, null, 2) + '\n', 'utf8');
+        const binDir = path.join(cwd, 'bin');
+        fs.mkdirSync(binDir, { recursive: true });
+        const dumpFile = path.join(cwd, 'dump.json');
+        fs.writeFileSync(path.join(binDir, 'vitest'),
+          `#!/usr/bin/env node\nconst fs = require('fs');\nfs.writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({ env: process.env, argv: process.argv }));\nprocess.exit(0);\n`,
+          { mode: 0o755 });
+        const poolDir = fs.mkdtempSync(path.join(os.tmpdir(), `smoke110-enf-pool-${enforcement}-`));
+        dirsToClean.push(poolDir);
+        const env = Object.assign({}, process.env, {
+          PATH: binDir + path.delimiter + process.env.PATH,
+          FORGE_RESOURCE_POOL_DIR: poolDir,
+          FORGE_RESOURCES_PRESSURE: '1',
+          NODE_OPTIONS: '',
+        });
+        const res = spawnSync(NODE, [VERIFY_CLI, '--cwd', cwd, '--unit', 'smoke110', '--gsd-dir', path.join(cwd, '.gsd'), '--preference', 'vitest'], { encoding: 'utf8', env });
+        assert(res.status === 0, `(b) forge-verify.js CLI exits 0 under enforcement:${enforcement}`, `status=${res.status} stderr=${res.stderr}`);
+        assert(fs.existsSync(dumpFile), `(b) fixture never ran under enforcement:${enforcement} — real spawn produced no child-observed dump`, res.stdout + res.stderr);
+        return JSON.parse(fs.readFileSync(dumpFile, 'utf8'));
+      }
+      const dumpOff = runVerifyCell('off');
+      const dumpClamp = runVerifyCell('clamp');
+      assert(dumpOff.env.VITEST_MAX_FORKS === undefined, '(b) enforcement:off — the verification command reaches the child argv/env byte-identical (no VITEST_MAX_FORKS injected)', String(dumpOff.env.VITEST_MAX_FORKS));
+      assert(dumpOff.env.NODE_OPTIONS === undefined || dumpOff.env.NODE_OPTIONS === '', '(b) enforcement:off — no heap NODE_OPTIONS injected', String(dumpOff.env.NODE_OPTIONS));
+      assert(typeof dumpClamp.env.VITEST_MAX_FORKS === 'string' && dumpClamp.env.VITEST_MAX_FORKS.length > 0,
+        '(b) POSITIVE CONTROL: the SAME entry under enforcement:clamp IS rewritten (VITEST_MAX_FORKS present) — proves the off-cell above passed because of the toggle, not because the rewrite is dead',
+        JSON.stringify(dumpClamp.env.VITEST_MAX_FORKS));
+      assert(typeof dumpClamp.env.NODE_OPTIONS === 'string' && /--max-old-space-size=\d+/.test(dumpClamp.env.NODE_OPTIONS),
+        '(b) clamp cell also carries the heap NODE_OPTIONS overlay', String(dumpClamp.env.NODE_OPTIONS));
+    }
+
+    // ── (c) T04: bench harness — real CLI spawn, incremental JSONL, prefs restored ──
+    const benchCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-bench-cwd-'));
+    dirsToClean.push(benchCwd);
+    fs.mkdirSync(path.join(benchCwd, '.gsd', 'forge'), { recursive: true });
+    const prefsPath = path.join(benchCwd, '.gsd', 'forge-prefs.jsonc');
+    const originalPrefs = JSON.stringify({ marker: 'smoke110-untouched', other: 42 }, null, 2) + '\n';
+    fs.writeFileSync(prefsPath, originalPrefs, 'utf8');
+    const outFile = path.join(benchCwd, 'bench-out.jsonl');
+    const shortCmd = JSON.stringify([NODE, '-e', 'process.exit(0)']);
+    const resC = spawnSync(NODE, [
+      BENCH_CLI, '--cwd', benchCwd, '--cells', 'solo/off', '--reps', '3',
+      '--out', outFile, '--command', shortCmd, '--timeout-ms', '10000',
+    ], { encoding: 'utf8' });
+    assert(resC.status === 0, '(c) forge-resources-bench.js CLI real spawn exits 0 with an injected instant command', `status=${resC.status} stdout=${resC.stdout} stderr=${resC.stderr}`);
+    const lines = fs.readFileSync(outFile, 'utf8').split('\n').filter(Boolean);
+    assert(lines.length === 3, '(c) JSONL has exactly one valid line per corrida — written incrementally (survives interruption by A4 design), never batched at the end', String(lines.length));
+    for (const line of lines) {
+      const rec = JSON.parse(line);
+      assert(rec.cell === 'solo/off', '(c) each JSONL record names its cell', line);
+      assert(rec.status === 'ok', '(c) each corrida of the injected instant command completed ok', line);
+    }
+    const restoredPrefs = fs.readFileSync(prefsPath, 'utf8');
+    assert(restoredPrefs === originalPrefs, '(c) the project-local prefs file is byte-identical to its original content after the bench run — every corrida\'s enforcement write is restored on exit, never left mutated', restoredPrefs);
+
+    // ── (d) T04: anti-silence floor bite — neutered in a COPY only ──────────
+    // (precedent: S04/T04, S05/T04) — copy scripts/ to a tmpdir, mutate ONLY
+    // the copy, spawn the mutated copy's CLI, and prove the floor's absence
+    // produces a false "measured" verdict where the REAL script correctly
+    // reports "inconclusive". The checkout is never edited in place; the
+    // mutation-copy tmpdir is removed in this block's own cleanup (R7 of S05
+    // — the mutation-fixture leak precedent — never repeated).
+    const mutCopyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-mutcopy-'));
+    let mutFixtureRoot = null;
+    try {
+      const mutScriptsDir = path.join(mutCopyRoot, 'scripts');
+      fs.cpSync(SCRIPTS, mutScriptsDir, { recursive: true });
+      const benchPath = path.join(mutScriptsDir, 'forge-resources-bench.js');
+      const originalSrc = fs.readFileSync(benchPath, 'utf8');
+      const originalOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-bench.js'), 'utf8');
+      const target = "if (ok.length === 0) {";
+      assert(originalSrc.includes(target), '(d) precondition: the anti-silence-floor guard line exists verbatim in the copy before mutation', 'guard line not found');
+      const neuteredSrc = originalSrc.replace(target, 'if (false) {');
+      assert(neuteredSrc !== originalSrc, '(d) the floor-neutering replacement actually changed the source (not a no-op substitution)', 'replace() produced no change');
+      fs.writeFileSync(benchPath, neuteredSrc, 'utf8');
+
+      mutFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-mut-fixture-'));
+      const mutOutFile = path.join(mutFixtureRoot, 'bench-out.jsonl');
+      // Zero-ok fixture: the injected command always FAILS, so there are zero
+      // `ok` corridas — exactly the case the anti-silence floor exists to
+      // catch and report as `inconclusive`.
+      const failCmd = JSON.stringify([NODE, '-e', 'process.exit(1)']);
+      const resD = spawnSync(NODE, [
+        path.join(mutScriptsDir, 'forge-resources-bench.js'),
+        '--cwd', mutFixtureRoot, '--cells', 'solo/off', '--reps', '3',
+        '--out', mutOutFile, '--command', failCmd, '--timeout-ms', '10000',
+      ], { encoding: 'utf8' });
+      assert(resD.status === 0, '(d) mutated-copy CLI still exits 0 (the harness never fails hard on a zero-ok cell)', `status=${resD.status} stderr=${resD.stderr}`);
+      assert(!/inconclusive/.test(resD.stdout),
+        '(d) MORDIDA NEGATIVA: with the anti-silence floor neutered, a zero-ok cell no longer reads inconclusive — this is the exact assertion the REAL script satisfies below, proving the floor (not coincidence) is what makes it pass',
+        resD.stdout);
+
+      const stillOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-bench.js'), 'utf8');
+      assert(stillOnDisk === originalOnDisk, '(d) the REAL checkout file is byte-identical before/after this mutation exercise — only the tmp copy was ever written', 'checkout file drifted');
+
+      // Contrast: the REAL (unmutated) script, same zero-ok fixture, DOES read inconclusive.
+      const realFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-real-fixture-'));
+      dirsToClean.push(realFixtureRoot);
+      const realOutFile = path.join(realFixtureRoot, 'bench-out.jsonl');
+      const resReal = spawnSync(NODE, [
+        BENCH_CLI, '--cwd', realFixtureRoot, '--cells', 'solo/off', '--reps', '3',
+        '--out', realOutFile, '--command', failCmd, '--timeout-ms', '10000',
+      ], { encoding: 'utf8' });
+      assert(resReal.status === 0, '(d) real script also exits 0 on the same zero-ok fixture', `status=${resReal.status} stderr=${resReal.stderr}`);
+      assert(/inconclusive/.test(resReal.stdout), '(d) the REAL (unmutated) script correctly reads inconclusive on the same zero-ok fixture — the positive half of the bidirectional bite', resReal.stdout);
+    } finally {
+      try { fs.rmSync(mutCopyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      if (mutFixtureRoot) { try { fs.rmSync(mutFixtureRoot, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    }
+
+    // ── (e) registration: the section verifies it is wired into main() ──────
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeResourcesFlakeAndBenchGuard\(\); \}/.test(mainBody),
+      '(e) Section 110 is registered in main() by closure — an unregistered section vanishes silently');
+  } finally {
+    for (const d of dirsToClean) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
+  pass('Section 110: forge-status --watch SIGINT-after-signal proven by real spawn (T01), forge-verify.js enforcement:off/clamp '
+    + 'contrast proven child-side on the same entry (T03), forge-resources-bench.js CLI proven to write per-corrida JSONL and '
+    + 'restore prefs byte-identical (T04), and the bench anti-silence floor proven to bite bidirectionally via copy-mutation (T04)');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -16771,6 +16995,7 @@ async function main() {
       () => { smokeRewriteCeilingAndE2E(); },
       () => { smokeVerifyReverifyChildSideE2E(); },
       () => { smokeResourcesObservabilityCensus(); },
+      () => { smokeResourcesFlakeAndBenchGuard(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
