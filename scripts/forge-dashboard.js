@@ -113,7 +113,11 @@ function readLedgerTail(cwd, maxEntries) {
   const file = path.join(cwd, '.gsd', 'LEDGER.md');
   if (!fs.existsSync(file)) return [];
   try {
-    const raw = fs.readFileSync(file, 'utf8');
+    // Form A/funnel (S03-FIXSET.json): normalize once at the read — LEDGER.md
+    // is only ever displayed here, never rewritten by this module — so the
+    // `split('\n')` below never leaves a stray CR at the end of a header
+    // line. `/\r\n?/g`, never `/\r\n/g` (a lone CR degrades identically).
+    const raw = fs.readFileSync(file, 'utf8').replace(/\r\n?/g, '\n');
     // LEDGER entries are blocks separated by "## " headers (typical Forge LEDGER format)
     // We just want short summaries — pull header lines and their first non-blank line
     const lines = raw.split('\n');
@@ -140,7 +144,9 @@ function readEventsTail(cwd, milestoneDir, maxLines) {
     const fallback = path.join(cwd, '.gsd', 'forge', 'events.jsonl');
     if (!fs.existsSync(fallback)) return [];
     try {
-      const raw = fs.readFileSync(fallback, 'utf8').trimEnd();
+      // Form A/funnel (S03-FIXSET.json): normalize once at the read —
+      // events.jsonl is never rewritten by this module, only displayed.
+      const raw = fs.readFileSync(fallback, 'utf8').replace(/\r\n?/g, '\n').trimEnd();
       if (!raw) return [];
       return raw.split('\n').slice(-maxLines)
         .map(l => { try { return JSON.parse(l); } catch { return null; } })
@@ -148,7 +154,9 @@ function readEventsTail(cwd, milestoneDir, maxLines) {
     } catch { return []; }
   }
   try {
-    const raw = fs.readFileSync(file, 'utf8').trimEnd();
+    // Form A/funnel (S03-FIXSET.json): same normalization as the fallback
+    // path above.
+    const raw = fs.readFileSync(file, 'utf8').replace(/\r\n?/g, '\n').trimEnd();
     if (!raw) return [];
     return raw.split('\n').slice(-maxLines)
       .map(l => { try { return JSON.parse(l); } catch { return null; } })
@@ -191,7 +199,12 @@ function formatActivityLine(ev, runId) {
   return `- ${icon} [${clock}] ${runId}/${unit} — ${ev.status || ev.event || 'event'}${agent}${summary}`;
 }
 
-function render(cwd) {
+// `eol` is the line ending of the .gsd/STATE.md projection already on disk. This
+// render IS the serialisation regenerate() writes, so joining with LF by decree
+// would re-write every line of a CRLF projection on each regen (D-S03-2). Defaults
+// to LF when there is no file yet — nothing to preserve.
+function render(cwd, eol) {
+  const nl = eol || '\n';
   const now = Date.now();
   const active = runs.listActive(cwd);
   const ledgerEntries = readLedgerTail(cwd, 5);
@@ -257,12 +270,21 @@ function render(cwd) {
     out.push('');
   }
 
-  return out.join('\n');
+  const rendered = out.join(nl);
+  return nl === '\n' ? rendered : rendered.replace(/\r\n?|\n/g, nl);
 }
 
 async function regenerate(cwd, opts) {
   opts = opts || {};
-  const content = render(cwd);
+  // Form B: capture the EOL of the projection already on disk and re-emit it.
+  let existingEol = '\n';
+  try {
+    const prior = fs.readFileSync(path.join(cwd, '.gsd', 'STATE.md'), 'utf8');
+    existingEol = (prior.match(/\r\n|\n|\r/) || ['\n'])[0];
+  } catch {
+    // No projection yet (or unreadable) — LF, the default for a new file.
+  }
+  const content = render(cwd, existingEol);
   if (opts.dryRun) return content;
 
   // A dashboard describes a project's runs; rendering one into a directory

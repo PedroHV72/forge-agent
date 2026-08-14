@@ -40,6 +40,16 @@ function deepEqual(actual, expected) {
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
+// Form A-funnel (S03/T05): every assert below that compares a file's text against
+// an LF literal declared in this file normalizes at the read that owns the text.
+// Without it the comparison is an EOL guard by accident: on a CRLF checkout (or
+// under the EOL differential's CRLF arm) `===` against an LF literal fails for a
+// file whose CONTENT is correct. The five asserts this closes were confirmed
+// flipping by the S01 oracle and are the last EOL residue in this suite.
+function readNormalized(filePath) {
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n?/g, '\n');
+}
+
 // ── Fixtures — real-shaped legacy markdown ──────────────────────────────────
 
 const GLOBAL_MD = `# Forge Agent Preferences
@@ -209,7 +219,7 @@ process.stdout.write('\nmigrateAll — happy path round-trip\n');
   assert(fs.existsSync(path.join(fx.localDir, 'prefs.local.md.bak')), 'local .bak exists');
   assert(!fs.existsSync(path.join(fx.globalDir, 'forge-agent-prefs.md')), 'legacy global md retired after re-verify');
   assert(!fs.existsSync(path.join(fx.localDir, 'prefs.local.md')), 'legacy local md retired after re-verify');
-  assert(fs.readFileSync(path.join(fx.globalDir, 'forge-agent-prefs.md.bak'), 'utf8') === GLOBAL_MD,
+  assert(readNormalized(path.join(fx.globalDir, 'forge-agent-prefs.md.bak')) === GLOBAL_MD,
     '.bak is a byte-identical copy of the legacy md');
 
   // Idempotence: second run is a no-op that never re-reads the .bak.
@@ -327,10 +337,10 @@ process.stdout.write('\nmigrateAll — .bak never overwritten\n');
   fs.writeFileSync(preexisting, 'PRECIOUS OLD BACKUP\n');
   const result = migrateAll(fx.cwd, { globalDir: fx.globalDir, localDir: fx.localDir });
   assert(result.status === 'migrated', 'migration succeeds with pre-existing .bak');
-  assert(fs.readFileSync(preexisting, 'utf8') === 'PRECIOUS OLD BACKUP\n', 'pre-existing .bak untouched');
+  assert(readNormalized(preexisting) === 'PRECIOUS OLD BACKUP\n', 'pre-existing .bak untouched');
   const timestamped = fs.readdirSync(fx.globalDir).filter((f) => /^forge-agent-prefs\.md\.bak-\d+$/.test(f));
   assert(timestamped.length === 1, 'new backup written with .bak-<ts> suffix instead');
-  assert(fs.readFileSync(path.join(fx.globalDir, timestamped[0]), 'utf8') === GLOBAL_MD,
+  assert(readNormalized(path.join(fx.globalDir, timestamped[0])) === GLOBAL_MD,
     'timestamped backup holds the legacy md content');
 }
 
@@ -405,14 +415,14 @@ process.stdout.write('\nT02 — ensureGitignore\n');
     throw new Error('unexpected command');
   };
   const appended = ensureGitignore(cwd, { execFileSync: unignoredGit });
-  assert(appended.action === 'appended' && fs.readFileSync(path.join(cwd, '.gitignore'), 'utf8') === '.gsd/forge-prefs.jsonc\n',
+  assert(appended.action === 'appended' && readNormalized(path.join(cwd, '.gitignore')) === '.gsd/forge-prefs.jsonc\n',
     'git repo with unignored local catalog appends exact .gitignore line');
   fs.writeFileSync(path.join(cwd, '.gitignore'), '.gsd/\n');
   const covered = ensureGitignore(cwd, { execFileSync: (bin, args) => {
     if (args[0] === 'rev-parse' || args[0] === 'check-ignore') return '';
     throw new Error('unexpected command');
   } });
-  assert(covered.action === 'skipped' && covered.reason === 'already-ignored' && fs.readFileSync(path.join(cwd, '.gitignore'), 'utf8') === '.gsd/\n',
+  assert(covered.action === 'skipped' && covered.reason === 'already-ignored' && readNormalized(path.join(cwd, '.gitignore')) === '.gsd/\n',
     'already-covered path skips without touching .gitignore');
   const nonGit = ensureGitignore(cwd, { execFileSync: () => { throw new Error('not git'); } });
   assert(nonGit.action === 'skipped' && nonGit.reason === 'not-git', 'non-git directory skips .gitignore');

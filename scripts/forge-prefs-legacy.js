@@ -253,7 +253,11 @@ function schemaArrayPaths(schema) {
 function legacyReadFile(absPath) {
   let raw;
   try {
-    raw = fs.readFileSync(absPath, 'utf8');
+    // Form A/funnel (S03-FIXSET.json): the legacy .md is a SOURCE only —
+    // forge-prefs-migrate writes a new JSONC catalogue, it never rewrites
+    // this file — so normalize once here at the read. `/\r\n?/g`, never
+    // `/\r\n/g` (a lone CR degrades identically).
+    raw = fs.readFileSync(absPath, 'utf8').replace(/\r\n?/g, '\n');
   } catch {
     return { ok: true, prefs: {}, routingMalformed: false };
   }

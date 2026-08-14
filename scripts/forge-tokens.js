@@ -151,7 +151,7 @@ function truncateAtSectionBoundary(content, budgetChars, opts) {
   // Frontmatter is a --- block at the very top of the document.
   let prefix = '';
   let body = content;
-  const fmMatch = content.match(/^(---\n[\s\S]*?\n---\n?)/);
+  const fmMatch = content.match(/^(---\r?\n[\s\S]*?\r?\n---\r?\n?)/);
   if (fmMatch) {
     prefix = fmMatch[1];
     body = content.slice(prefix.length);
