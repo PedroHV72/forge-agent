@@ -876,6 +876,19 @@ Do NOT read artifact files here — templates now pass paths; workers read their
 
 Use `$MODEL_ID` resolved by Tier Resolution (step 1.5) above. Do NOT look up model from PREFS directly — `model = PREFS.tier_models[tier]` is already computed.
 
+**Heartbeat — record active worker** before dispatching (same block as `forge-auto/SKILL.md § Heartbeat — record active worker`; replicate the form, do not invent another).
+
+Until S01/T02 this skill had **zero** invocations of `forge-runs.js` (measured: `grep -c "forge-runs.js" skills/forge-next/SKILL.md` → `0`), so in step mode `run.worker` was never written and `forge-hook.js::resolveUnitContext` resolved **every** dispatch to `adhoc` — every tool call of every step-mode unit landed in one shared `evidence-…-adhoc.jsonl`. That is cause (a) of IN-2:
+```bash
+_now=$(node -e "process.stdout.write(String(Date.now()))")
+if [ -n "$RUN_ID" ]; then
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"worker\":\"UNIT_TYPE/UNIT_ID\",\"worker_slice\":\"SLICE_ID\",\"worker_started\":$_now,\"last_heartbeat\":$_now,\"active\":true}" > /dev/null || true
+else
+  echo "ℹ worker não registrado: RUN_ID ausente (step mode sem run registrada) — evidence desta unidade cai em adhoc"
+fi
+```
+Replace `UNIT_TYPE/UNIT_ID` with the actual values (e.g. `execute-task/T01`) and `SLICE_ID` with this unit's slice (e.g. `S01`); use `null` **unquoted** when the unit has no slice. Unlike `forge-auto`, step mode does **not** fall back to writing `auto-mode.json`: this skill never activates auto-mode, and asserting `active:true` there would make the statusline (and the handoff check) report an autonomous run that is not happening. An absent `RUN_ID` is announced as a named reason instead.
+
 **Per-unit `CODE_DIR` resolution (multi-repo precondition)** — executable mirror of `shared/forge-dispatch.md § Sidecar dispatch state machine step 0.5` (contract prose lives there, never restated here). Runs HERE because `$PLAN_PATH` is only known per unit — the bootstrap `WORKTREE_DIR` (§ Isolation setup) is derived before any plan exists and stays untouched:
 ```bash
 UNIT_CODE_DIR=""; CODE_DIR_STATUS="shared"; CODE_DIR_REASON=""; CODE_DIR_MULTI_ROOT=""; CODE_DIR_HINT=""
@@ -1293,6 +1306,14 @@ MODEL_APPLIED_JSON=$([ -n "$MODEL_ALIAS" ] && printf '"%s"' "$MODEL_ALIAS" || pr
 # shared/forge-dispatch.md § DISPATCH_VCS prelude (canonical — VCS-agnostic)
 DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
 echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"${unitType}/${unitId}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":${INPUT_TOKENS},\"output_tokens\":${OUTPUT_TOKENS},\"model_applied\":${MODEL_APPLIED_JSON},\"engine\":\"${ENGINE:-claude}\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"vcs\":\"${DISPATCH_VCS:-git}\",\"transport\":\"in-process\"}" >> .gsd/forge/events.jsonl
+```
+
+**Heartbeat — clear worker field** after `Agent()` returns (mirror of `forge-auto/SKILL.md`; keeps the run from advertising a worker that already finished):
+```bash
+_now=$(node -e "process.stdout.write(String(Date.now()))")
+if [ -n "$RUN_ID" ]; then
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"worker\":null,\"worker_slice\":null,\"worker_started\":null,\"last_heartbeat\":$_now,\"active\":true}" > /dev/null || true
+fi
 ```
 
 ### 5. Process result

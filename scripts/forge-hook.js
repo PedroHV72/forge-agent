@@ -34,6 +34,18 @@ try {
   } catch { runs = null; filelock = null; }
 }
 
+// ── Evidence-path module (S01/T01) — same dev/installed dual-path resolution ──
+// Owner of the evidence file-name shape and of the NAMED axis sentinels. A
+// partial install must stay fail-open (MEM008): a null module falls back to the
+// literal sentinel values at the single call site that needs them, so the hook
+// never throws on a user's tool-call path.
+let evidencePath = null;
+try { evidencePath = require(path.join(__dirname, 'scripts', 'forge-evidence-path.js')); }
+catch {
+  try { evidencePath = require(path.join(__dirname, 'forge-evidence-path.js')); }
+  catch { evidencePath = null; }
+}
+
 // ── Resolve context-monitor module — same dev/installed pattern ──
 let ctxMonitor = null;
 try {
@@ -164,23 +176,49 @@ const bumpHeartbeat = (cwd, sessionId) => {
 };
 
 // Resolve unit context for evidence file naming.
-// Multi-run path: { runId, unitId, kind } from run.worker via session_id resolution.
-// Legacy fallback: { runId: null, unitId, kind: null } from auto-mode.json worker.
+//
+// Returns the THREE axes `{ milestone, slice, unit }` (S01/T02) alongside the
+// pre-existing `{ runId, unitId, kind }` — the old fields are kept verbatim so
+// the current file-name call site (:744) keeps working byte-for-byte until T03
+// adopts the composite key. Only the RETURN CONTRACT widens here.
+//
+// An absent milestone/slice axis resolves to the NAMED sentinel exported by
+// forge-evidence-path.js — never `''`. An empty axis spliced into a name
+// produces `evidence--T01.jsonl`, which re-opens exactly the parse ambiguity
+// T01 closed.
+//
+// Both paths (resolved run record, and the auto-mode.json legacy fallback)
+// return all three axes; the fallback has no milestone axis to read from the
+// alias, so it names that absence instead of inventing one.
 const resolveUnitContext = (cwd, sessionId) => {
+  const NO_MS = (evidencePath && evidencePath.SENTINEL_NO_MILESTONE) || '_no-milestone_';
+  const NO_SL = (evidencePath && evidencePath.SENTINEL_NO_SLICE) || '_no-slice_';
   const r = resolveRunForSession(cwd, sessionId);
   if (r) {
     const unit = (r.worker || '').split('/')[1] || 'adhoc';
-    return { runId: r.id, unitId: unit, kind: r.kind };
+    // Only a milestone-kind run's id IS a milestone id. A task run's id is a
+    // task id — naming it "milestone" would be a fabricated axis.
+    const milestone = r.kind === 'milestone' && r.id ? r.id : NO_MS;
+    const slice = r.worker_slice ? r.worker_slice : NO_SL;
+    return { runId: r.id, unitId: unit, kind: r.kind, milestone, slice, unit };
   }
   try {
     const autoFile = path.join(cwd, '.gsd', 'forge', 'auto-mode.json');
     const auto = JSON.parse(fs.readFileSync(autoFile, 'utf8'));
     if (auto && typeof auto.worker === 'string' && auto.worker.length > 0) {
       const parts = auto.worker.split('/');
-      return { runId: null, unitId: parts.length === 2 ? parts[1] : 'adhoc', kind: null };
+      const unit = parts.length === 2 ? parts[1] : 'adhoc';
+      return {
+        runId: null,
+        unitId: unit,
+        kind: null,
+        milestone: NO_MS,
+        slice: auto.worker_slice ? auto.worker_slice : NO_SL,
+        unit,
+      };
     }
   } catch { /* no auto-mode / unreadable → adhoc */ }
-  return { runId: null, unitId: 'adhoc', kind: null };
+  return { runId: null, unitId: 'adhoc', kind: null, milestone: NO_MS, slice: NO_SL, unit: 'adhoc' };
 };
 
 // Read forge_isolation.file_locks pref (default true). Returns boolean.
@@ -377,6 +415,13 @@ const buildSchemaWarning = (res) => {
     'Rode /forge-update ou /forge-doctor --fix --migrate antes de fechar milestone.',
   ].join('\n');
 };
+
+// Testability seam (S01/T02): the hook is a CLI first — `require`-ing it must
+// NOT wire stdin (a listener that never sees `end` would hang the requiring
+// process). Exporting resolveUnitContext lets its three-axis contract be
+// exercised directly instead of asserted through a spawned hook fire.
+module.exports = { resolveUnitContext, sanitizeRunId, resolveRunForSession };
+if (require.main !== module) return;
 
 process.stdin.setEncoding('utf8');
 let raw = '';
