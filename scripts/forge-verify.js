@@ -242,6 +242,167 @@ function discoverCommands(options) {
   return { commands: [], source: "none" };
 }
 
+// ── Resource wiring (S04/T02) ───────────────────────────────────────────────
+//
+// `forge-verify.js` is a THIN consumer (D10) of `forge-resources.js` /
+// `forge-command-rewrite.js` — it computes ZERO worker/heap/ceiling numbers
+// itself. The molde for this shape is `forge-hook.js:731-838` (S03's
+// command-rewrite branch): pure lexical gate first (zero I/O), lazy require
+// of the resolver only for a candidate command, W5 release-on-every-path,
+// and a MEM008 outer guard so a missing/throwing resources module degrades
+// the gate to exactly its pre-wiring behavior — same command, same verdict,
+// process exit 0.
+//
+// D5: nothing here suspends, kills, or reprioritizes an already-running
+// spawn — the clamp only ever shapes the NEXT spawnSync call.
+
+/**
+ * Attempt to acquire a resource-pool lease and a rewritten command for one
+ * verification command. Returns byte-identical passthrough on every failure
+ * mode (module missing, module throws, non-runner command, unrecognized
+ * runner form) — never throws.
+ *
+ * @param {{
+ *   command: string, cwd: string, timeoutMs: number, session?: string,
+ *   gsdDir?: string|null,
+ *   requireResources?: () => object, requireCommandRewrite?: () => object,
+ * }} opts
+ * @returns {{ command: string, env: object|null, handle: object|null, resourcesMod: object|null }}
+ */
+function acquireClampForCommand(opts) {
+  const passthrough = { command: opts.command, env: null, handle: null, resourcesMod: null };
+  let rewriteMod;
+  try {
+    rewriteMod = typeof opts.requireCommandRewrite === "function"
+      ? opts.requireCommandRewrite()
+      : require("./forge-command-rewrite.js");
+  } catch {
+    // Module missing/broken — fail-open, zero lease attempted (MEM008).
+    return passthrough;
+  }
+
+  try {
+    if (typeof rewriteMod.looksLikeRunnerCommand !== "function" ||
+        !rewriteMod.looksLikeRunnerCommand(opts.command)) {
+      // Pure lexical gate says "not a candidate" — no require of the
+      // resolver, no lease taken (mirrors forge-hook.js B1).
+      appendResourceEvent(opts.cwd, opts.gsdDir, "resource-clamp-skipped", {
+        reason: "intact:not-runner-command",
+      });
+      return passthrough;
+    }
+  } catch {
+    return passthrough;
+  }
+
+  // Candidate command — require the resolver lazily (fail-open if missing).
+  let resourcesMod;
+  try {
+    resourcesMod = typeof opts.requireResources === "function"
+      ? opts.requireResources()
+      : require("./forge-resources.js");
+    if (!resourcesMod || typeof resourcesMod.acquireCommandBudget !== "function" ||
+        typeof resourcesMod.releaseCommandBudget !== "function") {
+      throw new Error("forge-resources.js missing acquireCommandBudget/releaseCommandBudget");
+    }
+  } catch {
+    return passthrough;
+  }
+
+  let handle = null;
+  try {
+    const contract = resourcesMod.acquireCommandBudget({
+      cwd: opts.cwd,
+      commandTimeoutMs: opts.timeoutMs,
+      session: opts.session,
+    });
+    if (contract && contract.pool && contract.pool.handle &&
+        Array.isArray(contract.pool.handle.slots) && contract.pool.handle.slots.length) {
+      handle = contract.pool.handle;
+    }
+
+    const plan = rewriteMod.planRewrite(opts.command, contract, { cwd: opts.cwd });
+
+    if (plan.outcome !== "rewritten") {
+      // Unrecognized/refused form — release immediately (W5, non-error
+      // intact path) and run the original command byte-identical.
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.cwd }); } catch { /* MEM008 */ }
+      }
+      appendResourceEvent(opts.cwd, opts.gsdDir, "resource-clamp-skipped", {
+        reason: `intact:${plan.reason}`,
+      });
+      return passthrough;
+    }
+
+    // Overlay: NODE_OPTIONS is never overwritten if the parent already
+    // defines it — a human's choice always wins (same rule S03 conceded
+    // three times, R3/R4).
+    const overlay = {};
+    let nodeOptionsReason = null;
+    let rewrittenCommand = plan.command;
+    if (process.env.NODE_OPTIONS) {
+      nodeOptionsReason = "node-options-preserved-parent-defined";
+      // forge-command-rewrite.js's vitest env-prefix embeds a LITERAL
+      // `NODE_OPTIONS='...'` assignment directly in the rewritten command
+      // STRING (not just spawnSync's `env` option) — a shell-level
+      // per-command env assignment on the command line always wins over
+      // the inherited/spawnSync-passed environment (`sh -c "NODE_OPTIONS=X
+      // cmd"` sets NODE_OPTIONS=X for that exec regardless of what env was
+      // passed in). Neutralizing the embedded assignment is the only way
+      // this module (D10: it never reimplements forge-command-rewrite.js's
+      // rewrite decision, it only refuses to let ITS OWN wiring override a
+      // parent-defined NODE_OPTIONS) can honor the truth above for the
+      // vitest runner. jest/playwright rewrite via argv flags only — they
+      // never touch NODE_OPTIONS, so this is a no-op for them.
+      if (plan.runner === "vitest") {
+        rewrittenCommand = rewrittenCommand.replace(/NODE_OPTIONS='[^']*' /, "");
+      }
+    } else {
+      overlay.NODE_OPTIONS = "--max-old-space-size=" + contract.heapMb;
+    }
+
+    appendResourceEvent(opts.cwd, opts.gsdDir, "resource-clamp-applied", {
+      reason: plan.reason,
+      runner: plan.runner,
+      workers: contract.workers,
+      ...(nodeOptionsReason ? { node_options_reason: nodeOptionsReason } : {}),
+    });
+
+    return { command: rewrittenCommand, env: overlay, handle, resourcesMod };
+  } catch {
+    // W5: release-on-error — a lease acquired above MUST be released here
+    // before falling through with the command byte-identical.
+    if (handle) {
+      try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.cwd }); } catch { /* MEM008 */ }
+    }
+    return passthrough;
+  }
+}
+
+/**
+ * Best-effort event append for the resource-clamp wiring, mirroring the
+ * owner-resolution used by the CLI's `verify` event (never plants `.gsd/`
+ * in a repo that doesn't own the run). Silent-fail (MEM008) — event
+ * logging never affects the gate's verdict.
+ */
+function appendResourceEvent(cwd, gsdDirOpt, kind, payload) {
+  try {
+    const cwdAbs = resolve(cwd);
+    const ownerGsd = gsdDirOpt ? resolve(gsdDirOpt) : null;
+    const ownerRoot = ownerGsd ? dirname(ownerGsd) : resolveOwner(cwdAbs);
+    const eventsDir = ownerGsd ? join(ownerGsd, "forge")
+                    : ownerRoot ? join(ownerRoot, ".gsd", "forge")
+                    : null;
+    if (!eventsDir) return;
+    mkdirSync(eventsDir, { recursive: true });
+    const line = JSON.stringify({ ts: new Date().toISOString(), kind, ...payload });
+    appendFileSync(join(eventsDir, "events.jsonl"), line + "\n", "utf-8");
+  } catch {
+    /* MEM008 — silent-fail */
+  }
+}
+
 // ── Failure Context ───────────────────────────────────────────────────────────
 
 /**
@@ -318,17 +479,63 @@ function runVerificationGate(options) {
   for (const command of commands) {
     const start = Date.now();
 
+    // Resource wiring (S04/T02, D10 zero sizing rules here): fail-open,
+    // byte-identical passthrough when the resolver is unavailable, not a
+    // candidate, or refuses to rewrite.
+    let commandToRun = command;
+    let overlay = null;
+    let leaseHandle = null;
+    let leaseMod = null;
+    try {
+      const clamp = acquireClampForCommand({
+        command,
+        cwd: options.cwd,
+        timeoutMs,
+        session: options.session,
+        gsdDir: options.gsdDir,
+        requireResources: options.requireResources,
+        requireCommandRewrite: options.requireCommandRewrite,
+      });
+      commandToRun = clamp.command;
+      overlay = clamp.env;
+      leaseHandle = clamp.handle;
+      leaseMod = clamp.resourcesMod;
+    } catch {
+      // Outer MEM008 guard — acquireClampForCommand already fails open
+      // internally, but a caller-side surprise never escapes to the spawn.
+      commandToRun = command;
+      overlay = null;
+      leaseHandle = null;
+      leaseMod = null;
+    }
+
     // Platform branch hardcoded — no user-controlled shell binary
     const shellBin = process.platform === "win32" ? "cmd" : "sh";
-    const shellArgs = process.platform === "win32" ? ["/c", command] : ["-c", command];
+    const shellArgs = process.platform === "win32" ? ["/c", commandToRun] : ["-c", commandToRun];
 
-    // shell: false — explicit argv binary + args (avoids Node DEP0190, prevents injection)
-    const result = spawnSync(shellBin, shellArgs, {
-      cwd: options.cwd,  // --cwd is a spawnSync option, never shell-interpolated
-      stdio: "pipe",
-      encoding: "utf-8",
-      timeout: timeoutMs,
-    });
+    // env: explicit process.env + overlay (additive at this established
+    // call site — before S04 this option was absent, inheriting
+    // process.env by Node default; that default is preserved verbatim,
+    // only the overlay is new).
+    const env = overlay ? { ...process.env, ...overlay } : process.env;
+
+    let result;
+    try {
+      // shell: false — explicit argv binary + args (avoids Node DEP0190, prevents injection)
+      result = spawnSync(shellBin, shellArgs, {
+        cwd: options.cwd,  // --cwd is a spawnSync option, never shell-interpolated
+        stdio: "pipe",
+        encoding: "utf-8",
+        timeout: timeoutMs,
+        env,
+      });
+    } finally {
+      // W5: released on EVERY exit path of this spawn — success, failure,
+      // timeout, or spawnSync throwing outright.
+      if (leaseHandle && leaseMod && typeof leaseMod.releaseCommandBudget === "function") {
+        try { leaseMod.releaseCommandBudget(leaseHandle, { cwd: options.cwd }); } catch { /* MEM008 */ }
+      }
+    }
 
     const durationMs = Date.now() - start;
 
@@ -509,6 +716,7 @@ if (require.main === module) {
       preferenceCommands: preferenceCommands.length > 0 ? preferenceCommands : undefined,
       taskPlanVerify: taskPlanVerify || undefined,
       commandTimeoutMs: timeoutMs,
+      gsdDir,
     });
     const duration = Date.now() - startTime;
 
