@@ -15886,6 +15886,243 @@ async function smokeResourcePool() {
     + 'always present and pool absent without the opts.pool seam — all via real CLI/process spawns');
 }
 
+// ── Section 107: S03/T04 — B1 latency ceiling, E2E child-side equivalence, census ──
+// Section number MEASURED at execution time (`grep -nE "^// ── Section
+// [0-9]+" scripts/forge-smoke.js | tail`), not assumed: 106 was the real max
+// (T03's S02 section) at authoring time. Never require()s forge-hook.js —
+// every mordida spawns the real hook CLI as a child process, the same
+// boundary forge-hook-rewrite.test.js (T03) crosses. FORGE_RESOURCE_POOL_DIR
+// always points at a temp pool — the real ~/.claude/forge/resource-pool is
+// never touched.
+function smokeRewriteCeilingAndE2E() {
+  process.stdout.write('\n▸ Section 107: B1 latency ceiling, child-side E2E equivalence, census sum\n');
+  const NODE = process.execPath;
+  const HOOK = path.join(SCRIPTS, 'forge-hook.js');
+  const rewriteMod = require(path.join(SCRIPTS, 'forge-command-rewrite.js'));
+
+  function tmpWorkspace(prefix) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
+    return dir;
+  }
+  function runPre(cmd, { cwd, env = {}, sessionId } = {}) {
+    const payload = { session_id: sessionId || 'sess-107', cwd, tool_name: 'Bash', tool_input: { command: cmd } };
+    const r = spawnSync(NODE, [HOOK, 'pre'], {
+      input: JSON.stringify(payload), encoding: 'utf8', cwd: cwd || os.tmpdir(),
+      env: Object.assign({}, process.env, env),
+    });
+    return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+  }
+  function readEvents(cwd) {
+    const p = path.join(cwd, '.gsd', 'forge', 'events.jsonl');
+    try { return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
+    catch { return []; }
+  }
+  function releaseBridge(sessionId, poolDir) {
+    const bridgeFile = path.join(os.tmpdir(), `forge-rewrite-grant-${String(sessionId).replace(/[^\w.\-]/g, '_')}.json`);
+    if (!fs.existsSync(bridgeFile)) return;
+    try {
+      const bridge = JSON.parse(fs.readFileSync(bridgeFile, 'utf8'));
+      const poolMod = require(path.join(SCRIPTS, 'forge-resource-pool.js'));
+      poolMod.releaseSlots(bridge.grant.slots, { poolDir });
+    } catch { /* best-effort test hygiene */ }
+    try { fs.unlinkSync(bridgeFile); } catch { /* ignore */ }
+  }
+
+  // ── (a) B1 ceiling — 10,000 calls of looksLikeRunnerCommand over a 20-command,
+  // representative NON-runner corpus, MEASURED (never asserted a made-up
+  // number), ceiling declared here: < 200 ms total for the 10,000-call loop.
+  const corpus = [
+    'ls -la', 'git status', 'cat package.json', 'node scripts/x.js', 'curl https://example.com',
+    'echo hello', 'pwd', 'mkdir -p tmp', 'rm -rf tmp', 'cp a b', 'mv a b', 'grep -n foo bar.js',
+    'find . -name "*.js"', 'sed -n "1,5p" file.txt', 'awk "{print $1}" file.txt', 'chmod +x script.sh',
+    'python3 script.py', 'go build ./...', 'docker ps', 'kubectl get pods',
+  ];
+  const iterations = 10000;
+  const t0 = Date.now();
+  for (let i = 0; i < iterations; i += 1) {
+    rewriteMod.looksLikeRunnerCommand(corpus[i % corpus.length]);
+  }
+  const measuredMs = Date.now() - t0;
+  const CEILING_MS = 200;
+  process.stdout.write(`  measured: ${iterations} calls over a ${corpus.length}-command non-runner corpus took ${measuredMs}ms (declared ceiling: ${CEILING_MS}ms)\n`);
+  assert(measuredMs < CEILING_MS, `(a) B1 in-process ceiling: ${iterations} looksLikeRunnerCommand calls over a ${corpus.length}-command corpus complete in under ${CEILING_MS}ms`, `measured ${measuredMs}ms`);
+
+  // ── (b) B1 outside-the-process direction — a real spawned hook process on a
+  // non-runner command performs ZERO fs/pool operations: empty stdout AND the
+  // temp pool directory has zero entries afterward (I/O-free short-circuit
+  // observed from OUTSIDE the process, not by inspecting require.cache).
+  const bDir = tmpWorkspace('smoke107-b-');
+  const bPool = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke107-b-pool-'));
+  try {
+    const res = runPre('git status', { cwd: bDir, env: { FORGE_RESOURCE_POOL_DIR: bPool } });
+    assert(res.status === 0, '(b) non-runner command (git status) is allowed', String(res.status));
+    assert(res.stdout === '', '(b) non-runner command emits no rewrite stdout', res.stdout);
+    const poolEntries = fs.existsSync(bPool) ? fs.readdirSync(bPool) : [];
+    assert(poolEntries.length === 0, '(b) temp pool dir remains untouched (zero slot files created) for a non-candidate command', JSON.stringify(poolEntries));
+  } finally {
+    try { fs.rmSync(bDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(bPool, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  // ── (c)-(f) E2E child-side equivalence — real fixture, real npm, real spawned
+  // dump shims. `sh -c <updatedInput.command>` executes the hook's OWN output
+  // string against a fixture whose "vitest"/"jest" node_modules/.bin shims
+  // dump their argv+env to a file — proving hook-output → executed-child
+  // equivalence without spending claude tokens (the claude-honors-updatedInput
+  // half was proven once, live, in T02 and is cited here, not re-run).
+  const fixture = tmpWorkspace('smoke107-fixture-');
+  const cPool = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke107-fixture-pool-'));
+  try {
+    fs.writeFileSync(path.join(fixture, 'package.json'), JSON.stringify({
+      name: 'smoke107-fixture', version: '1.0.0', scripts: { test: 'vitest', testjest: 'jest' },
+    }), 'utf8');
+    fs.writeFileSync(path.join(fixture, 'package-lock.json'), JSON.stringify({ name: 'smoke107-fixture', version: '1.0.0', lockfileVersion: 3 }), 'utf8');
+    const binDir = path.join(fixture, 'node_modules', '.bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const shimSrc = [
+      '#!/usr/bin/env node',
+      "const fs = require('fs');",
+      'fs.writeFileSync(process.env.DUMP_FILE, JSON.stringify({',
+      '  argv: process.argv.slice(2),',
+      '  env: {',
+      '    VITEST_MAX_FORKS: process.env.VITEST_MAX_FORKS || null,',
+      '    VITEST_MAX_THREADS: process.env.VITEST_MAX_THREADS || null,',
+      '    NODE_OPTIONS: process.env.NODE_OPTIONS || null,',
+      '  },',
+      '}));',
+      '',
+    ].join('\n');
+    for (const bin of ['vitest', 'jest']) {
+      const binPath = path.join(binDir, bin);
+      fs.writeFileSync(binPath, shimSrc, 'utf8');
+      fs.chmodSync(binPath, 0o755);
+    }
+
+    let candidatesSent = 0;
+
+    // (c) recognized: `npm test` → rewritten (env-prefix path, vitest) — dump
+    // shows the clamped VITEST_MAX_FORKS/VITEST_MAX_THREADS/NODE_OPTIONS.
+    const dumpA = path.join(fixture, 'dump-a.json');
+    const sessA = 'sess-107-a';
+    const resA = runPre('npm test', { cwd: fixture, sessionId: sessA, env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resA.status === 0, '(c) recognized npm-test payload: hook exits 0', String(resA.status));
+    candidatesSent += 1;
+    const linesA = resA.stdout.trim().split('\n').filter(Boolean);
+    assert(linesA.length === 1, '(c) recognized path: exactly one stdout JSON line', resA.stdout);
+    let parsedA = null;
+    try { parsedA = JSON.parse(linesA[0]); } catch { /* asserted below */ }
+    assert(!!(parsedA && parsedA.hookSpecificOutput && parsedA.hookSpecificOutput.updatedInput), '(c) recognized path: updatedInput.command present', resA.stdout);
+    if (parsedA) {
+      const rewritten = parsedA.hookSpecificOutput.updatedInput.command;
+      const forksMatch = /VITEST_MAX_FORKS='(\d+)'/.exec(rewritten);
+      const heapMatch = /--max-old-space-size=(\d+)/.exec(rewritten);
+      assert(!!forksMatch, '(c) rewritten command carries a VITEST_MAX_FORKS env prefix', rewritten);
+      if (forksMatch && heapMatch) {
+        const exec = spawnSync('/bin/sh', ['-c', rewritten], {
+          cwd: fixture, encoding: 'utf8', env: Object.assign({}, process.env, { DUMP_FILE: dumpA }),
+        });
+        assert(exec.status === 0, '(c) executing the hook-emitted command via sh -c exits 0', `status=${exec.status} stderr=${exec.stderr}`);
+        let dumpA_ = null;
+        try { dumpA_ = JSON.parse(fs.readFileSync(dumpA, 'utf8')); } catch { /* asserted below */ }
+        assert(!!dumpA_, '(c) fixture shim wrote its argv/env dump', String(fs.existsSync(dumpA)));
+        if (dumpA_) {
+          assert(dumpA_.env.VITEST_MAX_FORKS === forksMatch[1], '(c) child process observed the SAME clamped VITEST_MAX_FORKS the hook emitted (child-side equivalence)', JSON.stringify(dumpA_.env));
+          assert(dumpA_.env.NODE_OPTIONS && dumpA_.env.NODE_OPTIONS.includes(`--max-old-space-size=${heapMatch[1]}`), '(c) child process observed the SAME NODE_OPTIONS heap clamp the hook emitted', JSON.stringify(dumpA_.env));
+        }
+      }
+      const events = readEvents(fixture);
+      assert(events.some((e) => e.event === 'rewrite-applied'), '(c) rewrite-applied event recorded for the recognized payload', JSON.stringify(events));
+    }
+    releaseBridge(sessA, cPool);
+
+    // (d) intact/skip: a DIRECT vitest invocation with an explicit --shard is
+    // left intact (never overrides a human choice, T03's shipped "intact"
+    // semantics) — no stdout, byte-identical (branch never touches the
+    // string), rewrite-skipped event present with a named enum reason.
+    const sessD = 'sess-107-d';
+    const resD = runPre('vitest run --shard=1/2', { cwd: fixture, sessionId: sessD, env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resD.status === 0, '(d) intact/skip payload: hook exits 0', String(resD.status));
+    assert(resD.stdout === '', '(d) intact/skip payload: no updatedInput emission — command stays byte-identical', resD.stdout);
+    candidatesSent += 1;
+    releaseBridge(sessD, cPool);
+
+    // (e) chain: `true && npm run testjest` — only the npm-run segment is a
+    // runner candidate (T03's shipped chain semantics); rewritten to append
+    // the jest argv flag after `--`. Dump shows the clamped --maxWorkers flag.
+    const dumpE = path.join(fixture, 'dump-e.json');
+    const sessE = 'sess-107-e';
+    const resE = runPre('true && npm run testjest', { cwd: fixture, sessionId: sessE, env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resE.status === 0, '(e) chain payload: hook exits 0', String(resE.status));
+    candidatesSent += 1;
+    let parsedE = null;
+    try { parsedE = JSON.parse(resE.stdout.trim().split('\n').filter(Boolean)[0]); } catch { /* asserted below */ }
+    assert(!!(parsedE && parsedE.hookSpecificOutput && parsedE.hookSpecificOutput.updatedInput), '(e) chain payload: updatedInput.command present for the rewritten segment', resE.stdout);
+    if (parsedE) {
+      const rewrittenE = parsedE.hookSpecificOutput.updatedInput.command;
+      const workersMatch = /--maxWorkers=(\d+)/.exec(rewrittenE);
+      assert(!!workersMatch, '(e) chain rewrite carries a --maxWorkers argv flag (jest, via npm -- forwarding)', rewrittenE);
+      if (workersMatch) {
+        const execE = spawnSync('/bin/sh', ['-c', rewrittenE], {
+          cwd: fixture, encoding: 'utf8', env: Object.assign({}, process.env, { DUMP_FILE: dumpE }),
+        });
+        assert(execE.status === 0, '(e) executing the chain-rewritten command via sh -c exits 0 (the `true` segment ran too)', `status=${execE.status} stderr=${execE.stderr}`);
+        let dumpE_ = null;
+        try { dumpE_ = JSON.parse(fs.readFileSync(dumpE, 'utf8')); } catch { /* asserted below */ }
+        assert(!!dumpE_, '(e) fixture jest shim wrote its argv/env dump', String(fs.existsSync(dumpE)));
+        if (dumpE_) {
+          assert(dumpE_.argv.includes(`--maxWorkers=${workersMatch[1]}`), '(e) child process observed the SAME clamped --maxWorkers the hook emitted (child-side equivalence)', JSON.stringify(dumpE_.argv));
+        }
+      }
+    }
+    releaseBridge(sessE, cPool);
+
+    // (f) literal subshell: `(npm test)` fails tokenization entirely — the B1
+    // lexical gate returns false BEFORE planRewrite is ever reached, so this
+    // is NOT a "candidate" (S03-PLAN Notes: commands that fail the lexical
+    // gate emit nothing from the pre-hook). Deliberately excluded from
+    // `candidatesSent` below — its zero-event, zero-stdout outcome is the
+    // proof, not an omission.
+    const resF = runPre('(npm test)', { cwd: fixture, sessionId: 'sess-107-f', env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resF.status === 0, '(f) syntactically-refused subshell command is allowed through unrewritten', String(resF.status));
+    assert(resF.stdout === '', '(f) subshell command emits no rewrite stdout — byte-identical, branch never engaged', resF.stdout);
+
+    // ── (g) census (W3): rewrite-applied + rewrite-skipped events sum EXACTLY
+    // to the number of LEXICAL-GATE-CANDIDATE payloads sent — no remainder.
+    // The subshell (f) is excluded by construction (never a candidate); a
+    // full reconciliation against the PostToolUse evidence log (which
+    // records 100% of Bash calls, including non-candidates) is S05's
+    // `--check resources` per S03-PLAN Notes — this section asserts only the
+    // candidate half.
+    const finalEvents = readEvents(fixture).filter((e) => e.event === 'rewrite-applied' || e.event === 'rewrite-skipped');
+    assert(finalEvents.length === candidatesSent, `(g) census: rewrite-applied + rewrite-skipped events sum EXACTLY to the ${candidatesSent} candidate payloads sent, no remainder`, JSON.stringify(finalEvents));
+
+    // ── (h) self-bite — FORGE_REWRITE_FAULT='emission' (existing seam, T03)
+    // deliberately breaks the recognized path AFTER tokenizer/resolver/pool
+    // succeed: the emitted command must fall back byte-identical (no
+    // VITEST_MAX_FORKS prefix), proving this section's own assertions are
+    // sensitive to a broken rewrite path, not tautological.
+    const sessH = 'sess-107-h';
+    const resH = runPre('npm test', { cwd: fixture, sessionId: sessH, env: { FORGE_RESOURCE_POOL_DIR: cPool, FORGE_REWRITE_FAULT: 'emission' } });
+    assert(resH.status === 0, '(h) self-bite: faulted emission stage still exits 0', String(resH.status));
+    assert(resH.stdout === '', '(h) self-bite: faulted emission stage emits NO rewrite stdout — falls through byte-identical', resH.stdout);
+    releaseBridge(sessH, cPool);
+  } finally {
+    try { fs.rmSync(fixture, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(cPool, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  // ── (i) registration: the section verifies it is wired into main() ───────
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeRewriteCeilingAndE2E\(\); \}/.test(mainBody),
+    '(i) Section 107 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass(`Section 107: B1 ceiling measured at ${measuredMs}ms/${iterations} calls (< ${CEILING_MS}ms), outside-process zero-pool-I/O `
+    + 'proven, real npm+sh -c child-side equivalence for env-prefix (vitest) and argv-flag (jest via chain) rewrites, '
+    + 'census sums exactly to candidates sent, and a faulted emission stage falls back byte-identical (self-bite)');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -16007,6 +16244,7 @@ async function main() {
       () => { smokeScriptsCallSitesCanonical(); },
       () => { smokeResourcesFoundation(); },
       async () => { await smokeResourcePool(); },
+      () => { smokeRewriteCeilingAndE2E(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
