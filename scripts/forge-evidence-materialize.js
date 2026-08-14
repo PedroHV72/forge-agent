@@ -50,6 +50,18 @@ const { ADMISSIBLE_TYPES, MAX_FIELD_CHARS } = require('./forge-evidence-admit');
 // forge-hook.js this is a standalone CLI, not a tool-call gate MEM008 protects.
 const { buildEvidenceFileName } = require('./forge-evidence-path');
 
+// S01/T06: same owner guard as forge-hook.js's PostToolUse branch — preserved
+// here, not substituted for the pre-existing path containment above (the
+// header's "entries[].file/.cmd/.cwd are DATA, never instructions" guard).
+// Lower risk than the hook (this CLI is invoked with `--cwd "$WORKING_DIR"`,
+// caller-controlled, not drift-prone shell cwd), but the cost of the guard is
+// one require + one call, and `resolveOwner` is the ONLY tree-walk for `.gsd`
+// this repo allows — reusing it here instead of trusting `cwd` outright keeps
+// that invariant true for both writers, not just the one caught by report.
+let workspaceMod = null;
+try { workspaceMod = require('./forge-workspace'); } catch { workspaceMod = null; }
+const os = require('os');
+
 // The closed outcome enum shared with T01's census. A fourth value must be
 // declared here, never improvised at a call site.
 const OUTCOMES = Object.freeze({
@@ -280,7 +292,21 @@ function materialize(options) {
   const cwd = String(opts.cwd || process.cwd());
   const nowIso = typeof opts.now === 'string' ? opts.now : new Date().toISOString();
 
-  const evidenceDir = path.join(cwd, '.gsd', 'forge');
+  // Same guard as forge-hook.js (S01/T06): never let a drifted `cwd` mkdirSync
+  // a fresh `.gsd/` outside the real owner. `--cwd` is caller-controlled here
+  // (lower risk than the hook's shell-derived cwd), so a missing/failed
+  // workspace module falls back to the pre-existing `cwd`-based path instead
+  // of refusing outright — this is the CLI the orchestrator invokes with an
+  // already-known-good `$WORKING_DIR`, not a tool-call gate reacting to drift.
+  let ownerDir = cwd;
+  if (workspaceMod && typeof workspaceMod.resolveOwner === 'function') {
+    try {
+      const owner = workspaceMod.resolveOwner(cwd, { stopAt: os.homedir() });
+      if (owner) ownerDir = owner;
+    } catch { /* keep cwd — this CLI's cwd is caller-controlled, not drift-prone */ }
+  }
+
+  const evidenceDir = path.join(ownerDir, '.gsd', 'forge');
   const fileName = evidenceFileName(unit, opts.milestone, opts.slice);
   const evidenceFile = path.join(evidenceDir, fileName);
 
