@@ -11,7 +11,12 @@
 //   Q1 — is `updatedInput` honored WITHOUT `permissionDecision: 'allow'`,
 //        preserving the normal permission flow?
 //   Q2 — with `permissionDecision: 'allow'` alongside `updatedInput`, is the
-//        rewrite honored AND the permission prompt bypassed?
+//        rewrite honored under `--dangerously-skip-permissions`? (R6: this
+//        variant ALSO passes `--dangerously-skip-permissions`, so it can only
+//        establish "rewrite honored under allow" — it does NOT, and cannot,
+//        establish that `allow` itself caused any permission-prompt bypass.
+//        That half is unmeasured by this probe; do not read Q2's result as
+//        evidence of a bypass.)
 //   Q3 — does a malformed `hookSpecificOutput` cause the ORIGINAL command to
 //        run (doc says: non-blocking error on schema-invalid stdout, exit 0)?
 //
@@ -67,7 +72,10 @@ function runCli() {
         skipPermissions: false,
       },
       {
-        name: 'updatedInput-with-allow',
+        // R6: this variant measures "rewrite honored under allow", NOT
+        // "allow bypassed the permission prompt" — skipPermissions is true
+        // here, so no bypass claim is measurable from this result.
+        name: 'updatedInput-with-allow-under-skip-permissions',
         question: 'Q2',
         hookVariant: 'allow',
         skipPermissions: true,
@@ -91,6 +99,18 @@ function runCli() {
 
   for (const v of verdicts) {
     console.log(JSON.stringify(v));
+  }
+
+  // R8: a total auth/API/environment failure can pass the earlier
+  // `claude --version` check (unauthenticated) yet leave every variant with
+  // `bash_ran: false` (no dump ever written) — nothing was measured. The
+  // header promises exit 1 on an environment failure that prevented
+  // measurement; honor that here instead of exiting 0 on three null
+  // verdicts.
+  const anyMeasured = verdicts.some((v) => v.bash_ran);
+  if (!anyMeasured) {
+    console.error(JSON.stringify({ status: 'blocked', reason: 'no-variant-produced-a-dump' }));
+    process.exit(1);
   }
 
   process.exit(0);
@@ -161,7 +181,7 @@ function buildWorkspace(workspace) {
       PreToolUse: [
         {
           matcher: 'Bash',
-          hooks: [{ type: 'command', command: `node ${JSON.stringify(hookPath).slice(1, -1)}` }],
+          hooks: [{ type: 'command', command: `node ${JSON.stringify(hookPath)}` }],
         },
       ],
     },

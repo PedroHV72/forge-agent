@@ -46,18 +46,40 @@ function test(name, fn) {
   }
 }
 
+// R12: per-run mkdtemp dirs (workspace + pool) are the unbounded-growth
+// concern (bridge FILES do not accumulate — fixed names overwrite, that is
+// R10's fix, not this one). Track every dir created so the suite can remove
+// them all on exit instead of leaving each `fhrewrite-*`/`fhrewrite-pool-*`
+// tmpdir behind forever.
+const createdDirs = [];
+
 function tmpWorkspace() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fhrewrite-'));
   fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
+  createdDirs.push(dir);
   return dir;
 }
 
 function tmpPoolDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fhrewrite-pool-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fhrewrite-pool-'));
+  createdDirs.push(dir);
+  return dir;
+}
+
+function cleanupCreatedDirs() {
+  for (const dir of createdDirs) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+function tmpTrackedDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  createdDirs.push(dir);
+  return dir;
 }
 
 function runPre(stdinObj, { cwd, env = {}, sessionId } = {}) {
-  const payload = Object.assign({ session_id: sessionId || 'sess-1', cwd }, stdinObj);
+  const payload = Object.assign({ session_id: sessionId || crypto.randomUUID(), cwd }, stdinObj);
   const result = spawnSync(process.execPath, [HOOK_PATH, 'pre'], {
     input: JSON.stringify(payload),
     encoding: 'utf8',
@@ -68,7 +90,7 @@ function runPre(stdinObj, { cwd, env = {}, sessionId } = {}) {
 }
 
 function runPost(stdinObj, { cwd, env = {}, sessionId } = {}) {
-  const payload = Object.assign({ session_id: sessionId || 'sess-1', cwd }, stdinObj);
+  const payload = Object.assign({ session_id: sessionId || crypto.randomUUID(), cwd }, stdinObj);
   const result = spawnSync(process.execPath, [HOOK_PATH, 'post'], {
     input: JSON.stringify(payload),
     encoding: 'utf8',
@@ -118,7 +140,7 @@ test('guard ordering: git push --force is blocked, not rewritten (no rewrite eve
 test('B1: non-runner command (ls) writes ZERO rewrite-stage counter lines', () => {
   const cwd = tmpWorkspace();
   const poolDir = tmpPoolDir();
-  const counterFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fhrewrite-ctr-')), 'counters.txt');
+  const counterFile = path.join(tmpTrackedDir('fhrewrite-ctr-'), 'counters.txt');
   const res = bashPre('ls -la', {
     cwd,
     env: { FORGE_RESOURCE_POOL_DIR: poolDir, FORGE_REWRITE_TEST_COUNTERS: counterFile },
@@ -131,7 +153,7 @@ test('B1: non-runner command (ls) writes ZERO rewrite-stage counter lines', () =
 test('B1: a real runner candidate DOES reach the resolver/pool stages (control — proves the shim itself works)', () => {
   const cwd = tmpWorkspace();
   const poolDir = tmpPoolDir();
-  const counterFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fhrewrite-ctr-')), 'counters.txt');
+  const counterFile = path.join(tmpTrackedDir('fhrewrite-ctr-'), 'counters.txt');
   const res = bashPre('vitest run', {
     cwd,
     env: { FORGE_RESOURCE_POOL_DIR: poolDir, FORGE_REWRITE_TEST_COUNTERS: counterFile },
@@ -166,33 +188,45 @@ test('W5: fault at stage "pool" (after acquire, before rewrite) releases the lea
   const cwd = tmpWorkspace();
   const poolDir = tmpPoolDir();
   const poolMod = require('./forge-resource-pool.js');
+  // R10: a fixed session id ('sess-1') keys a bridge file in the SHARED
+  // os.tmpdir() namespace — two concurrent suite invocations (e.g. two
+  // worktrees, this milestone's own premise) would find/release each
+  // other's bridge. randomUUID() plus explicit cleanup below closes that.
+  const sessionId = crypto.randomUUID();
+  const bridgeFile = bridgePathFor(sessionId);
 
-  // First call with no fault: acquire+rewrite normally to learn the ceiling
-  // via a real grant, then release it so the pool is back to full capacity.
-  const baseline = bashPre('vitest run', { cwd, env: { FORGE_RESOURCE_POOL_DIR: poolDir } });
-  assert.strictEqual(baseline.status, 0);
-  // Drain the bridge (simulate Claude running the rewritten command) so the
-  // lease from the baseline call is released and doesn't pollute the count.
-  const bridgeFile = bridgePathFor('sess-1');
-  if (fs.existsSync(bridgeFile)) {
-    const bridge = JSON.parse(fs.readFileSync(bridgeFile, 'utf8'));
-    poolMod.releaseSlots(bridge.grant.slots, { poolDir });
-    fs.unlinkSync(bridgeFile);
+  try {
+    // First call with no fault: acquire+rewrite normally to learn the
+    // ceiling via a real grant, then release it so the pool is back to full
+    // capacity.
+    const baseline = bashPre('vitest run', { cwd, sessionId, env: { FORGE_RESOURCE_POOL_DIR: poolDir } });
+    assert.strictEqual(baseline.status, 0);
+    // Drain the bridge (simulate Claude running the rewritten command) so
+    // the lease from the baseline call is released and doesn't pollute the
+    // count.
+    if (fs.existsSync(bridgeFile)) {
+      const bridge = JSON.parse(fs.readFileSync(bridgeFile, 'utf8'));
+      poolMod.releaseSlots(bridge.grant.slots, { poolDir });
+      fs.unlinkSync(bridgeFile);
+    }
+    const statusBefore = poolMod.poolStatus({ poolDir });
+
+    // Second call: fault AFTER pool acquire (stage 'pool') — must release
+    // before falling through.
+    const faulted = bashPre('vitest run', {
+      cwd,
+      sessionId,
+      env: { FORGE_RESOURCE_POOL_DIR: poolDir, FORGE_REWRITE_FAULT: 'pool' },
+    });
+    assert.strictEqual(faulted.status, 0);
+    assert.strictEqual(faulted.stdout, '', 'faulted call emits no rewrite stdout');
+
+    const statusAfter = poolMod.poolStatus({ poolDir });
+    assert.strictEqual(statusAfter.held, statusBefore.held,
+      'pool held-slot count is restored after the faulted acquire — release-on-error worked (W5)');
+  } finally {
+    try { fs.unlinkSync(bridgeFile); } catch { /* may not exist */ }
   }
-  const statusBefore = poolMod.poolStatus({ poolDir });
-
-  // Second call: fault AFTER pool acquire (stage 'pool') — must release
-  // before falling through.
-  const faulted = bashPre('vitest run', {
-    cwd,
-    env: { FORGE_RESOURCE_POOL_DIR: poolDir, FORGE_REWRITE_FAULT: 'pool' },
-  });
-  assert.strictEqual(faulted.status, 0);
-  assert.strictEqual(faulted.stdout, '', 'faulted call emits no rewrite stdout');
-
-  const statusAfter = poolMod.poolStatus({ poolDir });
-  assert.strictEqual(statusAfter.held, statusBefore.held,
-    'pool held-slot count is restored after the faulted acquire — release-on-error worked (W5)');
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -244,17 +278,33 @@ test('rewritten path: PostToolUse with a NON-matching command (Claude ignored th
   const cwd = tmpWorkspace();
   const poolDir = tmpPoolDir();
   const sessionId = 'sess-rewrite-2';
-  const res = bashPre('jest', { cwd, sessionId, env: { FORGE_RESOURCE_POOL_DIR: poolDir } });
-  assert.strictEqual(res.status, 0);
   const bridgeFile = bridgePathFor(sessionId);
-  assert.ok(fs.existsSync(bridgeFile), 'bridge persisted after rewrite');
+  try {
+    const res = bashPre('jest', { cwd, sessionId, env: { FORGE_RESOURCE_POOL_DIR: poolDir } });
+    assert.strictEqual(res.status, 0);
+    assert.ok(fs.existsSync(bridgeFile), 'bridge persisted after rewrite');
 
-  const post = runPost(
-    { tool_name: 'Bash', tool_input: { command: 'jest' } }, // the ORIGINAL, not the rewritten command
-    { cwd, sessionId, env: { FORGE_RESOURCE_POOL_DIR: poolDir } }
-  );
-  assert.strictEqual(post.status, 0);
-  assert.ok(fs.existsSync(bridgeFile), 'bridge left in place on mismatch — never deleted, never released here (TTL reap only)');
+    const post = runPost(
+      { tool_name: 'Bash', tool_input: { command: 'jest' } }, // the ORIGINAL, not the rewritten command
+      { cwd, sessionId, env: { FORGE_RESOURCE_POOL_DIR: poolDir } }
+    );
+    assert.strictEqual(post.status, 0);
+    assert.ok(fs.existsSync(bridgeFile), 'bridge left in place on mismatch — never deleted, never released here (TTL reap only)');
+  } finally {
+    // R12: this test deliberately produces a bridge that the branch under
+    // test never releases (that IS the assertion — TTL reap only, which
+    // never runs here since the pool is never reopened). Release + delete
+    // it ourselves so the leaked lease and the fixture file don't survive
+    // past this test.
+    try {
+      if (fs.existsSync(bridgeFile)) {
+        const poolMod = require('./forge-resource-pool.js');
+        const bridge = JSON.parse(fs.readFileSync(bridgeFile, 'utf8'));
+        poolMod.releaseSlots(bridge.grant.slots, { poolDir });
+        fs.unlinkSync(bridgeFile);
+      }
+    } catch { /* best-effort */ }
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -312,7 +362,7 @@ test('permission hazard: a dangerous non-benign chain segment (rm -rf <path> && 
 // ═══════════════════════════════════════════════════════════════════════
 
 test('absent forge-command-rewrite.js module → branch is inert, command passes intact, exit 0', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fhrewrite-noshim-'));
+  const dir = tmpTrackedDir('fhrewrite-noshim-');
   const scriptsDir = path.join(dir, 'scripts');
   fs.mkdirSync(scriptsDir, { recursive: true });
   // Copy every scripts/*.js EXCEPT forge-command-rewrite.js into an isolated
@@ -337,6 +387,8 @@ test('absent forge-command-rewrite.js module → branch is inert, command passes
   assert.strictEqual(result.status, 0, 'inert branch still exits 0');
   assert.strictEqual(result.stdout, '', 'no rewrite stdout when the module is absent');
 });
+
+cleanupCreatedDirs();
 
 console.log(`\n${passed + failed} assertions/tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) {

@@ -16019,8 +16019,15 @@ function smokeRewriteCeilingAndE2E() {
       const heapMatch = /--max-old-space-size=(\d+)/.exec(rewritten);
       assert(!!forksMatch, '(c) rewritten command carries a VITEST_MAX_FORKS env prefix', rewritten);
       if (forksMatch && heapMatch) {
-        const exec = spawnSync('/bin/sh', ['-c', rewritten], {
-          cwd: fixture, encoding: 'utf8', env: Object.assign({}, process.env, { DUMP_FILE: dumpA }),
+        // R11: this suite is measured on win32 too — `/bin/sh` does not exist
+        // there. Reuse the same resolvePosixSh() the mock-codex shim already
+        // uses (:2033-2034), prepending its `bin` to the child PATH.
+        const { sh: shA, bin: shBinA } = resolvePosixSh();
+        const envA = shBinA
+          ? Object.assign({}, process.env, { DUMP_FILE: dumpA, PATH: shBinA + path.delimiter + (process.env.PATH || '') })
+          : Object.assign({}, process.env, { DUMP_FILE: dumpA });
+        const exec = spawnSync(shA, ['-c', rewritten], {
+          cwd: fixture, encoding: 'utf8', env: envA,
         });
         assert(exec.status === 0, '(c) executing the hook-emitted command via sh -c exits 0', `status=${exec.status} stderr=${exec.stderr}`);
         let dumpA_ = null;
@@ -16063,8 +16070,12 @@ function smokeRewriteCeilingAndE2E() {
       const workersMatch = /--maxWorkers=(\d+)/.exec(rewrittenE);
       assert(!!workersMatch, '(e) chain rewrite carries a --maxWorkers argv flag (jest, via npm -- forwarding)', rewrittenE);
       if (workersMatch) {
-        const execE = spawnSync('/bin/sh', ['-c', rewrittenE], {
-          cwd: fixture, encoding: 'utf8', env: Object.assign({}, process.env, { DUMP_FILE: dumpE }),
+        const { sh: shE, bin: shBinE } = resolvePosixSh();
+        const envE = shBinE
+          ? Object.assign({}, process.env, { DUMP_FILE: dumpE, PATH: shBinE + path.delimiter + (process.env.PATH || '') })
+          : Object.assign({}, process.env, { DUMP_FILE: dumpE });
+        const execE = spawnSync(shE, ['-c', rewrittenE], {
+          cwd: fixture, encoding: 'utf8', env: envE,
         });
         assert(execE.status === 0, '(e) executing the chain-rewritten command via sh -c exits 0 (the `true` segment ran too)', `status=${execE.status} stderr=${execE.stderr}`);
         let dumpE_ = null;

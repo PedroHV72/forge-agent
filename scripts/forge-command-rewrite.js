@@ -68,6 +68,7 @@ const TOKENIZE_REFUSAL_REASONS = Object.freeze({
   UNTERMINATED_QUOTE: 'tokenize-refused:unterminated-quote',
   EMPTY_OR_INVALID: 'tokenize-refused:empty-or-invalid',
   EMPTY_SEGMENT: 'tokenize-refused:empty-segment',
+  VARIABLE_EXPANSION: 'tokenize-refused:variable-expansion',
 });
 
 // ── Frozen enum: planRewrite outcome reasons (rewritten:* / intact:*) ──────
@@ -148,13 +149,11 @@ function tokenizeCommand(cmd) {
 
     if (c === '$') {
       if (cmd[i + 1] === '(') return { ok: false, reason: TOKENIZE_REFUSAL_REASONS.COMMAND_SUBSTITUTION, at: i };
-      // Bare $VAR outside quotes does not change the tokenizer's structural
-      // decisions (chain segmentation, word boundaries) — kept as a literal
-      // word character. Only `$(` (command substitution) is unprovable.
-      if (wordStart === -1) wordStart = i;
-      wordBuf += c;
-      i += 1;
-      continue;
+      // Bare $VAR outside quotes is unprovable: its expanded value is
+      // invisible to hasExplicitConcurrency, so a generated concurrency flag
+      // could silently override a human's explicit choice hidden inside the
+      // variable (R3). Refuse rather than treat as a literal word character.
+      return { ok: false, reason: TOKENIZE_REFUSAL_REASONS.VARIABLE_EXPANSION, at: i };
     }
 
     if (c === '(' || c === ')') return { ok: false, reason: TOKENIZE_REFUSAL_REASONS.SUBSHELL, at: i };
@@ -246,7 +245,18 @@ function classifySegment(segTokens) {
     if (rest.length < 2) return { kind: 'unrecognized' };
     const name = basenameLike(unquoteSimple(rest[1].raw));
     if (RUNNER_BIN_RE.test(name)) {
-      return { kind: 'direct', runner: name.replace(/\.(cmd|exe)$/i, '').toLowerCase(), tokens: segTokens, headToken: segTokens[0], subToken: rest[1] };
+      const runner = name.replace(/\.(cmd|exe)$/i, '').toLowerCase();
+      // `npx playwright <anything>` is only a test run when the `test`
+      // subcommand follows — same requirement the bare-`playwright` branch
+      // below already applies (R5). `npx playwright install ...` is not a
+      // test invocation and must not be mutated.
+      if (runner === 'playwright') {
+        if (rest.length >= 3 && unquoteSimple(rest[2].raw) === 'test') {
+          return { kind: 'direct', runner, tokens: segTokens, headToken: segTokens[0], subToken: rest[2] };
+        }
+        return { kind: 'unrecognized' };
+      }
+      return { kind: 'direct', runner, tokens: segTokens, headToken: segTokens[0], subToken: rest[1] };
     }
     return { kind: 'unrecognized' };
   }
@@ -294,8 +304,16 @@ function looksLikeRunnerCommand(cmd) {
 
 // ── Explicit-flag / shard detection (never override a human choice) ───────
 const EXPLICIT_CONCURRENCY_RE = /^(--workers=|--maxWorkers=|maxWorkers=|VITEST_MAX_FORKS=|VITEST_MAX_THREADS=)/;
+// Space-separated flag forms (`--maxWorkers 2`, `--workers 2`) are also
+// explicit human choices — both jest (yargs) and playwright (commander)
+// accept this form, and missing it duplicates the generated flag (R4).
+const EXPLICIT_CONCURRENCY_SPACE_RE = /^(--workers|--maxWorkers)$/;
 function hasExplicitConcurrency(tokens) {
-  return tokens.some((t) => EXPLICIT_CONCURRENCY_RE.test(unquoteSimple(t.raw)));
+  return tokens.some((t, idx) => {
+    const raw = unquoteSimple(t.raw);
+    if (EXPLICIT_CONCURRENCY_RE.test(raw)) return true;
+    return EXPLICIT_CONCURRENCY_SPACE_RE.test(raw) && idx + 1 < tokens.length;
+  });
 }
 function hasVitestShard(tokens) {
   return tokens.some((t) => /^--shard(=|$)/.test(unquoteSimple(t.raw)));
@@ -376,6 +394,14 @@ function rewriteManagerSegment(classification, budget, { cwd, readScript }) {
   if (!bodyTokenized.ok) {
     return { rewritten: false, reason: REWRITE_REASON_CODES.INTACT_SCRIPT_UNRESOLVABLE };
   }
+  // A multi-segment script body (`"test": "jest && cleanup"`) is unprovable:
+  // npm/pnpm/yarn append the forwarded flag to the END of the whole script
+  // string, which can land on a LATER segment (e.g. `cleanup`), not the
+  // runner segment being classified here (R2). Only a single-segment body
+  // is safe to rewrite.
+  if (bodyTokenized.segments.length !== 1) {
+    return { rewritten: false, reason: REWRITE_REASON_CODES.INTACT_SCRIPT_UNRESOLVABLE };
+  }
   const bodySeg = bodyTokenized.segments[0] || [];
   const bodyClassification = classifySegment(bodySeg);
   if (bodyClassification.kind !== 'direct') {
@@ -407,10 +433,13 @@ function rewriteManagerSegment(classification, budget, { cwd, readScript }) {
     const flag = runner === 'jest' ? `--maxWorkers=${budget.workers}` : `--workers=${budget.playwrightWorkers}`;
     // Per-manager `--` rule (research W2, S03-PLAN Notes): npm ALWAYS needs
     // `--` to forward args; yarn NEVER needs it; pnpm only for the literal
-    // `test` script (pnpm/pnpm#5522, #4821). Driven by the REPO's detected
-    // manager (resolvePackageManager), not by the literal binary named in
-    // the command string — an unknown manager already returned intact above.
-    const needsDashDash = pmInfo.manager === 'npm' || (pmInfo.manager === 'pnpm' && classification.scriptName === 'test');
+    // `test` script (pnpm/pnpm#5522, #4821). Forwarding syntax is a property
+    // of the binary that actually parses argv — the LITERAL invoked manager
+    // (`classification.manager`), not the repo's detected lockfile manager
+    // (`pmInfo.manager`), which can disagree (R1: `npm run e2e` in a
+    // pnpm-lock repo gets no `--` if keyed on the detected manager, npm
+    // swallows the flag as config, and the runner runs uncapped).
+    const needsDashDash = classification.manager === 'npm' || (classification.manager === 'pnpm' && classification.scriptName === 'test');
     const text = needsDashDash ? ` -- ${flag}` : ` ${flag}`;
     const reason = runner === 'jest' ? REWRITE_REASON_CODES.REWRITTEN_JEST_ARGV : REWRITE_REASON_CODES.REWRITTEN_PLAYWRIGHT_ARGV;
     return { rewritten: true, runner, insertions: [{ at: lastOuter.end, text }], reason };
