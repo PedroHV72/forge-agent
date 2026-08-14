@@ -7,12 +7,15 @@
 //   checkProjectionVersioned(cwd) // (cwd?) → { ok, tracked: string[], skipped?: string, message }
 //   checkPlanRepoDeclared(cwd)  // (cwd?) → { ok, plans: string[], skipped?: string, message }  (advisory)
 //   checkWorkspaceConsistency(cwd) // (cwd?) → { ok: true, workspaces, divergentCount, skipped?, message }  (advisory, D3)
+//   checkResources(cwd, options)   // (cwd?, { platform?, poolDir? }?) → { ok: true, verdict?, pool?, census?, skipped?, message }  (advisory)
 //
 // CLI:
 //   node forge-doctor.js --check schema [--cwd <dir>]
 //   node forge-doctor.js --check projection-versioned [--cwd <dir>]
 //   node forge-doctor.js --check plan-repo-declared [--cwd <dir>]
 //   node forge-doctor.js --check workspace-consistency [--cwd <dir>]
+//   node forge-doctor.js --check run-overlap [--cwd <dir>]
+//   node forge-doctor.js --check resources [--cwd <dir>]
 //   node forge-doctor.js --check all [--cwd <dir>]
 //   node forge-doctor.js --fix [--cwd <dir>]
 //   node forge-doctor.js --regen-projection [--cwd <dir>]
@@ -23,6 +26,7 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
@@ -39,7 +43,7 @@ const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 // Single source of truth for the check names this CLI accepts via `--check`.
 // `runCheck` dispatches these; the unknown-check message and `--help` text
 // must both be derived from this array — never hand-repeated.
-const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap'];
+const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap', 'resources'];
 
 // ── checkSchema ───────────────────────────────────────────────────────────────
 /**
@@ -441,6 +445,94 @@ function checkRunOverlap(cwd) {
   };
 }
 
+// ── checkResources ───────────────────────────────────────────────────────────
+/**
+ * Advisory guard (S05/T02): surfaces the S05/T01 census plus a LIVE read of
+ * current resource pressure and pool occupancy, in the shape of every other
+ * check on this CLI (molde: `checkRunOverlap`). This function does not decide
+ * anything about admission/sizing (CONTEXT D10) — it consumes
+ * `forge-resources-census.js` (T01), `resolveResourceBudget` (forge-resources.js)
+ * and `poolStatus` (forge-resource-pool.js) and formats what they already
+ * computed.
+ *
+ * `noEvents: true` is passed to `resolveResourceBudget` deliberately — this
+ * diagnostic runs the resolver LIVE to report current pressure, and without
+ * `noEvents` every invocation of this check would append a `resource-admission`
+ * event, contaminating the very census it reports (S05-PLAN.md § "O diagnóstico
+ * não pode poluir o log que audita"). Proven by a byte-identical events.jsonl
+ * before/after test.
+ *
+ * ALWAYS `ok: true` — resource pressure/pool/census here is advisory
+ * information, never a failure. `--check all` never turns red because of this
+ * check, including when the census verdict is `degraded`.
+ *
+ * @param {string} [cwd] - Working directory (default: process.cwd())
+ * @param {object} [options] - `{ platform, poolDir }` — both forwarded for
+ *   test injection (forced platform degradation, isolated pool root).
+ * @returns {{ ok: true, verdict?: string, skipped?: string, message: string }}
+ */
+function checkResources(cwd, options) {
+  const dir = cwd || process.cwd();
+  const opts = options || {};
+
+  try {
+    const { resolveResourceBudget } = require('./forge-resources.js');
+    const { poolStatus } = require('./forge-resource-pool.js');
+    const {
+      collectResourceEvents, buildCensus, reconcileW3, formatCensus,
+    } = require('./forge-resources-census.js');
+
+    // (a) Live pressure — noEvents:true so the diagnostic never contaminates
+    // the very stream it audits.
+    const contract = resolveResourceBudget({ cwd: dir, noEvents: true, platform: opts.platform });
+
+    const aggregateMb = contract.workers * contract.heapMb;
+    const totalMb = Math.round(os.totalmem() / (1024 * 1024));
+
+    const pressureLines = [
+      `forge-doctor: pressão viva — reason=${contract.reason} nível=${contract.pressureLevel === null ? 'n/a' : contract.pressureLevel}`
+      + ` workers=${contract.workers} heapMb=${contract.heapMb} playwrightWorkers=${contract.playwrightWorkers}`
+      + ` enforcement=${contract.enforcement} fonte=${contract.source}`
+      + `${contract.maxConcurrentClamp !== undefined ? ` clamp=${contract.maxConcurrentClamp}` : ''}`,
+      `  heap agregado: ${aggregateMb} MB (workers × heapMb) vs RAM ${totalMb} MB`
+      + `${contract.shadowWait && contract.shadowWait.triggered ? ' · shadow-wait ativo' : ''}`,
+    ];
+
+    // (b) Pool occupancy.
+    const pool = poolStatus({ poolDir: opts.poolDir });
+    const poolLine = pool.ok
+      ? `  pool: ceiling=${pool.ceiling} held=${pool.held} free=${pool.free}`
+      + ` (${(pool.slots || []).filter((s) => s.state === 'held').length} held-observados)`
+      : `  pool: ${pool.reason}`;
+
+    // (c) T01 census + W3 reconciliation.
+    const collected = collectResourceEvents(dir, {});
+    const census = buildCensus(collected);
+    census.w3 = reconcileW3(dir, collected, {});
+
+    const message = [...pressureLines, poolLine, formatCensus(census)].join('\n');
+
+    return {
+      ok: true, // advisory — never fails `--check all`, including verdict === 'degraded'
+      verdict: census.verdict,
+      pool: pool.ok ? { ceiling: pool.ceiling, held: pool.held, free: pool.free } : { reason: pool.reason },
+      census: {
+        events_scanned: census.events_scanned,
+        resource_events: census.resource_events,
+        degraded_count: census.degraded_count,
+        skipped: census.skipped.length,
+      },
+      message,
+    };
+  } catch (e) {
+    return {
+      ok: true, // advisory — an internal error here still must not fail `--check all`
+      skipped: `error: ${e.message}`,
+      message: `forge-doctor: erro ao diagnosticar recursos (${e.message}) — advisory, não bloqueia.`,
+    };
+  }
+}
+
 // ── module.exports ────────────────────────────────────────────────────────────
 module.exports = {
   CURRENT_SCHEMA,
@@ -451,6 +543,7 @@ module.exports = {
   checkCapabilities,
   checkWorkspaceConsistency,
   checkRunOverlap,
+  checkResources,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -510,6 +603,12 @@ function runCheck(name, cwd, options = {}) {
       // Advisory: `r.ok` is always true, so this never flips `allOk` — a
       // cross-run overlap must never fail `--check all`.
       if (!r.ok) allOk = false;
+    } else if (c === 'resources') {
+      const r = checkResources(cwd, options);
+      results.push({ check: c, ...r });
+      // Advisory: `r.ok` is always true, so this never flips `allOk` — live
+      // pressure/pool/census here must never fail `--check all`.
+      if (!r.ok) allOk = false;
     } else {
       process.stderr.write(`forge-doctor: unknown check "${c}". Valid: ${VALID_CHECKS.join(', ')}, all\n`);
       process.exit(2);
@@ -524,7 +623,8 @@ function formatResults(results) {
   for (const r of results) {
     const advisoryWarn = (r.check === 'plan-repo-declared' && Array.isArray(r.plans) && r.plans.length > 0)
       || (r.check === 'workspace-consistency' && r.divergentCount > 0)
-      || (r.check === 'run-overlap' && r.verdict === 'overlap');
+      || (r.check === 'run-overlap' && r.verdict === 'overlap')
+      || (r.check === 'resources' && r.verdict === 'degraded');
     const icon = advisoryWarn ? '⚠' : (r.ok ? '✓' : '✗');
     const label = r.check === 'schema' ? 'Layer 2 — Schema version'
       : r.check === 'review-model-drift' ? 'Advisory — Review model drift'
@@ -532,6 +632,7 @@ function formatResults(results) {
       : r.check === 'capabilities' ? 'Runtime — Capabilities'
       : r.check === 'workspace-consistency' ? 'Advisory — Workspace registry × marker consistency'
       : r.check === 'run-overlap' ? 'Advisory — Cross-run overlap'
+      : r.check === 'resources' ? 'Advisory — Resource control'
       : 'Layer 3 — Projection versioned';
     lines.push(`  ${icon} ${label}`);
     lines.push(`    ${r.message}`);
@@ -695,7 +796,11 @@ Exit codes:
   }
 
   if (args.check) {
-    const { allOk, results } = runCheck(args.check, cwdArg, { runtime: args.runtime });
+    const { allOk, results } = runCheck(args.check, cwdArg, {
+      runtime: args.runtime,
+      platform: typeof args.platform === 'string' ? args.platform : undefined,
+      poolDir: typeof args['pool-dir'] === 'string' ? args['pool-dir'] : undefined,
+    });
     if (args.json) {
       process.stdout.write(`${JSON.stringify({ ok: allOk, results })}\n`);
       process.exit(allOk ? 0 : 1);
