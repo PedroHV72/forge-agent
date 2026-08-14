@@ -211,6 +211,62 @@ const truncate = (s, max) => {
   return s.length <= max ? s : s.slice(0, max) + '…';
 };
 
+// ── S03/T03: PreToolUse Bash command-rewrite branch helpers ────────────────
+// (`forge-command-rewrite.js` + `forge-resources.js` lazy-required below, dual
+// dev/installed path — same idiom as `runs`/`filelock` at the top of the
+// file.) Kept as small standalone helpers so the branch body reads linearly.
+
+// Dual-path lazy require: dev (sibling under scripts/) then installed
+// (~/.claude/<name>). Returns null (never throws) on total absence — an
+// absent module means the branch is inert (T01 key_links contract).
+function requireDualPath(name) {
+  try { return require(path.join(__dirname, 'scripts', name)); }
+  catch {
+    try { return require(path.join(__dirname, name)); }
+    catch { return null; }
+  }
+}
+
+// Test-only counting shim (B1 proof). Inert unless FORGE_REWRITE_TEST_COUNTERS
+// is set — never touched in production. Each call appends one line naming the
+// stage reached, so a test can assert ZERO lines were written for a
+// non-candidate command (the lexical gate short-circuited before any of
+// these fs/pool/resolver checkpoints ran).
+function recordRewriteStage(stage) {
+  const counterFile = process.env.FORGE_REWRITE_TEST_COUNTERS;
+  if (!counterFile) return;
+  try { fs.appendFileSync(counterFile, stage + '\n', 'utf8'); } catch { /* MEM008 */ }
+}
+
+// Test-only fault injection (B2 proof). FORGE_REWRITE_FAULT names the stage
+// ('tokenizer'|'resolver'|'pool'|'emission') to synthetically fail at — a
+// seam honored ONLY under this env var, same pattern as
+// FORGE_RESOURCES_PRESSURE (S01) / the fixedNow clock injection (S02).
+// Production never sets this var, so the throws below never fire outside a
+// test process.
+function rewriteFaultStage() {
+  return process.env.FORGE_REWRITE_FAULT || '';
+}
+
+// Bridge file path — grant persisted so the PostToolUse Bash branch can
+// release the lease it took here (W5). Keyed by session_id so concurrent
+// sessions on the same box never collide.
+function rewriteBridgePath(sessionId) {
+  return path.join(os.tmpdir(), `forge-rewrite-grant-${sanitizeRunId(sessionId || 'nosession')}.json`);
+}
+
+// Best-effort append to .gsd/forge/events.jsonl — same append idiom as
+// appendPrefsBlockedEvent above. Never throws (MEM008); silently a no-op if
+// the repo has no .gsd/forge yet.
+function appendRewriteEvent(cwd, eventName, fields) {
+  try {
+    const forgeDir = path.join(cwd, '.gsd', 'forge');
+    if (!fs.existsSync(forgeDir)) return;
+    const event = Object.assign({ ts: new Date().toISOString(), event: eventName }, fields || {});
+    fs.appendFileSync(path.join(forgeDir, 'events.jsonl'), JSON.stringify(event) + '\n', 'utf8');
+  } catch { /* MEM008 */ }
+}
+
 // Forge workers below have a machine-readable return contract consumed by the
 // orchestration skills.  Claude Code's SubagentStop hook can repair a missing
 // contract in-place: blocking the first stop feeds the reason back to the SAME
@@ -672,6 +728,117 @@ process.stdin.on('end', () => {
         }
       }
 
+      // ── Command-rewrite branch (S03/T03) ───────────────────────────────────
+      // Runs only when nothing above blocked the command (guard ordering,
+      // T03 truth #1: a blocked command is NEVER rewritten). B1: the lexical
+      // gate (`looksLikeRunnerCommand`, pure string, zero I/O) short-circuits
+      // BEFORE any fs/spawnSync/prefs/pool/resolver work — the resolver
+      // module isn't even required for a non-candidate command. B2/MEM008:
+      // this entire branch is wrapped so ANY exception at ANY stage
+      // (tokenizer, resolver, pool acquire, emission serialization) falls
+      // through with the command byte-identical, hook exit 0, no stdout
+      // rewrite emission — this branch blocks NOTHING, ever (unlike the
+      // guards above, which `exit(2)`). This branch NEVER emits
+      // `permissionDecision` — T02 measured `updatedInput` is honored
+      // without it in the headless path `forge-hook.js` runs in
+      // (T02-SUMMARY Answer 1), so the permission-widening hazard (S03-PLAN
+      // Notes) never arises: no chain segment is ever auto-allowed here.
+      if (!blockMessage && toolName === 'Bash') {
+        try {
+          const cmd = toolInput.command || '';
+          const rewriteMod = requireDualPath('forge-command-rewrite.js');
+          if (rewriteMod && typeof rewriteMod.looksLikeRunnerCommand === 'function') {
+            const fault = rewriteFaultStage();
+            const isCandidate = rewriteMod.looksLikeRunnerCommand(cmd);
+            // Synthetic tokenizer-stage fault (test-only, B2 proof) — thrown
+            // AFTER the real (successful) gate call, simulating a tokenizer
+            // failure downstream of the pure check without touching T01's
+            // module. Never reachable without FORGE_REWRITE_FAULT set.
+            if (fault === 'tokenizer') throw new Error('forced-fault:tokenizer');
+            if (isCandidate) {
+              let acquiredHandle = null;
+              let resourcesMod = null;
+              try {
+                recordRewriteStage('resolver-require');
+                resourcesMod = requireDualPath('forge-resources.js');
+                if (fault === 'resolver') throw new Error('forced-fault:resolver');
+                if (resourcesMod && typeof resourcesMod.acquireCommandBudget === 'function') {
+                  recordRewriteStage('resolver-acquire');
+                  // TTL derives from tool_input.timeout per S02's
+                  // deriveSlotTtlMs contract (forge-resource-pool.js) — this
+                  // branch performs zero sizing math itself (D10).
+                  const contract = resourcesMod.acquireCommandBudget({
+                    cwd,
+                    commandTimeoutMs: toolInput.timeout,
+                    session: sessionId,
+                  });
+                  if (contract && contract.pool && contract.pool.handle &&
+                      Array.isArray(contract.pool.handle.slots) && contract.pool.handle.slots.length) {
+                    acquiredHandle = contract.pool.handle;
+                  }
+                  if (fault === 'pool') throw new Error('forced-fault:pool');
+
+                  const plan = rewriteMod.planRewrite(cmd, contract, { cwd });
+                  if (plan.outcome === 'rewritten') {
+                    if (fault === 'emission') throw new Error('forced-fault:emission');
+                    if (acquiredHandle) {
+                      const cmdHash = require('crypto').createHash('sha256').update(plan.command).digest('hex');
+                      try {
+                        recordRewriteStage('bridge-write');
+                        fs.writeFileSync(rewriteBridgePath(sessionId), JSON.stringify({
+                          cmdHash,
+                          grant: acquiredHandle,
+                          ts: Date.now(),
+                        }), 'utf8');
+                      } catch { /* MEM008 — bridge write is best-effort */ }
+                    }
+                    appendRewriteEvent(cwd, 'rewrite-applied', {
+                      runner: plan.runner,
+                      workers: contract.workers,
+                      heapMb: contract.heapMb,
+                    });
+                    // Single-stdout invariant: this is the ONLY stdout write
+                    // of the pre invocation on this path. No
+                    // permissionDecision field (see comment above the
+                    // branch).
+                    process.stdout.write(JSON.stringify({
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse',
+                        updatedInput: { command: plan.command },
+                      },
+                    }));
+                    return;
+                  }
+                  // outcome === 'intact': release any lease taken above
+                  // immediately (W5 — non-error intact path).
+                  if (acquiredHandle) {
+                    try {
+                      recordRewriteStage('release-intact');
+                      resourcesMod.releaseCommandBudget(acquiredHandle, { cwd });
+                    } catch { /* MEM008 */ }
+                  }
+                  appendRewriteEvent(cwd, 'rewrite-skipped', { reason: plan.reason });
+                }
+              } catch (innerErr) {
+                // W5: release-on-error — a lease acquired above MUST be
+                // released here, BEFORE falling through with the command
+                // intact. Never re-throw; the outer catch would still
+                // degrade safely, but releasing here (not there) is what
+                // the leaked-lease test asserts against.
+                if (acquiredHandle && resourcesMod && typeof resourcesMod.releaseCommandBudget === 'function') {
+                  try {
+                    recordRewriteStage('release-error');
+                    resourcesMod.releaseCommandBudget(acquiredHandle, { cwd });
+                  } catch { /* MEM008 */ }
+                }
+                // Fall through — command proceeds byte-identical, no stdout
+                // rewrite emission (B2).
+              }
+            }
+          }
+        } catch { /* MEM008 — top-level guard: command proceeds byte-identical */ }
+      }
+
       if (blockMessage) {
         process.stdout.write(blockMessage + '\n');
         process.exit(2);
@@ -717,6 +884,31 @@ process.stdin.on('end', () => {
           fs.appendFileSync(evidenceFile, serialized + '\n', 'utf8');
         }
       } catch { /* silent-fail — hook must never crash Claude Code (MEM008) */ }
+    }
+
+    // ── PostToolUse: release the command-rewrite bridge (S03/T03, W5) ──────
+    // If a Pre invocation rewrote this command it left a bridge keyed by
+    // session_id with the sha256 of the REWRITTEN command. Match here means
+    // Claude actually ran the rewritten command (releasing the lease it
+    // consumed). A mismatch — or no bridge at all — means either this isn't
+    // a rewrite candidate, or Claude ignored the rewrite (T02 Q3 case): left
+    // untouched for TTL reap, never counted as a release success.
+    if (phase === 'post' && toolName === 'Bash') {
+      try {
+        const bridgePath = rewriteBridgePath(sessionId);
+        const bridgeRaw = fs.readFileSync(bridgePath, 'utf8');
+        const bridge = JSON.parse(bridgeRaw);
+        const executedHash = require('crypto').createHash('sha256').update(toolInput.command || '').digest('hex');
+        if (bridge && bridge.cmdHash === executedHash) {
+          const resourcesMod = requireDualPath('forge-resources.js');
+          if (resourcesMod && typeof resourcesMod.releaseCommandBudget === 'function') {
+            resourcesMod.releaseCommandBudget(bridge.grant, { cwd });
+          }
+          try { fs.unlinkSync(bridgePath); } catch { /* MEM008 */ }
+        }
+        // Mismatch: leave the bridge in place for TTL reap — do not delete,
+        // do not release (the rewritten command never actually ran).
+      } catch { /* no bridge, unreadable, or release failure — MEM008 no-op */ }
     }
 
     // ── PostToolUse: proactive context monitor (writes additionalContext, never blocks) ──
