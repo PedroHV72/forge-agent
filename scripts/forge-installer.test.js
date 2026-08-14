@@ -294,5 +294,109 @@ test('Claude 3.1.4 fixture is versioned with prefs, Markdown, hooks, templates a
   assert.match(fs.readFileSync(path.join(fixtureRoot, 'forge-agent-prefs.jsonc'), 'utf8'), /fixture_version/);
 });
 
+// ── The summary names what it left behind ───────────────────────────────────
+// A bare "Conflicts preserved: N" is why this drift stays invisible: the
+// operator learns that N destinations were skipped but not WHICH, so a stale
+// file on the hook execution path reads exactly like a stale file nobody loads.
+// Measured: an `--update` that reported success left ~/.claude/forge-hook.js
+// frozen several releases back, and finding it took a byte-compare against repo
+// history instead of reading the summary.
+test('preserved conflicts are named, not just counted', () => {
+  const data = fixture();
+  try {
+    installer.install({ ...data.options, runtime: 'claude' });
+
+    // Make two destinations conflict for the two DIFFERENT reasons the summary
+    // distinguishes: an unmarked legacy projection, and the operator-owned file.
+    const legacy = path.join(data.claudeHome, 'forge-prefs.schema.json');
+    fs.writeFileSync(legacy, '{"editado":true}\n', 'utf8');
+    const settings = path.join(data.claudeHome, 'settings.json');
+    fs.writeFileSync(settings, '{"hooks":{}}\n', 'utf8');
+
+    const report = installer.install({ ...data.options, runtime: 'claude', update: true });
+    const text = installer.render(report);
+
+    // Positive control first: the counts still exist, so the asserts below are
+    // about naming and not about a summary that lost its conflict section.
+    assert.match(text, /Conflicts preserved: \d+/, 'a linha de contagem sumiu do resumo');
+    assert.match(text, /Operator-owned preserved: \d+/, 'a linha de operator-owned sumiu do resumo');
+
+    assert.ok(text.includes(`  [preserved] ${legacy}`),
+      `o resumo não nomeou a projeção legada preservada:\n${text}`);
+    assert.ok(text.includes(`  [operator-owned] ${settings}`),
+      `o resumo não nomeou o arquivo do operador preservado:\n${text}`);
+
+    // Every named line must point at a real path — a label with no destination
+    // would be the anonymous count wearing a different shape.
+    for (const line of text.split('\n')) {
+      const named = /^ {2}\[(?:preserved|operator-owned)\] (.+)$/.exec(line);
+      if (named) assert.ok(path.isAbsolute(named[1]), `caminho não absoluto no resumo: ${line}`);
+    }
+  } finally { data.cleanup(); }
+});
+
+// The renderer owns the ownership BEHAVIOR; the installer owns its PERSISTENCE.
+// A record that is not carried across runs is no record at all — every JSON
+// projection would re-freeze on the next update, which is the defect this
+// closes, reintroduced one layer up.
+test('the ownership record is persisted in the manifest and survives a second run', () => {
+  const data = fixture();
+  try {
+    installer.install({ ...data.options, runtime: 'claude' });
+    const manifestPath = path.join(data.forgeHome, 'manifest.json');
+    const first = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+
+    assert.ok(first.ownership && typeof first.ownership === 'object', 'manifesto não persistiu o registro de propriedade');
+    const schemaDest = path.join(data.claudeHome, 'forge-prefs.schema.json');
+    assert.ok(first.ownership[path.resolve(schemaDest)],
+      'o destino JSON — o que não pode carregar marcador — ficou de fora do registro');
+    for (const [file, sha] of Object.entries(first.ownership)) {
+      assert.ok(path.isAbsolute(file), `chave do registro não é caminho absoluto: ${file}`);
+      assert.match(sha, /^[0-9a-f]{64}$/, `digest malformado para ${file}`);
+    }
+
+    const second = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    installer.install({ ...data.options, runtime: 'claude', update: true });
+    const third = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    assert.ok(third.ownership[path.resolve(schemaDest)],
+      'o registro do destino JSON sumiu no update — ele volta a congelar na execução seguinte');
+    assert.strictEqual(third.ownership[path.resolve(schemaDest)], second.ownership[path.resolve(schemaDest)],
+      'o digest mudou sem que o conteúdo mudasse');
+  } finally { data.cleanup(); }
+});
+
+// Held by TWO independent mechanisms — the renderer spreads the record it was
+// given into the one it returns, and the installer merges over the prior
+// manifest. Removing either alone keeps this green; removing both turns it red
+// (verified). Kept as a property test rather than split into two line-level
+// asserts: what matters is that a Codex destination survives a Claude-only run,
+// not which of the two layers happened to carry it.
+test('a single-runtime run merges the record instead of replacing it', () => {
+  const data = fixture();
+  try {
+    installer.install({ ...data.options, runtime: 'both' });
+    const manifestPath = path.join(data.forgeHome, 'manifest.json');
+    const both = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const codexEntries = Object.keys(both.ownership).filter((file) => file.startsWith(path.resolve(data.codexHome)));
+    assert.ok(codexEntries.length > 0, 'controle: a instalação both não registrou nenhum destino do Codex');
+
+    installer.install({ ...data.options, runtime: 'claude', update: true });
+    const after = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    for (const file of codexEntries) {
+      assert.ok(after.ownership[file],
+        `um run --runtime claude derrubou o registro do Codex (${file}) — a próxima instalação Codex trataria tudo como estranho`);
+    }
+  } finally { data.cleanup(); }
+});
+
+test('a clean update names nothing — the section is absent, not empty', () => {
+  const data = fixture();
+  try {
+    installer.install({ ...data.options, runtime: 'claude' });
+    const text = installer.render(installer.install({ ...data.options, runtime: 'claude', update: true }));
+    assert.ok(!/\[preserved\]/.test(text), 'resumo listou preservados num update sem conflito');
+  } finally { data.cleanup(); }
+});
+
 process.stdout.write(`\n${passed} passed, 0 failed\n`);
 

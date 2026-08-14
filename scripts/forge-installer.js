@@ -277,6 +277,10 @@ function install(input = {}) {
 
   // All host projections are rendered from the canonical source manifest.
   // The installer does not keep a second, host-specific copy strategy.
+  // The ownership record is read BEFORE rendering and written back after: it is
+  // the only proof of ownership a format without comment syntax can have, so a
+  // run that forgets to carry it forward re-freezes every JSON projection.
+  const priorManifest = readJsonIfPresent(paths.shared.manifest) || {};
   const generated = generateProjections({
     repo,
     runtime,
@@ -287,8 +291,9 @@ function install(input = {}) {
     dryRun: options.dryRun,
     update: options.update,
     migrateLegacy: options.migrateLegacy,
+    ownership: priorManifest.ownership && typeof priorManifest.ownership === 'object' ? priorManifest.ownership : {},
   });
-  const existingManifest = readJsonIfPresent(paths.shared.manifest) || {};
+  const existingManifest = priorManifest;
   const adapterManifest = { ...(existingManifest.adapters || {}) };
   for (const host of selected) {
     const home = paths.runtimeHomes[host];
@@ -308,7 +313,15 @@ function install(input = {}) {
     writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files, project_files: projectFiles, conflicts }, null, 2) + '\n', plan, options);
   }
   const installedHosts = Object.keys(adapterManifest).sort();
-  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
+  // Merge, never replace: a `--runtime claude` run must not drop the digests of
+  // the Codex host's destinations, or the next Codex install treats every one of
+  // them as an unmarked stranger.
+  const ownershipRecord = { ...(existingManifest.ownership || {}) };
+  for (const host of installedHosts) {
+    const report = generated.reports[host];
+    if (report && report.ownership && typeof report.ownership === 'object') Object.assign(ownershipRecord, report.ownership);
+  }
+  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest, ownership: ownershipRecord };
   writeText(paths.shared.manifest, JSON.stringify(manifest, null, 2) + '\n', plan, options);
   const app = installApp(repo, plan, options, paths.platform);
   const backupPath = path.resolve(backupRoot);
@@ -338,9 +351,22 @@ function render(report) {
     ? Object.values(report.manifest.adapters).flatMap((adapter) => (Array.isArray(adapter.conflicts) ? adapter.conflicts : []))
     : [];
   const operatorOwned = allConflicts.filter((item) => path.basename(String(item && item.destination || '')) === 'settings.json');
-  const legacy = allConflicts.length - operatorOwned.length;
-  if (legacy) lines.push(`Conflicts preserved: ${legacy}; use --migrate-legacy to replace unmarked legacy projections.`);
-  if (operatorOwned.length) lines.push(`Operator-owned preserved: ${operatorOwned.length} (settings.json) — Forge never replaces it; use scripts/merge-settings.js to add Forge's hooks/statusLine keys.`);
+  const legacyConflicts = allConflicts.filter((item) => !operatorOwned.includes(item));
+  // Name them. A bare count is the reason this drift stays invisible: the
+  // operator is told that N files were left behind but not WHICH, so a stale
+  // destination on the execution path reads exactly like a stale destination
+  // nobody loads. Measured cost of the anonymous form: an `--update` that
+  // reported success left `~/.claude/forge-hook.js` — the file `settings.json`
+  // actually runs — frozen several releases back, and finding that took a
+  // byte-compare against repo history rather than reading the summary.
+  if (legacyConflicts.length) {
+    lines.push(`Conflicts preserved: ${legacyConflicts.length}; use --migrate-legacy to replace unmarked legacy projections.`);
+    for (const item of legacyConflicts) lines.push(`  [preserved] ${item.destination}`);
+  }
+  if (operatorOwned.length) {
+    lines.push(`Operator-owned preserved: ${operatorOwned.length} (settings.json) — Forge never replaces it; use scripts/merge-settings.js to add Forge's hooks/statusLine keys.`);
+    for (const item of operatorOwned) lines.push(`  [operator-owned] ${item.destination}`);
+  }
   return lines.join('\n') + '\n';
 }
 

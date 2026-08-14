@@ -17,7 +17,7 @@
     {
       "source_id": "skills",
       "target": "skills",
-      "sha256": "546eeba71f15381a88d5fdedae98532934e26d6419e25e7ec0f996dd42946c1c"
+      "sha256": "94bb1261027acab36e7b68023afaecefce56f6b4f3a2c124d1d91fe24e9757c3"
     },
     {
       "source_id": "dispatch-templates",
@@ -27,7 +27,7 @@
     {
       "source_id": "hooks",
       "target": "hooks/forge-hook.js",
-      "sha256": "1c337a58c4ddd27516e4a6bf489752e6bb2a03b3fc93374c2b799f111f8ed19a"
+      "sha256": "225d8620a77169f39a149873c2759ec5444b9c8491ccec92f2b147fb82fed22b"
     },
     {
       "source_id": "mcp",
@@ -37,7 +37,7 @@
     {
       "source_id": "claude-instructions",
       "target": "project/CLAUDE.md",
-      "sha256": "1cf5aa60bd1cc769f01caeea136d7569b6e450957e26d4fbbe31ad9658731398"
+      "sha256": "a8515bffd07b3e821df5cab15d7116284d9f79acc20c9024363fc91a5f44c53d"
     },
     {
       "source_id": "claude-settings",
