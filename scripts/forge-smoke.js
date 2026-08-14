@@ -16134,6 +16134,314 @@ function smokeRewriteCeilingAndE2E() {
     + 'census sums exactly to candidates sent, and a faulted emission stage falls back byte-identical (self-bite)');
 }
 
+// ── Section 108: S04/T04 — verify.js/reverify.js child-side clamp E2E, byte-identity, W5 census ──
+// Section number MEASURED at execution time (`grep -oE "Section ([0-9]+)"
+// scripts/forge-smoke.js | grep -oE "[0-9]+" | sort -n | tail -1`), not
+// assumed: 107 was the real max at authoring time. Never require()s
+// forge-verify.js/forge-reverify.js — every assertion spawns the REAL CLI as
+// a child process, and every clamp claim is read from a dump the CHILD
+// process itself writes (never inferred from what the parent intended to
+// pass — the exact "environment is only proven by the child" lesson S04's
+// own plan cites from S03/T02).
+function smokeVerifyReverifyChildSideE2E() {
+  process.stdout.write('\n▸ Section 108: forge-verify.js/forge-reverify.js child-side clamp E2E, byte-identity, W5 census\n');
+  const NODE = process.execPath;
+  const VERIFY_CLI = path.join(SCRIPTS, 'forge-verify.js');
+  const REVERIFY_CLI = path.join(SCRIPTS, 'forge-reverify.js');
+  const POOL_CLI = path.join(SCRIPTS, 'forge-resource-pool.js');
+  const REWRITE_MOD_PATH = path.join(SCRIPTS, 'forge-command-rewrite.js');
+  const isPosix = process.platform !== 'win32';
+
+  function tmpWorkspace(prefix) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
+    return dir;
+  }
+  function poolCensus(poolDir) {
+    const r = spawnSync(NODE, [POOL_CLI, '--status', '--json', '--pool-dir', poolDir], { encoding: 'utf8' });
+    try { return JSON.parse(r.stdout); } catch { return { ok: false, held: -1 }; }
+  }
+  function shimBody(dumpFile, { exitCode = 0, delayMs = 0 } = {}) {
+    return [
+      '#!/usr/bin/env node',
+      "const fs = require('fs');",
+      `fs.writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({ argv: process.argv, env: process.env }));`,
+      delayMs > 0 ? `setTimeout(() => { process.exit(${exitCode}); }, ${delayMs});` : `process.exit(${exitCode});`,
+      '',
+    ].join('\n');
+  }
+  function writeShim(binPath, dumpFile, opts) {
+    fs.mkdirSync(path.dirname(binPath), { recursive: true });
+    fs.writeFileSync(binPath, shimBody(dumpFile, opts), { mode: 0o755 });
+  }
+  function hasMakeBinary() {
+    try { return spawnSync('make', ['--version'], { encoding: 'utf8' }).status === 0; } catch { return false; }
+  }
+  // Temporarily removes forge-command-rewrite.js from disk so a FRESHLY
+  // spawned child's require() throws MODULE_NOT_FOUND — the strongest form
+  // of "wiring disabled": the module genuinely absent, the exact pre-S04
+  // condition on disk, not a stubbed in-process injection (which the CLI
+  // boundary does not expose). Only ever touched synchronously, restored in
+  // `finally` before any other code in this single-threaded process runs.
+  function withRewriteModuleDisabled(fn) {
+    const disabledPath = `${REWRITE_MOD_PATH}.smoke108-disabled`;
+    fs.renameSync(REWRITE_MOD_PATH, disabledPath);
+    try { return fn(); } finally { fs.renameSync(disabledPath, REWRITE_MOD_PATH); }
+  }
+  function writeResultFile(p) {
+    const result = { must_haves_status: [{ status: 'unmet', scope: 'environment', reason: 'sandbox-exec-blocked', note: 'run the test suite' }] };
+    fs.writeFileSync(p, JSON.stringify(result), 'utf8');
+    return p;
+  }
+
+  // ── Real pool root: never created/touched by anything in this section ────
+  const realPoolRoot = path.join(os.homedir(), '.claude', 'forge', 'resource-pool');
+  const realPoolExistedBefore = fs.existsSync(realPoolRoot);
+  const realPoolListingBefore = realPoolExistedBefore ? fs.readdirSync(realPoolRoot).sort() : null;
+
+  if (!isPosix) {
+    skip('Section 108: verify.js/reverify.js child-side clamp E2E', 'posix-only shebang fixtures (mirrors T02/T03 suites)');
+    return;
+  }
+
+  // ═══ Consumer A: forge-verify.js ══════════════════════════════════════
+  const aDir = tmpWorkspace('smoke108-verify-');
+  const aPoolOn = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-verify-pool-on-'));
+  const aPoolOff = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-verify-pool-off-'));
+  const aPoolFail = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-verify-pool-fail-'));
+  const aPoolTimeout = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-verify-pool-to-'));
+  try {
+    // (a) clamp ON: taskPlanVerify:'vitest' resolved via a PATH-injected shim.
+    const binOnDir = path.join(aDir, 'bin-on');
+    const dumpOn = path.join(aDir, 'dump-on.json');
+    writeShim(path.join(binOnDir, 'vitest'), dumpOn);
+    const planA = path.join(aDir, 'plan-a.md');
+    fs.writeFileSync(planA, '---\nverify: vitest\n---\n# fixture\n', 'utf8');
+    const envA = Object.assign({}, process.env, {
+      PATH: binOnDir + path.delimiter + process.env.PATH,
+      FORGE_RESOURCE_POOL_DIR: aPoolOn, FORGE_RESOURCES_PRESSURE: '1',
+    });
+    const resA = spawnSync(NODE, [VERIFY_CLI, '--plan', planA, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-a'], { encoding: 'utf8', env: envA });
+    assert(resA.status === 0, '(a) forge-verify.js CLI exits 0 for the clamp-ON fixture', String(resA.status) + resA.stderr);
+    assert(fs.existsSync(dumpOn), '(a) the CHILD process wrote its own argv/env dump — clamp observed child-side, never inferred', dumpOn);
+    const dumpOnJson = JSON.parse(fs.readFileSync(dumpOn, 'utf8'));
+    assert(typeof dumpOnJson.env.NODE_OPTIONS === 'string' && /--max-old-space-size=\d+/.test(dumpOnJson.env.NODE_OPTIONS),
+      '(a) clamp ON: child dump carries NODE_OPTIONS from the resource contract', JSON.stringify(dumpOnJson.env));
+    assert(typeof dumpOnJson.env.VITEST_MAX_FORKS === 'string' && dumpOnJson.env.VITEST_MAX_FORKS.length > 0,
+      '(a) clamp ON: child dump carries the VITEST_MAX_FORKS worker clamp', JSON.stringify(dumpOnJson.env));
+
+    // (b) clamp OFF: SAME fixture body, non-runner binary name — bite reverses.
+    const binOffDir = path.join(aDir, 'bin-off');
+    const dumpOff = path.join(aDir, 'dump-off.json');
+    const offBin = path.join(binOffDir, 'not-a-real-runner');
+    writeShim(offBin, dumpOff);
+    const planB = path.join(aDir, 'plan-b.md');
+    fs.writeFileSync(planB, `---\nverify: ${offBin}\n---\n# fixture\n`, 'utf8');
+    const envB = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: aPoolOff, FORGE_RESOURCES_PRESSURE: '1' });
+    const resB = spawnSync(NODE, [VERIFY_CLI, '--plan', planB, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-b'], { encoding: 'utf8', env: envB });
+    assert(resB.status === 0, '(b) forge-verify.js CLI exits 0 for the clamp-OFF fixture', String(resB.status) + resB.stderr);
+    const dumpOffJson = JSON.parse(fs.readFileSync(dumpOff, 'utf8'));
+    assert(dumpOffJson.env.NODE_OPTIONS === undefined, '(b) clamp OFF: NODE_OPTIONS is ABSENT from the child env (bite reverses)', JSON.stringify(dumpOffJson.env));
+    assert(dumpOffJson.env.VITEST_MAX_FORKS === undefined, '(b) clamp OFF: VITEST_MAX_FORKS is ABSENT from the child env', JSON.stringify(dumpOffJson.env));
+
+    // (c) W5 outside-process: a FAILING command releases the lease.
+    const binFailDir = path.join(aDir, 'bin-fail');
+    const dumpFail = path.join(aDir, 'dump-fail.json');
+    writeShim(path.join(binFailDir, 'vitest'), dumpFail, { exitCode: 7 });
+    const planC = path.join(aDir, 'plan-c.md');
+    fs.writeFileSync(planC, '---\nverify: vitest\n---\n# fixture\n', 'utf8');
+    const envC = Object.assign({}, process.env, {
+      PATH: binFailDir + path.delimiter + process.env.PATH,
+      FORGE_RESOURCE_POOL_DIR: aPoolFail, FORGE_RESOURCES_PRESSURE: '1',
+    });
+    const resC = spawnSync(NODE, [VERIFY_CLI, '--plan', planC, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-c'], { encoding: 'utf8', env: envC });
+    let parsedC = null;
+    try { parsedC = JSON.parse(resC.stdout); } catch { /* asserted below */ }
+    assert(!!parsedC && parsedC.passed === false && parsedC.checks[0].exitCode === 7,
+      '(c) failing command reports the project exit code (7) through the real CLI', resC.stdout);
+    const censusC = poolCensus(aPoolFail);
+    assert(censusC.ok === true && censusC.held === 0, '(c) W5 outside-process: pool census shows ZERO held slots after a FAILED forge-verify.js command', JSON.stringify(censusC));
+
+    // (d) W5 outside-process: a TIMING-OUT command releases the lease.
+    const binToDir = path.join(aDir, 'bin-timeout');
+    const dumpTo = path.join(aDir, 'dump-timeout.json');
+    writeShim(path.join(binToDir, 'vitest'), dumpTo, { delayMs: 4000 });
+    const planD = path.join(aDir, 'plan-d.md');
+    fs.writeFileSync(planD, '---\nverify: vitest\n---\n# fixture\n', 'utf8');
+    const envD = Object.assign({}, process.env, {
+      PATH: binToDir + path.delimiter + process.env.PATH,
+      FORGE_RESOURCE_POOL_DIR: aPoolTimeout, FORGE_RESOURCES_PRESSURE: '1',
+    });
+    const resD = spawnSync(NODE, [VERIFY_CLI, '--plan', planD, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-d', '--timeout', '300'], { encoding: 'utf8', env: envD });
+    let parsedD = null;
+    try { parsedD = JSON.parse(resD.stdout); } catch { /* asserted below */ }
+    assert(!!parsedD && parsedD.checks[0].exitCode === 124 && parsedD.checks[0].skipped === 'timeout',
+      '(d) timing-out command maps to exitCode 124 through the real CLI', resD.stdout);
+    const censusD = poolCensus(aPoolTimeout);
+    assert(censusD.ok === true && censusD.held === 0, '(d) W5 outside-process: pool census shows ZERO held slots after a TIMED-OUT forge-verify.js command', JSON.stringify(censusD));
+
+    // (e) byte-identity (consumer A): an unrecognized command runs
+    // identically whether the command-rewrite module is present or
+    // genuinely absent from disk.
+    const binUnrecDir = path.join(aDir, 'bin-unrec');
+    const unrecBin = path.join(binUnrecDir, 'totally-unrecognized-runner');
+    const dumpUnrec1 = path.join(aDir, 'dump-unrec-1.json');
+    const dumpUnrec2 = path.join(aDir, 'dump-unrec-2.json');
+    const planE = path.join(aDir, 'plan-e.md');
+    fs.writeFileSync(planE, `---\nverify: ${unrecBin} --flag x\n---\n# fixture\n`, 'utf8');
+    const envE = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: aPoolOn, FORGE_RESOURCES_PRESSURE: '1' });
+
+    writeShim(unrecBin, dumpUnrec1);
+    const resE1 = spawnSync(NODE, [VERIFY_CLI, '--plan', planE, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-e1'], { encoding: 'utf8', env: envE });
+    writeShim(unrecBin, dumpUnrec2);
+    const resE2 = withRewriteModuleDisabled(() => spawnSync(NODE, [VERIFY_CLI, '--plan', planE, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke108-e2'], { encoding: 'utf8', env: envE }));
+
+    assert(resE1.status === 0 && resE2.status === 0, '(e) both unrecognized-command runs (wiring present/absent) exit 0', `${resE1.status}/${resE2.status}`);
+    const dumpUnrec1Json = JSON.parse(fs.readFileSync(dumpUnrec1, 'utf8'));
+    const dumpUnrec2Json = JSON.parse(fs.readFileSync(dumpUnrec2, 'utf8'));
+    assert(JSON.stringify(dumpUnrec1Json.argv) === JSON.stringify(dumpUnrec2Json.argv),
+      '(e) byte-identity (consumer A): the child process observed the SAME argv with the rewrite module present vs genuinely absent from disk — strict equality',
+      JSON.stringify({ a: dumpUnrec1Json.argv, b: dumpUnrec2Json.argv }));
+    const parsedE1 = JSON.parse(resE1.stdout);
+    const parsedE2 = JSON.parse(resE2.stdout);
+    assert(parsedE1.checks[0].command === parsedE2.checks[0].command && parsedE1.checks[0].exitCode === parsedE2.checks[0].exitCode,
+      '(e) byte-identity (consumer A): the reported command/exitCode is IDENTICAL in both modes', JSON.stringify({ e1: parsedE1.checks[0], e2: parsedE2.checks[0] }));
+  } finally {
+    try { fs.rmSync(aDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    for (const d of [aPoolOn, aPoolOff, aPoolFail, aPoolTimeout]) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
+  // ═══ Consumer B: forge-reverify.js ════════════════════════════════════
+  const bDir = tmpWorkspace('smoke108-reverify-');
+  const bPoolOn = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-reverify-pool-on-'));
+  const bPoolOff = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-reverify-pool-off-'));
+  const bPoolFail = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-reverify-pool-fail-'));
+  const bPoolTimeout = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-reverify-pool-to-'));
+  const bPoolMake = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-reverify-pool-make-'));
+  let offDir = null;
+  let makeDir = null;
+  try {
+    // (f) clamp ON: package.json's "test" script is a single-segment
+    // "vitest" body — npm resolves node_modules/.bin/vitest, the REAL shim,
+    // over a REAL spawned npm (S03/T04 Section 107's precedent).
+    const dumpF = path.join(bDir, 'dump-f.json');
+    fs.writeFileSync(path.join(bDir, 'package.json'), JSON.stringify({ name: 'smoke108-b', version: '1.0.0', scripts: { test: 'vitest' } }), 'utf8');
+    fs.writeFileSync(path.join(bDir, 'package-lock.json'), JSON.stringify({ name: 'smoke108-b', version: '1.0.0', lockfileVersion: 3 }), 'utf8');
+    writeShim(path.join(bDir, 'node_modules', '.bin', 'vitest'), dumpF);
+    const resultF = writeResultFile(path.join(bDir, 'result-f.json'));
+    const envF = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolOn, FORGE_RESOURCES_PRESSURE: '1' });
+    const resF = spawnSync(NODE, [REVERIFY_CLI, '--result', resultF, '--code-dir', bDir, '--gsd-dir', path.join(bDir, '.gsd'), '--apply'], { encoding: 'utf8', cwd: bDir, env: envF });
+    assert(resF.status === 0, '(f) forge-reverify.js CLI exits 0 for the clamp-ON fixture', String(resF.status) + resF.stderr);
+    assert(fs.existsSync(dumpF), '(f) the CHILD process wrote its own argv/env dump (child-side observation)', dumpF);
+    const dumpFJson = JSON.parse(fs.readFileSync(dumpF, 'utf8'));
+    assert(typeof dumpFJson.env.NODE_OPTIONS === 'string' && /--max-old-space-size=\d+/.test(dumpFJson.env.NODE_OPTIONS),
+      '(f) clamp ON: reverify child dump carries NODE_OPTIONS from the resource contract', JSON.stringify(dumpFJson.env));
+    assert(typeof dumpFJson.env.VITEST_MAX_FORKS === 'string' && dumpFJson.env.VITEST_MAX_FORKS.length > 0,
+      '(f) clamp ON: reverify child dump carries VITEST_MAX_FORKS', JSON.stringify(dumpFJson.env));
+    assert(!dumpFJson.argv.slice(2).some((tok) => /^[A-Za-z_]\w*=/.test(tok)),
+      '(f) NO argv element is a NAME=value assignment — the structural guarantee of T01/T03 (shell:false)', JSON.stringify(dumpFJson.argv));
+    const parsedF = JSON.parse(resF.stdout);
+    assert(parsedF.verdict === 'verified', '(f) re-verification applied a "verified" outcome for the environment must-have', resF.stdout);
+
+    // (g) clamp OFF: same shape, package.json's "test" script is NOT a
+    // recognized runner body — bite reverses on the SAME code path.
+    const dumpG = path.join(bDir, 'dump-g.json');
+    offDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-reverify-off-'));
+    fs.mkdirSync(path.join(offDir, '.gsd', 'forge'), { recursive: true });
+    fs.writeFileSync(path.join(offDir, 'package.json'), JSON.stringify({ name: 'smoke108-b-off', version: '1.0.0', scripts: { test: 'node dump.js' } }), 'utf8');
+    fs.writeFileSync(path.join(offDir, 'dump.js'), `const fs=require('fs');fs.writeFileSync(${JSON.stringify(dumpG)}, JSON.stringify({argv:process.argv,env:process.env}));`, 'utf8');
+    const resultG = writeResultFile(path.join(offDir, 'result-g.json'));
+    const envG = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolOff, FORGE_RESOURCES_PRESSURE: '1' });
+    const resG = spawnSync(NODE, [REVERIFY_CLI, '--result', resultG, '--code-dir', offDir, '--gsd-dir', path.join(offDir, '.gsd'), '--apply'], { encoding: 'utf8', cwd: offDir, env: envG });
+    assert(resG.status === 0, '(g) forge-reverify.js CLI exits 0 for the clamp-OFF fixture', String(resG.status) + resG.stderr);
+    const dumpGJson = JSON.parse(fs.readFileSync(dumpG, 'utf8'));
+    assert(dumpGJson.env.VITEST_MAX_FORKS === undefined, '(g) clamp OFF: VITEST_MAX_FORKS is ABSENT — command is not runner-shaped, bite reverses', JSON.stringify(dumpGJson.env));
+
+    // (h) W5 outside-process: a FAILING command releases the lease.
+    const dumpH = path.join(bDir, 'dump-h.json');
+    writeShim(path.join(bDir, 'node_modules', '.bin', 'vitest'), dumpH, { exitCode: 5 });
+    const resultH = writeResultFile(path.join(bDir, 'result-h.json'));
+    const envH = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolFail, FORGE_RESOURCES_PRESSURE: '1' });
+    const resH = spawnSync(NODE, [REVERIFY_CLI, '--result', resultH, '--code-dir', bDir, '--gsd-dir', path.join(bDir, '.gsd')], { encoding: 'utf8', cwd: bDir, env: envH });
+    const parsedH = JSON.parse(resH.stdout);
+    assert(parsedH.verdict === 'failed' && parsedH.exit_code === 5, '(h) failing command reports the project exit code (5) through the real CLI', resH.stdout);
+    const censusH = poolCensus(bPoolFail);
+    assert(censusH.ok === true && censusH.held === 0, '(h) W5 outside-process: pool census shows ZERO held slots after a FAILED forge-reverify.js command', JSON.stringify(censusH));
+
+    // (i) W5 outside-process: a TIMING-OUT command releases the lease.
+    const dumpI = path.join(bDir, 'dump-i.json');
+    writeShim(path.join(bDir, 'node_modules', '.bin', 'vitest'), dumpI, { delayMs: 4000 });
+    const resultI = writeResultFile(path.join(bDir, 'result-i.json'));
+    const envI = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolTimeout, FORGE_RESOURCES_PRESSURE: '1' });
+    const resI = spawnSync(NODE, [REVERIFY_CLI, '--result', resultI, '--code-dir', bDir, '--gsd-dir', path.join(bDir, '.gsd'), '--timeout-ms', '300'], { encoding: 'utf8', cwd: bDir, env: envI });
+    const parsedI = JSON.parse(resI.stdout);
+    assert(parsedI.verdict === 'no-command', '(i) timed-out command surfaces as no-command through the real CLI (ETIMEDOUT mapping)', resI.stdout);
+    const censusI = poolCensus(bPoolTimeout);
+    assert(censusI.ok === true && censusI.held === 0, '(i) W5 outside-process: pool census shows ZERO held slots after a TIMED-OUT forge-reverify.js command', JSON.stringify(censusI));
+
+    // (j) byte-identity (consumer B): a Makefile-resolved command
+    // (unrecognized runner form — S04-PLAN step 6's own example, and
+    // resolveVerifyCommand's own precedent) runs byte-identical whether the
+    // command-rewrite module is present or genuinely absent from disk.
+    if (hasMakeBinary()) {
+      makeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke108-make-'));
+      fs.mkdirSync(path.join(makeDir, '.gsd', 'forge'), { recursive: true });
+      const dumpJ1 = path.join(makeDir, 'dump-j1.json');
+      const dumpJ2 = path.join(makeDir, 'dump-j2.json');
+      fs.writeFileSync(path.join(makeDir, 'dump.js'), "const fs=require('fs');fs.writeFileSync(process.env.SMOKE108_DUMP_FILE, JSON.stringify({argv:process.argv}));", 'utf8');
+      fs.writeFileSync(path.join(makeDir, 'Makefile'), 'test:\n\tnode dump.js\n', 'utf8');
+
+      const resultJ1 = writeResultFile(path.join(makeDir, 'result-j1.json'));
+      const envJ1 = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolMake, FORGE_RESOURCES_PRESSURE: '1', SMOKE108_DUMP_FILE: dumpJ1 });
+      const resJ1 = spawnSync(NODE, [REVERIFY_CLI, '--result', resultJ1, '--code-dir', makeDir, '--gsd-dir', path.join(makeDir, '.gsd')], { encoding: 'utf8', cwd: makeDir, env: envJ1 });
+
+      const resultJ2 = writeResultFile(path.join(makeDir, 'result-j2.json'));
+      const envJ2 = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolMake, FORGE_RESOURCES_PRESSURE: '1', SMOKE108_DUMP_FILE: dumpJ2 });
+      const resJ2 = withRewriteModuleDisabled(() => spawnSync(NODE, [REVERIFY_CLI, '--result', resultJ2, '--code-dir', makeDir, '--gsd-dir', path.join(makeDir, '.gsd')], { encoding: 'utf8', cwd: makeDir, env: envJ2 }));
+
+      assert(resJ1.status === 0 && resJ2.status === 0, '(j) both make-test runs (wiring present/absent) exit 0', `${resJ1.status}/${resJ2.status}`);
+      const parsedJ1 = JSON.parse(resJ1.stdout);
+      const parsedJ2 = JSON.parse(resJ2.stdout);
+      assert(parsedJ1.verdict === parsedJ2.verdict && parsedJ1.exit_code === parsedJ2.exit_code && parsedJ1.command === parsedJ2.command,
+        '(j) byte-identity (consumer B): reverify CLI outcome (verdict/exit_code/command) is IDENTICAL with the rewrite module present vs genuinely absent from disk',
+        JSON.stringify({ parsedJ1, parsedJ2 }));
+      const dumpJ1Json = JSON.parse(fs.readFileSync(dumpJ1, 'utf8'));
+      const dumpJ2Json = JSON.parse(fs.readFileSync(dumpJ2, 'utf8'));
+      assert(JSON.stringify(dumpJ1Json.argv) === JSON.stringify(dumpJ2Json.argv),
+        '(j) byte-identity (consumer B): the child process observed the SAME argv in both runs — strict equality, not "looks equal"',
+        JSON.stringify({ a: dumpJ1Json.argv, b: dumpJ2Json.argv }));
+    } else {
+      skip('(j) byte-identity Makefile scenario', 'no `make` binary on PATH on this machine');
+    }
+  } finally {
+    try { fs.rmSync(bDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (offDir) { try { fs.rmSync(offDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    if (makeDir) { try { fs.rmSync(makeDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    for (const d of [bPoolOn, bPoolOff, bPoolFail, bPoolTimeout, bPoolMake]) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
+  // ── (k) real pool root untouched by ANY spawn above ───────────────────
+  const realPoolExistedAfter = fs.existsSync(realPoolRoot);
+  const realPoolListingAfter = realPoolExistedAfter ? fs.readdirSync(realPoolRoot).sort() : null;
+  assert(realPoolExistedBefore === realPoolExistedAfter && JSON.stringify(realPoolListingBefore) === JSON.stringify(realPoolListingAfter),
+    '(k) the real machine pool root (~/.claude/forge/resource-pool) is untouched — every fixture above used FORGE_RESOURCE_POOL_DIR pointed at a tmpdir',
+    JSON.stringify({ before: realPoolListingBefore, after: realPoolListingAfter }));
+
+  // ── (l) registration: the section verifies it is wired into main() ───
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeVerifyReverifyChildSideE2E\(\); \}/.test(mainBody),
+    '(l) Section 108 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass('Section 108: forge-verify.js and forge-reverify.js clamp/unclamp proven CHILD-side via real CLI spawns, '
+    + 'W5 census zeroed after failure AND timeout for both consumers, byte-identity proven for an unrecognized command '
+    + 'with the rewrite module genuinely absent from disk (both consumers), and the real machine pool root never touched');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -16256,6 +16564,7 @@ async function main() {
       () => { smokeResourcesFoundation(); },
       async () => { await smokeResourcePool(); },
       () => { smokeRewriteCeilingAndE2E(); },
+      () => { smokeVerifyReverifyChildSideE2E(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
