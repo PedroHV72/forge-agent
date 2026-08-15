@@ -6,11 +6,16 @@ const assert = require('assert');
 const childProcess = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const curate = require('./forge-sweep-curate');
 const internals = curate._private;
 
+// Internals-level fixtures live under the OS temp area (no repo-cwd
+// dependency). Only the CLI-spawning test below deliberately keeps a
+// repo-cwd fixture — see its own comment for why.
+function osTempDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-curate-test-')); }
 function tempDir() { return fs.mkdtempSync(path.join(process.cwd(), '.curate-test-')); }
 function removeDir(dir) { fs.rmSync(dir, { recursive: true, force: true }); }
 function digest(file) { return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); }
@@ -96,7 +101,7 @@ function liveContext(dir, clusters, arb, overrides) {
 }
 
 function testPlanChangedZeroMutation() {
-  const dir = tempDir();
+  const dir = osTempDir();
   try {
     const original = [cluster('c', [item('a', 'MEM001'), item('b', 'MEM002')])];
     const doc = arbitration('c', [verdict('a', 'MEM001', 'manter'), verdict('b', 'MEM002', 'fundir-no-sobrevivente')]);
@@ -110,7 +115,7 @@ function testPlanChangedZeroMutation() {
 }
 
 function testIntentFailureZeroMutation() {
-  const dir = tempDir();
+  const dir = osTempDir();
   try {
     const clusters = [cluster('c', [item('a', 'MEM001'), item('b', 'MEM002')])];
     const doc = arbitration('c', [verdict('a', 'MEM001', 'manter'), verdict('b', 'MEM002', 'fundir-no-sobrevivente')]);
@@ -123,7 +128,7 @@ function testIntentFailureZeroMutation() {
 }
 
 function testRewriteIsolation() {
-  const dir = tempDir();
+  const dir = osTempDir();
   try {
     const clusters = [cluster('c', [item('a', 'MEM001'), item('b', 'MEM002'), item('c', 'MEM003')])];
     const doc = arbitration('c', [verdict('a', 'MEM001', 'manter'), verdict('b', 'MEM002', 'fundir-no-sobrevivente'), verdict('c', 'MEM003', 'fundir-no-sobrevivente')]);
@@ -137,7 +142,7 @@ function testRewriteIsolation() {
 }
 
 function testActivePhaseFailClosed() {
-  const dir = tempDir();
+  const dir = osTempDir();
   try {
     const clusters = [cluster('c', [item('a', 'MEM001'), item('b', 'MEM002')])];
     const doc = arbitration('c', [verdict('a', 'MEM001', 'manter'), verdict('b', 'MEM002', 'fundir-no-sobrevivente')]);
@@ -167,6 +172,11 @@ function testDefaultIsDryRun() {
   assert.strictEqual(options.undo, false);
 }
 
+// Deliberate dogfood: this test spawns the real CLI, which resolves
+// eligibility (createEligibility/VCS status) against `--cwd`. That path is
+// only exercised meaningfully under a real repo working tree — an
+// untracked-ancestor fixture is part of what's under test here — so this
+// one test keeps the repo-cwd fixture rather than moving to os.tmpdir().
 function testCliDefaultLeavesDigestUntouched() {
   const dir = tempDir();
   try {
@@ -223,7 +233,7 @@ function testDuplicateAddressRejected() {
 }
 
 function testNoTargetsNoVault() {
-  const dir = tempDir();
+  const dir = osTempDir();
   try {
     let vaulted = false;
     const ctx = liveContext(dir, [], { clusters: [] }, {
@@ -252,7 +262,7 @@ function testDropsGroupedByStorage() {
 }
 
 function testPhaseBlocked() {
-  const dir = tempDir();
+  const dir = osTempDir();
   try {
     const clusters = [cluster('c', [item('a', 'MEM001', 'T01'), item('b', 'MEM002', 'T01')])];
     const result = internals.curatePlan(liveContext(dir, clusters, { clusters: [] }, {
