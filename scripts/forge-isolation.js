@@ -333,7 +333,7 @@ function fetchDefaultBranch(repoPath, def) {
     execSync(`git rev-parse --verify origin/${def}`, { cwd: repoPath, encoding: 'utf8', shell: true, stdio: 'ignore' });
     return { ref: `origin/${def}`, fetched: true };
   } catch (e) {
-    return { ref: def, fetched: false, warn: `fetch origin ${def} failed: ${e.message.split('\n')[0]}` };
+    return { ref: def, fetched: false, warn: `fetch origin ${def} failed: ${e.message.split(/\r?\n/)[0]}` };
   }
 }
 
@@ -367,7 +367,7 @@ function setupBranchOne(repoPath, branchName, autoPullMain) {
           execSync(`git pull --ff-only`, { cwd: repoPath, encoding: 'utf8', shell: true, stdio: 'pipe' });
         }
       } catch (e) {
-        result.warn = `update ${def} failed: ${e.message.split('\n')[0]}`;
+        result.warn = `update ${def} failed: ${e.message.split(/\r?\n/)[0]}`;
       }
     }
 
@@ -380,7 +380,7 @@ function setupBranchOne(repoPath, branchName, autoPullMain) {
     }
   } catch (e) {
     result.status = 'error';
-    result.error = e.message.split('\n')[0];
+    result.error = e.message.split(/\r?\n/)[0];
   }
   return result;
 }
@@ -399,7 +399,7 @@ function cleanupBranchOne(repoPath, branchName) {
     }
   } catch (e) {
     result.status = 'error';
-    result.error = e.message.split('\n')[0];
+    result.error = e.message.split(/\r?\n/)[0];
   }
   return result;
 }
@@ -552,7 +552,7 @@ function loadRegistryRoots(home) {
   } catch (e) {
     return {
       roots: [], file, present: false,
-      warn: `workspace registry ${file} could not be read (${e.message.split('\n')[0]}) — worktree anchoring falls back to the legacy sibling convention`,
+      warn: `workspace registry ${file} could not be read (${e.message.split(/\r?\n/)[0]}) — worktree anchoring falls back to the legacy sibling convention`,
     };
   }
 }
@@ -598,7 +598,7 @@ function setupWorktreeOne(repoPath, branchName, worktreeRoot, runId, autoPullMai
     result.deps = installWorktreeDeps(repoPath, wtPath, installOpts);
   } catch (e) {
     result.status = 'error';
-    result.error = e.message.split('\n')[0];
+    result.error = e.message.split(/\r?\n/)[0];
   }
   return result;
 }
@@ -623,7 +623,7 @@ function cleanupWorktreeOne(repoPath, worktreePath) {
     result.status = 'removed';
   } catch (e) {
     result.status = 'error';
-    result.error = e.message.split('\n')[0];
+    result.error = e.message.split(/\r?\n/)[0];
   }
   return result;
 }

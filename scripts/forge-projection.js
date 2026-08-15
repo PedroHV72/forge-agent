@@ -374,7 +374,11 @@ function snapshotUnitsFromMonolith(cwd) {
     return [];
   }
 
-  const lines = String(text).replace(/\r\n/g, '\n').split('\n');
+  // Form A/funnel (S03-FIXSET.json): the snapshot is prompt-injected, never
+  // written back. `/\r\n?/g`, never `/\r\n/g` — a lone CR degrades
+  // identically (measured, T-20260811190103); the pair-only form left half
+  // the class alive.
+  const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
   const units = [];
   let current = null;
   for (const line of lines) {
@@ -488,7 +492,7 @@ function renderDecisions(cwd) {
 
   // Prepend legacy orphan rows (they're already formatted table rows)
   for (const body of legacyOrphanBodies) {
-    const rowLines = body.split('\n').filter(l => l.trim().startsWith('|') && !l.includes('---'));
+    const rowLines = body.split(/\r\n|\n|\r/).filter(l => l.trim().startsWith('|') && !l.includes('---'));
     for (const row of rowLines) {
       lines.push(row);
       num++;
@@ -518,7 +522,9 @@ function renderDecisions(cwd) {
 function parseOrphanMemory(text) {
   const entries = [];
   // Split on ## [ headers; each part after the first (preamble) is one entry
-  const blocks = text.split(/\n(?=## \[)/);
+  // Tolerant, never normalising: these entries are re-emitted by renderMemory /
+  // renderDecisions, which writeAll persists — a round-trip (D-S03-2).
+  const blocks = text.split(/(?:\r\n|\n|\r)(?=## \[)/);
   for (const block of blocks) {
     const headerMatch = block.match(/^## \[([^\]]+)\]\s*(.*)/);
     if (!headerMatch) continue;
@@ -1125,7 +1131,19 @@ function writeAll(cwd, opts) {
     }
 
     const fpath = path.join(cwd, file);
-    const content = render();
+    // Form B, applied once at the writer boundary rather than threaded through
+    // renderLedger/renderDecisions/renderMemory/renderChecker separately: the four
+    // renderers assemble with LF, and the projection is re-emitted with the EOL the
+    // file on disk already uses. A .gsd/ projection authored/checked out on Windows
+    // therefore stays CRLF instead of being flattened on every write (D-S03-2).
+    let eol = '\n';
+    try {
+      eol = (fs.readFileSync(fpath, 'utf8').match(/\r\n|\n|\r/) || ['\n'])[0];
+    } catch {
+      // No projection yet (or unreadable) — LF, the default for a new file.
+    }
+    const rendered = render();
+    const content = eol === '\n' ? rendered : rendered.replace(/\r\n?|\n/g, eol);
 
     // Ensure parent dir exists
     const dir = path.dirname(fpath);

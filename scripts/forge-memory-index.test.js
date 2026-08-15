@@ -646,6 +646,38 @@ test('writeIndex called twice with no store change → second call reports chang
   }
 });
 
+// S03/T05 — the economy check compares CONTENT, and must not become an
+// end-of-line guard by accident. On a checkout where the index on disk carries
+// CRLF, a strict `===` against the LF render reported `changed` on every call and
+// rewrote a file nothing had changed in — flattening the operator's bytes as a
+// side effect of an optimisation. Measured before the fix: changed:true and the
+// CR count went to 0 on the second call.
+test('an index already on disk in CRLF is content-identical: no rewrite, bytes untouched', () => {
+  const root = mkStore(
+    [{ unitId: 'T01', text: 'Fixed `scripts/forge-alpha.js` today.', mem_id: 'mem-eol-1' }],
+    ['scripts/forge-alpha.js'],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const first = writeIndex(result, root, {});
+    assertEq(first.changed, true, 'first write must report changed:true');
+
+    // Re-author the index with explicit CRLF bytes, as a Windows checkout has it.
+    fs.writeFileSync(first.path, fs.readFileSync(first.path, 'utf8').replace(/\r\n?|\n/g, '\r\n'));
+    const crBefore = fs.readFileSync(first.path).filter((b) => b === 13).length;
+    assert(crBefore > 0, 'fixture did not actually contain CR bytes');
+
+    const second = writeIndex(result, root, {});
+    assertEq(second.changed, false,
+      'a CRLF index with identical content must report changed:false, not be rewritten');
+    const crAfter = fs.readFileSync(first.path).filter((b) => b === 13).length;
+    assertEq(crAfter, crBefore,
+      `the untouched index lost CR bytes: ${crBefore} → ${crAfter}`);
+  } finally {
+    cleanup(root);
+  }
+});
+
 // ── Section 9: unreadable fragment ───────────────────────────────────────────
 console.log('\nSection 9: unreadable fragment — degrades by report line, never crashes the run\n');
 

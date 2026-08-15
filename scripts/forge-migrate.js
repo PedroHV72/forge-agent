@@ -102,7 +102,7 @@ const STORES = [
 // numbering differences don't cause spurious "differs" classification.
 function stripDecisionNumbers(text) {
   return text
-    .split('\n')
+    .split(/\r?\n/)
     .map(line => {
       // Match table rows that start with "| <number> |" and strip that column
       const m = line.match(/^\|\s*\d+\s*\|(.*)/);
@@ -154,7 +154,7 @@ function normalizeLayout(text, storeName) {
     return canonicalizeMemory(text);
   }
 
-  let lines = text.split('\n');
+  let lines = text.split(/\r?\n/);
 
   // Strip derived header/preamble lines (projection title + blockquote boilerplate)
   lines = lines.filter(line => !/^#\s/.test(line) && !/^>\s/.test(line));

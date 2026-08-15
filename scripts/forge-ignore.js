@@ -112,9 +112,16 @@ function detectVcs(cwd) {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // Read .gitignore lines, returning an array of trimmed non-empty lines.
+//
+// Form A/funnel (S03-FIXSET.json): normalize once at the read. applyIgnore
+// only ever APPENDS to this file, never rewrites it, so existing bytes are
+// untouched by this normalization — but a CRLF .gitignore left the split
+// with a trailing CR on every entry, which made the presence check below
+// miss an already-present line and re-append it. `/\r\n?/g`, never
+// `/\r\n/g` — a lone CR degrades identically.
 function readGitignoreLines(gitignorePath) {
   if (!fs.existsSync(gitignorePath)) return [];
-  return fs.readFileSync(gitignorePath, 'utf8').split('\n');
+  return fs.readFileSync(gitignorePath, 'utf8').replace(/\r\n?/g, '\n').split('\n');
 }
 
 // Group LOCAL_IGNORE_PATHS by their parent directory for SVN propset.
@@ -148,7 +155,10 @@ function svnIsVersioned(dir) {
 function svnPropget(dir) {
   try {
     const out = _execFileSync('svn', ['propget', 'svn:ignore', dir], { encoding: 'utf8' });
-    return out.split('\n').map(l => l.trim()).filter(Boolean);
+    // Tolerant split: `svn propget` output is CRLF on Windows. The read side of the
+    // propget→propset round-trip must not turn one pattern into two, nor smuggle a
+    // lone CR into a pattern.
+    return out.split(/\r\n|\n|\r/).map(l => l.trim()).filter(Boolean);
   } catch (e) {
     // Property not set on dir → empty; treat as []
     if (e.stderr && /E200009|svn: E/.test(e.stderr)) return [];
@@ -159,6 +169,10 @@ function svnPropget(dir) {
 }
 
 // Write patterns via tempfile and svn propset.
+// EOL note (Form B audit, S03/T02): this tempfile is GENERATED — it never re-emits
+// bytes read from a file on disk, so there is no original EOL to capture here. The
+// round-trip's byte-preserving side is svnPropget above (tolerant read). LF is the
+// separator svn itself stores svn:ignore with; emitting CRLF would be the churn.
 function svnPropset(dir, patterns) {
   const tmp = path.join(os.tmpdir(), `forge-ignore-${Date.now()}.tmp`);
   try {
@@ -200,8 +214,13 @@ function applyIgnore(cwd) {
       const existingContent = fs.existsSync(gitignorePath)
         ? fs.readFileSync(gitignorePath, 'utf8')
         : '';
-      const separator = existingContent.length > 0 && !existingContent.endsWith('\n') ? '\n' : '';
-      const block = toAppend.join('\n') + '\n';
+      // Form B (EOL preservation): this appends to bytes the user owns. Capture the
+      // EOL the existing .gitignore already uses and re-emit it — joining with LF
+      // would leave a Windows-authored file with mixed endings. Tolerant of a lone
+      // CR too (`/\r\n?/`), which degrades the same way (measured).
+      const eol = (existingContent.match(/\r\n|\n|\r/) || ['\n'])[0];
+      const separator = existingContent.length > 0 && !/(?:\r\n|\n|\r)$/.test(existingContent) ? eol : '';
+      const block = toAppend.join(eol) + eol;
       fs.appendFileSync(gitignorePath, separator + block, 'utf8');
     }
 
