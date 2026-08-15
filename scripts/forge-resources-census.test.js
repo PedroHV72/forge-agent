@@ -34,6 +34,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const MODULE = path.join(__dirname, 'forge-resources-census.js');
@@ -108,17 +109,8 @@ function run(cwd) {
   return buildCensus(collected);
 }
 
-// ── R13 (opening half) ──────────────────────────────────────────────────────
+// ── R13 (see the closing half) ──────────────────────────────────────────────
 const LIVE_EVENTS = path.join(__dirname, '..', '.gsd', 'forge', 'events.jsonl');
-function liveStamp() {
-  try {
-    const st = fs.statSync(LIVE_EVENTS);
-    return `${st.mtimeMs}:${st.size}`;
-  } catch {
-    return 'absent';
-  }
-}
-const LIVE_BEFORE = liveStamp();
 
 console.log('\nforge-resources-census\n');
 
@@ -643,8 +635,49 @@ test('R12: CLI sai 0 em repo sem .gsd/ e com --json', () => {
 
 // ── R13 (closing half) ──────────────────────────────────────────────────────
 
-test('R13: o events.jsonl VIVO do operador nunca foi escrito', () => {
-  assertEqual(liveStamp(), LIVE_BEFORE, 'mtime/size do log vivo devem estar inalterados');
+// R13 prova que o censo NUNCA escreve num events.jsonl real.
+//
+// A versão anterior media o arquivo VIVO do operador (mtime/size no início do
+// módulo contra o fim). Isso não prova a propriedade: o log vivo é
+// legitimamente appendado por qualquer processo forge concorrente (hooks, um
+// forge-auto ativo), então o assert só ficava verde com a máquina ociosa —
+// item I-20260814142227, a mesma patologia que S06/T02 (4cc3533) consertou no
+// run-overlap. Remédio idêntico: copiar a superfície viva para um root isolado
+// ANTES da medição, rodar o censo contra a CÓPIA e comparar só a cópia.
+// Escritas concorrentes no arquivo vivo não alcançam o snapshot.
+test('R13: o censo nunca escreve num events.jsonl real (cópia isolada + controle positivo)', () => {
+  if (!fs.existsSync(LIVE_EVENTS)) {
+    process.stdout.write('    (skip: .gsd/forge/events.jsonl vivo ausente neste checkout)\n');
+    return;
+  }
+
+  const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-census-r13-'));
+  try {
+    const isoDir = path.join(isoRoot, '.gsd', 'forge');
+    fs.mkdirSync(isoDir, { recursive: true });
+    const target = path.join(isoDir, 'events.jsonl');
+    fs.copyFileSync(LIVE_EVENTS, target);
+
+    // mtime + size + conteúdo: size sozinho não pega uma reescrita do mesmo
+    // tamanho, e mtime sozinho tem granularidade de sistema de arquivos.
+    const stamp = () => {
+      const st = fs.statSync(target);
+      return `${st.mtimeMs}:${st.size}:${crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`;
+    };
+
+    const before = stamp();
+    const r = spawnSync(process.execPath, [MODULE, '--check', '--json', '--cwd', isoRoot], { encoding: 'utf8' });
+    assertEqual(r.status, 0, `o censo deve sair 0 (advisory): ${r.stderr}`);
+    assertEqual(stamp(), before, 'o events.jsonl real-shaped não pode ser tocado pelo censo');
+
+    // Controle positivo: o mesmo comparador precisa MORDER. Um assert de
+    // imutabilidade sem controle é indistinguível de um assert que não olha
+    // nada — o piso anti-silêncio deste repo.
+    fs.appendFileSync(target, '{"ts":"controle-positivo"}\n');
+    assert(stamp() !== before, 'controle positivo: uma escrita deliberada deve ser detectada pelo mesmo comparador');
+  } finally {
+    fs.rmSync(isoRoot, { recursive: true, force: true });
+  }
 });
 
 // ── summary ─────────────────────────────────────────────────────────────────

@@ -392,6 +392,119 @@ test('end-to-end: --open --wait blocks, then an --answer from "the app" releases
   assertEq(res.choice, 'treat', 'choice propagated');
 });
 
+// ── Lapse resolution without a surviving waiter (I-20260814111723) ───────────
+// The reported defect was read as "gates are born expired". The surviving
+// artifact refutes that: `expires_at - created_at` was the requested 1800000ms
+// to the millisecond. What actually failed is that NOTHING resolved the lapse,
+// because the only resolver was a waiter process that cannot outlive its own
+// caller's budget. These tests pin the property that fixes it: resolution is a
+// function of the file, reachable by any later process.
+
+test('a gate opened with a timeout is NEVER born expired — the reported premise, refuted', (cwd) => {
+  const g = gate.openGate(cwd, { ...SPEC, timeout_ms: 1_800_000 });
+  assertEq(g.status, 'pending', 'status at birth');
+  assertEq(g.expires_at - g.created_at, 1_800_000, 'expiry is exactly the requested timeout');
+  assert(g.expires_at > Date.now(), 'expires_at must be in the future at birth');
+  assertEq(gate.readGate(cwd, g.id).status, 'pending', 'and it reads pending');
+});
+
+test('a lapsed gate abandoned by its waiter is resolved by a LATER process', (cwd) => {
+  // Reproduces the artifact: pending, unanswered, already past expires_at —
+  // the state a killed `--open --wait` leaves behind.
+  const g = gate.openGate(cwd, { ...SPEC, timeout_ms: 1, default: 'skip' });
+  spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},20)']);
+  const abandoned = JSON.parse(fs.readFileSync(gate.gateFile(cwd, g.id), 'utf8'));
+  assertEq(abandoned.status, 'pending', 'nobody persisted the lapse');
+  assertEq(abandoned.answer, null, 'and no resolution exists');
+
+  const r = gate.resolveLapsed(cwd);
+  assertEq(r.resolved.length, 1, 'the sweep resolves it');
+  assertEq(r.skipped.length, 0, 'nothing skipped');
+  const after = JSON.parse(fs.readFileSync(gate.gateFile(cwd, g.id), 'utf8'));
+  assertEq(after.answer.source, 'timeout-default', 'declared default persisted');
+  assertEq(after.answer.key, 'skip', 'the declared default, not the first option');
+});
+
+test('the sweep reports a census — examined and skipped are never silent', (cwd) => {
+  const lapsed  = gate.openGate(cwd, { ...SPEC, timeout_ms: 1 });
+  const pending = gate.openGate(cwd, { ...SPEC, timeout_ms: 600_000 });
+  spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},20)']);
+
+  const first = gate.resolveLapsed(cwd);
+  assertEq(first.examined, 2, 'both gates examined');
+  assertEq(first.resolved.length, 1, 'only the lapsed one resolved');
+  assert(first.resolved[0].id === lapsed.id, 'the lapsed gate is the one resolved');
+  assert(pending.id !== lapsed.id, 'distinct ids');
+
+  // Idempotent: a second sweep resolves nothing and NAMES why it skipped.
+  const second = gate.resolveLapsed(cwd);
+  assertEq(second.resolved.length, 0, 'nothing left to resolve');
+  assertEq(second.skipped.length, 1, 'the already-resolved gate is reported, not dropped');
+  assertEq(second.skipped[0].reason, 'already-resolved', 'skip reason is named');
+});
+
+test('the sweep NEVER clobbers a human answer', (cwd) => {
+  const g = gate.openGate(cwd, { ...SPEC, timeout_ms: 60_000 });
+  gate.answerGate(cwd, g.id, 'treat');
+  const r = gate.resolveLapsed(cwd);
+  assertEq(r.resolved.length, 0, 'an answered gate is not swept');
+  const after = JSON.parse(fs.readFileSync(gate.gateFile(cwd, g.id), 'utf8'));
+  assertEq(after.answer.source, 'human', 'the human answer survives');
+});
+
+test('positive control: the sweep bites only lapsed gates', (cwd) => {
+  // Without this, a sweep that resolved NOTHING would look identical to a
+  // sweep whose selector is broken.
+  const fresh = gate.openGate(cwd, { ...SPEC, timeout_ms: 600_000 });
+  const none = gate.resolveLapsed(cwd);
+  assertEq(none.resolved.length, 0, 'a live gate must not be resolved');
+  assertEq(none.examined, 1, 'but it WAS examined — silence would be a broken selector');
+
+  const r = gate.resolveLapsedGate(cwd, fresh.id);
+  assert(!r.ok, 'resolving a live gate directly is refused');
+  assertEq(r.reason, 'not-lapsed', 'refusal is named');
+});
+
+test('--max-wait bounds the block so a waiter cannot outlive its caller', (cwd) => {
+  // The mechanism behind the incident: the gate timeout is far longer than the
+  // caller's budget. Bounded, the waiter returns promptly and says so.
+  const g = gate.openGate(cwd, { ...SPEC, timeout_ms: 600_000 });
+  const started = Date.now();
+  const res = gate.waitForAnswerSync(cwd, g.id, { poll_ms: 5, max_wait_ms: 60 });
+  const elapsed = Date.now() - started;
+  assertEq(res.status, 'pending', 'gate is still open — nothing was decided');
+  assertEq(res.source, 'wait-timeout', 'the caller is told the WAIT lapsed, not the gate');
+  assert(elapsed < 30_000, `bounded wait must return promptly, took ${elapsed}ms`);
+});
+
+test('CLI --open --wait --max-wait returns instead of blocking to the gate timeout', (cwd) => {
+  // Covers the WIRING, not just the library: an unwired flag would leave the
+  // CLI blocking for the full timeout and be invisible to a library-level test.
+  const started = Date.now();
+  const r = spawnSync(process.execPath, [
+    ENGINE, '--open', '--cwd', cwd, '--json', '--no-notify',
+    '--question', 'q', '--option', 'treat:Treat', '--option', 'skip:Skip',
+    '--timeout', '600000', '--wait', '--max-wait', '200',
+  ], { encoding: 'utf8', timeout: 60_000 });
+  const elapsed = Date.now() - started;
+  assertEq(r.status, 0, `CLI must exit 0: ${r.stderr}`);
+  assert(elapsed < 30_000, `--max-wait must bound the CLI block, took ${elapsed}ms`);
+  const parsed = JSON.parse(r.stdout);
+  assertEq(parsed.source, 'wait-timeout', 'the CLI reports the wait lapsed, not the gate');
+  assertEq(parsed.status, 'pending', 'the gate is left open for a later responder');
+});
+
+test('CLI --resolve-lapsed closes an abandoned gate and exits 0', (cwd) => {
+  const g = gate.openGate(cwd, { ...SPEC, timeout_ms: 1, default: 'skip' });
+  spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},20)']);
+  const r = spawnSync(process.execPath, [ENGINE, '--resolve-lapsed', '--cwd', cwd, '--json'], { encoding: 'utf8' });
+  assertEq(r.status, 0, `CLI must exit 0: ${r.stderr}`);
+  const parsed = JSON.parse(r.stdout);
+  assertEq(parsed.resolved.length, 1, 'CLI resolved the abandoned gate');
+  const after = JSON.parse(fs.readFileSync(gate.gateFile(cwd, g.id), 'utf8'));
+  assertEq(after.answer.source, 'timeout-default', 'persisted through the CLI path');
+});
+
 // ── Summary ──────────────────────────────────────────────────────────────────
 console.log(`\n${'─'.repeat(60)}`);
 console.log(`  ${passed} passed, ${failed} failed`);
