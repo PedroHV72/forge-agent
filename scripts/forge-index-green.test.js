@@ -214,8 +214,15 @@ test('measureGreen never mutates the store tree', () => {
 });
 
 test('the module never exposes a --write flag on its CLI', () => {
+  // S02 R6 (review-fix): escopado ao bloco de parsing do argv (precedente:
+  // forge-index-f2.test.js). Sobre o arquivo inteiro, um comentário legítimo
+  // que mencionasse `--write` quebraria o teste com o contrato intacto.
   const source = fs.readFileSync(path.join(__dirname, 'forge-index-green.js'), 'utf8');
-  assert.ok(!/--write/.test(source), 'forge-index-green.js must never accept --write — this gate is read-only by contract');
+  const start = source.indexOf('function parseCliArgs');
+  const end = source.indexOf('function renderMarkdown');
+  assert.ok(start >= 0 && end > start, 'parseCliArgs must precede renderMarkdown — guard anchors moved');
+  const argvBlock = source.slice(start, end);
+  assert.ok(!/--write/.test(argvBlock), 'forge-index-green.js must never accept --write — this gate is read-only by contract');
 });
 
 // ── Section 8: determinism ───────────────────────────────────────────────────

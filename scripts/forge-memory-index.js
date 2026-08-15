@@ -20,6 +20,7 @@ const path = require('path');
 
 const { listFragments, parseFragment, memoryDir, readFragmentText } = require('./forge-memory');
 const { guardReadAndWarn } = require('./forge-schema-guard');
+const { buildUnitAxis, renderUnitAxis, buildSubjectAxis, renderSubjectAxis } = require('./forge-memory-axes');
 
 // T02 default artifact path — LOCKED with T03 so the two never diverge.
 const DEFAULT_INDEX_PATH = '.gsd/MEMORY-INDEX-BY-FILE.md';
@@ -57,8 +58,13 @@ const CITATION_REGEXES = [
   },
   {
     name: 'bare-basename',
-    // file.ext loose in prose — dominant case in this repo's real fragment
-    regex: new RegExp('(?<![`\\w./\\-@])([\\w.\\-]+\\.' + CODE_EXT + ')(?![`\\w])', 'g'),
+    // file.ext loose in prose — dominant case in this repo's real fragment.
+    //
+    // Classe FP T02: `T##-PLAN.md` (token de plano, não arquivo). Sem `#` no
+    // lookbehind, a regex começava no hífen e emitia o pedaço `-PLAN.md`, uma
+    // citação permanentemente not-found. O delimitador entra na guarda para
+    // avaliar o token inteiro; `T01-PLAN.md` continua uma citação legítima.
+    regex: new RegExp('(?<![`#\\w./\\-@])([\\w.\\-]+\\.' + CODE_EXT + ')(?![`\\w])', 'g'),
     description: 'Nome de arquivo solto na prosa, sem crases e sem barra.',
   },
   {
@@ -103,34 +109,219 @@ const CITATION_REGEXES = [
   },
 ];
 
+// gaps[] T02 — o detector independente mede estes formatos, mas alargar
+// CODE_EXT para qualquer sufixo transformaria palavras pontuadas em citações
+// irresolúveis (o precedente medido foi 311 -> 972). Permanecem reportados em
+// `coverage.citation_gaps` e na saída F2 como menções perdidas, nunca ocultados
+// para melhorar a métrica. Exemplo motivador: `config.weird` (mem_id sintético
+// `mem-gap-extension-outside-code-ext`).
+const CITATION_GAPS = [
+  {
+    name: 'extension-outside-code-ext',
+    reason: 'sufixo fora de CODE_EXT: manter precisão, não aceitar extensão arbitrária',
+  },
+];
+
 // Extension test used by the token-based dynamic-candidate scan below — bounded
 // per-token, never a whole-text greedy match (avoids catastrophic over-match
 // across unrelated backticks elsewhere in the sentence).
 const EXT_SUFFIX_RE = new RegExp('\\.' + CODE_EXT + '[)\\],.;:!?]*$');
 
-// Uses the extractor's CODE_EXT vocabulary as the sole source of truth for
-// the missed-extractor bucket (T02 plan: "fonte única obrigatória"). The
-// consequence is stated where it is published: a file mention whose extension
-// is outside CODE_EXT is invisible to BOTH the extractor and this detector, so
-// it lands in bucket (a) — see the (a) label in renderIndex, which does not
-// claim that bucket is defect-free.
-//
-// S06 R7: the token IS copied into the index verbatim — it is rendered in the
-// defect table and emitted whole under `coverage` by `--json`. The 120-char cap
-// is a SIGNAL BUDGET (enough to identify the shape of the missed mention), not
-// a privacy guarantee. What bounds exposure is the `\S+` match: a token never
-// spans whitespace, so it cannot carry a prose fragment. It CAN still be a UNC
-// path or an identifying URL — that is the real exposure, and it is the reason
-// this index is not published without being read first. The token is never
-// probed on disk.
-function findSampleFileToken(text) {
-  if (typeof text !== 'string') return null;
-  const tokenRe = /\S+/g;
-  let match;
-  while ((match = tokenRe.exec(text)) !== null) {
-    if (EXT_SUFFIX_RE.test(match[0])) return match[0].slice(0, 120);
+// Bucket (b) must not grade the extractor with its own CODE_EXT vocabulary.
+// Loading is deliberately late: forge-index-f2 imports this module to measure
+// it, so a top-level require would freeze a circular, incomplete export.
+// S06 R7's 120-char signal budget still applies; the detector's raw token is
+// rendered but never probed on disk.
+function findIndependentSampleFileToken(text) {
+  const mention = independentMentionEvidence(text).mentions[0];
+  return mention ? String(mention.raw).slice(0, 120) : null;
+}
+
+// The F2 detector deliberately has its own normalizer. Keep comparison logic
+// here limited to the stable basename representation: importing CODE_EXT or a
+// registry pattern into this boundary would turn the independent observation
+// back into self-evaluation. These helpers are also deliberately total: a
+// malformed detector return becomes an empty observation rather than a new
+// exception in the index read path.
+function citationComparableBasename(value) {
+  return String(value || '').replace(/\\/g, '/').split('/').pop().toLowerCase();
+}
+
+function detectIndependentMentions(text) {
+  try {
+    // Key link T02: the measurement detector is the source for bucket (b).
+    // S02 R1 (review-fix): consumir a lista JÁ filtrada do ruído conhecido do
+    // detector (versão nua, `e/ou`, abreviação com barra). O bucket (b) e a
+    // medição F2 passam a classificar pelo mesmo critério; antes, um fato cuja
+    // única menção era ruído entrava em `missed_by_extractor`.
+    const { detectSignalMentions } = require('./forge-index-f2');
+    const mentions = detectSignalMentions(text);
+    return Array.isArray(mentions) ? mentions : [];
+  } catch (_) {
+    // A measurement helper must not make core index reads fail. This is only a
+    // classification aid; extraction/resolution remains available on its own.
+    return [];
   }
-  return null;
+}
+
+function independentMentionEvidence(text, citations) {
+  const mentions = detectIndependentMentions(text);
+  const extracted = Array.isArray(citations) ? citations : extractCitations(text);
+  const citedNames = new Set(extracted.map((citation) => citationComparableBasename(citation.path || citation.raw)));
+  const unmatched = mentions.filter((mention) => !citedNames.has(citationComparableBasename(mention.normalized || mention.raw)));
+  return {
+    mentions,
+    unmatched,
+    // Keep this name descriptive instead of calling it "valid": the detector
+    // intentionally reports file-shaped noise so its false positives remain
+    // auditable in F2. Bucket (b) means "detected but unextracted", not proof
+    // that the token names a real file.
+    detector_observed: mentions.length > 0,
+  };
+}
+
+function classifyNoCitationFact(text) {
+  const evidence = independentMentionEvidence(text, []);
+  const first = evidence.mentions[0];
+  if (!first) {
+    return {
+      bucket: 'no_file_mention',
+      sample_token: null,
+      detector_mentions: 0,
+    };
+  }
+  return {
+    bucket: 'missed_by_extractor',
+    sample_token: String(first.raw || '').slice(0, 120),
+    detector_mentions: evidence.mentions.length,
+  };
+}
+
+function citationGapCoverage() {
+  // Copy the public report shape on every result so a caller cannot mutate the
+  // registry used by later index runs. `reason` is prose, not a control value.
+  return CITATION_GAPS.map((gap) => ({ name: gap.name, reason: gap.reason }));
+}
+
+function citationGapNames(gaps) {
+  return (Array.isArray(gaps) ? gaps : [])
+    .map((gap) => String(gap && gap.name || ''))
+    .filter(Boolean);
+}
+
+function hasNamedCitationGap(gaps, name) {
+  return citationGapNames(gaps).includes(String(name || ''));
+}
+
+function isKnownCitationGap(name) {
+  return hasNamedCitationGap(CITATION_GAPS, name);
+}
+
+function sumUnresolvedCoverage(unresolved) {
+  return (Array.isArray(unresolved) ? unresolved : [])
+    .reduce((total, item) => total + Number((item && item.count) || 0), 0);
+}
+
+function hasCitationCoverageIdentity(coverage) {
+  const safe = coverage || {};
+  return Number(safe.citations_resolved || 0) + sumUnresolvedCoverage(safe.unresolved) === Number(safe.citations_total || 0);
+}
+
+// Produce a compact, serializable comparison for diagnostics and tests. It is
+// deliberately a snapshot, never a second extraction pass over the store. The
+// extractor owns citations; F2 owns what looks like a mention; this helper only
+// makes the boundary between their two observations explicit.
+function citationDetectionBreakdown(text, citations) {
+  const extracted = Array.isArray(citations) ? citations : extractCitations(text);
+  const evidence = independentMentionEvidence(text, extracted);
+  const observedNames = independentMentionNames(evidence.mentions);
+  const extractorOnly = citationsWithoutIndependentMention(extracted, observedNames);
+  return {
+    detector_mentions: evidence.mentions.length,
+    detector_unmatched: evidence.unmatched.map((mention) => mention.raw),
+    extractor_only: extractorOnly,
+  };
+}
+
+function independentMentionNames(mentions) {
+  const names = new Set();
+  for (const mention of Array.isArray(mentions) ? mentions : []) {
+    const name = citationComparableBasename(mention && (mention.normalized || mention.raw));
+    if (name) names.add(name);
+  }
+  return names;
+}
+
+function citationNames(citations) {
+  const names = new Set();
+  for (const citation of Array.isArray(citations) ? citations : []) {
+    const name = citationComparableBasename(citation && (citation.path || citation.raw));
+    if (name) names.add(name);
+  }
+  return names;
+}
+
+function citationsWithoutIndependentMention(citations, mentionNames) {
+  const observed = mentionNames instanceof Set ? mentionNames : new Set();
+  return (Array.isArray(citations) ? citations : [])
+    .filter((citation) => !observed.has(citationComparableBasename(citation && (citation.path || citation.raw))))
+    .map((citation) => citation.raw);
+}
+
+function mentionsWithoutCitation(mentions, citations) {
+  const cited = citationNames(citations);
+  return (Array.isArray(mentions) ? mentions : [])
+    .filter((mention) => !cited.has(citationComparableBasename(mention && (mention.normalized || mention.raw))));
+}
+
+function formatCitationGap(gap) {
+  const name = String(gap && gap.name || 'unnamed-gap');
+  const reason = String(gap && gap.reason || 'sem motivo declarado');
+  return `${name} (${reason})`;
+}
+
+function renderCitationGapLines(gaps) {
+  const safe = Array.isArray(gaps) ? gaps : [];
+  if (safe.length === 0) return ['- citation_gaps: nenhum'];
+  const lines = ['- citation_gaps:'];
+  for (const gap of safe) lines.push(`  - ${formatCitationGap(gap)}`);
+  return lines;
+}
+
+function citationCoverageSummary(coverage) {
+  const safe = coverage || {};
+  const total = Number(safe.citations_total || 0);
+  const resolved = Number(safe.citations_resolved || 0);
+  const unresolved = sumUnresolvedCoverage(safe.unresolved);
+  return {
+    total,
+    resolved,
+    unresolved,
+    identity_holds: resolved + unresolved === total,
+    gaps: citationGapNames(citationGapCoverage()),
+  };
+}
+
+function citationCoverageIsPrecise(before, after) {
+  const previous = citationCoverageSummary(before);
+  const current = citationCoverageSummary(after);
+  return current.unresolved <= previous.unresolved;
+}
+
+function citationCoverageGaps(coverage) {
+  const safe = coverage || {};
+  return citationGapCoverage().filter((gap) => {
+    const reported = Array.isArray(safe.citation_gaps) ? safe.citation_gaps : [];
+    return hasNamedCitationGap(reported, gap.name);
+  });
+}
+
+function citationGapCount(coverage) {
+  return citationCoverageGaps(coverage).length;
+}
+
+function hasCitationGaps(coverage) {
+  return citationGapCount(coverage) > 0;
 }
 
 // ── findDynamicCandidates ────────────────────────────────────────────────────
@@ -451,6 +642,7 @@ function buildFileIndex(cwd, opts) {
 
   const unreadableFragments = [];
   const allFacts = []; // { fact, fragment }
+  const facts = [];
 
   // S02 R3: an enumeration failure used to yield fragments_read:0 with an empty
   // unreadable_fragments and partial untouched — BYTE-IDENTICAL to a genuinely
@@ -504,14 +696,18 @@ function buildFileIndex(cwd, opts) {
     const storageKey = fragment.storageKey;
 
     const citations = extractCitations(fact && fact.text);
+    let factCitationsResolved = 0;
 
     if (citations.length === 0) {
-      const sampleToken = findSampleFileToken(fact && fact.text);
+      const classification = classifyNoCitationFact(fact && fact.text);
       const record = { mem_id: memId, storage_key: storageKey };
       factsWithoutCitation.push(record);
-      factClassifications.push(sampleToken
-        ? { mem_id: memId, storage_key: storageKey, bucket: 'missed_by_extractor', sample_token: sampleToken }
-        : { mem_id: memId, storage_key: storageKey, bucket: 'no_file_mention' });
+      factClassifications.push({
+        mem_id: memId,
+        storage_key: storageKey,
+        bucket: classification.bucket,
+        ...(classification.sample_token ? { sample_token: classification.sample_token } : {}),
+      });
       continue;
     }
 
@@ -526,10 +722,11 @@ function buildFileIndex(cwd, opts) {
 
     for (const citation of citations) {
       const resolution = resolveCitation(citation, cwd, fileIndex);
-      resolvedCitations.push({ citation, resolution });
+      resolvedCitations.push({ citation, resolution, mem_id: memId });
 
       if (resolution.state === 'RESOLVED') {
         anyResolved = true;
+        factCitationsResolved++;
         const file = resolution.file;
         if (seenFilesForFact.has(file)) continue;
         seenFilesForFact.add(file);
@@ -550,11 +747,26 @@ function buildFileIndex(cwd, opts) {
 
     if (!anyResolved) {
       const record = { mem_id: memId, storage_key: storageKey };
+      record.citation_reasons = citations.map((item) => resolveCitation(item, cwd, fileIndex).reason).filter(Boolean);
       factsUnresolvedOnly.push(record);
       factClassifications.push({ mem_id: memId, storage_key: storageKey, bucket: 'unresolved_only' });
     } else {
       factClassifications.push({ mem_id: memId, storage_key: storageKey, bucket: 'with_resolved' });
     }
+
+    facts.push({
+      mem_id: memId,
+      category: fact && fact.category ? fact.category : null,
+      summary: summarizeFact(fact, opts.summarize || {}),
+      unit_id: fragment.unitId || null,
+      storage_key: storageKey || null,
+      milestone_id: fragment.milestoneId || null,
+      source_unit: fact && fact.source_unit ? fact.source_unit : null,
+      text: fact && typeof fact.text === 'string' ? fact.text : '',
+      citations_total: citations.length,
+      citations_resolved: factCitationsResolved,
+      citations_resolved_count: factCitationsResolved,
+    });
   }
 
   // entries ordered by file (localeCompare('en')); facts ordered by storage_key then mem_id.
@@ -630,12 +842,33 @@ function buildFileIndex(cwd, opts) {
     // saw them. Distinct from unreadable_fragments (which the store returned
     // and we failed to read). Never feeds the citation sum invariant.
     fragments_skipped_by_store: fragmentsSkippedByStore,
+    citation_gaps: citationGapCoverage(),
     scan_capped: fileIndex.capped,
     guard_unavailable: guardUnavailable,
     fragment_listing_failed: fragmentListingFailed,
   };
 
-  return { entries, coverage, partial: guardPartial || fragmentListingFailed !== null };
+  // R4: classify existing (c) facts from the citation census. A file-missing
+  // reason dominates when a fact also contains a by-design citation.
+  const causes = { por_design_nao_e_arquivo: [], citacao_de_arquivo_nao_localizada: [] };
+  const reasonsByFact = new Map();
+  for (const item of resolvedCitations) {
+    if (!reasonsByFact.has(item.mem_id)) reasonsByFact.set(item.mem_id, []);
+    if (item.resolution && item.resolution.reason) reasonsByFact.get(item.mem_id).push(item.resolution.reason);
+  }
+  for (const item of factsUnresolvedOnly) {
+    const reasons = reasonsByFact.get(item.mem_id) || item.citation_reasons || [];
+    const missing = reasons.some((reason) => reason === 'not-found' || reason === 'ambiguous-basename');
+    causes[missing ? 'citacao_de_arquivo_nao_localizada' : 'por_design_nao_e_arquivo'].push(item);
+  }
+  if (causes.por_design_nao_e_arquivo.length + causes.citacao_de_arquivo_nao_localizada.length !== factsUnresolvedOnly.length) throw new Error('identidade de causas do balde (c) não fecha');
+  coverage.unresolved_cause_counts = {
+    por_design_nao_e_arquivo: causes.por_design_nao_e_arquivo.length,
+    citacao_de_arquivo_nao_localizada: causes.citacao_de_arquivo_nao_localizada.length,
+  };
+  coverage.unresolved_cause_facts = causes;
+
+  return { entries, facts, coverage, partial: guardPartial || fragmentListingFailed !== null, _cwd: root };
 }
 
 // ── renderIndex ────────────────────────────────────────────────────────────────
@@ -681,7 +914,30 @@ function factLine(fact) {
   const unit = (fact.unit_id || fact.storage_key)
     ? codeCell(fact.unit_id || fact.storage_key)
     : '(unidade desconhecida)';
-  return `- ${memId} (${category}) — ${summary} — origem: ${unit}`;
+  const source = fact.source_unit ? ` — source_unit: ${codeCell(fact.source_unit)}` : '';
+  return `- ${memId} (${category}) — ${summary} — origem: ${unit}${source}`;
+}
+
+// S02 R2 (review-fix): a chave do cache é o OBJETO `result` desta render, não o
+// `cwd`. Cacheado por cwd, um segundo render no mesmo processo devolvia o número
+// de uma medição anterior enquanto o rótulo afirmava "medida nesta execução" —
+// afirmação de medição que ninguém fez naquela render (classe TASK-021/S07).
+// O WeakMap existe só para evitar medir duas vezes DENTRO da mesma render.
+const PARTIAL_CAPTURE_CACHE = new WeakMap();
+function partialCaptureCount(result) {
+  const key = result && typeof result === 'object' ? result : null;
+  if (key && PARTIAL_CAPTURE_CACHE.has(key)) return PARTIAL_CAPTURE_CACHE.get(key);
+  const cwd = (result && result._cwd) || process.cwd();
+  let value;
+  try {
+    const { measureF2 } = require('./forge-index-f2');
+    const report = measureF2(cwd);
+    value = Array.isArray(report.facts_missed_partial) ? report.facts_missed_partial.length : 0;
+  } catch (error) {
+    value = `não medida nesta execução (${error && error.message ? error.message : String(error)})`;
+  }
+  if (key) PARTIAL_CAPTURE_CACHE.set(key, value);
+  return value;
 }
 
 function renderIndex(result, opts) {
@@ -722,6 +978,11 @@ function renderIndex(result, opts) {
     }
   }
 
+  const unitAxis = buildUnitAxis(result);
+  lines.push(renderUnitAxis(unitAxis));
+  const { buildSubjectAxis, renderSubjectAxis } = require('./forge-memory-axes');
+  lines.push(renderSubjectAxis(buildSubjectAxis(result)));
+
   // ── Cobertura e descarte — INCONDICIONAL (never omitted, never skipped). ──
   lines.push('## Cobertura e descarte');
   lines.push('');
@@ -737,12 +998,15 @@ function renderIndex(result, opts) {
   const noFileMention = Array.isArray(coverage.facts_no_file_mention) ? coverage.facts_no_file_mention : [];
   const missedByExtractor = Array.isArray(coverage.facts_missed_by_extractor) ? coverage.facts_missed_by_extractor : [];
   const unresolvedOnly = Array.isArray(coverage.facts_unresolved_only) ? coverage.facts_unresolved_only : [];
-  lines.push(`- (a) fatos sem menção reconhecida pelo vocabulário atual do extrator: ${noFileMention.length} — parte desconhecida. Este balde absorve tanto fatos que realmente não citam arquivo quanto menções cujo sufixo está fora de \`CODE_EXT\`; não há medição que separe as duas populações, portanto ele NÃO pode ser declarado livre de defeito.`);
-  lines.push(`- (b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator: ${missedByExtractor.length} — é defeito real do extrator e requer investigação. Esta contagem cobre apenas fatos SEM NENHUMA citação capturada; captura PARCIAL (ex.: um fato que cita três arquivos e o extrator só capturou um) não é medida aqui — permanece invisível a este balde.`);
-  lines.push(`- (c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo: ${unresolvedOnly.length} — mistura duas causas que esta contagem NÃO separa: citações que apontam para arquivo e não foram localizadas, e citações que por design não são arquivo (\`package-ref\`, \`dynamic\` — ver tabela abaixo). A divisão entre as duas populações permanece não medida.`);
+  lines.push(`- (a) fatos sem menção reconhecida pelo vocabulário do detector independente: ${noFileMention.length} — fronteira do detector de T01/T02; não permite afirmar ausência de defeito fora dela.`);
+  lines.push(`- (b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator: ${missedByExtractor.length} — o detector reconhece a menção; captura PARCIAL não incluída neste total, medida nesta execução: ${partialCaptureCount(result)}.`);
+  const causes = coverage.unresolved_cause_counts || { por_design_nao_e_arquivo: 0, citacao_de_arquivo_nao_localizada: 0 };
+  lines.push(`- (c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo: ${unresolvedOnly.length} — por design não são arquivo (package-ref/dynamic/outside-root): ${causes.por_design_nao_e_arquivo}; citação de arquivo não localizada (not-found/ambiguous-basename): ${causes.citacao_de_arquivo_nao_localizada}. A segunda categoria domina quando ambas aparecem; a soma é exatamente (c).`);
   lines.push(`- citations_total: ${coverage.citations_total || 0}`);
   lines.push(`- citations_resolved: ${coverage.citations_resolved || 0}`);
   lines.push(`- files_indexed: ${coverage.files_indexed || 0}`);
+  const citationGaps = Array.isArray(coverage.citation_gaps) ? coverage.citation_gaps : [];
+  lines.push(...renderCitationGapLines(citationGaps));
   lines.push('');
 
   lines.push('### Citações não resolvidas');
@@ -1017,6 +1281,17 @@ function renderQuery(result, query) {
 
 module.exports = {
   CITATION_REGEXES,
+  CITATION_GAPS,
+  detectIndependentMentions,
+  independentMentionEvidence,
+  classifyNoCitationFact,
+  citationDetectionBreakdown,
+  citationCoverageSummary,
+  citationCoverageIsPrecise,
+  citationCoverageGaps,
+  citationGapCount,
+  hasCitationCoverageIdentity,
+  renderCitationGapLines,
   extractCitations,
   resolveCitation,
   listRepoFiles,
@@ -1025,9 +1300,14 @@ module.exports = {
   renderIndex,
   writeIndex,
   factLine,
+  cell,
+  codeCell,
+  prose,
   normalizeQueryPath,
   queryIndex,
   renderQuery,
+  buildUnitAxis,
+  renderUnitAxis,
   DEFAULT_INDEX_PATH,
 };
 
@@ -1037,8 +1317,8 @@ module.exports = {
 // {error} em stderr, exits 0/1/2). Exit 2 rejeita args inválidos explicitamente
 // (S01's guard CLI took a review objection precisely for accepting bad args).
 function parseCliArgs(argv) {
-  const KNOWN = new Set(['--write', '--json', '--out', '--cwd', '--file']);
-  const out = { write: false, json: false, out: undefined, cwd: undefined, files: [], valid: true };
+  const KNOWN = new Set(['--write', '--json', '--out', '--cwd', '--file', '--unit', '--subject']);
+  const out = { write: false, json: false, out: undefined, cwd: undefined, files: [], units: [], subjects: [], valid: true };
   // Uma opção que pede valor nunca consome a PRÓXIMA OPÇÃO como se fosse valor
   // (S03 R2): `--file --json` viraria consulta por um arquivo chamado `--json`,
   // engolindo em silêncio o modo pedido e devolvendo exit 0 com alegação falsa de
@@ -1054,20 +1334,22 @@ function parseCliArgs(argv) {
     if (!KNOWN.has(arg)) { out.valid = false; return out; }
     if (arg === '--write') { out.write = true; continue; }
     if (arg === '--json') { out.json = true; continue; }
-    if (arg === '--out' || arg === '--cwd' || arg === '--file') {
+    if (arg === '--out' || arg === '--cwd' || arg === '--file' || arg === '--unit' || arg === '--subject') {
       const value = takesValue(arg, i);
       if (value === null) { out.valid = false; return out; }
       i++;
       if (arg === '--out') out.out = value;
       else if (arg === '--cwd') out.cwd = value;
-      else out.files.push(value);
+      else if (arg === '--file') out.files.push(value);
+      else if (arg === '--unit') out.units.push(value);
+      else out.subjects.push(value);
       continue;
     }
   }
   // --write grava o índice COMPLETO em .gsd/MEMORY-INDEX-BY-FILE.md; escrever um
   // índice filtrado por cima do completo destruiria o artefato sem nenhum sinal
   // (T01 step 3) — recusado nos args, antes de qualquer leitura do store.
-  if (out.files.length > 0 && out.write === true) { out.valid = false; return out; }
+  if ((out.files.length > 0 || out.units.length > 0 || out.subjects.length > 0) && out.write === true) { out.valid = false; return out; }
   return out;
 }
 
@@ -1079,7 +1361,7 @@ function runCli(argv) {
   }
 
   const cwd = args.cwd ? path.resolve(args.cwd) : process.cwd();
-  const isQuery = args.files.length > 0;
+  const isQuery = args.files.length > 0 || args.units.length > 0 || args.subjects.length > 0;
   // Sem flag de saída explícita → default --write (step 6 do plano) — EXCETO em
   // modo consulta: `--file` sozinho nunca escreve (T01 step 4; sem isto, o
   // default implícito sobrescreveria o artefato completo com um índice filtrado
@@ -1090,6 +1372,28 @@ function runCli(argv) {
     const result = buildFileIndex(cwd, {});
 
     if (isQuery) {
+      if (args.subjects.length > 0) {
+        const axis = buildSubjectAxis(result);
+        if (args.json) process.stdout.write(JSON.stringify({ partial: result.partial, coverage: result.coverage, subject_axis: axis, subjects: args.subjects, out: null }) + '\n');
+        else process.stdout.write(renderSubjectAxis(axis, { requested: args.subjects }));
+        return 0;
+      }
+      if (args.units.length > 0) {
+        const axis = buildUnitAxis(result);
+        if (args.json) {
+          process.stdout.write(JSON.stringify({
+            partial: result.partial,
+            counts: { facts_total: result.coverage.facts_total, facts_with_unit: axis.coverage.facts_with_unit },
+            coverage: result.coverage,
+            unit_axis: axis,
+            units: args.units,
+            out: null,
+          }) + '\n');
+        } else {
+          process.stdout.write(renderUnitAxis(axis, { requested: args.units }));
+        }
+        return 0;
+      }
       const query = queryIndex(result, args.files);
 
       if (args.json) {
