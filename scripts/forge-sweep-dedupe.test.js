@@ -21,7 +21,13 @@ function test(name, fn) {
   catch (error) { process.stderr.write(`not ok - ${name}\n${error.stack}\n`); process.exitCode = 1; }
 }
 function equal(actual, expected, message) { assert.deepStrictEqual(actual, expected, message); }
-function root() { return fs.mkdtempSync(path.join(os.tmpdir(), 'fsd-')); }
+// realpathSync is load-bearing on macOS, where os.tmpdir() is `/tmp` — a
+// symlink to `/private/tmp`. restoreVault deliberately reports the RESOLVED
+// physical path of everything it restores, so a fixture rooted at the symlinked
+// spelling makes `restored.includes(f.second)` false there while passing on
+// Linux, where no such symlink exists. Rooting the fixture at the real path
+// keeps both sides of every path comparison in the same spelling.
+function root() { return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fsd-'))); }
 function remove(dir) { fs.rmSync(dir, { recursive: true, force: true }); }
 function bytes(file) { return fs.readFileSync(file); }
 function digest(buffer) { return crypto.createHash('sha256').update(buffer).digest('hex'); }

@@ -33,14 +33,32 @@ function randomSuffix() {
 
 // Build the member list before touching the vault directory. A skipped member
 // means the caller has no complete undo record, so no partial vault is written.
+// Member ids are relative to the workspace, and BOTH sides of that subtraction
+// must be resolved the same way. They were not: `cwd` arrived lexically while
+// the file paths arrive already physical (the census resolves them), so on any
+// machine where the workspace sits under a symlink the subtraction produced an
+// id that escapes — `../../private/tmp/…/.gsd/memory/x.md` instead of
+// `.gsd/memory/x.md`. Restore then resolved that id back to the physical path,
+// compared it against the LEXICAL `.gsd` root, and refused every member with
+// `path-escapes-gsd`, making undo entirely inert.
+//
+// It is invisible on Linux (`/tmp` is real) and fires on macOS (`/tmp` is a
+// symlink to `/private/tmp`) — which is exactly the ubuntu-green / macOS-red
+// split this suite showed. Same lesson already paid for in the memory index:
+// containment is real-vs-real, never real-vs-lexical.
+function physical(target) {
+  try { return fs.realpathSync(target); } catch { return path.resolve(target); }
+}
+
 function writeVault(cwd, options) {
   const opts = options || {};
   const files = Array.isArray(opts.files) ? opts.files : [];
   const members = [];
+  const cwdReal = physical(cwd);
   for (const file of files) {
     const absolute = path.resolve(file);
     members.push({
-      id: toPosix(path.relative(cwd, absolute)),
+      id: toPosix(path.relative(cwdReal, physical(absolute))),
       path: absolute,
       content: fs.readFileSync(absolute),
     });
