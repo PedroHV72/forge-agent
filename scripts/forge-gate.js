@@ -295,6 +295,69 @@ function resolutionFrom(gate) {
   };
 }
 
+// ── Lapse resolution ─────────────────────────────────────────────────────────
+// Persisting the declared default when a gate lapses is what makes the mailbox
+// safe: the caller always gets an actionable choice instead of a dead end.
+//
+// Until now the ONLY code that did it lived inside `waitForAnswerSync`, which
+// means resolution was a side effect of one process staying alive until the
+// expiry moment. It does not stay alive. The real call site
+// (`shared/forge-review.md`, `--open --wait --timeout 1800000`) runs inside an
+// orchestrator tool call whose budget is minutes, not the gate's 30 — so the
+// waiter is killed long before the gate expires and the gate is left `pending`
+// forever. A later reader then sees `expired` with `answer: null`, which is
+// byte-identical to a gate that was never given a window at all. That is the
+// shape reported in item I-20260814111723, and the surviving artifact
+// `G-20260814042121-3d46.json` shows it exactly: `expires_at - created_at` is
+// the requested 1800000 to the millisecond, yet 6.4h later nothing had
+// resolved it.
+//
+// So resolution is now a function of the FILE, callable by anyone at any later
+// time — never a property of a process that has to survive.
+function resolveLapsedGate(cwd, id) {
+  const raw = readGateFile(cwd, id);
+  if (!raw) return { ok: false, reason: 'not-found', gate: null };
+
+  if (effectiveStatus(raw, Date.now()) !== 'expired') {
+    return { ok: false, reason: 'not-lapsed', gate: withEffectiveStatus(raw, Date.now()) };
+  }
+  // Already carries a resolution (a waiter got there, or a previous sweep did).
+  if (raw.answer) return { ok: false, reason: 'already-resolved', gate: raw };
+
+  const opt  = findOption(raw, raw.default) || raw.options[0];
+  const gate = {
+    ...raw,
+    status: 'expired',
+    answer: {
+      key: opt.key, label: opt.label,
+      source: 'timeout-default', notes: '', at: Date.now(),
+    },
+  };
+  // A human may have answered between our read and this write — never clobber.
+  const current = readGateFile(cwd, id);
+  if (current && current.status === 'answered') {
+    return { ok: false, reason: 'answered-meanwhile', gate: current };
+  }
+  writeGateFile(cwd, gate);
+  return { ok: true, reason: 'timeout-default', gate };
+}
+
+// Sweep every lapsed-but-unresolved gate. Reports a census rather than a bare
+// count: a sweep that says nothing about what it skipped is indistinguishable
+// from a sweep that examined nothing (this repo's anti-silence floor).
+function resolveLapsed(cwd) {
+  const all      = listGates(cwd);
+  const resolved = [];
+  const skipped  = [];
+  for (const g of all) {
+    if (g.status !== 'expired') continue;
+    const r = resolveLapsedGate(cwd, g.id);
+    if (r.ok) resolved.push(r.gate);
+    else skipped.push({ id: g.id, reason: r.reason });
+  }
+  return { examined: all.length, resolved, skipped };
+}
+
 function waitForAnswerSync(cwd, id, opts) {
   opts = opts || {};
   const pollMs   = Number(opts.poll_ms || DEFAULT_POLL_MS);
@@ -311,22 +374,10 @@ function waitForAnswerSync(cwd, id, opts) {
     }
 
     if (status === 'expired') {
-      // Persist the lapse once, resolving to the declared default so the caller
-      // always receives an actionable choice rather than a dead end.
-      const opt  = findOption(raw, raw.default) || raw.options[0];
-      const gate = {
-        ...raw,
-        status: 'expired',
-        answer: {
-          key: opt.key, label: opt.label,
-          source: 'timeout-default', notes: '', at: Date.now(),
-        },
-      };
-      // A human may have answered between our read and this write — never clobber.
-      const current = readGateFile(cwd, id);
-      if (current && current.status === 'answered') return resolutionFrom(current);
-      writeGateFile(cwd, gate);
-      return resolutionFrom(gate);
+      // Single resolution path, shared with the `--resolve-lapsed` sweep: the
+      // waiter is now one of several possible resolvers, not the only one.
+      const r = resolveLapsedGate(cwd, id);
+      return resolutionFrom(r.gate || raw);
     }
 
     if (deadline && Date.now() >= deadline) {
@@ -464,12 +515,27 @@ function usage() {
     '  --show <id> [--json]',
     '  --answer <id> --choice <key> [--notes "..."] [--json]',
     '  --cancel <id> [--json]',
-    '  --wait <id> [--json]            bloqueia até resposta/expiração',
+    '  --wait <id> [--json] [--max-wait <ms>]',
+    '                                  bloqueia até resposta/expiração;',
+    '                                  --max-wait limita o bloqueio ao orçamento',
+    '                                  de quem chama (source: wait-timeout)',
+    '  --resolve-lapsed [--json]       resolve para o default declarado todo gate',
+    '                                  que expirou sem ninguém para persistir o',
+    '                                  lapso (não depende de waiter sobrevivente)',
     '  --cleanup [--max-age <ms>]',
     '  --demo                          abre um gate de exemplo e espera',
     '',
     'Env: FORGE_GATE_NO_NOTIFY=1 desliga notificação',
   ].join('\n');
+}
+
+// A blocking wait must be boundable to the CALLER's budget, which is routinely
+// far shorter than the gate's own timeout. Without this, `--open --wait` blocks
+// for the full timeout and gets killed mid-block, leaving the gate unresolved.
+// Returns undefined when unset — preserving the historical block-to-expiry
+// behaviour for anyone who genuinely wants it.
+function maxWaitMs(a) {
+  return a['max-wait'] !== undefined ? Number(a['max-wait']) : undefined;
 }
 
 function main(argv) {
@@ -514,13 +580,14 @@ function main(argv) {
     const gate = openGate(cwd, spec);
 
     if (a.wait || a.demo) {
+      const capMs = maxWaitMs(a);
       if (!json) {
         console.log(renderGate(gate, { full: true }));
         console.log('');
         console.log(`  Responda com:  forge-gate answer ${gate.id} <key>`);
         console.log('  (aguardando…)');
       }
-      const res = waitForAnswerSync(cwd, gate.id);
+      const res = waitForAnswerSync(cwd, gate.id, { max_wait_ms: capMs });
       out(res, `\n→ ${res.status}: "${res.choice}" (${res.source})${res.notes ? ` · ${res.notes}` : ''}`);
       return res.status === 'answered' ? 0 : 0;
     }
@@ -558,8 +625,19 @@ function main(argv) {
     return 0;
   }
 
+  if (a['resolve-lapsed']) {
+    const r = resolveLapsed(cwd);
+    out(r, [
+      `✓ ${r.resolved.length} gate(s) lapso(s) resolvido(s) para o default declarado`,
+      `  examinados: ${r.examined} · pulados: ${r.skipped.length}`,
+      ...r.skipped.map(s => `  - ${s.id}: ${s.reason}`),
+      ...r.resolved.map(g => `  → ${g.id}: "${g.answer.key}" (timeout-default)`),
+    ].join('\n'));
+    return 0;
+  }
+
   if (a.wait) {
-    const res = waitForAnswerSync(cwd, a.wait);
+    const res = waitForAnswerSync(cwd, a.wait, { max_wait_ms: maxWaitMs(a) });
     out(res, `→ ${res.status}: "${res.choice}" (${res.source})`);
     return 0;
   }
@@ -579,6 +657,7 @@ module.exports = {
   openGate, readGate, listGates, listPending,
   answerGate, cancelGate,
   waitForAnswerSync, ask,
+  resolveLapsedGate, resolveLapsed,
   cleanupResolved, notify, renderGate,
   DEFAULT_TIMEOUT_MS,
 };

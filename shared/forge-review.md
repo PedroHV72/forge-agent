@@ -933,7 +933,8 @@ Agent({ subagent_type: 'forge-executor',
     --option "fix:Refatorar agora:Despacha um review-fix para este item" \
     --option "followup:Criar follow-up:Cria item no backlog (.gsd/items/) e segue" \
     --default followup \
-    --timeout "${GATE_TIMEOUT_MS:-1800000}")
+    --timeout "${GATE_TIMEOUT_MS:-1800000}" \
+    --max-wait "${GATE_MAX_WAIT_MS:-240000}")
   CHOICE=$(printf '%s' "$RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).choice||'')}catch{console.log('')}})")
   SOURCE=$(printf '%s' "$RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).source||'')}catch{console.log('')}})")
   ```
@@ -944,7 +945,19 @@ Agent({ subagent_type: 'forge-executor',
 
   Record the provenance on the `**Decisão:**` line (`via gate — humano` vs `via gate — expirou`), so the artefact never claims a human made a call the clock made.
 
+  - `source == wait-timeout` → **nobody answered inside this tool call's budget.** The gate stays open (a human can still answer it) and the item is marked `**Decisão:** deferido → triagem no fim da milestone`, joining the guaranteed end-of-milestone surfacing. Never treat `wait-timeout` as a decision — no choice was made.
+
   `GATE_TIMEOUT_MS` defaults to 30min and is read from `review.gate_timeout_ms` when set. A run left alone overnight therefore behaves exactly like `defer` — the safe default is the one that happens when nobody is watching.
+
+  **`--max-wait` is not optional, and the reason is measured.** The gate timeout (30min) is far longer than the budget of the tool call that opens it. Without a bound the process blocks to the gate's own expiry and is **killed mid-block**, so the lapse is never persisted: the gate is left `pending` forever and a later reader sees `expired` with `answer: null` — byte-identical to a gate that was never given a window at all. That is the shape recorded in item `I-20260814111723` (artifact `G-20260814042121-3d46.json`: `expires_at - created_at` is exactly the requested `1800000`, yet 6.4h later nothing had resolved it). `GATE_MAX_WAIT_MS` defaults to 4min so the call always returns while the gate keeps its full 30min window for a human.
+
+  **Safety net — sweep abandoned gates.** Because resolution must never depend on a process surviving, run the sweep at the milestone-final triage (Step 9), before presenting the digest:
+
+  ```bash
+  node "${FORGE_SCRIPTS}/forge-gate.js" --resolve-lapsed --cwd "$WORKING_DIR" --json
+  ```
+
+  Every gate that lapsed with nobody watching gets its **declared default** persisted with `source: timeout-default`, so the artefact records what the clock decided instead of dangling. It is idempotent, names what it skipped, and exits 0.
 
 The gate **never** returns a blocker regardless of posture.
 
