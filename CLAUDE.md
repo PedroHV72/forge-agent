@@ -709,13 +709,26 @@ run `--runtime claude` não derrubar os destinos do Codex.
 
 ## Estado atual
 
-- **Milestone ativo:** — nenhum. **M018** (Sidecar multi-LLM autônomo via `codex app-server`) fechada, **mergeada na `master`** em `eaeb556` (fast-forward) e pushada para `origin/master`.
-- **Fase:** idle.
-- **Última entrega:** M018, 7 slices. Cliente JSON-RPC/stdio para `codex app-server` substitui o `codex exec` — a **ausência** do transporte antigo é provada por scanner in-process (`forge-exec-callsites.js`: `outcome: clean`, 312 arquivos, 0 call sites), não afirmada. Mais: schema pinado + guard de drift que nomeia o campo divergente, capability por turn, evidência de primeira classe com piso anti-silêncio, cobertura de env por reason (dois promovidos a exit code observado, três textuais com razão nomeada), e `turn/interrupt` antes do SIGKILL.
-- **Consertos pós-triagem, no mesmo commit:** rota inerte do `worker:` família (um `claude` nu resolvia para alias nulo e a task caía no default do frontmatter, ignorando o modelo do tier); Dimensão 9 do plan-checker (`.gsd/**` × `dispatch_engine`); Branch C marcando `status: DONE` no plano que completou; a mensagem de reparo do `SubagentStop`, que mandava o agente emitir **só** o bloco de resultado — obedecida ao pé da letra, custou 6 defesas do advogado, três voltando como placar nu; e o guard `nested-top-level-key`, achado por dogfood num workspace de dois repos onde **2 de 3 planos** aninhavam `expected_output` sob `must_haves:`, o validador chamava os três de válidos, e o resolvedor de `CODE_DIR` via zero paths.
-- **Baselines medidas na master pós-merge (medidas, não afirmadas):** `node scripts/run-tests.js` → **111 suítes**; `node scripts/forge-smoke.js` → **2502 passed / 0 failed / 1 skipped**; `cd app && swift run ForgeKitTests` → **515 passed / 0 failed**.
-- **Cópias instaladas:** `~/.claude` sincronizado com a master via `install.sh --update`, conferido arquivo a arquivo com `cmp`. Backup em `~/.claude-backup-20260807-231632`.
-- **Próxima ação:** Operador. Quatro itens em aberto, deliberadamente não corrigidos: (1) `GitActivity.Glob` (`app/Sources/ForgeKit/GitActivity.swift:219-227`) casa `X/**` **ancorado na raiz**, enquanto `agents/forge-completer.md:151` afirma prefixo-de-segmento em qualquer profundidade para a **mesma** lista de ignore — divergência medida por probe Swift temporário; (2) o comentário em `app/Sources/ForgeKitTests/main.swift:3086` afirma uma profundidade que o caso não exercita; (3) **S06 R7** (`scripts/forge-reverify.js:181-190`, o atalho de cardinalidade) segue **sem disposição nomeada** — nem corrigida nem listada como follow-up na triagem; (4) o dogfood real num workspace multi-repo de produção ainda não rodou — o `fs-probe` foi provado em umbrella sintético, não no projeto onde a falha 4/4-em-Claude foi medida.
+- **Milestone ativo:** — (M-20260814222313-sweep-curadoria concluído — 5/5 slices).
+- **Fase:** idle — milestone encerrada com sucesso, **não mergeada**.
+- **Branch:** `forge/M-20260814222313-sweep-curadoria` (HEAD `2c448db`) — fluxo fork+PR deste repo; o
+  operador abre a PR (mesmo precedente de outras milestones recentes de curadoria/isolamento).
+- **Última entrega:** 5 operações irmãs no `forge-sweep-registry` — dedupe mecânico (S01), índice de
+  memória multi-eixo consertado como gate da deleção (S02), destilador de invólucros com budget duro
+  (S03), deleção física de invólucros fail-closed (S04), curadoria semântica em lote CLI+skill (S05).
+  Todo apply real provado neste repo; WDMA usado só como laboratório read-only (D-1), sem nenhum apply
+  lá. Review agregado: 22 objeções nas 5 slices, 19 concedidas e corrigidas, 2 resolvidas em debate,
+  1 aberta refatorada na triagem final — zero objeções abertas ao fechar.
+- **Pendências nomeadas herdadas** (ver `.gsd/KNOWLEDGE.md § Review follow-ups` e itens
+  `I-20260815052212-curate-undo-recusa-pos` / `I-20260815042115-preview-delete-wrappers`): `curate
+  --undo` recusa pós-apply real (`restoreVault` de S08 é delete/recria, incompatível com reescrita-
+  no-lugar); exit code do preview de `delete-wrappers` não distingue recusa-por-cerca de
+  sem-candidatos; gate índice-verde (D-2) medido **vermelho** neste repo (`f2_recall=0,4286` < piso
+  0,99) — deleção física segue estruturalmente bloqueada até a extração de citações melhorar; WDMA
+  nunca recebeu apply/preview real (caminho não fornecido pelo operador); caps 3/8 de S05 seguem
+  provisórios, não recalibrados pela medição WDMA.
+- **Próxima ação:** Operador abre a PR do branch `forge/M-20260814222313-sweep-curadoria`, ou executa
+  `/forge-new-milestone <descrição>` para iniciar o próximo milestone.
 
 ## GSD — Início de sessão obrigatório (dogfood)
 
