@@ -107,6 +107,15 @@ function withAddressDefaults(rec) {
     // branch/root/project above: live records in .gsd/forge/runs/ are never
     // rewritten, and SCHEMA-VERSION is not bumped.
     worker_slice: (rec.worker_slice === undefined || rec.worker_slice === '') ? null : rec.worker_slice,
+    // ── Write-claim axis (S03/T01) ────────────────────────────────────────────
+    // What the current unit declares it is about to write, plus the CODE_DIR
+    // it is writing from as a GIVEN fact (never derived — see
+    // forge-write-claim.js). Additive by READ exactly like the fields above:
+    // live records in .gsd/forge/runs/ are never rewritten, no SCHEMA-VERSION
+    // bump. `null` means "never claimed"; a recorded object (even with
+    // `paths: []`) means "claimed, honestly empty" — the two must never
+    // collapse (see forge-write-claim.js::readClaim).
+    write_claim: (rec.write_claim === undefined || rec.write_claim === '') ? null : rec.write_claim,
   });
 }
 
@@ -161,7 +170,7 @@ function normalizeMetadataPatch(patch) {
     if (next.host_runtime === undefined || next.host_runtime === null || next.host_runtime === '') delete next.host_runtime;
     else next.host_runtime = normalizeHostRuntime(next.host_runtime);
   }
-  for (const key of ['owner', 'session', 'heartbeat', 'expires_at', 'worker_engine', 'worker_slice']) {
+  for (const key of ['owner', 'session', 'heartbeat', 'expires_at', 'worker_engine', 'worker_slice', 'write_claim']) {
     if (Object.prototype.hasOwnProperty.call(next, key) && next[key] === undefined) delete next[key];
   }
   return next;
