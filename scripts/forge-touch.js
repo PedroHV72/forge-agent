@@ -48,7 +48,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const { resolveRunAddress } = require('./forge-run-address.js');
-const { gitDefaultBranch } = require('./forge-isolation.js');
+const { gitDefaultBranch, realpathCanonical } = require('./forge-isolation.js');
 const runs = require('./forge-runs.js');
 
 // ── Reasons ──────────────────────────────────────────────────────────────
@@ -114,7 +114,15 @@ function repoIdentity(p) {
     const out = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: p, encoding: 'utf8' }).trim();
     if (!out) return null;
     const abs = path.isAbsolute(out) ? out : path.resolve(p, out);
-    try { return fs.realpathSync(abs); } catch { return path.resolve(abs); }
+    // realpathCanonical (imported from forge-isolation.js), NOT a private
+    // fs.realpathSync: on the Windows CI runner `p` arrives via os.tmpdir() in
+    // 8.3 short form (C:\Users\RUNNER~1\...) while git prints the long form —
+    // plain realpathSync resolves symlinks but does not expand 8.3, so the
+    // SAME repo yielded two identities (idWt !== idMain) and the comparator
+    // never matched a worktree to its checkout. One shared implementation of
+    // "canonical spelling" is the rule this module already states above for
+    // repo addressing: a fourth copy of the relation is the defect.
+    return realpathCanonical(abs);
   } catch {
     return null;
   }

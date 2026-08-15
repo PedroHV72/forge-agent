@@ -1231,7 +1231,13 @@ if (require.main === module) {
     }
     const original = fs.readFileSync(regFile);
     fs.copyFileSync(regFile, bak);
-    const fd = fs.openSync(bak, 'r');
+    // 'r+' and not 'r' (measured on the Windows CI runner): fsync maps to
+    // FlushFileBuffers there, which requires WRITE access on the handle — a
+    // read-only fd fails with EPERM and killed the migrate AFTER the backup
+    // was copied. 'r+' is harmless on POSIX. The byte-compare below stays:
+    // the fsync only pushes the copy to disk, the compare is the real proof
+    // that the backup landed intact.
+    const fd = fs.openSync(bak, 'r+');
     try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     if (!fs.readFileSync(bak).equals(original)) {
       process.stderr.write(`forge-workspace: backup ${bak} não confere byte a byte — abortando antes de escrever.\n`);
