@@ -249,9 +249,17 @@ test('R2: reverting the resolver to derive from process.cwd() turns R1 RED (and 
 
 // ── R3 — precedence: a recorded field beats derivation ──────────────────────
 
+// Resolved through the same lens the resolver applies to declared fields
+// (path.resolve at forge-run-address.js — project leg and resolveRootPath):
+// on Windows `path.resolve('/declared/root')` anchors on the current drive
+// (`D:\declared\root` on the CI runner), so the byte-for-byte comparison
+// below must use the resolved spelling. On POSIX this is the identity.
+const DECLARED_ROOT    = path.resolve('/declared/root');
+const DECLARED_PROJECT = path.resolve('/declared/project');
+
 test('R3: a run that DECLARES root/project uses the declared values, not the derivation', () => {
-  const declaredRoot    = '/declared/root';
-  const declaredProject = '/declared/project';
+  const declaredRoot    = DECLARED_ROOT;
+  const declaredProject = DECLARED_PROJECT;
   const fx = makeFixture({ record: { root: declaredRoot, project: declaredProject } });
 
   const a = resolveRunAddress(fx.wsDir, fx.runId, { home: fx.home });
@@ -265,8 +273,10 @@ test('R3b: the derivation the declaration overrode points somewhere else (preced
   const fx = makeFixture();          // same fixture shape, nothing declared
   const derived = resolveRunAddress(fx.wsDir, fx.runId, { home: fx.home });
   assertEqual(derived.project.source, 'derived', 'undeclared → derived');
-  assert(derived.project.path !== '/declared/project', 'derivation differs from the declaration used in R3');
-  assert(derived.root.path !== '/declared/root', 'derivation differs from the declaration used in R3');
+  // Compared against the same resolved constants R3 declared — the guard is
+  // true on both platforms either way, but only this spelling can ever match.
+  assert(derived.project.path !== DECLARED_PROJECT, 'derivation differs from the declaration used in R3');
+  assert(derived.root.path !== DECLARED_ROOT, 'derivation differs from the declaration used in R3');
 });
 
 // ── R4 — named degradation ──────────────────────────────────────────────────

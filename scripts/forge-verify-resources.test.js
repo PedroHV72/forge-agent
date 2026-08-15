@@ -415,7 +415,7 @@ test('D5: no process.kill / child.kill appears anywhere in the new resource-wiri
 // ── 11. Vereditos byte-preservados: skipped/timeout/spawn-failure/exit ─────
 //     (asserted in both modes: clamp-capable command AND non-candidate)
 
-test('verdict table (no-command / timeout=124 / spawn-failure=127 / project exit) holds with clamp ON and OFF', () => {
+test('verdict table (no-command / timeout=124 / not-found: 127 on sh, cmd.exe status on win32 / project exit) holds with clamp ON and OFF', () => {
   const cwdTable = mkTmpDir('forge-verify-resources-table-');
   try {
     // no-command
@@ -427,17 +427,38 @@ test('verdict table (no-command / timeout=124 / spawn-failure=127 / project exit
     assertEqual(noCmdOn.skipped, 'no-stack');
     assertEqual(noCmdOff.skipped, 'no-stack');
 
-    // spawn failure (127) — a command that cannot be found at all. This is
+    // spawn failure — a command that cannot be found at all. This is
     // NOT a runner-candidate (unknown binary), so the wiring is a no-op on
     // both legs by construction — asserted explicitly rather than assumed.
+    //
+    // The exit-code expectation is platform-conditional because the OSes
+    // genuinely answer differently: 127 is /bin/sh's "command not found"
+    // convention, and forge-verify.js only synthesizes 127 when spawnSync
+    // itself errored (result.error set — see forge-verify.js:587-590). On
+    // win32 the gate spawns `cmd /c <command>`: cmd.exe launches
+    // successfully and reports its OWN status for an unknown command (9009
+    // "not recognized"; 1 in some shells/locales), so result.error is never
+    // set and production rightly reports what the OS said instead of
+    // inventing a 127 the OS never produced. The invariant this table
+    // actually protects — a non-zero not-found verdict, byte-identical with
+    // the wiring on vs off — is asserted on both platforms.
     const notFoundCmd = 'this-binary-does-not-exist-anywhere-xyz --flag';
     const nfOn = runVerificationGate({ cwd: cwdTable, taskPlanVerify: notFoundCmd, commandTimeoutMs: 5000 });
     const nfOff = runVerificationGate({
       cwd: cwdTable, taskPlanVerify: notFoundCmd, commandTimeoutMs: 5000,
       requireCommandRewrite: () => { throw new Error('off'); },
     });
-    assertEqual(nfOn.checks[0].exitCode, 127);
-    assertEqual(nfOff.checks[0].exitCode, 127);
+    if (process.platform === 'win32') {
+      // cmd.exe's own named statuses for an unrecognized command.
+      const CMD_NOT_FOUND_EXITS = [1, 9009];
+      assert(CMD_NOT_FOUND_EXITS.includes(nfOn.checks[0].exitCode),
+        `win32 not-found exit must be one of ${JSON.stringify(CMD_NOT_FOUND_EXITS)}, got ${nfOn.checks[0].exitCode}`);
+      assertEqual(nfOff.checks[0].exitCode, nfOn.checks[0].exitCode,
+        'wiring on vs off must agree on the not-found exit code');
+    } else {
+      assertEqual(nfOn.checks[0].exitCode, 127);
+      assertEqual(nfOff.checks[0].exitCode, 127);
+    }
 
     // project's own exit code, via a plain non-runner command
     const exitCmd = 'node -e "process.exit(3)"';
