@@ -93,6 +93,17 @@ const REASON_CODES = Object.freeze({
   SYSCTL_PARSE_FAILED: 'sysctl-parse-failed',
   SHADOW_WAIT: 'shadow-wait',
   INTERNAL_ERROR_DEGRADED: 'internal-error-degraded',
+  // `resources.enforcement: off` / critical-pressure admission refusal
+  // (S06/T03) — emitted by the three rewrite consumers (forge-hook.js,
+  // forge-verify.js, forge-reverify.js) when they bypass the rewrite rather
+  // than hand out a contract. `intact:` naming borrowed from
+  // REWRITE_REASON_CODES on purpose: from the consumer's perspective the
+  // command is left intact, same vocabulary as the rewrite outcomes. Owned
+  // here (not in forge-command-rewrite.js) because the DECISION is a
+  // resources-domain fact (enforcement toggle / admission pressure), not a
+  // rewrite-domain one — planRewrite is never even called on these paths.
+  INTACT_ENFORCEMENT_OFF: 'intact:enforcement-off',
+  INTACT_ADMISSION_REFUSED_ADVISORY: 'intact:admission-refused-advisory',
 });
 
 const SYSCTL_KEYS = [

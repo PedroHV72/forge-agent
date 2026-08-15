@@ -178,12 +178,15 @@ test('R2: contar por kind NÃO veria a degradação — o kind é de admissão',
 // ── R3: unregistered reason ─────────────────────────────────────────────────
 
 test('R3: razão fora do registro vira reason-unregistered:<valor> com contagem', () => {
+  // `intact:admission-refused-advisory` is a REGISTERED reason (I-20260814120100)
+  // — using it here would silently stop testing the fallback. A genuinely
+  // bogus reason keeps this test honest about what it proves.
   const cwd = fixture([
-    { kind: 'resource-clamp-skipped', reason: 'intact:admission-refused-advisory' },
-    { kind: 'resource-clamp-skipped', reason: 'intact:admission-refused-advisory' },
+    { kind: 'resource-clamp-skipped', reason: 'intact:some-bogus-unregistered-reason' },
+    { kind: 'resource-clamp-skipped', reason: 'intact:some-bogus-unregistered-reason' },
   ]);
   const r = run(cwd);
-  const row = r.reasons.find((x) => x.reason === 'reason-unregistered:intact:admission-refused-advisory');
+  const row = r.reasons.find((x) => x.reason === 'reason-unregistered:intact:some-bogus-unregistered-reason');
   assert(row, 'razão não registrada deve aparecer, nunca sumir');
   assertEqual(row.count, 2, 'contagem');
   assertEqual(row.registered, false, 'registered:false');
