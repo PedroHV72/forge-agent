@@ -464,8 +464,9 @@ test('R6: two recordTouched calls over the same git state produce identical repo
 
 // ── R7 — mutation: prove the dedup actually bites ───────────────────────────
 
-test('R7: removing the Set-dedup turns the shared.txt duplicate RED (and the restore is byte-identical)', () => {
+test('R7: removing the Set-dedup turns the shared.txt duplicate RED (mutação em memória — o fonte real nunca é escrito)', () => {
   const pristine = fs.readFileSync(MODULE);
+  const pristineMtime = fs.statSync(MODULE).mtimeMs;
   const source = pristine.toString('utf8');
 
   const ORIGINAL = [
@@ -481,26 +482,37 @@ test('R7: removing the Set-dedup turns the shared.txt duplicate RED (and the res
   const occurrences = source.split(ORIGINAL).length - 1;
   assertEqual(occurrences, 1, 'the dedup block must appear exactly once (mutation target)');
 
-  let sawRed = false;
-  try {
-    fs.writeFileSync(MODULE, source.replace(ORIGINAL, MUTATED), 'utf8');
-    delete require.cache[require.resolve(MODULE)];
-    const mutant = require('./forge-touch.js');
+  // A mutação é compilada EM MEMÓRIA, nunca gravada em disco.
+  //
+  // A versão anterior escrevia o fonte mutado por cima do
+  // `scripts/forge-touch.js` REAL e restaurava no finally. O restore era
+  // correto, mas durante a janela entre escrever e restaurar o arquivo ficava
+  // divergente — e esta suíte roda em paralelo com 169 outras. Quem digere a
+  // árvore de fontes do repo nessa janela lê bytes diferentes: o
+  // `forge-release-gate` chama `packaging.build({repo})` DUAS vezes e afirma
+  // que os dois hashes são iguais, e o `forge-package` digere a mesma árvore.
+  // Ou seja, este teste era o ESCRITOR CONCORRENTE que tornava os vizinhos
+  // flaky — a mesma família do item I-20260814142227, vista do outro lado.
+  //
+  // `Module._compile` com o filename real preserva a resolução dos requires
+  // relativos internos, então o mutante roda idêntico sem tocar o disco.
+  const NodeModule = require('module');
+  const mutantModule = new NodeModule(MODULE, null);
+  mutantModule.filename = MODULE;
+  mutantModule.paths = NodeModule._nodeModulePaths(path.dirname(MODULE));
+  mutantModule._compile(source.replace(ORIGINAL, MUTATED), MODULE);
+  const mutant = mutantModule.exports;
 
-    const repo = makeDivergedRepo(mktmp('forge-touch-mutant-'));
-    const fx = makeFixture({ 'repo-a': repo });
-    const t = mutant.collectTouched(fx.wsDir, fx.runId, { home: fx.home });
-    const files = t.repos[0].files;
-    const dupCount = files.filter((f) => f === 'shared.txt').length;
-    sawRed = dupCount > 1;
-  } finally {
-    fs.writeFileSync(MODULE, pristine);
-    delete require.cache[require.resolve(MODULE)];
-    require('./forge-touch.js');
-  }
+  const repo = makeDivergedRepo(mktmp('forge-touch-mutant-'));
+  const fx = makeFixture({ 'repo-a': repo });
+  const t = mutant.collectTouched(fx.wsDir, fx.runId, { home: fx.home });
+  const files = t.repos[0].files;
+  const dupCount = files.filter((f) => f === 'shared.txt').length;
 
-  assert(sawRed, 'MUTATION SURVIVED: shared.txt did not duplicate without the dedup — R1 is not testing what it claims');
-  assert(fs.readFileSync(MODULE).equals(pristine), 'restored file must be byte-identical to the pristine source');
+  assert(dupCount > 1, 'MUTATION SURVIVED: shared.txt did not duplicate without the dedup — R1 is not testing what it claims');
+  // O fonte real nunca foi escrito — não há janela para vizinho nenhum ver.
+  assert(fs.readFileSync(MODULE).equals(pristine), 'o fonte real não pode ser escrito por este teste');
+  assertEqual(fs.statSync(MODULE).mtimeMs, pristineMtime, 'nem sequer o mtime do fonte real pode mudar');
 });
 
 // ── R5 (closing half) — this suite never wrote to the operator's live registry ──
