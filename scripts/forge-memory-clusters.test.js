@@ -207,5 +207,16 @@ test('falha de leitura conta fragmento examinado e não aborta o JSON', () => {
   assert.deepStrictEqual(result.census.skipped, [{ key: 'M001', reason: 'unreadable-fragment' }]);
 });
 
+test('mem_id duplicado no mesmo fragmento é pulado por motivo nomeado, nunca sobrescrito', () => {
+  const result = clusters.buildClusters('unused', { memory: stub([
+    { storageKey: 'M001', unitId: 'M001', grouped: false, text: JSON.stringify({ facts: [
+      fact('MEM001', 'primeiro fato legado'),
+      fact('MEM001', 'segundo fato com o mesmo mem_id'),
+    ] }) },
+  ]) });
+  assert.strictEqual(result.census.facts_examined, 1);
+  assert.deepStrictEqual(result.census.skipped, [{ key: 'M001::MEM001', reason: 'duplicate-mem-id-in-fragment' }]);
+});
+
 if (failed) { console.error(`\n${failed} falha(s), ${passed} passou(aram).`); process.exit(1); }
 console.log(`\nPASS: ${passed} testes`);

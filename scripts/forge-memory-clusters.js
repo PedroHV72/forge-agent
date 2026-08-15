@@ -69,6 +69,11 @@ function enumerateFacts(cwd, api, subjectTokens) {
   const fragments = api.listFragments(cwd);
   const facts = [];
   const skipped = [];
+  // makeClusters keys every fact by itemKey(storage_key, mem_id). Legacy data
+  // can carry the same mem_id twice inside one fragment (parseFragment accepts
+  // it), and a Map keyed that way would silently drop one of them. Name the
+  // discard here instead: enumeration is the only place that can still see it.
+  const seen = new Set();
   for (const entry of fragments) {
     // Keep storage identity grounded in the shared parser.  This also makes
     // malformed test doubles auditable without ever opening entry.path here.
@@ -81,7 +86,11 @@ function enumerateFacts(cwd, api, subjectTokens) {
       source = api.readFragmentText(cwd, entry);
       const parsed = api.parseFragment(String(source).replace(/\r\n?/g, '\n'));
       for (const fact of Array.isArray(parsed.facts) ? parsed.facts : []) {
-        facts.push(parseFact(entry, fact, subjectTokens));
+        const parsedFact = parseFact(entry, fact, subjectTokens);
+        const key = itemKey(parsedFact.storage_key, parsedFact.mem_id);
+        if (seen.has(key)) { skipped.push({ key, reason: 'duplicate-mem-id-in-fragment' }); continue; }
+        seen.add(key);
+        facts.push(parsedFact);
       }
     } catch (error) {
       skipped.push({ key: entry.storageKey, reason: 'unreadable-fragment' });

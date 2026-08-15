@@ -38,6 +38,9 @@ const USAGE = 'Uso: node scripts/forge-sweep-curate.js [--cwd <dir>] [--arbitrat
  * 5. The registry invokes eligibility at its normal target boundary.  This
  *    command supplies members with actual fragment paths so every possible
  *    rewrite is checked through the one policy helper.
+ * 5b. Eligibility narrows WHICH judged clusters may be written; it never
+ *    narrows the universe the arbitration is judged against.  A cluster the
+ *    filter removed is reported as a named skip and its verdicts are dropped.
  * 6. applyCurate rebuilds the plan before it opens a vault.  The fingerprint
  *    compares item identities rather than an old JSON plan file, preventing a
  *    human verdict from being applied to a changed store.
@@ -196,40 +199,78 @@ function planFingerprint(preview) {
   return crypto.createHash('sha256').update(clusters.map(cluster => `${cluster.id}\0${(cluster.items || []).map(itemAddress).sort().join('\n')}`).sort().join('\n')).digest('hex');
 }
 
-function selectedDrops(doc) {
+/*
+ * The one canonical eligible set.  `plan` is what the registry already passed
+ * through the eligibility filter; `fresh` is the unfiltered re-measurement.
+ * Two separate duties, deliberately not collapsed:
+ *   - the arbitration's cluster UNIVERSE is judged against `fresh`, so a dirty
+ *     fragment anywhere else in the store cannot abort an otherwise complete
+ *     curatorial session (an eligibility exclusion is a named skip, never an
+ *     unknown-cluster failure);
+ *   - every write address is resolved through THIS set only, so a
+ *     VCS-ineligible target is structurally unable to reach rewriteFragment
+ *     no matter which plan shape a future edit chooses to validate against.
+ */
+function eligibleSet(plan) {
+  const clusterIds = new Set(); const byStorage = new Map();
+  for (const target of (plan && plan.targets) || []) {
+    const id = target.name || target.path;
+    if (id) clusterIds.add(id);
+    for (const member of target.members || []) {
+      const key = member.storageKey || member.storage_key;
+      if (key) byStorage.set(key, member.path);
+    }
+  }
+  return { clusterIds, byStorage };
+}
+
+const FILTERED_REASON = 'cluster-filtrado-por-eligibility';
+const OFF_SET_REASON = 'alvo-inelegível-no-limite-de-escrita';
+
+function filteredOutClusters(doc, eligible) {
+  return (doc.clusters || []).filter(cluster => !eligible.clusterIds.has(cluster.cluster_id))
+    .map(cluster => ({ path: cluster.cluster_id, reason: FILTERED_REASON }));
+}
+
+function selectedDrops(doc, eligible) {
   const byStorage = new Map();
-  for (const cluster of doc.clusters) for (const item of cluster.items) if (item.verdict === 'fundir-no-sobrevivente') {
-    if (!byStorage.has(item.storage_key)) byStorage.set(item.storage_key, []);
-    byStorage.get(item.storage_key).push(item.mem_id);
+  for (const cluster of doc.clusters) {
+    if (eligible && !eligible.clusterIds.has(cluster.cluster_id)) continue;
+    for (const item of cluster.items) if (item.verdict === 'fundir-no-sobrevivente') {
+      if (!byStorage.has(item.storage_key)) byStorage.set(item.storage_key, []);
+      byStorage.get(item.storage_key).push(item.mem_id);
+    }
   }
   return byStorage;
 }
 
-function filesForDrops(cwd, drops, rewrite) {
-  // rewriteFragment owns storage-key lookup; use its memory backing only for
-  // vault file addresses exposed in the plan, never serialize fragments here.
-  const byKey = new Map();
-  for (const target of (rewrite.targets || [])) for (const member of target.members || []) byKey.set(member.storageKey, member.path);
-  return [...drops.keys()].map(key => byKey.get(key)).filter(Boolean).map(file => path.resolve(cwd, file));
+function filesForDrops(cwd, drops, eligible) {
+  // rewriteFragment owns storage-key lookup; use the eligible member addresses
+  // only for vault file paths, never serialize fragments here.
+  return [...drops.keys()].map(key => eligible.byStorage.get(key)).filter(Boolean).map(file => path.resolve(cwd, file));
 }
 
 function applyCurate(ctx, plan) {
-  const arbitration = validateArbitrationShape(ctx.arbitration, plan);
   const fresh = curatePlan(ctx);
   const expectedFingerprint = ctx.planFingerprint || planFingerprint(plan);
   if (expectedFingerprint !== planFingerprint(fresh)) return { written: [], skipped: (plan.skipped || []).concat([{ path: '.gsd/memory', reason: 'plan-changed' }]), error: 'plan-changed' };
-  validateArbitrationShape(arbitration, fresh);
-  const drops = selectedDrops(arbitration);
-  const files = filesForDrops(ctx.cwd, drops, fresh);
-  if (!files.length) return { written: [], skipped: fresh.skipped || [] };
+  const arbitration = validateArbitrationShape(ctx.arbitration, fresh);
+  const eligible = eligibleSet(plan);
+  const filteredOut = filteredOutClusters(arbitration, eligible);
+  const drops = selectedDrops(arbitration, eligible);
+  const files = filesForDrops(ctx.cwd, drops, eligible);
+  if (!files.length) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut) };
   let vault;
   try { vault = (ctx.writeVault || writeVault)(ctx.cwd, { operation: OPERATION, files }); }
-  catch (error) { return { written: [], skipped: (fresh.skipped || []).concat([{ path: '.gsd/forge/sweep-vault', reason: `vault-failed: ${error.message}` }]), error: 'vault-failed' }; }
-  if (!vault || vault.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat((vault && vault.skipped) || [{ path: '.gsd/forge/sweep-vault', reason: 'vault-failed' }]), error: 'vault-failed' };
+  catch (error) { return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, [{ path: '.gsd/forge/sweep-vault', reason: `vault-failed: ${error.message}` }]), error: 'vault-failed' }; }
+  if (!vault || vault.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, (vault && vault.skipped) || [{ path: '.gsd/forge/sweep-vault', reason: 'vault-failed' }]), error: 'vault-failed' };
   const intent = (ctx.journal || journal).appendIntent(ctx.cwd, { operation: OPERATION, containers: [vault.containerPath] });
-  if (!intent || intent.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat([{ path: vault.containerPath, reason: `journal-intent-failed: ${(intent && intent.error) || 'indisponível'}` }]), error: 'journal-intent-failed' };
-  const written = []; const skipped = (fresh.skipped || []).slice();
+  if (!intent || intent.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, [{ path: vault.containerPath, reason: `journal-intent-failed: ${(intent && intent.error) || 'indisponível'}` }]), error: 'journal-intent-failed' };
+  const written = []; const skipped = (fresh.skipped || []).concat(filteredOut);
   for (const [storageKey, dropMemIds] of drops) {
+    // Last structural gate: an address absent from the eligible set never
+    // reaches the write boundary, whatever produced `drops`.
+    if (!eligible.byStorage.has(storageKey)) { skipped.push({ path: storageKey, reason: OFF_SET_REASON }); continue; }
     const result = (ctx.rewriteFragment || rewriteFragment)(ctx.cwd, { storageKey, dropMemIds });
     if (result && result.ok) written.push(result.path); else skipped.push({ path: (result && result.path) || storageKey, reason: (result && result.reason) || 'rewrite-failed' });
   }
@@ -269,5 +310,5 @@ async function main(argv) {
   } catch (error) { process.stderr.write(`${OPERATION}: ${error.reason || error.message}\n`); return error.exitCode || 1; }
 }
 
-module.exports = { buildRegistry, validateArbitrationShape, planFingerprint, main, _private: { OPERATION, parseArgs, resolveCwd, loadArbitration, validateArbitrationAgainstPlan, curatePlan, applyCurate, selectedDrops, filesForDrops, rawPlan, runUndo } };
+module.exports = { buildRegistry, validateArbitrationShape, planFingerprint, main, _private: { OPERATION, parseArgs, resolveCwd, loadArbitration, validateArbitrationAgainstPlan, curatePlan, applyCurate, selectedDrops, filesForDrops, eligibleSet, filteredOutClusters, rawPlan, runUndo, FILTERED_REASON, OFF_SET_REASON } };
 if (require.main === module) main(process.argv.slice(2)).then(code => { process.exitCode = code; }).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

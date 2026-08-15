@@ -69,10 +69,28 @@ test('frontmatter declara identidade, ferramenta e invocação humana', () => {
   assert(/invoca[çc][ãa]o HUMANA/i.test(body));
 });
 
+// The claim is about the whole task's provenance, so the working tree alone
+// cannot answer it: once committed, an unbased `git diff` reads clean and the
+// guard goes green while blind. Measure the committed range too.
 test('skills forge-sweep não está entre os arquivos da task', () => {
   assert(fs.existsSync(sweepPath));
-  const diff = require('child_process').execFileSync('git', ['diff', '--name-only', '--', 'skills/forge-sweep/SKILL.md'], { encoding: 'utf8' });
-  assert.strictEqual(diff.trim(), '');
+  const repo = path.join(__dirname, '..');
+  const git = args => require('child_process').spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  const working = git(['diff', '--name-only', '--', 'skills/forge-sweep/SKILL.md']);
+  assert.strictEqual(working.status, 0, `git indisponível: ${working.stderr || working.error}`);
+  assert.strictEqual(working.stdout.trim(), '', 'mudança não commitada em skills/forge-sweep');
+  const base = ['master', 'origin/master']
+    .map(ref => git(['merge-base', 'HEAD', ref]))
+    .find(result => result.status === 0 && result.stdout.trim());
+  if (!base) {
+    // Named skip, never a silent pass: without a base ref the committed range
+    // is unmeasurable and this check reports exactly that.
+    console.log('    ↳ pulado (nomeado): merge-base indisponível — nem master nem origin/master resolvem');
+    return;
+  }
+  const committed = git(['diff', '--name-only', `${base.stdout.trim()}..HEAD`, '--', 'skills/forge-sweep/SKILL.md']);
+  assert.strictEqual(committed.status, 0, `git diff merge-base..HEAD falhou: ${committed.stderr}`);
+  assert.strictEqual(committed.stdout.trim(), '', 'commit da task alterou skills/forge-sweep');
 });
 
 test('Steps 3, 5 e 6 mantêm a ordem operacional', () => {
@@ -114,10 +132,11 @@ test('todas as flags da skill existem nos parseArgs reais', () => {
     if (clusterFlags.includes(flag)) accepted(clusterParse, flag);
     if (curateFlags.includes(flag)) accepted(curateParse, flag);
   }
-  const planted = `${source}\nnode scripts/forge-memory-clusters.js --out arquivo.json`;
-  assert.throws(() => {
-    for (const flag of flags(planted)) if (flag === '--out') throw new Error(`flag inexistente: ${flag}`);
-  }, /--out/);
+  // Negative direction proved against the real parsers, not against a token
+  // planted in the doc text: an undocumented flag must be rejected by name.
+  for (const [label, parse] of [['clusters', clusterParse], ['curate', curateParse]]) {
+    assert.throws(() => parse(['--out', 'arquivo.json']), /desconhecido: --out/i, `${label} aceitou --out`);
+  }
 });
 
 test('exemplo embutido é aceito pelo validador real', () => {

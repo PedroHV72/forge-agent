@@ -263,8 +263,55 @@ function testPhaseBlocked() {
   } finally { removeDir(dir); }
 }
 
+// R1/R3 regression. A cluster removed by the VCS eligibility filter (a dirty
+// fragment anywhere else in the store) must not abort a fully-judged
+// arbitration, and must not be written either. Reverting the fix makes the
+// first assertion fail with `unknown-cluster`.
+function testEligibilityFilteredClusterSkipsWithoutAborting() {
+  const dir = tempDir();
+  try {
+    const clusters = [
+      cluster('c1', [item('a', 'MEM001'), item('b', 'MEM002')]),
+      cluster('c2', [item('x', 'MEM003'), item('y', 'MEM004')]),
+    ];
+    const doc = { clusters: [
+      { cluster_id: 'c1', items: [verdict('a', 'MEM001', 'manter'), verdict('b', 'MEM002', 'fundir-no-sobrevivente')] },
+      { cluster_id: 'c2', items: [verdict('x', 'MEM003', 'manter'), verdict('y', 'MEM004', 'fundir-no-sobrevivente')] },
+    ] };
+    const calls = [];
+    const ctx = liveContext(dir, clusters, doc, { rewriteFragment: (_cwd, request) => { calls.push(request.storageKey); return { ok: true, path: request.storageKey }; } });
+    // The CLI fingerprints the unfiltered preliminary plan; mirror that here.
+    ctx.planFingerprint = curate.planFingerprint(plan(clusters));
+    const unfiltered = plan(clusters);
+    const filtered = { targets: unfiltered.targets.filter(target => target.name === 'c1'), skipped: [{ path: 'c2', reason: 'modificado localmente' }] };
+    const result = internals.applyCurate(ctx, filtered);
+    assert.strictEqual(result.error, undefined);
+    assert.deepStrictEqual(calls, ['b']);
+    assert(result.skipped.some(entry => entry.path === 'c2' && entry.reason === internals.FILTERED_REASON), 'cluster filtrado deve ser pulado por motivo nomeado');
+  } finally { removeDir(dir); }
+}
+
+// R3 structural boundary, independent of which plan shape is validated: a drop
+// address absent from the eligible set can never reach rewriteFragment.
+function testWriteBoundaryConsultsEligibleSetOnly() {
+  const dir = tempDir();
+  try {
+    const clusters = [cluster('c', [item('a', 'MEM001'), item('b', 'MEM002')])];
+    const doc = arbitration('c', [verdict('a', 'MEM001', 'manter'), verdict('b', 'MEM002', 'fundir-no-sobrevivente')]);
+    const eligible = internals.eligibleSet({ targets: [] });
+    assert.deepStrictEqual(internals.filesForDrops(dir, internals.selectedDrops(doc), eligible), []);
+    const calls = [];
+    const ctx = liveContext(dir, clusters, doc, { rewriteFragment: (_cwd, request) => { calls.push(request.storageKey); return { ok: true, path: request.storageKey }; } });
+    ctx.planFingerprint = curate.planFingerprint(plan(clusters));
+    const result = internals.applyCurate(ctx, { targets: [], skipped: [] });
+    assert.deepStrictEqual(calls, []);
+    assert.deepStrictEqual(result.written, []);
+    assert(result.skipped.some(entry => entry.reason === internals.FILTERED_REASON));
+  } finally { removeDir(dir); }
+}
+
 function main() {
-  const tests = [testRegistry, testClosedVerdicts, testExactlyOneSurvivor, testUnknownItem, testUnjudgedItems, testUnknownCluster, testCompoundAddress, testFingerprintStableAndSensitive, testPlanChangedZeroMutation, testIntentFailureZeroMutation, testRewriteIsolation, testActivePhaseFailClosed, testArgumentCodes, testNoSecondWriterOrContainers, testDefaultIsDryRun, testCliDefaultLeavesDigestUntouched, testParseConflicts, testClusterMustBeJudged, testDuplicateAddressRejected, testNoTargetsNoVault, testDropsGroupedByStorage, testPhaseBlocked];
+  const tests = [testEligibilityFilteredClusterSkipsWithoutAborting, testWriteBoundaryConsultsEligibleSetOnly, testRegistry, testClosedVerdicts, testExactlyOneSurvivor, testUnknownItem, testUnjudgedItems, testUnknownCluster, testCompoundAddress, testFingerprintStableAndSensitive, testPlanChangedZeroMutation, testIntentFailureZeroMutation, testRewriteIsolation, testActivePhaseFailClosed, testArgumentCodes, testNoSecondWriterOrContainers, testDefaultIsDryRun, testCliDefaultLeavesDigestUntouched, testParseConflicts, testClusterMustBeJudged, testDuplicateAddressRejected, testNoTargetsNoVault, testDropsGroupedByStorage, testPhaseBlocked];
   for (const test of tests) test();
   process.stdout.write(`forge-sweep-curate: ${tests.length} tests passed\n`);
 }
