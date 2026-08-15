@@ -60,7 +60,16 @@ const {
   CLAIM_NOTE_REASONS,
 } = require('./forge-claim-overlap.js');
 const { declaredFor } = require('./forge-write-coverage.js');
-const { normalizeClaim, recordClaim, readClaim, CLAIM_SOURCES } = require('./forge-write-claim.js');
+const {
+  normalizeClaim, recordClaim, readClaim, isHeld, CLAIM_SOURCES, RELEASE_MECHANISMS,
+} = require('./forge-write-claim.js');
+// S05/T03 — the release DECISION is never re-implemented here. `probeClaim`
+// collects the facts (the only function in that module with I/O) and
+// `classifyRelease` applies the precedence of S05-PLAN contract #5, PURE. This
+// gate only consumes the verdict and translates it into a NAMED census skip.
+const {
+  probeClaim, classifyRelease, measureBaseline, CLAIM_RELEASE_REASONS,
+} = require('./forge-claim-release.js');
 const { readPrefs } = require('./forge-prefs.js');
 const runs = require('./forge-runs.js');
 
@@ -93,7 +102,32 @@ const PROCEED_REASONS = [
 const GATE_SKIP_REASONS = [
   'different-code-dir', // D2: the counterpart writes from a MEASURED different CODE_DIR, so identical
                         // relative paths denote different files. Out of scope; never counted as confronted.
+  // ── Release skips (S05/T03) — one entry PER MECHANISM, because each names a
+  // DIFFERENT thing that was proved. Collapsing them into a single
+  // `claim-released` would leave the operator unable to tell a claim that a
+  // measured commit retired from one the TTL net swept away, and those two
+  // deserve very different follow-ups.
+  //
+  // Every one of them is a skip, never a note: the counterpart LEFT the
+  // universe, and a census where a departure looks like an uncertainty is the
+  // same silence one font smaller.
+  'claim-released:committed',   // the two probes agreed: the baseline advanced AND no claimed path is still in flight.
+  'claim-released:ttl-expired', // the TTL net (D2) fired: `ttl + grace` elapsed over a run measured INACTIVE. Never age alone.
+  'claim-released:explicit',    // the claim already carried the `released` envelope, written by an earlier corroborated release.
 ];
+
+/**
+ * `RELEASE_MECHANISMS` (forge-write-claim.js, T01) -> the skip reason above.
+ *
+ * Derived from the CLOSED set of the owner module rather than written out a
+ * second time: a mechanism grown there without being taught here must surface
+ * loudly (the counterpart is KEPT, see `counterpartRelease`), never as an
+ * unlabelled skip string that every `includes` downstream reads as absence.
+ */
+const RELEASE_SKIP_BY_MECHANISM = Object.freeze(RELEASE_MECHANISMS.reduce((acc, m) => {
+  acc[m] = `claim-released:${m}`;
+  return acc;
+}, {}));
 
 const GATE_NOTE_REASONS = [
   'own-claim-ineligible-no-counterpart', // the own side did not declare, but nobody is in scope to be harmed by it.
@@ -103,6 +137,17 @@ const GATE_NOTE_REASONS = [
   'invalid-timing-pref',                 // one of the three anti-livelock timings resolved to a non-positive integer.
   'defer-ledger-unreadable',             // the defer ledger could not be read; the counter is treated as 0, NEVER a crash.
   'defer-ledger-unwritable',             // the ledger could not be persisted; the decision still stands, and says so.
+  // ── Release probe notes (S05/T03). ALL THREE mean the same thing about the
+  // decision — the counterpart STAYED in scope — and different things about
+  // WHY, which is exactly why they are three. A probe that could not answer
+  // must never look like a probe that answered "still held": the first is a
+  // hole in the evidence, the second is evidence.
+  'release-probe-unavailable',   // the probe answered `held-probe-unavailable` (no code_dir, no vcs_baseline, seam `{ok:false}`). Counterpart KEPT.
+  'release-probe-threw',         // the injected probe (or `classifyRelease`) threw. Counterpart KEPT — a broken probe never opens the fence.
+  'release-probe-unrecognised',  // the verdict came back outside `CLAIM_RELEASE_REASONS`/`RELEASE_MECHANISMS`. Counterpart KEPT, loudly.
+  // ── Baseline measured at RECORD time (S05/T03, B2 posture).
+  'vcs-baseline-absent',     // no `code_dir` was GIVEN, so nothing could be measured: `vcs_baseline: null`, NAMED, never derived from root/branch.
+  'vcs-baseline-unmeasured', // a `code_dir` was given and the measurement FAILED (`detail` carries the seam's named error): `vcs_baseline: null`, NAMED.
 ];
 
 // Escalations are a FIELD of the result, never a fifth decision value. The
@@ -122,7 +167,14 @@ const ESCALATIONS = [
 const UNCOVERED_BOUNDARIES = [
   {
     boundary: 'complete-slice',
-    reason: 'o release do claim pelo completer colide com o release de IN-6 (S05) — Deferred do CONTEXT',
+    // S05/T03: the OLD reason said this boundary collided with "the release of
+    // IN-6 (S05)". IN-6 is DELIVERED — `forge-claim-release.js` exists and this
+    // gate consumes it — so keeping that sentence would leave an enumerated
+    // LIE in the one list whose whole job is to be trustworthy. The boundary
+    // stays out because the CONTEXT deferred it (the completer does not invoke
+    // the gate and does not request a release at slice close), not for want of
+    // a mechanism: the mechanism is now here and the wiring is a decision.
+    reason: 'o completer não invoca o gate nem pede release ao fechar o slice — fora por decisão (Deferred do CONTEXT); o mecanismo de release existe desde IN-6/S05',
   },
   {
     boundary: 'orchestrator-writes',
@@ -284,6 +336,119 @@ function ownEligibility(claim) {
   return { eligible: true, cause: null };
 }
 
+// ── Release awareness: a dead claim must stop blocking, and only a dead one ──
+//
+// The DEFAULT probe is T02's `probeClaim`, held here by REFERENCE so the suite
+// can assert the wiring by identity instead of by re-testing behaviour that
+// already has its own suite one module over.
+const DEFAULT_RELEASE_PROBE = probeClaim;
+// The second half of the SAME seam. It exists for one reason, stated plainly:
+// the two guards below (`reason` outside `CLAIM_RELEASE_REASONS`, `mechanism`
+// outside `RELEASE_MECHANISMS`) are UNREACHABLE through the probe alone —
+// `classifyRelease` cannot emit either, by construction. A guard no test can
+// reach is an inert guard, and this repo has already paid for inert guards more
+// than once. Injecting the classifier is how the fail-closed branch is PROVED
+// to bite rather than asserted to exist. Default held by reference, like above.
+const DEFAULT_RELEASE_CLASSIFY = classifyRelease;
+
+/**
+ * Is this counterpart's claim still alive? `{ released, mechanism, reason,
+ * skip, note, detail }`.
+ *
+ * ── The polarity, which is not negotiable anywhere in this milestone ────────
+ *
+ * A question that COULD NOT BE ASKED keeps the claim. A probe that throws, a
+ * verdict outside the closed sets, a `held-probe-unavailable`, a missing seam:
+ * every one of them KEEPS the counterpart in scope and adds a NAMED note. The
+ * opposite reading — "the probe broke, so assume the claim is gone" — would
+ * remove counterparts silently, and a fence that silently lets everyone through
+ * is byte-for-byte indistinguishable from a clean `proceed`. That
+ * indistinguishability is the origin defect of this whole milestone; a broken
+ * probe must never be able to recreate it.
+ *
+ * A claim that is ABSENT (`null`) is not probed at all and is never called
+ * released: absent, empty and released are THREE facts (contract #6) and this
+ * function is where two of them would be easiest to collapse. Absent stays in
+ * scope and remains `undeclared-writes` under D1 — the release must never
+ * become a shortcut around the declaration requirement.
+ */
+function counterpartRelease(claim, opts) {
+  const o = opts || {};
+  if (!claim) {
+    // Never probed, never released. `collectRunClaims` already noted
+    // `claim-absent` for this run; adding a release verdict on top of an
+    // absent claim is exactly the collapse contract #6 forbids.
+    return { released: false, mechanism: null, reason: null, skip: null, note: null, detail: null };
+  }
+
+  const probe = typeof o.releaseProbe === 'function' ? o.releaseProbe : DEFAULT_RELEASE_PROBE;
+  const classify = typeof o.releaseClassify === 'function' ? o.releaseClassify : DEFAULT_RELEASE_CLASSIFY;
+  let verdict;
+  try {
+    // The counterpart's COMPLETE RunRecord travels with the claim: `runRecord`
+    // is what lets `releaseIfObservable`-shaped probes (and any future seam,
+    // the way `resolvePosture` carries the record for S06/D8) answer without a
+    // second registry read, and it is asserted by spy so the seam is never
+    // discovered broken later.
+    const facts = probe(claim, Object.assign({}, o.releaseProbeOpts, {
+      cwd: o.cwd,
+      runId: o.runId,
+      runRecord: o.runRecord || null,
+    }));
+    verdict = classify(facts);
+  } catch (e) {
+    return {
+      released: false, mechanism: null, reason: null,
+      skip: null, note: 'release-probe-threw', detail: e && e.message ? e.message : String(e),
+    };
+  }
+
+  if (!verdict || !CLAIM_RELEASE_REASONS.includes(verdict.reason)) {
+    return {
+      released: false, mechanism: null, reason: null,
+      skip: null, note: 'release-probe-unrecognised',
+      detail: `razão fora de CLAIM_RELEASE_REASONS: ${verdict ? JSON.stringify(verdict.reason) : 'sem veredito'}`,
+    };
+  }
+
+  if (verdict.held === true) {
+    return {
+      released: false,
+      mechanism: null,
+      reason: verdict.reason,
+      skip: null,
+      // `held-uncommitted` is a MEASURED answer and needs no note; only the
+      // hole in the evidence does.
+      note: verdict.reason === 'held-probe-unavailable' ? 'release-probe-unavailable' : null,
+      detail: null,
+    };
+  }
+
+  const skip = RELEASE_SKIP_BY_MECHANISM[verdict.mechanism];
+  if (!skip) {
+    // A release with a mechanism this gate does not know how to NAME is not a
+    // release this gate may act on: naming is what keeps it out of
+    // `claim-absent`, and an unnamed skip would leave the departure invisible.
+    return {
+      released: false, mechanism: null, reason: verdict.reason,
+      skip: null, note: 'release-probe-unrecognised',
+      detail: `mecanismo fora de RELEASE_MECHANISMS: ${JSON.stringify(verdict.mechanism)}`,
+    };
+  }
+  // Cross-check against the persisted fact when the mechanism claims the claim
+  // was already released: `isHeld` (T01) is the accessor that distinguishes
+  // absent from released, and it is consulted rather than re-derived here.
+  return {
+    released: true,
+    mechanism: verdict.mechanism,
+    reason: verdict.reason,
+    skip,
+    note: null,
+    detail: verdict.mechanism === 'explicit' && isHeld(claim)
+      ? 'envelope released ausente no claim persistido' : null,
+  };
+}
+
 /**
  * The heart. Returns a result that ALWAYS carries a census and the
  * enumeration of uncovered boundaries — a decision without a census does not
@@ -314,6 +479,7 @@ function evaluateGate(opts) {
 
   const candidates = (collected.comparable || []).filter((c) => c.id !== runId);
   const inScope = [];
+  const released_counterparts = [];
 
   for (const c of candidates) {
     const { scope, note } = codeDirScope(claim, c.claim);
@@ -333,12 +499,55 @@ function evaluateGate(opts) {
       skipped.push({ id: c.id, reason: 'different-code-dir' });
       continue;
     }
+
+    const record = activeById.get(c.id) || runs.get(cwd, c.id);
+
+    // ── Release probe — AFTER the scope skip, on purpose (T03-PLAN step 2) ──
+    // `different-code-dir` is cheap and I/O-free; probing first would spend a
+    // VCS round-trip on pairs that are out of scope anyway, and would grow the
+    // census with release facts about runs this evaluation never had to judge.
+    const rel = counterpartRelease(c.claim, {
+      cwd,
+      runId: c.id,
+      runRecord: record,
+      releaseProbe: o.releaseProbe,
+      releaseClassify: o.releaseClassify,
+      releaseProbeOpts: o.releaseProbeOpts,
+    });
+    if (rel.note) {
+      const n = { id: `${runId} × ${c.id}`, reason: rel.note };
+      if (rel.detail) n.detail = rel.detail;
+      notes.push(n);
+    }
+    if (rel.released) {
+      // The departure is NAMED and COUNTED: it stays inside
+      // `counterparts_considered`, leaves `counterparts_in_scope`, and lands in
+      // `skipped` carrying the mechanism that proved it. What it must NEVER do
+      // is fall back into the universe as an absent claim — that would turn a
+      // release into `undeclared-writes` (D1) and make the release WORSEN the
+      // very block it came to fix (contract #6, the most expensive possible
+      // mistake in this slice; it has its own dedicated assert).
+      skipped.push({ id: c.id, reason: rel.skip });
+      const entry = { id: c.id, mechanism: rel.mechanism, reason: rel.reason };
+      // `mechanism` is the mechanism of THIS verdict; when the claim already
+      // carried the envelope, that verdict is `explicit` and the mechanism that
+      // originally retired the claim lives in the envelope. Both are reported,
+      // because collapsing them would tell the operator "released explicitly"
+      // about a claim a measured commit retired — true about the verdict,
+      // misleading about the history.
+      if (c.claim.released && c.claim.released.mechanism) {
+        entry.persisted_mechanism = c.claim.released.mechanism;
+      }
+      released_counterparts.push(entry);
+      continue;
+    }
+
     inScope.push({
       id: c.id,
       claim: c.claim,
       scope,
       note: note || null,
-      record: activeById.get(c.id) || runs.get(cwd, c.id),
+      record,
     });
   }
 
@@ -355,6 +564,11 @@ function evaluateGate(opts) {
     posture_pref: o.posture || null,
     ready_alternatives: readyAlternatives,
     census,
+    // Additive field (S05/T03), same convention as `tier`/`reason` on the
+    // dispatch event: a reader that does not know it ignores it and stays
+    // correct. It rides on EVERY result, `proceed` included — a departure that
+    // is only reported where someone remembered to look is not reported.
+    released_counterparts,
     not_covered: UNCOVERED_BOUNDARIES,
   };
 
@@ -653,6 +867,11 @@ function emitGateEvent(cwd, result) {
     escalation: result.escalation === undefined ? null : result.escalation,
     floor: result.floor === undefined ? null : result.floor,
     counterparts: result.counterparts || [],
+    // ADDITIVE (S05/T03): who left the universe because their claim was
+    // measured dead, and by which mechanism. An old reader that ignores the
+    // key stays correct; a reader that wants to explain why a `proceed`
+    // happened now can, without re-running the probe.
+    released_counterparts: result.released_counterparts || [],
     census: result.census,
     not_covered: result.not_covered,
   };
@@ -729,11 +948,31 @@ function recordAndEvaluate(opts) {
   // `record: false` the same shape is DERIVED and not persisted: the batch
   // union already on the record is the fence, and overwriting it here is the
   // very defect R2 named.
+  // The baseline is measured AT RECORD TIME and nowhere else (S05/T03): it is
+  // the "before" half of probe A, and a "before" read after the fact is not a
+  // before. Same B2 posture as `code_dir`: without a `code_dir` there is
+  // nothing to measure, so the field is `null` and the ABSENCE IS NAMED — never
+  // derived from `root`+`branch` (a derived string names a tree that may not
+  // exist, the defect S06 already measured), and never guessed.
+  const baselineNotes = [];
+  let vcs_baseline = null;
+  if (typeof o.codeDir === 'string' && o.codeDir !== '') {
+    const measured = measureBaseline(o.codeDir, { vcsSeam: o.vcsSeam, vcs: o.vcs });
+    if (measured.ok) {
+      vcs_baseline = { vcs: measured.vcs, id: measured.id };
+    } else {
+      baselineNotes.push({ id: runId, reason: 'vcs-baseline-unmeasured', detail: measured.error });
+    }
+  } else {
+    baselineNotes.push({ id: runId, reason: 'vcs-baseline-absent', detail: 'code_dir não foi dado ao dispatch' });
+  }
+
   const claimInput = {
     unit,
     source: CLAIM_SOURCES.includes(o.source) ? o.source : 'manual',
     code_dir: typeof o.codeDir === 'string' ? o.codeDir : undefined,
     paths: Array.isArray(o.paths) ? o.paths : [],
+    vcs_baseline,
   };
   const recording = o.record !== false;
   const claim = recording ? recordClaim(cwd, runId, claimInput) : normalizeClaim(claimInput);
@@ -750,7 +989,17 @@ function recordAndEvaluate(opts) {
 
   // (2) EVALUATE — the recorded claim is the one confronted.
   const evaluate = () => evaluateGate({
-    cwd, runId, claim: evalClaim, posture: resolvedPref.posture, readyAlternatives,
+    cwd,
+    runId,
+    claim: evalClaim,
+    posture: resolvedPref.posture,
+    readyAlternatives,
+    // The seam travels through: an injected probe must reach the counterpart
+    // loop from here too, otherwise the operational entry point would silently
+    // fall back to the default while the tests exercised the injection.
+    releaseProbe: o.releaseProbe,
+    releaseClassify: o.releaseClassify,
+    releaseProbeOpts: o.releaseProbeOpts,
   });
 
   let result = evaluate();
@@ -784,6 +1033,10 @@ function recordAndEvaluate(opts) {
   const ledger = readDeferLedger(cwd);
   const notes = result.census.notes;
   for (const n of timings.notes) notes.push(n);
+  // The baseline outcome is census material even when it succeeded silently:
+  // only its ABSENCE produces a note, and that absence must be visible on the
+  // same result that carries the decision it will later be used to release.
+  for (const n of baselineNotes) notes.push(n);
   if (ledger.note) notes.push({ id: runId, reason: ledger.note });
 
   const key = deferKey(runId, unit);
@@ -856,7 +1109,10 @@ function formatGate(result) {
     + ` · em escopo ${c.counterparts_in_scope} · skipped ${c.skipped.length} · notes ${c.notes.length}`,
   );
   for (const s of c.skipped) lines.push(`  · fora de escopo: ${s.id} (${s.reason})`);
-  for (const n of c.notes) lines.push(`  · ${n.id} (${n.reason})`);
+  for (const n of c.notes) lines.push(`  · ${n.id} (${n.reason}${n.detail ? `: ${n.detail}` : ''})`);
+  for (const r of (result.released_counterparts || [])) {
+    lines.push(`  · claim liberado: ${r.id} — mecanismo ${r.mechanism} (${r.reason})`);
+  }
   for (const b of result.not_covered) lines.push(`  · fronteira não coberta: ${b.boundary} — ${b.reason}`);
   return lines.join('\n');
 }
@@ -877,6 +1133,10 @@ const USAGE = [
   'Decisões: proceed | defer | block | refuse.',
   'Causas: overlap | undeclared-writes | pathless-conceded-item — nunca uma no lugar da outra.',
   'Razões de proceed: no-active-counterpart (não confrontou nada) | no-conflict (confrontou, limpo).',
+  '',
+  'Counterpart cujo claim já foi LIBERADO (S05) sai do universo com skip nomeado',
+  '(claim-released:<mecanismo>), contado no censo — nunca vira claim-absent. Sonda de',
+  'release que não pôde responder MANTÉM o counterpart em escopo, com note nomeada.',
   '',
   'Este gate é ENFORCING: erro interno sai com exit != 0. O consumidor que',
   'receber exit != 0 ou stdout não-JSON trata como block/gate-unavailable.',
@@ -1052,6 +1312,13 @@ module.exports = {
   GATE_NOTE_REASONS,
   UNCOVERED_BOUNDARIES,
   POSTURES,
+  // S05/T03: exported so the suite can assert the default seam by REFERENCE
+  // IDENTITY against `forge-claim-release.probeClaim` — behaviour is T02's to
+  // prove, wiring is this module's.
+  DEFAULT_RELEASE_PROBE,
+  DEFAULT_RELEASE_CLASSIFY,
+  RELEASE_SKIP_BY_MECHANISM,
+  counterpartRelease,
   parseArgs,
   main,
   USAGE,

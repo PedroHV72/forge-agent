@@ -1268,6 +1268,354 @@ console.log('\nG21: wiring do batch — união não-vazia, cerca preservada, sob
   });
 }
 
+// ── G22: release no gate (S05/T03) ─────────────────────────────────────────
+//
+// O erro mais caro possível desta slice tem assert PRÓPRIO e vem primeiro: um
+// counterpart LIBERADO que caísse em `claim-absent` viraria `undeclared-writes`
+// (D1) e o release PIORARIA o bloqueio que veio consertar (contrato #6).
+console.log('\nG22: release — skip nomeado, mordida nos dois sentidos, sonda fail-closed, baseline medido');
+{
+  const release = require('./forge-claim-release.js');
+  const runsApi22 = require('./forge-runs.js');
+  const { readClaim: readClaim22, RELEASE_MECHANISMS: MECHS } = require('./forge-write-claim.js');
+  const { recordAndEvaluate, DEFAULT_RELEASE_PROBE, DEFAULT_RELEASE_CLASSIFY,
+    RELEASE_SKIP_BY_MECHANISM } = gate;
+
+  /** O envelope `released` de T01, na forma que `normalizeReleased` aceita. */
+  function releasedEnvelope(mechanism) {
+    return { at: 1785763254000, mechanism, evidence: {} };
+  }
+
+  /** Reescreve o claim de uma run já gravada — o "único delta" das mordidas. */
+  function patchClaim(ws, id, patch) {
+    const file = path.join(ws, '.gsd', 'forge', 'runs', `${id}.json`);
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    rec.write_claim = Object.assign({}, rec.write_claim, patch);
+    fs.writeFileSync(file, JSON.stringify(rec, null, 2), 'utf8');
+  }
+
+  /** Sonda injetada que devolve FATOS fixos — o mundo, sem VCS nem relógio. */
+  function factsProbe(facts) {
+    return () => Object.assign({
+      claim_present: true,
+      explicit_release: false,
+      code_dir: '/code/dir',
+      vcs: 'git',
+      baseline_before: 'aaa',
+      baseline_now: 'aaa',
+      baseline_advanced: false,
+      dirty_paths: [],
+      paths_in_flight: true,
+      age_ms: 1,
+      ttl_ms: 10,
+      grace_ms: 1,
+      ttl_expired: false,
+      owner_active: true,
+      probe_error: null,
+    }, facts);
+  }
+
+  test('G22a: contrato #6 — counterpart LIBERADO sai com skip nomeado e NUNCA vira claim-absent', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js'], undefined, { released: releasedEnvelope('explicit') }) },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+    }));
+
+    // 1. Saiu do universo NOMEADO e CONTADO.
+    assert(r.census.skipped.some((s) => s.id === 'M-other' && s.reason === 'claim-released:explicit'),
+      'o counterpart liberado precisa sair com skip nomeado carregando o mecanismo');
+    assertEqual(r.census.counterparts_considered, 1, 'considerado: o liberado CONTA no censo');
+    assertEqual(r.census.counterparts_in_scope, 0, 'em escopo: o liberado NÃO conta');
+
+    // 2. A NÃO-CONVERSÃO, que é o assert dedicado desta slice.
+    assert(!r.census.notes.some((n) => String(n.id).includes('M-other') && n.reason === 'claim-absent'),
+      'REGRESSÃO CONTRATO #6: claim liberado colapsou em claim-absent — o release viraria undeclared-writes');
+    assert(!r.census.notes.some((n) => n.reason === 'claim-absent'),
+      'nenhuma note claim-absent pode nascer de um claim que EXISTE e foi liberado');
+    assertEqual(r.cause, null, 'um claim liberado nunca pode produzir cause alguma');
+    assert(r.cause !== 'undeclared-writes',
+      'REGRESSÃO CONTRATO #6: o release piorou o bloqueio — virou undeclared-writes');
+    assertEqual(r.decision !== 'refuse' && r.decision !== 'block', true, 'liberado não bloqueia');
+
+    // 3. Razão do proceed: nada foi confrontado.
+    assertEqual(r.decision, 'proceed');
+    assertEqual(r.reason, 'no-active-counterpart',
+      'com o liberado como único candidato, NADA foi confrontado — no-conflict alegaria um confronto inexistente');
+    assert(r.reason !== 'no-conflict', 'as duas razões de proceed continuam distintas');
+
+    // 4. O campo aditivo nomeia quem saiu e por quê.
+    assertEqual(JSON.stringify(r.released_counterparts),
+      JSON.stringify([{
+        id: 'M-other', mechanism: 'explicit', reason: 'released-explicit', persisted_mechanism: 'explicit',
+      }]));
+  });
+
+  test('G22b: mordida nos DOIS sentidos sobre a MESMA fixture — único delta é o envelope released', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+    const args = { cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 2 };
+
+    const held = record(evaluateGate(args));
+    assertEqual(held.decision, 'block', 'sentido 1: counterpart NÃO liberado bloqueia');
+    assertEqual(held.cause, 'overlap');
+    assertEqual(held.census.counterparts_in_scope, 1);
+    assertEqual(held.released_counterparts.length, 0);
+
+    patchClaim(ws, 'M-other', { released: releasedEnvelope('committed') });
+
+    const freed = record(evaluateGate(args));
+    assertEqual(freed.decision, 'proceed', 'sentido 2: o MESMO estado com o envelope released passa');
+    assertEqual(freed.reason, 'no-active-counterpart');
+    assertEqual(freed.census.counterparts_in_scope, 0);
+    assertEqual(freed.census.skipped.filter((s) => s.reason.startsWith('claim-released:')).length, 1);
+  });
+
+  test('G22c: os três mecanismos produzem os três skips nomeados (committed / ttl-expired / explicit)', () => {
+    function withProbe(facts) {
+      const ws = makeFixture([
+        { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+        { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+      ]);
+      return record(evaluateGate({
+        cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+        releaseProbe: factsProbe(facts),
+      }));
+    }
+    // As DUAS sondas de T02 satisfeitas -> released-committed.
+    const committed = withProbe({ baseline_advanced: true, paths_in_flight: false });
+    assertEqual(committed.decision, 'proceed');
+    assertEqual(committed.released_counterparts[0].mechanism, 'committed');
+    assert(committed.census.skipped.some((s) => s.reason === 'claim-released:committed'));
+
+    // A rede do TTL (D2): janela vencida SOBRE RUN INATIVA — nunca idade sozinha.
+    const ttl = withProbe({ ttl_expired: true, owner_active: false });
+    assertEqual(ttl.decision, 'proceed');
+    assertEqual(ttl.released_counterparts[0].mechanism, 'ttl-expired');
+    assert(ttl.census.skipped.some((s) => s.reason === 'claim-released:ttl-expired'));
+
+    // Par de polaridade: MESMA janela vencida, run ATIVA -> segue em escopo.
+    const alive = withProbe({ ttl_expired: true, owner_active: true });
+    assertEqual(alive.decision, 'block', 'run viva nunca perde o claim para o relógio (D2)');
+    assertEqual(alive.cause, 'overlap');
+    assertEqual(alive.census.counterparts_in_scope, 1);
+  });
+
+  test('G22d: fail-closed — held-probe-unavailable MANTÉM o counterpart, com note nomeada', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+      releaseProbe: factsProbe({ probe_error: 'vcs-baseline-absent', baseline_advanced: null, paths_in_flight: null }),
+    }));
+    assertEqual(r.decision, 'block', 'pergunta que não pôde ser feita NUNCA abre a cerca');
+    assertEqual(r.cause, 'overlap');
+    assertEqual(r.census.counterparts_in_scope, 1);
+    assertEqual(r.released_counterparts.length, 0);
+    assert(r.census.notes.some((n) => n.reason === 'release-probe-unavailable'),
+      'o motivo da sonda indisponível precisa aparecer no censo');
+  });
+
+  test('G22e: fail-closed — sonda que LANÇA mantém o counterpart e nomeia o throw', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+      releaseProbe: () => { throw new Error('sonda quebrada'); },
+    }));
+    assertEqual(r.decision, 'block', 'uma sonda quebrada que removesse counterparts abriria a cerca em silêncio');
+    assertEqual(r.census.counterparts_in_scope, 1);
+    const note = r.census.notes.find((n) => n.reason === 'release-probe-threw');
+    assert(note, 'o throw precisa virar note nomeada');
+    assert(/sonda quebrada/.test(note.detail || ''), 'a note deve carregar o erro nomeado');
+  });
+
+  test('G22f: fail-closed — veredito irreconhecível (razão E mecanismo) mantém o counterpart', () => {
+    function withClassify(verdict) {
+      const ws = makeFixture([
+        { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+        { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+      ]);
+      return record(evaluateGate({
+        cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+        releaseProbe: factsProbe({}), releaseClassify: () => verdict,
+      }));
+    }
+    // (a) razão fora de CLAIM_RELEASE_REASONS.
+    const badReason = withClassify({ held: false, reason: 'liberado-por-vibe', mechanism: 'committed' });
+    assertEqual(badReason.decision, 'block');
+    assertEqual(badReason.census.counterparts_in_scope, 1);
+    assert(badReason.census.notes.some((n) => n.reason === 'release-probe-unrecognised'));
+
+    // (b) razão conhecida, MECANISMO fora de RELEASE_MECHANISMS: sem nome não há
+    //     skip, e sem skip a saída seria invisível — então não há saída.
+    const badMech = withClassify({ held: false, reason: 'released-committed', mechanism: 'bogus' });
+    assertEqual(badMech.decision, 'block', 'mecanismo sem nome não pode tirar counterpart do universo');
+    assertEqual(badMech.census.counterparts_in_scope, 1);
+    assert(badMech.census.notes.some((n) => n.reason === 'release-probe-unrecognised'));
+  });
+
+  test('G22g: sem sonda injetada, o DEFAULT roda e um claim sem baseline segue em escopo', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+    }));
+    assertEqual(r.decision, 'block', 'claim sem vcs_baseline não é prova de release');
+    assertEqual(r.census.counterparts_in_scope, 1);
+    assert(r.census.notes.some((n) => n.reason === 'release-probe-unavailable'),
+      'a ausência de baseline é um buraco na evidência, e é nomeada');
+  });
+
+  test('G22h: o seam é INJETÁVEL e observável — recebe o claim do counterpart E o RunRecord dele', () => {
+    const seen = [];
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']), isolation_mode: 'worktree' },
+    ]);
+    record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+      releaseProbe: (c, opts) => { seen.push({ c, opts }); return factsProbe({})(); },
+    }));
+    assertEqual(seen.length, 1, 'a sonda deve ser chamada uma vez por counterpart em escopo');
+    assertEqual(JSON.stringify(seen[0].c.paths), JSON.stringify(['scripts/x.js']),
+      'o claim do COUNTERPART precisa chegar à sonda');
+    assert(seen[0].opts.runRecord, 'o RunRecord do counterpart precisa chegar à sonda');
+    assertEqual(seen[0].opts.runRecord.id, 'M-other');
+    assertEqual(seen[0].opts.runRecord.isolation_mode, 'worktree',
+      'o RunRecord COMPLETO viaja — um seam que ninguém alimenta é um seam descoberto quebrado depois');
+    assertEqual(seen[0].opts.runId, 'M-other');
+  });
+
+  test('G22i: o default do seam é o probeClaim de T02 — por IDENTIDADE DE REFERÊNCIA', () => {
+    assertEqual(DEFAULT_RELEASE_PROBE, release.probeClaim,
+      'o default precisa SER a função de T02, não uma cópia com o mesmo comportamento');
+    assertEqual(DEFAULT_RELEASE_CLASSIFY, release.classifyRelease,
+      'a decisão de release não é reimplementada no gate — é a de T02, por referência');
+  });
+
+  test('G22j: recordAndEvaluate MEDE o baseline na gravação e o persiste no claim', () => {
+    const ws = makeFixture([{ id: 'M-own' }]);
+    const seam = {
+      detectVcs: () => 'git',
+      baselineId: () => ({ ok: true, id: 'abc123' }),
+      workingStatus: () => ({ ok: true, entries: [] }),
+    };
+    const r = record(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T01', source: 'manual',
+      codeDir: '/code/dir', paths: ['scripts/x.js'], vcsSeam: seam, emitEvent: false,
+    }));
+    assertEqual(JSON.stringify(r.claim.vcs_baseline), JSON.stringify({ vcs: 'git', id: 'abc123' }));
+    assertEqual(JSON.stringify(readClaim22(runsApi22.get(ws, 'M-own')).vcs_baseline),
+      JSON.stringify({ vcs: 'git', id: 'abc123' }),
+      'o baseline medido precisa estar PERSISTIDO — um "antes" lido depois não é um antes');
+    assert(!r.census.notes.some((n) => String(n.reason).startsWith('vcs-baseline-')),
+      'baseline medido com sucesso não gera note');
+  });
+
+  test('G22k: sem code_dir ou com medição falha -> vcs_baseline null NOMEADO, nunca adivinhado (B2)', () => {
+    const wsA = makeFixture([{ id: 'M-own' }]);
+    const semCodeDir = record(recordAndEvaluate({
+      cwd: wsA, runId: 'M-own', unit: 'execute-task/T01', source: 'manual',
+      paths: ['scripts/x.js'], emitEvent: false,
+    }));
+    assertEqual(semCodeDir.claim.vcs_baseline, null);
+    assert(semCodeDir.census.notes.some((n) => n.reason === 'vcs-baseline-absent'),
+      'a ausência é FATO e é nomeada — nunca derivada de root+branch');
+
+    const wsB = makeFixture([{ id: 'M-own' }]);
+    const falhou = record(recordAndEvaluate({
+      cwd: wsB, runId: 'M-own', unit: 'execute-task/T01', source: 'manual',
+      codeDir: '/code/dir', paths: ['scripts/x.js'], emitEvent: false,
+      vcsSeam: { detectVcs: () => 'git', baselineId: () => ({ ok: false, error: 'boom' }) },
+    }));
+    assertEqual(falhou.claim.vcs_baseline, null, 'medição falha nunca vira id inventado');
+    const note = falhou.census.notes.find((n) => n.reason === 'vcs-baseline-unmeasured');
+    assert(note, 'a falha de medição precisa ser nomeada');
+    assert(/boom/.test(note.detail || ''), 'a note deve carregar o erro nomeado da sonda');
+  });
+
+  test('G22l: o evento claim-gate carrega released_counterparts (campo ADITIVO, lido do events.jsonl)', () => {
+    const ws = makeFixture([
+      { id: 'M-own' },
+      { id: 'M-other', write_claim: claim(['scripts/x.js'], undefined, { released: releasedEnvelope('committed') }) },
+    ]);
+    const r = record(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T01', source: 'manual',
+      codeDir: '/code/dir', paths: ['scripts/x.js'],
+      vcsSeam: { detectVcs: () => 'git', baselineId: () => ({ ok: true, id: 'zzz' }) },
+    }));
+    assertEqual(r.decision, 'proceed');
+    const lines = fs.readFileSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), 'utf8').trim().split('\n');
+    const ev = JSON.parse(lines[lines.length - 1]);
+    assertEqual(ev.event, 'claim-gate');
+    // `mechanism` é o do VEREDITO (o envelope já estava lá -> explicit) e
+    // `persisted_mechanism` é o que originalmente aposentou o claim. Os dois
+    // viajam: colapsá-los diria "liberado explicitamente" sobre um claim que um
+    // commit medido aposentou.
+    assertEqual(JSON.stringify(ev.released_counterparts),
+      JSON.stringify([{
+        id: 'M-other', mechanism: 'explicit', reason: 'released-explicit', persisted_mechanism: 'committed',
+      }]),
+      'o evento precisa nomear quem saiu e por qual mecanismo');
+    // Leitor ANTIGO que ignora o campo continua correto: tudo que ele lia segue lá.
+    for (const k of ['decision', 'cause', 'census', 'counterparts', 'not_covered', 'run', 'unit']) {
+      assert(Object.prototype.hasOwnProperty.call(ev, k), `campo pré-existente sumiu do evento: ${k}`);
+    }
+  });
+
+  test('G22m: compareClaims segue PURA — nenhum import de release em forge-claim-overlap.js', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'forge-claim-overlap.js'), 'utf8');
+    const stripped = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const guard = (s) => !/forge-claim-release|probeClaim|classifyRelease/.test(s);
+    assert(guard(stripped), 'a sondagem vazou para o comparador — contrato #7 quebrado');
+    // Controle positivo: o mesmo predicado precisa MORDER quando o import existe.
+    assert(!guard(`${stripped}\nconst { probeClaim } = require('./forge-claim-release.js');\n`),
+      'o guard não mordeu o import injetado — guard cego');
+    // E o gate, que É impuro, carrega o import: prova de que a fronteira está do lado certo.
+    assert(/forge-claim-release/.test(fs.readFileSync(MODULE, 'utf8')),
+      'o gate é quem importa o release — se nem ele importa, o guard acima passa por vacuidade');
+  });
+
+  test('G22n: cruzamento dos skips de release nos DOIS sentidos, contra RELEASE_MECHANISMS', () => {
+    const mapped = Object.values(RELEASE_SKIP_BY_MECHANISM).sort();
+    const declared = GATE_SKIP_REASONS.filter((s) => s.startsWith('claim-released:')).sort();
+    assertEqual(JSON.stringify(mapped), JSON.stringify(declared),
+      'todo mecanismo tem skip declarado, e todo skip declarado vem de um mecanismo');
+    assertEqual(mapped.length, MECHS.length, 'um skip por mecanismo de T01, nem mais nem menos');
+  });
+
+  test('G22o: R7 intocada — as primitivas do ledger de defer seguem íntegras e nomeadas', () => {
+    const { readDeferLedger, writeDeferLedger, deferKey, deferLedgerPath } = gate._private;
+    const ws = mktmp();
+    assertEqual(JSON.stringify(readDeferLedger(ws)), JSON.stringify({ data: {}, note: null }),
+      'ledger inexistente não é falha');
+    assertEqual(writeDeferLedger(ws, { 'a|b': { count: 1 } }), null);
+    assertEqual(readDeferLedger(ws).data['a|b'].count, 1);
+    assertEqual(deferKey('R', 'execute-task/T01'), 'R|execute-task/T01');
+    assert(deferLedgerPath(ws).endsWith(path.join('.gsd', 'forge', 'claim-gate-defers.json')));
+  });
+
+  test('G22p: a razão de complete-slice deixou de citar a colisão com o release de IN-6', () => {
+    assertEqual(UNCOVERED_BOUNDARIES.length, 3, 'a fronteira continua enumerada — o conjunto segue com 3');
+    const cs = UNCOVERED_BOUNDARIES.find((b) => b.boundary === 'complete-slice');
+    assert(cs, 'a fronteira complete-slice não pode sumir da enumeração');
+    assert(!/colide com o release/.test(cs.reason),
+      'a razão antiga virou mentira enumerada: o release de IN-6 foi entregue nesta slice');
+    assert(/Deferred do CONTEXT/.test(cs.reason), 'a razão precisa dizer que a fronteira está fora por DECISÃO');
+  });
+}
+
 // ── G9: direção 2 dos conjuntos fechados — depois de TUDO ter rodado ───────
 console.log('\nG9: direção 2 — todo valor declarado foi emitido por >= 1 teste');
 {
