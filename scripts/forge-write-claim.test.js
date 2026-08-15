@@ -31,7 +31,10 @@ const { spawnSync } = require('child_process');
 
 const MODULE = path.join(__dirname, 'forge-write-claim.js');
 const claimMod = require('./forge-write-claim.js');
-const { normalizeClaim, recordClaim, readClaim, clearClaim, CLAIM_SOURCES } = claimMod;
+const {
+  normalizeClaim, recordClaim, readClaim, clearClaim, releaseClaim, isHeld,
+  CLAIM_SOURCES, RELEASE_MECHANISMS,
+} = claimMod;
 const runs = require('./forge-runs.js');
 
 // ── Runner ──────────────────────────────────────────────────────────────────
@@ -340,6 +343,194 @@ test('R8c: nada é gravado quando o code_dir é recusado', () => {
   } catch (_) { threw = true; }
   assert(threw, 'recordClaim deveria propagar a recusa');
   assertEqual(sha256(runFile), before, 'um claim recusado NÃO pode ter tocado o registro');
+});
+
+// ── R9: vcs_baseline — additive, validated at the write boundary ───────────
+test('R9a: vcs_baseline absent/null -> null, never derived', () => {
+  assertEqual(normalizeClaim({ source: 'manual' }).vcs_baseline, null);
+  assertEqual(normalizeClaim({ source: 'manual', vcs_baseline: null }).vcs_baseline, null);
+});
+test('R9b: vcs_baseline valid shape round-trips', () => {
+  const claim = normalizeClaim({ source: 'manual', vcs_baseline: { vcs: 'git', id: 'abc123' } });
+  assertEqual(claim.vcs_baseline.vcs, 'git');
+  assertEqual(claim.vcs_baseline.id, 'abc123');
+  const svnClaim = normalizeClaim({ source: 'manual', vcs_baseline: { vcs: 'svn', id: '42' } });
+  assertEqual(svnClaim.vcs_baseline.vcs, 'svn');
+});
+test('R9c: vcs_baseline malformed throws, naming the rejected value and accepted shape, nothing written', () => {
+  const bad = [
+    42, 'git:abc', [],
+    { vcs: 'hg', id: 'x' },
+    { vcs: 'git', id: '' },
+    { vcs: 'git', id: 42 },
+    { vcs: 'git' },
+  ];
+  for (const v of bad) {
+    let threw = null;
+    try { normalizeClaim({ source: 'manual', vcs_baseline: v }); }
+    catch (e) { threw = e; }
+    assert(threw !== null, `vcs_baseline ${JSON.stringify(v)} deveria ter sido recusado`);
+    assert(/vcs_baseline/.test(threw.message), `mensagem deve nomear vcs_baseline, veio: ${threw.message}`);
+  }
+  const { wsDir, runFile } = makeFixture('M-20260813-r9c');
+  const before = sha256(runFile);
+  let threw = false;
+  try { recordClaim(wsDir, 'M-20260813-r9c', { source: 'manual', vcs_baseline: { vcs: 'hg', id: 'x' } }); }
+  catch (_) { threw = true; }
+  assert(threw, 'recordClaim deve propagar a recusa');
+  assertEqual(sha256(runFile), before, 'vcs_baseline recusado não pode ter tocado o registro');
+});
+
+// ── R10: released — additive, validated at the write boundary ──────────────
+test('R10a: released absent/null -> null', () => {
+  assertEqual(normalizeClaim({ source: 'manual' }).released, null);
+  assertEqual(normalizeClaim({ source: 'manual', released: null }).released, null);
+});
+test('R10b: released valid shape round-trips', () => {
+  const claim = normalizeClaim({
+    source: 'manual', released: { at: 123, mechanism: 'explicit', evidence: { foo: 'bar' } },
+  });
+  assertEqual(claim.released.at, 123);
+  assertEqual(claim.released.mechanism, 'explicit');
+  assertEqual(claim.released.evidence.foo, 'bar');
+});
+test('R10c: released malformed throws, naming rejected value, nothing written', () => {
+  const bad = [
+    42, [], { at: 'x', mechanism: 'explicit', evidence: {} },
+    { at: 1, mechanism: 'chute', evidence: {} },
+    { at: 1, mechanism: 'explicit', evidence: null },
+    { at: 1, mechanism: 'explicit' },
+  ];
+  for (const v of bad) {
+    let threw = null;
+    try { normalizeClaim({ source: 'manual', released: v }); }
+    catch (e) { threw = e; }
+    assert(threw !== null, `released ${JSON.stringify(v)} deveria ter sido recusado`);
+    assert(/released/.test(threw.message), `mensagem deve nomear released, veio: ${threw.message}`);
+  }
+  const { wsDir, runFile } = makeFixture('M-20260813-r10c');
+  const before = sha256(runFile);
+  let threw = false;
+  try { recordClaim(wsDir, 'M-20260813-r10c', { source: 'manual', released: { at: 1, mechanism: 'chute', evidence: {} } }); }
+  catch (_) { threw = true; }
+  assert(threw, 'recordClaim deve propagar a recusa de released');
+  assertEqual(sha256(runFile), before, 'released recusado não pode ter tocado o registro');
+});
+
+// ── R11: RELEASE_MECHANISMS closed set, cross-checked both directions ──────
+const mechanismsSeen = new Set();
+test('R11a: every RELEASE_MECHANISMS entry is accepted by normalizeClaim', () => {
+  for (const mechanism of RELEASE_MECHANISMS) {
+    const claim = normalizeClaim({ source: 'manual', released: { at: 1, mechanism, evidence: {} } });
+    assertEqual(claim.released.mechanism, mechanism, `mechanism ${mechanism} must round-trip`);
+    mechanismsSeen.add(mechanism);
+  }
+});
+test('R11b: an unknown mechanism is rejected', () => {
+  let threw = false, message = '';
+  try { normalizeClaim({ source: 'manual', released: { at: 1, mechanism: 'chute', evidence: {} } }); }
+  catch (e) { threw = true; message = e.message; }
+  assert(threw, 'mecanismo desconhecido deve lançar');
+  assert(message.includes('chute'), 'mensagem deve nomear o valor recusado');
+});
+test('R11c: RELEASE_MECHANISMS cross-check — every listed mechanism was exercised', () => {
+  for (const m of RELEASE_MECHANISMS) {
+    assert(mechanismsSeen.has(m), `RELEASE_MECHANISMS entry ${m} nunca foi exercitado`);
+  }
+  assertEqual(mechanismsSeen.size, RELEASE_MECHANISMS.length, 'nenhum teste exercitou mecanismo fora do conjunto');
+});
+
+// ── R12: releaseClaim preserves the rest of the claim, field by field ──────
+test('R12a: releaseClaim preserves paths/unit/source/code_dir/vcs_baseline exactly', () => {
+  const { wsDir } = makeFixture('M-20260813-r12a');
+  recordClaim(wsDir, 'M-20260813-r12a', {
+    unit: 'execute-task/T01', source: 'manual', code_dir: '/code/dir',
+    paths: ['a.js', 'b.js'], vcs_baseline: { vcs: 'git', id: 'deadbeef' },
+  });
+  const before = readClaim(runs.get(wsDir, 'M-20260813-r12a'));
+  const result = releaseClaim(wsDir, 'M-20260813-r12a', { at: 999, mechanism: 'committed', evidence: { probe: 'ok' } });
+  assert(result.ok, 'releaseClaim deve retornar ok:true quando há claim');
+  const after = readClaim(runs.get(wsDir, 'M-20260813-r12a'));
+  assertEqual(after.unit, before.unit, 'unit deve ser preservado');
+  assertEqual(after.source, before.source, 'source deve ser preservado');
+  assertEqual(after.code_dir, before.code_dir, 'code_dir deve ser preservado');
+  assertEqual(JSON.stringify(after.paths), JSON.stringify(before.paths), 'paths devem ser preservados');
+  assertEqual(JSON.stringify(after.vcs_baseline), JSON.stringify(before.vcs_baseline), 'vcs_baseline deve ser preservado');
+  assertEqual(after.released.mechanism, 'committed');
+  assertEqual(after.released.at, 999);
+});
+
+test('R12b: releaseClaim on a run with no claim returns a named result, writes nothing', () => {
+  const { wsDir, runFile } = makeFixture('M-20260813-r12b');
+  const before = sha256(runFile);
+  const result = releaseClaim(wsDir, 'M-20260813-r12b', { at: 1, mechanism: 'explicit', evidence: {} });
+  assertEqual(result.ok, false, 'run sem claim deve retornar ok:false');
+  assertEqual(result.reason, 'no-claim', 'razão deve ser nomeada como no-claim, nunca inventar claim');
+  assertEqual(sha256(runFile), before, 'releaseClaim sem claim não pode escrever no registro');
+});
+
+test('R12c: releaseClaim writes through runs.update (locked), never fs.writeFileSync directly', () => {
+  const { wsDir } = makeFixture('M-20260813-r12c');
+  recordClaim(wsDir, 'M-20260813-r12c', { unit: 'execute-task/T01', source: 'manual', paths: [] });
+  const result = releaseClaim(wsDir, 'M-20260813-r12c', { at: 1, mechanism: 'explicit', evidence: {} });
+  assert(result.ok, 'release deve ter sucesso');
+  const rec = runs.get(wsDir, 'M-20260813-r12c');
+  assert(rec.write_claim.released !== null, 'released deve estar persistido no registry');
+});
+
+// ── R13: THREE distinct facts — absent × claimed-empty × released — never collapse
+test('R13: absent, claimed-empty and released are three distinct facts, each with its own assert', () => {
+  const { wsDir } = makeFixture('M-20260813-r13');
+
+  // Fact 1: absent — never claimed.
+  const recAbsent = runs.get(wsDir, 'M-20260813-r13');
+  assertEqual(readClaim(recAbsent), null, 'fact 1: absent must read as null');
+  assertEqual(isHeld(readClaim(recAbsent)), false, 'fact 1: isHeld(absent) must be false');
+
+  // Fact 2: claimed, honestly empty.
+  recordClaim(wsDir, 'M-20260813-r13', { unit: 'execute-task/T01', source: 'manual', paths: [] });
+  const recEmpty = runs.get(wsDir, 'M-20260813-r13');
+  const claimEmpty = readClaim(recEmpty);
+  assert(claimEmpty !== null, 'fact 2: claimed-empty must not read as null');
+  assertEqual(claimEmpty.released, null, 'fact 2: claimed-empty must not carry a released envelope');
+  assertEqual(isHeld(claimEmpty), true, 'fact 2: isHeld(claimed-empty) must be true');
+
+  // Fact 3: released — paths stay intact, released envelope present.
+  releaseClaim(wsDir, 'M-20260813-r13', { at: 1, mechanism: 'ttl-expired', evidence: {} });
+  const recReleased = runs.get(wsDir, 'M-20260813-r13');
+  const claimReleased = readClaim(recReleased);
+  assert(claimReleased !== null, 'fact 3: released claim must still be present, not absent');
+  assert(claimReleased.released !== null, 'fact 3: released envelope must be present');
+  assertEqual(isHeld(claimReleased), false, 'fact 3: isHeld(released) must be false');
+
+  // isHeld(false) happens for BOTH fact 1 and fact 3, for DIFFERENT reasons —
+  // distinguishable only by inspecting the claim itself, never by isHeld alone.
+  assertEqual(readClaim(recAbsent), null, 'fact 1 remains null (re-asserted)');
+  assert(readClaim(recReleased) !== null, 'fact 3 remains non-null (re-asserted) — released ≠ absent');
+});
+
+// ── R14: legacy record — vcs_baseline/released default null, sha256 unchanged by read
+test('R14: legacy record (no vcs_baseline/released) reads both as null, sha256 unchanged', () => {
+  const { wsDir, runFile } = makeFixture('M-20260813-legacy-r14');
+  const before = sha256(runFile);
+  const rec = runs.get(wsDir, 'M-20260813-legacy-r14');
+  assertEqual(rec.write_claim, null, 'legacy record has no write_claim at all -> null');
+  const after = sha256(runFile);
+  assertEqual(after, before, 'reading a legacy record must not rewrite it');
+});
+
+// ── R15 (review posture): guard-of-source scan — runs.update only, never fs.writeFileSync
+// directly on the run registry file, with a POSITIVE control (planting the
+// forbidden pattern in a copy must turn the scan red).
+test('R15: source scan — every write path uses runs.update, never fs.writeFileSync on the run file directly', () => {
+  const src = fs.readFileSync(MODULE, 'utf8');
+  const stripped = src.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  const forbidden = /fs\.writeFileSync\s*\(\s*(runFile|rf|f)\b/;
+  assert(!forbidden.test(stripped), 'forge-write-claim.js não deve chamar fs.writeFileSync diretamente no arquivo do run');
+
+  // Positive control: plant the forbidden pattern and confirm the scan goes red.
+  const planted = `${stripped}\nfunction bait(){ fs.writeFileSync(runFile, "{}"); }`;
+  assert(forbidden.test(planted), 'controle positivo: a varredura deve acusar o padrão plantado');
 });
 
 // ── Suite close ──────────────────────────────────────────────────────────

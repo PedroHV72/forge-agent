@@ -31,15 +31,38 @@
 //
 // ── Posture ──────────────────────────────────────────────────────────────
 //
-// This module is a PRIMITIVE. Coupling the claim's release to a commit (git
-// or svn) and any TTL are out of scope here (IN-6/S05) — `clearClaim` exists
-// so tests and CLI callers can reset state, nothing more.
+// This module PERSISTS the claim's whole lifecycle — record, read, and now
+// release — but never JUDGES it. Two fields are additive here (S05/T01):
+//
+//   vcs_baseline  the VCS state observed at claim time ({vcs, id} or null),
+//                 GIVEN by the caller at record time, never re-derived later.
+//   released      the envelope written when a release is granted ({at,
+//                 mechanism, evidence} or null). This module does not decide
+//                 WHETHER a release is warranted — `releaseClaim` writes
+//                 whatever it is told. The measurement that PROVES a commit
+//                 happened (two probes: baseline advanced AND paths left
+//                 flight) and the TTL-as-net decision belong to
+//                 `forge-claim-release.js` (T02) — this module is the write
+//                 side only, same posture as `code_dir` above: it validates
+//                 SHAPE at the boundary, never plausibility of content.
+//
+// This is the S05 update of what used to say "Coupling the claim's release
+// to a commit (git or svn) and any TTL are out of scope here (IN-6/S05)" —
+// that scope line described a module with no release concept at all.
+// `clearClaim` remains the primitive reset it always was (unconditional
+// `write_claim: null`, no envelope, no history) — it is NOT `releaseClaim`
+// and must not be confused with it: `clearClaim` erases the claim outright
+// (used by tests/CLI to reset fixtures); `releaseClaim` preserves the claim
+// and appends the `released` envelope onto it. Reading a cleared run and a
+// released run must never look the same to a caller that cares which one it
+// is looking at (see `isHeld` below).
 //
 // CLI:
 //   node forge-write-claim.js --claim <run-id> --unit <u> [--source <s>]
 //                              [--code-dir <p>] [--paths <csv|json>] [--json] [--cwd <dir>]
 //   node forge-write-claim.js --show  <run-id> [--json] [--cwd <dir>]
 //   node forge-write-claim.js --clear <run-id> [--json] [--cwd <dir>]
+//   node forge-write-claim.js --release <run-id> --mechanism <m> [--evidence <json>] [--json] [--cwd <dir>]
 
 'use strict';
 
@@ -51,6 +74,27 @@ const { normalizePath } = require('./forge-parallelism.js');
 // items (D7, consumed in S04). `manual` = operator/CLI. A source outside this
 // set must never be recorded — see `normalizeClaim` below.
 const CLAIM_SOURCES = ['plan-writes', 'review-fix-paths', 'manual'];
+
+// Closed set of release mechanisms (S05/T01). This module never corroborates
+// any of them — corroboration (the two-probe commit proof, and the TTL net
+// over an inactive run) is `forge-claim-release.js` (T02)'s job. A caller
+// that requests a mechanism outside this set is refused, naming the closed
+// set, and nothing is written.
+const RELEASE_MECHANISMS = [
+  // An explicit release request that T02 has ALREADY corroborated by probe
+  // (baseline advanced AND paths left flight) before calling `releaseClaim`.
+  // This module trusts the caller here — it does not re-run the probe.
+  'explicit',
+  // Same proof as `explicit`, named separately so an event/audit reader can
+  // tell "release was requested and confirmed" apart from "release was
+  // observed passively during a routine gate evaluation".
+  'committed',
+  // The TTL net (D2): the claim's owner run went inactive and the TTL+grace
+  // window elapsed. Never a criterion of possession on its own — always
+  // gated on run inactivity by the caller (forge-claim-release.js), never
+  // by this module.
+  'ttl-expired',
+];
 
 /**
  * Pure — no disk. Validates and shapes a claim input into the persisted form
@@ -97,7 +141,67 @@ function normalizeClaim(input) {
     code_dir: (opts.code_dir === undefined || opts.code_dir === null || opts.code_dir === '')
       ? null : opts.code_dir,
     paths,
+    vcs_baseline: normalizeVcsBaseline(opts.vcs_baseline),
+    released: normalizeReleased(opts.released),
   };
+}
+
+/**
+ * `undefined`/`null` -> `null`. Otherwise requires `{ vcs, id }` with
+ * `vcs ∈ ['git', 'svn']` and `id` a non-empty string. Same guard posture as
+ * `code_dir` above (the S03 incident where an unvalidated non-string value
+ * silenced the comparator's verdict for every run): reject the shape at the
+ * only place that writes, name the rejected value AND the accepted shape,
+ * and write nothing.
+ */
+function normalizeVcsBaseline(input) {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error(
+      `forge-write-claim: invalid vcs_baseline ${JSON.stringify(input)} — ` +
+      `must be null or an object shaped { vcs: 'git'|'svn', id: <non-empty string> }`);
+  }
+  if (input.vcs !== 'git' && input.vcs !== 'svn') {
+    throw new Error(
+      `forge-write-claim: invalid vcs_baseline.vcs ${JSON.stringify(input.vcs)} — ` +
+      `must be one of ["git","svn"]`);
+  }
+  if (typeof input.id !== 'string' || input.id === '') {
+    throw new Error(
+      `forge-write-claim: invalid vcs_baseline.id ${JSON.stringify(input.id)} — ` +
+      `must be a non-empty string`);
+  }
+  return { vcs: input.vcs, id: input.id };
+}
+
+/**
+ * `undefined`/`null` -> `null`. Otherwise requires `{ at, mechanism,
+ * evidence }` with `at` a finite number, `mechanism ∈ RELEASE_MECHANISMS`,
+ * and `evidence` an object (may be `{}`). Same guard posture as
+ * `vcs_baseline`/`code_dir`: reject at the write boundary, name the rejected
+ * value AND the accepted shape/set, write nothing.
+ */
+function normalizeReleased(input) {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error(
+      `forge-write-claim: invalid released ${JSON.stringify(input)} — ` +
+      `must be null or an object shaped { at: <number>, mechanism: <string>, evidence: <object> }`);
+  }
+  if (typeof input.at !== 'number' || !Number.isFinite(input.at)) {
+    throw new Error(
+      `forge-write-claim: invalid released.at ${JSON.stringify(input.at)} — must be a finite number`);
+  }
+  if (!RELEASE_MECHANISMS.includes(input.mechanism)) {
+    throw new Error(
+      `forge-write-claim: unknown released.mechanism ${JSON.stringify(input.mechanism)} — ` +
+      `must be one of ${JSON.stringify(RELEASE_MECHANISMS)}`);
+  }
+  if (typeof input.evidence !== 'object' || input.evidence === null || Array.isArray(input.evidence)) {
+    throw new Error(
+      `forge-write-claim: invalid released.evidence ${JSON.stringify(input.evidence)} — must be an object (may be {})`);
+  }
+  return { at: input.at, mechanism: input.mechanism, evidence: input.evidence };
 }
 
 /** Derive AND persist — the ONLY function in this module that writes. */
@@ -122,14 +226,62 @@ function readClaim(rec) {
 }
 
 /**
- * Grava `write_claim: null` — a PRIMITIVE reset, not a release protocol. The
- * coupling to a commit (git/svn) and any TTL are IN-6/S05 and do NOT belong
- * here; this function exists only so tests and CLI callers can return a run
- * to its unclaimed state.
+ * Grava `write_claim: null` — a PRIMITIVE reset, not a release protocol.
+ * Unconditional erasure: whatever `vcs_baseline`/`released` history the
+ * claim carried is gone. This is NOT `releaseClaim` (below) — `clearClaim`
+ * exists only so tests and CLI callers can return a run to its unclaimed
+ * state; a real release PRESERVES the claim and appends the `released`
+ * envelope onto it.
  */
 function clearClaim(cwd, runId) {
   runs.update(cwd, runId, { write_claim: null });
   return null;
+}
+
+/**
+ * Writes the `released` envelope onto the run's CURRENT claim, preserving
+ * every other field (`paths`/`unit`/`source`/`code_dir`/`vcs_baseline`)
+ * verbatim. This module does not decide whether release is warranted — the
+ * caller (`forge-claim-release.js`, T02) already measured that; this
+ * function just persists the verdict, via the locked `runs.update` (never
+ * `fs.writeFileSync` on the registry file directly — see module Standards).
+ *
+ * `runs.update` replaces `write_claim` as a WHOLE SLOT (`Object.assign`
+ * over the patch, not a deep merge) — so this function must spread the
+ * current claim explicitly before writing, rather than relying on any
+ * implicit merge. See forge-runs.js:243-252 (`update`) — the merge is
+ * shallow at the top level; nesting one level below `write_claim` is NOT
+ * merged automatically.
+ *
+ * A run with no claim returns a NAMED result and never invents one:
+ * `{ ok: false, reason: 'no-claim' }`, nothing written.
+ */
+function releaseClaim(cwd, runId, release) {
+  const rec = runs.get(cwd, runId);
+  const claim = readClaim(rec);
+  if (claim === null) {
+    return { ok: false, reason: 'no-claim' };
+  }
+  const released = normalizeReleased(release);
+  const nextClaim = Object.assign({}, claim, { released });
+  runs.update(cwd, runId, { write_claim: nextClaim });
+  return { ok: true, claim: nextClaim };
+}
+
+/**
+ * Pure. THREE distinct facts must never collapse when read through here:
+ *   - claim absent (`readClaim` -> null)              -> isHeld: false
+ *   - claim recorded, honestly empty (`paths: []`)     -> isHeld: true
+ *   - claim RELEASED (`released` present, paths intact) -> isHeld: false
+ * `isHeld` returns `false` for the first AND the third case, for DIFFERENT
+ * reasons — callers that need to tell "never claimed" apart from "claimed
+ * then released" must inspect `claim` (or `claim.released`) directly, not
+ * `isHeld` alone. This is the accessor T03 uses so a released claim never
+ * falls into `claim-absent` (which cross-run is `undeclared-writes`, D1) —
+ * see S05-PLAN.md contract #6.
+ */
+function isHeld(claim) {
+  return !!claim && !claim.released;
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────
@@ -159,18 +311,21 @@ function parsePathsArg(raw) {
   return s.split(',').map((p) => p.trim()).filter((p) => p !== '');
 }
 
-const USAGE = `forge-write-claim — record/read/clear the write claim on a run's RunRecord
+const USAGE = `forge-write-claim — record/read/clear/release the write claim on a run's RunRecord
 
 Flags:
   --claim <run-id> --unit <u> [--source <s>] [--code-dir <p>] [--paths <csv|json>]
                        record a write claim for the run (source default: manual)
   --show <run-id>      print the run's currently recorded claim
-  --clear <run-id>     reset the run's claim to null
+  --clear <run-id>     reset the run's claim to null (PRIMITIVE erase — not a release)
+  --release <run-id> --mechanism <m> [--evidence <json>]
+                       write the released envelope, preserving the rest of the claim
+                       (mechanism must be one of: explicit, committed, ttl-expired)
   --json               emit JSON instead of the human-readable form
   --cwd <path>         where to look for the run registry (default: process.cwd())
   --help               this text
 
-recordClaim is the only function that writes. Exit code 0 on success.
+recordClaim and releaseClaim are the only functions that write. Exit code 0 on success.
 `;
 
 function formatClaim(claim) {
@@ -179,19 +334,39 @@ function formatClaim(claim) {
     `at=${new Date(claim.at).toISOString()} unit=${claim.unit || '(?)'} source=${claim.source}`,
     `code_dir=${claim.code_dir === null ? '(desconhecido)' : claim.code_dir}`,
     `paths=${claim.paths.length === 0 ? '(vazio)' : claim.paths.join(', ')}`,
+    `vcs_baseline=${claim.vcs_baseline ? `${claim.vcs_baseline.vcs}:${claim.vcs_baseline.id}` : '(nenhum)'}`,
+    `released=${claim.released ? `${claim.released.mechanism} @ ${new Date(claim.released.at).toISOString()}` : '(não liberado)'}`,
   ];
   return lines.join('\n');
 }
 
 function main(argv) {
   const args = parseArgs(argv);
-  if (args.help || (!args.claim && !args.show && !args.clear)) {
+  if (args.help || (!args.claim && !args.show && !args.clear && !args.release)) {
     process.stdout.write(USAGE);
     return 0;
   }
   const cwd = typeof args.cwd === 'string' ? args.cwd : process.cwd();
 
   try {
+    if (typeof args.release === 'string') {
+      let evidence = {};
+      if (typeof args.evidence === 'string') {
+        try { evidence = JSON.parse(args.evidence); }
+        catch (e) { throw new Error(`forge-write-claim: --evidence must be valid JSON, got ${JSON.stringify(args.evidence)}`); }
+      }
+      const result = releaseClaim(cwd, args.release, {
+        at: Date.now(),
+        mechanism: typeof args.mechanism === 'string' ? args.mechanism : undefined,
+        evidence,
+      });
+      if (!result.ok) {
+        process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : `(sem claim para liberar: ${result.reason})\n`);
+        return 0;
+      }
+      process.stdout.write(args.json ? `${JSON.stringify(result.claim, null, 2)}\n` : `${formatClaim(result.claim)}\n`);
+      return 0;
+    }
     if (typeof args.claim === 'string') {
       const claim = recordClaim(cwd, args.claim, {
         unit: typeof args.unit === 'string' ? args.unit : null,
@@ -229,7 +404,10 @@ module.exports = {
   recordClaim,
   readClaim,
   clearClaim,
+  releaseClaim,
+  isHeld,
   CLAIM_SOURCES,
+  RELEASE_MECHANISMS,
   parseArgs,
   main,
   USAGE,
