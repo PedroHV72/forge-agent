@@ -571,6 +571,17 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
 
 > Fires ONLY when the derived unit is `complete-slice`. Boundary is per-slice; standalone `/forge-task` keeps its own step-5.5 review. After the gate, dispatch `forge-completer` normally.
 
+**Slice git guard (around complete-slice):** `complete-slice` never integrates a branch — that is `complete-milestone`'s competence (`agents/forge-completer.md § Git boundary — complete-slice`). Snapshot the checkout **before** dispatching, verify **after** the worker returns:
+
+```bash
+# before Agent("forge-completer", ...)
+node "$FORGE_SCRIPTS_DIR/forge-slice-git-guard.js" --snapshot --cwd "$CODE_DIR" --unit "complete-slice/{S##}" > /dev/null
+# after it returns
+node "$FORGE_SCRIPTS_DIR/forge-slice-git-guard.js" --verify --cwd "$CODE_DIR" --unit "complete-slice/{S##}"
+```
+
+The snapshot is written to `.gsd/forge/` on purpose — shell variables do not survive between Bash calls. Exit `3` = violation (moved checkout, advanced default branch, or new merge commit): print it LOUDLY, append a `slice-git-violation` event, and **suppress any push for the rest of this run** regardless of `auto_push` — nothing is pushed yet, so `git reset --hard` on the default branch still recovers it. A violation is one of the few conditions worth surfacing mid-loop: an incomplete milestone on the default branch, or a checkout left outside the isolation branch, corrupts every subsequent slice. Verdict `inconclusive` means nothing was measurable and **must not** be read as clean. The guard never blocks the loop; it reports.
+
 **Review triage gate (before complete-milestone):** If `unit_type == complete-milestone`, run the **milestone-final triage** (`shared/forge-review.md § Step 9`) BEFORE dispatching `forge-completer` — i.e., before the milestone is finalized "de fato" (final close-out, LEDGER entry, cleanup):
 
 1. Scan all `{S##}-REVIEW.md` under `.gsd/milestones/{M###}/slices/*/` for pending items: `Decisão: deferido → triagem no fim da milestone`, `Correção: falhou — deferida para triagem final`, or legacy `Decisão: deferido (auto-mode)`.
