@@ -38,7 +38,7 @@ as one argv element. Tests can inject a fake executable through
 
 Runtime `minimum_version` values are CLI-version floors, not Forge product
 versions. For example, the current Claude Code floor is `2.0.0`, while the
-Forge package release proposed by this integration is `4.8.0`.
+Forge package release is `4.11.0`.
 
 Both version and behavior probes return one of four stable statuses:
 
