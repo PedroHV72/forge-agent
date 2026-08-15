@@ -89,4 +89,8 @@ function checkFileLock(cwd, filePath, opts) {
 function parseArgs(argv) { const args = {}; for (let i = 0; i < argv.length; i++) if (argv[i].startsWith('--')) { const key = argv[i].slice(2), next = argv[i + 1]; args[key] = next && !next.startsWith('--') ? (i++, next) : true; } return args; }
 function cliMain() { const args = parseArgs(process.argv.slice(2)), cwd = args.cwd || process.cwd(); try { if (args.acquire) { const result = acquireFileLock(cwd, args.acquire, args.run || null, args.session || null, { ttlMs: args.ttl && Number(args.ttl), intent: args.intent, ownerToken: args.token }); process.stdout.write(JSON.stringify(result) + '\n'); if (!result.acquired) process.exitCode = 1; } else if (args.release) { const ok = releaseFileLock(cwd, args.release, args.run, args.token, args.generation); process.stdout.write(ok ? 'released\n' : 'not held (token obrigatório)\n'); if (!ok) process.exitCode = 1; } else if (args.check) process.stdout.write(JSON.stringify(checkFileLock(cwd, args.check), null, 2) + '\n'); else { process.stderr.write('forge-filelock: comando inválido\n'); process.exitCode = 2; } } catch (error) { process.stderr.write(`forge-filelock error: ${error.message}\n`); process.exitCode = 1; } }
 if (require.main === module) cliMain();
-module.exports = { acquireFileLock, renewFileLock, releaseFileLock, checkFileLock, lockPathFor, encodePath, DEFAULT_TTL_MS };
+// `isHolderRunActive` é export ADITIVO (S05/T02): zero mudança de lógica ou de
+// comportamento — só a visibilidade. Um helper privado conta como código
+// existente, então a saída para o TTL-como-rede de `forge-claim-release.js` é
+// exportar o dono, nunca uma terceira cópia do predicado de run inativa.
+module.exports = { acquireFileLock, renewFileLock, releaseFileLock, checkFileLock, lockPathFor, encodePath, isHolderRunActive, DEFAULT_TTL_MS };
