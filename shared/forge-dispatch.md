@@ -522,14 +522,27 @@ Read if exists: {WORKING_DIR}/.gsd/milestones/{M###}/{M###}-SUMMARY.md
    If exit code != 0 and not skipped:"no-stack" → stop, return blocked with blocker_class: tooling_failure.
 4. Security scan — search changed files for risky patterns (eval, innerHTML, dangerouslySetInnerHTML, raw SQL concatenation, console.log near secrets, hardcoded credentials). If found, add ## ⚠ Security Flags to S##-SUMMARY.md. Not a blocker — document and continue.
 5. Run lint gate — if lint commands exist, run on changed files. Fix violations.
-If auto_commit is true:
-6. Squash-merge branch gsd/M###/S## to main
-If auto_commit is false:
-6. Skip — do NOT run any git commands (no merge, no branch operations).
+6. **Git — this unit has NO merge step, under either value of auto_commit.** Integrating a branch is
+   `complete-milestone`'s competence, never a slice's. FORBIDDEN here regardless of auto_commit, and
+   the prohibition is on INTEGRATING, not on any one spelling of it: `git merge` (squash or not,
+   --ff or --no-ff), `git rebase`, `git cherry-pick`, `git pull`, `git push`, `git checkout <branch>`,
+   `git switch`, `git branch -d/-m`, `git reset`, `git worktree`.
+   - If auto_commit is true: the ONLY git verbs permitted are `git add <specific-path>` and
+     `git commit`, on the branch already checked out. You must return on the same branch you started on.
+   - If auto_commit is false: run no git command at all.
+   The orchestrator verifies this after you return (`forge-slice-git-guard.js --verify`): a moved
+   checkout, an advanced default branch, or a new merge commit is a reported violation.
 7. Update M###-SUMMARY.md with this slice's contribution
 8. Mark slice [x] in M###-ROADMAP.md
 Return ---GSD-WORKER-RESULT---.
 ```
+
+> **Why the capability was removed rather than forbidden by prompt** (item `I-20260814114608`): a
+> dispatch prompt that said "Do NOT squash-merge" produced a **non-squash** merge of the milestone
+> branch into `master` at the close of a mid-milestone slice — the agent read the prohibition as
+> specific to *squash*. A negative instruction competes with a canonical step; deleting the step
+> and naming the class (`integrating`) removes the competition. The guard makes the invariant
+> checkable instead of merely stated.
 
 ### complete-milestone
 
@@ -1434,8 +1447,11 @@ After assembling the SUMMARY + result block, control **rejoins the normal Proces
 
 ```bash
 node "$FORGE_SCRIPTS_DIR/forge-evidence-materialize.js" \
-  --result "$RESULT_FILE" --unit "execute-task/{T##}" --cwd "$WORKING_DIR" --json
+  --result "$RESULT_FILE" --unit "execute-task/{T##}" \
+  --milestone "{M###}" --slice "{S##}" --cwd "$WORKING_DIR" --json
 ```
+
+**Both axes are passed, never only `--unit`** (S01 review R2). The file name is the composite key `milestone~slice~unit`, and `resolveEvidenceFiles` matches composites by strict equality on all three axes — an invocation that omits them lands the file under the named sentinels (`_no-milestone_`/`_no-slice_`), which parse back to `null` and can therefore never match the real `{M###, S##, T##}` the completer resolves. The lines would be written and never found. Where a caller genuinely has no milestone/slice (`/forge-task`), omitting them is correct — the sentinel is then the truth, and the resolution target carries the same absence.
 
 `scripts/forge-evidence-materialize.js` is the formula-once owner of the outcome enum, the naming, the 512-byte stepped truncation and the census shape; mirrors call it and restate none of them. Every written line carries `source: codex-runtime` — **never** `codex-sidecar`, which stays the marker of 7a, so a strict-equality filter separates the two in the same file. **Every invocation appends exactly one `kind:"census"` line**, including when nothing else is written: silence in the artifact a human reads is indistinguishable from a broken collector. The outcome enum is closed at three, and none is an omission:
 

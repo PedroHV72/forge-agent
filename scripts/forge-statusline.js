@@ -29,6 +29,13 @@ let _prefs = null;
 try { _prefs = require(path.join(__dirname, 'scripts', 'forge-prefs.js')); }
 catch { try { _prefs = require(path.join(__dirname, 'forge-prefs.js')); } catch { /* partial install */ } }
 
+// forge-evidence-path — file-name-shape authority for the evidence log
+// (S01/T04). Dual-path like above; module absent → evidenceFiles pre-scan
+// falls back to the old bare regex further down, statusline never throws.
+let _evpath = null;
+try { _evpath = require(path.join(__dirname, 'scripts', 'forge-evidence-path.js')); }
+catch { try { _evpath = require(path.join(__dirname, 'forge-evidence-path.js')); } catch { /* partial install */ } }
+
 // Passive consumers report malformed prefs without making status rendering fail.
 const updatePrefsErrorFlag = (cwd, error) => {
   try {
@@ -208,10 +215,25 @@ process.stdin.on('end', () => {
         const now = Date.now();
         const files = fs.readdirSync(runsDir).filter(f => f.endsWith('.json'));
         const forgeDir = path.join(cwd, '.gsd', 'forge');
-        // Pre-scan evidence files once — readdir per-run is wasteful
-        let evidenceFiles = [];
-        try { evidenceFiles = fs.readdirSync(forgeDir).filter(f => /^evidence-.*\.jsonl$/.test(f)); }
-        catch {}
+        // Pre-scan evidence files once — readdir per-run is wasteful.
+        // S01/T04: classify each name via the module's parseEvidenceFileName
+        // (composite + 3 legacy forms) instead of matching by loose
+        // substring — same statSync-only cost, no extra I/O per file.
+        let evidenceParsed = [];
+        try {
+          const rawNames = fs.readdirSync(forgeDir).filter(f => f.startsWith('evidence') && f.endsWith('.jsonl'));
+          if (_evpath) {
+            const knownMilestoneIds = _evpath.collectKnownMilestoneIds(cwd);
+            evidenceParsed = rawNames
+              .map(f => _evpath.parseEvidenceFileName(f, { knownMilestoneIds }))
+              .filter(p => p.form !== 'unrecognized');
+          } else {
+            // Module absent (partial install) — degrade to the pre-S01
+            // substring shape: `milestone` carries the raw name so the
+            // per-run match below falls back to `-${r.id}-` containment.
+            evidenceParsed = rawNames.map(f => ({ name: f, milestone: undefined }));
+          }
+        } catch {}
 
         for (const f of files) {
           try {
@@ -230,10 +252,13 @@ process.stdin.on('end', () => {
               }
             }
             // M005.3+: evidence files (hook-written per tool call, very fresh signal)
-            for (const ef of evidenceFiles) {
-              if (!ef.includes(`-${r.id}-`)) continue;
+            for (const ep of evidenceParsed) {
+              const matches = ep.milestone === undefined
+                ? ep.name.includes(`-${r.id}-`)   // degraded fallback (module absent)
+                : ep.milestone === r.id;
+              if (!matches) continue;
               try {
-                const sigAge = now - fs.statSync(path.join(forgeDir, ef)).mtimeMs;
+                const sigAge = now - fs.statSync(path.join(forgeDir, ep.name)).mtimeMs;
                 if (sigAge < age) age = sigAge;
               } catch {}
             }
@@ -816,11 +841,55 @@ process.stdin.on('end', () => {
     // rendering (MEM008), including legacy-md-without-jsonc.
     if (resolvedPrefs.hadError) forgeVersionTail += ' │ ⚠ prefs';
 
+    // --- Resource clamp indicator (🧮) ---
+    // Zero spawn on this path — the statusline renders continuously, and the
+    // sysctl-backed pressure probe in forge-resources.js shells out on every
+    // call. Allowed sources only: `poolStatus()` (small fs reads, no spawn —
+    // forge-resource-pool.js) and `readLastResourceEvent` (bounded tail read
+    // of `events.jsonl`, export of T01 — forge-resources-census.js).
+    // MEM008: any failure here (missing module, corrupt log, unreadable
+    // pool) must never stop the render.
+    let resourceSegment = '';
+    try {
+      let poolStatus = null;
+      try { ({ poolStatus } = require(path.join(__dirname, 'scripts', 'forge-resource-pool.js'))); }
+      catch { ({ poolStatus } = require(path.join(__dirname, 'forge-resource-pool.js'))); }
+      let readLastResourceEvent = null;
+      let DEGRADATION_REASONS = null;
+      try {
+        ({ readLastResourceEvent, DEGRADATION_REASONS } = require(path.join(__dirname, 'scripts', 'forge-resources-census.js')));
+      } catch {
+        ({ readLastResourceEvent, DEGRADATION_REASONS } = require(path.join(__dirname, 'forge-resources-census.js')));
+      }
+
+      const pool = poolStatus({});
+      const held = pool && pool.ok ? pool.held : 0;
+      const ceiling = pool && pool.ok ? pool.ceiling : 0;
+
+      const lastEvent = cwd ? readLastResourceEvent(cwd, { tailBytes: 8192 }) : null;
+      // R4 fix: the comment above promises "a recent event carrying a
+      // degradation reason" — but ANY last resource event has a `.reason`
+      // (pool-released, pressure-normal included). Only a reason registered
+      // in DEGRADATION_REASONS is actually degradation.
+      const degradedReason = (lastEvent && lastEvent.reason && DEGRADATION_REASONS
+        && DEGRADATION_REASONS.has(lastEvent.reason)) ? lastEvent.reason : '';
+
+      // Gate: show only when clamp is active — pool holding a slot OR a
+      // recent event carrying a degradation reason. Silence otherwise keeps
+      // the rendered line byte-identical to before this change.
+      if (held > 0 || degradedReason) {
+        const parts = [`🧮 ${held}/${ceiling}`];
+        if (degradedReason) parts.push(`${c.dim}${degradedReason}${c.reset}`);
+        resourceSegment = parts.join(' ');
+      }
+    } catch { /* MEM008 — resource indicator never blocks a render */ }
+
     // --- Model segment: only when NOT auto (tier icon covers "what's running" in auto mode) ---
     const segments = [];
     if (!autoMode) segments.push(model);
     segments.push(middleSegment, ctxStr, costDisplay);
     if (usageSegment) segments.push(usageSegment);
+    if (resourceSegment) segments.push(resourceSegment);
 
     const line1 = autoPrefix + segments.join(' │ ') + forgeVersionTail;
 

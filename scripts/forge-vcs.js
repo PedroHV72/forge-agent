@@ -129,6 +129,129 @@ function parseSvnStatusXml(xml) {
   return { ok: true, entries };
 }
 
+/*
+ * Parse the known, machine-produced `svn log --xml -v` format fail-closed
+ * (S02/T02, additive — nothing above this point changes behaviour).
+ *
+ * Molded on parseSvnStatusXml directly above: same tolerant block regex, same
+ * "a structurally present entry whose required fields do not parse is a PARSE
+ * FAILURE, not an entry to skip" posture. The distinction matters more here
+ * than in status: the consumer (forge-unit-delta) attributes WRITES to units,
+ * and an entry silently dropped becomes a file nobody wrote — the silent-clean
+ * failure class this milestone exists to close. So a `<logentry>` without a
+ * readable revision fails the whole parse loudly rather than shrinking the
+ * answer quietly.
+ *
+ * `<paths>` legitimately ABSENT is not a failure: `svn log --xml` without `-v`
+ * omits it, and a revision can carry only property changes. That yields
+ * `paths: []` — an honest empty, distinguishable from a malformed parse by the
+ * `ok` flag, never by an empty array alone.
+ *
+ * `msg` absent (empty commit message) → `''`, never null: the caller runs a
+ * regex over it, and `null` would force every call site to re-handle a case
+ * that has one obvious neutral value.
+ *
+ * Returns { ok: true, revisions: [{ rev, msg, paths: [{ action, path }] }] }
+ *      or { ok: false, error: 'svn-log-malformed' }.
+ *
+ * ── S02 review R1: the four inputs that used to answer `ok: true` ──────────
+ *
+ * The posture above was DECLARED here and not implemented: four malformed
+ * inputs were executed during the S02 review and ALL FOUR returned
+ * `{ ok: true }` with a silently shrunken answer — an unclosed `<path>` inside
+ * a closed `<paths>` (a written file becomes a file nobody wrote),
+ * `revision="12junk"` (`parseInt` prefix-parses, `Number.isFinite` never
+ * fires), a truncated stream and outright garbage (both collapse "could not
+ * ask" into "asked and there is nothing"). Four guards close them, and each
+ * one names the input it exists for:
+ *
+ *   1. ROOT     — a non-empty payload with no `<log …>` opening tag, or with
+ *                 no `</log>` closing tag, is not a log this parser read to the
+ *                 end. Truncation and garbage both land here.
+ *   2. REVISION — `/^\d+$/` strict. `12junk` is malformed, not revision 12.
+ *   3. PATH COUNT — inside a MATCHED `<paths>…</paths>`, the number of `<path`
+ *                 opening tags must equal the number of fully parsed entries.
+ *                 An unclosed `<path>` no longer evaporates.
+ *   4. RESIDUE  — any `<logentry`/`<paths`/`<path` left OUTSIDE every matched
+ *                 `<logentry>` block is unconsumed structure; returning a
+ *                 shorter `revisions[]` while ignoring it is exactly the
+ *                 silent-shrink this function claims not to do.
+ */
+function parseSvnLogXml(xml) {
+  const source = Buffer.isBuffer(xml) ? xml.toString('utf8') : String(xml);
+
+  // 1. ROOT. `svn log --xml` always emits `<log>…</log>`, even for an empty
+  // log (`<log>\n</log>`). Absence of either end means the payload is not a
+  // complete log — never an empty one.
+  if (!/<log\b[^>]*>/.test(source) || !/<\/log\s*>/.test(source)) {
+    return { ok: false, error: 'svn-log-malformed' };
+  }
+
+  const revisions = [];
+  const entryRe = /<logentry\b[^>]*>[\s\S]*?<\/logentry\s*>/g;
+  let entryMatch;
+  let consumedUpTo = 0;
+  let residue = '';
+  while ((entryMatch = entryRe.exec(source))) {
+    residue += source.slice(consumedUpTo, entryMatch.index);
+    consumedUpTo = entryMatch.index + entryMatch[0].length;
+    const block = entryMatch[0];
+    const open = /^<logentry\b[^>]*>/.exec(block);
+    if (!open) return { ok: false, error: 'svn-log-malformed' };
+    const revRaw = xmlAttribute(open[0], 'revision');
+    // 2. REVISION: strict. A prefix-parse would admit `12junk` as 12.
+    if (revRaw === null || !/^\d+$/.test(revRaw.trim())) return { ok: false, error: 'svn-log-malformed' };
+    const rev = Number.parseInt(revRaw.trim(), 10);
+    if (!Number.isFinite(rev)) return { ok: false, error: 'svn-log-malformed' };
+
+    const msgMatch = /<msg\b[^>]*>([\s\S]*?)<\/msg\s*>/.exec(block);
+    const msg = msgMatch ? decodeXmlEntities(msgMatch[1]) : '';
+
+    const paths = [];
+    const pathsBlock = /<paths\b[^>]*>[\s\S]*?<\/paths\s*>/.exec(block);
+    if (pathsBlock) {
+      const pathRe = /<path\b([^>]*)>([\s\S]*?)<\/path\s*>/g;
+      let pathMatch;
+      while ((pathMatch = pathRe.exec(pathsBlock[0]))) {
+        const action = xmlAttribute(`<path${pathMatch[1]}>`, 'action');
+        if (action === null) return { ok: false, error: 'svn-log-malformed' };
+        paths.push({ action, path: decodeXmlEntities(pathMatch[2]) });
+      }
+      // 3. PATH COUNT: every `<path` that opened must have been parsed.
+      const opened = (pathsBlock[0].match(/<path\b/g) || []).length;
+      if (opened !== paths.length) return { ok: false, error: 'svn-log-malformed' };
+    }
+    revisions.push({ rev, msg, paths });
+  }
+  residue += source.slice(consumedUpTo);
+  // 4. RESIDUE: structure outside every matched entry was never consumed.
+  if (/<logentry\b|<paths\b|<path\b/.test(residue)) return { ok: false, error: 'svn-log-malformed' };
+  return { ok: true, revisions };
+}
+
+/*
+ * Changed paths per revision over a range, from a working copy root.
+ *
+ * Additive read-only primitive (S02/T02). `-v` is what carries `<paths>`; the
+ * range is passed as `-r <from>:<to>` so a caller can bound the walk.
+ *
+ * Failure is CLOSED and named at both stages a caller can distinguish:
+ *   exit != 0        → { ok: false, error: 'svn-log-failed', stderr }
+ *   unparsable XML   → { ok: false, error: 'svn-log-malformed' }
+ * Never `{ ok: true, revisions: [] }` on failure — "asked and there is nothing"
+ * and "could not ask" must stay different answers (forge-touch precedent).
+ */
+function svnLogChangedPaths(cwd, opts) {
+  const o = opts || {};
+  const fromRev = o.fromRev == null ? 1 : o.fromRev;
+  const toRev = o.toRev == null ? 'HEAD' : o.toRev;
+  const result = svnRun(cwd, ['log', '--xml', '-v', '-r', `${fromRev}:${toRev}`], o);
+  if (result.error || result.status !== 0) {
+    return { ok: false, error: 'svn-log-failed', stderr: stderrOf(result, 'svn log failed') };
+  }
+  return parseSvnLogXml(result.stdout);
+}
+
 function mapSvnItem(item, props) {
   if (item === 'modified' || item === 'replaced') return 'M';
   if (item === 'added' || item === 'unversioned') return 'A';
@@ -684,6 +807,10 @@ module.exports = {
   parsePorcelainZ,
   parseNameStatusZ,
   parseSvnStatusXml,
+  // Additive (S02/T02) — svnRun already existed at :71 and was internal only.
+  svnRun,
+  parseSvnLogXml,
+  svnLogChangedPaths,
   decodeXmlEntities,
   mapSvnItem,
   pruneEmptyParents,

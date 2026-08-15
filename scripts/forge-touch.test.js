@@ -79,18 +79,9 @@ function git(cwd, args) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' });
 }
 
-// ── R5 (opening half): the operator's live registry, before anything runs ───
+// ── R5 (see the closing half) ───────────────────────────────────────────────
 const REAL_HOME = os.userInfo().homedir;
 const LIVE_REGISTRY = path.join(REAL_HOME, '.claude', 'forge-gate-workspaces.json');
-function liveRegistryStamp() {
-  try {
-    const st = fs.statSync(LIVE_REGISTRY);
-    return `${st.mtimeMs}:${st.size}`;
-  } catch {
-    return 'absent';
-  }
-}
-const LIVE_BEFORE = liveRegistryStamp();
 
 // ── Reasons seen across the whole suite — cross-checked against
 //    TOUCH_REASONS at the very end (Step 6 of T01-PLAN's steps).
@@ -473,8 +464,9 @@ test('R6: two recordTouched calls over the same git state produce identical repo
 
 // ── R7 — mutation: prove the dedup actually bites ───────────────────────────
 
-test('R7: removing the Set-dedup turns the shared.txt duplicate RED (and the restore is byte-identical)', () => {
+test('R7: removing the Set-dedup turns the shared.txt duplicate RED (mutação em memória — o fonte real nunca é escrito)', () => {
   const pristine = fs.readFileSync(MODULE);
+  const pristineMtime = fs.statSync(MODULE).mtimeMs;
   const source = pristine.toString('utf8');
 
   const ORIGINAL = [
@@ -490,33 +482,100 @@ test('R7: removing the Set-dedup turns the shared.txt duplicate RED (and the res
   const occurrences = source.split(ORIGINAL).length - 1;
   assertEqual(occurrences, 1, 'the dedup block must appear exactly once (mutation target)');
 
-  let sawRed = false;
-  try {
-    fs.writeFileSync(MODULE, source.replace(ORIGINAL, MUTATED), 'utf8');
-    delete require.cache[require.resolve(MODULE)];
-    const mutant = require('./forge-touch.js');
+  // A mutação é compilada EM MEMÓRIA, nunca gravada em disco.
+  //
+  // A versão anterior escrevia o fonte mutado por cima do
+  // `scripts/forge-touch.js` REAL e restaurava no finally. O restore era
+  // correto, mas durante a janela entre escrever e restaurar o arquivo ficava
+  // divergente — e esta suíte roda em paralelo com 169 outras. Quem digere a
+  // árvore de fontes do repo nessa janela lê bytes diferentes: o
+  // `forge-release-gate` chama `packaging.build({repo})` DUAS vezes e afirma
+  // que os dois hashes são iguais, e o `forge-package` digere a mesma árvore.
+  // Ou seja, este teste era o ESCRITOR CONCORRENTE que tornava os vizinhos
+  // flaky — a mesma família do item I-20260814142227, vista do outro lado.
+  //
+  // `Module._compile` com o filename real preserva a resolução dos requires
+  // relativos internos, então o mutante roda idêntico sem tocar o disco.
+  const NodeModule = require('module');
+  const mutantModule = new NodeModule(MODULE, null);
+  mutantModule.filename = MODULE;
+  mutantModule.paths = NodeModule._nodeModulePaths(path.dirname(MODULE));
+  mutantModule._compile(source.replace(ORIGINAL, MUTATED), MODULE);
+  const mutant = mutantModule.exports;
 
-    const repo = makeDivergedRepo(mktmp('forge-touch-mutant-'));
-    const fx = makeFixture({ 'repo-a': repo });
-    const t = mutant.collectTouched(fx.wsDir, fx.runId, { home: fx.home });
-    const files = t.repos[0].files;
-    const dupCount = files.filter((f) => f === 'shared.txt').length;
-    sawRed = dupCount > 1;
-  } finally {
-    fs.writeFileSync(MODULE, pristine);
-    delete require.cache[require.resolve(MODULE)];
-    require('./forge-touch.js');
-  }
+  const repo = makeDivergedRepo(mktmp('forge-touch-mutant-'));
+  const fx = makeFixture({ 'repo-a': repo });
+  const t = mutant.collectTouched(fx.wsDir, fx.runId, { home: fx.home });
+  const files = t.repos[0].files;
+  const dupCount = files.filter((f) => f === 'shared.txt').length;
 
-  assert(sawRed, 'MUTATION SURVIVED: shared.txt did not duplicate without the dedup — R1 is not testing what it claims');
-  assert(fs.readFileSync(MODULE).equals(pristine), 'restored file must be byte-identical to the pristine source');
+  assert(dupCount > 1, 'MUTATION SURVIVED: shared.txt did not duplicate without the dedup — R1 is not testing what it claims');
+  // O fonte real nunca foi escrito — não há janela para vizinho nenhum ver.
+  assert(fs.readFileSync(MODULE).equals(pristine), 'o fonte real não pode ser escrito por este teste');
+  assertEqual(fs.statSync(MODULE).mtimeMs, pristineMtime, 'nem sequer o mtime do fonte real pode mudar');
 });
 
 // ── R5 (closing half) — this suite never wrote to the operator's live registry ──
 
-test('R5: the REAL ~/.claude/forge-gate-workspaces.json was never touched', () => {
-  const after = liveRegistryStamp();
-  assertEqual(after, LIVE_BEFORE, 'live registry mtime/size must be unchanged after the whole suite');
+// R5 proves this suite never writes the operator's workspace registry.
+//
+// The previous version watched the operator's LIVE
+// `~/.claude/forge-gate-workspaces.json` (mtime/size at module load vs at the
+// end). That cannot prove the property: the live registry is legitimately
+// written by the app and by any concurrent forge process, so the assert only
+// passed on an idle machine — item I-20260814142227, the same pathology
+// S06/T02 (4cc3533) fixed in run-overlap. Worse, the header's claim of a
+// "SYNTHETIC $HOME" was aspirational: nothing in the suite ever set one, so
+// the guard was observational rather than structural.
+//
+// Now the isolation is REAL and the measurement is on a copy: a real-shaped
+// registry is placed in a synthetic home, the CLI runs against it with HOME /
+// USERPROFILE pointed there, and only that copy is compared. Concurrent
+// writes to the operator's live file cannot reach the snapshot.
+test('R5: uma registry real-shaped num HOME sintético nunca é escrita (cópia isolada + controle positivo)', () => {
+  const isoHome = mktmp('touch-r5-home');
+  const claudeDir = path.join(isoHome, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const target = path.join(claudeDir, 'forge-gate-workspaces.json');
+
+  // Prefer the operator's real registry SHAPE; fall back to a minimal valid
+  // one so the assert still runs on a fresh checkout / CI instead of skipping.
+  let shape = 'synthetic';
+  if (fs.existsSync(LIVE_REGISTRY)) {
+    fs.copyFileSync(LIVE_REGISTRY, target);
+    shape = 'real-shaped';
+  } else {
+    writeJson(target, { version: 1, roots: [], entries: [] });
+  }
+
+  const stamp = () => {
+    const st = fs.statSync(target);
+    return `${st.mtimeMs}:${st.size}:${require('crypto').createHash('sha256').update(fs.readFileSync(target)).digest('hex')}`;
+  };
+
+  // A repo for --record to act on, so the run is a real exercise of the CLI.
+  const repo = mktmp('touch-r5-repo');
+  git(repo, ['init', '-q', '-b', 'main', repo]);
+  git(repo, ['config', 'user.email', 't@example.com']);
+  git(repo, ['config', 'user.name', 'T']);
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+  git(repo, ['add', 'a.txt']);
+  git(repo, ['commit', '-qm', 'init']);
+
+  const before = stamp();
+  const env = { ...process.env, HOME: isoHome, USERPROFILE: isoHome };
+  try {
+    execFileSync(process.execPath, [MODULE, '--record', 'R5-run', '--cwd', repo, '--json'],
+      { encoding: 'utf8', env, stdio: 'pipe' });
+  } catch {
+    // --record may legitimately refuse (no such run registered). The property
+    // under test is that it did not WRITE the registry either way.
+  }
+  assertEqual(stamp(), before, `a registry ${shape} no HOME sintético não pode ser escrita`);
+
+  // Positive control: the same comparator must bite.
+  fs.appendFileSync(target, '\n');
+  assert(stamp() !== before, 'controle positivo: uma escrita deliberada deve ser detectada pelo mesmo comparador');
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────

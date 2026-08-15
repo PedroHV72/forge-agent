@@ -138,18 +138,216 @@ function spawnPlan(argv) {
   };
 }
 
-function runVerification({ argv, codeDir, timeoutMs }) {
+// ── Resource wiring (S04/T03) ────────────────────────────────────────────
+//
+// `forge-reverify.js` is a THIN consumer (D10) of `forge-resources.js` /
+// `forge-command-rewrite.js` — it derives ZERO worker/heap/ceiling numbers
+// itself. Mirrors `forge-verify.js`'s `acquireClampForCommand` (S04/T02) and
+// `forge-hook.js:731-838`'s S03 command-rewrite branch: lazy require, W5
+// release-on-every-path, MEM008 fail-open when the resources/rewrite module
+// is missing or throws — the spawn then runs exactly as it did before this
+// wiring existed.
+//
+// Unlike T02's string consumer, `runVerification` spawns with `shell:false`
+// and an explicit argv array — `planRewriteArgv` (T01) is the ONLY place
+// that may split a `NAME=value` assignment out of argv into `env`. This
+// function never re-implements that split, and never places an assignment
+// token back into argv (that is precisely the hazard T01 exists to close:
+// `shell:false` would execute `NAME=value` as the binary name).
+//
+// Best-effort event append for the resource-clamp wiring — mirrors
+// `forge-verify.js`'s `appendResourceEvent`. Silent-fail (MEM008): event
+// logging never affects the verdict.
+function appendReverifyResourceEvent(codeDir, gsdDirOpt, kind, payload) {
+  try {
+    const codeDirAbs = path.resolve(codeDir);
+    const ownerGsd = gsdDirOpt ? path.resolve(gsdDirOpt) : path.join(codeDirAbs, '.gsd');
+    const eventsDir = path.join(ownerGsd, 'forge');
+    fs.mkdirSync(eventsDir, { recursive: true });
+    const line = JSON.stringify({ ts: new Date().toISOString(), kind, ...payload });
+    fs.appendFileSync(path.join(eventsDir, 'events.jsonl'), line + '\n', 'utf8');
+  } catch { /* MEM008 — silent-fail */ }
+}
+
+/**
+ * Attempt to acquire a resource-pool lease and a rewritten argv for one
+ * re-verification command. Returns byte-identical passthrough (same argv
+ * reference, no env override beyond the NODE_OPTIONS overlay) on every
+ * failure mode (module missing, module throws, non-runner argv, unrecognized
+ * runner form, unsafe token) — never throws.
+ *
+ * @returns {{ argv: string[], env: object|null, handle: object|null, resourcesMod: object|null }}
+ */
+function acquireReverifyClamp(argv, opts) {
+  const passthrough = { argv, env: null, handle: null, resourcesMod: null };
+  let resourcesMod;
+  try {
+    resourcesMod = typeof opts.requireResources === 'function'
+      ? opts.requireResources() : require('./forge-resources.js');
+    if (!resourcesMod || typeof resourcesMod.acquireCommandBudget !== 'function' ||
+        typeof resourcesMod.releaseCommandBudget !== 'function') {
+      throw new Error('forge-resources.js missing acquireCommandBudget/releaseCommandBudget');
+    }
+  } catch {
+    return passthrough;
+  }
+  let rewriteMod;
+  try {
+    rewriteMod = typeof opts.requireCommandRewrite === 'function'
+      ? opts.requireCommandRewrite() : require('./forge-command-rewrite.js');
+    if (!rewriteMod || typeof rewriteMod.planRewriteArgv !== 'function') {
+      throw new Error('forge-command-rewrite.js missing planRewriteArgv');
+    }
+  } catch {
+    return passthrough;
+  }
+
+  let handle = null;
+  try {
+    const contract = resourcesMod.acquireCommandBudget({
+      cwd: opts.codeDir,
+      commandTimeoutMs: opts.timeoutMs,
+      session: opts.session,
+    });
+    if (contract && contract.pool && contract.pool.handle &&
+        Array.isArray(contract.pool.handle.slots) && contract.pool.handle.slots.length) {
+      handle = contract.pool.handle;
+    }
+
+    if (contract && contract.enforcement === 'off') {
+      // `resources.enforcement: off` (S06/T03) — same bypass as
+      // forge-verify.js. Placed BEFORE the NODE_OPTIONS overlay is computed
+      // so `off` yields the full passthrough: argv byte-identical AND no
+      // heap NODE_OPTIONS injected (env stays null, the spawn inherits the
+      // parent environment untouched). FAIL-SAFE: only the exact string
+      // `off` bypasses. D10: reads, never derives.
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.codeDir }); } catch { /* MEM008 */ }
+      }
+      appendReverifyResourceEvent(opts.codeDir, opts.gsdDir, 'resource-clamp-skipped', {
+        reason: 'intact:enforcement-off',
+      });
+      return passthrough;
+    }
+
+    // NODE_OPTIONS overlay from the contract's heapMb — never overwrites a
+    // parent-defined NODE_OPTIONS (a human's choice always wins, same rule
+    // T02 uses). Applies on BOTH outcomes below — T03-PLAN step 2d: env is
+    // still explicit on the intact path too, only argv stays untouched.
+    const overlay = {};
+    let nodeOptionsReason = null;
+    if (process.env.NODE_OPTIONS) {
+      nodeOptionsReason = 'node-options-preserved-parent-defined';
+    } else if (contract && Number.isFinite(contract.heapMb)) {
+      overlay.NODE_OPTIONS = `--max-old-space-size=${contract.heapMb}`;
+    }
+
+    if (contract && contract.admit === false) {
+      // Critical pressure: admission refused. D3 is LOCKED — never refuse
+      // the spawn. Skip the rewrite entirely and run argv byte-identical
+      // rather than hand a zero-worker contract to the planner.
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.codeDir }); } catch { /* MEM008 */ }
+      }
+      appendReverifyResourceEvent(opts.codeDir, opts.gsdDir, 'resource-clamp-skipped', {
+        reason: 'intact:admission-refused-advisory',
+      });
+      return { argv, env: { ...process.env, ...overlay }, handle: null, resourcesMod: null };
+    }
+
+    const plan = rewriteMod.planRewriteArgv(argv, contract, { cwd: opts.codeDir });
+
+    if (plan.outcome !== 'rewritten') {
+      // W5 (non-error intact path): release immediately, argv byte-identical.
+      if (handle) {
+        try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.codeDir }); } catch { /* MEM008 */ }
+      }
+      appendReverifyResourceEvent(opts.codeDir, opts.gsdDir, 'resource-clamp-skipped', {
+        reason: `intact:${plan.reason}`,
+      });
+      return { argv, env: { ...process.env, ...overlay }, handle: null, resourcesMod: null };
+    }
+
+    // `plan.env` holds the NAME=value assignments the adapter split out of
+    // argv (e.g. vitest's NODE_OPTIONS/VITEST_MAX_FORKS) — never re-merged
+    // into argv. A parent-defined NODE_OPTIONS still wins even when the
+    // rewrite embedded its own value.
+    const env = { ...process.env, ...plan.env, ...overlay };
+    if (nodeOptionsReason) env.NODE_OPTIONS = process.env.NODE_OPTIONS;
+
+    appendReverifyResourceEvent(opts.codeDir, opts.gsdDir, 'resource-clamp-applied', {
+      reason: plan.reason,
+      runner: plan.runner,
+      workers: contract.workers,
+      ...(nodeOptionsReason ? { node_options_reason: nodeOptionsReason } : {}),
+    });
+
+    return { argv: plan.argv, env, handle, resourcesMod };
+  } catch {
+    // W5: release-on-error — a lease acquired above MUST be released here
+    // before falling through with the argv byte-identical.
+    if (handle) {
+      try { resourcesMod.releaseCommandBudget(handle, { cwd: opts.codeDir }); } catch { /* MEM008 */ }
+    }
+    return passthrough;
+  }
+}
+
+function releaseReverifyClamp(clamp, codeDir) {
+  if (clamp && clamp.handle && clamp.resourcesMod &&
+      typeof clamp.resourcesMod.releaseCommandBudget === 'function') {
+    try { clamp.resourcesMod.releaseCommandBudget(clamp.handle, { cwd: codeDir }); } catch { /* MEM008 */ }
+  }
+}
+
+function runVerification({ argv, codeDir, timeoutMs, gsdDir, session, requireResources, requireCommandRewrite, spawnPlanFn }) {
   if (!Array.isArray(argv) || !argv.length) return { verdict: 'no-command', command: '', exit_code: null };
-  const planned = spawnPlan(argv);
-  if (!planned) return { verdict: 'no-command', command: commandText(argv), exit_code: null };
-  const run = spawnSync(planned.file, planned.args, {
-    cwd: codeDir,
-    encoding: 'utf8',
-    shell: false,
-    timeout: Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT_MS,
-    maxBuffer: 16 * 1024 * 1024,
-    ...planned.options,
-  });
+  // `spawnPlanFn` is a test-only injection seam (S04 review R5) — production
+  // callers never pass it, so `spawnPlan` (POSIX: never null; win32: null
+  // when the executable can't be resolved) is unchanged for every real
+  // invocation. It exists solely so the `spawnPlan === null` leg of the
+  // verdict table is provable on any host, not just win32.
+  const plan = typeof spawnPlanFn === 'function' ? spawnPlanFn : spawnPlan;
+  const originalPlanned = plan(argv);
+  if (!originalPlanned) return { verdict: 'no-command', command: commandText(argv), exit_code: null };
+
+  // MEM008: any throw anywhere in the clamp path degrades to the exact
+  // pre-wiring argv/spawn, never propagates.
+  let clamp;
+  try {
+    clamp = acquireReverifyClamp(argv, { codeDir, timeoutMs, gsdDir, session, requireResources, requireCommandRewrite });
+  } catch {
+    clamp = { argv, env: null, handle: null, resourcesMod: null };
+  }
+
+  // Windows `.cmd`/`windowsVerbatimArguments` routing must be derived from
+  // the FINAL argv — a rewritten argv (e.g. jest's appended
+  // `--maxWorkers=N`) recomputes spawnPlan; an intact argv (same reference)
+  // reuses the plan already validated above, so that path stays exactly
+  // byte-identical to before this wiring.
+  const rewrote = clamp.argv !== argv;
+  const planned = rewrote ? plan(clamp.argv) : originalPlanned;
+  if (!planned) {
+    releaseReverifyClamp(clamp, codeDir); // W5
+    return { verdict: 'no-command', command: commandText(argv), exit_code: null };
+  }
+
+  let run;
+  try {
+    run = spawnSync(planned.file, planned.args, {
+      cwd: codeDir,
+      encoding: 'utf8',
+      shell: false,
+      timeout: Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+      ...planned.options,
+      ...(clamp.env ? { env: clamp.env } : {}),
+    });
+  } finally {
+    // W5: released on every exit of the spawn — verified, failed, ENOENT,
+    // ETIMEDOUT, or an exception unwinding through this try.
+    releaseReverifyClamp(clamp, codeDir);
+  }
   const base = { command: commandText(argv), exit_code: typeof run.status === 'number' ? run.status : null };
   if (run.error && (run.error.code === 'ENOENT' || run.error.code === 'ETIMEDOUT')) {
     return { ...base, verdict: 'no-command' };
@@ -227,7 +425,7 @@ function reverify({ result, codeDir, gsdDir, mode = 'auto', timeoutMs = DEFAULT_
   }
   const argv = resolveVerifyCommand(codeDir, gsdDir);
   const outcome = argv
-    ? runVerification({ argv, codeDir, timeoutMs })
+    ? runVerification({ argv, codeDir, timeoutMs, gsdDir })
     : { verdict: 'no-command', command: '', exit_code: null };
   outcome.entries = affectedEntries(result).length;
   if (apply) applyVerdict(result, outcome);
@@ -284,4 +482,6 @@ module.exports = {
   hasDivergentCommandNotes,
   // Exported for the platform-routing regression guard only.
   spawnPlan, resolveExecutable,
+  // Exported for the resource-clamp test suite (S04/T03) only.
+  acquireReverifyClamp, releaseReverifyClamp,
 };

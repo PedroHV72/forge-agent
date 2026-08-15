@@ -52,15 +52,15 @@ function assert(cond, msg) {
   if (!cond) throw new Error(msg || 'assertion failed');
 }
 
-const swift = fs.readFileSync(markerSwift, 'utf8');
+const swift = fs.readFileSync(markerSwift, 'utf8').replace(/\r\n?/g, '\n'); // Form A/funnel (S03-FIXSET.json), read-only, /\r\n?/g not /\r\n/g (T-20260811190103)
 
 /** Extract the string literals of `public static let workEntries: [String] = [...]`. */
 function swiftWorkEntries(src) {
-  const m = src.match(/public static let workEntries: \[String\] = \[([\s\S]*?)\n {4}\]/);
+  const m = src.match(/public static let workEntries: \[String\] = \[([\s\S]*?)\r?\n {4}\]/);
   if (!m) throw new Error('workEntries não encontrado em ProjectMarker.swift');
   // Strip // comments before harvesting literals, so a name mentioned in prose
   // is never mistaken for an entry.
-  const body = m[1].split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+  const body = m[1].split(/\r?\n/).map(l => l.replace(/\/\/.*$/, '')).join('\n');
   return [...body.matchAll(/"([^"]+)"/g)].map(x => x[1]);
 }
 
@@ -166,7 +166,7 @@ const gitCoreSrc = fs.readFileSync(gitCoreSwift, 'utf8');
 
 /** Drop `//` comments so prose is never harvested as a literal. */
 function stripLineComments(text) {
-  return text.split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+  return text.split(/\r?\n/).map(l => l.replace(/\/\/.*$/, '')).join('\n');
 }
 
 function setDiff(a, b) {
@@ -318,7 +318,7 @@ function compareRoots(swiftSrc, jsRoots) {
 
 /** Body of `public enum ProjectRole … { … }`, comments stripped. */
 function projectRoleBody(swiftSrc) {
-  const m = swiftSrc.match(/public enum ProjectRole:[^{]*\{([\s\S]*?)\n\}/);
+  const m = swiftSrc.match(/public enum ProjectRole:[^{]*\{([\s\S]*?)\r?\n\}/);
   if (!m) throw new Error('enum ProjectRole não encontrado em ProjectMarker.swift — regex quebrou?');
   return stripLineComments(m[1]);
 }
@@ -555,7 +555,12 @@ function swiftDefaultCandidates(swiftSrc) {
 
 /** The same ordered names as spelled in `gitDefaultBranch()`'s own source. */
 function jsDefaultCandidates() {
-  const src = fs.readFileSync(path.join(repoRoot, 'scripts/forge-isolation.js'), 'utf8');
+  // Form A/funnel (S03-FIXSET.json): forge-isolation.js may be checked out
+  // CRLF on Windows; normalize once at the read so the `\n}` scope
+  // terminator below always finds its LF. `/\r\n?/g`, never `/\r\n/g` — a
+  // lone CR degrades identically (measured, T-20260811190103).
+  const src = fs.readFileSync(path.join(repoRoot, 'scripts/forge-isolation.js'), 'utf8')
+    .replace(/\r\n?/g, '\n');
   const i = src.indexOf('function gitDefaultBranch(');
   if (i < 0) throw new Error('gitDefaultBranch() sumiu de forge-isolation.js');
   const body = stripLineComments(src.slice(i, src.indexOf('\n}', i)));
@@ -577,9 +582,11 @@ function compareDefaultCandidates(swiftSrc, jsNames) {
 /** Throwaway repo in tmp. Never touches the operator's repos. */
 function tmpRepo(tag, init) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-gitdef-${tag}-`));
-  const git = (...args) => execFileSync('/usr/bin/git', ['-C', dir, ...args],
+  // `git` resolvido pelo PATH, nunca um caminho POSIX absoluto: `/usr/bin/git`
+  // não existe no Windows e derrubava esta suíte inteira com ENOENT no CI.
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args],
                                         { stdio: 'ignore' });
-  execFileSync('/usr/bin/git', ['init', '-q', '-b', init, dir], { stdio: 'ignore' });
+  execFileSync('git', ['init', '-q', '-b', init, dir], { stdio: 'ignore' });
   git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
   fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
   git('add', 'a.txt'); git('commit', '-qm', 'x');

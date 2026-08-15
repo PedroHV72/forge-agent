@@ -29,6 +29,15 @@ const projectsPath = path.join(appSourcesDir, 'Forge', 'Projects.swift');
 const forgeKitItemsPath = path.join(appSourcesDir, 'ForgeKit', 'Items.swift');
 const previewsPath = path.join(appSourcesDir, 'Forge', 'Previews.swift');
 
+// Form A/funnel (S03-FIXSET.json): the .swift sources this suite parses may
+// be checked out CRLF (or a lone-CR remnant) on Windows. Every reader below
+// funnels through this one normalization point so downstream `\n`-anchored
+// regex/split never sees a CR — `/\r\n?/g`, never `/\r\n/g` (a lone CR
+// degrades identically, measured in T-20260811190103).
+function readNormalized(filePath) {
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n?/g, '\n');
+}
+
 let passed = 0;
 let failed = 0;
 function check(name, fn) {
@@ -66,11 +75,11 @@ function stripLineComments(line) {
 // `stripLineComments` opera linha a linha; para varrer um corpo inteiro de
 // struct precisamos da versao multi-linha.
 function stripAllComments(source) {
-  return source.split('\n').map(stripLineComments).join('\n');
+  return source.split(/\r?\n/).map(stripLineComments).join('\n');
 }
 
 function readLines(filePath) {
-  return fs.readFileSync(filePath, 'utf8').split('\n');
+  return readNormalized(filePath).split('\n');
 }
 
 function findForbiddenPattern(filePath, pattern) {
@@ -233,7 +242,7 @@ check('guard actually bites — a real (non-comment) above-baseline API is detec
 // element vanished from the card itself.
 
 function itemCardBody() {
-  const src = fs.readFileSync(itemsViewPath, 'utf8');
+  const src = readNormalized(itemsViewPath);
   const m = src.match(/struct\s+ItemCard\s*:[\s\S]*?\n\}\n/);
   assert(m, 'could not locate the ItemCard struct body in ItemsView.swift');
   return m[0];
@@ -262,7 +271,7 @@ check('ItemCard draws the title (ItemCardPresentation.displayTitle)', () => {
 // destino (sheet e/ou tooltip).
 
 function itemDetailSheetBody() {
-  const src = fs.readFileSync(itemsViewPath, 'utf8');
+  const src = readNormalized(itemsViewPath);
   const m = src.match(/struct\s+ItemDetailSheet\s*:[\s\S]*?\n\}\n/);
   assert(m, 'could not locate the ItemDetailSheet struct body in ItemsView.swift');
   return m[0];
@@ -316,7 +325,7 @@ check('a expansão exige DWELL, não hover cru', () => {
 });
 
 check('os ícones de ação têm caixa fixa — nenhum fica maior por ter glifo mais largo', () => {
-  const src = fs.readFileSync(itemsViewPath, 'utf8');
+  const src = readNormalized(itemsViewPath);
   const m = src.match(/struct\s+IconAction[\s\S]*?\n\}\n/);
   assert(m, 'não encontrei a struct IconAction — o wrapper dos ícones de ação sumiu');
   const body = stripAllComments(m[0]);
@@ -455,7 +464,7 @@ check('ItemsView.swift wires ItemDetailSheet via .sheet(item:', () => {
 });
 
 check('ItemDetailSheet body renders the whole item.body, not bodyPreview', () => {
-  const src = fs.readFileSync(itemsViewPath, 'utf8');
+  const src = readNormalized(itemsViewPath);
   const structMatch = src.match(/struct\s+ItemDetailSheet\s*:[\s\S]*?\n\}\n/);
   assert(structMatch, 'could not locate the ItemDetailSheet struct body in ItemsView.swift');
   const body = structMatch[0];
@@ -488,7 +497,7 @@ check('guard actually bites — bodyPreview inside ItemDetailSheet would be caug
 // culprit (D-S05-2, LOCKED).
 
 function itemsViewBody() {
-  const src = fs.readFileSync(itemsViewPath, 'utf8');
+  const src = readNormalized(itemsViewPath);
   const m = src.match(/struct\s+ItemsView\s*:[\s\S]*?\n\}\n/);
   assert(m, 'could not locate the ItemsView struct body in ItemsView.swift');
   return m[0];

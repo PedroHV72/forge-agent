@@ -1234,8 +1234,18 @@ test('R2: --watch child process exits cleanly on SIGINT', () => {
   }
   const { dir } = makeFixture({ runs: [{ id: 'M-20260101120000-alpha', startedAt: 1000 }] });
   const nodeBin = process.execPath;
-  const script = `"${nodeBin}" "${CLI_PATH}" --watch=0.5 --cwd "${dir}" >/dev/null 2>&1 & pid=$!; sleep 0.2; kill -INT $pid; wait $pid; echo "EXIT:$?"`;
+  const outFile = path.join(dir, '.watch-out.txt');
+  // R2 fix: wait for an OBSERVABLE READINESS SIGNAL from the child (first
+  // frame's output containing "refresh #1"), not for a fixed clock duration.
+  // This only proves handler installation because forge-status.js registers
+  // the SIGINT handler BEFORE the first frame() call (see runWatch) — so
+  // "output observed" implies "handler installed". A poll loop with its own
+  // named-reason ceiling (READY_TIMEOUT) replaces the sleep 0.2 gamble: if
+  // the child never signals readiness, the test fails saying so explicitly,
+  // never via spawnSync's mute res.signal/timeout diagnostic.
+  const script = `"${nodeBin}" "${CLI_PATH}" --watch=0.5 --cwd "${dir}" >"${outFile}" 2>&1 & pid=$!; i=0; while ! grep -q "refresh #1" "${outFile}" 2>/dev/null; do i=$((i+1)); if [ "$i" -ge 150 ]; then echo READY_TIMEOUT; kill -INT "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; exit 0; fi; sleep 0.02; done; kill -INT "$pid"; wait "$pid"; echo "EXIT:$?"`;
   const res = spawnSync('/bin/sh', ['-c', script], { encoding: 'utf8', timeout: 8000 });
+  assert(!/READY_TIMEOUT/.test(res.stdout || ''), `child never signaled readiness (no "refresh #1" observed within ceiling) — stdout: ${res.stdout}\nstderr: ${res.stderr}`);
   const m = (res.stdout || '').match(/EXIT:(\d+)/);
   assert(m, `expected EXIT:<code> marker in stdout, got: ${res.stdout}\nstderr: ${res.stderr}`);
   assertEq(m[1], '0', 'child exited with code 0 after SIGINT');

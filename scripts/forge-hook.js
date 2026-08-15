@@ -34,6 +34,34 @@ try {
   } catch { runs = null; filelock = null; }
 }
 
+// ── Evidence-path module (S01/T01) — same dev/installed dual-path resolution ──
+// Owner of the evidence file-name shape and of the NAMED axis sentinels. A
+// partial install must stay fail-open (MEM008): a null module falls back to the
+// literal sentinel values at the single call site that needs them, so the hook
+// never throws on a user's tool-call path.
+let evidencePath = null;
+try { evidencePath = require(path.join(__dirname, 'scripts', 'forge-evidence-path.js')); }
+catch {
+  try { evidencePath = require(path.join(__dirname, 'forge-evidence-path.js')); }
+  catch { evidencePath = null; }
+}
+
+// ── Workspace module (S01/T06) — same dev/installed dual-path resolution ──
+// `resolveOwner` is the ONLY tree-walk for `.gsd` this repo allows (Standards).
+// Loader is narrowed like the schema-guard precedent (forge-decisions.js /
+// forge-ledger.js / forge-memory.js / forge-projection.js): a MODULE_NOT_FOUND
+// naming this module itself is a legitimate "not colocated in this install
+// layout" fail-open; anything else (a real init fault) is a fault this hook
+// still must never crash on (MEM008), so it is swallowed too but never mistaken
+// for "the module tried and lied" — resolveOwnerDir() below treats a null
+// workspaceMod as "no owner resolvable", same as resolveOwner() returning null.
+let workspaceMod = null;
+try { workspaceMod = require(path.join(__dirname, 'scripts', 'forge-workspace.js')); }
+catch (err1) {
+  try { workspaceMod = require(path.join(__dirname, 'forge-workspace.js')); }
+  catch (err2) { workspaceMod = null; }
+}
+
 // ── Resolve context-monitor module — same dev/installed pattern ──
 let ctxMonitor = null;
 try {
@@ -163,24 +191,96 @@ const bumpHeartbeat = (cwd, sessionId) => {
   } catch { /* no auto mode or unreadable — ignore */ }
 };
 
+// Resolve the directory that OWNS this hook fire — never the raw cwd.
+//
+// Two-degree ladder (S01/T06), each degree named:
+//   1. resolveOwner(cwd, {stopAt: os.homedir()}) — the sole `.gsd` tree-walk
+//      this repo allows (forge-workspace.js:150). Handles the plain case: cwd
+//      is the workspace, or a subdirectory of it.
+//   2. RunRecord.cwd via resolveRunForSession — handles worktree isolation,
+//      where the CWD the worker actually runs in (CODE_DIR) has NO `.gsd` in
+//      any ancestor (measured 2026-08-14: classify() returns 'none' for every
+//      ancestor up to stopAt), but the run that dispatched it recorded the
+//      ORIGINAL workspace in `cwd` at registration (forge-runs.js `add()`:
+//      `cwd: record.cwd || cwd`). `r.root`/`r.project` are NOT used here —
+//      measured null on the live run this task was executed under (additive
+//      fields, not populated by this milestone).
+//
+// Neither degree found → null. Caller MUST treat null as "do not write,
+// do not mkdirSync" — never as "create one here" (same contract resolveOwner
+// itself documents).
+const resolveOwnerDir = (cwd, sessionId) => {
+  if (workspaceMod && typeof workspaceMod.resolveOwner === 'function') {
+    try {
+      const owner = workspaceMod.resolveOwner(cwd, { stopAt: os.homedir() });
+      if (owner) return owner;
+    } catch { /* fall through to the RunRecord degree */ }
+  }
+  const r = resolveRunForSession(cwd, sessionId);
+  // Security (T06-SECURITY.md, Input Validation blocker 3): `r.cwd` is DATA
+  // read from a RunRecord file, not a trusted constant. A record hand-edited
+  // or corrupted to carry a bogus `cwd` must not become a NEW directory this
+  // hook writes into — it is accepted only when it independently classifies
+  // as a real project (`isProject`, same WORK_ENTRIES predicate `resolveOwner`
+  // itself uses). Anything else → null, never "create one here".
+  if (r && typeof r.cwd === 'string' && r.cwd) {
+    if (workspaceMod && typeof workspaceMod.isProject === 'function') {
+      try {
+        if (workspaceMod.isProject(r.cwd)) return r.cwd;
+        return null;
+      } catch { return null; }
+    }
+    // workspaceMod unavailable — cannot validate r.cwd, so it cannot be
+    // trusted either (MEM008 silent-fail still holds: exit 0, just no write).
+    return null;
+  }
+  return null;
+};
+
 // Resolve unit context for evidence file naming.
-// Multi-run path: { runId, unitId, kind } from run.worker via session_id resolution.
-// Legacy fallback: { runId: null, unitId, kind: null } from auto-mode.json worker.
+//
+// Returns the THREE axes `{ milestone, slice, unit }` (S01/T02) alongside the
+// pre-existing `{ runId, unitId, kind }` — the old fields are kept verbatim so
+// the current file-name call site (:744) keeps working byte-for-byte until T03
+// adopts the composite key. Only the RETURN CONTRACT widens here.
+//
+// An absent milestone/slice axis resolves to the NAMED sentinel exported by
+// forge-evidence-path.js — never `''`. An empty axis spliced into a name
+// produces `evidence--T01.jsonl`, which re-opens exactly the parse ambiguity
+// T01 closed.
+//
+// Both paths (resolved run record, and the auto-mode.json legacy fallback)
+// return all three axes; the fallback has no milestone axis to read from the
+// alias, so it names that absence instead of inventing one.
 const resolveUnitContext = (cwd, sessionId) => {
+  const NO_MS = (evidencePath && evidencePath.SENTINEL_NO_MILESTONE) || '_no-milestone_';
+  const NO_SL = (evidencePath && evidencePath.SENTINEL_NO_SLICE) || '_no-slice_';
   const r = resolveRunForSession(cwd, sessionId);
   if (r) {
     const unit = (r.worker || '').split('/')[1] || 'adhoc';
-    return { runId: r.id, unitId: unit, kind: r.kind };
+    // Only a milestone-kind run's id IS a milestone id. A task run's id is a
+    // task id — naming it "milestone" would be a fabricated axis.
+    const milestone = r.kind === 'milestone' && r.id ? r.id : NO_MS;
+    const slice = r.worker_slice ? r.worker_slice : NO_SL;
+    return { runId: r.id, unitId: unit, kind: r.kind, milestone, slice, unit };
   }
   try {
     const autoFile = path.join(cwd, '.gsd', 'forge', 'auto-mode.json');
     const auto = JSON.parse(fs.readFileSync(autoFile, 'utf8'));
     if (auto && typeof auto.worker === 'string' && auto.worker.length > 0) {
       const parts = auto.worker.split('/');
-      return { runId: null, unitId: parts.length === 2 ? parts[1] : 'adhoc', kind: null };
+      const unit = parts.length === 2 ? parts[1] : 'adhoc';
+      return {
+        runId: null,
+        unitId: unit,
+        kind: null,
+        milestone: NO_MS,
+        slice: auto.worker_slice ? auto.worker_slice : NO_SL,
+        unit,
+      };
     }
   } catch { /* no auto-mode / unreadable → adhoc */ }
-  return { runId: null, unitId: 'adhoc', kind: null };
+  return { runId: null, unitId: 'adhoc', kind: null, milestone: NO_MS, slice: NO_SL, unit: 'adhoc' };
 };
 
 // Read forge_isolation.file_locks pref (default true). Returns boolean.
@@ -210,6 +310,62 @@ const truncate = (s, max) => {
   if (typeof s !== 'string') return '';
   return s.length <= max ? s : s.slice(0, max) + '…';
 };
+
+// ── S03/T03: PreToolUse Bash command-rewrite branch helpers ────────────────
+// (`forge-command-rewrite.js` + `forge-resources.js` lazy-required below, dual
+// dev/installed path — same idiom as `runs`/`filelock` at the top of the
+// file.) Kept as small standalone helpers so the branch body reads linearly.
+
+// Dual-path lazy require: dev (sibling under scripts/) then installed
+// (~/.claude/<name>). Returns null (never throws) on total absence — an
+// absent module means the branch is inert (T01 key_links contract).
+function requireDualPath(name) {
+  try { return require(path.join(__dirname, 'scripts', name)); }
+  catch {
+    try { return require(path.join(__dirname, name)); }
+    catch { return null; }
+  }
+}
+
+// Test-only counting shim (B1 proof). Inert unless FORGE_REWRITE_TEST_COUNTERS
+// is set — never touched in production. Each call appends one line naming the
+// stage reached, so a test can assert ZERO lines were written for a
+// non-candidate command (the lexical gate short-circuited before any of
+// these fs/pool/resolver checkpoints ran).
+function recordRewriteStage(stage) {
+  const counterFile = process.env.FORGE_REWRITE_TEST_COUNTERS;
+  if (!counterFile) return;
+  try { fs.appendFileSync(counterFile, stage + '\n', 'utf8'); } catch { /* MEM008 */ }
+}
+
+// Test-only fault injection (B2 proof). FORGE_REWRITE_FAULT names the stage
+// ('tokenizer'|'resolver'|'pool'|'emission') to synthetically fail at — a
+// seam honored ONLY under this env var, same pattern as
+// FORGE_RESOURCES_PRESSURE (S01) / the fixedNow clock injection (S02).
+// Production never sets this var, so the throws below never fire outside a
+// test process.
+function rewriteFaultStage() {
+  return process.env.FORGE_REWRITE_FAULT || '';
+}
+
+// Bridge file path — grant persisted so the PostToolUse Bash branch can
+// release the lease it took here (W5). Keyed by session_id so concurrent
+// sessions on the same box never collide.
+function rewriteBridgePath(sessionId) {
+  return path.join(os.tmpdir(), `forge-rewrite-grant-${sanitizeRunId(sessionId || 'nosession')}.json`);
+}
+
+// Best-effort append to .gsd/forge/events.jsonl — same append idiom as
+// appendPrefsBlockedEvent above. Never throws (MEM008); silently a no-op if
+// the repo has no .gsd/forge yet.
+function appendRewriteEvent(cwd, eventName, fields) {
+  try {
+    const forgeDir = path.join(cwd, '.gsd', 'forge');
+    if (!fs.existsSync(forgeDir)) return;
+    const event = Object.assign({ ts: new Date().toISOString(), event: eventName }, fields || {});
+    fs.appendFileSync(path.join(forgeDir, 'events.jsonl'), JSON.stringify(event) + '\n', 'utf8');
+  } catch { /* MEM008 */ }
+}
 
 // Forge workers below have a machine-readable return contract consumed by the
 // orchestration skills.  Claude Code's SubagentStop hook can repair a missing
@@ -377,6 +533,13 @@ const buildSchemaWarning = (res) => {
     'Rode /forge-update ou /forge-doctor --fix --migrate antes de fechar milestone.',
   ].join('\n');
 };
+
+// Testability seam (S01/T02): the hook is a CLI first — `require`-ing it must
+// NOT wire stdin (a listener that never sees `end` would hang the requiring
+// process). Exporting resolveUnitContext lets its three-axis contract be
+// exercised directly instead of asserted through a spawned hook fire.
+module.exports = { resolveUnitContext, sanitizeRunId, resolveRunForSession, resolveOwnerDir };
+if (require.main !== module) return;
 
 process.stdin.setEncoding('utf8');
 let raw = '';
@@ -725,6 +888,135 @@ process.stdin.on('end', () => {
         }
       }
 
+      // ── Command-rewrite branch (S03/T03) ───────────────────────────────────
+      // Runs only when nothing above blocked the command (guard ordering,
+      // T03 truth #1: a blocked command is NEVER rewritten). B1: the lexical
+      // gate (`looksLikeRunnerCommand`, pure string, zero I/O) short-circuits
+      // BEFORE any fs/spawnSync/prefs/pool/resolver work — the resolver
+      // module isn't even required for a non-candidate command. B2/MEM008:
+      // this entire branch is wrapped so ANY exception at ANY stage
+      // (tokenizer, resolver, pool acquire, emission serialization) falls
+      // through with the command byte-identical, hook exit 0, no stdout
+      // rewrite emission — this branch blocks NOTHING, ever (unlike the
+      // guards above, which `exit(2)`). This branch NEVER emits
+      // `permissionDecision` — T02 measured `updatedInput` is honored
+      // without it in the headless path `forge-hook.js` runs in
+      // (T02-SUMMARY Answer 1), so the permission-widening hazard (S03-PLAN
+      // Notes) never arises: no chain segment is ever auto-allowed here.
+      if (!blockMessage && toolName === 'Bash') {
+        try {
+          const cmd = toolInput.command || '';
+          const rewriteMod = requireDualPath('forge-command-rewrite.js');
+          if (rewriteMod && typeof rewriteMod.looksLikeRunnerCommand === 'function') {
+            const fault = rewriteFaultStage();
+            const isCandidate = rewriteMod.looksLikeRunnerCommand(cmd);
+            // Synthetic tokenizer-stage fault (test-only, B2 proof) — thrown
+            // AFTER the real (successful) gate call, simulating a tokenizer
+            // failure downstream of the pure check without touching T01's
+            // module. Never reachable without FORGE_REWRITE_FAULT set.
+            if (fault === 'tokenizer') throw new Error('forced-fault:tokenizer');
+            if (isCandidate) {
+              let acquiredHandle = null;
+              let resourcesMod = null;
+              try {
+                recordRewriteStage('resolver-require');
+                resourcesMod = requireDualPath('forge-resources.js');
+                if (fault === 'resolver') throw new Error('forced-fault:resolver');
+                if (resourcesMod && typeof resourcesMod.acquireCommandBudget === 'function') {
+                  recordRewriteStage('resolver-acquire');
+                  // TTL derives from tool_input.timeout per S02's
+                  // deriveSlotTtlMs contract (forge-resource-pool.js) — this
+                  // branch performs zero sizing math itself (D10).
+                  const contract = resourcesMod.acquireCommandBudget({
+                    cwd,
+                    commandTimeoutMs: toolInput.timeout,
+                    session: sessionId,
+                  });
+                  if (contract && contract.pool && contract.pool.handle &&
+                      Array.isArray(contract.pool.handle.slots) && contract.pool.handle.slots.length) {
+                    acquiredHandle = contract.pool.handle;
+                  }
+                  if (fault === 'pool') throw new Error('forced-fault:pool');
+
+                  if (contract && contract.enforcement === 'off') {
+                    // `resources.enforcement: off` (S06/T03) — same bypass as
+                    // forge-verify.js / forge-reverify.js. Releases the lease
+                    // (W5) and returns WITHOUT writing the `updatedInput`
+                    // stdout payload, so the executor's command passes
+                    // through byte-identical. FAIL-SAFE: only the exact
+                    // string `off` bypasses; any other value leaves the
+                    // rewrite ON. D10: reads, never derives.
+                    if (acquiredHandle) {
+                      try {
+                        recordRewriteStage('release-enforcement-off');
+                        resourcesMod.releaseCommandBudget(acquiredHandle, { cwd });
+                      } catch { /* MEM008 */ }
+                    }
+                    appendRewriteEvent(cwd, 'rewrite-skipped', { reason: 'intact:enforcement-off' });
+                    return;
+                  }
+
+                  const plan = rewriteMod.planRewrite(cmd, contract, { cwd });
+                  if (plan.outcome === 'rewritten') {
+                    if (fault === 'emission') throw new Error('forced-fault:emission');
+                    if (acquiredHandle) {
+                      const cmdHash = require('crypto').createHash('sha256').update(plan.command).digest('hex');
+                      try {
+                        recordRewriteStage('bridge-write');
+                        fs.writeFileSync(rewriteBridgePath(sessionId), JSON.stringify({
+                          cmdHash,
+                          grant: acquiredHandle,
+                          ts: Date.now(),
+                        }), 'utf8');
+                      } catch { /* MEM008 — bridge write is best-effort */ }
+                    }
+                    appendRewriteEvent(cwd, 'rewrite-applied', {
+                      runner: plan.runner,
+                      workers: contract.workers,
+                      heapMb: contract.heapMb,
+                    });
+                    // Single-stdout invariant: this is the ONLY stdout write
+                    // of the pre invocation on this path. No
+                    // permissionDecision field (see comment above the
+                    // branch).
+                    process.stdout.write(JSON.stringify({
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse',
+                        updatedInput: { command: plan.command },
+                      },
+                    }));
+                    return;
+                  }
+                  // outcome === 'intact': release any lease taken above
+                  // immediately (W5 — non-error intact path).
+                  if (acquiredHandle) {
+                    try {
+                      recordRewriteStage('release-intact');
+                      resourcesMod.releaseCommandBudget(acquiredHandle, { cwd });
+                    } catch { /* MEM008 */ }
+                  }
+                  appendRewriteEvent(cwd, 'rewrite-skipped', { reason: plan.reason });
+                }
+              } catch (innerErr) {
+                // W5: release-on-error — a lease acquired above MUST be
+                // released here, BEFORE falling through with the command
+                // intact. Never re-throw; the outer catch would still
+                // degrade safely, but releasing here (not there) is what
+                // the leaked-lease test asserts against.
+                if (acquiredHandle && resourcesMod && typeof resourcesMod.releaseCommandBudget === 'function') {
+                  try {
+                    recordRewriteStage('release-error');
+                    resourcesMod.releaseCommandBudget(acquiredHandle, { cwd });
+                  } catch { /* MEM008 */ }
+                }
+                // Fall through — command proceeds byte-identical, no stdout
+                // rewrite emission (B2).
+              }
+            }
+          }
+        } catch { /* MEM008 — top-level guard: command proceeds byte-identical */ }
+      }
+
       if (blockMessage) {
         process.stdout.write(blockMessage + '\n');
         process.exit(2);
@@ -732,17 +1024,35 @@ process.stdin.on('end', () => {
     }
 
     // ── PostToolUse: evidence capture (Bash/Write/Edit only) ─────────────────
-    // M004: file is evidence-{runId}-{unitId}.jsonl when session resolves to a run.
-    // Legacy: evidence-{unitId}.jsonl when no run resolution possible.
+    // S01/T03: file name is owned by forge-evidence-path.js's composite key
+    // (milestone~slice~unit), built from the three axes resolveUnitContext
+    // (S01/T02) now returns. `evidencePath` is the same lazy/tolerant
+    // require used by every sibling module in this file — module missing →
+    // this branch degrades to the legacy bare/adhoc name and NEVER aborts
+    // the tool call (MEM008).
+    //
+    // S01/T06: the OWNER is resolved BEFORE the unit — never the raw cwd.
+    // Without this order the branch below can `mkdirSync` a fresh `.gsd/` at
+    // whatever directory the shell happened to be anchored in (the SVN/WDMA
+    // orphans this task closes). When no owner resolves, `mkdirSync` is
+    // UNREACHABLE: the whole branch returns instead — never "create one here".
     if (phase === 'post' && (toolName === 'Bash' || toolName === 'Write' || toolName === 'Edit')) {
       try {
         const mode = readEvidenceMode(cwd);
-        if (mode !== 'disabled') {
-          const ctx = resolveUnitContext(cwd, sessionId);
-          const evidenceDir  = path.join(cwd, '.gsd', 'forge');
-          const fileSlug = ctx.runId
-            ? `evidence-${sanitizeRunId(ctx.runId)}-${ctx.unitId}.jsonl`
-            : `evidence-${ctx.unitId}.jsonl`;
+        // No owner resolvable → skip entirely. `mkdirSync` below is UNREACHABLE
+        // in that case, not merely unlikely — never "create one here" (a bare
+        // `return` here would also skip the unrelated phase==='post' blocks
+        // below, e.g. the context monitor, so the guard is an `if`, not a
+        // short-circuit return).
+        const ownerDir = mode !== 'disabled' ? resolveOwnerDir(cwd, sessionId) : null;
+        if (mode !== 'disabled' && ownerDir) {
+          const ctx = resolveUnitContext(ownerDir, sessionId);
+          const evidenceDir  = path.join(ownerDir, '.gsd', 'forge');
+          const fileSlug = evidencePath && typeof evidencePath.buildEvidenceFileName === 'function'
+            ? evidencePath.buildEvidenceFileName({ milestone: ctx.milestone, slice: ctx.slice, unit: ctx.unit })
+            : (ctx.runId
+                ? `evidence-${sanitizeRunId(ctx.runId)}-${ctx.unitId}.jsonl`
+                : `evidence-${ctx.unitId}.jsonl`);
           const evidenceFile = path.join(evidenceDir, fileSlug);
 
           const toolResponse = data.tool_response || {};
@@ -770,6 +1080,31 @@ process.stdin.on('end', () => {
           fs.appendFileSync(evidenceFile, serialized + '\n', 'utf8');
         }
       } catch { /* silent-fail — hook must never crash Claude Code (MEM008) */ }
+    }
+
+    // ── PostToolUse: release the command-rewrite bridge (S03/T03, W5) ──────
+    // If a Pre invocation rewrote this command it left a bridge keyed by
+    // session_id with the sha256 of the REWRITTEN command. Match here means
+    // Claude actually ran the rewritten command (releasing the lease it
+    // consumed). A mismatch — or no bridge at all — means either this isn't
+    // a rewrite candidate, or Claude ignored the rewrite (T02 Q3 case): left
+    // untouched for TTL reap, never counted as a release success.
+    if (phase === 'post' && toolName === 'Bash') {
+      try {
+        const bridgePath = rewriteBridgePath(sessionId);
+        const bridgeRaw = fs.readFileSync(bridgePath, 'utf8');
+        const bridge = JSON.parse(bridgeRaw);
+        const executedHash = require('crypto').createHash('sha256').update(toolInput.command || '').digest('hex');
+        if (bridge && bridge.cmdHash === executedHash) {
+          const resourcesMod = requireDualPath('forge-resources.js');
+          if (resourcesMod && typeof resourcesMod.releaseCommandBudget === 'function') {
+            resourcesMod.releaseCommandBudget(bridge.grant, { cwd });
+          }
+          try { fs.unlinkSync(bridgePath); } catch { /* MEM008 */ }
+        }
+        // Mismatch: leave the bridge in place for TTL reap — do not delete,
+        // do not release (the rewritten command never actually ran).
+      } catch { /* no bridge, unreadable, or release failure — MEM008 no-op */ }
     }
 
     // ── PostToolUse: proactive context monitor (writes additionalContext, never blocks) ──

@@ -6100,8 +6100,18 @@ test("Git.baseline: estar NA padrão não gasta processo nenhum, e é um fato pr
 }
 
 test("Git.status enche a divergência da padrão junto — este repo, medido de verdade") {
-    // Ponta a ponta, no disco do operador. `feat/projects-screen-richer` está 5
-    // à frente de master e sem upstream; os dois fatos convivem no mesmo card.
+    // Ponta a ponta, no disco do operador — mas afirmando SÓ o que independe
+    // de onde o operador está parado.
+    //
+    // A versão anterior terminava com `if !onDefault { assertTrue(ahead > 0) }`,
+    // que não é uma afirmação sobre o código: é uma afirmação sobre o hábito de
+    // trabalho de quem roda a suíte. Um branch recém-criado tem legitimamente
+    // zero commits à frente, então a suíte falhava de forma 100% determinística
+    // no primeiro `git checkout -b` — medido: falha na hora, passa depois do
+    // primeiro commit. Entrou no item I-20260814142227 como "flaky sensível a
+    // contenção"; não é contenção nenhuma, é um assert observando uma
+    // superfície viva que o teste não controla (a posição do branch do
+    // operador). Mesma família, causa diferente.
     let repo = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent().deletingLastPathComponent().path
@@ -6113,9 +6123,57 @@ test("Git.status enche a divergência da padrão junto — este repo, medido de 
     }
     assertEqual(b.defaultBranch, "master")
     assertEqual(b.onDefault, snap.branch == "master")
-    if !b.onDefault {
-        assertTrue(b.ahead > 0, "um branch de trabalho sem nada à frente da master é suspeito")
+    // Divergência é contagem: nunca negativa, e zero-zero quando se está NA padrão.
+    assertTrue(b.ahead >= 0 && b.behind >= 0, "divergência negativa: \(b.ahead)/\(b.behind)")
+    if b.onDefault { assertEqual(b.ahead, 0); assertEqual(b.behind, 0) }
+}
+
+test("Git.status mede a divergência EXATA num repo sintético — o número, não o sinal") {
+    // O que o teste acima perdeu ao parar de afirmar sobre o branch do
+    // operador, este devolve com juros: um repo construído com uma divergência
+    // CONHECIDA, então a asserção é sobre o número exato em vez de `> 0`.
+    // Determinístico, e sem depender de nada fora do tmpdir.
+    let repo = gitTmpDir("divergencia-exata")
+    defer { try? FileManager.default.removeItem(atPath: repo) }
+    fixtureGit(["init", "-q", "-b", "main"], at: repo)
+    fixtureGit(["config", "user.email", "t@example.com"], at: repo)
+    fixtureGit(["config", "user.name", "T"], at: repo)
+    fixtureWrite("base", to: repo + "/a.txt")
+    fixtureGit(["add", "."], at: repo)
+    fixtureGit(["commit", "-qm", "base"], at: repo)
+
+    // Na padrão: zero-zero, e `onDefault` é um fato próprio.
+    guard let naPadrao = Git.status(at: repo).snapshot?.baseline?.state else {
+        return assertTrue(false, "não mediu a padrão no repo sintético")
     }
+    assertEqual(naPadrao.defaultBranch, "main")
+    assertTrue(naPadrao.onDefault)
+    assertEqual(naPadrao.ahead, 0); assertEqual(naPadrao.behind, 0)
+
+    // Dois commits à frente, nenhum atrás — números escolhidos, não observados.
+    fixtureGit(["checkout", "-q", "-b", "trabalho"], at: repo)
+    for n in 1...2 {
+        fixtureWrite("c\(n)", to: repo + "/c\(n).txt")
+        fixtureGit(["add", "."], at: repo)
+        fixtureGit(["commit", "-qm", "c\(n)"], at: repo)
+    }
+    guard let divergiu = Git.status(at: repo).snapshot?.baseline?.state else {
+        return assertTrue(false, "não mediu a divergência no repo sintético")
+    }
+    assertEqual(divergiu.defaultBranch, "main")
+    assertFalse(divergiu.onDefault)
+    assertEqual(divergiu.ahead, 2, "à frente medido")
+    assertEqual(divergiu.behind, 0, "atrás medido")
+
+    // Controle positivo: um branch SEM nada à frente é legítimo e mensurável —
+    // exatamente o estado que o assert antigo chamava de "suspeito".
+    fixtureGit(["checkout", "-q", "-b", "recem-criado", "main"], at: repo)
+    guard let zero = Git.status(at: repo).snapshot?.baseline?.state else {
+        return assertTrue(false, "não mediu um branch recém-criado")
+    }
+    assertFalse(zero.onDefault, "não está na padrão")
+    assertEqual(zero.ahead, 0, "um branch recém-criado tem zero à frente — e isso é normal")
+    assertEqual(zero.behind, 0)
 }
 
 // MARK: - Marcas vendorizadas: todo nome desenha, e nenhuma marca é um palpite

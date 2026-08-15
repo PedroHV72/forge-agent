@@ -361,6 +361,29 @@ Execução paralela de execute-task dentro do mesmo slice + comportamento em ove
 - **Valores permitidos:** `defer`, `block`
 - **Descrição:** Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff).
 
+## resources
+
+Controle de recursos sob pressão do host — dimensionamento de concorrência e espera sob pressão crítica (D2/D3).
+
+### `resources.enforcement`
+
+- **Tipo:** string
+- **Default:** `"clamp"`
+- **Valores permitidos:** `off`, `clamp`, `full`
+- **Descrição:** off = tudo advisory/desligado (necessário para S06 medir com o controle desligado); clamp = dimensionamento enforcing, recusa advisory (D2, postura do v1); full = recusa também enforcing (flip pós-calibração).
+
+### `resources.shadow_wait`
+
+- **Tipo:** boolean
+- **Default:** `true`
+- **Descrição:** true = espera sob pressão crítica roda em modo sombra, registrando 'teria esperado Xs' como evento sem bloquear (D3, único modo implementado no v1). false = RESERVADO/INERTE no v1 — nenhum código deste milestone implementa espera real bloqueante; setar false hoje apenas desliga o evento de telemetria de shadow-wait sem substituí-lo por nada (D3 trava shadow-only).
+
+### `resources.wait_cap_ms`
+
+- **Tipo:** integer
+- **Default:** `30000`
+- **Descrição:** Teto da espera (sombra ou real) sob pressão crítica, em milissegundos. Deve ser >= 1; não há semântica de 'sem espera' via 0 ou negativo — o reader substitui qualquer valor fora do range pelo default (30000).
+
 ## retry
 
 Retry Handler para falhas transitórias do Agent() (rate-limit, network, server, stream, connection). Classes permanentes/unknown falham imediatamente; model_refusal/context_overflow/tooling_failure são da Failure Taxonomy, não deste handler.

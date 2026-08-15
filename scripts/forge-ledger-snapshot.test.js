@@ -94,7 +94,7 @@ function seedMonolith(label) {
 
 // The marker is the last non-empty line of a truncated snapshot.
 function markerLineOf(snap) {
-  return snap.markdown.split('\n').filter(Boolean).pop();
+  return snap.markdown.split(/\r?\n/).filter(Boolean).pop();
 }
 
 // The projection command is a POINTER, and a pointer that resolves to something
@@ -370,6 +370,57 @@ test('renderLedger is NOT reordered by this slice — it stays ascending', () =>
   const rendered = projection.renderLedger(cwd);
   const order = (rendered.match(/^## (M\d+)$/gm) || []).map(l => l.replace('## ', ''));
   assert.deepStrictEqual(order, ['M001', 'M002', 'M003', 'M004'], 'readLedgerTail contract: oldest first');
+});
+
+// S03/T02 — Form B: writeFragment re-emits the EOL the fragment on disk uses.
+// Measured at e8c4040: merging into a CRLF .gsd/ledger fragment took its CR count
+// from 7 to 0 — every line of an operator's Windows-authored fragment rewritten,
+// silently, by a routine append. parseFragment's LF-anchored frontmatter regex is
+// the other half: it did not match CRLF at all, so the merge read an empty entry.
+test('Form B — writeFragment merges into a CRLF fragment without flattening it', () => {
+  const cwd = withStore('crlf-eol');
+  const id = 'M-20260813131121-eol';
+  ledger.writeFragment(cwd, { id, title: 'eol probe', slices: ['S01'], body: 'body line one' });
+  const fpath = ledger.fragmentPath(cwd, id);
+
+  // Re-author with explicit CRLF bytes, as a Windows checkout has it.
+  fs.writeFileSync(fpath, fs.readFileSync(fpath, 'utf8').replace(/\r\n?|\n/g, '\r\n'));
+  const bytesBefore = fs.readFileSync(fpath);
+  const crBefore = bytesBefore.filter((b) => b === 13).length;
+  assert.ok(crBefore > 0, 'fixture did not actually contain CR bytes');
+
+  // Form B is "re-emit the EOL of the text the writer READ" — so the expectation
+  // is derived from that same read, never from the bytes this test authored.
+  // Under an instrument that rewrites utf8 reads (forge-eol-preload.js in its LF
+  // arm) the writer cannot see the CR at all; asserting CR survival there would
+  // demand the impossible and register as a false EOL flip. The property below
+  // holds in every arm and still fails if the Form B fix is reverted.
+  const seenByWriter = fs.readFileSync(fpath, 'utf8');
+  const writerSeesCrlf = /\r\n/.test(seenByWriter);
+
+  // The read half: the frontmatter must parse at all when it is CRLF.
+  const reparsed = ledger.parseFragment(seenByWriter);
+  assert.strictEqual(reparsed.id, id, 'parseFragment did not match a CRLF frontmatter');
+  assert.deepStrictEqual(reparsed.slices, ['S01'], 'CRLF frontmatter parsed to the wrong slices');
+
+  ledger.writeFragment(cwd, { id, title: 'eol probe', slices: ['S01', 'S02'], body: 'body line one' });
+  const after = fs.readFileSync(fpath);
+  const crAfter = after.filter((b) => b === 13).length;
+  const lfAfter = after.filter((b) => b === 10).length;
+
+  if (writerSeesCrlf) {
+    assert.notStrictEqual(crAfter, 0, `CR count zeroed: ${crBefore} → 0 — the fragment was flattened to LF`);
+    assert.strictEqual(crAfter, lfAfter,
+      `mixed EOL after write: cr=${crAfter} lf=${lfAfter} — the new row was emitted with LF`);
+    assert.ok(crAfter - crBefore >= 0 && crAfter - crBefore <= 3,
+      `unexpected line delta: ${crBefore} → ${crAfter} (one slice row was added)`);
+  } else {
+    // The writer read LF, so it must emit LF: re-emitting the EOL it saw is the
+    // whole contract. A stray CR here would be fabricated, not preserved.
+    assert.strictEqual(crAfter, 0,
+      `writer read LF but emitted ${crAfter} CR bytes — EOL was invented, not re-emitted`);
+    assert.ok(lfAfter > 0, 'writer produced no line terminators at all');
+  }
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

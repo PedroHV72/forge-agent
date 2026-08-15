@@ -1130,7 +1130,13 @@ function writeIndex(result, cwd, opts) {
 
   let unchanged = false;
   try {
-    if (fs.existsSync(outAbs) && fs.readFileSync(outAbs, 'utf8') === md) unchanged = true;
+    // The economy check compares CONTENT, so it must not be an end-of-line guard
+    // by accident: on a checkout where the index on disk carries CRLF, a strict
+    // `===` against the LF render reports `changed` every single call and rewrites
+    // a file nothing changed in. Normalising both sides at this read keeps the
+    // comparison about content and leaves the operator's bytes alone.
+    const sameContent = (a, b) => a.replace(/\r\n?/g, '\n') === b.replace(/\r\n?/g, '\n');
+    if (fs.existsSync(outAbs) && sameContent(fs.readFileSync(outAbs, 'utf8'), md)) unchanged = true;
   } catch (_) {
     unchanged = false;
   }

@@ -139,8 +139,12 @@ function fragmentPath(cwd, id) {
 // block-scalar values (multi-line strings via `|` indicator).
 // Unknown frontmatter keys are passed through as-is.
 // Returns { id, title, completed_at, slices, key_files, key_decisions, body, ...rest }
+// EOL: tolerant, never normalising — this parser sits inside a read-modify-write
+// (forge-ledger.js:readFragment→writeFragment, forge-ledger-migrate.js likewise).
+// Folding CRLF→LF here would rewrite every line of a Windows-authored fragment.
+// The EOL actually on disk is captured by writeFragment and re-emitted (D-S03-2).
 function parseFragment(text) {
-  const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) {
     // No frontmatter — return minimal object with raw body
     return { id: null, title: null, completed_at: null, slices: [], key_files: [], key_decisions: [], body: text.trim() };
@@ -151,7 +155,7 @@ function parseFragment(text) {
   const result = {};
 
   // Parse frontmatter line by line
-  const lines = frontmatter.split('\n');
+  const lines = frontmatter.split(/\r\n|\n|\r/);
   let i = 0;
 
   while (i < lines.length) {
@@ -241,7 +245,10 @@ function parseFragment(text) {
 // Keys are emitted in alphabetical order for diff stability.
 // Arrays use block form for readability.
 // Scalar values use forge-yaml-safe to handle multi-line / unsafe chars.
-function serializeFrontmatter(entry) {
+// `eol` is the line ending captured from the fragment already on disk (Form B).
+// Defaults to LF for a fragment that does not exist yet — nothing to preserve.
+function serializeFrontmatter(entry, eol) {
+  const nl = eol || '\n';
   const skip = new Set(['body']);
   const keys = Object.keys(entry).filter(k => !skip.has(k)).sort();
 
@@ -265,7 +272,10 @@ function serializeFrontmatter(entry) {
       lines.push(`${key}: ${serialized}`);
     }
   }
-  return lines.join('\n');
+  // Block scalars from serializeScalar are internally LF-joined; re-emit them with
+  // the captured EOL so the produced file is not half CRLF and half LF.
+  const out = lines.join(nl);
+  return nl === '\n' ? out : out.replace(/\r\n?|\n/g, nl);
 }
 
 // ── writeFragment ─────────────────────────────────────────────────────────────
@@ -285,21 +295,29 @@ function writeFragment(cwd, entry, opts) {
 
   const fpath = fragmentPath(cwd, entry.id); // throws if invalid id
 
-  // Serialize
-  const frontmatter = serializeFrontmatter(entry);
-  const body = entry.body ? `\n${entry.body}` : '';
-  const content = `---\n${frontmatter}\n---\n${body}`;
-
-  // Idempotent check — read before acquiring lock to avoid unnecessary contention
+  // Form B: capture the EOL of the fragment already on disk and re-emit it. A
+  // fragment authored on Windows stays CRLF; a brand-new one is written LF.
+  let eol = '\n';
+  let onDisk = null;
   if (fs.existsSync(fpath)) {
     try {
-      const existing = fs.readFileSync(fpath, 'utf8');
-      if (existing === content) {
-        return { path: fpath, created: false };
-      }
+      onDisk = fs.readFileSync(fpath, 'utf8');
+      eol = (onDisk.match(/\r\n|\n|\r/) || ['\n'])[0];
     } catch {
-      // File unreadable — proceed to write
+      // File unreadable — proceed with the LF default
     }
+  }
+
+  // Serialize
+  const frontmatter = serializeFrontmatter(entry, eol);
+  const rawBody = entry.body ? `${eol}${entry.body}` : '';
+  const body = eol === '\n' ? rawBody : rawBody.replace(/\r\n?|\n/g, eol);
+  const content = `---${eol}${frontmatter}${eol}---${eol}${body}`;
+
+  // Idempotent check — reuses the bytes already read above (same read that gave us
+  // the EOL), so no second stat/read is paid for it.
+  if (onDisk !== null && onDisk === content) {
+    return { path: fpath, created: false };
   }
 
   writeAtomic(fpath, content, {
