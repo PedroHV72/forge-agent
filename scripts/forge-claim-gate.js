@@ -60,7 +60,8 @@ const {
   CLAIM_NOTE_REASONS,
 } = require('./forge-claim-overlap.js');
 const { declaredFor } = require('./forge-write-coverage.js');
-const { normalizeClaim, CLAIM_SOURCES } = require('./forge-write-claim.js');
+const { normalizeClaim, recordClaim, readClaim, CLAIM_SOURCES } = require('./forge-write-claim.js');
+const { readPrefs } = require('./forge-prefs.js');
 const runs = require('./forge-runs.js');
 
 // ── Closed sets ────────────────────────────────────────────────────────────
@@ -98,6 +99,18 @@ const GATE_NOTE_REASONS = [
   'own-claim-ineligible-no-counterpart', // the own side did not declare, but nobody is in scope to be harmed by it.
                                          // Visible, never punished into a refuse without a counterpart (D1).
   'posture-invalid',                     // the posture given is outside {defer, block}; fell back to `defer`, named.
+  'invalid-posture-pref',                // `parallelism.cross_run_overlap` resolved to a value outside {defer, block}.
+  'invalid-timing-pref',                 // one of the three anti-livelock timings resolved to a non-positive integer.
+  'defer-ledger-unreadable',             // the defer ledger could not be read; the counter is treated as 0, NEVER a crash.
+  'defer-ledger-unwritable',             // the ledger could not be persisted; the decision still stands, and says so.
+];
+
+// Escalations are a FIELD of the result, never a fifth decision value. The
+// decision stays `block` and the CONSUMER acts on the escalation — a gate that
+// invented a decision here would force every caller to learn a new verb.
+const ESCALATIONS = [
+  'wait-ceiling', // `--wait` polled up to `parallelism.block_wait_ms` and the conflict never cleared.
+  'defer-cap',    // the same unit deferred `parallelism.defer_cap` times in a row; waiting stopped being productive.
 ];
 // Counterpart-scope notes (`code-dir-unknown` and friends) are NOT redefined
 // here: they come from S03's `CLAIM_NOTE_REASONS` and travel verbatim.
@@ -476,6 +489,328 @@ function evaluateGate(opts) {
   }, base);
 }
 
+// ── The knob, made live (B1) ───────────────────────────────────────────────
+//
+// `parallelism.cross_run_overlap` shipped with ZERO consumers: it was declared
+// in the schema, documented in the reference and read by nobody. This module is
+// its first reader. Three precedents in this repo say that "the value is read"
+// is NOT the property worth proving (ROUTING_DOMAINS inert, plan-check
+// Dimension 9 anchored on the wrong artifact, the Layer 3 gate that flagged the
+// three correct files and passed the one versioned offender): a knob is alive
+// when CHANGING IT CHANGES THE DECISION. The suite proves that with the same
+// pair of colliding runs under both values, and with an EXECUTED bite that
+// neutralises the read below and leaves one of the two red.
+//
+// The hardcoded fallbacks here are the LAST line of defence, and each one MUST
+// be byte-identical to the corresponding default in forge-prefs.schema.json —
+// `forge-prefs-schema.test.js` carries a witness assert per key citing THIS
+// file as the reader. A fallback that drifts from the schema makes the
+// documented default a lie for anyone who never wrote a prefs file.
+const PARALLELISM_FALLBACKS = {
+  cross_run_overlap: 'defer', // == forge-prefs.schema.json parallelism.cross_run_overlap.default
+  block_wait_ms: 300000,      // == parallelism.block_wait_ms.default (5 min — ceiling of ONE blocking wait)
+  block_poll_ms: 15000,       // == parallelism.block_poll_ms.default
+  defer_cap: 3,               // == parallelism.defer_cap.default (consecutive defers of the SAME unit)
+};
+
+function positiveIntPref(value, fallback, key, notes) {
+  if (Number.isInteger(value) && value > 0) return value;
+  if (value === undefined) return fallback;
+  notes.push({ id: `parallelism.${key}`, reason: 'invalid-timing-pref' });
+  return fallback;
+}
+
+/**
+ * The three anti-livelock timings, resolved from prefs (W6: they are OPERATOR
+ * knobs, never magic constants buried in this file — an operator who cannot
+ * find the ceiling cannot raise it).
+ *
+ * `opts` is forwarded verbatim to `readPrefs` so a test can isolate the global
+ * layer (`globalDir`) instead of reading the operator's real home.
+ */
+function readParallelism(cwd, opts) {
+  const notes = [];
+  let block = {};
+  try {
+    const resolved = readPrefs(cwd, opts);
+    const p = resolved && resolved.prefs && resolved.prefs.parallelism;
+    if (p && typeof p === 'object') block = p;
+  } catch (_) {
+    // Unreadable prefs are not a reason to go mute: fall back to the documented
+    // defaults, which are the SAME values the operator would have got by
+    // writing nothing at all.
+    block = {};
+  }
+  return {
+    cross_run_overlap: block.cross_run_overlap,
+    block_wait_ms: positiveIntPref(block.block_wait_ms, PARALLELISM_FALLBACKS.block_wait_ms, 'block_wait_ms', notes),
+    block_poll_ms: positiveIntPref(block.block_poll_ms, PARALLELISM_FALLBACKS.block_poll_ms, 'block_poll_ms', notes),
+    defer_cap: positiveIntPref(block.defer_cap, PARALLELISM_FALLBACKS.defer_cap, 'defer_cap', notes),
+    notes,
+  };
+}
+
+/**
+ * `{ posture, source, note }` — the FIRST real read of
+ * `parallelism.cross_run_overlap` in this repo.
+ *
+ * `source` says where the value came from (`prefs` | `fallback` |
+ * `invalid-pref`), so a `block` that came from a typo is distinguishable from a
+ * `block` the operator asked for. A value outside `{defer, block}` falls back to
+ * `defer` and is NAMED (`invalid-posture-pref`) — never silently accepted,
+ * because the D3 floor downstream still converts a useless `defer` into `block`.
+ *
+ * The single line that reads the pref is the BITE TARGET of the suite: it must
+ * appear exactly once in this file.
+ */
+function resolvePostureFromPrefs(cwd, opts) {
+  const raw = readParallelism(cwd, opts).cross_run_overlap;
+  if (raw === undefined || raw === null) {
+    return { posture: PARALLELISM_FALLBACKS.cross_run_overlap, source: 'fallback', note: null };
+  }
+  if (POSTURES.includes(raw)) return { posture: raw, source: 'prefs', note: null };
+  return {
+    posture: PARALLELISM_FALLBACKS.cross_run_overlap,
+    source: 'invalid-pref',
+    note: 'invalid-posture-pref',
+  };
+}
+
+// ── Anti-livelock: the defer ledger ────────────────────────────────────────
+//
+// `.gsd/forge/claim-gate-defers.json`, keyed `"<runId>|<unit>"`. Consecutive
+// defers of the SAME unit are counted; a `proceed` resets the counter, because
+// what the cap measures is "waiting stopped being productive", not "this unit
+// ever waited".
+function deferLedgerPath(cwd) {
+  return path.join(cwd, '.gsd', 'forge', 'claim-gate-defers.json');
+}
+
+/**
+ * `{ data, note }` — an unreadable or corrupt ledger is treated as EMPTY with a
+ * named note, never as a crash. The ledger is a SAFETY NET (it escalates a
+ * livelock to the operator); a broken net must not become the thing that stops
+ * every dispatch, and it must not pretend to be intact either.
+ */
+function readDeferLedger(cwd) {
+  const file = deferLedgerPath(cwd);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    // A ledger that was never written is not a fault — only a real read error is.
+    if (e && e.code === 'ENOENT') return { data: {}, note: null };
+    return { data: {}, note: 'defer-ledger-unreadable' };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { data: parsed, note: null };
+    return { data: {}, note: 'defer-ledger-unreadable' };
+  } catch (_) {
+    return { data: {}, note: 'defer-ledger-unreadable' };
+  }
+}
+
+/** `null` on success, `'defer-ledger-unwritable'` otherwise — never a throw. */
+function writeDeferLedger(cwd, data) {
+  const file = deferLedgerPath(cwd);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    return null;
+  } catch (_) {
+    return 'defer-ledger-unwritable';
+  }
+}
+
+function deferKey(runId, unit) {
+  return `${runId}|${unit || '(sem unidade)'}`;
+}
+
+// ── The event, written BY CODE ─────────────────────────────────────────────
+
+/**
+ * One JSON line appended to `.gsd/forge/events.jsonl` of the given `--cwd`.
+ *
+ * Written HERE, in code, and not narrated by the orchestrator: this repo has
+ * measured what happens when the only record of a routing decision is a line
+ * the model was asked to write (TASK-021 — a whole slice fell through to a
+ * different engine and the session narrated it as a tooling bug). Returns
+ * `{ event_written, event_error }`; a failure to log NEVER swallows the
+ * decision, and never hides that it failed.
+ */
+function emitGateEvent(cwd, result) {
+  const line = {
+    event: 'claim-gate',
+    ts: new Date().toISOString(),
+    run: result.run,
+    unit: result.unit === undefined ? null : result.unit,
+    decision: result.decision,
+    cause: result.cause === undefined ? null : result.cause,
+    undeclared_side: result.undeclared_side === undefined ? null : result.undeclared_side,
+    posture: result.posture === undefined ? null : result.posture,
+    posture_source: result.posture_source === undefined ? null : result.posture_source,
+    escalation: result.escalation === undefined ? null : result.escalation,
+    floor: result.floor === undefined ? null : result.floor,
+    counterparts: result.counterparts || [],
+    census: result.census,
+    not_covered: result.not_covered,
+  };
+  const file = path.join(cwd, '.gsd', 'forge', 'events.jsonl');
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
+    return { event_written: true, event_error: null };
+  } catch (e) {
+    return { event_written: false, event_error: e.message };
+  }
+}
+
+// ── Record, then evaluate — an invisible fence does not fence ──────────────
+
+/** Zero-dep synchronous sleep. The poll is synchronous on purpose (see below). */
+function sleepSync(ms) {
+  if (!(ms > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function eligibilityOfPaths(paths) {
+  const list = Array.isArray(paths) ? paths : [];
+  return list.length > 0
+    ? { eligible: true, cause: null, detail: null }
+    : { eligible: false, cause: 'undeclared-writes', detail: 'declared-empty' };
+}
+
+/**
+ * The operational entry point: RECORD the own claim, THEN evaluate.
+ *
+ * The order is canonical and not an implementation detail (S04-PLAN contract
+ * #6): a fence nobody can see does not fence. Two symmetric runs that record
+ * before evaluating SEE EACH OTHER and both stop; the deadlock that follows is
+ * resolved by the wait ceiling and the defer cap ESCALATING TO THE OPERATOR —
+ * never by a tie-break. Ordering runs, or picking a winner, is an integration
+ * queue: an entire product, and the LOCKED frontier of S07. Do not grow one here.
+ *
+ * `code_dir` is a GIVEN fact (B2/contract #7): whatever `codeDir` is passed gets
+ * recorded, and its ABSENCE is recorded as `null` — never derived from
+ * root/branch/isolation_mode. A `null` scope stays IN scope (fail closed).
+ *
+ * Options: `{ cwd, runId, unit, source, codeDir, paths, derived,
+ * readyAlternatives, posture, prefsOpts, wait, emitEvent, onPoll }`.
+ */
+function recordAndEvaluate(opts) {
+  const o = opts || {};
+  const cwd = o.cwd || process.cwd();
+  const runId = o.runId || null;
+  const unit = o.unit || null;
+  const readyAlternatives = Number.isFinite(o.readyAlternatives) ? o.readyAlternatives : 0;
+
+  const timings = readParallelism(cwd, o.prefsOpts);
+  // An explicit `--posture` is an OPERATOR override and outranks the pref; its
+  // absence is what makes the pref the deciding input (this is exactly what the
+  // B1 pair exercises — the fixture sets no posture, only the prefs file).
+  const resolvedPref = typeof o.posture === 'string'
+    ? { posture: o.posture, source: 'explicit', note: null }
+    : resolvePostureFromPrefs(cwd, o.prefsOpts);
+
+  // (1) RECORD — via S03's primitive, never `runs.update` directly.
+  const claim = recordClaim(cwd, runId, {
+    unit,
+    source: CLAIM_SOURCES.includes(o.source) ? o.source : 'manual',
+    code_dir: typeof o.codeDir === 'string' ? o.codeDir : undefined,
+    paths: Array.isArray(o.paths) ? o.paths : [],
+  });
+
+  // Read back through S03's own accessor: the point of recording first is that
+  // the fence becomes VISIBLE to the other run, and "visible" means persisted —
+  // asserted by the suite on a call whose decision is `block`.
+  const claim_persisted = readClaim(runs.get(cwd, runId));
+
+  const elig = o.derived
+    ? { eligible: o.derived.eligible, cause: o.derived.cause, detail: o.derived.detail }
+    : eligibilityOfPaths(claim.paths);
+  const evalClaim = Object.assign({}, claim, elig);
+
+  // (2) EVALUATE — the recorded claim is the one confronted.
+  const evaluate = () => evaluateGate({
+    cwd, runId, claim: evalClaim, posture: resolvedPref.posture, readyAlternatives,
+  });
+
+  let result = evaluate();
+  let escalation = null;
+  let wait = null;
+
+  // (3) The ceiling. Synchronous polling in-process: the consumer owns the tool
+  // call timeout (contract in shared/forge-claim-gate.md, T03). Expiry NEVER
+  // becomes `proceed` — it becomes a named escalation with the decision intact.
+  if (o.wait && result.decision === 'block') {
+    const started = Date.now();
+    let polls = 0;
+    while (result.decision === 'block') {
+      const elapsed = Date.now() - started;
+      if (elapsed >= timings.block_wait_ms) break;
+      sleepSync(Math.min(timings.block_poll_ms, timings.block_wait_ms - elapsed));
+      polls++;
+      // Observation seam: the suite substitutes the world between polls (clearing
+      // the counterpart's claim) to prove a conflict that CLEARS produces
+      // `proceed` — asserting that against wall-clock timers would be flaky.
+      if (typeof o.onPoll === 'function') o.onPoll(polls);
+      result = evaluate();
+    }
+    wait = { polls, waited_ms: Date.now() - started, ceiling_ms: timings.block_wait_ms };
+    if (result.decision === 'block') escalation = 'wait-ceiling';
+  }
+
+  // (4) The cap. Deferring forever is waiting dressed as progress (same family
+  // as the D3 floor); when it stops being productive the gate ESCALATES — D3
+  // inherited: it never degrades into proceeding.
+  const ledger = readDeferLedger(cwd);
+  const notes = result.census.notes;
+  for (const n of timings.notes) notes.push(n);
+  if (ledger.note) notes.push({ id: runId, reason: ledger.note });
+
+  const key = deferKey(runId, unit);
+  let deferCount = 0;
+  const previous = ledger.data[key] && Number(ledger.data[key].count);
+  const prior = Number.isFinite(previous) && previous > 0 ? previous : 0;
+
+  if (result.decision === 'defer') {
+    deferCount = prior + 1;
+    if (deferCount > timings.defer_cap) {
+      result.decision = 'block';
+      escalation = 'defer-cap';
+    }
+    ledger.data[key] = { count: deferCount, last_at: Date.now() };
+    const werr = writeDeferLedger(cwd, ledger.data);
+    if (werr) notes.push({ id: key, reason: werr });
+  } else if (result.decision === 'proceed') {
+    if (Object.prototype.hasOwnProperty.call(ledger.data, key)) {
+      delete ledger.data[key];
+      const werr = writeDeferLedger(cwd, ledger.data);
+      if (werr) notes.push({ id: key, reason: werr });
+    }
+  } else {
+    deferCount = prior;
+  }
+
+  if (resolvedPref.note) notes.push({ id: runId, reason: resolvedPref.note });
+
+  const full = Object.assign({}, result, {
+    unit,
+    claim,
+    claim_persisted,
+    posture: resolvedPref.posture,
+    posture_source: resolvedPref.source,
+    escalation,
+    wait,
+    defer_count: result.decision === 'defer' || escalation === 'defer-cap' ? deferCount : prior,
+    defer_cap: timings.defer_cap,
+  });
+
+  if (o.emitEvent === false) return Object.assign(full, { event_written: null, event_error: null });
+  return Object.assign(full, emitGateEvent(cwd, full));
+}
+
 // ── Rendering ──────────────────────────────────────────────────────────────
 
 function formatGate(result) {
@@ -483,6 +818,18 @@ function formatGate(result) {
   const tail = result.cause ? ` — ${result.cause}` : (result.reason ? ` — ${result.reason}` : '');
   lines.push(`forge-claim-gate: ${result.decision}${tail}`);
   if (result.floor) lines.push(`  piso: ${result.floor} (defer sem alternativa nunca prossegue — D3)`);
+  if (result.escalation) {
+    lines.push(`  ESCALAÇÃO: ${result.escalation} — sobe ao operador; o gate nunca degrada para prosseguir`);
+  }
+  if (result.posture) {
+    lines.push(`  postura: ${result.posture} (origem: ${result.posture_source})`);
+  }
+  if (result.wait) {
+    lines.push(`  espera: ${result.wait.polls} polls · ${result.wait.waited_ms}ms de teto ${result.wait.ceiling_ms}ms`);
+  }
+  if (result.event_written === false) {
+    lines.push(`  evento NÃO gravado: ${result.event_error} (a decisão vale; o silêncio do log não)`);
+  }
   if (result.undeclared_side) lines.push(`  lado não declarado: ${result.undeclared_side}`);
   if (result.paths && result.paths.length > 0) lines.push(`  caminhos: ${result.paths.join(', ')}`);
   const c = result.census;
@@ -502,6 +849,9 @@ const USAGE = [
   'uso: node scripts/forge-claim-gate.js --evaluate (--plan <p> | --conceded <json|@file> | --paths <csv>)',
   '                                      --run <id> [--code-dir <p>] [--posture defer|block]',
   '                                      [--ready-alternatives <n>] [--cwd <dir>] [--json]',
+  '     node scripts/forge-claim-gate.js --claim-and-check (mesmas fontes) --run <id> --unit <u>',
+  '                                      [--source <s>] [--code-dir <p>] [--wait] [--posture defer|block]',
+  '                                      [--ready-alternatives <n>] [--cwd <dir>] [--json]',
   '',
   'Decide se a unidade pode despachar dado o claim próprio e os claims das runs',
   'ativas que dividem o mesmo CODE_DIR.',
@@ -514,13 +864,18 @@ const USAGE = [
   'receber exit != 0 ou stdout não-JSON trata como block/gate-unavailable.',
   '',
   'Flags:',
-  '  --evaluate                 avalia e emite a decisão',
+  '  --evaluate                 avalia e emite a decisão (NÃO grava claim, NÃO emite evento)',
+  '  --claim-and-check          grava o claim ANTES de avaliar e emite o evento claim-gate',
+  '  --unit <u>                 a unidade do claim (execute-task/T02, review-fix/..., ...)',
+  '  --source <s>               plan-writes | review-fix-paths | manual (default: derivado da fonte)',
+  '  --wait                     em block, re-avalia por poll até parallelism.block_wait_ms;',
+  '                             o teto escala (wait-ceiling), NUNCA vira proceed',
   '  --plan <path>              deriva o claim de um T##-PLAN.md (writes: ∪ expected_output:)',
   '  --conceded <json|@file>    deriva o claim dos itens concedidos [{r, path, line}] (D7)',
   '  --paths <csv>              claim explícito (operador/teste)',
   '  --run <id>                 a run própria (excluída do universo de counterparts)',
   '  --code-dir <p>             fato DADO pelo dispatch; ausente => code_dir null => escopo unknown',
-  '  --posture defer|block      postura em caso de colisão (default: defer)',
+  '  --posture defer|block      override explícito; AUSENTE => parallelism.cross_run_overlap das prefs',
   '  --ready-alternatives <n>   quantas outras tasks estão ready (default 0 — falha fechado)',
   '  --cwd <path>               onde vive o registry de runs (default: process.cwd())',
   '  --json                     emite JSON em vez da forma legível',
@@ -550,7 +905,8 @@ function parseConceded(raw) {
 
 function main(argv) {
   const args = parseArgs(argv);
-  if (args.help || !args.evaluate) {
+  const claimAndCheck = Boolean(args['claim-and-check']);
+  if (args.help || (!args.evaluate && !claimAndCheck)) {
     process.stdout.write(`${USAGE}\n`);
     return args.help ? 0 : 2;
   }
@@ -595,14 +951,34 @@ function main(argv) {
       paths: derived.paths,
     }), { eligible: derived.eligible, cause: derived.cause, detail: derived.detail });
 
-    result = evaluateGate({
-      cwd,
-      runId: args.run,
-      claim,
-      posture: typeof args.posture === 'string' ? args.posture : 'defer',
-      readyAlternatives: typeof args['ready-alternatives'] === 'string'
-        ? Number(args['ready-alternatives']) : 0,
-    });
+    const readyAlternatives = typeof args['ready-alternatives'] === 'string'
+      ? Number(args['ready-alternatives']) : 0;
+
+    if (claimAndCheck) {
+      // `--claim-and-check` implies the event: a fence that records and decides
+      // without leaving a trace is exactly the silence this milestone closes.
+      result = recordAndEvaluate({
+        cwd,
+        runId: args.run,
+        unit: typeof args.unit === 'string' ? args.unit : null,
+        source,
+        // B2: passed ONLY when the dispatch actually resolved it. Absent flag =>
+        // `code_dir: null` => scope `unknown` => fail closed. Never a fallback guess.
+        codeDir: typeof args['code-dir'] === 'string' ? args['code-dir'] : undefined,
+        paths: derived.paths,
+        derived,
+        readyAlternatives,
+        posture: typeof args.posture === 'string' ? args.posture : undefined,
+        wait: Boolean(args.wait),
+      });
+    } else {
+      // `--evaluate` stays exactly what T01 shipped: no write, no event. Only the
+      // posture default changed — absent `--posture` now consults the pref.
+      const posture = typeof args.posture === 'string'
+        ? args.posture
+        : resolvePostureFromPrefs(cwd).posture;
+      result = evaluateGate({ cwd, runId: args.run, claim, posture, readyAlternatives });
+    }
   } catch (e) {
     // ENFORCING, so this is NOT the advisory `return 0` of forge-claim-overlap:
     // an internal error must reach the caller as a failure, so it can fail
@@ -624,8 +1000,14 @@ module.exports = {
   deriveClaimFromPlan,
   deriveClaimFromConcededItems,
   resolvePosture,
+  resolvePostureFromPrefs,
+  readParallelism,
+  recordAndEvaluate,
+  emitGateEvent,
   evaluateGate,
   formatGate,
+  PARALLELISM_FALLBACKS,
+  ESCALATIONS,
   GATE_DECISIONS,
   GATE_CAUSES,
   PROCEED_REASONS,
@@ -636,7 +1018,9 @@ module.exports = {
   parseArgs,
   main,
   USAGE,
-  _private: { ownEligibility, parseConceded },
+  _private: {
+    ownEligibility, parseConceded, readDeferLedger, writeDeferLedger, deferLedgerPath, deferKey,
+  },
 };
 
 // AFTER `module.exports` on purpose: `evaluateGate` reaches the D8 seam through

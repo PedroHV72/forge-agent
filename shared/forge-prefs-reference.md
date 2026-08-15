@@ -359,7 +359,25 @@ Execução paralela de execute-task dentro do mesmo slice + comportamento em ove
 - **Tipo:** string
 - **Default:** `"defer"`
 - **Valores permitidos:** `defer`, `block`
-- **Descrição:** Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff).
+- **Descrição:** Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff). Lido por scripts/forge-claim-gate.js (resolvePostureFromPrefs) — um valor fora de {defer, block} cai para defer com note nomeada invalid-posture-pref.
+
+### `parallelism.block_wait_ms`
+
+- **Tipo:** integer
+- **Default:** `300000`
+- **Descrição:** Teto de UMA espera bloqueante do claim gate (--wait): re-avalia por poll até este limite. Atingido o teto, o gate ESCALA ao operador com escalation wait-ceiling mantendo a decisão block — nunca degrada para prosseguir (D3/W6). Lido por scripts/forge-claim-gate.js (readParallelism).
+
+### `parallelism.block_poll_ms`
+
+- **Tipo:** integer
+- **Default:** `15000`
+- **Descrição:** Intervalo entre re-avaliações do claim gate durante a espera bloqueante (--wait). Se o conflito limpa durante o poll, a decisão vira proceed; expiração nunca vira proceed. Lido por scripts/forge-claim-gate.js (readParallelism).
+
+### `parallelism.defer_cap`
+
+- **Tipo:** integer
+- **Default:** `3`
+- **Descrição:** Máximo de deferimentos CONSECUTIVOS da mesma unidade (contados em .gsd/forge/claim-gate-defers.json; um proceed reseta o contador). Excedido, o gate ESCALA ao operador com escalation defer-cap e decisão block — esperar deixou de ser produtivo e o gate nunca degrada para prosseguir (D3/W6). Lido por scripts/forge-claim-gate.js (readParallelism).
 
 ## resources
 

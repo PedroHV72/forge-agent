@@ -24,6 +24,12 @@ const path = require('path');
 const { loadSchema, validatePrefs, parseJsonc } = require('./forge-prefs.js');
 const { spawnSync } = require('child_process');
 const { DEFAULT_THRESHOLDS } = require('./forge-context-monitor.js');
+// Imported LIVE, not transcribed: the four `parallelism.*` knobs the claim gate
+// reads have their hardcoded fallbacks in this object, and the witness asserts
+// below compare it against the schema. A transcribed copy would drift the day
+// someone edits the gate — which is the exact failure mode the witness block
+// exists to catch (S04/T02: `cross_run_overlap` gained its FIRST reader here).
+const { PARALLELISM_FALLBACKS } = require('./forge-claim-gate.js');
 
 let passed = 0;
 let failed = 0;
@@ -104,7 +110,10 @@ const INVENTORY = [
   { key: 'multi_run.legacy_alias', type: 'boolean', default: true, source: 'scripts/forge-runs.js ALIAS_FILE refresh (auto-mode.json mirror kept by default)' },
   // — parallelism —
   { key: 'parallelism.max_concurrent', type: 'integer', default: 3, source: 'shared/forge-dispatch.md:1979 "integer 1–8; default 3"' },
-  { key: 'parallelism.cross_run_overlap', type: 'string', default: 'defer', source: 'forge-agent-prefs.md § Parallelism + shared/forge-dispatch.md § Parallel Task Execution' },
+  { key: 'parallelism.cross_run_overlap', type: 'string', default: 'defer', source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.cross_run_overlap (primeiro reader real — S04/T02)' },
+  { key: 'parallelism.block_wait_ms', type: 'integer', default: 300000, source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.block_wait_ms (teto de UMA espera bloqueante)' },
+  { key: 'parallelism.block_poll_ms', type: 'integer', default: 15000, source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.block_poll_ms' },
+  { key: 'parallelism.defer_cap', type: 'integer', default: 3, source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.defer_cap (defers consecutivos da mesma unidade)' },
   { key: 'resources.enforcement', type: 'string', default: 'clamp', source: 'scripts/forge-resources.js:195,200 (readResourcePrefs defaults + read)' },
   { key: 'resources.shadow_wait', type: 'boolean', default: true, source: 'scripts/forge-resources.js:195,201 (readResourcePrefs defaults + read)' },
   { key: 'resources.wait_cap_ms', type: 'integer', default: 30000, source: 'scripts/forge-resources.js:195,202 (readResourcePrefs defaults + read)' },
@@ -444,6 +453,12 @@ const WITNESSES = [
   ['ids.format', 'timestamp', 'scripts/forge-ids.js readIdFormat fallback'],
   ['milestone_cleanup', 'keep', 'agents/forge-completer.md:461 — REAL default (template example shows archive)'],
   ['compact_after', 'unlimited', 'skills/forge-auto/SKILL.md:63 — REAL default (template example shows 50)'],
+  // parallelism — the claim gate is the reader; the fallbacks are imported live
+  // (scripts/forge-claim-gate.js PARALLELISM_FALLBACKS), never transcribed.
+  ['parallelism.cross_run_overlap', PARALLELISM_FALLBACKS.cross_run_overlap, 'scripts/forge-claim-gate.js resolvePostureFromPrefs fallback (imported)'],
+  ['parallelism.block_wait_ms', PARALLELISM_FALLBACKS.block_wait_ms, 'scripts/forge-claim-gate.js readParallelism fallback (imported)'],
+  ['parallelism.block_poll_ms', PARALLELISM_FALLBACKS.block_poll_ms, 'scripts/forge-claim-gate.js readParallelism fallback (imported)'],
+  ['parallelism.defer_cap', PARALLELISM_FALLBACKS.defer_cap, 'scripts/forge-claim-gate.js readParallelism fallback (imported)'],
   ['forge_isolation.repos.exclude', ['node_modules/**', 'vendor/**', '.forge-worktrees/**', '.gsd/**', 'dist/**', 'build/**', '.next/**'], 'scripts/forge-repos.js:20 DEFAULT_EXCLUDE'],
 ];
 check(`witness defaults identity (${WITNESSES.length} >= 12 asserts, each cited)`, () => {

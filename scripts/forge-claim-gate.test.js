@@ -519,22 +519,10 @@ console.log('\nG9/G10: conjuntos fechados nos dois sentidos + enumeração em to
     assertEqual(typeof r.census.counterparts_considered, 'number');
   });
 
-  // Direction 2: every declared value was emitted by >= 1 test above.
-  test('G9a: toda decisão de GATE_DECISIONS foi emitida por >= 1 teste', () => {
-    for (const d of GATE_DECISIONS) assert(decisionsSeen.has(d), `decisão declarada e nunca emitida: ${d}`);
-  });
-  test('G9b: toda causa de GATE_CAUSES foi emitida por >= 1 teste', () => {
-    for (const c of GATE_CAUSES) assert(causesSeen.has(c), `causa declarada e nunca emitida: ${c}`);
-  });
-  test('G9c: toda razão de PROCEED_REASONS foi emitida por >= 1 teste', () => {
-    for (const p of PROCEED_REASONS) assert(proceedReasonsSeen.has(p), `razão declarada e nunca emitida: ${p}`);
-  });
-  test('G9d: todo skip de GATE_SKIP_REASONS foi emitido por >= 1 teste', () => {
-    for (const s of GATE_SKIP_REASONS) assert(skipsSeen.has(s), `skip declarado e nunca emitido: ${s}`);
-  });
-  test('G9e: toda note de GATE_NOTE_REASONS foi emitida por >= 1 teste', () => {
-    for (const n of GATE_NOTE_REASONS) assert(notesSeen.has(n), `note declarada e nunca emitida: ${n}`);
-  });
+  // Direction 2 lives at the END of this file (see "G9: direção 2"): the sets
+  // are only fully exercised after the T02 blocks run, and asserting the
+  // crossing here would report "declared and never emitted" for a value the
+  // suite emits fifty lines later — a false red that teaches nothing.
 }
 
 // ── G11: source guard + the S03 suites, by spawn, unedited ─────────────────
@@ -663,6 +651,504 @@ console.log('\nG13: deriveClaimFromPlan — reuso de declaredFor, legacy ≠ vaz
     let threw = false;
     try { deriveClaimFromPlan(mktmp(), 'nao/existe.md'); } catch (_) { threw = true; }
     assert(threw, 'um plano ilegível precisa falhar fechado, não degradar para "não declara nada"');
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// S04/T02 — the knob made live, the waiting machine, the event
+// ══════════════════════════════════════════════════════════════════════════
+//
+//   G14 B1 IN BOTH SENSES: the SAME pair of colliding runs decides `defer` with
+//       the pref at defer and `block` with the pref at block — two tests, each
+//       reading a REAL prefs file, never the `--posture` parameter. Plus an
+//       EXECUTED bite: a throwaway copy with the pref read neutralised leaves
+//       the `block` assert red.
+//   G15 record BEFORE evaluate — after a call that decided `block`, `readClaim`
+//       of the own run returns the recorded claim (the fence is visible).
+//   G16 B2 — no `--code-dir` records `code_dir: null` (never derived) AND the
+//       consequence: the counterpart stays in scope, fail closed.
+//   G17 the ceiling — `--wait` polls to `parallelism.block_wait_ms` and escalates
+//       `wait-ceiling` with the decision still `block`; a conflict that CLEARS
+//       during the poll produces `proceed`.
+//   G18 the cap — consecutive defers up to `parallelism.defer_cap` escalate
+//       `defer-cap`; a `proceed` resets; an unreadable ledger is a named note
+//       with the counter treated as 0, never a crash.
+//   G19 the event, written BY CODE, read back from the fixture's events.jsonl;
+//       a write failure becomes `event_written: false` + `event_error`.
+//   G20 ESCALATIONS crossed in both senses; escalation is a FIELD, never a
+//       fifth decision.
+
+const {
+  resolvePostureFromPrefs, readParallelism, recordAndEvaluate, emitGateEvent,
+  PARALLELISM_FALLBACKS, ESCALATIONS,
+} = gate;
+const { readClaim } = require('./forge-write-claim.js');
+const runsApi = require('./forge-runs.js');
+
+const escalationsSeen = new Set();
+function recordEsc(result) {
+  if (result.escalation !== null && result.escalation !== undefined) {
+    assert(ESCALATIONS.includes(result.escalation), `escalação fora de ESCALATIONS: ${result.escalation}`);
+    escalationsSeen.add(result.escalation);
+  }
+  // Escalation is a FIELD, never a decision value — checked on every result that
+  // passes through, so a future "decision: 'wait-ceiling'" cannot slip in.
+  assert(!ESCALATIONS.includes(result.decision),
+    `escalação virou valor de decisão: ${result.decision} — a decisão permanece block/defer`);
+  return record(result);
+}
+
+/** An isolated GLOBAL prefs layer: the operator's real home is never read. */
+const EMPTY_GLOBAL = mktmp();
+function prefsOpts() {
+  return { globalDir: EMPTY_GLOBAL };
+}
+
+/** Writes the fixture's LOCAL prefs layer (`<cwd>/.gsd/forge-prefs.jsonc`). */
+function withPrefs(ws, parallelism) {
+  fs.writeFileSync(
+    path.join(ws, '.gsd', 'forge-prefs.jsonc'),
+    `${JSON.stringify({ parallelism }, null, 2)}\n`,
+    'utf8',
+  );
+  return ws;
+}
+
+/** The SAME collision, every time: two runs claiming the same file. */
+function collidingFixture(parallelism, ownPaths) {
+  const ws = makeFixture([
+    { id: 'M-own', write_claim: claim([]) },
+    { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+  ]);
+  if (parallelism) withPrefs(ws, parallelism);
+  return { ws, paths: ownPaths || ['scripts/x.js'] };
+}
+
+// ── G14: B1 — the knob decides, in both senses, with a real prefs file ──────
+console.log('\nG14: B1 — a MESMA colisão sob defer e sob block, lendo a pref de verdade');
+{
+  function decideWithPref(value) {
+    const { ws, paths } = collidingFixture({ cross_run_overlap: value });
+    return {
+      ws,
+      result: recordEsc(recordAndEvaluate({
+        cwd: ws,
+        runId: 'M-own',
+        unit: 'execute-task/T02',
+        paths,
+        // NO `posture` — the pref is the deciding input, which is the whole point.
+        readyAlternatives: 2,
+        prefsOpts: prefsOpts(),
+        emitEvent: false,
+      })),
+    };
+  }
+
+  test('G14a: pref cross_run_overlap=defer -> decisão defer (posture_source prefs)', () => {
+    const { result } = decideWithPref('defer');
+    assertEqual(result.decision, 'defer');
+    assertEqual(result.posture, 'defer');
+    assertEqual(result.posture_source, 'prefs', 'a decisão veio da pref, não de um parâmetro');
+    assertEqual(result.cause, 'overlap');
+  });
+
+  test('G14b: MESMA colisão com pref cross_run_overlap=block -> decisão block', () => {
+    const { result } = decideWithPref('block');
+    assertEqual(result.decision, 'block', 'mudar a pref TEM de mudar a decisão — senão o knob é inerte (B1)');
+    assertEqual(result.posture, 'block');
+    assertEqual(result.posture_source, 'prefs');
+    assertEqual(result.floor, null, 'com alternativa ready o block vem da postura, não do piso D3');
+  });
+
+  test('G14c: MORDIDA — neutralizar a leitura da pref deixa o caso block VERMELHO', () => {
+    const src = fs.readFileSync(MODULE, 'utf8');
+    const needle = '  const raw = readParallelism(cwd, opts).cross_run_overlap;';
+    assertEqual(src.split(needle).length - 1, 1,
+      'a mordida precisa casar EXATAMENTE a leitura da pref — 0 ou 2 casamentos a tornariam vazia');
+
+    const biteFile = path.join(__dirname, 'forge-claim-gate.__bite-pref__.js');
+    fs.writeFileSync(biteFile, src.replace(needle, "  const raw = 'defer';"), 'utf8');
+    try {
+      // eslint-disable-next-line global-require
+      const bitten = require(biteFile);
+      const { ws, paths } = collidingFixture({ cross_run_overlap: 'block' });
+      const bittenResult = bitten.recordAndEvaluate({
+        cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+        readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+      });
+      assertEqual(bittenResult.decision, 'defer',
+        'com a leitura da pref neutralizada, block deixa de acontecer — G14b ficaria vermelho: a mordida morde');
+
+      // And the real module, on an equivalent fixture, still blocks.
+      const live = collidingFixture({ cross_run_overlap: 'block' });
+      assertEqual(recordAndEvaluate({
+        cwd: live.ws, runId: 'M-own', unit: 'execute-task/T02', paths: live.paths,
+        readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+      }).decision, 'block', 'o módulo real permanece intacto após a mordida');
+    } finally {
+      delete require.cache[require.resolve(biteFile)];
+      fs.rmSync(biteFile, { force: true });
+    }
+  });
+
+  test('G14d: sem arquivo de prefs -> fallback hardcoded defer, com a origem NOMEADA', () => {
+    const { ws, paths } = collidingFixture(null);
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+      readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(r.posture, PARALLELISM_FALLBACKS.cross_run_overlap);
+    assertEqual(r.posture, 'defer', 'o fallback é defer — e é idêntico ao default do schema (witness no schema test)');
+    assertEqual(r.posture_source, 'fallback', 'ausência de pref é um fato distinto de uma pref escrita');
+  });
+
+  test('G14e: pref fora de {defer, block} -> defer com note invalid-posture-pref', () => {
+    const { ws, paths } = collidingFixture({ cross_run_overlap: 'talvez-sim' });
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+      readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(r.posture, 'defer');
+    assertEqual(r.posture_source, 'invalid-pref');
+    assert(r.census.notes.some((n) => n.reason === 'invalid-posture-pref'),
+      'uma pref inválida é NOMEADA, nunca aceita calada');
+  });
+
+  test('G14f: --posture explícito continua sendo override da pref (T01 intocado)', () => {
+    const { ws, paths } = collidingFixture({ cross_run_overlap: 'defer' });
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths, posture: 'block',
+      readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(r.decision, 'block');
+    assertEqual(r.posture_source, 'explicit');
+  });
+
+  test('G14g: timing inválido na pref -> fallback + note invalid-timing-pref', () => {
+    const ws = withPrefs(makeFixture([{ id: 'M-own', write_claim: claim([]) }]), {
+      cross_run_overlap: 'defer', block_wait_ms: -5, block_poll_ms: 'já', defer_cap: 0,
+    });
+    const p = readParallelism(ws, prefsOpts());
+    assertEqual(p.block_wait_ms, PARALLELISM_FALLBACKS.block_wait_ms);
+    assertEqual(p.block_poll_ms, PARALLELISM_FALLBACKS.block_poll_ms);
+    assertEqual(p.defer_cap, PARALLELISM_FALLBACKS.defer_cap);
+    assertEqual(p.notes.length, 3, 'cada timing inválido é nomeado individualmente');
+    assert(p.notes.every((n) => n.reason === 'invalid-timing-pref'));
+
+    // And the note travels to the RESULT — a note nobody carries is silence.
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths: ['scripts/x.js'],
+      readyAlternatives: 1, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assert(r.census.notes.some((n) => n.reason === 'invalid-timing-pref'),
+      'a note do timing inválido precisa chegar ao censo do resultado');
+  });
+
+  test('G14h: resolvePostureFromPrefs isolado — pref vale, ausência cai no fallback', () => {
+    const withBlock = withPrefs(makeFixture([{ id: 'M-own' }]), { cross_run_overlap: 'block' });
+    assertEqual(resolvePostureFromPrefs(withBlock, prefsOpts()).posture, 'block');
+    const bare = makeFixture([{ id: 'M-own' }]);
+    assertEqual(resolvePostureFromPrefs(bare, prefsOpts()).source, 'fallback');
+  });
+}
+
+// ── G15: record BEFORE evaluate — an invisible fence does not fence ─────────
+console.log('\nG15: gravar ANTES de avaliar — a cerca fica visível mesmo bloqueado');
+{
+  test('G15a: após uma decisão block, readClaim da PRÓPRIA run devolve o claim gravado', () => {
+    const { ws, paths } = collidingFixture({ cross_run_overlap: 'block' });
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', source: 'plan-writes',
+      codeDir: '/code/dir', paths, readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(r.decision, 'block');
+
+    const persisted = readClaim(runsApi.get(ws, 'M-own'));
+    assert(persisted !== null, 'a cerca precisa estar em disco — bloqueado NÃO é motivo para não gravar');
+    assertEqual(JSON.stringify(persisted.paths), JSON.stringify(paths));
+    assertEqual(persisted.unit, 'execute-task/T02');
+    assertEqual(persisted.source, 'plan-writes');
+    assertEqual(JSON.stringify(r.claim_persisted), JSON.stringify(persisted),
+      'o claim relido pelo próprio gate é o mesmo que ficou em disco');
+  });
+
+  test('G15b: duas runs simétricas se VEEM mutuamente (sem tie-break, sem ordenação)', () => {
+    const ws = withPrefs(makeFixture([
+      { id: 'M-a', write_claim: claim([]) },
+      { id: 'M-b', write_claim: claim([]) },
+    ]), { cross_run_overlap: 'block' });
+
+    const a = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-a', unit: 'execute-task/T01', paths: ['scripts/x.js'],
+      readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    // A recorded first and saw B undeclared; B now records and sees A's fence.
+    const b = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-b', unit: 'execute-task/T01', paths: ['scripts/x.js'],
+      readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(b.cause, 'overlap', 'a segunda run VÊ a cerca da primeira — foi por isso que gravar veio antes');
+    assertEqual(b.decision, 'block');
+    assert(a.decision !== 'proceed', 'nenhuma das duas prossegue: o empate escala, nunca é desempatado aqui');
+  });
+}
+
+// ── G16: B2 — code_dir is a GIVEN fact, and the consequence ────────────────
+console.log('\nG16: B2 — sem --code-dir grava null, e a avaliação segue fail-closed');
+{
+  test('G16a: invocação sem codeDir grava code_dir null (nunca derivado de root/branch/isolation)', () => {
+    const ws = makeFixture([{ id: 'M-own', write_claim: claim([]), isolation_mode: 'worktree' }]);
+    recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths: ['scripts/x.js'],
+      posture: 'block', readyAlternatives: 1, prefsOpts: prefsOpts(), emitEvent: false,
+    });
+    const persisted = readClaim(runsApi.get(ws, 'M-own'));
+    assertEqual(persisted.code_dir, null, 'ausência de fato dado é null — nunca um palpite');
+  });
+
+  test('G16b: consequência — counterpart com code_dir conhecido fica EM ESCOPO (unknown fail-closed)', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim([]) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js'], '/outro/code/dir') },
+    ]);
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths: ['scripts/x.js'],
+      posture: 'block', readyAlternatives: 1, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(r.census.counterparts_in_scope, 1,
+      'code_dir desconhecido do lado próprio NÃO tira o par do escopo — ausência de informação nunca é "seguro"');
+    assertEqual(r.decision, 'block');
+    assert(r.census.notes.some((n) => CLAIM_NOTE_REASONS.includes(n.reason)),
+      'a incerteza de identidade viaja como note de S03');
+  });
+}
+
+// ── G17: the ceiling ───────────────────────────────────────────────────────
+console.log('\nG17: teto de espera — escala, nunca prossegue por expiração');
+{
+  const TINY = { cross_run_overlap: 'block', block_wait_ms: 60, block_poll_ms: 10 };
+
+  test('G17a: --wait com teto curto e conflito persistente -> escalation wait-ceiling, decisão block', () => {
+    const { ws, paths } = collidingFixture(TINY);
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+      readyAlternatives: 2, wait: true, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(r.decision, 'block', 'expirar o teto NUNCA vira proceed');
+    assertEqual(r.escalation, 'wait-ceiling');
+    assert(r.wait.polls >= 1, `esperava >= 1 re-avaliação por poll, veio ${r.wait.polls}`);
+    assertEqual(r.wait.ceiling_ms, 60, 'o teto vem da pref, não de constante mágica (W6)');
+  });
+
+  test('G17b: conflito que LIMPA durante o poll -> proceed (com o censo da última avaliação)', () => {
+    const { ws, paths } = collidingFixture(TINY);
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+      readyAlternatives: 2, wait: true, prefsOpts: prefsOpts(), emitEvent: false,
+      // The counterpart releases its claim between polls.
+      onPoll: () => { runsApi.update(ws, 'M-other', { write_claim: claim(['scripts/outro.js']) }); },
+    }));
+    assertEqual(r.decision, 'proceed');
+    assertEqual(r.reason, 'no-conflict', 'o proceed confrontou de verdade na última re-avaliação');
+    assertEqual(r.escalation, null);
+  });
+
+  test('G17c: sem --wait não há espera nenhuma (o poll é opt-in do consumidor)', () => {
+    const { ws, paths } = collidingFixture(TINY);
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+      readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+    assertEqual(r.decision, 'block');
+    assertEqual(r.wait, null);
+    assertEqual(r.escalation, null, 'sem espera não há teto a atingir — escalar aqui seria inventar urgência');
+  });
+}
+
+// ── G18: the defer cap ─────────────────────────────────────────────────────
+console.log('\nG18: cap de deferimentos — escala ao operador, reseta em proceed, nunca crasha');
+{
+  function deferOnce(ws, paths) {
+    return recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths: paths || ['scripts/x.js'],
+      readyAlternatives: 2, prefsOpts: prefsOpts(), emitEvent: false,
+    }));
+  }
+
+  test('G18a: defers consecutivos até defer_cap -> escalation defer-cap com decisão block', () => {
+    const { ws } = collidingFixture({ cross_run_overlap: 'defer', defer_cap: 2 });
+    assertEqual(deferOnce(ws).decision, 'defer');
+    assertEqual(deferOnce(ws).decision, 'defer');
+    const third = deferOnce(ws);
+    assertEqual(third.decision, 'block', 'esperar deixou de ser produtivo — escala, não degrada para prosseguir (D3)');
+    assertEqual(third.escalation, 'defer-cap');
+    assertEqual(third.defer_cap, 2, 'o cap vem da pref (W6)');
+  });
+
+  test('G18b: um proceed RESETA o contador da unidade', () => {
+    const { ws } = collidingFixture({ cross_run_overlap: 'defer', defer_cap: 2 });
+    deferOnce(ws);
+    deferOnce(ws);
+    // Same unit, now claiming something nobody else touches -> proceed.
+    const clean = deferOnce(ws, ['scripts/só-meu.js']);
+    assertEqual(clean.decision, 'proceed');
+    const ledger = JSON.parse(fs.readFileSync(path.join(ws, '.gsd', 'forge', 'claim-gate-defers.json'), 'utf8'));
+    assert(!Object.prototype.hasOwnProperty.call(ledger, 'M-own|execute-task/T02'),
+      'o proceed apaga a entrada — o cap mede defers CONSECUTIVOS, não defers de sempre');
+    // And the next defer starts over instead of arriving already capped.
+    assertEqual(deferOnce(ws).decision, 'defer');
+  });
+
+  test('G18c: ledger ilegível -> note defer-ledger-unreadable, contador 0, NUNCA crash', () => {
+    const { ws } = collidingFixture({ cross_run_overlap: 'defer', defer_cap: 1 });
+    const file = path.join(ws, '.gsd', 'forge', 'claim-gate-defers.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{isso não é json', 'utf8');
+    const r = deferOnce(ws);
+    assertEqual(r.decision, 'defer', 'um ledger quebrado não pode travar tudo — a rede não vira o obstáculo');
+    assert(r.census.notes.some((n) => n.reason === 'defer-ledger-unreadable'),
+      'ledger ilegível é NOMEADO, nunca um 0 silencioso');
+  });
+
+  test('G18d: ledger impossível de gravar -> note defer-ledger-unwritable, decisão intacta', () => {
+    const { ws } = collidingFixture({ cross_run_overlap: 'defer', defer_cap: 3 });
+    // A DIRECTORY where the ledger file belongs: writeFileSync fails, and the
+    // decision must survive it (precedent: the SCHEMA-VERSION-as-directory dogfood).
+    fs.mkdirSync(path.join(ws, '.gsd', 'forge', 'claim-gate-defers.json'), { recursive: true });
+    const r = deferOnce(ws);
+    assertEqual(r.decision, 'defer');
+    assert(r.census.notes.some((n) => n.reason === 'defer-ledger-unwritable'),
+      'falhar em gravar a rede é dito em voz alta, nunca engolido');
+  });
+}
+
+// ── G19: the event, written BY CODE ────────────────────────────────────────
+console.log('\nG19: evento claim-gate escrito por CÓDIGO em .gsd/forge/events.jsonl');
+{
+  function lastEvent(ws) {
+    const lines = fs.readFileSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), 'utf8')
+      .split('\n').filter((l) => l.trim() !== '');
+    return JSON.parse(lines[lines.length - 1]);
+  }
+
+  test('G19a: --claim-and-check emite UMA linha com os campos do contrato', () => {
+    const { ws, paths } = collidingFixture({ cross_run_overlap: 'block' });
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', codeDir: '/code/dir', paths,
+      readyAlternatives: 2, prefsOpts: prefsOpts(),
+    }));
+    assertEqual(r.event_written, true);
+
+    const ev = lastEvent(ws);
+    assertEqual(ev.event, 'claim-gate');
+    assert(typeof ev.ts === 'string' && ev.ts.length >= 20, 'o evento carrega timestamp ISO');
+    assertEqual(ev.run, 'M-own');
+    assertEqual(ev.unit, 'execute-task/T02');
+    assertEqual(ev.decision, 'block');
+    assertEqual(ev.cause, 'overlap');
+    assertEqual(ev.posture, 'block');
+    assertEqual(ev.posture_source, 'prefs');
+    assertEqual(ev.escalation, null);
+    assertEqual(ev.floor, null);
+    assertEqual(ev.undeclared_side, null);
+    assert(Array.isArray(ev.counterparts) && ev.counterparts.length === 1, 'os counterparts confrontados viajam no evento');
+    assertEqual(typeof ev.census.runs_examined, 'number');
+    assertEqual(ev.not_covered.length, 3, 'as fronteiras não cobertas também são enumeradas NO EVENTO');
+  });
+
+  test('G19b: a escalação também viaja no evento', () => {
+    const { ws, paths } = collidingFixture({ cross_run_overlap: 'block', block_wait_ms: 40, block_poll_ms: 10 });
+    recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+      readyAlternatives: 2, wait: true, prefsOpts: prefsOpts(),
+    }));
+    assertEqual(lastEvent(ws).escalation, 'wait-ceiling');
+  });
+
+  test('G19c: falha de escrita -> event_written false + event_error, decisão intacta', () => {
+    const { ws, paths } = collidingFixture({ cross_run_overlap: 'block' });
+    fs.mkdirSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), { recursive: true });
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
+      readyAlternatives: 2, prefsOpts: prefsOpts(),
+    }));
+    assertEqual(r.decision, 'block', 'o gate decide mesmo sem conseguir logar');
+    assertEqual(r.event_written, false, '...e DIZ que não logou — nunca finge que logou');
+    assert(typeof r.event_error === 'string' && r.event_error.length > 0, 'o erro de escrita é nomeado');
+  });
+
+  test('G19d: --evaluate puro NÃO emite evento e NÃO grava claim (T01 intocado)', () => {
+    const ws = makeFixture([
+      { id: 'M-own' },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+    const r = runCli(['--evaluate', '--paths', 'scripts/x.js', '--run', 'M-own', '--cwd', ws, '--posture', 'block', '--json']);
+    assertEqual(r.status, 0, r.stderr);
+    assertEqual(JSON.parse(r.stdout).decision, 'block');
+    assert(!fs.existsSync(path.join(ws, '.gsd', 'forge', 'events.jsonl')), '--evaluate não emite evento');
+    assertEqual(readClaim(runsApi.get(ws, 'M-own')), null, '--evaluate não grava claim');
+  });
+
+  test('G19e: CLI --claim-and-check grava, avalia, emite — exit 0 com a decisão no payload', () => {
+    const ws = makeFixture([
+      { id: 'M-own' },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+    const r = runCli(['--claim-and-check', '--paths', 'scripts/x.js', '--run', 'M-own',
+      '--unit', 'execute-task/T02', '--cwd', ws, '--posture', 'block', '--json']);
+    assertEqual(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assertEqual(out.decision, 'block');
+    assertEqual(out.event_written, true);
+    assertEqual(readClaim(runsApi.get(ws, 'M-own')).paths[0], 'scripts/x.js');
+    assertEqual(lastEvent(ws).unit, 'execute-task/T02');
+  });
+
+  test('G19f: emitGateEvent é chamável isoladamente e nunca lança', () => {
+    const ws = mktmp();
+    const out = emitGateEvent(ws, {
+      run: 'M-x', unit: null, decision: 'proceed', cause: null, undeclared_side: null,
+      census: { runs_examined: 0, counterparts_considered: 0, counterparts_in_scope: 0, skipped: [], notes: [] },
+      not_covered: UNCOVERED_BOUNDARIES, counterparts: [],
+    });
+    assertEqual(out.event_written, true);
+    assertEqual(lastEvent(ws).decision, 'proceed');
+  });
+}
+
+// ── G20: ESCALATIONS as a closed set, both senses ──────────────────────────
+console.log('\nG20: ESCALATIONS — conjunto fechado nos dois sentidos');
+{
+  test('G20a: ESCALATIONS é exatamente [wait-ceiling, defer-cap]', () => {
+    assertEqual(ESCALATIONS.slice().sort().join(','), 'defer-cap,wait-ceiling');
+  });
+  test('G20b: toda escalação declarada foi emitida por >= 1 teste', () => {
+    for (const e of ESCALATIONS) assert(escalationsSeen.has(e), `escalação declarada e nunca emitida: ${e}`);
+  });
+  test('G20c: nenhuma escalação é um valor de GATE_DECISIONS (é campo, não decisão)', () => {
+    for (const e of ESCALATIONS) {
+      assert(!GATE_DECISIONS.includes(e), `${e} virou decisão — a decisão permanece block/defer`);
+    }
+  });
+}
+
+// ── G9: direção 2 dos conjuntos fechados — depois de TUDO ter rodado ───────
+console.log('\nG9: direção 2 — todo valor declarado foi emitido por >= 1 teste');
+{
+  test('G9a: toda decisão de GATE_DECISIONS foi emitida por >= 1 teste', () => {
+    for (const d of GATE_DECISIONS) assert(decisionsSeen.has(d), `decisão declarada e nunca emitida: ${d}`);
+  });
+  test('G9b: toda causa de GATE_CAUSES foi emitida por >= 1 teste', () => {
+    for (const c of GATE_CAUSES) assert(causesSeen.has(c), `causa declarada e nunca emitida: ${c}`);
+  });
+  test('G9c: toda razão de PROCEED_REASONS foi emitida por >= 1 teste', () => {
+    for (const p of PROCEED_REASONS) assert(proceedReasonsSeen.has(p), `razão declarada e nunca emitida: ${p}`);
+  });
+  test('G9d: todo skip de GATE_SKIP_REASONS foi emitido por >= 1 teste', () => {
+    for (const s of GATE_SKIP_REASONS) assert(skipsSeen.has(s), `skip declarado e nunca emitido: ${s}`);
+  });
+  test('G9e: toda note de GATE_NOTE_REASONS foi emitida por >= 1 teste', () => {
+    for (const n of GATE_NOTE_REASONS) assert(notesSeen.has(n), `note declarada e nunca emitida: ${n}`);
   });
 }
 
