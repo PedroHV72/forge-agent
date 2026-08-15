@@ -36,6 +36,13 @@ const WRAPPER_DIR_READERS = Object.freeze([
     why: 'collectPlanFiles only descends through directory entries and reads loose PLAN files; it does not parse an epoch.md container.',
   },
   {
+    file: 'forge-distill.js',
+    dirs: Object.freeze(['.gsd/milestones']),
+    evidence: 'forge-distill.js:35,48-50 — checkEligibility and sourceFiles both join .gsd/milestones/<milestoneId> from a caller-supplied milestoneId, and the only fs.readdirSync call is on path.join(root, \'slices\'), filtered to /^S\\d+$/ directory entries.',
+    verdict: 'safe-by-construction',
+    why: 'The specific caller-selected milestoneId is joined before any enumeration and readdirSync never targets the .gsd/milestones root itself; distillation only reads loose slice-summary source files below the selected milestone, never a grouped container.',
+  },
+  {
     file: 'forge-epoch-group.js',
     dirs: Object.freeze(['.gsd/milestones', '.gsd/tasks']),
     evidence: 'forge-epoch-group.js:202-205 — listWrapperDirs(parent) then entries(parent), followed by if (!entry.isDirectory()) continue.',
@@ -111,6 +118,13 @@ const WRAPPER_DIR_READERS = Object.freeze([
     evidence: 'forge-statusline.js:182 reads one milestone ROADMAP; lines 209,213,580 enumerate only .gsd/forge paths.',
     verdict: 'safe-by-construction',
     why: 'The concrete .json, evidence-*.jsonl, and pause-* filters operate below .gsd/forge, never on the milestone root.',
+  },
+  {
+    file: 'forge-sweep-delete.js',
+    dirs: Object.freeze(['.gsd/milestones', '.gsd/tasks']),
+    evidence: 'forge-sweep-delete.js:137-148 — enumerateWrappers walks WRAPPER_ROOTS directly with fs.readdirSync(root, { withFileTypes: true }) and the specific if (!entry.isDirectory()) continue filter before treating an entry as a candidate.',
+    verdict: 'safe-by-construction',
+    why: 'The specific entry.isDirectory() filter accepts only directory entries as deletion candidates, matching forge-epoch-group.js\'s shape; a grouped epoch.md container is a file, so it is skipped rather than misread as a wrapper unit, and this module never groups or parses container bytes — D11\'s container prohibition is intact.',
   },
   {
     file: 'forge-surgical-reset.js',

@@ -863,6 +863,7 @@ module.exports = {
   qualifiedStorageKey,
   parseStorageKey,
   parseFragment,
+  serializeFrontmatter,
   writeFragment,
   readFragment,
   readFragmentText,
