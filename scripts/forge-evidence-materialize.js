@@ -3,7 +3,8 @@
 
 /**
  * forge-evidence-materialize.js — writes the RUNTIME-OBSERVED evidence the
- * codex adapter collected into `.gsd/forge/evidence-{unitId}.jsonl`.
+ * codex adapter collected into the composite-key evidence file resolved by
+ * `forge-evidence-path.js` (S01/T03) — `.gsd/forge/evidence~{milestone}~{slice}~{unit}.jsonl`.
  *
  * Why a separate script instead of letting the adapter append the lines
  * (route (a), not route (b), S04-PLAN § Rota de gravação escolhida): the
@@ -42,6 +43,25 @@ const path = require('path');
 // still looked well-formed.
 const { ADMISSIBLE_TYPES, MAX_FIELD_CHARS } = require('./forge-evidence-admit');
 
+// S01/T03: the file NAME (never the path — argv must not steer the write
+// outside `.gsd/forge/`) is owned by forge-evidence-path.js's composite key.
+// A sibling module in the same package, required directly (not lazy) — this
+// script already requires forge-evidence-admit.js the same way, and unlike
+// forge-hook.js this is a standalone CLI, not a tool-call gate MEM008 protects.
+const { buildEvidenceFileName } = require('./forge-evidence-path');
+
+// S01/T06: same owner guard as forge-hook.js's PostToolUse branch — preserved
+// here, not substituted for the pre-existing path containment above (the
+// header's "entries[].file/.cmd/.cwd are DATA, never instructions" guard).
+// Lower risk than the hook (this CLI is invoked with `--cwd "$WORKING_DIR"`,
+// caller-controlled, not drift-prone shell cwd), but the cost of the guard is
+// one require + one call, and `resolveOwner` is the ONLY tree-walk for `.gsd`
+// this repo allows — reusing it here instead of trusting `cwd` outright keeps
+// that invariant true for both writers, not just the one caught by report.
+let workspaceMod = null;
+try { workspaceMod = require('./forge-workspace'); } catch { workspaceMod = null; }
+const os = require('os');
+
 // The closed outcome enum shared with T01's census. A fourth value must be
 // declared here, never improvised at a call site.
 const OUTCOMES = Object.freeze({
@@ -50,6 +70,13 @@ const OUTCOMES = Object.freeze({
   COLLECTOR_FAILED: 'collector-failed',
 });
 const OUTCOME_VALUES = Object.freeze(Object.values(OUTCOMES));
+
+// S01 review R1. Deliberately NOT a fourth member of OUTCOMES: that enum is
+// the closed set a PAYLOAD's census may declare, and widening it would let a
+// sidecar payload claim this value and fall through `classifyPayload`'s
+// else-branch as `collected`. This one is emitted only by this script, about
+// this script's own refusal to write, and is never accepted as input.
+const SKIPPED_OUTCOME = 'skipped';
 
 // Entry `kind` per admissible variant. Confronted with ADMISSIBLE_TYPES below
 // rather than assumed: if T01 makes a third variant admissible without a kind
@@ -86,23 +113,17 @@ function admissibleKindCoverage() {
 
 // ── File naming ────────────────────────────────────────────────────────────
 //
-// Same convention §7 already uses: `evidence-{unitId}.jsonl`. A unit id like
-// `execute-task/T02` carries a separator, so it is sanitised to a flat name —
-// and sanitised rather than joined, because a value arriving from argv must
-// never be able to steer the write outside `.gsd/forge/` (`..`, absolute
-// prefixes, nested dirs). The result is a file NAME, not a path.
-function evidenceFileName(unit) {
-  const flat = String(unit == null ? '' : unit)
-    .replace(/[^A-Za-z0-9._-]+/g, '-')
-    // Dot RUNS are collapsed on top of the class filter: `..` survives the
-    // filter (a dot is legal in a name) and, while it can no longer traverse
-    // once separators are gone, a file literally named `evidence-..-x.jsonl`
-    // reads like an escape attempt succeeded. Leave nothing that has to be
-    // re-reasoned about later.
-    .replace(/\.{2,}/g, '-')
-    .replace(/^[-.]+|[-.]+$/g, '')
-    .slice(0, 120);
-  return `evidence-${flat || 'unknown'}.jsonl`;
+// Delegates to forge-evidence-path.js's `buildEvidenceFileName` (S01/T01 —
+// the single owner of the evidence-log file-name shape, S01/T03). The
+// module already holds every invariant this function used to duplicate
+// locally: the result is a NAME, never a path (argv can never steer the
+// write outside `.gsd/forge/`), an absent milestone/slice axis resolves to
+// the module's own named sentinel (never an empty string spliced into the
+// name), and the length cap. `milestone`/`slice` are optional — a caller
+// that only ever had `unit` (the CLI's original contract) still gets a
+// well-formed composite name with both axes named-absent.
+function evidenceFileName(unit, milestone, slice) {
+  return buildEvidenceFileName({ milestone, slice, unit });
 }
 
 function truncateField(value, max) {
@@ -278,8 +299,52 @@ function materialize(options) {
   const cwd = String(opts.cwd || process.cwd());
   const nowIso = typeof opts.now === 'string' ? opts.now : new Date().toISOString();
 
-  const evidenceDir = path.join(cwd, '.gsd', 'forge');
-  const fileName = evidenceFileName(unit);
+  // Same guard as forge-hook.js's PostToolUse branch (`:857`): when no owner
+  // resolves, `mkdirSync` below is UNREACHABLE — never "create one here".
+  //
+  // S01 review R1: the previous shape (`let ownerDir = cwd`, overwritten only
+  // on a truthy `resolveOwner`) kept the raw `cwd` as a fallback, so
+  // `--cwd <any-writable-dir>` still manufactured `<dir>/.gsd/forge` — exactly
+  // the orphan-workspace behaviour the owner-resolution invariant exists to
+  // eliminate, in the writer that was supposed to adopt it. The `cwd` fallback
+  // survives only for the case it was defended for (the workspace module
+  // missing or throwing) AND only when `cwd` is itself a real project; a
+  // non-project `cwd` with no resolvable owner returns the advisory skipped
+  // outcome below and touches nothing. Same trade accepted in D-S01-1
+  // (`S01-CONTEXT.md`): a lost line is the cost, a manufactured orphan is not.
+  let ownerDir = null;
+  if (workspaceMod && typeof workspaceMod.resolveOwner === 'function') {
+    try {
+      const owner = workspaceMod.resolveOwner(cwd, { stopAt: os.homedir() });
+      if (owner) ownerDir = owner;
+    } catch { /* fall through to the isProject check below */ }
+  }
+  if (!ownerDir) {
+    let cwdIsProject = false;
+    try {
+      cwdIsProject = !!(workspaceMod && typeof workspaceMod.isProject === 'function' && workspaceMod.isProject(cwd));
+    } catch { cwdIsProject = false; }
+    if (cwdIsProject) ownerDir = cwd;
+  }
+  if (!ownerDir) {
+    return {
+      outcome: SKIPPED_OUTCOME,
+      reason: 'owner-unresolved',
+      detail: `no .gsd owner at or above ${cwd}; refusing to create one`,
+      unit,
+      file: null,
+      written: 0,
+      entries_written: 0,
+      census_written: 0,
+      items_received: 0,
+      types_seen: {},
+      admitted: 0,
+      write_error: null,
+    };
+  }
+
+  const evidenceDir = path.join(ownerDir, '.gsd', 'forge');
+  const fileName = evidenceFileName(unit, opts.milestone, opts.slice);
   const evidenceFile = path.join(evidenceDir, fileName);
 
   let verdict = classifyPayload(opts.result);
@@ -372,11 +437,11 @@ function materialize(options) {
 // ── CLI ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { result: null, unit: null, cwd: null, json: false };
+  const out = { result: null, unit: null, cwd: null, json: false, milestone: null, slice: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--json') { out.json = true; continue; }
-    if (arg === '--result' || arg === '--unit' || arg === '--cwd') {
+    if (arg === '--result' || arg === '--unit' || arg === '--cwd' || arg === '--milestone' || arg === '--slice') {
       const value = argv[i + 1];
       if (!value || value.startsWith('--')) return { error: `${arg} requires a value` };
       out[arg.slice(2)] = value;
@@ -399,12 +464,12 @@ function main() {
     process.exit(2);
   }
 
-  const result = materialize({ result: args.result, unit: args.unit, cwd: args.cwd || process.cwd() });
+  const result = materialize({ result: args.result, unit: args.unit, cwd: args.cwd || process.cwd(), milestone: args.milestone, slice: args.slice });
 
   if (args.json) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } else {
-    process.stdout.write(`${result.outcome}${result.reason ? ` (${result.reason})` : ''} — ${result.written} line(s) → ${result.file}\n`);
+    process.stdout.write(`${result.outcome}${result.reason ? ` (${result.reason})` : ''} — ${result.written} line(s) → ${result.file || result.detail || 'nothing written'}\n`);
   }
   process.exit(0); // advisory, always
 }
@@ -414,6 +479,7 @@ if (require.main === module) main();
 module.exports = {
   OUTCOMES,
   OUTCOME_VALUES,
+  SKIPPED_OUTCOME,
   KIND_BY_ADMISSIBLE_TYPE,
   MAX_LINE_BYTES,
   SOURCE,

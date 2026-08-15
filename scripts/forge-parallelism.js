@@ -327,8 +327,20 @@ function main() {
   });
 }
 
-try {
-  main();
-} catch (e) {
-  emit({ mode: 'error', batch: [], reason: 'parser error: ' + (e && e.message || String(e)) }, 1);
+if (require.main === module) {
+  try {
+    main();
+  } catch (e) {
+    emit({ mode: 'error', batch: [], reason: 'parser error: ' + (e && e.message || String(e)) }, 1);
+  }
 }
+
+module.exports = {
+  globToRegex,
+  normalizePath,
+  pathsOverlap,
+  writesConflict,
+  parseTaskFrontmatter,
+  parseListField,
+  discoverTasks,
+};

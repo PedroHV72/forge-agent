@@ -25,6 +25,7 @@ const runs = require('./forge-runs.js');
 const lock = require('./forge-lock.js');
 const forgeState = require('./forge-state.js');
 const { isProject } = require('./forge-workspace.js');
+const { parseEvidenceFileName, collectKnownMilestoneIds } = require('./forge-evidence-path.js');
 
 const STALE_WARNING_MS = 5  * 60 * 1000;  // yellow chip
 const STALE_MS         = 15 * 60 * 1000;  // red chip / "stale" label (M005.3+: 15min matches statusline)
@@ -50,10 +51,17 @@ function effectiveHeartbeatAge(r, now, cwd) {
   // M005.3+: per-run evidence files (hook-writes a line per tool call —
   // freshest per-run signal available; bypasses opus-thinking gaps where
   // no other mtime updates for 5-10min).
+  // S01/T04: classify each file via parseEvidenceFileName (the module that
+  // owns the file-name shape) instead of matching `-${r.id}-` by substring —
+  // the composite/legacy forms are not all shaped that way, and a loose
+  // substring match silently degrades freshness for the new form (R3).
   try {
     const forgeDir = path.join(cwd, '.gsd', 'forge');
+    const knownMilestoneIds = collectKnownMilestoneIds(cwd);
     for (const ef of fs.readdirSync(forgeDir)) {
-      if (!/^evidence-.*\.jsonl$/.test(ef) || !ef.includes(`-${r.id}-`)) continue;
+      if (!ef.startsWith('evidence') || !ef.endsWith('.jsonl')) continue;
+      const parsed = parseEvidenceFileName(ef, { knownMilestoneIds });
+      if (parsed.form === 'unrecognized' || parsed.milestone !== r.id) continue;
       try {
         const age = now - fs.statSync(path.join(forgeDir, ef)).mtimeMs;
         if (age < minAge) minAge = age;
@@ -381,4 +389,5 @@ if (require.main === module) cliMain();
 module.exports = {
   regenerate, render,
   formatActiveRunLine, formatActivityLine,
+  effectiveHeartbeatAge,
 };

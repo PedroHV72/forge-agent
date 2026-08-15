@@ -100,6 +100,13 @@ function withAddressDefaults(rec) {
     branch:  (rec.branch  === undefined || rec.branch  === '') ? null : rec.branch,
     root:    (rec.root    === undefined || rec.root    === '') ? null : rec.root,
     project: (rec.project === undefined || rec.project === '') ? null : rec.project,
+    // ── Unit-context axis (S01/T02) ──────────────────────────────────────────
+    // `worker` is "UNIT_TYPE/UNIT_ID" and carries NO slice, so the evidence log
+    // could never name the slice a tool call belonged to. `worker_slice` is the
+    // missing third axis, additive by READ (default applied here) exactly like
+    // branch/root/project above: live records in .gsd/forge/runs/ are never
+    // rewritten, and SCHEMA-VERSION is not bumped.
+    worker_slice: (rec.worker_slice === undefined || rec.worker_slice === '') ? null : rec.worker_slice,
   });
 }
 
@@ -154,7 +161,7 @@ function normalizeMetadataPatch(patch) {
     if (next.host_runtime === undefined || next.host_runtime === null || next.host_runtime === '') delete next.host_runtime;
     else next.host_runtime = normalizeHostRuntime(next.host_runtime);
   }
-  for (const key of ['owner', 'session', 'heartbeat', 'expires_at', 'worker_engine']) {
+  for (const key of ['owner', 'session', 'heartbeat', 'expires_at', 'worker_engine', 'worker_slice']) {
     if (Object.prototype.hasOwnProperty.call(next, key) && next[key] === undefined) delete next[key];
   }
   return next;
@@ -182,6 +189,10 @@ function add(cwd, record) {
     last_heartbeat: record.last_heartbeat || now,
     worker: record.worker || null,
     worker_started: record.worker_started || null,
+    // Explicit `null`, never `undefined`: undefined disappears in
+    // JSON.stringify and a consumer could not tell "no value" from
+    // "field absent". (S01/T02, additive-by-read axis — see withAddressDefaults.)
+    worker_slice: record.worker_slice || null,
     isolation_mode: record.isolation_mode || 'shared',
     milestone_dir: record.milestone_dir || (record.kind === 'milestone' ? `.gsd/milestones/${record.id}/` : null),
     cwd: record.cwd || cwd,
@@ -272,6 +283,13 @@ function refreshLegacyAlias(cwd) {
       last_heartbeat: oldest.last_heartbeat,
       worker: oldest.worker,
       worker_started: oldest.worker_started,
+      // Mirror the slice axis alongside worker/worker_started (S01/T02): the
+      // hook's legacy fallback reads THIS file when no run resolves by
+      // session_id, so an alias without the axis makes that path re-emit a
+      // slice-less context — the exact hole the axis exists to close.
+      // `oldest` comes from listActive → withAddressDefaults, so the field is
+      // always present as null rather than undefined.
+      worker_slice: oldest.worker_slice === undefined ? null : oldest.worker_slice,
     };
   } else {
     mirror = { active: false };

@@ -1447,8 +1447,11 @@ After assembling the SUMMARY + result block, control **rejoins the normal Proces
 
 ```bash
 node "$FORGE_SCRIPTS_DIR/forge-evidence-materialize.js" \
-  --result "$RESULT_FILE" --unit "execute-task/{T##}" --cwd "$WORKING_DIR" --json
+  --result "$RESULT_FILE" --unit "execute-task/{T##}" \
+  --milestone "{M###}" --slice "{S##}" --cwd "$WORKING_DIR" --json
 ```
+
+**Both axes are passed, never only `--unit`** (S01 review R2). The file name is the composite key `milestone~slice~unit`, and `resolveEvidenceFiles` matches composites by strict equality on all three axes — an invocation that omits them lands the file under the named sentinels (`_no-milestone_`/`_no-slice_`), which parse back to `null` and can therefore never match the real `{M###, S##, T##}` the completer resolves. The lines would be written and never found. Where a caller genuinely has no milestone/slice (`/forge-task`), omitting them is correct — the sentinel is then the truth, and the resolution target carries the same absence.
 
 `scripts/forge-evidence-materialize.js` is the formula-once owner of the outcome enum, the naming, the 512-byte stepped truncation and the census shape; mirrors call it and restate none of them. Every written line carries `source: codex-runtime` — **never** `codex-sidecar`, which stays the marker of 7a, so a strict-equality filter separates the two in the same file. **Every invocation appends exactly one `kind:"census"` line**, including when nothing else is written: silence in the artifact a human reads is indistinguishable from a broken collector. The outcome enum is closed at three, and none is an omission:
 

@@ -5971,7 +5971,11 @@ function smokePrefsCutover() {
     const evidence = String(resolved.evidence.mode || 'lenient').toLowerCase();
     assert(locksEnabled === false && evidence === 'strict',
       '(d) engine golden preserves worktree file-lock override and normalized evidence mode');
-    const evidenceFile = path.join(forgeDir, 'evidence-adhoc.jsonl');
+    // S01/T03: the hook now resolves the composite name via buildEvidenceFileName
+    // even on the adhoc fallback path (no runs/ record) — never the legacy bare
+    // 'evidence-adhoc.jsonl'. Compute the same way the hook does, not hardcode it.
+    const { buildEvidenceFileName } = require('./forge-evidence-path.js');
+    const evidenceFile = path.join(forgeDir, buildEvidenceFileName({ unit: 'adhoc' }));
     try { fs.unlinkSync(evidenceFile); } catch {}
     fs.writeFileSync(globalJsonc, '{"evidence":{"mode":"disabled"}}', 'utf8');
     const disabled = runScript('forge-hook.js', ['post'], {

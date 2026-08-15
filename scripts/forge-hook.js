@@ -34,6 +34,34 @@ try {
   } catch { runs = null; filelock = null; }
 }
 
+// ── Evidence-path module (S01/T01) — same dev/installed dual-path resolution ──
+// Owner of the evidence file-name shape and of the NAMED axis sentinels. A
+// partial install must stay fail-open (MEM008): a null module falls back to the
+// literal sentinel values at the single call site that needs them, so the hook
+// never throws on a user's tool-call path.
+let evidencePath = null;
+try { evidencePath = require(path.join(__dirname, 'scripts', 'forge-evidence-path.js')); }
+catch {
+  try { evidencePath = require(path.join(__dirname, 'forge-evidence-path.js')); }
+  catch { evidencePath = null; }
+}
+
+// ── Workspace module (S01/T06) — same dev/installed dual-path resolution ──
+// `resolveOwner` is the ONLY tree-walk for `.gsd` this repo allows (Standards).
+// Loader is narrowed like the schema-guard precedent (forge-decisions.js /
+// forge-ledger.js / forge-memory.js / forge-projection.js): a MODULE_NOT_FOUND
+// naming this module itself is a legitimate "not colocated in this install
+// layout" fail-open; anything else (a real init fault) is a fault this hook
+// still must never crash on (MEM008), so it is swallowed too but never mistaken
+// for "the module tried and lied" — resolveOwnerDir() below treats a null
+// workspaceMod as "no owner resolvable", same as resolveOwner() returning null.
+let workspaceMod = null;
+try { workspaceMod = require(path.join(__dirname, 'scripts', 'forge-workspace.js')); }
+catch (err1) {
+  try { workspaceMod = require(path.join(__dirname, 'forge-workspace.js')); }
+  catch (err2) { workspaceMod = null; }
+}
+
 // ── Resolve context-monitor module — same dev/installed pattern ──
 let ctxMonitor = null;
 try {
@@ -163,24 +191,96 @@ const bumpHeartbeat = (cwd, sessionId) => {
   } catch { /* no auto mode or unreadable — ignore */ }
 };
 
+// Resolve the directory that OWNS this hook fire — never the raw cwd.
+//
+// Two-degree ladder (S01/T06), each degree named:
+//   1. resolveOwner(cwd, {stopAt: os.homedir()}) — the sole `.gsd` tree-walk
+//      this repo allows (forge-workspace.js:150). Handles the plain case: cwd
+//      is the workspace, or a subdirectory of it.
+//   2. RunRecord.cwd via resolveRunForSession — handles worktree isolation,
+//      where the CWD the worker actually runs in (CODE_DIR) has NO `.gsd` in
+//      any ancestor (measured 2026-08-14: classify() returns 'none' for every
+//      ancestor up to stopAt), but the run that dispatched it recorded the
+//      ORIGINAL workspace in `cwd` at registration (forge-runs.js `add()`:
+//      `cwd: record.cwd || cwd`). `r.root`/`r.project` are NOT used here —
+//      measured null on the live run this task was executed under (additive
+//      fields, not populated by this milestone).
+//
+// Neither degree found → null. Caller MUST treat null as "do not write,
+// do not mkdirSync" — never as "create one here" (same contract resolveOwner
+// itself documents).
+const resolveOwnerDir = (cwd, sessionId) => {
+  if (workspaceMod && typeof workspaceMod.resolveOwner === 'function') {
+    try {
+      const owner = workspaceMod.resolveOwner(cwd, { stopAt: os.homedir() });
+      if (owner) return owner;
+    } catch { /* fall through to the RunRecord degree */ }
+  }
+  const r = resolveRunForSession(cwd, sessionId);
+  // Security (T06-SECURITY.md, Input Validation blocker 3): `r.cwd` is DATA
+  // read from a RunRecord file, not a trusted constant. A record hand-edited
+  // or corrupted to carry a bogus `cwd` must not become a NEW directory this
+  // hook writes into — it is accepted only when it independently classifies
+  // as a real project (`isProject`, same WORK_ENTRIES predicate `resolveOwner`
+  // itself uses). Anything else → null, never "create one here".
+  if (r && typeof r.cwd === 'string' && r.cwd) {
+    if (workspaceMod && typeof workspaceMod.isProject === 'function') {
+      try {
+        if (workspaceMod.isProject(r.cwd)) return r.cwd;
+        return null;
+      } catch { return null; }
+    }
+    // workspaceMod unavailable — cannot validate r.cwd, so it cannot be
+    // trusted either (MEM008 silent-fail still holds: exit 0, just no write).
+    return null;
+  }
+  return null;
+};
+
 // Resolve unit context for evidence file naming.
-// Multi-run path: { runId, unitId, kind } from run.worker via session_id resolution.
-// Legacy fallback: { runId: null, unitId, kind: null } from auto-mode.json worker.
+//
+// Returns the THREE axes `{ milestone, slice, unit }` (S01/T02) alongside the
+// pre-existing `{ runId, unitId, kind }` — the old fields are kept verbatim so
+// the current file-name call site (:744) keeps working byte-for-byte until T03
+// adopts the composite key. Only the RETURN CONTRACT widens here.
+//
+// An absent milestone/slice axis resolves to the NAMED sentinel exported by
+// forge-evidence-path.js — never `''`. An empty axis spliced into a name
+// produces `evidence--T01.jsonl`, which re-opens exactly the parse ambiguity
+// T01 closed.
+//
+// Both paths (resolved run record, and the auto-mode.json legacy fallback)
+// return all three axes; the fallback has no milestone axis to read from the
+// alias, so it names that absence instead of inventing one.
 const resolveUnitContext = (cwd, sessionId) => {
+  const NO_MS = (evidencePath && evidencePath.SENTINEL_NO_MILESTONE) || '_no-milestone_';
+  const NO_SL = (evidencePath && evidencePath.SENTINEL_NO_SLICE) || '_no-slice_';
   const r = resolveRunForSession(cwd, sessionId);
   if (r) {
     const unit = (r.worker || '').split('/')[1] || 'adhoc';
-    return { runId: r.id, unitId: unit, kind: r.kind };
+    // Only a milestone-kind run's id IS a milestone id. A task run's id is a
+    // task id — naming it "milestone" would be a fabricated axis.
+    const milestone = r.kind === 'milestone' && r.id ? r.id : NO_MS;
+    const slice = r.worker_slice ? r.worker_slice : NO_SL;
+    return { runId: r.id, unitId: unit, kind: r.kind, milestone, slice, unit };
   }
   try {
     const autoFile = path.join(cwd, '.gsd', 'forge', 'auto-mode.json');
     const auto = JSON.parse(fs.readFileSync(autoFile, 'utf8'));
     if (auto && typeof auto.worker === 'string' && auto.worker.length > 0) {
       const parts = auto.worker.split('/');
-      return { runId: null, unitId: parts.length === 2 ? parts[1] : 'adhoc', kind: null };
+      const unit = parts.length === 2 ? parts[1] : 'adhoc';
+      return {
+        runId: null,
+        unitId: unit,
+        kind: null,
+        milestone: NO_MS,
+        slice: auto.worker_slice ? auto.worker_slice : NO_SL,
+        unit,
+      };
     }
   } catch { /* no auto-mode / unreadable → adhoc */ }
-  return { runId: null, unitId: 'adhoc', kind: null };
+  return { runId: null, unitId: 'adhoc', kind: null, milestone: NO_MS, slice: NO_SL, unit: 'adhoc' };
 };
 
 // Read forge_isolation.file_locks pref (default true). Returns boolean.
@@ -433,6 +533,13 @@ const buildSchemaWarning = (res) => {
     'Rode /forge-update ou /forge-doctor --fix --migrate antes de fechar milestone.',
   ].join('\n');
 };
+
+// Testability seam (S01/T02): the hook is a CLI first — `require`-ing it must
+// NOT wire stdin (a listener that never sees `end` would hang the requiring
+// process). Exporting resolveUnitContext lets its three-axis contract be
+// exercised directly instead of asserted through a spawned hook fire.
+module.exports = { resolveUnitContext, sanitizeRunId, resolveRunForSession, resolveOwnerDir };
+if (require.main !== module) return;
 
 process.stdin.setEncoding('utf8');
 let raw = '';
@@ -917,17 +1024,35 @@ process.stdin.on('end', () => {
     }
 
     // ── PostToolUse: evidence capture (Bash/Write/Edit only) ─────────────────
-    // M004: file is evidence-{runId}-{unitId}.jsonl when session resolves to a run.
-    // Legacy: evidence-{unitId}.jsonl when no run resolution possible.
+    // S01/T03: file name is owned by forge-evidence-path.js's composite key
+    // (milestone~slice~unit), built from the three axes resolveUnitContext
+    // (S01/T02) now returns. `evidencePath` is the same lazy/tolerant
+    // require used by every sibling module in this file — module missing →
+    // this branch degrades to the legacy bare/adhoc name and NEVER aborts
+    // the tool call (MEM008).
+    //
+    // S01/T06: the OWNER is resolved BEFORE the unit — never the raw cwd.
+    // Without this order the branch below can `mkdirSync` a fresh `.gsd/` at
+    // whatever directory the shell happened to be anchored in (the SVN/WDMA
+    // orphans this task closes). When no owner resolves, `mkdirSync` is
+    // UNREACHABLE: the whole branch returns instead — never "create one here".
     if (phase === 'post' && (toolName === 'Bash' || toolName === 'Write' || toolName === 'Edit')) {
       try {
         const mode = readEvidenceMode(cwd);
-        if (mode !== 'disabled') {
-          const ctx = resolveUnitContext(cwd, sessionId);
-          const evidenceDir  = path.join(cwd, '.gsd', 'forge');
-          const fileSlug = ctx.runId
-            ? `evidence-${sanitizeRunId(ctx.runId)}-${ctx.unitId}.jsonl`
-            : `evidence-${ctx.unitId}.jsonl`;
+        // No owner resolvable → skip entirely. `mkdirSync` below is UNREACHABLE
+        // in that case, not merely unlikely — never "create one here" (a bare
+        // `return` here would also skip the unrelated phase==='post' blocks
+        // below, e.g. the context monitor, so the guard is an `if`, not a
+        // short-circuit return).
+        const ownerDir = mode !== 'disabled' ? resolveOwnerDir(cwd, sessionId) : null;
+        if (mode !== 'disabled' && ownerDir) {
+          const ctx = resolveUnitContext(ownerDir, sessionId);
+          const evidenceDir  = path.join(ownerDir, '.gsd', 'forge');
+          const fileSlug = evidencePath && typeof evidencePath.buildEvidenceFileName === 'function'
+            ? evidencePath.buildEvidenceFileName({ milestone: ctx.milestone, slice: ctx.slice, unit: ctx.unit })
+            : (ctx.runId
+                ? `evidence-${sanitizeRunId(ctx.runId)}-${ctx.unitId}.jsonl`
+                : `evidence-${ctx.unitId}.jsonl`);
           const evidenceFile = path.join(evidenceDir, fileSlug);
 
           const toolResponse = data.tool_response || {};
