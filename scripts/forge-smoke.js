@@ -5933,6 +5933,14 @@ function smokePrefsCutover() {
   '(d) statusline reads repo_path through engine and has prefs error badge');
   withHermeticHome(({ env }) => {
     const dir = mkTmp('prefs-cutover-passive');
+    // A capture assertion below needs the hook to actually WRITE, and since
+    // PR #94 the PostToolUse branch refuses when no owner resolves rather than
+    // manufacturing an orphan `.gsd/`. `mkTmp` seeds only `.gsd/forge`, and
+    // `forge` is not a WORK_ENTRY, so the directory is not a project and the
+    // refusal — correctly — fires. Seeding one WORK_ENTRY makes it a project.
+    // Without this the `disabled` half passes vacuously (nothing is ever
+    // written, for the wrong reason) and the `lenient` half fails.
+    fs.writeFileSync(path.join(dir, '.gsd', 'PROJECT.md'), '# fixture project\n', 'utf8');
     const forgeDir = path.join(dir, '.gsd', 'forge');
     const globalJsonc = path.join(env.HOME, '.claude', 'forge-agent-prefs.jsonc');
     fs.mkdirSync(path.dirname(globalJsonc), { recursive: true });
@@ -13524,6 +13532,18 @@ function smokeEvidenceRuntime() {
     evidenceFileName, SOURCE, LEGACY_SOURCE, CENSUS_KIND,
   } = require('./forge-evidence-materialize');
 
+  // `mkTmp` seeds only `.gsd/forge`, and `forge` is NOT a WORK_ENTRY — so the
+  // directory is not a project. Since PR #94 the materializer (and the hook)
+  // REFUSE to write when no owner resolves, rather than manufacturing an
+  // orphan `.gsd/` (S01 review R1 / D-S01-1). That refusal is the invariant,
+  // not the bug: these scenarios have to hand it a real project. Seeding one
+  // WORK_ENTRY is the whole difference between `owner-unresolved` and a write.
+  const mkEvidenceProject = (label) => {
+    const made = mkTmp(label);
+    fs.writeFileSync(path.join(made, '.gsd', 'PROJECT.md'), '# fixture project\n', 'utf8');
+    return made;
+  };
+
   const dir = mkTmp('evidence-runtime');
   // Declarados FORA do try para que o finally os alcance mesmo com assert
   // vermelho — a pegadinha já anotada na Seção 94 (um repo git vazado deixa
@@ -13579,7 +13599,7 @@ function smokeEvidenceRuntime() {
       assert(ev.census.outcome !== 'not-collected' && ev.census.items_received >= 3,
         '(a) coletado-e-vazio NÃO colapsa em not-collected e o censo conta os itens recebidos', JSON.stringify(ev.census));
 
-      const cwdA = mkTmp('evidence-runtime-empty');
+      const cwdA = mkEvidenceProject('evidence-runtime-empty');
       try {
         const mat = runScript('forge-evidence-materialize.js',
           ['--result', got.resultFile, '--unit', 'execute-task/T95', '--cwd', cwdA, '--json']);
@@ -13690,7 +13710,7 @@ function smokeEvidenceRuntime() {
       for (const [label, payload] of Object.entries(scenarios)) {
         const resultFile = path.join(dir, `${label}-payload.json`);
         fs.writeFileSync(resultFile, JSON.stringify(payload), 'utf8');
-        const cwdX = mkTmp(`evidence-runtime-${label}`);
+        const cwdX = mkEvidenceProject(`evidence-runtime-${label}`);
         try {
           const mat = runScript('forge-evidence-materialize.js',
             ['--result', resultFile, '--unit', 'execute-task/T95', '--cwd', cwdX, '--json']);
@@ -13736,7 +13756,7 @@ function smokeEvidenceRuntime() {
     // igualdade estrita. A linha sintetizada legada é pré-gravada como o §7a a
     // grava; o materializador acrescenta as runtime.
     {
-      const cwdE = mkTmp('evidence-runtime-coexist');
+      const cwdE = mkEvidenceProject('evidence-runtime-coexist');
       try {
         const file = path.join(cwdE, '.gsd', 'forge', evidenceFileName('execute-task/T95'));
         fs.writeFileSync(file, `${JSON.stringify({

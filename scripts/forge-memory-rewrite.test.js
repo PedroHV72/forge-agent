@@ -20,7 +20,13 @@ function test(name, fn) {
 }
 
 function withTemp(fn) {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-rewrite-test-'));
+  // realpathSync is load-bearing on macOS, where os.tmpdir() is `/tmp` — a
+  // symlink to `/private/tmp`. The module under test reports resolved paths, so
+  // a fixture rooted at the symlinked spelling makes every path assertion fail
+  // as `/private/tmp/... !== /tmp/...` on macOS while passing on Linux, where
+  // no such symlink exists. Rooting the fixture at the real path removes the
+  // discrepancy instead of loosening the assertions.
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-rewrite-test-')));
   try {
     return fn(cwd);
   } finally {

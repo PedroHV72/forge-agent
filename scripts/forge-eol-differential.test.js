@@ -247,11 +247,25 @@ test('R2: a standalone \\r survives both arms unchanged', () => {
 console.log('\nR3 — containment holds across devices');
 test('R3: a different drive/root is outside the repository', () => {
   const { isOutsideRepository } = differential._private;
-  // Constructed as strings so the case is pinned on POSIX too, where the
-  // Windows-style path parses with a root that differs from '/'.
-  assert.strictEqual(isOutsideRepository('D:\\forge-eol-temp\\state.jsonl'), true);
+
+  // Platform-independent half: a path under the repo is inside, and the real
+  // temp directory — which is genuinely elsewhere on every platform — is not.
   assert.strictEqual(isOutsideRepository(path.join(SCRIPT_DIR, 'state.jsonl')), false);
   assert.strictEqual(isOutsideRepository(path.join(os.tmpdir(), 'state.jsonl')), true);
+
+  // The drive-letter half is Windows-only, and the previous version asserted it
+  // unconditionally on the claim that "the Windows-style path parses with a root
+  // that differs from '/'" on POSIX. It does not: POSIX has exactly one root, so
+  // `D:\forge-eol-temp\state.jsonl` is a perfectly legal RELATIVE filename and
+  // path.resolve puts it INSIDE the repo. Answering "inside" there is correct,
+  // not a containment hole — so the assert was demanding the wrong answer and
+  // failed on macOS and ubuntu alike.
+  if (process.platform === 'win32') {
+    assert.strictEqual(isOutsideRepository('D:\\forge-eol-temp\\state.jsonl'), true);
+  } else {
+    assert.strictEqual(isOutsideRepository('D:\\forge-eol-temp\\state.jsonl'), false,
+      'on POSIX this is a relative filename resolved inside the repo, not another drive');
+  }
 });
 
 console.log('\nR4 — a suite that never finished was not proven clean');

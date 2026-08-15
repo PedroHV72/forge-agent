@@ -180,6 +180,52 @@ test('listVaults returns deterministic filename order', () => {
   remove(cwd);
 });
 
+// ── Regression: a workspace reached through a SYMLINK ────────────────────────
+// The member id is `relative(cwd, file)`, and both sides must be resolved the
+// same way. They were not: `cwd` arrived lexically while the file paths arrive
+// already physical, so a workspace under a symlink produced an escaping id
+// (`../../real/path/.gsd/memory/x.md`). Restore resolved that back to the
+// physical path, compared it against the LEXICAL `.gsd` root, and refused with
+// `path-escapes-gsd` — undo entirely inert, on every member.
+//
+// This guard exists because the suite's own fixtures now root at the realpath
+// (they must, to compare paths at all), which REMOVES the condition that
+// exposed the defect. Without an explicit symlink case the bug returns unseen.
+// It is also why the bug read as ubuntu-green / macOS-red: `/tmp` is real on
+// Linux and a symlink to `/private/tmp` on macOS.
+test('a workspace reached through a symlink yields contained ids, and undo restores', () => {
+  const real = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vault-symlink-real-')));
+  const link = path.join(fs.realpathSync(os.tmpdir()), `vault-symlink-view-${process.pid}`);
+  try { fs.unlinkSync(link); } catch { /* first run */ }
+  fs.symlinkSync(real, link, 'dir');
+  try {
+    const memoryDir = path.join(real, '.gsd', 'memory');
+    fs.mkdirSync(memoryDir, { recursive: true });
+    const fragment = path.join(memoryDir, 'M-20260815000001-sym.md');
+    const original = Buffer.from('fato\r\noutro\r\n', 'utf8');
+    fs.writeFileSync(fragment, original);
+
+    // The workspace is addressed through the LINK; the file path is physical —
+    // exactly the mixture the census hands the vault in a real run.
+    const written = writeVault(link, { operation: 'dedupe-memoria', files: [fragment] });
+    assert(written.ok === true, `vault must be written: ${JSON.stringify(written.skipped || [])}`);
+    for (const id of written.members) {
+      assert(!id.startsWith('..'), `member id must stay inside the workspace, got: ${id}`);
+      assert(id.startsWith('.gsd/'), `member id must be workspace-relative, got: ${id}`);
+    }
+
+    // And the round trip actually restores: delete the fragment, undo, compare bytes.
+    fs.unlinkSync(fragment);
+    const restored = restoreVault(link, written.containerPath);
+    assert(restored.refused.length === 0, `nothing may be refused: ${JSON.stringify(restored.refused)}`);
+    assert(fs.existsSync(fragment), 'the fragment must be back on disk');
+    assert(Buffer.compare(fs.readFileSync(fragment), original) === 0, 'bytes must round-trip exactly');
+  } finally {
+    try { fs.unlinkSync(link); } catch { /* best effort */ }
+    fs.rmSync(real, { recursive: true, force: true });
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) {
   for (const failure of failures) console.error(`${failure.name}: ${failure.error}`);
