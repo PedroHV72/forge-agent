@@ -337,6 +337,17 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
 
 > Fires ONLY when the derived unit is `complete-slice`. Boundary is per-slice; standalone `/forge-task` keeps its own step-5.5 review. After the gate, dispatch `forge-completer` normally.
 
+**Slice git guard (around complete-slice):** `complete-slice` never integrates a branch — that is `complete-milestone`'s competence (`agents/forge-completer.md § Git boundary — complete-slice`). Snapshot the checkout **before** dispatching, verify **after** the worker returns:
+
+```bash
+# before Agent("forge-completer", ...)
+node "$FORGE_SCRIPTS_DIR/forge-slice-git-guard.js" --snapshot --cwd "$CODE_DIR" --unit "complete-slice/{S##}" > /dev/null
+# after it returns
+node "$FORGE_SCRIPTS_DIR/forge-slice-git-guard.js" --verify --cwd "$CODE_DIR" --unit "complete-slice/{S##}"
+```
+
+The snapshot is written to `.gsd/forge/` on purpose — shell variables do not survive between Bash calls. Exit `3` = violation (moved checkout, advanced default branch, or new merge commit): print it LOUDLY to the operator with the offending detail, append a `slice-git-violation` event, and **do not push** — nothing is pushed yet, so `git reset --hard` on the default branch still recovers it. Verdict `inconclusive` means nothing was measurable (no git repo, unresolved default branch) and **must not** be read as clean. The guard never blocks the loop; it reports.
+
 **Review triage gate (before complete-milestone):** If `unit_type == complete-milestone`, run the milestone-final triage (`shared/forge-review.md § Step 9`) BEFORE dispatching `forge-completer`. In pure forge-next sessions OPEN items were already decided live per-slice, so this usually finds nothing and skips silently — it exists for mixed sessions (slices run under `forge-auto` with `ask_in_auto: defer`, milestone closed via `forge-next`): scan all `{S##}-REVIEW.md` for pending `deferido`/`falhou — deferida` items, triage each via `AskUserQuestion`, dispatch ONE `review-fix/{M###}-triage` for the `Refatorar agora` items (`Criar follow-up` items create an item per `shared/forge-review.md § Item capture`, source `review/{S##}/{R#}`, plus the pointer line in `.gsd/KNOWLEDGE.md § Review follow-ups`), write decisions back, append the `review-triage` event. Never blocks the close-out.
 
 **Plan-check gate (between plan-slice and first execute-task):**
