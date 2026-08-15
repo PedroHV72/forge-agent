@@ -216,8 +216,11 @@ is no run to deactivate.
 
    Saídas legítimas:
    1. Aguardar o commit da run counterpart e re-rodar esta unidade.
-      (Atenção: em S04 o claim NÃO é liberado pelo commit — ver § Over-block abaixo.)
-   2. Liberar o claim manualmente, com consciência do risco:
+      (O claim da counterpart é liberado quando o commit dela é OBSERVÁVEL — ver
+       § Release lifecycle abaixo. Para inspecionar sem gravar nada:
+         node scripts/forge-claim-release.js --status {counterpart run id} --cwd "{WORKING_DIR}" --json)
+   2. Escape hatch — liberar o claim manualmente, com consciência do risco (pula a
+      exigência de prova; use quando a árvore da counterpart não é mais sondável):
         node scripts/forge-write-claim.js --clear {counterpart run id} --cwd "{WORKING_DIR}"
    3. Ajustar as prefs: parallelism.cross_run_overlap (defer|block),
       parallelism.block_wait_ms, parallelism.block_poll_ms, parallelism.defer_cap.
@@ -227,17 +230,122 @@ is no run to deactivate.
 degrades into approval. If the operator wants the dispatch to happen anyway, they take exit 2 or 3
 above — an explicit, recorded human act.
 
-### Over-block between S04 and S05 is design, not a bug
+## Release lifecycle — a claim is worth exactly as much as the commit it is waiting for
 
-Between this gate going live (S04) and release-on-commit (S05), **claims are not released**. A
-counterpart that already committed and finished still holds its claim, so this gate will keep
-blocking against it. This is disclosed, not accidental: erring toward blocking is accepted, erring
-toward the incident is not.
+A claim that is never released is a fence that outlives its reason. This section replaces the S04
+disclosure that claims were held forever: **the claim now has a measured end of life**, and the
+measurement — never a presumption, never the clock alone — is what ends it.
 
-The only release that exists in S04 is natural overwrite — when the **same** run records the claim
-of its next unit, the previous one is replaced (the claim carries the current unit, by S03's
-design). An operator facing a persistent block after the counterpart has committed should either
-wait for S05 or clear the claim manually with `forge-write-claim.js --clear`, exit 2 above.
+The core is `scripts/forge-claim-release.js`; this section is its contract for consumers.
+
+### The three release mechanisms
+
+`released` is written into the `RunRecord` with the mechanism that produced it. The set is closed
+(`CLAIM_RELEASE_REASONS`), and precedence between reasons is fixed in the module:
+`released-explicit` > `released-committed` > `released-ttl-expired` > `held-probe-unavailable` >
+`held-uncommitted`.
+
+| mechanism | reason | what it means |
+|---|---|---|
+| `explicit` | `released-explicit` | the claim already carried the `released` envelope — an earlier corroborated release, or the operator's escape hatch (§ Step 4 exit 2). Nothing to measure, nothing to write. |
+| `committed` | `released-committed` | **the only positive proof of commit**: both probes below agreed. |
+| `ttl-expired` | `released-ttl-expired` | the net (D2): the `ttl + grace` window elapsed **and** the owning run was measured **inactive**. |
+
+### Two probes, and why the conjunction is the design
+
+Proof of commit requires **both**, always:
+
+- **A — the baseline advanced.** `baselineId(code_dir, {vcs})` differs from the `vcs_baseline.id`
+  recorded when the claim was written.
+- **B — the claimed paths left flight.** No path of the claim appears in `workingStatus(code_dir)`
+  with `kind ∈ {modified, added, deleted}`.
+
+Each probe **alone releases wrongly, in opposite directions**. A alone releases on the *neighbour's*
+commit in a shared tree — literally the SVN/WDMA scenario that originated this milestone, since the
+baseline is a property of the tree and not of this claim's work. B alone releases a claim whose
+worker **has not started writing**: zero dirty paths is indistinguishable from "committed
+everything" when nobody looks at the baseline. Relaxing to one probe is a regression, not a
+simplification, and both git and svn go through the same public seam of `scripts/forge-vcs.js` —
+the symmetry is deliberate, not a concession to SVN.
+
+### A question that could not be asked keeps the claim
+
+A probe returning `{ok:false}` (missing binary, vanished directory), a `code_dir: null`, an absent
+`vcs_baseline` or an unrecognised vcs yields `held-probe-unavailable` with the error **named** —
+never a `released-*`. Same polarity as D1/B2: an honest `null` over-blocks, a guess under-blocks,
+and this gate takes the former by decision. A release granted without proof hands back to the gate
+exactly the hole the gate exists to close.
+
+### TTL is a net, never a criterion of ownership (D2)
+
+A claim expires by TTL only when **both** hold: the `ttl + grace` window has elapsed
+(`DEFAULT_TTL_MS`/`DEFAULT_GRACE_MS` imported from `forge-unit-lease.js` — no new pref, no knob) and
+the owning run is **inactive** (predicate reused from `forge-filelock.js`). A live run never loses
+its claim to the clock: a legitimate 40-minute worker is byte-for-byte indistinguishable from a dead
+one if only the clock is consulted. The TTL sits **above** `held-probe-unavailable` in the
+precedence on purpose — a dead run whose tree vanished still has to get out of the way; that is what
+the net is for.
+
+### Released ≠ absent ≠ empty, at the gate
+
+A released claim **stays** in the `RunRecord`. The gate drops that counterpart from the universe
+with a **named** skip (`claim-released:committed` / `:ttl-expired` / `:explicit`), counted in the
+census — it never falls through to `claim-absent`, which would turn a release into
+`undeclared-writes` and make the release *worsen* the block it came to fix.
+
+### Where the release is asked for
+
+At the **unit boundary**, by both orchestrators, in Post-unit housekeeping — `skills/forge-auto`
+(step 6) and `skills/forge-next` (§ 6) — after the unit's own commit has had its chance to land, and
+by nobody else. `complete-slice` deliberately stays out of it (§ Step 5, `not_covered`).
+
+### The canonical release invocation
+
+One block. Consumers **invoke it by reference**; they do not restate it, do not re-tabulate the
+mechanisms, and do not invent flag combinations around it.
+
+```bash
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-claim-release.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
+
+RELEASE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-release.js" --release "$RUN_ID" \
+  ${CODE_DIR:+--code-dir "$CODE_DIR"} \
+  --cwd "$WORKING_DIR" \
+  --json)
+RELEASE_EXIT=$?
+
+if [ "$RELEASE_EXIT" -ne 0 ]; then
+  echo "ℹ️  Release do claim indisponível (exit $RELEASE_EXIT) — claim MANTIDO. O loop segue." >&2
+else
+  printf '%s' "$RELEASE_JSON" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let r;try{r=JSON.parse(d)}catch(e){console.error("ℹ️  Release do claim: JSON inválido — claim MANTIDO. O loop segue.");process.exit(0)}console.error(r.released?"✓ Claim liberado ("+r.reason+", mecanismo "+r.mechanism+") — run "+r.run+", unidade "+(r.unit||"(?)")+".":"ℹ️  Claim MANTIDO ("+r.reason+") — recusa: "+(r.refusal||"nenhuma")+". O loop segue.")})'
+fi
+```
+
+- `--release <run-id>` is the **request**. The module refuses it (`refusal: not-observable`, nothing
+  written) whenever the commit is not observable; `--status <run-id>` is the side-effect-free probe,
+  for the operator and for § Step 4's message.
+- `--cwd "$WORKING_DIR"` — always the workspace, where the registry and `events.jsonl` live, never
+  `CODE_DIR`.
+- `${CODE_DIR:+--code-dir "$CODE_DIR"}` — the **same B2 rule** as § Step 2: passed only with the
+  value the dispatch already resolved, omitted otherwise. A guessed `code_dir` here probes the wrong
+  tree, and a probe of the wrong tree can *release* — the failure is worse on this side than on the
+  gate's.
+- `--vcs <git|svn>` exists as an operator override of the recorded baseline's vcs; the orchestrators
+  do not pass it. No other flags exist — do not invent one.
+
+### Asking for the release is FAIL-SOFT — and that asymmetry with the gate is deliberate
+
+The pre-dispatch gate (§ Fail-closed) is **enforcing**: a mute gate is an approval nobody
+authorised, so `gate-unavailable` blocks, loudly. The release is the mirror image and therefore has
+the **opposite** posture:
+
+> **Asking for a release is measuring.** A measurement that cannot be taken leaves the claim
+> standing — which is the safe side, because a claim left standing only over-blocks, and the gate
+> already fails closed on the side that matters.
+
+So a non-zero exit, invalid JSON or a refused request **echoes one line and the loop continues**.
+It never stops the loop, never deactivates the run, and never escalates. Symmetry with the gate
+would be aesthetic and wrong: a release that stops the loop when the probe is unavailable would turn
+a *tidying* step into an outage.
 
 ## Step 5 — The event, and the mandatory enumeration
 
@@ -262,7 +370,7 @@ three boundaries, and the consumer **prints it** every time:
 
 | boundary | why it is not covered |
 |---|---|
-| `complete-slice` | releasing the claim at the completer collides with the IN-6 release (S05) |
+| `complete-slice` | the claim is released at the **unit boundary** (§ Release lifecycle), not by the completer — the completer never records, evaluates or releases a claim |
 | `orchestrator-writes` | the orchestrator's own `.gsd/**` writes do not pass through a claim |
 | `forge-task` | this milestone's Boundary Map limits the wiring to `forge-auto`/`forge-next`; `/forge-task` does not invoke the gate |
 
@@ -311,11 +419,14 @@ never defaulted to proceed.
 ## Cross-references
 
 - `scripts/forge-claim-gate.js` — the decision core and the CLI invoked in **§ Step 2**
+- `scripts/forge-claim-release.js` — the measured end of life of a claim and the CLI invoked in
+  **§ Release lifecycle** (`--release`, `--status`)
 - `scripts/forge-claim-overlap.js` — S03 confrontation algebra (`claimsConflict`, `codeDirScope`,
   `collectRunClaims`, `CONFLICT_CAUSES`, `CLAIM_NOTE_REASONS`)
 - `scripts/forge-write-claim.js` — claim record/read primitives and `--clear` (manual release,
   **§ Step 4** exit 2)
-- `shared/forge-dispatch.md § Cross-run claim gate` — pointer plus the `claim-gate` event fields
+- `shared/forge-dispatch.md § Cross-run claim gate` — pointer plus the `claim-gate` and
+  `claim-release` event fields
 - `shared/forge-review.md § Step 7a`, `§ Step 9` — the two `review-fix` call sites
 - `skills/forge-auto/SKILL.md`, `skills/forge-next/SKILL.md` — the two orchestrator consumers
 - `forge-agent-prefs.jsonc § Parallelism Settings` — `parallelism.{cross_run_overlap, block_wait_ms,

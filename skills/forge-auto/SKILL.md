@@ -1899,6 +1899,24 @@ Os seguintes requisitos planejados não foram entregues pela unidade anterior e 
 
 Also append this same section to `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-SUMMARY.md` (create section if not present; append if exists). Items pruned via PRUNE are excluded from the diff (already registered in CONTEXT — do not re-inject).
 
+**e-release) Ask for the claim release (unit boundary)** — runs after re-injection, before progress
+tracking. Applies to units that went through the claim gate of step 1.7 (`execute-task`,
+`review-fix`); skip otherwise.
+
+Run the **canonical release invocation** of `shared/forge-claim-gate.md § Release lifecycle`
+verbatim, with `RUN_ID`, `WORKING_DIR` and (per the B2 rule stated there) `CODE_DIR` bound to this
+dispatch's values. The mechanisms, the two probes, the TTL rule and the flag set live in that
+section — do not restate them here, and do not add flags it does not list.
+
+**Fail-soft, by decision.** Asking for a release is *measuring*; a measurement that cannot be taken
+leaves the claim standing, which is the safe side. A non-zero exit, invalid JSON or a refused
+request (`held: true`) echoes one line and the loop **continues** — it never stops the loop, never
+deactivates the run and never escalates. This is the deliberate opposite of the pre-dispatch gate of
+step 1.7, which is enforcing; the reason for the asymmetry is written in the spec section above.
+
+The `claim-release` event is written **by the module**, not narrated here
+(`shared/forge-dispatch.md § Event claim-release`).
+
 **e) Track progress:**
 ```
 session_units += 1

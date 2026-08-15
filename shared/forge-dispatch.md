@@ -164,6 +164,28 @@ ignore it.
 | `census` | `{runs_examined, counterparts_considered, counterparts_in_scope, skipped[], notes[]}` — anti-silence floor |
 | `not_covered[]` | the three boundaries this gate does not cover (`complete-slice`, `orchestrator-writes`, `forge-task`), each with a reason — present in **every** result, including `proceed` |
 
+### Event `claim-release` (additive fields, same convention)
+
+The claim's **end of life**. Appended to `.gsd/forge/events.jsonl` of `WORKING_DIR` **by
+`scripts/forge-claim-release.js` itself**, on every `--release` — including a **refused** one, since
+a refused request is information and silence here would reproduce the very defect this mechanism
+fights. Never hand-written by the orchestrator. Readers that do not recognise a field ignore it.
+
+Procedure, mechanisms and the fail-soft posture of the request live in
+**`shared/forge-claim-gate.md § Release lifecycle`**, once; this table is the reader's schema only.
+
+| field | meaning |
+|---|---|
+| `event` | always `claim-release` |
+| `ts` | ISO-8601 timestamp |
+| `run` | the run whose claim was probed |
+| `unit` | the unit string carried by the claim, verbatim (`null` when no claim) |
+| `held` | `true` = the claim survives the request; `false` = it was released |
+| `reason` | closed set: `released-explicit` \| `released-committed` \| `released-ttl-expired` \| `held-probe-unavailable` \| `held-uncommitted` — fixed precedence, never substituted for one another |
+| `mechanism` | `explicit` \| `committed` \| `ttl-expired` \| `null` (always `null` when `held: true`) |
+| `probes` | `{baseline_before, baseline_now, baseline_advanced, paths_in_flight, dirty_paths, age_ms, ttl_expired, owner_active, probe_error}` — the facts the verdict was taken on; a `null` probe means *not asked*, never *false* |
+| `code_dir` | the tree that was probed, or `null` (B2: an absent `code_dir` keeps the claim) |
+
 ---
 
 ## Spawn Liveness Banner

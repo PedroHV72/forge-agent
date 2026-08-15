@@ -1600,6 +1600,21 @@ Os seguintes requisitos planejados não foram entregues pela unidade anterior e 
 
 Also append this same section to `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-SUMMARY.md`.
 
+**d-release) Ask for the claim release (unit boundary)** — runs after the re-injection diff, before
+isolation cleanup. Applies to units that went through the claim gate (`execute-task`, `review-fix`);
+skip otherwise.
+
+Run the **canonical release invocation** of `shared/forge-claim-gate.md § Release lifecycle`
+verbatim, with `RUN_ID`, `WORKING_DIR` and (per the B2 rule stated there) `CODE_DIR` bound to this
+dispatch's values. Mechanisms, probes, TTL rule and flag set live in that section — do not restate
+them here, and do not add flags it does not list.
+
+**Fail-soft, by decision.** Asking for a release is *measuring*; a measurement that cannot be taken
+leaves the claim standing, which is the safe side. A non-zero exit, invalid JSON or a refused
+request (`held: true`) echoes one line and the flow **continues** — the deliberate opposite of the
+pre-dispatch gate, which is enforcing. The `claim-release` event is written **by the module**
+(`shared/forge-dispatch.md § Event claim-release`), never narrated here.
+
 **e) Isolation cleanup (complete-milestone only)** — if the unit just processed was `complete-milestone` with `status: done`, release the isolation. No-op when `ISOLATION_MODE == shared`; `branch` mode checks the repo back out to the default branch (the `forge/{run}` branch is kept for PR/merge); `worktree` mode removes the worktree only if `worktree_cleanup_on_complete: true` in prefs. Never run this on partial/blocked — the branch/worktree must survive for resume:
 ```bash
 node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --cleanup --run "$ISO_RUN" --cwd "$WORKING_DIR" || true
