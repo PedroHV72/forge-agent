@@ -577,9 +577,11 @@ function compareDefaultCandidates(swiftSrc, jsNames) {
 /** Throwaway repo in tmp. Never touches the operator's repos. */
 function tmpRepo(tag, init) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `forge-gitdef-${tag}-`));
-  const git = (...args) => execFileSync('/usr/bin/git', ['-C', dir, ...args],
+  // `git` resolvido pelo PATH, nunca um caminho POSIX absoluto: `/usr/bin/git`
+  // não existe no Windows e derrubava esta suíte inteira com ENOENT no CI.
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args],
                                         { stdio: 'ignore' });
-  execFileSync('/usr/bin/git', ['init', '-q', '-b', init, dir], { stdio: 'ignore' });
+  execFileSync('git', ['init', '-q', '-b', init, dir], { stdio: 'ignore' });
   git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
   fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
   git('add', 'a.txt'); git('commit', '-qm', 'x');

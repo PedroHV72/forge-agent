@@ -110,6 +110,54 @@ test('--check all stays exit 0 with overlap present (advisory never flips allOk)
   }
 });
 
+// ── R5 (S05 review, arbitrated): inconclusive/overlap warn, never show ✓ ────
+
+test('--check run-overlap shows ⚠ (never ✓) on an inconclusive verdict', () => {
+  const root = mkTmp('t03-inconclusive-glyph');
+  try {
+    fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+    // Exactly one comparable run -> n*(n-1)/2 === 0 pairs -> inconclusive.
+    writeRun(root, 'RUN-A', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/inconclusive/.test(r.stdout), 'setup: verdict must actually be inconclusive');
+    assert.ok(/⚠ Advisory — Cross-run overlap/.test(r.stdout), 'inconclusive must warn, never show ✓');
+    assert.ok(!/✓ Advisory — Cross-run overlap/.test(r.stdout), 'inconclusive must not render ✓');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--check run-overlap shows ⚠ (never ✓) when overlap is present', () => {
+  const root = mkTmp('t03-overlap-glyph');
+  try {
+    fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+    writeRun(root, 'RUN-A', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    writeRun(root, 'RUN-B', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/⚠ Advisory — Cross-run overlap/.test(r.stdout), 'overlap must warn (unchanged behavior)');
+    assert.ok(!/✓ Advisory — Cross-run overlap/.test(r.stdout), 'overlap must not render ✓');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--check run-overlap shows ✓ (positive control) on a genuinely clean verdict', () => {
+  const root = mkTmp('t03-clean-glyph');
+  try {
+    fs.mkdirSync(path.join(root, '.gsd'), { recursive: true });
+    writeRun(root, 'RUN-A', { touched: touchedOf([repoEntry('freyr', ['src/a.ts'])]) });
+    writeRun(root, 'RUN-B', { touched: touchedOf([repoEntry('freyr', ['src/z.ts'])]) });
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `must exit 0, got ${r.status}: ${r.stderr}`);
+    assert.ok(/\bclean\b/.test(r.stdout), 'setup: verdict must actually be clean');
+    assert.ok(/✓ Advisory — Cross-run overlap/.test(r.stdout), 'a real clean verdict DOES still show ✓ (positive control)');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── 2. ok:true on all three paths ───────────────────────────────────────────
 
 test('checkRunOverlap ok:true — no runs registry (skip path)', () => {
@@ -271,19 +319,67 @@ test('checkRunOverlap mutates no RunRecord — SHA-256 identical before/after, r
     };
     assert.deepStrictEqual(before, after, 'RunRecord files must be byte-identical before/after --check');
 
-    // The operator's real registry (this repo's own ~/.claude-independent
-    // .gsd/forge/runs/) must not be touched either. Compare mtimeMs where the
-    // registry exists; skip with a named reason when it does not (fresh
-    // checkout / CI), never assert blindly against an absent path.
+    // Prove non-mutation against data with the REAL operator registry's shape,
+    // WITHOUT reading the live `.gsd/forge/runs/` during the measurement —
+    // that live dir is legitimately written by any active forge-auto's
+    // heartbeat (item I-20260814113610: ~1 failure in 3 measured with a
+    // concurrent writer). Instead: copy the real files into an isolated tmp
+    // root BEFORE the check, run the check against the copy, and compare the
+    // copy before/after. Concurrent writes to the live dir after the copy is
+    // taken cannot affect the isolated snapshot.
     const realRunsDir = path.join(REPO_ROOT, '.gsd', 'forge', 'runs');
-    if (fs.existsSync(realRunsDir)) {
-      const files = fs.readdirSync(realRunsDir).filter(f => f.endsWith('.json'));
-      const mtimesBefore = files.map(f => fs.statSync(path.join(realRunsDir, f)).mtimeMs);
-      spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', REPO_ROOT], { encoding: 'utf8' });
-      const mtimesAfter = files.map(f => fs.statSync(path.join(realRunsDir, f)).mtimeMs);
-      assert.deepStrictEqual(mtimesBefore, mtimesAfter, 'operator registry mtimes must not change');
-    } else {
+    if (!fs.existsSync(realRunsDir)) {
       process.stdout.write('    (skip: real .gsd/forge/runs/ absent in this checkout)\n');
+    } else {
+      const realFiles = fs.readdirSync(realRunsDir).filter(f => f.endsWith('.json'));
+      if (realFiles.length === 0) {
+        process.stdout.write('    (skip: real .gsd/forge/runs/ present but empty in this checkout)\n');
+      } else {
+        const isoRoot = mkTmp('t03-overlap-real-shape');
+        try {
+          const isoRunsDir = path.join(isoRoot, '.gsd', 'forge', 'runs');
+          fs.mkdirSync(isoRunsDir, { recursive: true });
+          for (const f of realFiles) {
+            fs.copyFileSync(path.join(realRunsDir, f), path.join(isoRunsDir, f));
+          }
+
+          const isoSha256 = () => {
+            const out = {};
+            for (const f of realFiles) out[f] = sha256(path.join(isoRunsDir, f));
+            return out;
+          };
+          const isoMtimes = () => realFiles.map(f => fs.statSync(path.join(isoRunsDir, f)).mtimeMs);
+
+          const shaBefore = isoSha256();
+          const mtimesBefore = isoMtimes();
+
+          spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'run-overlap', '--cwd', isoRoot], { encoding: 'utf8' });
+
+          const shaAfter = isoSha256();
+          const mtimesAfter = isoMtimes();
+          assert.deepStrictEqual(shaBefore, shaAfter, 'isolated copy of real-shaped registry must be byte-identical before/after --check');
+          assert.deepStrictEqual(mtimesBefore, mtimesAfter, 'isolated copy mtimes must not change (no mutation)');
+
+          // Positive control: the assert must still bite. Mutate one file of
+          // the isolated copy deliberately and confirm the SAME comparison
+          // fails — an immutability assert without a positive control is
+          // indistinguishable from an assert that inspects nothing (this
+          // milestone's S05 anti-silence-floor precedent).
+          const targetFile = path.join(isoRunsDir, realFiles[0]);
+          const shaBeforeMutation = sha256(targetFile);
+          fs.appendFileSync(targetFile, '\n// mutated for positive control\n');
+          const shaAfterMutation = sha256(targetFile);
+          let mutationCaught = false;
+          try {
+            assert.deepStrictEqual(shaBeforeMutation, shaAfterMutation, 'positive control must detect this mutation');
+          } catch {
+            mutationCaught = true;
+          }
+          assert.ok(mutationCaught, 'positive control: deliberate mutation of the isolated copy must be detected by the same comparison');
+        } finally {
+          fs.rmSync(isoRoot, { recursive: true, force: true });
+        }
+      }
     }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

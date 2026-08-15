@@ -105,6 +105,9 @@ const INVENTORY = [
   // — parallelism —
   { key: 'parallelism.max_concurrent', type: 'integer', default: 3, source: 'shared/forge-dispatch.md:1979 "integer 1–8; default 3"' },
   { key: 'parallelism.cross_run_overlap', type: 'string', default: 'defer', source: 'forge-agent-prefs.md § Parallelism + shared/forge-dispatch.md § Parallel Task Execution' },
+  { key: 'resources.enforcement', type: 'string', default: 'clamp', source: 'scripts/forge-resources.js:195,200 (readResourcePrefs defaults + read)' },
+  { key: 'resources.shadow_wait', type: 'boolean', default: true, source: 'scripts/forge-resources.js:195,201 (readResourcePrefs defaults + read)' },
+  { key: 'resources.wait_cap_ms', type: 'integer', default: 30000, source: 'scripts/forge-resources.js:195,202 (readResourcePrefs defaults + read)' },
   // — retry —
   { key: 'retry.max_transient_retries', type: 'integer', default: 3, source: 'shared/forge-dispatch.md § Retry Handler (per-unit cap 3)' },
   { key: 'retry.base_backoff_ms', type: 'integer', default: 2000, source: 'shared/forge-dispatch.md § Retry Handler' },

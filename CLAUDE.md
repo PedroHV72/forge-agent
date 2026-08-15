@@ -709,13 +709,10 @@ run `--runtime claude` não derrubar os destinos do Codex.
 
 ## Estado atual
 
-- **Milestone ativo:** — nenhum. **M018** (Sidecar multi-LLM autônomo via `codex app-server`) fechada, **mergeada na `master`** em `eaeb556` (fast-forward) e pushada para `origin/master`.
-- **Fase:** idle.
-- **Última entrega:** M018, 7 slices. Cliente JSON-RPC/stdio para `codex app-server` substitui o `codex exec` — a **ausência** do transporte antigo é provada por scanner in-process (`forge-exec-callsites.js`: `outcome: clean`, 312 arquivos, 0 call sites), não afirmada. Mais: schema pinado + guard de drift que nomeia o campo divergente, capability por turn, evidência de primeira classe com piso anti-silêncio, cobertura de env por reason (dois promovidos a exit code observado, três textuais com razão nomeada), e `turn/interrupt` antes do SIGKILL.
-- **Consertos pós-triagem, no mesmo commit:** rota inerte do `worker:` família (um `claude` nu resolvia para alias nulo e a task caía no default do frontmatter, ignorando o modelo do tier); Dimensão 9 do plan-checker (`.gsd/**` × `dispatch_engine`); Branch C marcando `status: DONE` no plano que completou; a mensagem de reparo do `SubagentStop`, que mandava o agente emitir **só** o bloco de resultado — obedecida ao pé da letra, custou 6 defesas do advogado, três voltando como placar nu; e o guard `nested-top-level-key`, achado por dogfood num workspace de dois repos onde **2 de 3 planos** aninhavam `expected_output` sob `must_haves:`, o validador chamava os três de válidos, e o resolvedor de `CODE_DIR` via zero paths.
-- **Baselines medidas na master pós-merge (medidas, não afirmadas):** `node scripts/run-tests.js` → **111 suítes**; `node scripts/forge-smoke.js` → **2502 passed / 0 failed / 1 skipped**; `cd app && swift run ForgeKitTests` → **515 passed / 0 failed**.
-- **Cópias instaladas:** `~/.claude` sincronizado com a master via `install.sh --update`, conferido arquivo a arquivo com `cmp`. Backup em `~/.claude-backup-20260807-231632`.
-- **Próxima ação:** Operador. Quatro itens em aberto, deliberadamente não corrigidos: (1) `GitActivity.Glob` (`app/Sources/ForgeKit/GitActivity.swift:219-227`) casa `X/**` **ancorado na raiz**, enquanto `agents/forge-completer.md:151` afirma prefixo-de-segmento em qualquer profundidade para a **mesma** lista de ignore — divergência medida por probe Swift temporário; (2) o comentário em `app/Sources/ForgeKitTests/main.swift:3086` afirma uma profundidade que o caso não exercita; (3) **S06 R7** (`scripts/forge-reverify.js:181-190`, o atalho de cardinalidade) segue **sem disposição nomeada** — nem corrigida nem listada como follow-up na triagem; (4) o dogfood real num workspace multi-repo de produção ainda não rodou — o `fs-probe` foi provado em umbrella sintético, não no projeto onde a falha 4/4-em-Claude foi medida.
+- **Milestone ativo:** M-20260813221024-controle-recursos — **Concluído** (6/6 slices).
+- **Fase:** complete — todos os 6 slices terminados, LEDGER entry gravada, branch pronto para PR.
+- **Status:** 32 commits no branch `forge/M-20260813221024-controle-recursos` (intentionally unmerged per operator's documented PR workflow). Medição honesta-negativa: baseline não reproduziu, ganho não apareceu, enforcement provado ativo 12/12 child-side. Review dialético: 46 objections, 38 concedidas, 0 abertas ao fecho. Flakies I-20260802213721 e I-20260814113610 consertados na raiz.
+- **Próxima ação:** Operador abre PR de `forge/M-20260813221024-controle-recursos` para master.
 
 ## GSD — Início de sessão obrigatório (dogfood)
 
