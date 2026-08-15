@@ -35,7 +35,13 @@ function isWithin(root, candidate) {
 // Ordered registry — order IS precedence (first match for a given span wins).
 // `name`s are LOCKED: T02 prints them, T03 asserts against them.
 // Uses [ \t], never \s — do not cross newlines (MEM004 precedent). \Z does not exist in JS.
-const CODE_EXT = '(?:js|mjs|cjs|ts|tsx|jsx|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg)';
+// Measured, narrow widening (2026-08-15): jsonl|jsonc|txt|swift added for real
+// misses counted in the store (`events.jsonl` x3, `.gsd/forge-prefs.jsonc`,
+// `seed.txt`, `GitActivity.swift` x2). citations_total moved 142 -> 150 on this
+// workspace — no explosion (the 311 -> 972 precedent below was an ANY-suffix
+// widening, not a closed-list addition). `jsonl|jsonc` sit before `json` for
+// clarity only; the trailing guards already force the longest alternative.
+const CODE_EXT = '(?:js|mjs|cjs|ts|tsx|jsx|jsonl|jsonc|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg|txt|swift)';
 
 const CITATION_REGEXES = [
   {
@@ -113,8 +119,10 @@ const CITATION_REGEXES = [
 // CODE_EXT para qualquer sufixo transformaria palavras pontuadas em citações
 // irresolúveis (o precedente medido foi 311 -> 972). Permanecem reportados em
 // `coverage.citation_gaps` e na saída F2 como menções perdidas, nunca ocultados
-// para melhorar a métrica. Exemplo motivador: `config.weird` (mem_id sintético
-// `mem-gap-extension-outside-code-ext`).
+// para melhorar a métrica. Exemplo motivador: `config.py` (mem_id sintético
+// `mem-gap-extension-outside-code-ext`) — uma extensão REAL fora de CODE_EXT.
+// (`config.weird` deixou de servir de exemplo: o detector F2 agora enumera
+// sufixos que não são extensão de arquivo real como ruído do instrumento.)
 const CITATION_GAPS = [
   {
     name: 'extension-outside-code-ext',
