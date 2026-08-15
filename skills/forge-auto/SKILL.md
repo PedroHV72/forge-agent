@@ -538,6 +538,70 @@ Skill({ skill: "forge-security", args: "{M###} {S##} {T##}" })
 ```
 The produced `T##-SECURITY.md` will be injected into that task's worker prompt as `## Security Checklist`. Skills run in the orchestrator context — loop them serially (fast enough; each is short) before dispatching the batch in parallel.
 
+**Cross-run claim gate (step 1.7 — execute-task and review-fix; ENFORCING, not advisory):** If `unit_type == execute-task`, before dispatching, fence every task in `BATCH` against the write claims of every other active run sharing the same `CODE_DIR`. Authoritative spec: `shared/forge-claim-gate.md` — this block only **invokes** it; the decision table, the causes and the escalation procedure are formula-once there and are never restated here (S04-PLAN contract #1). This gate is distinct from the Overlap advisory right below: that one is a **post-work, pre-merge signal** (touch/overlap, advisory, never blocks); this one is a **pre-dispatch fence** (claim, enforcing, stops the unit).
+
+Batch order (spec § Step 1 — fixed, not an implementation detail): (1) record the union of the whole ready `BATCH` first, as one claim, before evaluating anything; (2) evaluate per task, each against the counterpart universe; (3) drop every task whose decision is not `proceed`; (4) re-record the union of the survivors.
+
+```bash
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-claim-gate.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
+
+# B2: --code-dir carries ONLY a value THIS dispatch already resolved. At this point (step 1.7 runs
+# BEFORE Step 4's per-unit CODE_DIR resolution) only `shared` isolation already has one — WORKING_DIR
+# itself. `worktree`/`branch` modes have not resolved the per-unit CODE_DIR yet, so the flag is
+# omitted here on purpose (code_dir: null -> scope unknown -> fail closed, spec contract #7). NEVER
+# $WORKTREE_DIR, NEVER a value derived from root+branch+isolation_mode (explicitly prohibited).
+GATE_CODE_DIR_FLAG=""
+[ "$ISOLATION_MODE" = "shared" ] && [ -n "$CODE_DIR" ] && GATE_CODE_DIR_FLAG="--code-dir $CODE_DIR"
+
+# 1. Union of the whole ready batch, recorded BEFORE any evaluation (visible fence, contract #6).
+BATCH_UNION_PATHS="[]"
+for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id, planPath}
+  ONE=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --evaluate --plan "$WORKING_DIR/${ENTRY_PLAN_PATH}" \
+    --run "$RUN_ID" --cwd "$WORKING_DIR" --json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.stringify(JSON.parse(d).claim.paths||[]))}catch(e){process.stdout.write('[]')}})")
+  BATCH_UNION_PATHS=$(node -e "const a=JSON.parse(process.argv[1]),b=JSON.parse(process.argv[2]);process.stdout.write(JSON.stringify(Array.from(new Set([...a,...b]))))" "$BATCH_UNION_PATHS" "$ONE")
+done
+BATCH_IDS_CSV=$(node -e "process.stdout.write(process.argv.slice(1).join(','))" "${BATCH_TASK_IDS[@]}")
+BATCH_PATHS_CSV=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).join(','))" "$BATCH_UNION_PATHS")
+node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check --paths "$BATCH_PATHS_CSV" --source manual \
+  --run "$RUN_ID" --unit "BATCH:$BATCH_IDS_CSV" $GATE_CODE_DIR_FLAG --ready-alternatives 0 \
+  --cwd "$WORKING_DIR" --json > /dev/null
+
+# 2. Evaluate per task, --ready-alternatives = (tasks ready remaining in BATCH − 1).
+REMAINING=$(( ${#BATCH[@]} - 1 ))
+for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id: T##, planPath}
+  GATE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check \
+    --run "$RUN_ID" --unit "execute-task/${ENTRY_ID}" --source plan-writes \
+    --plan "$WORKING_DIR/${ENTRY_PLAN_PATH}" $GATE_CODE_DIR_FLAG \
+    --ready-alternatives "$REMAINING" --cwd "$WORKING_DIR" --json)
+  GATE_EXIT=$?
+  REMAINING=$((REMAINING - 1))
+  # Fail-closed (spec § Fail-closed): exit != 0 or non-JSON stdout -> block/gate-unavailable, LOUD.
+  if [ "$GATE_EXIT" -ne 0 ] || ! printf '%s' "$GATE_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{JSON.parse(d);process.exit(0)}catch(e){process.exit(1)}})"; then
+    echo "⛔ Claim gate indisponível (exit $GATE_EXIT) para ${ENTRY_ID} — tratando como block/gate-unavailable. Nenhum dispatch." >&2
+    # 3-decision -> block: checkpoint + deactivate this run + actionable message, per § Step 4 below. STOP.
+  fi
+  # Parse .decision / .cause / .escalation / .not_covered / .counterparts.
+  # proceed -> keep ${ENTRY_ID} in BATCH.
+  # defer   -> drop ${ENTRY_ID} from BATCH; echo "⤳ ${ENTRY_ID} adiada — claim overlap com run {counterpart id}".
+  # block   -> the module already polled to the ceiling (--wait was NOT passed above; auto mode invokes
+  #            with --wait only when the posture is block — add --wait to the invocation when posture ==
+  #            block per spec § Step 2/3). If .escalation is set -> § Step 4 (Account Handoff form) below.
+  #            Otherwise: stop this task only, do not dispatch.
+  # refuse  -> stop this task, surface .cause; do not retry (waiting cannot fix it).
+  # Echo the 3 `.not_covered` boundaries once per slice (first execution of this gate in the session).
+done
+
+# 3. Drop non-proceed tasks from BATCH (step above already marks them). 4. Re-record the union of the
+# survivors — only needed when at least one task was dropped; skip re-recording an unchanged batch.
+if [ "$BATCH_CHANGED" = "1" ] && [ ${#BATCH[@]} -gt 0 ]; then
+  # Recompute the union exactly as step 1 above, over the SURVIVING BATCH only, then --claim-and-check
+  # again with the same "BATCH:<csv>" unit form (now naming only the survivors).
+  : # (same shape as step 1, restricted to survivors — omitted here for brevity, not a new procedure)
+fi
+```
+
+**Escalation (`wait-ceiling`/`defer-cap`, or any `block`/`refuse` that stops a run):** follow spec § Step 4 in the **Account Handoff Procedure** form (below) — checkpoint (`continue.md`), deactivate this run (same deactivation the pause path uses — the event was already written by `--claim-and-check`, do not hand-write a second line), emit the actionable message naming the counterpart run, cause, paths and the three legitimate exits from the spec. **The loop STOPS, it never dispatches** — this is the same CRITICAL rule as the isolation-setup and Account Handoff failures above: when dispatch cannot happen, stop and surface, executing inline is never a fallback.
+
 **Overlap advisory (before complete-slice):** grave o toque desta run e confronte com as demais runs ativas — o sinal existe para ser visto **antes do merge**.
 ```bash
 node "{WORKING_DIR}/scripts/forge-touch.js" --record "{RUN_ID}" --cwd "{WORKING_DIR}" || true
@@ -559,7 +623,7 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
    - Rebuttal × `rounds` → `forge-reviewer` in rebuttal mode (DEFENSE injected)
    - The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literals are a violation detected by `forge-review-audit.js`.
    - Resolve (Step 5 truth table), write `{S##}-REVIEW.md` (Step 6).
-   - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty.
+   - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; **before dispatching**, run the cross-run claim gate exactly as `shared/forge-review.md § Step 7a` prescribes (it in turn references `shared/forge-claim-gate.md § Step 1` for the `--conceded` claim derivation — the path derivation is not repeated here); dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty and the gate decision is `proceed`.
    - **OPEN items → posture (Step 7b):** `ask_in_auto: defer` (default) marks each `**Decisão:** deferido → triagem no fim da milestone` and continues WITHOUT pausing — they are guaranteed to surface at the milestone-final triage gate below. `pause` (opt-in) asks per-slice via `AskUserQuestion`.
    - Append the `review` event to `events.jsonl` (Step 8).
 4. The gate **never blocks** — any `Agent()` throw is recorded and the loop proceeds to `complete-slice` regardless.
@@ -587,7 +651,7 @@ The snapshot is written to `.gsd/forge/` on purpose — shell variables do not s
 1. Scan all `{S##}-REVIEW.md` under `.gsd/milestones/{M###}/slices/*/` for pending items: `Decisão: deferido → triagem no fim da milestone`, `Correção: falhou — deferida para triagem final`, or legacy `Decisão: deferido (auto-mode)`.
 2. Zero pending → skip silently and dispatch `complete-milestone` normally.
 3. Otherwise **fire push (call-site 2):** use Push helper with message `"Forge {RUN_ID} — {N} item(ns) de review aguardam sua triagem antes de fechar a milestone."` (N = count of pending items). Then print the digest table (slice · R# · path:line · objeção · status) and triage each item via `AskUserQuestion` (batched up to 4, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
-4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (slices already merged — fixes are normal commits). Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items create an item per `shared/forge-review.md § Item capture` (source `review/{S##}/{R#}`, status `inbox`, provenance from the digest row) and append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing — this survives `milestone_cleanup`; the item is the single destination for full content).
+4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (slices already merged — fixes are normal commits). **Before dispatching**, run the cross-run claim gate exactly as `shared/forge-review.md § Step 9` prescribes (it references `shared/forge-claim-gate.md § Step 1` for the `--conceded` claim derivation of the triage items — not repeated here); dispatch only when the gate decision is `proceed`. Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items create an item per `shared/forge-review.md § Item capture` (source `review/{S##}/{R#}`, status `inbox`, provenance from the digest row) and append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing — this survives `milestone_cleanup`; the item is the single destination for full content).
 5. Append the `review-triage` event to `events.jsonl`. The triage **never blocks** the milestone close-out.
 
 > **This gate is the explicit exception to the AUTONOMY RULE** — at this point every slice is done; asking the operator here is the designed arbitration moment that `defer` postponed to. It does not fire on pause/blocked/partial exits — only when the derived unit is `complete-milestone`.
