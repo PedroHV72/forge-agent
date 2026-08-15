@@ -407,16 +407,19 @@
         },
         "block_wait_ms": {
           "type": "integer",
+          "minimum": 1,
           "default": 300000,
           "description": "Teto de UMA espera bloqueante do claim gate (--wait): re-avalia por poll até este limite. Atingido o teto, o gate ESCALA ao operador com escalation wait-ceiling mantendo a decisão block — nunca degrada para prosseguir (D3/W6). Lido por scripts/forge-claim-gate.js (readParallelism)."
         },
         "block_poll_ms": {
           "type": "integer",
+          "minimum": 1,
           "default": 15000,
           "description": "Intervalo entre re-avaliações do claim gate durante a espera bloqueante (--wait). Se o conflito limpa durante o poll, a decisão vira proceed; expiração nunca vira proceed. Lido por scripts/forge-claim-gate.js (readParallelism)."
         },
         "defer_cap": {
           "type": "integer",
+          "minimum": 1,
           "default": 3,
           "description": "Máximo de deferimentos CONSECUTIVOS da mesma unidade (contados em .gsd/forge/claim-gate-defers.json; um proceed reseta o contador). Excedido, o gate ESCALA ao operador com escalation defer-cap e decisão block — esperar deixou de ser produtivo e o gate nunca degrada para prosseguir (D3/W6). Lido por scripts/forge-claim-gate.js (readParallelism)."
         }

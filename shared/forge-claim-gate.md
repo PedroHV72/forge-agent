@@ -71,11 +71,22 @@ list from a plan it read itself.
 **A batch of ready tasks (forge-auto parallel dispatch).** The order is fixed and is not an
 implementation detail:
 
-1. Record the **union** of the whole ready batch first, as one claim, before evaluating anything.
-2. Evaluate **per task**, each against the counterpart universe.
+1. Record the **union** of the whole ready batch first, as one claim, before evaluating anything
+   (`--claim-and-check --paths <union csv> --unit "BATCH:<ids csv>"`). The union itself is derived
+   with one `--evaluate --plan <path>` per member, reading `.claim.paths` from each result — a
+   derivation that fails is **fail-closed** (`gate-unavailable`), never an empty union.
+2. Evaluate **per task** with **`--check-only`**, each against the counterpart universe.
 3. Drop every task whose decision is not `proceed` from the batch.
 4. Re-record the union of the **survivors**, so the persisted claim describes what will actually
-   run.
+   run. **Zero survivors is a named case:** nothing is dispatched, so the run must hold no fence —
+   clear the claim (`forge-write-claim.js --clear`) instead of leaving the original union standing.
+
+**Why `--check-only` and not `--claim-and-check` in the loop.** `recordClaim` is a **single slot**
+(`forge-write-claim.js` — `runs.update({ write_claim })` replaces wholesale). A per-task
+`--claim-and-check` would therefore destroy the union recorded in item 1 two lines after writing it,
+and each task would be confronted while the RunRecord described only that task. `--check-only`
+evaluates the derived claim and **emits the event** (so item 1's visibility rule and § Step 5's
+"the event is written by code" both hold) while **preserving** the persisted claim.
 
 Why: recording the union first makes the fence visible to a symmetric run during the window in which
 this run is still deciding (contract #6 — an invisible fence does not fence). Re-recording after the
@@ -112,17 +123,23 @@ GATE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check \
 GATE_EXIT=$?
 ```
 
-- `--claim-and-check` (never `--evaluate`) is the operational entry point: it **records the claim
-  before evaluating** and emits the `claim-gate` event. `--evaluate` neither records nor logs and
-  exists for inspection and tests.
+- `--claim-and-check` is the operational entry point for a **single** unit: it **records the claim
+  before evaluating** and emits the `claim-gate` event. Its batch sibling is `--check-only`, which
+  evaluates and emits the event but **preserves** the persisted claim (see § Step 1). `--evaluate`
+  neither records nor logs; it is for inspection, tests, and for deriving a claim's paths
+  (`.claim`, present on all three modes) when computing a batch union. A decision that gates a
+  dispatch is never taken on `--evaluate`.
 - `--source` is `plan-writes` for `execute-task` and `review-fix-paths` for `review-fix`; substitute
   `--plan "$PLAN_PATH"` with `--conceded "@$ITEMS_JSON_FILE"` at the review-fix call sites.
 - `--cwd "$WORKING_DIR"` — always the workspace, never `CODE_DIR`.
 - `--ready-alternatives` is computed **by the consumer** (how many other units it could dispatch
   right now instead). It is what makes the D3 floor meaningful; when the consumer does not know, the
   honest value is `0`, which fails closed.
-- `--wait` is added **only** when the effective posture is `block` and the consumer is willing to
-  spend the wait inside its own tool call (see **§ Step 3**, `block` row). The module polls up to
+- `--wait` is added by any consumer willing to spend the wait inside its own tool call (see
+  **§ Step 3**, `block` row). `MODE == auto` passes it **unconditionally**: the module polls only
+  when the decision is `block`, which is behaviourally identical to "when the effective posture is
+  `block`" — and § Step 0 forbids the consumer from pre-reading the posture pref, so a conditional
+  flag would be unactionable. The module polls up to
   `parallelism.block_wait_ms`; expiry becomes the `wait-ceiling` escalation and **never** becomes
   `proceed`.
 - `--json` always: the consumer parses `.decision`, `.cause`, `.escalation`, `.census`,
@@ -150,7 +167,7 @@ on it by reference.**
 |---|---|---|
 | `proceed` | Dispatch normally. | Dispatch normally. |
 | `defer` | Drop this task from the ready batch, echo one line naming the counterpart and the colliding paths, and continue with the rest of the batch. Never dispatch it this pass. | Try another ready unit if one exists; otherwise surface the collision to the operator with the instruction to re-run once the counterpart commits. |
-| `block` | Invoke with `--wait`: the module already polled to the ceiling before returning. Stop this unit. If `escalation` is set → **§ Step 4**. | Surface immediately (no wait — a human is present and waiting silently is worse than telling them): name the counterpart run, the paths, and the legitimate exits from **§ Step 4**. |
+| `block` | `--wait` is always passed, so the module already polled to the ceiling before returning. Stop this unit. If `escalation` is set → **§ Step 4**. | Surface immediately (no wait — a human is present and waiting silently is worse than telling them): name the counterpart run, the paths, and the legitimate exits from **§ Step 4**. |
 | `refuse` | Stop this unit, surface the cause, do not retry — waiting cannot fix it. | Same, plus the concrete repair. |
 
 `escalation` is a **field**, never a fifth decision: the decision stays `block`/`defer` and the

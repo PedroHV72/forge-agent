@@ -553,23 +553,50 @@ FORGE_SCRIPTS_DIR=$([ -f scripts/forge-claim-gate.js ] && echo scripts || echo "
 GATE_CODE_DIR_FLAG=""
 [ "$ISOLATION_MODE" = "shared" ] && [ -n "$CODE_DIR" ] && GATE_CODE_DIR_FLAG="--code-dir $CODE_DIR"
 
-# 1. Union of the whole ready batch, recorded BEFORE any evaluation (visible fence, contract #6).
-BATCH_UNION_PATHS="[]"
-for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id, planPath}
-  ONE=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --evaluate --plan "$WORKING_DIR/${ENTRY_PLAN_PATH}" \
-    --run "$RUN_ID" --cwd "$WORKING_DIR" --json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.stringify(JSON.parse(d).claim.paths||[]))}catch(e){process.stdout.write('[]')}})")
-  BATCH_UNION_PATHS=$(node -e "const a=JSON.parse(process.argv[1]),b=JSON.parse(process.argv[2]);process.stdout.write(JSON.stringify(Array.from(new Set([...a,...b]))))" "$BATCH_UNION_PATHS" "$ONE")
-done
-BATCH_IDS_CSV=$(node -e "process.stdout.write(process.argv.slice(1).join(','))" "${BATCH_TASK_IDS[@]}")
-BATCH_PATHS_CSV=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).join(','))" "$BATCH_UNION_PATHS")
-node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check --paths "$BATCH_PATHS_CSV" --source manual \
-  --run "$RUN_ID" --unit "BATCH:$BATCH_IDS_CSV" $GATE_CODE_DIR_FLAG --ready-alternatives 0 \
-  --cwd "$WORKING_DIR" --json > /dev/null
+# Claim extraction, used by every union computation below. `--evaluate` and `--check-only` both carry
+# `.claim` (the derived, normalised claim). FAIL CLOSED: a missing/invalid `.claim.paths` exits != 0
+# and is NEVER swallowed into `[]` — an empty union is an absent fence, not a permissive one.
+EXTRACT_CLAIM_PATHS='let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);if(!j.claim||!Array.isArray(j.claim.paths))throw new Error("resultado sem claim.paths");process.stdout.write(JSON.stringify(j.claim.paths))}catch(e){process.stderr.write("claim-gate: derivação do claim falhou — "+e.message+"\n");process.exit(1)}})'
+UNION_ADD='const a=JSON.parse(process.argv[1]),b=JSON.parse(process.argv[2]);process.stdout.write(JSON.stringify(Array.from(new Set([...a,...b]))))'
 
-# 2. Evaluate per task, --ready-alternatives = (tasks ready remaining in BATCH − 1).
+# claim_union <plan path…> -> JSON array on stdout; exit != 0 on any failed derivation (fail closed).
+claim_union() {
+  local ACC="[]" P ONE
+  for P in "$@"; do
+    ONE=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --evaluate --plan "$P" \
+      --run "$RUN_ID" --cwd "$WORKING_DIR" --json | node -e "$EXTRACT_CLAIM_PATHS") || return 1
+    ACC=$(node -e "$UNION_ADD" "$ACC" "$ONE") || return 1
+  done
+  printf '%s' "$ACC"
+}
+
+# record_union <unit label> <JSON array of paths> — the visible fence, verified.
+record_union() {
+  local CSV; CSV=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).join(','))" "$2") || return 1
+  node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check --paths "$CSV" --source manual \
+    --run "$RUN_ID" --unit "$1" $GATE_CODE_DIR_FLAG --ready-alternatives 0 \
+    --cwd "$WORKING_DIR" --json > /dev/null
+}
+
+# 1. Union of the whole ready batch, recorded BEFORE any evaluation (visible fence, contract #6).
+BATCH_IDS_CSV=$(node -e "process.stdout.write(process.argv.slice(1).join(','))" "${BATCH_TASK_IDS[@]}")
+BATCH_UNION_PATHS=$(claim_union "${BATCH_PLAN_PATHS[@]}")   # BATCH_PLAN_PATHS = "$WORKING_DIR/${ENTRY_PLAN_PATH}" of every ENTRY
+UNION_EXIT=$?
+if [ "$UNION_EXIT" -ne 0 ] || ! record_union "BATCH:$BATCH_IDS_CSV" "$BATCH_UNION_PATHS"; then
+  echo "⛔ Claim gate indisponível: a união do batch não pôde ser derivada/gravada — block/gate-unavailable. Nenhum dispatch." >&2
+  # DECISION=block, cause gate-unavailable, BATCH=() — § Step 4 (checkpoint + deactivate). STOP.
+fi
+
+# 2. Evaluate per task with --check-only, --ready-alternatives = (tasks ready remaining in BATCH − 1).
+#    --check-only (NOT --claim-and-check): it evaluates and emits the event while PRESERVING the union
+#    recorded in step 1. `recordClaim` is a single slot, so a per-task record here would destroy the
+#    fence two lines after writing it and each task would be confronted against itself only.
+#    --wait is passed UNCONDITIONALLY: the module polls only when the decision is `block`, which is
+#    behaviourally identical to "when the effective posture is block" — and the consumer must not
+#    pre-read the posture pref (spec § Step 0).
 REMAINING=$(( ${#BATCH[@]} - 1 ))
 for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id: T##, planPath}
-  GATE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check \
+  GATE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --check-only --wait \
     --run "$RUN_ID" --unit "execute-task/${ENTRY_ID}" --source plan-writes \
     --plan "$WORKING_DIR/${ENTRY_PLAN_PATH}" $GATE_CODE_DIR_FLAG \
     --ready-alternatives "$REMAINING" --cwd "$WORKING_DIR" --json)
@@ -581,22 +608,36 @@ for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id: T##, planPath}
     # 3-decision -> block: checkpoint + deactivate this run + actionable message, per § Step 4 below. STOP.
   fi
   # Parse .decision / .cause / .escalation / .not_covered / .counterparts.
-  # proceed -> keep ${ENTRY_ID} in BATCH.
-  # defer   -> drop ${ENTRY_ID} from BATCH; echo "⤳ ${ENTRY_ID} adiada — claim overlap com run {counterpart id}".
-  # block   -> the module already polled to the ceiling (--wait was NOT passed above; auto mode invokes
-  #            with --wait only when the posture is block — add --wait to the invocation when posture ==
-  #            block per spec § Step 2/3). If .escalation is set -> § Step 4 (Account Handoff form) below.
+  # proceed -> keep ${ENTRY_ID} in BATCH (append to SURVIVOR_IDS / SURVIVOR_PLAN_PATHS).
+  # defer   -> drop ${ENTRY_ID} from BATCH; BATCH_CHANGED=1;
+  #            echo "⤳ ${ENTRY_ID} adiada — claim overlap com run {counterpart id}".
+  # block   -> the module already polled to the ceiling (--wait IS passed above). Drop ${ENTRY_ID};
+  #            BATCH_CHANGED=1. If .escalation is set -> § Step 4 (Account Handoff form) below.
   #            Otherwise: stop this task only, do not dispatch.
-  # refuse  -> stop this task, surface .cause; do not retry (waiting cannot fix it).
+  # refuse  -> drop ${ENTRY_ID}; BATCH_CHANGED=1; surface .cause; do not retry (waiting cannot fix it).
   # Echo the 3 `.not_covered` boundaries once per slice (first execution of this gate in the session).
 done
 
-# 3. Drop non-proceed tasks from BATCH (step above already marks them). 4. Re-record the union of the
-# survivors — only needed when at least one task was dropped; skip re-recording an unchanged batch.
-if [ "$BATCH_CHANGED" = "1" ] && [ ${#BATCH[@]} -gt 0 ]; then
-  # Recompute the union exactly as step 1 above, over the SURVIVING BATCH only, then --claim-and-check
-  # again with the same "BATCH:<csv>" unit form (now naming only the survivors).
-  : # (same shape as step 1, restricted to survivors — omitted here for brevity, not a new procedure)
+# 3./4. Drop non-proceed tasks and re-record the union of the SURVIVORS, so the persisted claim
+# describes what will actually run (spec § Step 1, items 3 and 4). Leaving the original union in place
+# would block counterparts on files this run already decided not to touch.
+if [ "$BATCH_CHANGED" = "1" ]; then
+  if [ ${#SURVIVOR_IDS[@]} -eq 0 ]; then
+    # ZERO SURVIVORS — named, not implicit: nothing will be dispatched this pass, so this run must hold
+    # NO fence. The claim is cleared (S03 primitive), and the loop moves to the next unit / stops per
+    # the decision that emptied the batch.
+    node "$FORGE_SCRIPTS_DIR/forge-write-claim.js" --clear "$RUN_ID" --cwd "$WORKING_DIR" \
+      || echo "⚠ claim do batch vazio não pôde ser liberado — a cerca da união segue persistida" >&2
+    echo "⤳ Nenhuma task sobreviveu ao claim gate — claim liberado, nada despachado neste passe."
+  else
+    SURVIVOR_IDS_CSV=$(node -e "process.stdout.write(process.argv.slice(1).join(','))" "${SURVIVOR_IDS[@]}")
+    SURVIVOR_UNION_PATHS=$(claim_union "${SURVIVOR_PLAN_PATHS[@]}")
+    UNION_EXIT=$?
+    if [ "$UNION_EXIT" -ne 0 ] || ! record_union "BATCH:$SURVIVOR_IDS_CSV" "$SURVIVOR_UNION_PATHS"; then
+      echo "⛔ Claim gate indisponível: a união dos sobreviventes não pôde ser regravada — block/gate-unavailable." >&2
+      # DECISION=block, cause gate-unavailable, BATCH=() — § Step 4 (checkpoint + deactivate). STOP.
+    fi
+  fi
 fi
 ```
 

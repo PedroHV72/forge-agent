@@ -481,6 +481,25 @@ check('validatePrefs(defaultsFromSchema(schema), schema) → [] (0 warnings)', (
   assert(warnings.length === 0, `warnings:\n    ${warnings.map((w) => w.message).join('\n    ')}`);
 });
 
+// ── 7b. Bounds: the schema must not accept what the runtime rejects (S04 R8) ─
+// `positiveIntPref` (scripts/forge-claim-gate.js) rejects `<= 0` for the three
+// anti-livelock timings and falls back to the default. A schema that validated
+// `0` would make the validated document lie about the behaviour the operator
+// gets. `minimum` is declared AND enforced by validatePrefs.
+for (const key of ['parallelism.block_wait_ms', 'parallelism.block_poll_ms', 'parallelism.defer_cap']) {
+  check(`${key} declares minimum: 1 and validatePrefs rejects 0 and negatives`, () => {
+    const hit = resolveKey(schema, key);
+    assert(hit && hit.node.minimum === 1, `${key}: minimum !== 1`);
+    for (const bad of [0, -1]) {
+      const doc = { parallelism: { [key.split('.')[1]]: bad } };
+      const warnings = validatePrefs(doc, schema);
+      assert(warnings.some((w) => w.key === key), `${key}=${bad} deveria gerar warning e não gerou`);
+    }
+    const ok = validatePrefs({ parallelism: { [key.split('.')[1]]: 1 } }, schema);
+    assert(!ok.some((w) => w.key === key), `${key}=1 é válido e não pode gerar warning`);
+  });
+}
+
 // ── 8. Structural sanity ─────────────────────────────────────────────────────
 check('open-set routing node declares additionalProperties: true (validator must not flag domains)', () => {
   const hit = resolveKey(schema, 'routing');

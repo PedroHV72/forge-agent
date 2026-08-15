@@ -695,8 +695,20 @@ function eligibilityOfPaths(paths) {
  * recorded, and its ABSENCE is recorded as `null` — never derived from
  * root/branch/isolation_mode. A `null` scope stays IN scope (fail closed).
  *
+ * `record: false` is the BATCH mode (R2 of the S04 review). The batch protocol
+ * of `shared/forge-claim-gate.md § Step 1` demands two things at once — "record
+ * the union of the whole batch FIRST" and "never use `--evaluate`" (which emits
+ * no event) — and until this option existed the module had no mode that
+ * satisfied both: every per-task `--claim-and-check` overwrote the union two
+ * lines after it was written (`recordClaim` is a SINGLE SLOT —
+ * forge-write-claim.js `runs.update({ write_claim })` replaces wholesale), so
+ * during the evaluation of task *k* the RunRecord described only *k*. With
+ * `record: false` the derived claim is evaluated and the event IS emitted, and
+ * the persisted claim — the union — is left exactly as it was. The suite proves
+ * the preservation by reading the record back after the call.
+ *
  * Options: `{ cwd, runId, unit, source, codeDir, paths, derived,
- * readyAlternatives, posture, prefsOpts, wait, emitEvent, onPoll }`.
+ * readyAlternatives, posture, prefsOpts, wait, emitEvent, onPoll, record }`.
  */
 function recordAndEvaluate(opts) {
   const o = opts || {};
@@ -713,13 +725,18 @@ function recordAndEvaluate(opts) {
     ? { posture: o.posture, source: 'explicit', note: null }
     : resolvePostureFromPrefs(cwd, o.prefsOpts);
 
-  // (1) RECORD — via S03's primitive, never `runs.update` directly.
-  const claim = recordClaim(cwd, runId, {
+  // (1) RECORD — via S03's primitive, never `runs.update` directly. Under
+  // `record: false` the same shape is DERIVED and not persisted: the batch
+  // union already on the record is the fence, and overwriting it here is the
+  // very defect R2 named.
+  const claimInput = {
     unit,
     source: CLAIM_SOURCES.includes(o.source) ? o.source : 'manual',
     code_dir: typeof o.codeDir === 'string' ? o.codeDir : undefined,
     paths: Array.isArray(o.paths) ? o.paths : [],
-  });
+  };
+  const recording = o.record !== false;
+  const claim = recording ? recordClaim(cwd, runId, claimInput) : normalizeClaim(claimInput);
 
   // Read back through S03's own accessor: the point of recording first is that
   // the fence becomes VISIBLE to the other run, and "visible" means persisted —
@@ -798,6 +815,7 @@ function recordAndEvaluate(opts) {
   const full = Object.assign({}, result, {
     unit,
     claim,
+    claim_recorded: recording,
     claim_persisted,
     posture: resolvedPref.posture,
     posture_source: resolvedPref.source,
@@ -849,7 +867,7 @@ const USAGE = [
   'uso: node scripts/forge-claim-gate.js --evaluate (--plan <p> | --conceded <json|@file> | --paths <csv>)',
   '                                      --run <id> [--code-dir <p>] [--posture defer|block]',
   '                                      [--ready-alternatives <n>] [--cwd <dir>] [--json]',
-  '     node scripts/forge-claim-gate.js --claim-and-check (mesmas fontes) --run <id> --unit <u>',
+  '     node scripts/forge-claim-gate.js (--claim-and-check | --check-only) (mesmas fontes) --run <id> --unit <u>',
   '                                      [--source <s>] [--code-dir <p>] [--wait] [--posture defer|block]',
   '                                      [--ready-alternatives <n>] [--cwd <dir>] [--json]',
   '',
@@ -864,8 +882,12 @@ const USAGE = [
   'receber exit != 0 ou stdout não-JSON trata como block/gate-unavailable.',
   '',
   'Flags:',
-  '  --evaluate                 avalia e emite a decisão (NÃO grava claim, NÃO emite evento)',
+  '  --evaluate                 avalia e emite a decisão (NÃO grava claim, NÃO emite evento);',
+  '                             o resultado carrega `claim` — o claim derivado e normalizado',
   '  --claim-and-check          grava o claim ANTES de avaliar e emite o evento claim-gate',
+  '  --check-only               avalia o claim derivado e EMITE o evento, PRESERVANDO o claim',
+  '                             persistido — o modo do laço por task de um batch, cuja cerca é',
+  '                             a união gravada antes do laço (spec § Step 1)',
   '  --unit <u>                 a unidade do claim (execute-task/T02, review-fix/..., ...)',
   '  --source <s>               plan-writes | review-fix-paths | manual (default: derivado da fonte)',
   '  --wait                     em block, re-avalia por poll até parallelism.block_wait_ms;',
@@ -906,7 +928,12 @@ function parseConceded(raw) {
 function main(argv) {
   const args = parseArgs(argv);
   const claimAndCheck = Boolean(args['claim-and-check']);
-  if (args.help || (!args.evaluate && !claimAndCheck)) {
+  const checkOnly = Boolean(args['check-only']);
+  if (claimAndCheck && checkOnly) {
+    process.stderr.write('forge-claim-gate: --claim-and-check e --check-only são exclusivos\n');
+    return 2;
+  }
+  if (args.help || (!args.evaluate && !claimAndCheck && !checkOnly)) {
     process.stdout.write(`${USAGE}\n`);
     return args.help ? 0 : 2;
   }
@@ -954,7 +981,7 @@ function main(argv) {
     const readyAlternatives = typeof args['ready-alternatives'] === 'string'
       ? Number(args['ready-alternatives']) : 0;
 
-    if (claimAndCheck) {
+    if (claimAndCheck || checkOnly) {
       // `--claim-and-check` implies the event: a fence that records and decides
       // without leaving a trace is exactly the silence this milestone closes.
       result = recordAndEvaluate({
@@ -970,6 +997,9 @@ function main(argv) {
         readyAlternatives,
         posture: typeof args.posture === 'string' ? args.posture : undefined,
         wait: Boolean(args.wait),
+        // R2: `--check-only` evaluates and LOGS without touching the persisted
+        // claim, so a batch union recorded before the loop survives the loop.
+        record: !checkOnly,
       });
     } else {
       // `--evaluate` stays exactly what T01 shipped: no write, no event. Only the
@@ -977,7 +1007,14 @@ function main(argv) {
       const posture = typeof args.posture === 'string'
         ? args.posture
         : resolvePostureFromPrefs(cwd).posture;
-      result = evaluateGate({ cwd, runId: args.run, claim, posture, readyAlternatives });
+      // R1: the derived, normalised claim rides on the result. Without it the
+      // consumer's `--evaluate` extraction (`.claim.paths`) threw on EVERY
+      // evaluation, the catch returned `[]`, and the batch union was born empty
+      // — the fence never existed in runtime. `--claim-and-check` had carried
+      // `claim` since T02; `--evaluate` did not, and only the latter is safe to
+      // call while deriving a union.
+      result = Object.assign(evaluateGate({ cwd, runId: args.run, claim, posture, readyAlternatives }),
+        { claim, claim_recorded: false });
     }
   } catch (e) {
     // ENFORCING, so this is NOT the advisory `return 0` of forge-claim-overlap:

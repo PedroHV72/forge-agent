@@ -1132,6 +1132,142 @@ console.log('\nG20: ESCALATIONS — conjunto fechado nos dois sentidos');
   });
 }
 
+// ── G21: o wiring do batch (S04 review — R1, R2, R5, R6) ──────────────────
+//
+// O núcleo estava sólido e o wiring não conectava: a união do batch nascia
+// vazia (R1), o laço por task destruía a cerca (R2), a regravação dos
+// sobreviventes era um no-op (R5) e `--wait` nunca era passado (R6). Estes
+// asserts rodam o EXTRATOR LITERAL publicado no fence do forge-auto contra a
+// CLI real — não uma reimplementação — para que reverter a correção deixe o
+// teste vermelho.
+console.log('\nG21: wiring do batch — união não-vazia, cerca preservada, sobreviventes regravados');
+{
+  const SKILL = path.join(__dirname, '..', 'skills', 'forge-auto', 'SKILL.md');
+  const skillText = fs.readFileSync(SKILL, 'utf8');
+  const runsApi21 = require('./forge-runs.js');
+  const { readClaim: readClaim21 } = require('./forge-write-claim.js');
+
+  function fenceLiteral(name) {
+    const m = skillText.match(new RegExp(`^${name}='([^']*)'`, 'm'));
+    assert(m, `one-liner ${name} ausente do fence do forge-auto`);
+    return m[1];
+  }
+  const EXTRACT = fenceLiteral('EXTRACT_CLAIM_PATHS');
+  const UNION_ADD = fenceLiteral('UNION_ADD');
+
+  function planIn(ws, taskId, file) {
+    const rel = `.gsd/milestones/M-x/slices/S01/tasks/${taskId}/${taskId}-PLAN.md`;
+    const abs = path.join(ws, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, [
+      '---', `id: ${taskId}`, 'writes:', `  - "${file}"`,
+      'must_haves:', '  truths:', '    - "t"',
+      '  artifacts:', `    - path: "${file}"`, '      provides: "algo"', '      min_lines: 1',
+      '  key_links: []',
+      'expected_output: []', '---', '', `# ${taskId}`, '',
+    ].join('\n'), 'utf8');
+    return rel;
+  }
+
+  // O extrator do fence, aplicado ao stdout REAL da CLI. Exit != 0 = fail closed.
+  function extractPaths(stdout) {
+    const r = spawnSync(process.execPath, ['-e', EXTRACT], { input: stdout, encoding: 'utf8' });
+    return { status: r.status, paths: r.status === 0 ? JSON.parse(r.stdout) : null, stderr: r.stderr };
+  }
+  function unionOf(ws, rels) {
+    let acc = '[]';
+    for (const rel of rels) {
+      const cli = runCli(['--evaluate', '--plan', rel, '--run', 'M-own', '--cwd', ws, '--json']);
+      assertEqual(cli.status, 0, `--evaluate deveria avaliar (${cli.stderr})`);
+      const e = extractPaths(cli.stdout);
+      assertEqual(e.status, 0, `extração do claim falhou — R1 de volta: ${e.stderr}`);
+      const u = spawnSync(process.execPath, ['-e', UNION_ADD, acc, JSON.stringify(e.paths)], { encoding: 'utf8' });
+      assertEqual(u.status, 0, 'união falhou');
+      acc = u.stdout;
+    }
+    return JSON.parse(acc);
+  }
+
+  test('G21a: R1 — a união de um batch multi-task real é NÃO-VAZIA (extrator do fence, CLI real)', () => {
+    const ws = makeFixture([{ id: 'M-own' }]);
+    const rels = [planIn(ws, 'T01', 'scripts/a.js'), planIn(ws, 'T02', 'scripts/b.js')];
+    const union = unionOf(ws, rels);
+    assertEqual(JSON.stringify(union), JSON.stringify(['scripts/a.js', 'scripts/b.js']),
+      'união do batch — vazia significa cerca inexistente em runtime');
+  });
+
+  test('G21b: R1 — o extrator FALHA FECHADO quando o resultado não traz claim (nunca vira [])', () => {
+    const e = extractPaths(JSON.stringify({ decision: 'proceed' }));
+    assert(e.status !== 0, 'resultado sem claim deveria sair != 0, nunca degradar para []');
+    assert(/claim/.test(e.stderr), 'a falha deve nomear a derivação do claim');
+  });
+
+  test('G21c: R2 — --check-only avalia, EMITE evento e PRESERVA o claim persistido (união intacta)', () => {
+    const ws = makeFixture([{ id: 'M-own' }]);
+    const rels = [planIn(ws, 'T01', 'scripts/a.js'), planIn(ws, 'T02', 'scripts/b.js')];
+    const union = unionOf(ws, rels);
+    const rec = runCli(['--claim-and-check', '--paths', union.join(','), '--source', 'manual',
+      '--run', 'M-own', '--unit', 'BATCH:T01,T02', '--cwd', ws, '--json']);
+    assertEqual(rec.status, 0, 'gravação da união falhou');
+
+    const before = fs.readFileSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), 'utf8').trim().split('\n').length;
+    for (const [i, rel] of rels.entries()) {
+      const one = runCli(['--check-only', '--wait', '--run', 'M-own', '--unit', `execute-task/T0${i + 1}`,
+        '--source', 'plan-writes', '--plan', rel, '--posture', 'defer',
+        '--ready-alternatives', '1', '--cwd', ws, '--json']);
+      assertEqual(one.status, 0, `--check-only falhou: ${one.stderr}`);
+      const out = record(JSON.parse(one.stdout));
+      assertEqual(out.claim_recorded, false, '--check-only não pode gravar');
+      assertEqual(out.event_written, true, '--check-only deve emitir o evento (spec § Step 5)');
+      // A cerca confrontada é a união, não a task da vez.
+      assertEqual(JSON.stringify(readClaim21(runsApi21.get(ws, 'M-own')).paths), JSON.stringify(union),
+        'o claim persistido foi sobrescrito pelo laço — a cerca do batch morreu (R2)');
+    }
+    const after = fs.readFileSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), 'utf8').trim().split('\n').length;
+    assertEqual(after - before, 2, '--check-only deve deixar um evento claim-gate por task');
+  });
+
+  test('G21d: R5 — após um batch MISTO, o claim persistido descreve os SOBREVIVENTES', () => {
+    // T03 colide com uma counterpart em escopo; T01/T02 passam.
+    const ws = makeFixture([
+      { id: 'M-own' },
+      { id: 'M-other', write_claim: claim(['scripts/c.js'], null) },
+    ]);
+    const rels = [planIn(ws, 'T01', 'scripts/a.js'), planIn(ws, 'T02', 'scripts/b.js'), planIn(ws, 'T03', 'scripts/c.js')];
+    const union = unionOf(ws, rels);
+    assertEqual(union.length, 3, 'pré-condição: união do batch inteiro');
+    runCli(['--claim-and-check', '--paths', union.join(','), '--source', 'manual',
+      '--run', 'M-own', '--unit', 'BATCH:T01,T02,T03', '--cwd', ws, '--json']);
+
+    const survivors = [];
+    for (const [i, rel] of rels.entries()) {
+      const out = record(JSON.parse(runCli(['--check-only', '--run', 'M-own',
+        '--unit', `execute-task/T0${i + 1}`, '--source', 'plan-writes', '--plan', rel,
+        '--posture', 'defer', '--ready-alternatives', '2', '--cwd', ws, '--json']).stdout));
+      if (out.decision === 'proceed') survivors.push(rel);
+    }
+    assertEqual(survivors.length, 2, 'T03 deveria ser descartada pelo overlap medido');
+
+    const survivorUnion = unionOf(ws, survivors);
+    const re = runCli(['--claim-and-check', '--paths', survivorUnion.join(','), '--source', 'manual',
+      '--run', 'M-own', '--unit', 'BATCH:T01,T02', '--cwd', ws, '--json']);
+    assertEqual(re.status, 0, 'regravação dos sobreviventes falhou');
+    assertEqual(JSON.stringify(readClaim21(runsApi21.get(ws, 'M-own')).paths),
+      JSON.stringify(['scripts/a.js', 'scripts/b.js']),
+      'o claim persistido deve ser a união dos sobreviventes, não a última task avaliada');
+  });
+
+  test('G21e: R5/R6 — o fence do forge-auto passa --wait, regrava sobreviventes e nomeia zero-sobreviventes', () => {
+    const fence = skillText.slice(skillText.indexOf('# 1. Union of the whole ready batch'));
+    assert(/--check-only --wait/.test(fence), 'R6: o laço por task do modo auto deve passar --wait incondicionalmente');
+    assert(!/--claim-and-check[^\n]*--plan /.test(fence), 'R2: o laço não pode gravar o claim por task');
+    assert(!/:\s+#\s+\(same shape as step 1/.test(fence), 'R5: a regravação dos sobreviventes não pode ser um no-op');
+    assert(/BATCH_CHANGED=1/.test(fence), 'R5: BATCH_CHANGED precisa ser atribuída em algum ramo');
+    assert(/SURVIVOR_UNION_PATHS=\$\(claim_union/.test(fence), 'R5: a união dos sobreviventes precisa ser computada');
+    assert(/forge-write-claim\.js" --clear/.test(fence), 'R5: o caso zero-sobreviventes precisa ser nomeado');
+  });
+}
+
 // ── G9: direção 2 dos conjuntos fechados — depois de TUDO ter rodado ───────
 console.log('\nG9: direção 2 — todo valor declarado foi emitido por >= 1 teste');
 {

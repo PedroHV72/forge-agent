@@ -429,6 +429,15 @@ function validatePrefs(resolved, schema) {
     if (Array.isArray(node.enum) && !node.enum.some((item) => validationEqual(value, item))) {
       warnings.push({ key, message: `${key}: expected one of ${node.enum.map((item) => JSON.stringify(item)).join(', ')}` });
     }
+    // `minimum` is ENFORCED here, not decorative. A schema keyword the
+    // validator ignores makes the validated document lie: the three claim-gate
+    // timings (`parallelism.block_{wait,poll}_ms`, `parallelism.defer_cap`) are
+    // rejected at runtime when `<= 0` (forge-claim-gate.js positiveIntPref) and
+    // silently fall back — so a prefs file that "validates" with `0` behaves as
+    // the default (S04 review R8).
+    if (typeof node.minimum === 'number' && typeof value === 'number' && value < node.minimum) {
+      warnings.push({ key, message: `${key}: expected >= ${node.minimum}, got ${value}` });
+    }
     if (!isPlainObject(value) || !isPlainObject(node.properties)) return;
     for (const childKey of Object.keys(value)) {
       const child = node.properties[childKey];
