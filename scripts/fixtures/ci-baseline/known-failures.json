@@ -1,0 +1,62 @@
+{
+  "_comment": "Known-failures baseline for scripts/run-tests.js --baseline. HUMAN, versioned list: adding an entry is a decision made by whoever opens the PR, never automatic. Keyed by process.platform. Each entry: suite (exact *.test.js filename), item (backlog id tracking it), reason (short phrase). The comparison is two-way: a failure missing here blocks the run, and an entry whose suite now passes also blocks until removed.",
+  "win32": [
+    {
+      "suite": "forge-app-workspace-marker.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-hierarchy.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-isolation.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-resources-bench.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-run-address.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-surgical-reset-install.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-touch.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-vcs.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-verify-resources.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-workspace-registry.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    },
+    {
+      "suite": "forge-xllm-appserver.test.js",
+      "item": "I-20260815014759",
+      "reason": "chronic windows-latest failure; cause untriaged"
+    }
+  ],
+  "darwin": [],
+  "linux": []
+}

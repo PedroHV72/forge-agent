@@ -1,0 +1,281 @@
+#!/usr/bin/env node
+'use strict';
+
+// Standalone suite for the known-failures baseline in scripts/run-tests.js
+// (--baseline). It exercises the PURE resolver functions (resolveBaseline,
+// compareFailures) with synthetic sets and validates the versioned fixture
+// against the suite files that actually exist on disk.
+//
+// Deliberately NEVER spawns the runner: requiring run-tests.js is safe (its
+// main() is guarded by require.main), and discoverTests only does a readdir.
+// Spawning the runner here would execute all 196 suites recursively.
+
+const fs = require('fs');
+const path = require('path');
+const {
+  compareFailures,
+  discoverTests,
+  parseArgs,
+  resolveBaseline,
+  BASELINE_PLATFORMS,
+} = require('./run-tests.js');
+
+let passes = 0;
+let fails = 0;
+
+function pass(name) {
+  passes += 1;
+  process.stdout.write(`  ✓ ${name}\n`);
+}
+
+function fail(name, detail) {
+  fails += 1;
+  process.stdout.write(`  ✗ ${name}\n    ${detail || 'assertion failed'}\n`);
+}
+
+function assert(condition, name, detail) {
+  if (condition) pass(name);
+  else fail(name, detail);
+}
+
+function assertEqual(actual, expected, name) {
+  assert(
+    JSON.stringify(actual) === JSON.stringify(expected),
+    name,
+    `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`
+  );
+}
+
+const AVAILABLE = ['a.test.js', 'b.test.js', 'c.test.js', 'd.test.js'];
+
+function doc(win32Entries) {
+  return JSON.stringify({ win32: win32Entries, darwin: [], linux: [] });
+}
+
+function entry(suite) {
+  return { suite, item: 'I-0000', reason: 'synthetic' };
+}
+
+// --- Section 1: parseArgs stays additive -----------------------------------
+process.stdout.write('Section 1: parseArgs (--baseline is additive)\n');
+{
+  const legacy = parseArgs([]);
+  assertEqual(legacy.baseline, null, 'no flag -> options.baseline is null (legacy path untouched)');
+
+  const withFlag = parseArgs(['--baseline', 'scripts/fixtures/ci-baseline/known-failures.json']);
+  assertEqual(withFlag.baseline, 'scripts/fixtures/ci-baseline/known-failures.json', '--baseline captures its file path');
+
+  let threw = false;
+  try { parseArgs(['--baseline']); } catch { threw = true; }
+  assert(threw, '--baseline without a value throws');
+
+  threw = false;
+  try { parseArgs(['--baseline', '--verbose']); } catch { threw = true; }
+  assert(threw, '--baseline followed by another flag throws (no value)');
+
+  // Legacy flags still parse exactly as before.
+  const mixed = parseArgs(['--list', '--match', 'foo', '--fail-fast', '--verbose', '--inherit-home']);
+  assert(
+    mixed.list && mixed.failFast && mixed.verbose && mixed.inheritHome && mixed.matches[0] === 'foo',
+    'legacy flags unaffected by the new option'
+  );
+}
+
+// --- Section 2: resolveBaseline (named failures, never silent) --------------
+process.stdout.write('Section 2: resolveBaseline validation\n');
+{
+  const ok = resolveBaseline({
+    text: doc([entry('a.test.js'), entry('b.test.js')]),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(ok.ok === true, 'valid document resolves ok');
+  assertEqual(ok.entries.map(e => e.suite), ['a.test.js', 'b.test.js'], 'entries preserved with suite/item/reason');
+  assertEqual(ok.entries[0].item, 'I-0000', 'item field carried through');
+  assertEqual(ok.entries[0].reason, 'synthetic', 'reason field carried through');
+
+  const emptyPlatform = resolveBaseline({ text: doc([]), platform: 'darwin', availableSuites: AVAILABLE });
+  assert(emptyPlatform.ok === true && emptyPlatform.entries.length === 0, 'explicitly empty platform set is valid (means: zero known failures)');
+
+  const badJson = resolveBaseline({ text: '{not json', platform: 'win32', availableSuites: AVAILABLE });
+  assert(badJson.ok === false && badJson.errors[0].includes('not valid JSON'), 'invalid JSON is a named failure');
+
+  const notObject = resolveBaseline({ text: '["a"]', platform: 'win32', availableSuites: AVAILABLE });
+  assert(notObject.ok === false && notObject.errors[0].includes('keyed by platform'), 'non-object document is a named failure');
+
+  const typoKey = resolveBaseline({
+    text: JSON.stringify({ windows: [], win32: [], darwin: [], linux: [] }),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(
+    typoKey.ok === false && typoKey.errors.some(e => e.includes('"windows"')),
+    'unknown top-level key (typo "windows") is a named failure, not silently ignored'
+  );
+
+  const commentKey = resolveBaseline({
+    text: JSON.stringify({ _comment: 'hi', win32: [], darwin: [], linux: [] }),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(commentKey.ok === true, 'underscore-prefixed annotation keys are allowed');
+
+  const missingPlatform = resolveBaseline({
+    text: JSON.stringify({ win32: [] }),
+    platform: 'linux',
+    availableSuites: AVAILABLE,
+  });
+  assert(
+    missingPlatform.ok === false && missingPlatform.errors.some(e => e.includes('no entry set for platform "linux"')),
+    'missing platform key is a named failure (must be listed explicitly, even as [])'
+  );
+
+  const notArray = resolveBaseline({
+    text: JSON.stringify({ win32: {}, darwin: [], linux: [] }),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(notArray.ok === false && notArray.errors.some(e => e.includes('must be an array')), 'non-array platform set is a named failure');
+
+  const badSuiteName = resolveBaseline({
+    text: doc([{ suite: 'a.js', item: 'I-1', reason: 'r' }]),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(badSuiteName.ok === false && badSuiteName.errors.some(e => e.includes('*.test.js')), 'suite not ending in .test.js is a named failure');
+
+  const missingItem = resolveBaseline({
+    text: doc([{ suite: 'a.test.js', reason: 'r' }]),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(missingItem.ok === false && missingItem.errors.some(e => e.includes('missing "item"')), 'entry without backlog item is a named failure');
+
+  const missingReason = resolveBaseline({
+    text: doc([{ suite: 'a.test.js', item: 'I-1', reason: '   ' }]),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(missingReason.ok === false && missingReason.errors.some(e => e.includes('missing "reason"')), 'entry with blank reason is a named failure');
+
+  const duplicate = resolveBaseline({
+    text: doc([entry('a.test.js'), entry('a.test.js')]),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(duplicate.ok === false && duplicate.errors.some(e => e.includes('twice')), 'duplicate suite entry is a named failure');
+
+  const ghost = resolveBaseline({
+    text: doc([entry('ghost.test.js')]),
+    platform: 'win32',
+    availableSuites: AVAILABLE,
+  });
+  assert(
+    ghost.ok === false && ghost.errors.some(e => e.includes('ghost.test.js') && e.includes('does not exist')),
+    'baseline pointing at a nonexistent suite file is a named failure (ghost entry)'
+  );
+}
+
+// --- Section 3: compareFailures — both directions, always -------------------
+process.stdout.write('Section 3: compareFailures set comparison (two-way)\n');
+{
+  const match = compareFailures({
+    executedCount: 4,
+    failedSuites: ['a.test.js', 'b.test.js'],
+    baselineSuites: ['b.test.js', 'a.test.js'],
+  });
+  assert(match.ok === true && match.code === 'match', 'F == B -> ok (order-independent)');
+  assertEqual(match.knownFailures, ['a.test.js', 'b.test.js'], 'known failures enumerated (census), sorted');
+  assertEqual(match.newFailures, [], 'match: no new failures');
+  assertEqual(match.staleEntries, [], 'match: no stale entries');
+
+  const fresh = compareFailures({
+    executedCount: 4,
+    failedSuites: ['a.test.js', 'c.test.js'],
+    baselineSuites: ['a.test.js'],
+  });
+  assert(fresh.ok === false && fresh.code === 'new-failures', 'F - B nonempty -> not ok (new red blocks)');
+  assertEqual(fresh.newFailures, ['c.test.js'], 'new failure named individually');
+
+  const stale = compareFailures({
+    executedCount: 4,
+    failedSuites: ['a.test.js'],
+    baselineSuites: ['a.test.js', 'b.test.js'],
+  });
+  assert(stale.ok === false && stale.code === 'stale-entries', 'B - F nonempty -> not ok (cured suite left listed is an inert gate)');
+  assertEqual(stale.staleEntries, ['b.test.js'], 'stale entry named individually');
+
+  const both = compareFailures({
+    executedCount: 4,
+    failedSuites: ['c.test.js'],
+    baselineSuites: ['b.test.js'],
+  });
+  assert(both.ok === false && both.code === 'new-and-stale', 'both directions can fail at once');
+  assertEqual(both.newFailures, ['c.test.js'], 'new-and-stale: new failure still named');
+  assertEqual(both.staleEntries, ['b.test.js'], 'new-and-stale: stale entry still named');
+
+  const cleanRun = compareFailures({ executedCount: 4, failedSuites: [], baselineSuites: [] });
+  assert(cleanRun.ok === true && cleanRun.code === 'match', 'zero failures against empty baseline -> clean pass');
+
+  const allCured = compareFailures({ executedCount: 4, failedSuites: [], baselineSuites: ['a.test.js'] });
+  assert(allCured.ok === false && allCured.code === 'stale-entries', 'zero failures with nonempty baseline is NOT a pass — remova da baseline');
+}
+
+// --- Section 4: anti-silence floor ------------------------------------------
+process.stdout.write('Section 4: anti-silence floor\n');
+{
+  const zero = compareFailures({ executedCount: 0, failedSuites: [], baselineSuites: [] });
+  assert(
+    zero.ok === false && zero.code === 'no-suites-executed',
+    '0 suites executed is a named failure even with both sets empty — never a clean pass'
+  );
+
+  const negative = compareFailures({ executedCount: -1, failedSuites: [], baselineSuites: [] });
+  assert(negative.ok === false && negative.code === 'no-suites-executed', 'nonsensical executed count also trips the floor');
+
+  const nonInteger = compareFailures({ executedCount: undefined, failedSuites: [], baselineSuites: [] });
+  assert(nonInteger.ok === false && nonInteger.code === 'no-suites-executed', 'missing executed count trips the floor');
+}
+
+// --- Section 5: the versioned fixture is real -------------------------------
+process.stdout.write('Section 5: fixture integrity against the suites on disk\n');
+{
+  const fixturePath = path.join(__dirname, 'fixtures', 'ci-baseline', 'known-failures.json');
+  assert(fs.existsSync(fixturePath), 'fixture file exists at scripts/fixtures/ci-baseline/known-failures.json');
+
+  const text = fs.readFileSync(fixturePath, 'utf8');
+  // discoverTests only does a readdir of scripts/ — it never spawns anything.
+  const realSuites = discoverTests([]);
+  assert(realSuites.length > 0, 'suite discovery found real suites (floor for this very check)');
+
+  for (const platform of BASELINE_PLATFORMS) {
+    const resolved = resolveBaseline({ text, platform, availableSuites: realSuites });
+    assert(resolved.ok === true, `fixture resolves cleanly for ${platform}`, (resolved.errors || []).join('; '));
+  }
+
+  const win32 = resolveBaseline({ text, platform: 'win32', availableSuites: realSuites });
+  if (win32.ok) {
+    assertEqual(win32.entries.length, 11, 'win32 baseline lists exactly the 11 chronic suites');
+    assert(
+      win32.entries.every(e => e.item === 'I-20260815014759'),
+      'all win32 entries tracked by backlog item I-20260815014759'
+    );
+    assert(
+      win32.entries.every(e => realSuites.includes(e.suite)),
+      'every win32 baseline suite exists on disk (no ghosts — a rename here must break this test)'
+    );
+    assert(
+      win32.entries.some(e => e.suite === 'forge-isolation.test.js') &&
+        !win32.entries.some(e => e.suite === 'forge-isolation-runtime.test.js'),
+      'baseline pins forge-isolation.test.js exactly, not its -runtime sibling'
+    );
+  }
+
+  const darwin = resolveBaseline({ text, platform: 'darwin', availableSuites: realSuites });
+  const linux = resolveBaseline({ text, platform: 'linux', availableSuites: realSuites });
+  assert(darwin.ok && darwin.entries.length === 0, 'darwin baseline is explicitly empty');
+  assert(linux.ok && linux.entries.length === 0, 'linux baseline is explicitly empty');
+}
+
+process.stdout.write(`\n${passes} passed, ${fails} failed\n`);
+process.exitCode = fails === 0 ? 0 : 1;
