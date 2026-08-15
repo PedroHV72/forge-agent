@@ -1,43 +1,43 @@
 {
   "runtime": "claude",
-  "version": "4.11.0",
+  "version": "4.14.2",
   "newline": "lf",
   "origin_header": "markdown-only",
   "surfaces": [
     {
       "source_id": "agents",
       "target": "agents",
-      "sha256": "95fc5cff4a577374bd7ee6a5ea43f0302cf757c2ed1eaca03bc99b361f532b3b"
+      "sha256": "79dca68d9802ee9c7cf52a8c6852b28043413ade9908ce8b3c40ec884e45f233"
     },
     {
       "source_id": "commands",
       "target": "commands",
-      "sha256": "26a9fb470c93b79501e101e5428de31b5e4bf5268a938a5e6ef3cf73d74ec69b"
+      "sha256": "650d15cbb0bfc2fcdb56d2013273346ca85e47101a6f0b2ec79e3f4796d577d9"
     },
     {
       "source_id": "skills",
       "target": "skills",
-      "sha256": "05ab757cb59855d49ca1dcf4c917fa23be357c31318d81d237bd8fb94b701a20"
+      "sha256": "d1e58d5f2b703ceab182ca163a4ee39516b0ed81f2b304689a15d96b0d3d4453"
     },
     {
       "source_id": "dispatch-templates",
       "target": "shared/templates/dispatch",
-      "sha256": "9f9625f89e3c2164d8b9f4b1477bcfaddd2ec3fa36d73c9faa5bdcfb3ab3fabb"
+      "sha256": "3c75b257afc9c6861294105ac3e11e4d6e9f267a47b466a189f6f400eec9239c"
     },
     {
       "source_id": "hooks",
       "target": "hooks/forge-hook.js",
-      "sha256": "8029158047e94a06c5424c97321de76e92fb88b0b87b750f5e2a65bb25052fd4"
+      "sha256": "e6d36d0941d48849a2068b44f591c997d4124b6410a8c5f4d1ca22e39302874a"
     },
     {
       "source_id": "mcp",
       "target": "forge/forge-mcps.md",
-      "sha256": "35f693ffc959230dece66769bb1e468a36e3eeee930909f188f43fb2b6857fd0"
+      "sha256": "27cefda5ee161d6b996c7533f69eda75886dbe6aa475215d9f4871802fd62fcd"
     },
     {
       "source_id": "claude-instructions",
       "target": "project/CLAUDE.md",
-      "sha256": "50eec0c035b7b2ed826b1a5265a535401a2183790b6b2c3d192a4eb0f4558565"
+      "sha256": "61d7e0f9ddc31afc9fcb0d6bd9cee2e7849eae46e56846c25730b329cd38cb45"
     },
     {
       "source_id": "claude-settings",
