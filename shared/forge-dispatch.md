@@ -127,6 +127,45 @@ These four are the only measured, repeat-offending phrases from M018. Do not gro
 
 ---
 
+## Cross-run claim gate
+
+Before dispatching a unit that writes code (`execute-task`, `review-fix`), the orchestrator records
+what that unit claims to write into its own `RunRecord` and confronts it against the claims of the
+other active runs sharing the same `CODE_DIR`. A measured collision stops the dispatch.
+
+**Spec autoritativa: `shared/forge-claim-gate.md`.** The decision table (`proceed` / `defer` /
+`block` / `refuse` × `auto` / `interactive`), the canonical `--claim-and-check` invocation, the B2
+rule for `--code-dir`, the escalation procedure and the fail-closed rule live there, once. This
+section is a pointer plus the event schema — it deliberately does not restate any of them, because a
+second copy is what drifts between the two orchestrators.
+
+Unlike the advisory gates around it, this one is **enforcing**: exit `!= 0` or non-JSON stdout is
+treated as `block` with reason `gate-unavailable`, loud.
+
+### Event `claim-gate` (additive fields, `tier`/`reason` convention)
+
+Appended to `.gsd/forge/events.jsonl` **by `scripts/forge-claim-gate.js` itself** on every
+`--claim-and-check` — never hand-written by the orchestrator. Readers that do not recognise a field
+ignore it.
+
+| field | meaning |
+|---|---|
+| `event` | always `claim-gate` |
+| `ts` | ISO-8601 timestamp |
+| `run` | the own run id |
+| `unit` | the unit string verbatim (`execute-task/T03`, `review-fix/{S##}`, `review-fix/{M###}-triage`) |
+| `decision` | `proceed` \| `defer` \| `block` \| `refuse` |
+| `cause` | `overlap` \| `undeclared-writes` \| `pathless-conceded-item` \| `null` — never substituted for one another |
+| `undeclared_side` | `own` \| `counterpart` \| `both` \| `null` |
+| `posture` / `posture_source` | resolved `parallelism.cross_run_overlap` and where it came from (`prefs` \| `fallback` \| `invalid-pref` \| `explicit`) |
+| `escalation` | `wait-ceiling` \| `defer-cap` \| `null` — a **field**, never a fifth decision |
+| `floor` | `defer-floor` \| `null` — a `defer` with zero ready alternatives converted to `block` (D3) |
+| `counterparts[]` | `{id, cause, paths, scope, note}` per confronted run; `scope` is `same` \| `unknown`, `note` carries S03's verbatim reason |
+| `census` | `{runs_examined, counterparts_considered, counterparts_in_scope, skipped[], notes[]}` — anti-silence floor |
+| `not_covered[]` | the three boundaries this gate does not cover (`complete-slice`, `orchestrator-writes`, `forge-task`), each with a reason — present in **every** result, including `proceed` |
+
+---
+
 ## Spawn Liveness Banner
 
 When dispatching a subagent to execute a work unit (task, slice planning, research, etc.), the orchestrator/skill **must** present a liveness message to the user immediately before the spawn, so they understand that the absence of output is expected and not a freeze or hang. This section defines the canonical pt-BR phrasing and a static reference table of estimated durations by unit type.

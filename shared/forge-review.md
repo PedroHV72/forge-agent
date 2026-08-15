@@ -896,6 +896,40 @@ A CONCEDED objection is a problem **both agents agree is real** — the confront
 
 Skip if `fixConceded == false` (pref opt-out → conceded items fall through to Step 7b posture as before) or there are zero CONCEDED items.
 
+### Cross-run claim gate (before the dispatch)
+
+A `review-fix` writes code, so it passes the **cross-run claim gate** like any other writing unit —
+spec autoritativa `shared/forge-claim-gate.md`. Build the claim from the CONCEDED items' `path:line`
+(the `:line` suffix is stripped by the module — a claim is about files) and invoke the canonical
+block of that spec's **§ Step 2** with `--source review-fix-paths`, `--unit "review-fix/{S##}"`,
+`--conceded "@$ITEMS_JSON"`, `--cwd "$WORKING_DIR"`, and `--code-dir` only per its **§ B2**:
+
+```bash
+ITEMS_JSON=$(mktemp)   # [{"r":"R1","path":"scripts/foo.js","line":42}, ...] — one entry per CONCEDED item
+# ...then the canonical --claim-and-check invocation from shared/forge-claim-gate.md § Step 2.
+```
+
+Act on the result **by the decision table of that spec (§ Step 3) — it is not restated here**;
+`escalation` follows its § Step 4, and exit `!= 0` / non-JSON stdout follows its § Fail-closed
+(`block` / `gate-unavailable`, loud). The `not_covered` enumeration is printed on every execution.
+
+**Pathless conceded item (D7) — a named branch, never a quiet degradation.** When the gate returns
+`refuse` with cause `pathless-conceded-item`, the claim could not be derived because one or more
+conceded items arrived without a `path` (the challenger supplies `path`/`line`; `suggested_fix` may
+legitimately be absent, `path` may not). Do **not** dispatch, and do **not** fall back to fixing
+them unclaimed:
+
+- Mark each offending item in `{S##}-REVIEW.md`: `**Correção:** bloqueada pelo claim gate — item sem
+  path (pathless-conceded-item)`.
+- Those items join the OPEN items in the **milestone-final triage (Step 9)** — the same destination
+  the `Agent()` throw path already uses. They are postponed, never swallowed.
+- The remaining conceded items are **not** dispatched in this pass either: the claim covers the set,
+  and dispatching a subset under a claim that could not be built is exactly the invisible-fence
+  failure the gate exists to close. Fix the missing path (or triage it) and re-run.
+
+**Never blocks the slice.** A `refuse`/`block` here stops the `review-fix` dispatch only; the gate
+proceeds to `complete-slice` regardless, with the affected items marked as above.
+
 Before dispatching `review-fix`, compute `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; pass `model: '{RF_ALIAS}'` only when it is non-empty.
 
 ```
@@ -1057,6 +1091,16 @@ Consumer: `forge-auto` / `forge-next`, when the derived unit is `complete-milest
 3. **Digest.** Print a digest table to the user — one row per item: `slice · R# · path:line · objeção (one-liner) · status (aberta | concedida-sem-fix)`.
 4. **Triage.** For each item (batched up to 4 per `AskUserQuestion`, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
 5. **Act.** All `Refatorar agora` items → ONE `review-fix` dispatch (Step 7a shape, `UNIT: review-fix/{M###}-triage`, items grouped in a single prompt; slices are merged by now so fixes are normal commits on the current branch). On throw → mark those items `**Decisão:** refatorar — dispatch falhou, virou follow-up` and continue.
+
+   **The claim gate runs here too**, before this dispatch — same invocation as Step 7a's
+   **§ Cross-run claim gate**, with `--unit "review-fix/{M###}-triage"` and the claim built from the
+   `path:line` each triaged item already carries in the digest (Step 3). Decisions follow
+   `shared/forge-claim-gate.md § Step 3`; escalation follows its § Step 4; exit `!= 0` / non-JSON
+   follows its § Fail-closed. A `refuse` with cause `pathless-conceded-item` → mark each pathless
+   item `**Decisão:** refatorar — bloqueada pelo claim gate (item sem path)` and create a follow-up
+   per **§ Item capture** instead of dispatching, so the item survives `milestone_cleanup`. A
+   `defer`/`block` → the same follow-up capture, noting the counterpart run in the item body. The
+   triage **never blocks** `complete-milestone` — Step 9.9 stands unchanged.
 6. **Write back.** Update the `**Decisão:**` line of every triaged R# in its `{S##}-REVIEW.md`. `Criar follow-up` items create an item per **§ Item capture** (source `review/{S##}/{R#}`) and append ONLY the pointer line — `- {I-id} — {title}` — to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing; never the full content) so they survive `milestone_cleanup`.
 7. **Headless fallback.** When `AskUserQuestion` is unavailable at this boundary (headless session, no gate mailbox configured for this junction), Step 4's per-item ask cannot run: instead, create one item per still-pending deferred objection (source `review/{S##}/{R#}`, status `inbox`, `body` noting `triagem não realizada — headless`) so the deferrals survive `milestone_cleanup` rather than dying silently in a `REVIEW.md` that will be cleaned up. Skip Steps 3–6's human-facing digest/triage in this branch; proceed straight to Step 8.
 8. **Event.** Append to `events.jsonl`: `{"ts":"<ISO>","event":"review-triage","milestone":"{M###}","pending":N,"kept":N,"fixed":N,"follow_up":N}`. `follow_up` counts items created in either Step 6 or Step 7 — schema unchanged from before this cutover.
@@ -1075,6 +1119,7 @@ When `style == flags`: run Step 2 only — routed by `challenger` (so `codex`/`g
 - `scripts/forge-xllm.js` — S01 adapter for the external challengers (`--mode challenge|rebuttal`, `--engine codex|agy` — GPT via Codex CLI, Gemini via Antigravity CLI); parsing/validation lives there, not here
 - `forge-agent-prefs.jsonc § Review Settings` — `review.{mode,style,rounds,ask_in_auto,fix_conceded,engine,challenger,challenger_model,advocate_model}`
 - `scripts/forge-items.js` — the work-item fragment store consumed by **§ Item capture** (`--add`/`--list` CLI; single write path for `Criar follow-up` and every other deferral junction below)
+- `shared/forge-claim-gate.md` — authoritative spec of the cross-run claim gate invoked before every `review-fix` dispatch (Steps 7a and 9); its decision table, escalation and fail-closed rule are referenced, never restated here
 - `shared/forge-plan-gate.md § Deferir resolution` — the sibling consumer of **§ Item capture** for plan-gate deferrals (does not restate the invocation)
 - Artifact: `.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` (durable with the milestone; cleaned by `milestone_cleanup`)
 - Artifact: `.gsd/items/*.md` (work items created by this spec; durable — never cleaned by `milestone_cleanup`)
