@@ -25,8 +25,8 @@ The human only adjudicates what the two AIs genuinely disagree on. Everything el
 - `{S##}` — slice being completed
 - `MODE` — `interactive` (forge-next) or `auto` (forge-auto)
 - `FORGE_SCRIPTS_DIR` / `FORGE_SHARED_DIR` — resolved by the calling skill's bootstrap. Every
-  `scripts/<x>.js` and `shared/<x>.md` named below is opened through them; the installer flattens
-  `shared/*.md` into `~/.claude/`, so the bare relative path only exists inside the forge-agent
+  `scripts/<x>.js` and `shared/<x>.md` named below is opened through them; the installer copies
+  `shared/*.md` into `${FORGE_HOME:-$HOME/.forge-agent}/shared/`, so the bare relative path only exists inside the forge-agent
   repo. If the calling skill did not export them, resolve them the same way before Step 0.
 
 > **This spec is executed, not consulted.** Every step below is a procedure with a fixed output
@@ -43,7 +43,7 @@ The human only adjudicates what the two AIs genuinely disagree on. Everything el
 Resolve prefs once through the S01 engine CLI (`scripts/forge-prefs.js --resolved`, the canonical per-unit helper defined in `shared/forge-dispatch.md § Per-unit prefs resolution`) — it reads the JSONC catalog per layer, and legacy Markdown without JSONC hard-stops with the canonical repair message in `shared/forge-prefs-cutover.md`, so no `files=[…]` 3-file cascade merge is re-implemented here. Read every `review.*` knob off `.prefs`, applying the SAME whitelist/clamp + default each had inline. The single `REVIEW_CFG` JSON below preserves the exact shape downstream steps consume:
 
 ```bash
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
 if [ $? -ne 0 ]; then
   # M008-CONTEXT decision #2 — loud stop, never a silent default. errors[] (file+line)
@@ -75,7 +75,7 @@ process.stdout.write(JSON.stringify({mode,style,trigger,adaptiveFlagsLines,adapt
 CHALLENGER=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challenger||'claude')}catch(e){process.stdout.write('claude')}})")
 CHALLENGER_MODEL=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.challengerModel||'')}catch(e){process.stdout.write('')}})")
 ADVOCATE_MODEL=$(printf '%s' "$REVIEW_CFG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const c=JSON.parse(d);process.stdout.write(c.advocateModel||'')}catch(e){process.stdout.write('')}})")
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-model-alias.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-model-alias.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 ADVOCATE_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-model-alias.js" --id "$ADVOCATE_MODEL")
 # Adapter engine for the external challenger: codex → `codex app-server` (protocolo JSONL), gemini → `agy --print` (Antigravity CLI)
 XLLM_ENGINE=$([ "$CHALLENGER" = "gemini" ] && echo agy || echo codex)
@@ -933,7 +933,8 @@ Agent({ subagent_type: 'forge-executor',
     --option "fix:Refatorar agora:Despacha um review-fix para este item" \
     --option "followup:Criar follow-up:Cria item no backlog (.gsd/items/) e segue" \
     --default followup \
-    --timeout "${GATE_TIMEOUT_MS:-1800000}")
+    --timeout "${GATE_TIMEOUT_MS:-1800000}" \
+    --max-wait "${GATE_MAX_WAIT_MS:-240000}")
   CHOICE=$(printf '%s' "$RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).choice||'')}catch{console.log('')}})")
   SOURCE=$(printf '%s' "$RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).source||'')}catch{console.log('')}})")
   ```
@@ -944,7 +945,19 @@ Agent({ subagent_type: 'forge-executor',
 
   Record the provenance on the `**Decisão:**` line (`via gate — humano` vs `via gate — expirou`), so the artefact never claims a human made a call the clock made.
 
+  - `source == wait-timeout` → **nobody answered inside this tool call's budget.** The gate stays open (a human can still answer it) and the item is marked `**Decisão:** deferido → triagem no fim da milestone`, joining the guaranteed end-of-milestone surfacing. Never treat `wait-timeout` as a decision — no choice was made.
+
   `GATE_TIMEOUT_MS` defaults to 30min and is read from `review.gate_timeout_ms` when set. A run left alone overnight therefore behaves exactly like `defer` — the safe default is the one that happens when nobody is watching.
+
+  **`--max-wait` is not optional, and the reason is measured.** The gate timeout (30min) is far longer than the budget of the tool call that opens it. Without a bound the process blocks to the gate's own expiry and is **killed mid-block**, so the lapse is never persisted: the gate is left `pending` forever and a later reader sees `expired` with `answer: null` — byte-identical to a gate that was never given a window at all. That is the shape recorded in item `I-20260814111723` (artifact `G-20260814042121-3d46.json`: `expires_at - created_at` is exactly the requested `1800000`, yet 6.4h later nothing had resolved it). `GATE_MAX_WAIT_MS` defaults to 4min so the call always returns while the gate keeps its full 30min window for a human.
+
+  **Safety net — sweep abandoned gates.** Because resolution must never depend on a process surviving, run the sweep at the milestone-final triage (Step 9), before presenting the digest:
+
+  ```bash
+  node "${FORGE_SCRIPTS}/forge-gate.js" --resolve-lapsed --cwd "$WORKING_DIR" --json
+  ```
+
+  Every gate that lapsed with nobody watching gets its **declared default** persisted with `source: timeout-default`, so the artefact records what the clock decided instead of dangling. It is idempotent, names what it skipped, and exits 0.
 
 The gate **never** returns a blocker regardless of posture.
 

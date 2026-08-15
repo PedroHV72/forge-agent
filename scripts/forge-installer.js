@@ -148,6 +148,25 @@ function backupExisting(paths, backupRoot, plan, options) {
   return files;
 }
 
+// Retiring is intentionally a rename, not a backup copy: the old directory is
+// no longer a runtime source and copying it would leave the fossil executable.
+function retireLegacyScripts(source, backupRoot, plan, options) {
+  const tombstone = path.join(source, 'README.md');
+  const destination = path.join(backupRoot, 'legacy', 'claude-scripts');
+  const onlyTombstone = exists(source) && fs.statSync(source).isDirectory()
+    && fs.readdirSync(source).every((name) => name === 'README.md');
+  if (!exists(source) || onlyTombstone) {
+    plan.push({ op: 'skip', reason: 'already-retired', source, destination });
+    return;
+  }
+  plan.push({ op: 'retire', source, destination });
+  if (!options.dryRun) {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.renameSync(source, destination);
+  }
+  writeText(tombstone, 'Este diretório foi aposentado pelo forge-update. Para reverter, mova backups/legacy/claude-scripts de volta para ~/.claude/scripts.\n', plan, options);
+}
+
 function installApp(repo, plan, options, platform) {
   if (!options.withApp) return null;
   const script = path.join(repo, 'app', 'build.sh');
@@ -216,6 +235,7 @@ function install(input = {}) {
         path.join(paths.claudeHome, 'forge-agent-prefs.md'),
       ], path.join(backupRoot, 'legacy', 'claude'), plan, options);
     }
+    retireLegacyScripts(path.join(paths.userHome, '.claude', 'scripts'), backupRoot, plan, options);
     const projectFiles = [];
     if (selected.includes('claude')) projectFiles.push(path.join(projectRoot, 'CLAUDE.md'));
     if (selected.includes('codex')) projectFiles.push(path.join(projectRoot, 'AGENTS.md'));
@@ -257,6 +277,10 @@ function install(input = {}) {
 
   // All host projections are rendered from the canonical source manifest.
   // The installer does not keep a second, host-specific copy strategy.
+  // The ownership record is read BEFORE rendering and written back after: it is
+  // the only proof of ownership a format without comment syntax can have, so a
+  // run that forgets to carry it forward re-freezes every JSON projection.
+  const priorManifest = readJsonIfPresent(paths.shared.manifest) || {};
   const generated = generateProjections({
     repo,
     runtime,
@@ -267,8 +291,9 @@ function install(input = {}) {
     dryRun: options.dryRun,
     update: options.update,
     migrateLegacy: options.migrateLegacy,
+    ownership: priorManifest.ownership && typeof priorManifest.ownership === 'object' ? priorManifest.ownership : {},
   });
-  const existingManifest = readJsonIfPresent(paths.shared.manifest) || {};
+  const existingManifest = priorManifest;
   const adapterManifest = { ...(existingManifest.adapters || {}) };
   for (const host of selected) {
     const home = paths.runtimeHomes[host];
@@ -288,7 +313,15 @@ function install(input = {}) {
     writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files, project_files: projectFiles, conflicts }, null, 2) + '\n', plan, options);
   }
   const installedHosts = Object.keys(adapterManifest).sort();
-  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest };
+  // Merge, never replace: a `--runtime claude` run must not drop the digests of
+  // the Codex host's destinations, or the next Codex install treats every one of
+  // them as an unmarked stranger.
+  const ownershipRecord = { ...(existingManifest.ownership || {}) };
+  for (const host of installedHosts) {
+    const report = generated.reports[host];
+    if (report && report.ownership && typeof report.ownership === 'object') Object.assign(ownershipRecord, report.ownership);
+  }
+  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest, ownership: ownershipRecord };
   writeText(paths.shared.manifest, JSON.stringify(manifest, null, 2) + '\n', plan, options);
   const app = installApp(repo, plan, options, paths.platform);
   const backupPath = path.resolve(backupRoot);
@@ -318,9 +351,22 @@ function render(report) {
     ? Object.values(report.manifest.adapters).flatMap((adapter) => (Array.isArray(adapter.conflicts) ? adapter.conflicts : []))
     : [];
   const operatorOwned = allConflicts.filter((item) => path.basename(String(item && item.destination || '')) === 'settings.json');
-  const legacy = allConflicts.length - operatorOwned.length;
-  if (legacy) lines.push(`Conflicts preserved: ${legacy}; use --migrate-legacy to replace unmarked legacy projections.`);
-  if (operatorOwned.length) lines.push(`Operator-owned preserved: ${operatorOwned.length} (settings.json) — Forge never replaces it; use scripts/merge-settings.js to add Forge's hooks/statusLine keys.`);
+  const legacyConflicts = allConflicts.filter((item) => !operatorOwned.includes(item));
+  // Name them. A bare count is the reason this drift stays invisible: the
+  // operator is told that N files were left behind but not WHICH, so a stale
+  // destination on the execution path reads exactly like a stale destination
+  // nobody loads. Measured cost of the anonymous form: an `--update` that
+  // reported success left `~/.claude/forge-hook.js` — the file `settings.json`
+  // actually runs — frozen several releases back, and finding that took a
+  // byte-compare against repo history rather than reading the summary.
+  if (legacyConflicts.length) {
+    lines.push(`Conflicts preserved: ${legacyConflicts.length}; use --migrate-legacy to replace unmarked legacy projections.`);
+    for (const item of legacyConflicts) lines.push(`  [preserved] ${item.destination}`);
+  }
+  if (operatorOwned.length) {
+    lines.push(`Operator-owned preserved: ${operatorOwned.length} (settings.json) — Forge never replaces it; use scripts/merge-settings.js to add Forge's hooks/statusLine keys.`);
+    for (const item of operatorOwned) lines.push(`  [operator-owned] ${item.destination}`);
+  }
   return lines.join('\n') + '\n';
 }
 
@@ -332,5 +378,5 @@ function run(argv = process.argv.slice(2), write = process.stdout.write.bind(pro
   catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 1; }
 }
 
-module.exports = { RUNTIMES, VERSION, MANAGED_CORE, parseArgs, walk, adapterSources, installApp, install, render, run };
+module.exports = { RUNTIMES, VERSION, MANAGED_CORE, parseArgs, walk, adapterSources, installApp, retireLegacyScripts, install, render, run };
 if (require.main === module) process.exitCode = run();

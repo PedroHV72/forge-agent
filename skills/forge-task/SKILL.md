@@ -77,14 +77,15 @@ Read:
 if [ -f "scripts/forge-prefs.js" ]; then
   FORGE_SCRIPTS_DIR="scripts"
 else
-  FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
+  FORGE_SCRIPTS_DIR="${FORGE_HOME:-$HOME/.forge-agent}/scripts"
 fi
-# Same resolution for the shared reference specs — the installer FLATTENS shared/*.md
-# into ~/.claude/, so a bare relative `shared/X.md` is a dead path in every consumer project.
+# Same resolution for the shared reference specs — the installer COPIES shared/*.md
+# into ${FORGE_HOME:-$HOME/.forge-agent}/shared/, so a bare relative `shared/X.md`
+# is a dead path in every consumer project.
 if [ -f "shared/forge-review.md" ]; then
   FORGE_SHARED_DIR="shared"
 else
-  FORGE_SHARED_DIR="$HOME/.claude"
+  FORGE_SHARED_DIR="${FORGE_HOME:-$HOME/.forge-agent}/shared"
 fi
 WORKING_DIR="${WORKING_DIR:-$(pwd)}"
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --explain --cwd "$WORKING_DIR")
@@ -136,7 +137,7 @@ if [ -n "$ITEM_REF" ]; then
   if [ -f "scripts/forge-items.js" ]; then
     FORGE_SCRIPTS_DIR="scripts"
   else
-    FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
+    FORGE_SCRIPTS_DIR="${FORGE_HOME:-$HOME/.forge-agent}/scripts"
   fi
   WORKING_DIR="${WORKING_DIR:-$(pwd)}"
 
@@ -197,7 +198,7 @@ fi
 if [ -f "scripts/forge-runs.js" ]; then
   FORGE_SCRIPTS_DIR="scripts"
 else
-  FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
+  FORGE_SCRIPTS_DIR="${FORGE_HOME:-$HOME/.forge-agent}/scripts"
 fi
 ```
 
@@ -455,7 +456,7 @@ Write {TASK_ID}-CONTEXT.md to .gsd/tasks/{TASK_ID}/ with sections:
   ## Decisions, ## Agent's Discretion, ## Open Questions, ## Out of Scope
 Append significant decisions to the **fragment store** via `forge-decisions.js --write` (stdin JSON) — do NOT write to `.gsd/DECISIONS.md` directly. Use:
 ```bash
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-decisions.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-decisions.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 printf '%s' "$key_decisions_json" | node "$FORGE_SCRIPTS_DIR/forge-decisions.js" --write --cwd "$WORKING_DIR"
 ```
 Where `key_decisions_json` is `{ "unit_id": "{TASK_ID}", "decisions": [{when, scope, decision, choice, rationale, revisable}, ...] }`. The global `.gsd/DECISIONS.md` is rebuilt from fragments during `complete-milestone` (forge-merger).
@@ -635,7 +636,7 @@ Roda o handshake do plan gate (spec autoritativa: `shared/forge-plan-gate.md`) n
 Resolve prefs once through the S01 engine CLI (never a `files=[…forge-agent-prefs.jsonc…]` cascade merge) — see `shared/forge-dispatch.md § Per-unit prefs resolution` and `shared/forge-plan-gate.md § Step 0`.
 
 ```bash
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
 if [ $? -ne 0 ]; then
   # M008-CONTEXT decision #2 — loud stop, never a silent default. errors[] (file+line)
@@ -869,7 +870,7 @@ node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --baseline --cwd "${CODE_DIR:-.}" > .gsd/
 # forge-prefs.js --resolved call (reads the jsonc catalog per layer; legacy Markdown without jsonc
 # hard-stops — see shared/forge-prefs-cutover.md; NEVER a 3-file cascade node -e merge,
 # MEM001 M005). See shared/forge-dispatch.md § Per-unit prefs resolution.
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 PREFS_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --cwd "$WORKING_DIR")
 if [ $? -ne 0 ]; then
   # Loud stop (M008-CONTEXT #2): errors[] ({file,line,message}) on stdout, human hint on stderr.
@@ -886,7 +887,7 @@ fi
 # it (frontmatter worker: > routing: > pref > default precedence owned by the resolver, MEM018 reads
 # prefs from $WORKING_DIR). Loose task → NO --roadmap (risk-escalation inert). --cwd "$WORKING_DIR".
 PLAN_PATH=".gsd/tasks/{TASK_ID}/{TASK_ID}-PLAN.md"
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-dispatch-resolve.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-dispatch-resolve.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" \
   --unit-type execute-task --plan "$PLAN_PATH" --unit-id "{TASK_ID}" --cwd "$WORKING_DIR" --json)
 if [ $? -ne 0 ]; then
@@ -992,7 +993,7 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
 
 4. **Poll `$RESULT_FILE`** (state `polling`) every ~5–10s: `status==running` → keep polling + liveness check; `status==done` → success (step 5); `status==error` / adapter exit `!= 0` / unparseable JSON → failure with the matching `REASON` (`codex-exit-nonzero` / `codex-timeout` / `codex-invalid-json`) → Fallback. **Orphan:** heartbeat `updated_at` stale beyond the dynamic threshold `max(heartbeat_interval_ms × 4, 30s)` (field absent → assume 15s → 60s) → run the canonical liveness snippet (`shared/forge-dispatch.md § Orphan detection`): `stale-dead` → `kill "$pid"` (from the heartbeat) + `REASON=codex-orphan` → Fallback; `stale-alive` → grace of one more poll cycle, then kill if still stale.
 
-4.5. **Terminal outcome — runtime evidence materialization (step 7b), on EVERY outcome:** as soon as the poll loop settles a terminal outcome for this dispatch — `done`, **or** a failure `REASON` that Layer-1 transient retry will not retry in place (including `codex-invalid-json` and an unreadable `$RESULT_FILE`) — invoke exactly once `node "$FORGE_SCRIPTS_DIR/forge-evidence-materialize.js" --result "$RESULT_FILE" --unit "task/{TASK_ID}" --cwd "${WORKING_DIR:-.}" --json`. Step **7b** of `shared/forge-dispatch.md § Sidecar dispatch state machine` owns its outcome enum, naming and census; this mirror only invokes and never restates them (exit 0 always, advisory). It sits **before** the Success/Failure split on purpose (S06 review R9): invoked only from Success, the canonical table's unreadable-result-file row was unreachable from every call site. **One census per terminal outcome, never one per retry** — a Layer-1 in-place retry has not reached a terminal outcome yet and does not invoke it.
+4.5. **Terminal outcome — runtime evidence materialization (step 7b), on EVERY outcome:** as soon as the poll loop settles a terminal outcome for this dispatch — `done`, **or** a failure `REASON` that Layer-1 transient retry will not retry in place (including `codex-invalid-json` and an unreadable `$RESULT_FILE`) — invoke exactly once `node "$FORGE_SCRIPTS_DIR/forge-evidence-materialize.js" --result "$RESULT_FILE" --unit "task/{TASK_ID}" --cwd "${WORKING_DIR:-.}" --json`. **The milestone/slice axes are omitted here on purpose, not by oversight** (S01 review R2): a loose task has neither, so the `_no-milestone_`/`_no-slice_` sentinels in the composite name are the truth, and the resolution target for a loose task carries the same absence — the two match. The three mirrors that DO run inside a milestone (`forge-auto`, `forge-next`, and the canonical `shared/forge-dispatch.md`) must pass `--milestone`/`--slice`; omitting them there writes evidence under a sentinel that can never match the real unit. Step **7b** of `shared/forge-dispatch.md § Sidecar dispatch state machine` owns its outcome enum, naming and census; this mirror only invokes and never restates them (exit 0 always, advisory). It sits **before** the Success/Failure split on purpose (S06 review R9): invoked only from Success, the canonical table's unreadable-result-file row was unreachable from every call site. **One census per terminal outcome, never one per retry** — a Layer-1 in-place retry has not reached a terminal outcome yet and does not invoke it.
 
 5.0. **Orchestrator re-verification (TASK-015):** `REVERIFY=$(node "$FORGE_SCRIPTS_DIR/forge-reverify.js" --result "$RESULT_FILE" --code-dir "${CODE_DIR:-.}" --gsd-dir "${WORKING_DIR:-.}/.gsd" --apply --json)`. Follow `shared/forge-dispatch.md § Sidecar dispatch state machine` for the formula. `verified` continues with the amended result, `failed` follows Failure, and `no-command` leaves it untouched. Emit `orchestrator_reverification` with `unit:"task/{TASK_ID}"`, command, exit code, verdict, entries and ISO timestamp; except for `not-applicable`, add `## Re-verification` to the summary.
 5. **Partial promotion boundary:** for valid `status == "partial"`, run `PROMOTION=$(node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json)` before Success/Failure. The algorithm and allowlist are defined only by `shared/forge-dispatch.md § Sidecar dispatch state machine`; this mirror calls the checker and does not restate them. When `PROMOTION.promote == true`, treat it as `done`: write `## Env Constraints` to `{TASK_ID}-SUMMARY.md` with item + reason + note per entry, synthesize result-block `env_constraints[]`, exclude promoted entries from `must_haves_status.dropped`, and append `sidecar_env_promotion` with `unit:"task/{TASK_ID}"`, count, reasons and ISO timestamp to events.jsonl. `promote:false` (including a legacy payload without `scope`) follows Failure unchanged.
@@ -1032,7 +1033,7 @@ echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\"
 # — same field, S02/T01). Absent/unrecognized → terminal: byte-identical to pre-T02 (single-shot
 # fallback, never an unbounded retry). codex-timeout / codex-orphan are ALWAYS terminal (a hung/orphaned
 # process is never retried in place) regardless of a stale error_class.
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null || echo "$RESULT_FILE")
 ERROR_CLASS=$(node -pe "JSON.parse(require('fs').readFileSync('$RESULT_FILE','utf8')).error_class || 'terminal'" 2>/dev/null || echo terminal)
 case "$REASON" in codex-timeout|codex-orphan) ERROR_CLASS="terminal";; esac
@@ -1129,7 +1130,8 @@ PROMPT_META=$(node "$FORGE_SCRIPTS_DIR/forge-prompt.js" --unit-type execute-loos
   --task "$TASK_ID" --dispatch-id "$DISPATCH_ID" --unit-effort "$EFFORT" --thinking "$THINKING_OPUS" \
   --isolation-mode "$ISOLATION_MODE" --branch "$BRANCH" --code-dir "$CODE_DIR" \
   --memory-query "$TASK_DESCRIPTION" --memory-max-tokens "${PREFS[token_budget][auto_memory]:-1200}" \
-  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}") || { echo 'prompt render failed'; stop; }
+  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}" \
+  --ledger-max-tokens "${PREFS[token_budget][ledger_snapshot]:-1500}") || { echo 'prompt render failed'; stop; }
 PROMPT_PATH=$(node -pe 'JSON.parse(process.argv[1]).prompt_path' "$PROMPT_META")
 PROMPT_ID=$(node -pe 'JSON.parse(process.argv[1]).prompt_id' "$PROMPT_META")
 ```
@@ -1194,6 +1196,25 @@ mkdir -p "$WORKING_DIR/.gsd/forge/"
 DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd "${CODE_DIR:-$WORKING_DIR}" 2>/dev/null || echo "git")
 echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"execute-task/{TASK_ID}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"engine\":\"claude\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"milestone\":\"\",\"input_tokens\":${INPUT_TOKENS:-0},\"output_tokens\":${OUTPUT_TOKENS:-0},\"model_applied\":${MODEL_APPLIED_JSON},\"vcs\":\"${DISPATCH_VCS:-git}\",\"transport\":\"in-process\"}" >> "$WORKING_DIR/.gsd/forge/events.jsonl"
 ```
+
+**Contract miss gate (Layer 0) — BEFORE parsing any status.** Classify the return rather than eyeballing it:
+
+```bash
+CLASSIFY=$(node "$FORGE_SCRIPTS_DIR/forge-worker-result.js" --classify --inline "$result")
+SHAPE=$(printf '%s' "$CLASSIFY" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).shape")
+```
+
+`SHAPE == complete` → fall through unchanged. Anything else → the **recovery ladder** in `shared/forge-dispatch.md § Missing worker result (contract miss)`, canonical for the ladder, the salvage bases, the repair wording and the `contract_miss` event. A loose task has no slice tree, so the salvage points at the task dir and there is no per-milestone events file:
+
+```bash
+SALVAGE=$(node "$FORGE_SCRIPTS_DIR/forge-worker-result.js" --salvage \
+  --unit "execute-task/{TASK_ID}" --plan "$PLAN_PATH" \
+  --summary "$WORKING_DIR/.gsd/tasks/{TASK_ID}/{TASK_ID}-SUMMARY.md" \
+  --events "$WORKING_DIR/.gsd/forge/events.jsonl" \
+  --code-dir "${CODE_DIR:-$WORKING_DIR}" --since "$START_SHA" --vcs "${DISPATCH_VCS:-git}")
+```
+
+The `summary-file` + `plan-status` rung still applies here even though this skill does **not** stamp `status: DONE` on the sidecar path (see step 6 above): the rung reads whatever the *Claude* worker wrote, and a plan without the field simply makes that probe a `miss` with a named detail — never a false verdict. `/forge-task` is always interactive, so rung 4 (`blocked`) shows the operator the salvage census verbatim.
 
 **Process result:**
 - `status: done` → `TaskUpdate({ status: "completed" })`, proceed to post-task
@@ -1346,7 +1367,7 @@ Agent("forge-memory", "WORKING_DIR: {WORKING_DIR}\nUNIT_TYPE: execute-task\nUNIT
 
 **Write ledger entry to fragment store** — pipe a JSON payload to `forge-ledger.js --write`. The global LEDGER is rebuilt from fragments by the merger; do not append to it directly.
 ```bash
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-ledger.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-ledger.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 node "$FORGE_SCRIPTS_DIR/forge-ledger.js" --write --cwd . <<'EOF'
 {
   "id": "{TASK_ID}",

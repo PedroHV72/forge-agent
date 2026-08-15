@@ -36,11 +36,39 @@ const WRAPPER_DIR_READERS = Object.freeze([
     why: 'collectPlanFiles only descends through directory entries and reads loose PLAN files; it does not parse an epoch.md container.',
   },
   {
+    file: 'forge-distill.js',
+    dirs: Object.freeze(['.gsd/milestones']),
+    evidence: 'forge-distill.js:35,48-50 — checkEligibility and sourceFiles both join .gsd/milestones/<milestoneId> from a caller-supplied milestoneId, and the only fs.readdirSync call is on path.join(root, \'slices\'), filtered to /^S\\d+$/ directory entries.',
+    verdict: 'safe-by-construction',
+    why: 'The specific caller-selected milestoneId is joined before any enumeration and readdirSync never targets the .gsd/milestones root itself; distillation only reads loose slice-summary source files below the selected milestone, never a grouped container.',
+  },
+  {
+    file: 'forge-evidence-path.js',
+    dirs: Object.freeze(['.gsd/milestones']),
+    evidence: 'forge-evidence-path.js:176-177 — msDir is path.join(cwd, \'.gsd\', \'milestones\') and every name from fs.readdirSync(msDir) is added straight into the known-milestone-id set.',
+    verdict: 'breaks',
+    why: 'Each top-level name is taken to BE a milestone id with no shape check, so a container enters the set as a bogus id while the real ids of its members never do; the longest-prefix match that this set exists to serve then fails for every grouped milestone.',
+  },
+  {
+    file: 'forge-write-coverage.js',
+    dirs: Object.freeze(['.gsd/milestones', '.gsd/tasks']),
+    evidence: 'forge-write-coverage.js:156-162 — listDir over path.join(cwd, \'.gsd\', bucket) for both \'milestones\' and \'archive\', gated by entityKind(ownerId) !== \'milestone\'; the same shape at :209-215 over .gsd/tasks gated by entityKind(taskId) !== \'task\'.',
+    verdict: 'breaks',
+    why: 'The entityKind guard stops a container from being MISREAD as a milestone, but it does not descend into one, so every member milestone below it is skipped and the coverage denominator silently shrinks — the same failure shape as forge-decisions-migrate.js, minus the bogus entry.',
+  },
+  {
     file: 'forge-epoch-group.js',
     dirs: Object.freeze(['.gsd/milestones', '.gsd/tasks']),
     evidence: 'forge-epoch-group.js:202-205 — listWrapperDirs(parent) then entries(parent), followed by if (!entry.isDirectory()) continue.',
     verdict: 'safe-by-construction',
     why: 'The explicit entry.isDirectory() filter intentionally limits this writer to loose wrapper directories; existing epoch.md containers are skipped rather than misread as wrappers.',
+  },
+  {
+    file: 'forge-gsd-census.js',
+    dirs: Object.freeze(['.gsd/milestones', '.gsd/tasks']),
+    evidence: 'forge-gsd-census.js:333-334 — census() calls walkTreeDirs(cwd, \'.gsd/milestones\') and walkTreeDirs(cwd, \'.gsd/tasks\'); walkTreeDirs:281 fs.readdirSync(parentAbs) and :287 if (!entry.isDirectory()) continue.',
+    verdict: 'breaks',
+    why: 'Both wrapper roots are enumerated directly (not below a caller-selected unit) and every non-directory entry is discarded, so an epoch.md container is dropped rather than parsed — the same shape as forge-status.js. The consequence is specific to this module: the census exists to prove no bytes were lost, so grouped milestone/task mass would silently vanish from trees.totals and a post-sweep compare would read as a shrink instead of a relocation.',
   },
   {
     file: 'forge-ids.js',
@@ -104,6 +132,13 @@ const WRAPPER_DIR_READERS = Object.freeze([
     evidence: 'forge-statusline.js:182 reads one milestone ROADMAP; lines 209,213,580 enumerate only .gsd/forge paths.',
     verdict: 'safe-by-construction',
     why: 'The concrete .json, evidence-*.jsonl, and pause-* filters operate below .gsd/forge, never on the milestone root.',
+  },
+  {
+    file: 'forge-sweep-delete.js',
+    dirs: Object.freeze(['.gsd/milestones', '.gsd/tasks']),
+    evidence: 'forge-sweep-delete.js:137-148 — enumerateWrappers walks WRAPPER_ROOTS directly with fs.readdirSync(root, { withFileTypes: true }) and the specific if (!entry.isDirectory()) continue filter before treating an entry as a candidate.',
+    verdict: 'safe-by-construction',
+    why: 'The specific entry.isDirectory() filter accepts only directory entries as deletion candidates, matching forge-epoch-group.js\'s shape; a grouped epoch.md container is a file, so it is skipped rather than misread as a wrapper unit, and this module never groups or parses container bytes — D11\'s container prohibition is intact.',
   },
   {
     file: 'forge-surgical-reset.js',

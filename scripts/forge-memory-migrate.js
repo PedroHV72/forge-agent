@@ -52,7 +52,9 @@ function parseAutoMemory(text) {
 
   if (!text || !text.trim()) return { entries, warnings };
 
-  const lines = text.split('\n');
+  // Tolerant, never normalising: the parsed monolith is re-serialised into
+  // fragments by writeFragment, so this read sits inside a round-trip (D-S03-2).
+  const lines = text.split(/\r\n|\n|\r/);
   let i = 0;
 
   while (i < lines.length) {
@@ -247,7 +249,8 @@ function parseCheckerMemory(text) {
 
   if (!text || !text.trim()) return { rows, warnings };
 
-  const lines = text.split('\n');
+  // Tolerant, never normalising — same round-trip as parseAutoMemory above.
+  const lines = text.split(/\r\n|\n|\r/);
   let currentTable = null; // 'plan' | 'verify'
   let headerParsed = false;
   let headerCols = [];

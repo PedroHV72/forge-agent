@@ -21,21 +21,22 @@ WORKING_DIR=$(pwd)
 echo "WORKING_DIR=$WORKING_DIR"
 
 # Resolve runtime scripts dir — prefer local ./scripts (dogfood: edits take effect
-# immediately); fall back to ~/.claude/scripts (user-land: installed version).
+# immediately); fall back to ${FORGE_HOME:-$HOME/.forge-agent}/scripts (user-land: installed version).
 if [ -f "scripts/forge-parallelism.js" ]; then
   FORGE_SCRIPTS_DIR="scripts"
 else
-  FORGE_SCRIPTS_DIR="$HOME/.claude/scripts"
+  FORGE_SCRIPTS_DIR="${FORGE_HOME:-$HOME/.forge-agent}/scripts"
 fi
 echo "FORGE_SCRIPTS_DIR=$FORGE_SCRIPTS_DIR"
 
-# Same resolution for the shared reference specs — the installer FLATTENS shared/*.md
-# into ~/.claude/, so a bare relative `shared/X.md` is a dead path in every consumer
+# Same resolution for the shared reference specs — the installer COPIES shared/*.md
+# into ${FORGE_HOME:-$HOME/.forge-agent}/shared/, so a bare relative `shared/X.md`
+# is a dead path in every consumer
 # project. See the path convention note right below this block.
 if [ -f "shared/forge-review.md" ]; then
   FORGE_SHARED_DIR="shared"
 else
-  FORGE_SHARED_DIR="$HOME/.claude"
+  FORGE_SHARED_DIR="${FORGE_HOME:-$HOME/.forge-agent}/shared"
 fi
 echo "FORGE_SHARED_DIR=$FORGE_SHARED_DIR"
 ```
@@ -216,7 +217,7 @@ ROADMAP_PATH=".gsd/milestones/${M###}/${M###}-ROADMAP.md"
 # PLAN frontmatter + ROADMAP, and emits the full ordered contract. NEVER reintroduce a bash
 # tier/effort default map or a frontmatter/clamp regex here — that pure logic lives ONLY in the
 # resolver now (S01). See shared/forge-dispatch.md § Worker Engine Routing.
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-dispatch-resolve.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-dispatch-resolve.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 ROUTE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" \
   --unit-type "$unit_type" --plan "$PLAN_PATH" --unit-id "$unit_id" \
   --milestone "${RUN_ID:-{M###}}" --roadmap "$ROADMAP_PATH" \
@@ -335,6 +336,17 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
    - **Política deste modo (`MODE = interactive`):** advogado indisponível — **só depois** de a salvage do `DEFENSE_FILE` não render nenhum veredito (`shared/forge-review.md § Step 3`) — ⇒ objeções sobem **cruas** ao humano via `AskUserQuestion` (Step 7b), sem veredito fabricado, com Rebuttal PULADO e a ressalva de adversarialidade reduzida no artefato. Challenger indisponível ⇒ `{S##}-REVIEW.md` mínimo registrando a indisponibilidade (proibido renderizar como limpo — ausência de review não é aprovação).
 
 > Fires ONLY when the derived unit is `complete-slice`. Boundary is per-slice; standalone `/forge-task` keeps its own step-5.5 review. After the gate, dispatch `forge-completer` normally.
+
+**Slice git guard (around complete-slice):** `complete-slice` never integrates a branch — that is `complete-milestone`'s competence (`agents/forge-completer.md § Git boundary — complete-slice`). Snapshot the checkout **before** dispatching, verify **after** the worker returns:
+
+```bash
+# before Agent("forge-completer", ...)
+node "$FORGE_SCRIPTS_DIR/forge-slice-git-guard.js" --snapshot --cwd "$CODE_DIR" --unit "complete-slice/{S##}" > /dev/null
+# after it returns
+node "$FORGE_SCRIPTS_DIR/forge-slice-git-guard.js" --verify --cwd "$CODE_DIR" --unit "complete-slice/{S##}"
+```
+
+The snapshot is written to `.gsd/forge/` on purpose — shell variables do not survive between Bash calls. Exit `3` = violation (moved checkout, advanced default branch, or new merge commit): print it LOUDLY to the operator with the offending detail, append a `slice-git-violation` event, and **do not push** — nothing is pushed yet, so `git reset --hard` on the default branch still recovers it. Verdict `inconclusive` means nothing was measurable (no git repo, unresolved default branch) and **must not** be read as clean. The guard never blocks the loop; it reports.
 
 **Review triage gate (before complete-milestone):** If `unit_type == complete-milestone`, run the milestone-final triage (`shared/forge-review.md § Step 9`) BEFORE dispatching `forge-completer`. In pure forge-next sessions OPEN items were already decided live per-slice, so this usually finds nothing and skips silently — it exists for mixed sessions (slices run under `forge-auto` with `ask_in_auto: defer`, milestone closed via `forge-next`): scan all `{S##}-REVIEW.md` for pending `deferido`/`falhou — deferida` items, triage each via `AskUserQuestion`, dispatch ONE `review-fix/{M###}-triage` for the `Refatorar agora` items (`Criar follow-up` items create an item per `shared/forge-review.md § Item capture`, source `review/{S##}/{R#}`, plus the pointer line in `.gsd/KNOWLEDGE.md § Review follow-ups`), write decisions back, append the `review-triage` event. Never blocks the close-out.
 
@@ -811,7 +823,8 @@ PROMPT_META=$(node "$FORGE_SCRIPTS_DIR/forge-prompt.js" --unit-type "$unit_type"
   --isolation-mode "$ISOLATION_MODE" --branch "$BRANCH" --code-dir "$WORKER_CWD" \
   --memory-query "$unit_type $MILESTONE_ID $SLICE_ID $TASK_ID" \
   --memory-max-tokens "${PREFS[token_budget][auto_memory]:-1200}" \
-  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}") || { echo 'prompt render failed'; stop; }
+  --standards-max-tokens "${PREFS[token_budget][coding_standards]:-3000}" \
+  --ledger-max-tokens "${PREFS[token_budget][ledger_snapshot]:-1500}") || { echo 'prompt render failed'; stop; }
 PROMPT_PATH=$(node -pe 'JSON.parse(process.argv[1]).prompt_path' "$PROMPT_META")
 PROMPT_ID=$(node -pe 'JSON.parse(process.argv[1]).prompt_id' "$PROMPT_META")
 ```
@@ -846,7 +859,7 @@ Store as `RELEVANT_MEMORIES` and use in the worker prompt `## Project Memory` se
 
 > For human-readable consolidation, run `/forge-doctor --regen-projection` to rebuild the monolith from fragments (writes `AUTO-MEMORY.md` via `forge-memory.js --write-all`). See `forge-projection` in doctor help.
 
-Use the template from `~/.claude/forge-dispatch.md` for the current `unit_type`.
+Use the template from `$FORGE_SHARED_DIR/forge-dispatch.md` for the current `unit_type`.
 Substitute placeholders:
 - `{WORKING_DIR}` <- current working directory (orchestrator workspace — all `.gsd/**` paths)
 - `{M###}`, `{S##}`, `{T##}` <- from STATE
@@ -873,6 +886,19 @@ Do NOT read artifact files here — templates now pass paths; workers read their
 ### 4. Dispatch
 
 Use `$MODEL_ID` resolved by Tier Resolution (step 1.5) above. Do NOT look up model from PREFS directly — `model = PREFS.tier_models[tier]` is already computed.
+
+**Heartbeat — record active worker** before dispatching (same block as `forge-auto/SKILL.md § Heartbeat — record active worker`; replicate the form, do not invent another).
+
+Until S01/T02 this skill had **zero** invocations of `forge-runs.js` (measured: `grep -c "forge-runs.js" skills/forge-next/SKILL.md` → `0`), so in step mode `run.worker` was never written and `forge-hook.js::resolveUnitContext` resolved **every** dispatch to `adhoc` — every tool call of every step-mode unit landed in one shared `evidence-…-adhoc.jsonl`. That is cause (a) of IN-2:
+```bash
+_now=$(node -e "process.stdout.write(String(Date.now()))")
+if [ -n "$RUN_ID" ]; then
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"worker\":\"UNIT_TYPE/UNIT_ID\",\"worker_slice\":\"SLICE_ID\",\"worker_started\":$_now,\"last_heartbeat\":$_now,\"active\":true}" > /dev/null || true
+else
+  echo "ℹ worker não registrado: RUN_ID ausente (step mode sem run registrada) — evidence desta unidade cai em adhoc"
+fi
+```
+Replace `UNIT_TYPE/UNIT_ID` with the actual values (e.g. `execute-task/T01`) and `SLICE_ID` with this unit's slice (e.g. `S01`); use `null` **unquoted** when the unit has no slice. Unlike `forge-auto`, step mode does **not** fall back to writing `auto-mode.json`: this skill never activates auto-mode, and asserting `active:true` there would make the statusline (and the handoff check) report an autonomous run that is not happening. An absent `RUN_ID` is announced as a named reason instead.
 
 **Per-unit `CODE_DIR` resolution (multi-repo precondition)** — executable mirror of `shared/forge-dispatch.md § Sidecar dispatch state machine step 0.5` (contract prose lives there, never restated here). Runs HERE because `$PLAN_PATH` is only known per unit — the bootstrap `WORKTREE_DIR` (§ Isolation setup) is derived before any plan exists and stays untouched:
 ```bash
@@ -959,7 +985,7 @@ node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode execute \
 
 4. **Poll `$RESULT_FILE`** (state `polling`) every ~5–10s: `status==running` → keep polling + liveness check; `status==done` → success (step 5); `status==error` / adapter exit `!= 0` / unparseable JSON → failure with the matching `REASON` (`codex-exit-nonzero` / `codex-timeout` / `codex-invalid-json`) → Fallback. **Orphan:** heartbeat `updated_at` stale beyond the dynamic threshold `max(heartbeat_interval_ms × 4, 30s)` (field absent → assume 15s → 60s) → run the canonical liveness snippet (`shared/forge-dispatch.md § Orphan detection`): `stale-dead` → `kill "$pid"` (from the heartbeat) + `REASON=codex-orphan` → Fallback; `stale-alive` → grace of one more poll cycle, then kill if still stale.
 
-4.5. **Terminal outcome — runtime evidence materialization (step 7b), on EVERY outcome:** as soon as the poll loop settles a terminal outcome for this dispatch — `done`, **or** a failure `REASON` that Layer-1 transient retry will not retry in place (including `codex-invalid-json` and an unreadable `$RESULT_FILE`) — invoke exactly once `node "$FORGE_SCRIPTS_DIR/forge-evidence-materialize.js" --result "$RESULT_FILE" --unit "execute-task/{T##}" --cwd "$WORKING_DIR" --json`. Step **7b** of `shared/forge-dispatch.md § Sidecar dispatch state machine` owns its outcome enum, naming and census; this mirror only invokes and never restates them (exit 0 always, advisory). It sits **before** the Success/Failure split on purpose (S06 review R9): invoked only from Success, the canonical table's unreadable-result-file row was unreachable from every call site. **One census per terminal outcome, never one per retry** — a Layer-1 in-place retry has not reached a terminal outcome yet and does not invoke it.
+4.5. **Terminal outcome — runtime evidence materialization (step 7b), on EVERY outcome:** as soon as the poll loop settles a terminal outcome for this dispatch — `done`, **or** a failure `REASON` that Layer-1 transient retry will not retry in place (including `codex-invalid-json` and an unreadable `$RESULT_FILE`) — invoke exactly once `node "$FORGE_SCRIPTS_DIR/forge-evidence-materialize.js" --result "$RESULT_FILE" --unit "execute-task/{T##}" --milestone "{M###}" --slice "{S##}" --cwd "$WORKING_DIR" --json`. **All three axes, never `--unit` alone** (S01 review R2): the file name is the composite key, so an invocation missing the two axes lands under the `_no-milestone_`/`_no-slice_` sentinels, which parse back to `null` and can never match the real `{M###, S##, T##}` at resolution time — written and never found. Step **7b** of `shared/forge-dispatch.md § Sidecar dispatch state machine` owns its outcome enum, naming and census; this mirror only invokes and never restates them (exit 0 always, advisory). It sits **before** the Success/Failure split on purpose (S06 review R9): invoked only from Success, the canonical table's unreadable-result-file row was unreachable from every call site. **One census per terminal outcome, never one per retry** — a Layer-1 in-place retry has not reached a terminal outcome yet and does not invoke it.
 
 5.0. **Orchestrator re-verification (TASK-015):** `REVERIFY=$(node "$FORGE_SCRIPTS_DIR/forge-reverify.js" --result "$RESULT_FILE" --code-dir "$CODE_DIR" --gsd-dir "$WORKING_DIR/.gsd" --apply --json)`. Follow `shared/forge-dispatch.md § Sidecar dispatch state machine` for the formula. `verified` continues with the amended result, `failed` follows Failure, and `no-command` leaves it untouched. Emit `orchestrator_reverification` with `unit:"execute-task/{T##}"`, command, exit code, verdict, entries and ISO timestamp; except for `not-applicable`, add `## Re-verification` to the summary.
 5. **Partial promotion boundary:** for valid `status == "partial"`, run `PROMOTION=$(node "$FORGE_SCRIPTS_DIR/forge-env-promote.js" --result "$RESULT_FILE" --plan "$PLAN_PATH" --json)` before Success/Failure. `shared/forge-dispatch.md § Sidecar dispatch state machine` is the named canonical spec for its algorithm and allowlist; do not redefine either in this mirror. `PROMOTION.promote == true` is `done`: add `## Env Constraints` to `T##-SUMMARY.md` (item + reason + note per entry), synthesize `env_constraints[]` into the result block, leave promoted entries out of `must_haves_status.dropped`, and append `sidecar_env_promotion` (`unit:"execute-task/{T##}"`, count, reasons, ISO ts) to events.jsonl. Otherwise, including a legacy no-`scope` payload, follow Failure unchanged.
@@ -997,7 +1023,7 @@ echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\"
 # marker — same field, S02/T01). Absent/unrecognized → terminal: byte-identical to pre-T02 (single-shot
 # fallback, never an unbounded retry). codex-timeout / codex-orphan are ALWAYS terminal (a hung/orphaned
 # process is never retried in place) regardless of a stale error_class.
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 XLLM_STATE=$(node "$FORGE_SCRIPTS_DIR/forge-xllm-state.js" --mode read --dir "$WORKING_DIR/.gsd/forge" --milestone "{M###}" --slice "{S##}" --task "{T##}" --attempt "$N")
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null || echo "$RESULT_FILE")
 ERROR_CLASS=$(node -pe "JSON.parse(require('fs').readFileSync('$RESULT_FILE','utf8')).error_class || 'terminal'" 2>/dev/null || echo terminal)
@@ -1141,7 +1167,7 @@ fi
 
 3. **Dispatch detached via `run_in_background: true`**, `--mode plan` + `--plan-context` instead of `--plan`; `--model` is appended only when `$SIDECAR_MODEL` is non-empty; the resolver selects the chain's Codex member, then falls back to `workers.codex_model`:
 ```bash
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-xllm.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 node "$FORGE_SCRIPTS_DIR/forge-xllm.js" --mode plan \
   --plan-context "$CTX_FILE" --result-file "$RESULT_FILE" --cwd "$CODE_DIR" \
   --timeout "$WORKERS_TIMEOUT" \
@@ -1185,7 +1211,7 @@ and **rejoin the normal `plan-slice` completion path**: the **plan-check gate**,
 # Identical decision + counter + backoff + re-dispatch to Branch C, but codex wrote nothing on disk
 # (read-only), so there is NO surgical-reset step (§ BLOCKER item 2 skipped for the whole branch). The
 # result JSON is simply discarded and the SAME codex --mode plan dispatch re-runs after backoff.
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-surgical-reset.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 RESULT_FILE=$(node -pe "JSON.parse(require('fs').readFileSync('$XLLM_STATE','utf8')).result_file" 2>/dev/null || echo "$RESULT_FILE")
 ERROR_CLASS=$(node -pe "JSON.parse(require('fs').readFileSync('$RESULT_FILE','utf8')).error_class || 'terminal'" 2>/dev/null || echo terminal)
 case "$REASON" in codex-timeout|codex-orphan) ERROR_CLASS="terminal";; esac
@@ -1293,11 +1319,39 @@ DISPATCH_VCS=$(node "$FORGE_SCRIPTS_DIR/forge-vcs.js" --detect --field vcs --cwd
 echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"dispatch\",\"unit\":\"${unitType}/${unitId}\",\"model\":\"${MODEL_ID}\",\"tier\":\"${TIER}\",\"reason\":\"${REASON}\",\"effort\":\"${EFFORT}\",\"effort_reason\":\"${EFFORT_REASON}\",\"slice\":\"{S##}\",\"milestone\":\"${RUN_ID:-{M###}}\",\"input_tokens\":${INPUT_TOKENS},\"output_tokens\":${OUTPUT_TOKENS},\"model_applied\":${MODEL_APPLIED_JSON},\"engine\":\"${ENGINE:-claude}\",\"domain\":\"${DOMAIN_USED}\",\"route_source\":\"${ROUTE_SOURCE}\",\"chain_len\":${CHAIN_LEN},\"vcs\":\"${DISPATCH_VCS:-git}\",\"transport\":\"in-process\"}" >> .gsd/forge/events.jsonl
 ```
 
+**Heartbeat — clear worker field** after `Agent()` returns (mirror of `forge-auto/SKILL.md`; keeps the run from advertising a worker that already finished):
+```bash
+_now=$(node -e "process.stdout.write(String(Date.now()))")
+if [ -n "$RUN_ID" ]; then
+  node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$RUN_ID" --json "{\"worker\":null,\"worker_slice\":null,\"worker_started\":null,\"last_heartbeat\":$_now,\"active\":true}" > /dev/null || true
+fi
+```
+
 ### 5. Process result
 
 **Update timeline task** — mark the current task based on outcome:
 - `status: done` → `TaskUpdate({ taskId: current_task_id, status: "completed" })`
 - `status: partial` or `status: blocked` → leave task as `in_progress` (shows it was interrupted)
+
+**5.0 — Contract miss gate (Layer 0), BEFORE any status parsing.** Classify the return instead of eyeballing it for a block:
+
+```bash
+CLASSIFY=$(node "$FORGE_SCRIPTS_DIR/forge-worker-result.js" --classify --inline "$result")
+SHAPE=$(printf '%s' "$CLASSIFY" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).shape")
+```
+
+`SHAPE == complete` → fall through unchanged. Anything else (`absent` / `status-missing` / `empty`) → run the **recovery ladder** in `shared/forge-dispatch.md § Missing worker result (contract miss)` — canonical for the ladder, the salvage bases, the repair wording and the `contract_miss` event; do not restate them here:
+
+```bash
+SALVAGE=$(node "$FORGE_SCRIPTS_DIR/forge-worker-result.js" --salvage \
+  --unit "execute-task/{T##}" --plan "$PLAN_PATH" \
+  --summary "$WORKING_DIR/.gsd/milestones/{M###}/slices/{S##}/tasks/{T##}/{T##}-SUMMARY.md" \
+  --events "$WORKING_DIR/.gsd/milestones/{M###}/{M###}-events.jsonl" \
+  --events "$WORKING_DIR/.gsd/forge/events.jsonl" \
+  --code-dir "$CODE_DIR" --since "$START_SHA" --vcs "${DISPATCH_VCS:-git}")
+```
+
+A rung that yields a status hands back a `recovered.block` — parse **that** with the rows below. `/forge-next` is always `MODE = interactive`, so when the ladder reaches rung 4 (`blocked`), show the operator the salvage census verbatim before surfacing: what was probed and what each probe found is the actionable part, not the verdict alone.
 
 Parse the `---GSD-WORKER-RESULT---` block:
 - `status: done` → proceed to post-unit housekeeping
@@ -1407,7 +1461,7 @@ Partition rule:
 - Loose `/forge-task` run (no milestone, `{task-id}` is set) → `unit_id = {task-id}`
 
 ```bash
-FORGE_SCRIPTS_DIR=$([ -f scripts/forge-decisions.js ] && echo scripts || echo "$HOME/.claude/scripts")
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-decisions.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
 DECISIONS_UNIT_ID="${M###:-${task_id:-}}"
 if [ -n "$DECISIONS_UNIT_ID" ]; then
   printf '%s' "$key_decisions_json" | node "$FORGE_SCRIPTS_DIR/forge-decisions.js" --write --cwd "$WORKING_DIR"
@@ -1495,7 +1549,7 @@ Display the progress line AND the next action (read from the per-run `M###-STATE
 
 ## Worker Prompt Templates
 
-**Read `~/.claude/forge-dispatch.md`** and use the worker prompt template for the current `unit_type`. Substitute all placeholders with actual values from the loaded context.
+**Read `$FORGE_SHARED_DIR/forge-dispatch.md`** and use the worker prompt template for the current `unit_type`. Substitute all placeholders with actual values from the loaded context.
 
 ---
 

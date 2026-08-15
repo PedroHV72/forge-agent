@@ -200,7 +200,12 @@ test('R4 — resolvido-mas-não-isolado mantém reason e status; só o hint muda
   assertEqual(out.reason, 'sidecar-code-dir-undeclared', 'reason inalterado');
   assertEqual(out.declared_repo_status, 'unisolated', 'sub-status novo (aditivo)');
   assertEqual(out.code_dir, '', 'nenhum CODE_DIR é inventado');
-  assert(out.hint.includes(f.freyr), `hint nomeia o caminho resolvido: ${out.hint}`);
+  // O hint embute `declared_repo_path`, que é NORMALIZADO (`\` → `/` por
+  // normalizePath). Comparar contra o `f.freyr` cru casa por acidente no POSIX
+  // e falha no Windows, onde path.join produz barras invertidas — esta é uma
+  // das duas falhas remanescentes do item I-20260815014759. R3 logo acima já
+  // compara pela forma normalizada; R4/R5 estavam fora de passo.
+  assert(out.hint.includes(normalizePath(f.freyr)), `hint nomeia o caminho resolvido: ${out.hint}`);
   assert(/não tem worktree nesta run/.test(out.hint), 'hint explica que falta escopo, não nome');
 });
 
@@ -214,7 +219,7 @@ test('R5 — a recusa de R4 sai com exit code 5 pela CLI (mirrors intactos)', ()
   const j = JSON.parse(r.out);
   assertEqual(j.reason, 'sidecar-code-dir-undeclared', 'reason');
   assertEqual(j.declared_repo_status, 'unisolated', 'sub-status');
-  assert(j.hint.includes(f.freyr), 'hint com o caminho absoluto');
+  assert(j.hint.includes(normalizePath(f.freyr)), 'hint com o caminho absoluto (forma normalizada — ver R4)');
 });
 
 // ── R6: resolve para uma worktree existente ─────────────────────────────────

@@ -526,7 +526,7 @@ Somente o check de schema do executor (S01, componente #1) é enforcing em M003.
 Antes de ativar qualquer um destes em um projeto de produção: rode ≥ 1 milestone completo em modo advisory para medir a taxa de falsos positivos das heurísticas (regex stub, depth-2 walker, dimension scoring). M003 explicitamente não recomenda flipping defaults em v1.
 
 ### Review pairing dinâmico por autoria (M006)
-Resolver o challenger e advocate de cada review pela autoria do código reflete a realidade de que desafios independentes (de quem não escreveu) encontram brechas que dois Claudes não acham. `challenger: auto` resolve para a família **OPOSTA** ao autor (reduz viés de auto-preferência — paper arxiv 2404.13076); `advocate: auto` resolve para a **MESMA família** do autor. Autoria é derivada do campo `engine` dos dispatch events (Claude vs Codex) agregada por majority determinística. Enquanto `--mode defend` não existe (fase 2), autor GPT degrada para advocate Claude com evento `review-pairing-fallback: defend-mode-unavailable` — nunca bloqueia. Lógica em `scripts/forge-review-pairing.js`; Step 0 roda a CLI uma única vez por review. Defaults `challenger: claude` e `advocate: claude` permanecem — flip de `auto` é decisão pós-dogfood. Spec canônica sem redefinição: `shared/forge-review.md § Step 0`.
+Resolver o challenger e advocate de cada review pela autoria do código reflete a realidade de que desafios independentes (de quem não escreveu) encontram brechas que dois Claudes não acham. `challenger: auto` resolve para a família **OPOSTA** ao autor (reduz viés de auto-preferência — paper arxiv 2404.13076); `advocate: auto` resolve para a **MESMA família** do autor. Autoria é derivada do campo `engine` dos dispatch events (Claude vs Codex) agregada por majority determinística. **`--mode defend` já existe** em `scripts/forge-xllm.js` (docs `:43`, `authorizeSidecar` `:1691`, validação `:2353`), então um autor não-Claude passa a ser defendido pela **própria família** — a degradação para advocate Claude não é mais o caminho normal. Ela continua alcançável de propósito: quem sabe que o adapter falta (cópia instalada antiga, probe falho) passa `defendAvailable: false` e recebe o comportamento histórico, com o evento `review-pairing-fallback: defend-mode-unavailable`. Nunca bloqueia em nenhum dos dois caminhos. Lógica em `scripts/forge-review-pairing.js:223-225`. Lógica em `scripts/forge-review-pairing.js`; Step 0 roda a CLI uma única vez por review. Defaults `challenger: claude` e `advocate: claude` permanecem — flip de `auto` é decisão pós-dogfood. Spec canônica sem redefinição: `shared/forge-review.md § Step 0`.
 
 ### `scope: environment` do sidecar deixa de ser desculpa auto-aceita (TASK-020)
 `environment` é a **única** categoria que converte "não fiz" em "aceito", e a verificação dessa declaração era **textual, feita sobre um texto que o próprio sidecar escreve**. Resultado medido: **13 alegações falsas em três sessões** — 6× `git-commit-required` na M017, 6× `sandbox-exec-blocked` no projeto lookchina, e a 13ª durante a própria TASK-020. Em todas o trabalho estava correto e nenhuma estava provada; em uma delas **6 de 9** must-haves (toda a prova comportamental de uma task) ficaram sem verificação. **Três buracos que se compunham:** (a) o corroborador de `git-commit-required` era tautológico — `/\bgit\b|commit|push/i` sobre `item + note`, então qualquer note que **mencionasse** git se auto-corroborava (inclusive uma que dizia literalmente *"the task prohibits running any git command"*); agora corrobora **só contra `entry.note`** (nunca o `item`, boilerplate ecoado do plano) e exige operação de **escrita** git via `GIT_WRITE_RE` — o mesmo rigor que `sandbox-exec-blocked` já tinha em `:64-73` e que nunca fora aplicado ao vizinho. (b) `needsReverification` **e** `affectedEntries` filtravam por `reason === 'sandbox-exec-blocked'`, então a rede da TASK-015 nunca disparava para os outros quatro; ambos passam a compartilhar `isReverifiable()` — os **4 reasons de execução bloqueada**. `gsd-write-refused` é **deliberadamente excluído**: a alegação é sobre escrever `.gsd/**`, e uma suíte verde nunca toca esses arquivos, logo seu exit code não pode ser evidência (achado do review R1, arbitrado pelo operador; a versão inicial cobria os 5 e promovia por evidência irrelevante — reproduzido ao vivo). **Trigger e seletor mudam sempre juntos** — estreitar só um produz gate **verde inerte** (dispara, gasta a suíte, não seleciona nada). (c) `resolveVerifyCommand` detectava stack só por `package.json`/`go.mod`/`Cargo.toml`/pytest/`Makefile` e devolvia `null` neste repo zero-dep — mesmo com a rede disparando não havia comando a rodar; agora cai para `.gsd/CODING-STANDARDS.md § Lint & Format Commands → **Test:**`, descartando qualquer trecho que exija parsing de shell (glob, metacaractere, **aspas** e barra invertida — o spawn é `shell:false`, então só passam comandos tokenizáveis sem perda por split em espaço). `--gsd-dir` é encadeado até a CLI e as **4 mirrors** porque em modo worktree o `.gsd/` **não** está sob o `CODE_DIR` e walk-up não o alcança. **Regra operacional durável:** `reason: environment` vindo do sidecar **nunca** é evidência — exige re-execução pelo orquestrador, sempre. **Gaps registrados** em `.gsd/KNOWLEDGE.md § Review follow-ups`: `hasDivergentCommandNotes` não gateia notes sem runner token; o template do `/forge-init` (`commands/forge-init.md:415-419`) **não emite** `- **Test:**`, então projetos novos zero-dep não herdam o fallback de (c) até alguém acrescentar a linha à mão.
@@ -596,15 +596,138 @@ desfaz o container, não a mescla que já aconteceu na próxima escrita). `CURRE
 commit separado, porque é a última slice antes da PR e o bump é, na prática, irreversível.
 Containers `YYYY-QN` legados continuam **lidos**, nunca escritos ou migrados.
 
+### Worker truncado deixa de ser um ramo que não existe (Layer 0)
+
+Um subagente cuja mensagem final é cortada chega, a jusante, **byte a byte igual** a um que
+terminou: nos dois casos a chamada `Agent()` retornou. O bloco `---GSD-WORKER-RESULT---` é a única
+coisa que os separa — e ele está ausente exatamente no caso em que importa. O defeito não era uma
+heurística fraca: era a **ausência de ramo**. Um `grep` por tratamento de bloco faltante nos três
+orquestradores (`skills/forge-{auto,next,task}`) devolvia **zero**: o `Step 5. Process result`
+tratava `done`/`partial`/`blocked` e não tinha linha para "nenhum bloco". Sem ramo nomeado o modelo
+improvisa — numa sessão medida ele inventou um resume-por-`agentId` enquanto o trabalho de um
+executor de 17 min e 300k tokens estava **pronto no disco, não lido**. A improvisação não é o
+defeito; o ramo faltante é.
+
+**Layer 0** entra antes das três camadas existentes (Retry Handler / Failure Taxonomy / Node
+Repair), e a precedência é a justificativa: as três leem um sinal que o worker **emitiu**; um worker
+truncado não emitiu nenhum, então roteá-lo para qualquer uma delas é classificar um valor que
+ninguém leu. `scripts/forge-worker-result.js` decide por **marcador + enum de status**, e por mais
+nada — o **último** marcador vence (agentes citam o próprio template na prosa, e um placeholder
+`blocker: <description>` vazando do template citado vira uma objeção que o worker nunca reportou;
+o teste que prova isso precisou ser reescrito depois que um bite mostrou que asserir só sobre
+`status` não morde — a sobrescrita de chave concorda com as duas escolhas de marcador).
+**Deliberadamente não distinguido:** "o stream cortou" × "o agente esqueceu o bloco". O remédio é o
+mesmo, então um rótulo separando os dois compra zero decisão — e a única forma de adivinhá-lo é
+heurística de forma de prosa (cerca não fechada, sem pontuação final), o tipo de sinal confiante e
+não-medido que este repo já teve que apagar antes.
+
+A recuperação lê **o que o próprio worker escreveu**, nunca inventa: `worker-event` (a linha que o
+executor appenda em `{M###}-events.jsonl` **imediatamente antes** do bloco — mesmo precedente do
+salvage de `DEFENSE_FILE` em `shared/forge-review.md § Step 3`), ou `summary-file` **E**
+`plan-status: DONE` juntos — nunca um sozinho, porque um worker que fez só um está em voo.
+`vcs-delta` **nunca** decide: arquivo mudado significa que houve trabalho, não que a task concluiu;
+ele existe para separar "não fez nada" de "fez muito e perdemos o relatório", que é a diferença
+entre re-despachar barato e re-despachar por cima de trabalho vivo. `must_haves_status` **nunca** é
+sintetizado — é a alegação medida do worker sobre os próprios must-haves; ausente, fica ausente,
+para o verifier e a Layer 3 rodarem sobre evidência real. Piso anti-silêncio: as 4 sondas são
+sempre reportadas com desfecho do conjunto fechado `hit | miss | unavailable`, e `miss` (olhou, não
+achou) nunca colapsa em `unavailable` (não conseguiu olhar).
+
+**O hook parou de lavar o escape em sucesso.** `validateForgeSubagentResult` bloqueava o primeiro
+stop para pedir o re-emit e, no segundo passe (`stop_hook_active`), falhava aberto — correto, evita
+loop infinito — mas retornava **antes de computar `hasBlock`**, e o chamador gravava `status: 'done'`
+para um worker que nunca emitiu o contrato: a patologia "truncado é indistinguível de terminado",
+carimbada no artefato cuja função é distingui-los. Agora falha aberto **e diz o que houve**
+(`contract-missed`), e cada miss vira uma linha em `.gsd/forge/contract-miss.jsonl` com o `agent_id`
+— que é o único cabo para o resume. Nunca cria `.gsd/forge` num repo que não é Forge; silent-fail
+em tudo (MEM008). **Fronteira:** só o caminho Claude `Agent()`. O sidecar não precisa — o contrato
+dele é um JSON em disco e uma resposta cortada já aparece como `codex-invalid-json`, reason terminal
+com fallback existente; nada na máquina de estados do sidecar muda.
+
+### Uma projeção que só pode ser escrita uma vez não é gerenciada (install)
+
+Achado ao instalar o Layer 0: `install.sh --update` reportou sucesso e **o conserto do hook ficou
+inerte**. Três defeitos que se compõem, todos da mesma família — a instalação afirmando estar em dia
+sobre um arquivo que ela não toca há releases.
+
+**(1) A prova de propriedade não existia para não-Markdown.** `addOriginHeader` só acrescentava o
+marcador `<!-- forge-source:… -->` a Markdown; para qualquer outro formato devolvia o conteúdo
+intacto. Como o caminho de escrita lê destino existente **sem** marcador como `user_owned`, toda
+projeção `.js` virava conflito permanente na primeira vez que divergisse — congelada nos bytes da
+release que a criou, com cada `--update` seguinte preservando e reportando sucesso. Medido ao vivo:
+`~/.claude/hooks/forge-hook.js` parado várias releases atrás. Agora scripts recebem `// forge-source:…`
+**imediatamente abaixo do shebang** (acima quebraria a execução direta — mesma regra que o
+frontmatter já impunha ao Markdown), e `hasOriginMarker`/`stripOriginHeader` reconhecem a forma nova.
+JSON continua sem marcador possível — não tem sintaxe de comentário — e isso é **limitação nomeada e
+asserida**, não descuido: a compensação é o defeito (3).
+
+**(2) O caminho que executa não era projetado por ninguém.** `scripts/merge-settings.js` fia os 8
+hooks como `node ~/.claude/forge-hook.js`, mas o `forge-source-manifest.json` projetava só
+`hooks/forge-hook.js`. Dois arquivos que precisam concordar e nenhum enxerga o outro: a cópia que o
+Claude Code realmente roda não tinha dono. Corrigido no manifesto (o mesmo input com dois
+`render_targets`), sem tocar em `settings.json` — que é operator-owned por decisão e o instalador
+nunca reescreve. Guard: **Seção 106** do `forge-smoke.js` minera os comandos que o `merge-settings.js`
+emite e exige que cada um seja destino projetado, com controle positivo para o minerador não ser cego.
+
+**(3) O relatório era anônimo.** `Conflicts preserved: 3` sem nomear os arquivos é o que torna o
+drift invisível: um destino velho no caminho de execução lê exatamente igual a um que ninguém carrega.
+Achar o hook congelado custou byte-comparar contra o histórico do repo (`git show <sha>:<path>` em
+loop) em vez de ler o resumo. Agora cada preservado sai nomeado, separado por remédio
+(`[preserved]` × `[operator-owned]`).
+
+**Regra durável:** o marcador é a prova de propriedade, então **todo formato gerenciado precisa
+conseguir carregá-lo** — e o formato que não consegue (JSON) tem que aparecer nomeado no relatório.
+Contagem sem nome é silêncio com aparência de informação.
+
+### A prova de propriedade sai de dentro do arquivo (digest no manifesto)
+
+Fecha o que ficou em pé acima. Marcador de script resolveu o congelamento para **um** formato a mais
+e deixou a forma intacta: uma prova embutida no conteúdo não pode existir para um formato sem
+sintaxe de comentário. JSON é esse formato — `forge-prefs.schema.json` e o `capabilities.json` do
+renderer do Codex congelavam idêntico, com cada `--update` preservando e reportando sucesso.
+
+`scripts/forge-projection-ownership.js` formula a decisão **uma vez** para os dois renderers
+(antes cada um tinha a sua cópia, e o do Codex nunca tinha sido tocado). A escada é o contrato:
+(1) nada em disco → nosso; (2) `--migrate-legacy` → nosso (escape do operador, intocado);
+(3) marcador presente → nosso (comportamento anterior, **nunca estreitado**); (4) **digest bate com
+o registrado** → nosso — a única rung que um formato sem marcador alcança; (5) senão, conflito.
+
+**Estritamente aditivo, e isso é decisão.** O digest só é consultado quando o marcador falta: pode
+**conceder** propriedade, nunca revogar. Uma regra digest-first seria defensável e um pouco mais
+forte (impediria o instalador de sobrescrever a edição do operador num arquivo marcado, coisa que
+hoje ele faz de bom grado), mas transformaria em conflito arquivos que hoje atualizam — mudança de
+comportamento bem além de fechar o congelamento. Fica **registrada como não-mudança deliberada**,
+com assert próprio, não como descuido.
+
+Detalhes que custaram teste: CRLF e LF **têm** que digerir igual (checkout com `autocrlf` reportaria
+todo destino como editado e recongelaria tudo); `already-current` precisa **entrar** no registro, não
+só sobreviver nele (o caso real é reinstalação sobre árvore existente, sem registro anterior — e a
+primeira versão desse assert **não mordia**, porque o spread do carry-forward mantinha a entrada de
+qualquer jeito); dry-run **não** registra (registrar bytes nunca escritos faria a execução seguinte
+se achar dona de um arquivo que não tocou); e o instalador **mescla** em vez de substituir, para um
+run `--runtime claude` não derrubar os destinos do Codex.
+
 ## Estado atual
 
-- **Milestone ativo:** — nenhum. **M018** (Sidecar multi-LLM autônomo via `codex app-server`) fechada, **mergeada na `master`** em `eaeb556` (fast-forward) e pushada para `origin/master`.
+- **Milestone ativo:** — (nenhum em curso).
 - **Fase:** idle.
-- **Última entrega:** M018, 7 slices. Cliente JSON-RPC/stdio para `codex app-server` substitui o `codex exec` — a **ausência** do transporte antigo é provada por scanner in-process (`forge-exec-callsites.js`: `outcome: clean`, 312 arquivos, 0 call sites), não afirmada. Mais: schema pinado + guard de drift que nomeia o campo divergente, capability por turn, evidência de primeira classe com piso anti-silêncio, cobertura de env por reason (dois promovidos a exit code observado, três textuais com razão nomeada), e `turn/interrupt` antes do SIGKILL.
-- **Consertos pós-triagem, no mesmo commit:** rota inerte do `worker:` família (um `claude` nu resolvia para alias nulo e a task caía no default do frontmatter, ignorando o modelo do tier); Dimensão 9 do plan-checker (`.gsd/**` × `dispatch_engine`); Branch C marcando `status: DONE` no plano que completou; a mensagem de reparo do `SubagentStop`, que mandava o agente emitir **só** o bloco de resultado — obedecida ao pé da letra, custou 6 defesas do advogado, três voltando como placar nu; e o guard `nested-top-level-key`, achado por dogfood num workspace de dois repos onde **2 de 3 planos** aninhavam `expected_output` sob `must_haves:`, o validador chamava os três de válidos, e o resolvedor de `CODE_DIR` via zero paths.
-- **Baselines medidas na master pós-merge (medidas, não afirmadas):** `node scripts/run-tests.js` → **111 suítes**; `node scripts/forge-smoke.js` → **2502 passed / 0 failed / 1 skipped**; `cd app && swift run ForgeKitTests` → **515 passed / 0 failed**.
-- **Cópias instaladas:** `~/.claude` sincronizado com a master via `install.sh --update`, conferido arquivo a arquivo com `cmp`. Backup em `~/.claude-backup-20260807-231632`.
-- **Próxima ação:** Operador. Quatro itens em aberto, deliberadamente não corrigidos: (1) `GitActivity.Glob` (`app/Sources/ForgeKit/GitActivity.swift:219-227`) casa `X/**` **ancorado na raiz**, enquanto `agents/forge-completer.md:151` afirma prefixo-de-segmento em qualquer profundidade para a **mesma** lista de ignore — divergência medida por probe Swift temporário; (2) o comentário em `app/Sources/ForgeKitTests/main.swift:3086` afirma uma profundidade que o caso não exercita; (3) **S06 R7** (`scripts/forge-reverify.js:181-190`, o atalho de cardinalidade) segue **sem disposição nomeada** — nem corrigida nem listada como follow-up na triagem; (4) o dogfood real num workspace multi-repo de produção ainda não rodou — o `fs-probe` foi provado em umbrella sintético, não no projeto onde a falha 4/4-em-Claude foi medida.
+- **Último estado verde conhecido:** `v4.11.0` (merge `9b3f9fc`) — 170/170 suítes, smoke 2674/0/7.
+- **Mergeado desde então, com CI vermelha, por decisão explícita do operador em 2026-08-15:**
+  PR #91 (varredura da classe EOL), PR #94 (evidence PR1/2) e PR #98 (curadoria do `.gsd`).
+  As três estavam ~50 commits atrás da master e vermelhas nas três plataformas antes do merge.
+  **Consequência medida:** #91/#94 alteraram superfícies do golden (`agents/`, `skills/`,
+  `scripts/forge-hook.js`) sem regenerá-lo, quebrando `forge-claude-renderer.test.js` na master;
+  o golden foi regenerado pelo render path no merge da #98.
+- **Pendências nomeadas herdadas da curadoria** (ver `.gsd/KNOWLEDGE.md § Review follow-ups` e itens
+  `I-20260815052212-curate-undo-recusa-pos` / `I-20260815042115-preview-delete-wrappers`): `curate
+  --undo` recusa pós-apply real (`restoreVault` de S08 é delete/recria, incompatível com reescrita-
+  no-lugar); exit code do preview de `delete-wrappers` não distingue recusa-por-cerca de
+  sem-candidatos; gate índice-verde (D-2) medido **vermelho** neste repo (`f2_recall=0,4286` < piso
+  0,99) — deleção física segue estruturalmente bloqueada até a extração de citações melhorar; WDMA
+  nunca recebeu apply/preview real; caps 3/8 de S05 seguem provisórios.
+- **Backlog aberto do controle de recursos:** `I-20260814142227` (flakies, parcial),
+  `I-20260815014759` (Windows, 11 suítes), `I-20260814021202` + `I-20260815042402` (heap/RSS).
+- **Próxima ação:** rodar a suíte completa na master e tratar o vermelho herdado dos três merges.
 
 ## GSD — Início de sessão obrigatório (dogfood)
 

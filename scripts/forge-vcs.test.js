@@ -29,6 +29,77 @@ function fixture() {
   return cwd;
 }
 
+// ── S02 review R1 — parseSvnLogXml fail-closed, the four measured inputs ────
+//
+// These four inputs were EXECUTED during the S02 review and all four answered
+// `{ ok: true }` with a silently shrunken answer. Each assert below names the
+// input it exists for; the fix in forge-vcs.js names the guard that closes it.
+// A well-formed log is asserted alongside, so a parser that simply refuses
+// everything cannot pass this block.
+//
+// Placed HERE, ahead of the git fixtures, deliberately: this suite aborts on
+// the first throw (no per-test catch), and it carries a PRE-EXISTING failure
+// further down (the CRLF/EOL class, red on HEAD too). Appended at the end,
+// these asserts would never execute — a test that cannot run is not coverage.
+
+const WELL_FORMED = [
+  '<?xml version="1.0" encoding="UTF-8"?>',
+  '<log>',
+  '<logentry revision="12">',
+  '<msg>feat(S04/T01): trabalho</msg>',
+  '<paths><path action="M">/trunk/a.txt</path><path action="A">/trunk/b.txt</path></paths>',
+  '</logentry>',
+  '</log>',
+].join('\n');
+
+test('R1 log bem-formado continua parseando (os guards não são recusa geral)', () => {
+  const got = vcs.parseSvnLogXml(WELL_FORMED);
+  assert.strictEqual(got.ok, true, JSON.stringify(got));
+  assert.strictEqual(got.revisions.length, 1);
+  assert.strictEqual(got.revisions[0].rev, 12);
+  assert.deepStrictEqual(got.revisions[0].paths.map((p) => p.path), ['/trunk/a.txt', '/trunk/b.txt']);
+});
+
+test('R1 log vazio é um vazio honesto, nunca malformed', () => {
+  assert.deepStrictEqual(vcs.parseSvnLogXml('<?xml version="1.0"?>\n<log>\n</log>\n'), { ok: true, revisions: [] });
+});
+
+test('R1 <path> não fechado dentro de <paths> fechado é malformed, não revisão com zero paths', () => {
+  // Medido ANTES do fix: { ok: true, revisions: [{ rev: 1, paths: [] }] } —
+  // um arquivo escrito vira um arquivo que ninguém escreveu.
+  const bad = '<log><logentry revision="1"><paths><path action="M">/trunk/a.txt</paths></logentry></log>';
+  assert.deepStrictEqual(vcs.parseSvnLogXml(bad), { ok: false, error: 'svn-log-malformed' });
+});
+
+test('R1 revision="12junk" é malformed, não a revisão 12', () => {
+  // Medido ANTES do fix: rev 12 — parseInt faz prefix-parse e Number.isFinite nunca dispara.
+  const bad = '<log><logentry revision="12junk"><msg>x</msg></logentry></log>';
+  assert.deepStrictEqual(vcs.parseSvnLogXml(bad), { ok: false, error: 'svn-log-malformed' });
+});
+
+test('R1 stream truncado é malformed — "não consegui perguntar" nunca vira "não há"', () => {
+  const bad = '<?xml version="1.0"?>\n<log>\n<logentry revision="1">\n<msg>feat(S04/T01): x</msg>\n<paths><path action="M">/tr';
+  assert.deepStrictEqual(vcs.parseSvnLogXml(bad), { ok: false, error: 'svn-log-malformed' });
+});
+
+test('R1 lixo puro é malformed, nunca um log vazio', () => {
+  assert.deepStrictEqual(vcs.parseSvnLogXml('total garbage not xml'), { ok: false, error: 'svn-log-malformed' });
+});
+
+test('R1 entry deixada FORA de todo bloco casado é resíduo, não uma resposta mais curta', () => {
+  // Uma entry completa mais uma não fechada: devolver `revisions.length === 1`
+  // aqui é exatamente o encolhimento silencioso que este parser diz não fazer.
+  const bad = [
+    '<log>',
+    '<logentry revision="1"><msg>ok</msg></logentry>',
+    '<logentry revision="2"><msg>truncada',
+    '</log>',
+  ].join('\n');
+  assert.deepStrictEqual(vcs.parseSvnLogXml(bad), { ok: false, error: 'svn-log-malformed' });
+});
+
+// ── fim do bloco R1; o restante da suíte segue byte-idêntico ──────────────
+
 test('baselineId succeeds in a fixture and failures are normalized', () => {
   const cwd = fixture();
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-vcs-empty-'));

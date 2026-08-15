@@ -106,7 +106,14 @@ function parseListField(fm, key) {
     if (!raw) return [];
     return raw.split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
   }
-  const blockRe = new RegExp('^' + key + ':\\s*\\n((?:[ \\t]+-[ \\t]+.+\\n?)+)', 'm');
+  // Form A-inplace (S03/T05): the repetition terminator must accept CRLF. `.` in
+  // JavaScript excludes \r as a line terminator, so on a CRLF plan `.+` stops
+  // before the \r and the optional `\n?` cannot bridge it — the repetition ends
+  // after the FIRST item and every later declared path is silently dropped.
+  // Measured: a two-entry CRLF `writes:` parsed to one entry, which made a
+  // cross-repo plan look single-repo (forge-code-dir-repo.test.js "R12 — exit 4"
+  // came back 0). Silent under-reporting of declared paths, not a parse error.
+  const blockRe = new RegExp('^' + key + ':[ \\t]*\\r?\\n((?:[ \\t]+-[ \\t]+.+\\r?\\n?)+)', 'm');
   const mb = fm.match(blockRe);
   if (mb) {
     const items = [];

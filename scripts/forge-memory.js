@@ -355,8 +355,13 @@ function fragmentPath(cwd, unitId, opts) {
 // Unknown frontmatter keys are passed through as-is.
 // Accepts both inline ([...]) and block (- item) array forms.
 // Uses yamlSafe.parseScalar for scalar values (supports block-scalar `|` form).
+// EOL: this parser feeds writeFragment's read-modify-write (parseFragment →
+// mergeFacts/mergeStats → serializeFrontmatter → writeAtomic). Normalising CRLF→LF
+// here would silently rewrite every line of a Windows-authored .gsd/memory fragment
+// (D-S03-2). So the anchors are made TOLERANT, never normalising; the EOL actually
+// observed is captured by writeFragment from the same bytes and re-emitted.
 function parseFragment(text) {
-  const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) {
     return {
       unit_id: null,
@@ -372,7 +377,7 @@ function parseFragment(text) {
 
   const OBJECT_ARRAY_KEYS = new Set(['facts', 'stats']);
 
-  const lines = frontmatter.split('\n');
+  const lines = frontmatter.split(/\r\n|\n|\r/);
   let currentKey = null;
   let currentArray = null;
   let inObjectArray = false;
@@ -572,7 +577,11 @@ function mergeStats(existing, incoming) {
 // Keys are emitted in alphabetical order for diff stability.
 // `facts` and `stats` use block-of-objects form.
 // Simple arrays use block form. Scalars use yamlSafe.serializeScalar.
-function serializeFrontmatter(fragment) {
+// `eol` is the line ending captured from the fragment already on disk (Form B —
+// the writer re-emits the operator's bytes, it does not impose LF). Defaults to LF
+// for a fragment that does not exist yet, where there is nothing to preserve.
+function serializeFrontmatter(fragment, eol) {
+  const nl = eol || '\n';
   const skip = new Set(['body']);
   const keys = Object.keys(fragment).filter(k => !skip.has(k)).sort();
 
@@ -646,7 +655,11 @@ function serializeFrontmatter(fragment) {
       lines.push(`${key}: ${yamlSafe.serializeScalar(String(val), 0)}`);
     }
   }
-  return lines.join('\n');
+  // Block scalars produced by yamlSafe.serializeScalar are internally LF-joined;
+  // re-emit them with the captured EOL too, so the file the writer produces is not
+  // half CRLF and half LF. `/\r\n?|\n/` — a lone CR degrades the same way (measured).
+  const out = lines.join(nl);
+  return nl === '\n' ? out : out.replace(/\r\n?|\n/g, nl);
 }
 
 // ── writeFragment ─────────────────────────────────────────────────────────────
@@ -695,8 +708,13 @@ function writeFragment(cwd, fragment, opts) {
     // Read and merge only after acquiring the transaction lock. This is what
     // prevents two background forge-memory agents from both merging stale data.
     let base;
+    // Form B: capture the EOL of the fragment already on disk and re-emit it below.
+    // A fragment authored on Windows stays CRLF; a new one is written LF.
+    let eol = '\n';
     if (fs.existsSync(fpath)) {
-      const existing = parseFragment(fs.readFileSync(fpath, 'utf8'));
+      const rawExisting = fs.readFileSync(fpath, 'utf8');
+      eol = (rawExisting.match(/\r\n|\n|\r/) || ['\n'])[0];
+      const existing = parseFragment(rawExisting);
       const existingFacts = Array.isArray(existing.facts) ? existing.facts : [];
       const incomingFacts = Array.isArray(fragment.facts) ? fragment.facts : [];
       const existingStats = Array.isArray(existing.stats) ? existing.stats : [];
@@ -711,9 +729,10 @@ function writeFragment(cwd, fragment, opts) {
     }
     if (milestoneId) base.milestone_id = milestoneId;
 
-    const frontmatter = serializeFrontmatter(base);
-    const body = base.body ? `\n${base.body}` : '';
-    const content = `---\n${frontmatter}\n---\n${body}`;
+    const frontmatter = serializeFrontmatter(base, eol);
+    const rawBody = base.body ? `${eol}${base.body}` : '';
+    const body = eol === '\n' ? rawBody : rawBody.replace(/\r\n?|\n/g, eol);
+    const content = `---${eol}${frontmatter}${eol}---${eol}${body}`;
 
     if (fs.existsSync(fpath) && fs.readFileSync(fpath, 'utf8') === content) {
       return { path: fpath, created: false };
@@ -863,6 +882,7 @@ module.exports = {
   qualifiedStorageKey,
   parseStorageKey,
   parseFragment,
+  serializeFrontmatter,
   writeFragment,
   readFragment,
   readFragmentText,

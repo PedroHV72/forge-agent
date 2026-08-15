@@ -106,13 +106,17 @@ function itemPath(cwd, id) {
 // Flat scalar frontmatter only — values go through yamlSafe.parseScalar so
 // multi-line and colon-leading strings round-trip losslessly.
 // Unknown keys pass through unchanged (same tolerance as forge-decisions).
+// EOL: tolerant, never normalising — updateItem does parseItem(readFileSync) →
+// serializeItem → writeAtomic over the same file, so folding CRLF→LF here would
+// rewrite every line of a Windows-authored item fragment (D-S03-2). The EOL on
+// disk is captured by updateItem and handed back to serializeItem.
 function parseItem(text) {
-  const match = String(text).match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const match = String(text).match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) {
     return { id: null, body: String(text).trim() };
   }
 
-  const lines = match[1].split('\n');
+  const lines = match[1].split(/\r\n|\n|\r/);
   const body = match[2].trim();
   const result = {};
 
@@ -139,7 +143,10 @@ function parseItem(text) {
 // Serializes an item object back to the fragment format. Canonical keys first in
 // KEY_ORDER, then any extras alphabetically. Empty/absent optional keys are
 // omitted entirely rather than emitted blank.
-function serializeItem(item) {
+// `eol` is the line ending captured from the fragment already on disk (Form B).
+// Defaults to LF for a brand-new item, where there is nothing to preserve.
+function serializeItem(item, eol) {
+  const nl = eol || '\n';
   const skip = new Set(['body']);
   const extras = Object.keys(item)
     .filter(k => !skip.has(k) && !KEY_ORDER.includes(k))
@@ -153,8 +160,12 @@ function serializeItem(item) {
     lines.push(`${key}: ${yamlSafe.serializeScalar(val, 0)}`);
   }
 
-  const body = item.body ? `\n${item.body}\n` : '';
-  return `---\n${lines.join('\n')}\n---\n${body}`;
+  const body = item.body ? `${nl}${item.body}${nl}` : '';
+  const out = `---${nl}${lines.join(nl)}${nl}---${nl}${body}`;
+  // Block scalars from serializeScalar are internally LF-joined, and `body` carries
+  // whatever the parse handed back; re-emit both with the captured EOL so the file
+  // is not half CRLF and half LF. `/\r\n?|\n/` — a lone CR degrades the same way.
+  return nl === '\n' ? out : out.replace(/\r\n?|\n/g, nl);
 }
 
 // ── normalizeLabels ───────────────────────────────────────────────────────────
@@ -403,7 +414,10 @@ function updateItem(cwd, idOrPrefix, patch, opts) {
   opts = opts || {};
   const id = resolveItemId(cwd, idOrPrefix);
   const fpath = itemPath(cwd, id);
-  const existing = parseItem(fs.readFileSync(fpath, 'utf8'));
+  const rawExisting = fs.readFileSync(fpath, 'utf8');
+  // Form B: capture the EOL of the item already on disk and re-emit it below.
+  const eol = (rawExisting.match(/\r\n|\n|\r/) || ['\n'])[0];
+  const existing = parseItem(rawExisting);
 
   const merged = {
     ...existing,
@@ -452,7 +466,7 @@ function updateItem(cwd, idOrPrefix, patch, opts) {
     throw new Error(`Invalid item after update: ${errors.join('; ')}`);
   }
 
-  yamlSafe.writeAtomic(fpath, serializeItem(merged), {
+  yamlSafe.writeAtomic(fpath, serializeItem(merged, eol), {
     cwd: cwd,
     runId: opts.runId || null,
     sessionId: opts.sessionId || null,

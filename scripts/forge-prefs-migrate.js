@@ -139,26 +139,38 @@ function resolvedDiff(oldObj, newObj) {
 // comment. The result MUST parse via parseJsonc to exactly `values` (plus the
 // `$schema` metadata key, which the gate ignores).
 
-function renderActiveEntry(key, value, note) {
+// Form B: `eol` is the line ending observed in the catalogue this entry is being
+// spliced into. The entry must carry the file's own bytes — emitting LF into a
+// CRLF catalogue the operator authored leaves the file half and half.
+function detectEol(text) {
+  return (String(text).match(/\r\n|\n|\r/) || ['\n'])[0];
+}
+const ENDS_WITH_EOL = /(?:\r\n|\n|\r)$/;
+
+function renderActiveEntry(key, value, note, eol) {
+  const nl = eol || '\n';
   const json = JSON.stringify(value, null, 2)
     .split('\n')
     .map((line, index) => (index === 0 ? line : `  ${line}`))
-    .join('\n');
+    .join(nl);
   const lines = [];
   if (note) lines.push(`  // ${note}`);
   lines.push(`  ${JSON.stringify(key)}: ${json},`);
-  return `${lines.join('\n')}\n`;
+  return `${lines.join(nl)}${nl}`;
 }
 
 function activateValues(catalogText, values, schema) {
   const userValues = values || {};
   const pending = new Set(Object.keys(userValues));
+  // The catalogue may be a generated scaffold (LF) or bytes read from the
+  // operator's disk (possibly CRLF). Either way, follow what is there.
+  const eol = detectEol(catalogText);
   let output = '';
   for (const segment of segmentCatalog(catalogText)) {
     output += segment.raw;
     if (segment.key && pending.has(segment.key)) {
-      if (!output.endsWith('\n')) output += '\n';
-      output += renderActiveEntry(segment.key, userValues[segment.key]);
+      if (!ENDS_WITH_EOL.test(output)) output += eol;
+      output += renderActiveEntry(segment.key, userValues[segment.key], null, eol);
       pending.delete(segment.key);
     }
   }
@@ -169,12 +181,12 @@ function activateValues(catalogText, values, schema) {
     let block = '';
     for (const key of Object.keys(userValues)) {
       if (!pending.has(key)) continue;
-      block += renderActiveEntry(key, userValues[key], 'migrated from legacy md (not in schema)');
+      block += renderActiveEntry(key, userValues[key], 'migrated from legacy md (not in schema)', eol);
     }
     const close = output.lastIndexOf('}');
     if (close === -1) throw new Error('generated catalog has no root close');
     const head = output.slice(0, close);
-    output = `${head.endsWith('\n') ? head : `${head}\n`}${block}${output.slice(close)}`;
+    output = `${ENDS_WITH_EOL.test(head) ? head : `${head}${eol}`}${block}${output.slice(close)}`;
   }
   const parsed = parseJsonc(output);
   if (!parsed.ok) {
@@ -381,8 +393,12 @@ function ensureGitignore(cwd, opts) {
   if (options.dryRun) return { action: 'would-append', path: gitignore, warning: `adicionaria .gsd/forge-prefs.jsonc ao .gitignore; ${warning}` };
   let old = '';
   if (exists(gitignore)) old = fs.readFileSync(gitignore, 'utf8');
-  const newline = old.length === 0 || old.endsWith('\n') ? old : `${old}\n`;
-  write(gitignore, `${newline}.gsd/forge-prefs.jsonc\n`, 'utf8');
+  // Form B: the existing .gitignore is re-emitted whole (this is a rewrite, not an
+  // append), so its own EOL is captured and reused for the separator and the new
+  // line. Joining with LF would leave a Windows-authored .gitignore mixed.
+  const eol = detectEol(old);
+  const newline = old.length === 0 || ENDS_WITH_EOL.test(old) ? old : `${old}${eol}`;
+  write(gitignore, `${newline}.gsd/forge-prefs.jsonc${eol}`, 'utf8');
   return { action: 'appended', path: gitignore, warning: `adicionado .gsd/forge-prefs.jsonc ao .gitignore; ${warning}` };
 }
 
@@ -417,8 +433,13 @@ function rootEntryEnd(mask, text, keyStart) {
   }
   while (index < mask.length && (mask[index] === ' ' || mask[index] === '\t')) index += 1;
   if (mask[index] === ',') index += 1;
-  const newline = text.indexOf('\n', index);
-  return newline === -1 ? text.length : newline + 1;
+  // The returned offset is consumed as a RANGE end by activeSectionRanges →
+  // setCatalogValue, which rewrites the catalogue by slicing. It must land just
+  // past the whole line terminator, whatever that terminator is. `indexOf('\n')`
+  // already lands correctly on CRLF (the LF is the last byte of the pair) but is
+  // blind to a lone CR, which would fold two source lines into one range.
+  const tail = /\r\n|\n|\r/.exec(text.slice(index));
+  return tail === null ? text.length : index + tail.index + tail[0].length;
 }
 
 // Every ACTIVE occurrence of `section` as an absolute source range, in document
@@ -470,9 +491,12 @@ function setCatalogValue(catalogText, dotted, value, schema) {
   // keys can never change what the catalogue resolves to.
   const next = setDottedValue(parsed.value, dotted, value);
   const occurrences = activeSectionRanges(catalogText, section);
+  // Form B: every byte outside the touched range is re-emitted verbatim, so the
+  // replacement entry must carry the catalogue's own EOL — not LF by decree.
+  const eol = detectEol(catalogText);
   let output;
   if (occurrences.length > 0) {
-    const entry = renderActiveEntry(section, next[section]);
+    const entry = renderActiveEntry(section, next[section], null, eol);
     output = '';
     let cursor = 0;
     for (let index = 0; index < occurrences.length; index++) {
@@ -497,7 +521,7 @@ function setCatalogValue(catalogText, dotted, value, schema) {
       const close = catalogText.lastIndexOf('}');
       if (close === -1) throw new Error('catalog has no root close');
       const head = catalogText.slice(0, close);
-      output = `${head.endsWith('\n') ? head : `${head}\n`}${renderActiveEntry(section, next[section], SET_MARKER)}${catalogText.slice(close)}`;
+      output = `${ENDS_WITH_EOL.test(head) ? head : `${head}${eol}`}${renderActiveEntry(section, next[section], SET_MARKER, eol)}${catalogText.slice(close)}`;
     }
   }
   const checked = parseJsonc(output);

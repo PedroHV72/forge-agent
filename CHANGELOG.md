@@ -1,3 +1,88 @@
+## v4.11.0 — Controle de recursos com o eixo de heap declarado, e asserts que param de medir o vizinho
+
+Esta entrada cobre **v4.9.0, v4.10.0 e v4.11.0**. As duas primeiras foram tagueadas sem entrada de
+CHANGELOG e sem bump de `VERSION` — a constante ficou em `4.8.0` por três releases, então o
+instalador carimbava `4.8.0` num checkout tagueado `v4.10.0`. Corrigido aqui: `VERSION` volta a
+acompanhar a tag, e o golden do renderer foi regenerado **pelo próprio render path** (o marcador de
+origem embute `version=`, então bumpar move legitimamente os 7 hashes das superfícies marcadas).
+
+### Controle de recursos de máquina (v4.10.0, milestone `M-20260813221024`)
+
+Admissão e dimensionamento de recursos na execução de testes: `scripts/forge-resources.js` como dono
+único, pool machine-wide por lease compartilhado (soma-para-teto), tokenizer real que reconhece as
+formas provadas de runner e recusa com razão enumerada, três consumidores finos (`forge-verify`,
+`forge-reverify`, `forge-hook` PreToolUse) com release de lease em toda saída, censo
+(`forge-doctor --check resources`) com piso anti-silêncio, e indicador na statusline.
+
+**O ganho de performance NÃO foi reproduzido, e isso é parte da entrega.** A primeira medição foi
+invalidada pela própria review (o instrumento gravava o intento do processo pai, não a ação do
+filho). A re-medição, com 12/12 corridas carregando dump escrito pelo **próprio filho**, provou o
+enforcement ativo e não achou ganho: baseline não reproduziu (batch 312 s contra 301 s esperados;
+solo 179 s contra 88 s), e as diferenças ficaram dentro da dispersão interna das células
+(−0,9 s solo contra dispersão de 64 s; −16,1 s batch contra 174–202 s).
+
+**O eixo de heap não restringe — ele concede.** Medido dentro do processo filho: o teto real é
+**4288 MB** com `enforcement=off` (o default do Node nesta máquina) contra **8384 MB** sob pressão
+`warn` e **12480 MB** sob pressão normal — ou seja, ligar o controle eleva o teto por processo em
+**2 a 2,9×**. O agregado `workers × heapMb` fica em 2,5× a RAM sob `warn` e 7,5× no estado normal
+(máquina de 16 GB). Os eixos que **de fato** restringem são a **contagem de workers** (10 → 5) e o
+**cap do Playwright** (1).
+
+A calibração fica **inalterada de propósito**: teto não é alocação, e ninguém mediu consumo
+**residente** (RSS), então não há evidência de que o teto elevado vire consumo real. Recalibrar sem
+esse dado repetiria exatamente o erro que a milestone existiu para não cometer. A medição de RSS é
+pré-requisito declarado de qualquer recalibragem (itens `I-20260814021202`, `I-20260815042402`).
+
+### Added
+
+- **`forge-gate --resolve-lapsed`** — resolve para o default declarado todo gate que expirou sem
+  ninguém para persistir o lapso. Sweep idempotente, com censo (`examined`/`resolved`/
+  `skipped[{id,reason}]`) e razão nomeada em cada skip. Nunca sobrescreve resposta humana.
+- **`forge-gate --max-wait <ms>`** — limita o bloqueio ao orçamento de quem chama, devolvendo
+  `source: wait-timeout` com o gate **ainda aberto**. `wait-timeout` nunca é decisão.
+- **`writableRoots` do sidecar** (v4.9.0, PR #86) — medido, com semântica de soma.
+
+### Fixed
+
+- **Um gate lapso deixa de depender de um waiter sobrevivente.** O único código que persistia o
+  `timeout-default` vivia dentro de `waitForAnswerSync`, então a resolução era efeito colateral de um
+  processo seguir vivo até o instante da expiração. Ele não segue: o call site real
+  (`--open --wait --timeout 1800000`) roda numa tool call cujo orçamento é de minutos, não os 30 do
+  gate. O waiter morria no meio do bloqueio e o gate ficava `pending` para sempre — um leitor
+  posterior via `expired` com `answer: null`, byte a byte igual a um gate que nunca teve janela.
+  A resolução passa a ser função do **arquivo**, alcançável por qualquer processo depois.
+  *(O item original dizia que os gates "nasciam expirados"; o artefato sobrevivente refuta —
+  `expires_at - created_at` era exatamente o timeout pedido.)*
+- **`complete-slice` perde o caminho para mergear** (v4.11.0, PR #96). A instrução negativa competia
+  com um passo canônico escrito nas três superfícies que o completer lê, e perdia. O passo — que já
+  estava **morto**, nomeando um branch fora do esquema atual — saiu; a proibição passa a ser
+  declarada **por classe** (integrar), não por verbo. Guard fiado em `forge-auto`/`forge-next`, com o
+  incidente reproduzido literalmente.
+- **Dois reason codes emitidos e não registrados** (PR #96): `intact:enforcement-off` e
+  `intact:admission-refused-advisory` degradavam para `reason-unregistered:*` no censo.
+- **Asserts que mediam superfície viva compartilhada** — família de testes que só ficava verde com a
+  máquina ociosa (`I-20260814142227`). `census R13` e `forge-touch R5` passam a medir **cópias
+  isoladas**; o `forge-touch` ganhou o `HOME` sintético que o cabeçalho já **afirmava** ter sem que
+  nada no arquivo o setasse.
+- **O escritor concorrente era um teste.** `forge-touch` R7 escrevia o fonte mutado por cima do
+  `scripts/forge-touch.js` **real** e restaurava no `finally`; a janela é observável, e
+  `forge-release-gate` chama `packaging.build({repo})` duas vezes afirmando que os hashes são iguais.
+  R7 passa a compilar o mutante **em memória**. Medido amostrando o fonte 400× durante a suíte:
+  antes 10 amostras divergentes, agora 0.
+- **Um assert sobre o hábito de quem roda a suíte** — o teste Swift de divergência terminava em
+  `if !onDefault { assertTrue(ahead > 0) }`, quebrando 100% deterministicamente em qualquer branch
+  recém-criado. Trocado por repo sintético com divergência **conhecida** (`ahead` exato 2).
+- **Windows: `forge-code-dir-repo` R4/R5** comparavam o hint contra o caminho **cru** enquanto o hint
+  embute a forma **normalizada** (`\` → `/`); no POSIX coincidiam por acidente.
+
+### Known
+
+- **Windows continua vermelho em 12 suítes** (`I-20260815014759`), majoritariamente domínio
+  git/worktree/caminho. O item registrava 2; a medição na master mostra 12. Não são residuais.
+- `forge-lock`, `forge-release-gate`, `forge-package` e `forge-app-workspace-marker` **não foram
+  reproduzidos** isoladamente. Nos dois do meio a correção é por remoção da causa (o R7 acima),
+  declarada como hipótese medida na causa e não verificada no efeito.
+
 ## v4.8.0 — One core, two hosts, and a sidecar that gets nothing it doesn't need
 
 ### Added

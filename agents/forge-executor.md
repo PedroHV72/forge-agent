@@ -26,7 +26,7 @@ Key implication for autonomous mode: **never halt to ask the user**. Document as
 1a. **Validate must_haves schema (BEFORE setting `status: RUNNING`):**
     Run:
     ```bash
-    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-must-haves.js ] && echo scripts || echo "$HOME/.claude/scripts")
+    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-must-haves.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
     node "$FORGE_SCRIPTS_DIR/forge-must-haves.js" --check "{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/tasks/{T##}/{T##}-PLAN.md"
     ```
     Parse the JSON on stdout:
@@ -53,7 +53,7 @@ Key implication for autonomous mode: **never halt to ask the user**. Document as
 9. Verify every must-have (see ladder below)
 10. **Verification gate** — invoke:
     ```bash
-    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-verify.js ] && echo scripts || echo "$HOME/.claude/scripts")
+    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-verify.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
     node "$FORGE_SCRIPTS_DIR/forge-verify.js" --plan "{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/tasks/{T##}/{T##}-PLAN.md" --cwd "{WORKING_DIR}" --unit execute-task/{T##}
     ```
     Parse the JSON result:
@@ -70,20 +70,39 @@ Key implication for autonomous mode: **never halt to ask the user**. Document as
       - command: "npm run typecheck"
         exit_code: 0
         matched_line: 42
+        evidence_file: "evidence~M###~S01~T04.jsonl"
       - command: "npm test"
         exit_code: 0
         matched_line: 43
+        evidence_file: "evidence~M###~S01~T04.jsonl"
     ```
     Derivation:
     - `command`: the exact shell string you ran (or a stable substring — see below).
     - `exit_code`: the numeric exit code you observed in your conversation (Claude Code surfaces it in the Bash tool result).
-    - `matched_line`: the 1-indexed line number in `.gsd/forge/evidence-{T##}.jsonl` whose `cmd` field contains your command (or a recognisable substring). Derive with:
+    - **Resolve the evidence-log FILE SET first** — one logical unit (`{M###}|{S##}|{T##}`) can be spread
+      across the new composite name **and** legacy forms (bare, slice-qualified, milestone-qualified). Do
+      NOT read `.gsd/forge/evidence-{T##}.jsonl` by itself — that bare name only ever holds the unqualified
+      slice of the log and silently misses the rest of the set:
       ```bash
-      grep -n -m 1 -F "<command-substring>" .gsd/forge/evidence-{T##}.jsonl | cut -d: -f1
+      FORGE_SCRIPTS_DIR=$([ -f scripts/forge-evidence-path.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
+      node "$FORGE_SCRIPTS_DIR/forge-evidence-path.js" --resolve --milestone "{M###}" --slice "{S##}" --unit "{T##}" --json --cwd "{WORKING_DIR}"
       ```
-      - If grep finds a line → use that number.
-      - If grep returns nothing (evidence log missing, disabled mode, or the command string doesn't match) → record `matched_line: 0`. This is a valid sentinel — the slice completer (forge-completer) will surface it as an advisory flag, not a blocker.
-    - If the evidence log file does not exist at all (evidence.mode is `disabled`, or the hook failed silently), emit `verification_evidence: []` (empty array). Do NOT omit the key — the completer expects it.
+      Output: `{files:[{name, form}, ...], by_form:{...}, skipped:[...]}`. `files` is the resolved set —
+      every file in it belongs to this logical unit, none by loose substring guessing.
+    - `matched_line`: search **every file in the resolved set** (in the order returned) for the first
+      line whose `cmd` field contains your command (or a recognisable substring):
+      ```bash
+      grep -n -m 1 -F "<command-substring>" .gsd/forge/<file> | cut -d: -f1
+      ```
+      - First file with a hit → record that `matched_line` (1-indexed) **and** the file name in
+        `evidence_file` on the same entry, so a later `matched_line: 0` claim is diagnosable against a
+        named file instead of a silently-wrong guess.
+      - No hit in any file in the set → record `matched_line: 0`. This is a valid sentinel — the slice
+        completer (forge-completer) will surface it as an advisory flag, not a blocker.
+    - If the resolved set is empty (`files: []` — evidence log missing, disabled mode, or nothing written
+      for this unit yet), emit `verification_evidence: []` (empty array). Do NOT omit the key — the
+      completer expects it. An empty resolved SET is what makes `evidence_log_missing` legitimate — never
+      the absence of the single bare-named file alone.
 
     `command` string rules:
     - Must be ≤ 180 chars. Truncate at word boundary if the real command is longer.
@@ -221,15 +240,18 @@ verification_evidence:
   - command: "npm run typecheck"
     exit_code: 0
     matched_line: 42
+    evidence_file: "evidence~M###~S##~T##.jsonl"
   - command: "npm test"
     exit_code: 0
     matched_line: 43
+    evidence_file: "evidence~M###~S##~T##.jsonl"
 # ... other fields (provides, key_files, etc.) ...
 ---
 ```
 
-- Empty array (`verification_evidence: []`) is valid — means no verification commands were run OR the evidence log was unavailable (`evidence.mode: disabled`).
+- Empty array (`verification_evidence: []`) is valid — means no verification commands were run OR the evidence log was unavailable (`evidence.mode: disabled`, or the resolved evidence-log SET for this unit is empty).
 - `matched_line: 0` is the "claim not found in evidence log" sentinel — valid, advisory only.
+- `evidence_file`: the name of the file (from the resolved set — see step 12a) that carried the matched line, or that was the last file checked when `matched_line: 0`. Optional field, additive — old readers ignore it. It is what makes a `matched_line: 0` claim diagnosable instead of a silent guess (S01/T04, `I-20260813235424`).
 - The slice completer (`forge-completer`) reads this block to produce `## Evidence Flags` in `S##-SUMMARY.md`. Mismatches are flagged but never block merge (M003 is advisory; strict-mode blocker is reserved for M004+).
 
 Follow with: **one substantive liner** + `## What Happened` + `## Assumptions` (if any) + `## Deviations` + `## Files Created/Modified` + `## Verification`

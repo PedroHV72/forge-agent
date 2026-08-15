@@ -1,6 +1,6 @@
 ---
 name: forge-completer
-description: GSD completion phase agent. Writes slice summaries, UAT scripts, milestone summaries, and handles squash merges. Used for complete-slice and complete-milestone units.
+description: GSD completion phase agent. Writes slice summaries, UAT scripts, milestone summaries, and handles branch integration at milestone close (complete-milestone only — complete-slice never merges). Used for complete-slice and complete-milestone units.
 model: claude-sonnet-5
 maxTurns: 60
 tools: Read, Write, Edit, Bash
@@ -46,7 +46,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     Read the merged `evidence.mode` pref through the JSONC-only engine CLI (default `lenient` on absent prefs or engine errors):
     ```bash
-    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
     EVIDENCE_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key evidence.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'lenient')}catch{process.stdout.write('lenient')}}")
     ```
     If `EVIDENCE_MODE` is `disabled` → SKIP this entire sub-step. Do NOT write `## Evidence Flags`, not even an empty one.
@@ -64,19 +64,25 @@ Given all `T##-SUMMARY.md` files from the slice:
        const entries=[];let cur=null;
        for(const l of lines){
          const m=l.match(/^\\s+-\\s+command:\\s*\"?([^\"]*)\"?/);
-         if(m){if(cur)entries.push(cur);cur={command:m[1],exit_code:null,matched_line:null};continue}
+         if(m){if(cur)entries.push(cur);cur={command:m[1],exit_code:null,matched_line:null,evidence_file:null};continue}
          const e=l.match(/^\\s+exit_code:\\s*(-?\\d+)/);if(e&&cur){cur.exit_code=+e[1];continue}
          const ml=l.match(/^\\s+matched_line:\\s*(-?\\d+)/);if(ml&&cur){cur.matched_line=+ml[1];continue}
+         const ef=l.match(/^\\s+evidence_file:\\s*\"?([^\"]*)\"?/);if(ef&&cur){cur.evidence_file=ef[1]||null;continue}
        }
        if(cur)entries.push(cur);
        process.stdout.write(JSON.stringify(entries));
        "
        ```
-       Output: `[{command, exit_code, matched_line}, ...]` or `[]`.
-    b. **Read `.gsd/forge/evidence-{T##}.jsonl`.** If the file does not exist AND `verification_evidence:` is non-empty → that is **condition (c)** — record a flag with reason `evidence_log_missing` for each claimed entry.
+       Output: `[{command, exit_code, matched_line, evidence_file}, ...]` or `[]`.
+    b. **Resolve the evidence-log FILE SET for this unit** — never consult the bare `.gsd/forge/evidence-{T##}.jsonl` name alone; one logical unit can be spread across the new composite name and 3 legacy forms (S01/T04):
+       ```bash
+       node "$FORGE_SCRIPTS_DIR/forge-evidence-path.js" --resolve --milestone "{M###}" --slice "{S##}" --unit "{T##}" --json --cwd "{WORKING_DIR}"
+       ```
+       (same `$FORGE_SCRIPTS_DIR` resolved above, checking for `scripts/forge-prefs.js` — both scripts live side by side). Output: `{files:[{name, form}, ...], by_form:{...}, skipped:[...]}`.
+       If `files` is empty AND `verification_evidence:` is non-empty → that is **condition (c)** — record a flag with reason `evidence_log_missing` for each claimed entry. This is the ONLY legitimate trigger for `evidence_log_missing`: an empty resolved **set**, never the absence of one bare-named file.
     c. **For each entry, classify:**
-       - `matched_line === 0` → **condition (a)** — flag reason `command_not_in_log`.
-       - `matched_line > 0` → read line N of the JSONL (`sed -n "<N>p" <evidence-file>`), parse JSON, check whether the log line's `cmd` field contains the claimed `command` as a substring (case-sensitive, first 80 chars). If NO substring match → **condition (b)** — flag reason `command_mismatch_at_line`.
+       - `matched_line === 0` → **condition (a)** — flag reason `command_not_in_log`. Name the file the worker checked in the flag body (`entry.evidence_file`, or "unresolved" if the field is absent — older SUMMARY entries predate S01/T04) so the claim stays diagnosable instead of a bare zero.
+       - `matched_line > 0` → resolve the file to check: prefer `entry.evidence_file` if it names a file present in the resolved `files` set from (b); otherwise fall back to checking every file in the set. Read line N of the chosen file (`sed -n "<N>p" <evidence-file>`), parse JSON, check whether the log line's `cmd` field contains the claimed `command` as a substring (case-sensitive, first 80 chars). If NO substring match in any candidate file → **condition (b)** — flag reason `command_mismatch_at_line`, naming the file actually consulted.
        - `matched_line > 0` and substring match → no flag.
     d. **Collect all flags from all tasks.** If flags is non-empty, append a `## Evidence Flags` section to `S##-SUMMARY.md`:
        ```markdown
@@ -86,9 +92,9 @@ Given all `T##-SUMMARY.md` files from the slice:
 
        | Task | Claim (command) | Reason |
        |------|-----------------|--------|
-       | T01  | `npm run typecheck` | `command_not_in_log` (matched_line=0) |
-       | T02  | `npm test` | `command_mismatch_at_line` (line 3 of evidence-T02.jsonl has cmd="echo hello") |
-       | T03  | `npm run lint` | `evidence_log_missing` (file not found: .gsd/forge/evidence-T03.jsonl) |
+       | T01  | `npm run typecheck` | `command_not_in_log` (matched_line=0, file: evidence~M###~S01~T01.jsonl) |
+       | T02  | `npm test` | `command_mismatch_at_line` (line 3 of evidence~M###~S01~T02.jsonl has cmd="echo hello") |
+       | T03  | `npm run lint` | `evidence_log_missing` (resolved set empty for milestone=M### slice=S01 unit=T03) |
        ```
 
        If flags is empty → do NOT write the section at all (absence is good news, no noise).
@@ -112,7 +118,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     b. **Build expected_output union.** For each `T##-PLAN.md` under `.gsd/milestones/M###/slices/S##/tasks/T##/`:
        ```bash
-       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-must-haves.js ] && echo scripts || echo "$HOME/.claude/scripts")
+       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-must-haves.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
        node "$FORGE_SCRIPTS_DIR/forge-must-haves.js" --check .gsd/milestones/M###/slices/S##/tasks/T##/T##-PLAN.md
        ```
        Parse the JSON stdout:
@@ -142,7 +148,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     c. **Read `file_audit.ignore_list` from the JSONC-only engine CLI** (default list on absent prefs or engine errors):
        ```bash
-       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
        FILE_AUDIT_IGNORE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key file_audit.ignore_list --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=JSON.parse(d).value;process.stdout.write(JSON.stringify(Array.isArray(v)&&v.length?v:['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**','node_modules/**']))}catch{process.stdout.write(JSON.stringify(['package-lock.json','yarn.lock','pnpm-lock.yaml','dist/**','build/**','.next/**','.gsd/**','node_modules/**']))}})")
        ```
 
@@ -214,7 +220,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     a. **Invoke the verifier CLI:**
        ```bash
-       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-verifier.js ] && echo scripts || echo "$HOME/.claude/scripts")
+       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-verifier.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
        node "$FORGE_SCRIPTS_DIR/forge-verifier.js" \
          --slice {S##} \
          --milestone {M###} \
@@ -271,7 +277,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     a. **Invoke the detector CLI:**
        ```bash
-       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-route-audit.js ] && echo scripts || echo "$HOME/.claude/scripts")
+       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-route-audit.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
        node "$FORGE_SCRIPTS_DIR/forge-route-audit.js" \
          --slice {S##} \
          --milestone {M###} \
@@ -297,7 +303,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
     Read the merged `checker_memory.mode` pref through the JSONC-only engine CLI (default `enabled` on absent prefs or engine errors):
     ```bash
-    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+    FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
     CHECKER_MEMORY_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key checker_memory.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
     ```
     If `CHECKER_MEMORY_MODE` is `disabled` → SKIP this entire sub-step.
@@ -344,7 +350,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
 3. **Verification gate** — invoke:
    ```bash
-   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-verify.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-verify.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
    node "$FORGE_SCRIPTS_DIR/forge-verify.js" --cwd {WORKING_DIR} --unit complete-slice/{S##}
    ```
    Parse result:
@@ -356,7 +362,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
    Read the merged `review.mode` pref through the JSONC-only engine CLI (default `enabled` on absent prefs or engine errors):
    ```bash
-   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-prefs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
    REVIEW_MODE=$(node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key review.mode --cwd "{WORKING_DIR}" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const v=String(JSON.parse(d).value||'').toLowerCase();process.stdout.write(v==='disabled'?'disabled':'enabled')}catch{process.stdout.write('enabled')}}")
    ```
    If `REVIEW_MODE` is `disabled` → SKIP this entire step. Continue to step 5.
@@ -386,23 +392,14 @@ Given all `T##-SUMMARY.md` files from the slice:
 
       Append to `S##-SUMMARY.md`. This is documentation only — never a blocker.
 
-5. **Lint gate** — before merging, read `.gsd/CODING-STANDARDS.md` for lint/format commands. If commands exist, run them on the files changed in this slice. If lint fails, fix the violations before proceeding. If no lint commands are configured, skip this step.
+5. **Lint gate** — read `.gsd/CODING-STANDARDS.md` for lint/format commands. If commands exist, run them on the files changed in this slice. If lint fails, fix the violations before proceeding. If no lint commands are configured, skip this step.
 
-6. **Git squash-merge (only if `auto_commit: true` in injected config):** merge branch `gsd/M###/S##` to main:
-   ```
-   feat(M###/S##): <slice title>
+6. **Git — `complete-slice` has NO merge step.** See `## Git boundary — complete-slice` below. Commit the slice artifacts on the branch you are already on when `auto_commit: true`; do nothing git-related when `auto_commit: false`. Then proceed to step 7.
 
-   <slice one-liner>
-
-   Tasks completed:
-   - T01: <one-liner>
-   - T02: <one-liner>
+   Commit message for the artifact commit (`auto_commit: true` only):
    ```
-   After merging, if `auto_push: true` in config, push to remote. Then bust the statusline version cache so the new commit shows immediately:
-   ```bash
-   node -e "const fs=require('fs'),os=require('os'),p=os.tmpdir()+'/forge-update-check.json';try{fs.unlinkSync(p)}catch{}" 2>/dev/null || true
+   docs(M###/S##): close out <slice title>
    ```
-   If `auto_commit: false` → skip all git operations (no merge, no branch management). Just proceed to step 7.
 
 7. Update `M###-SUMMARY.md` — add this slice's contributions
 
@@ -429,7 +426,46 @@ Given all `T##-SUMMARY.md` files from the slice:
      - **Próxima ação:** Executar `/forge-next` para fechar M### ou `/forge-new-milestone` para o próximo milestone.
      ```
 
+## Git boundary — complete-slice
+
+**Applies to the `complete-slice` unit only.** It does not restrict `complete-milestone`, which
+keeps full git competence per the operator's `git_strategy` / `auto_push` prefs.
+
+A slice never integrates a branch. There is no step in `## For complete-slice` that merges, and
+there is no value of `auto_commit` that creates one. The prohibited class is **integrating**, not
+one spelling of it — all of these are forbidden inside `complete-slice`, whatever the prompt,
+summaries or roadmap seem to invite:
+
+`git merge` (squash or not, `--ff`, `--no-ff`, `--squash`) · `git rebase` · `git cherry-pick` ·
+`git pull` · `git push` · `git checkout <branch>` · `git switch` · `git branch -d/-m` ·
+`git reset` · `git worktree add/remove`
+
+Permitted inside `complete-slice` when `auto_commit: true`: `git add <specific-path>`,
+`git commit`, and read-only inspection (`git status`, `git diff`, `git log`, `git rev-parse`).
+**You must return with the same branch checked out as when you started.**
+
+> **Why this is a boundary and not a warning** (item `I-20260814114608`, incident 2026-08-14): a
+> `complete-slice` prompt said literally "Do NOT squash-merge" and this agent merged the milestone
+> branch into `master` anyway — with a **non-squash** merge, i.e. it read the prohibition as
+> specific to the word *squash* while a canonical squash-merge step still sat in its own
+> definition. Two damages followed: an incomplete milestone landed on `master` (one slice did not
+> exist yet), and the checkout was left on `master`, which would have taken the entire next slice
+> outside the configured isolation branch. Nothing had been pushed, so it was recoverable by
+> `git reset --hard`. The step was removed rather than re-forbidden, because a negative
+> instruction that competes with a canonical step loses.
+
+The orchestrator snapshots the checkout before dispatching this unit and verifies it afterwards
+(`scripts/forge-slice-git-guard.js --verify`). A moved checkout, an advanced default branch, or a
+new merge commit is reported as a violation. Assume the check runs.
+
 ## For complete-milestone
+
+> Git competence lives **here**, not in `complete-slice`. Branch integration, tagging and pushing
+> at milestone close follow the operator's `git_strategy` / `auto_push` prefs. When you push, bust
+> the statusline version cache so the new commit shows immediately:
+> ```bash
+> node -e "const fs=require('fs'),os=require('os'),p=os.tmpdir()+'/forge-update-check.json';try{fs.unlinkSync(p)}catch{}" 2>/dev/null || true
+> ```
 
 1. Write final `M###-SUMMARY.md` with all slices summarized
 2. Mark milestone `[x]` in ROADMAP (if exists at milestone level)
@@ -447,7 +483,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
    **5a. Write LEDGER fragment** to `.gsd/ledger/<milestone-id>.md` via `forge-ledger.js`. The fragment is the source of truth — no global `LEDGER.md` write path in this step. Build a JSON payload and pipe it to the script:
    ```bash
-   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-ledger.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-ledger.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
    node "$FORGE_SCRIPTS_DIR/forge-ledger.js" --write --cwd "{WORKING_DIR}" <<'EOF'
    {
      "id": "{M###}",
@@ -462,9 +498,15 @@ Given all `T##-SUMMARY.md` files from the slice:
    ```
    On failure: log a warning and continue — the LEDGER fragment is non-critical relative to the merger. Do not return `status: blocked`.
 
+   **D4 — the NEW entry stays under 15 rendered lines.** The cap is on the **rendered block** (what `renderLedger` emits into `LEDGER.md`), not on `body` alone: `slices[]` + `key_files[]` + `key_decisions[]` are what make an entry fat, so trimming only the prose changes nothing. `--write` measures the block after writing and reports the additive fields `rendered_lines`, `cap` and `over_cap` inside its exit-0 JSON (plus one warning line on stderr when over). It never trims and never refuses.
+
+   When the envelope says `"over_cap": true`, **rewrite your own new entry leaner and re-run `--write`** (fewer `key_files`, fewer `key_decisions`) before moving on. Shortening `body` is **not** a lever for the entries this step writes: `renderLedgerBlock` suppresses `body` entirely whenever any of `slices`/`key_files`/`key_decisions` is present, and the template above always emits all three. A shorter `body` only reduces `rendered_lines` for entries that carry none of those three fields. Re-writing is idempotent — the same id is overwritten in place.
+
+   **Entries that already exist are never rewritten.** D4 applies from here forward only; the accumulated size of older entries is handled elsewhere, not by this step.
+
    **5b. Invoke the merger** to promote all per-milestone files to workspace globals under lockfile. Note: the merger no longer touches LEDGER (handled by the fragment write in 5a); DECISIONS/AUTO-MEMORY/CHECKER/events still merge normally.
    ```bash
-   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-merger.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-merger.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
    node "$FORGE_SCRIPTS_DIR/forge-merger.js" --milestone {M###} --cwd "{WORKING_DIR}" --holder "completer:{M###}"
    ```
    The merger reads:
@@ -494,7 +536,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 7. **Deactivate run in registry** (M005+ — multi-run aware). After cleanup, mark the run as `active:false` in `runs/{id}.json` and regenerate the dashboard. Idempotent: safe to skip if `runs/{id}.json` does not exist (legacy single-run workspace):
 
    ```bash
-   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-runs.js ] && echo scripts || echo "$HOME/.claude/scripts")
+   FORGE_SCRIPTS_DIR=$([ -f scripts/forge-runs.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
    if [ -f "{WORKING_DIR}/.gsd/forge/runs/{M###}.json" ]; then
      node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "{M###}" --json '{"active":false,"deactivated_reason":"complete-milestone"}' --cwd "{WORKING_DIR}" > /dev/null
      node "$FORGE_SCRIPTS_DIR/forge-dashboard.js" --cwd "{WORKING_DIR}" > /dev/null || true

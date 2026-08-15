@@ -41,11 +41,19 @@ function test(name, fn) {
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
-const src = fs.readFileSync(projectsPath, 'utf8');
+// Form B, module-scope (S03-FIXSET.json, D-S03-3 undetermined→B): normalize
+// once at every .swift read in this suite — the sources here are only ever
+// pinned against, never rewritten by this module. `/\r\n?/g`, never
+// `/\r\n/g` — a lone CR degrades identically (measured, T-20260811190103).
+function readSwiftSource(p) {
+  return fs.readFileSync(p, 'utf8').replace(/\r\n?/g, '\n');
+}
+
+const src = readSwiftSource(projectsPath);
 
 /** Drop `//` comments so prose describing the old behaviour is never matched. */
 function stripComments(text) {
-  return text.split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+  return text.split(/\r?\n/).map(l => l.replace(/\/\/.*$/, '')).join('\n');
 }
 const code = stripComments(src);
 
@@ -229,8 +237,8 @@ test('o card nunca imprime "sem git" — a ausência medida vem nomeada do Forge
     'gitLine desenha um símbolo LITERAL — todo glifo desta linha tem de vir do GitGlyph, senão ' +
     'existe um nome de SF Symbol que o harness nunca valida (e um inválido é um quadrado branco)');
 
-  const digest = stripComments(fs.readFileSync(
-    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift'), 'utf8'));
+  const digest = stripComments(readSwiftSource(
+    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift')));
   // Prefixo sem o parêntese de fecho: a regra ganhou um segundo parâmetro
   // (`remote:`) e uma âncora que exigisse `)` acusaria a assinatura em vez da
   // regra. O que este teste protege são os quatro casos abaixo, não a aridade.
@@ -292,8 +300,8 @@ test('a divergência da branch padrão vem pronta do ForgeKit — a view não a 
       `fatos viram um`);
   }
 
-  const digest = stripComments(fs.readFileSync(
-    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift'), 'utf8'));
+  const digest = stripComments(readSwiftSource(
+    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift')));
   const j = digest.indexOf('static func of(_ baseline: GitBaseline?)');
   assert(j >= 0, 'GitBaselineMark.of não encontrado — a regra de composição da marca sumiu');
   const rule = digest.slice(j, j + 2200);
@@ -331,8 +339,8 @@ test('a linha de git é uma LISTA de segmentos vinda do ForgeKit, não uma strin
     'a view não distingue mais os segmentos por `kind` — se passar a casar por PALAVRA, o ' +
     'layout quebra na primeira mudança de texto em pt-BR');
 
-  const digest = stripComments(fs.readFileSync(
-    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift'), 'utf8'));
+  const digest = stripComments(readSwiftSource(
+    path.join(repoRoot, 'app/Sources/ForgeKit/ProjectDigest.swift')));
   const j = digest.indexOf('static func compose(_ s: GitStatusSnapshot');
   assert(j >= 0, 'GitRowSegment.compose sumiu — a regra de composição da linha não existe mais');
   const rule = digest.slice(j, j + 3000);
@@ -362,8 +370,8 @@ test('o git é re-perguntado quando falhou, e nunca quando foi medido', () => {
 });
 
 test('Git.invoke não estaciona o chamador num semáforo — foi isso que apagou o git da tela', () => {
-  const git = stripComments(fs.readFileSync(
-    path.join(repoRoot, 'app/Sources/ForgeKit/GitCore.swift'), 'utf8'));
+  const git = stripComments(readSwiftSource(
+    path.join(repoRoot, 'app/Sources/ForgeKit/GitCore.swift')));
   const i = git.indexOf('static func invoke(');
   assert(i >= 0, 'Git.invoke não encontrado — a chamada de processo foi renomeada ou removida');
   const body = git.slice(i, git.indexOf('static func run(', i));

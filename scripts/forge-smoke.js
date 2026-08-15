@@ -5953,6 +5953,14 @@ function smokePrefsCutover() {
   '(d) statusline reads repo_path through engine and has prefs error badge');
   withHermeticHome(({ env }) => {
     const dir = mkTmp('prefs-cutover-passive');
+    // A capture assertion below needs the hook to actually WRITE, and since
+    // PR #94 the PostToolUse branch refuses when no owner resolves rather than
+    // manufacturing an orphan `.gsd/`. `mkTmp` seeds only `.gsd/forge`, and
+    // `forge` is not a WORK_ENTRY, so the directory is not a project and the
+    // refusal — correctly — fires. Seeding one WORK_ENTRY makes it a project.
+    // Without this the `disabled` half passes vacuously (nothing is ever
+    // written, for the wrong reason) and the `lenient` half fails.
+    fs.writeFileSync(path.join(dir, '.gsd', 'PROJECT.md'), '# fixture project\n', 'utf8');
     const forgeDir = path.join(dir, '.gsd', 'forge');
     const globalJsonc = path.join(env.HOME, '.claude', 'forge-agent-prefs.jsonc');
     fs.mkdirSync(path.dirname(globalJsonc), { recursive: true });
@@ -5991,7 +5999,11 @@ function smokePrefsCutover() {
     const evidence = String(resolved.evidence.mode || 'lenient').toLowerCase();
     assert(locksEnabled === false && evidence === 'strict',
       '(d) engine golden preserves worktree file-lock override and normalized evidence mode');
-    const evidenceFile = path.join(forgeDir, 'evidence-adhoc.jsonl');
+    // S01/T03: the hook now resolves the composite name via buildEvidenceFileName
+    // even on the adhoc fallback path (no runs/ record) — never the legacy bare
+    // 'evidence-adhoc.jsonl'. Compute the same way the hook does, not hardcode it.
+    const { buildEvidenceFileName } = require('./forge-evidence-path.js');
+    const evidenceFile = path.join(forgeDir, buildEvidenceFileName({ unit: 'adhoc' }));
     try { fs.unlinkSync(evidenceFile); } catch {}
     fs.writeFileSync(globalJsonc, '{"evidence":{"mode":"disabled"}}', 'utf8');
     const disabled = runScript('forge-hook.js', ['post'], {
@@ -13540,6 +13552,18 @@ function smokeEvidenceRuntime() {
     evidenceFileName, SOURCE, LEGACY_SOURCE, CENSUS_KIND,
   } = require('./forge-evidence-materialize');
 
+  // `mkTmp` seeds only `.gsd/forge`, and `forge` is NOT a WORK_ENTRY — so the
+  // directory is not a project. Since PR #94 the materializer (and the hook)
+  // REFUSE to write when no owner resolves, rather than manufacturing an
+  // orphan `.gsd/` (S01 review R1 / D-S01-1). That refusal is the invariant,
+  // not the bug: these scenarios have to hand it a real project. Seeding one
+  // WORK_ENTRY is the whole difference between `owner-unresolved` and a write.
+  const mkEvidenceProject = (label) => {
+    const made = mkTmp(label);
+    fs.writeFileSync(path.join(made, '.gsd', 'PROJECT.md'), '# fixture project\n', 'utf8');
+    return made;
+  };
+
   const dir = mkTmp('evidence-runtime');
   // Declarados FORA do try para que o finally os alcance mesmo com assert
   // vermelho — a pegadinha já anotada na Seção 94 (um repo git vazado deixa
@@ -13595,7 +13619,7 @@ function smokeEvidenceRuntime() {
       assert(ev.census.outcome !== 'not-collected' && ev.census.items_received >= 3,
         '(a) coletado-e-vazio NÃO colapsa em not-collected e o censo conta os itens recebidos', JSON.stringify(ev.census));
 
-      const cwdA = mkTmp('evidence-runtime-empty');
+      const cwdA = mkEvidenceProject('evidence-runtime-empty');
       try {
         const mat = runScript('forge-evidence-materialize.js',
           ['--result', got.resultFile, '--unit', 'execute-task/T95', '--cwd', cwdA, '--json']);
@@ -13706,7 +13730,7 @@ function smokeEvidenceRuntime() {
       for (const [label, payload] of Object.entries(scenarios)) {
         const resultFile = path.join(dir, `${label}-payload.json`);
         fs.writeFileSync(resultFile, JSON.stringify(payload), 'utf8');
-        const cwdX = mkTmp(`evidence-runtime-${label}`);
+        const cwdX = mkEvidenceProject(`evidence-runtime-${label}`);
         try {
           const mat = runScript('forge-evidence-materialize.js',
             ['--result', resultFile, '--unit', 'execute-task/T95', '--cwd', cwdX, '--json']);
@@ -13752,7 +13776,7 @@ function smokeEvidenceRuntime() {
     // igualdade estrita. A linha sintetizada legada é pré-gravada como o §7a a
     // grava; o materializador acrescenta as runtime.
     {
-      const cwdE = mkTmp('evidence-runtime-coexist');
+      const cwdE = mkEvidenceProject('evidence-runtime-coexist');
       try {
         const file = path.join(cwdE, '.gsd', 'forge', evidenceFileName('execute-task/T95'));
         fs.writeFileSync(file, `${JSON.stringify({
@@ -15442,6 +15466,1633 @@ function smokeRoutingDomainsRendered() {
   pass('(final) Section 101: real rendered planner prompts carry routing and repository values with a biting fixture guard');
 }
 
+// ── Section 102: ledger snapshot proven in the RENDERED prompt + D1 exclusion ──
+//
+// S02's whole claim in one section: the ledger snapshot reaches plan-slice —
+// newest entries whole, oldest omitted, exact-entry marker, literal re-read
+// command — proven on the RENDERED prompt (never the template alone, the #77 /
+// MEM002 mold: a green guard anchored on the wrong artifact hid an inert wire
+// for weeks); and execute-task receives none of it (D1), with a positive
+// control proving the absence assert is not blind — the predicate is shown
+// seeing the ids in plan-slice BEFORE it is trusted to report their absence in
+// execute-task.
+//
+// The maxTokens budget below is never hand-computed: it is found by scanning
+// the REAL renderLedgerSnapshot() until it reports omitted_count === 2 — the
+// builder (S02 B1) is the single source of the block shape and the selection,
+// so a hardcoded byte count here would silently drift from what it claims to
+// measure the moment the block shape changes.
+function smokeLedgerSnapshotRendered() {
+  process.stdout.write('\n▸ Section 102: ledger snapshot in the rendered plan-slice prompt + D1 exclusion for execute-task\n');
+  const { renderPrompt } = require('./forge-prompt.js');
+  const projection = require('./forge-projection.js');
+  const repoRoot = path.dirname(SCRIPTS);
+  const dir = mkTmp('ledger-snapshot-rendered');
+  const templateDir = path.join(repoRoot, 'shared', 'templates', 'dispatch');
+  try {
+    const ledgerDir = path.join(dir, '.gsd', 'ledger');
+    fs.mkdirSync(ledgerDir, { recursive: true });
+
+    // 4 deterministic fragments, distinct greppable ids and controlled
+    // completed_at dates (molde seções 88-90). Equal-size bodies keep every
+    // entry's token weight uniform so the calibration scan below is stable.
+    const entries = [
+      { id: 'M-20260101000000-oldest-aa', completed_at: '2026-01-01T00:00:00Z', title: 'Oldest' },
+      { id: 'M-20260202000000-second-bb', completed_at: '2026-02-02T00:00:00Z', title: 'Second' },
+      { id: 'M-20260303000000-recent-cc', completed_at: '2026-03-03T00:00:00Z', title: 'Recent' },
+      { id: 'M-20260404000000-newest-dd', completed_at: '2026-04-04T00:00:00Z', title: 'Newest' },
+    ];
+    const body = 'x'.repeat(200);
+    for (const e of entries) {
+      const content = [
+        '---',
+        `id: ${e.id}`,
+        `title: ${e.title}`,
+        `completed_at: ${e.completed_at}`,
+        'slices: []',
+        'key_files: []',
+        'key_decisions: []',
+        '---',
+        '',
+        body,
+        '',
+      ].join('\n');
+      fs.writeFileSync(path.join(ledgerDir, `${e.id}.md`), content, 'utf8');
+    }
+
+    let maxTokens = null;
+    let snap = null;
+    for (let candidate = 40; candidate <= 2000; candidate += 5) {
+      const s = projection.renderLedgerSnapshot(dir, { maxTokens: candidate });
+      if (s.omitted_count === 2 && s.included_ids.length === 2) { maxTokens = candidate; snap = s; break; }
+    }
+    assert(maxTokens != null,
+      '(setup) a maxTokens exists where exactly 2 of the 4 fixture entries survive',
+      `no candidate in 40..2000 produced omitted_count===2 (last snap=${JSON.stringify(snap)})`);
+    assert(!!snap && snap.included_ids.join(',') === 'M-20260404000000-newest-dd,M-20260303000000-recent-cc',
+      '(setup) the 2 surviving ids are the 2 NEWEST fragments — recency selection, not directory order',
+      snap ? JSON.stringify(snap.included_ids) : '(no snap)');
+
+    // Disk path end-to-end, no options.ledger / ledgerProvider — the coupled
+    // API seam (forge-prompt → forge-projection.renderLedgerSnapshot) is what
+    // is under test, not a fixture-supplied override.
+    const slice = renderPrompt({
+      cwd: dir, unitType: 'plan-slice', milestoneId: 'M001', sliceId: 'S01',
+      templateDir, ledgerMaxTokens: maxTokens, memories: [],
+    });
+
+    assert(slice.prompt.includes('M-20260404000000-newest-dd'),
+      '(a) rendered plan-slice prompt contains the newest fixture id');
+    assert(slice.prompt.includes('M-20260303000000-recent-cc'),
+      '(a) rendered plan-slice prompt contains the second-newest fixture id');
+    assert(!slice.prompt.includes('M-20260101000000-oldest-aa'),
+      '(b B1) rendered plan-slice prompt does NOT contain the oldest fixture id');
+    assert(!slice.prompt.includes('M-20260202000000-second-bb'),
+      '(b B1) rendered plan-slice prompt does NOT contain the second-oldest fixture id');
+    assert(/\[\.\.\.truncated 2 ledger entries — see node scripts\/forge-projection\.js --render ledger/.test(slice.prompt),
+      '(c W1) the marker names exactly the 2 omitted ENTRIES (never sections) and the literal re-read command',
+      slice.prompt.slice(-400));
+    assert(slice.prompt.includes('[DATA FROM "LEDGER"') && slice.prompt.includes('[END DATA FROM "LEDGER"]'),
+      '(c) the snapshot is wrapped in the DATA FROM / END DATA FROM markers');
+
+    // D1 positive control BEFORE the absence assert: the predicate must first
+    // be shown seeing the fixture ids at all (it just did, in plan-slice above)
+    // so the execute-task absence assert below is not a blind, always-green
+    // check on an id nothing ever produces.
+    assert(slice.prompt.includes('M-20260404000000-newest-dd'),
+      '(d control) positive control — the predicate DOES see fixture ids when they are actually injected (plan-slice)');
+
+    const task = renderPrompt({
+      cwd: dir, unitType: 'execute-task', milestoneId: 'M001', sliceId: 'S01', taskId: 'T01',
+      templateDir, ledgerMaxTokens: maxTokens, memories: [],
+    });
+    for (const e of entries) {
+      assert(!task.prompt.includes(e.id), `(d D1) rendered execute-task prompt does not contain fixture id ${e.id}`);
+    }
+
+    const execTemplate = readRepoText(path.join(templateDir, 'execute-task.md'));
+    assert(!execTemplate.includes('{LEDGER}'),
+      '(d D1) shared/templates/dispatch/execute-task.md (executable template, never the prose mirror) does not contain {LEDGER}');
+
+    const sliceTemplate = readRepoText(path.join(templateDir, 'plan-slice.md'));
+    const dataBlock = sliceTemplate.match(/\[DATA FROM "LEDGER"[^\n]*\n([\s\S]*?)\[END DATA FROM "LEDGER"\]/);
+    assert(!!dataBlock, '(e) shared/templates/dispatch/plan-slice.md carries the LEDGER DATA markers');
+    assert(!!dataBlock && dataBlock[1].includes('{LEDGER}'),
+      '(e) shared/templates/dispatch/plan-slice.md (executable template) contains {LEDGER} between the DATA markers');
+
+    const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+    assert(/smokeLedgerSnapshotRendered\(\);/.test(mainBody), '(f) Section 102 is registered in main()');
+  } finally {
+    cleanup(dir);
+  }
+  pass('(final) Section 102: {LEDGER} lands in the RENDERED plan-slice prompt with recency, an exact-entry marker and the '
+    + 'literal re-read command; execute-task proves the absence (D1) with a positive control proving the predicate is not '
+    + 'blind; and the template-level assert targets plan-slice.md, the executable template, never the prose mirror');
+}
+
+// ── Section 103: memory-index command proven in the EXECUTABLE TEMPLATE and ──
+// ── in the RENDERED plan-slice prompt (D3: command, not content) ─────────────
+//
+// T02 wired a query command for scripts/forge-memory-index.js into
+// shared/templates/dispatch/plan-slice.md, deliberately never the full index
+// content (D3 — the whole point of --file is that the consult stays cheap).
+// The MEM002 / PR #77 lesson is that a guard anchored on shared/forge-dispatch.md
+// (the prose mirror) proves nothing about what forge-prompt.js actually reads —
+// so this section asserts on BOTH: the executable template read straight off
+// disk, and a real rendered plan-slice prompt produced by renderPrompt (mold:
+// Section 102). A positive control (plan-slice sees the command) is asserted
+// BEFORE the negative control (execute-task does not) so the absence assert is
+// never a blind, always-green predicate. The token ceiling on the section is
+// what makes "command, not content" falsifiable: if anyone ever inlines index
+// facts into this block, the section grows past the ceiling and turns red.
+function smokeMemoryIndexCommandRendered() {
+  process.stdout.write('\n▸ Section 103: memory-index command in the executable template and the rendered plan-slice prompt\n');
+  const { renderPrompt } = require('./forge-prompt.js');
+  const { countTokens } = require('./forge-tokens.js');
+  const repoRoot = path.dirname(SCRIPTS);
+  const templateDir = path.join(repoRoot, 'shared', 'templates', 'dispatch');
+  const dir = mkTmp('memory-index-command-rendered');
+  try {
+    // (a) executable template, never the prose mirror (MEM002 / PR #77).
+    const sliceTemplate = readRepoText(path.join(templateDir, 'plan-slice.md'));
+    const cmdLine = sliceTemplate.split('\n').find(l => l.includes('forge-memory-index.js'));
+    assert(!!cmdLine,
+      '(a) shared/templates/dispatch/plan-slice.md (executable template) contains a forge-memory-index.js command line');
+    assert(!!cmdLine && cmdLine.includes('--file'),
+      '(a) the same command line also carries --file, never a bare invocation',
+      cmdLine || '(no line found)');
+    assert(!!cmdLine && /--cwd\s+"\{WORKING_DIR\}"/.test(cmdLine),
+      '(a) --cwd is quoted around {WORKING_DIR} in the template line — S02/R1: a bare path with a space breaks a pasted command',
+      cmdLine || '(no line found)');
+
+    // (b) rendered prompt — placeholders resolved, {WORKING_DIR} value quoted.
+    const slice = renderPrompt({
+      cwd: dir, unitType: 'plan-slice', milestoneId: 'M001', sliceId: 'S01', templateDir, memories: [],
+    });
+    const renderedLine = slice.prompt.split('\n').find(l => l.includes('forge-memory-index.js'));
+    assert(!!renderedLine, '(b) rendered plan-slice prompt contains a forge-memory-index.js command line');
+    assert(!!renderedLine && !/\{[A-Z_]+\}/.test(renderedLine),
+      '(b) no raw {PLACEHOLDER} token survives on the rendered command line — every brace was resolved',
+      renderedLine || '(no line found)');
+    assert(!!renderedLine && renderedLine.includes('--file'),
+      '(b) the rendered command line also carries --file');
+    assert(!!renderedLine && new RegExp(`--cwd\\s+"${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`).test(renderedLine),
+      '(b) --cwd is quoted around the resolved WORKING_DIR value on the rendered line',
+      renderedLine || '(no line found)');
+
+    // (c) controls — positive ordered before negative, so the absence assert
+    // below is never a blind predicate (Section 102 mold).
+    assert(slice.prompt.includes('forge-memory-index.js'),
+      '(c control) positive control — the predicate DOES see the command when it is actually injected (plan-slice)');
+    const task = renderPrompt({
+      cwd: dir, unitType: 'execute-task', milestoneId: 'M001', sliceId: 'S01', taskId: 'T01', templateDir, memories: [],
+    });
+    assert(!task.prompt.includes('forge-memory-index.js'),
+      '(c) rendered execute-task prompt does not carry the memory-index command');
+    const execTemplate = readRepoText(path.join(templateDir, 'execute-task.md'));
+    assert(!execTemplate.includes('forge-memory-index.js'),
+      '(c) shared/templates/dispatch/execute-task.md (executable template) does not carry the memory-index command');
+
+    // (d) D3 — command, not content: the section itself stays under a small
+    // fixed token ceiling, and the rendered prompt never carries an actual
+    // index fact line or the index artifact's own header. If someone later
+    // injects index content here, both asserts below turn red — that is the
+    // design (T03 must-have #4).
+    const sectionMatch = sliceTemplate.match(/## Memory Index[\s\S]*?(?=\n## Instructions)/);
+    assert(!!sectionMatch, '(d) shared/templates/dispatch/plan-slice.md carries a ## Memory Index section');
+    const sectionTokens = sectionMatch ? countTokens(sectionMatch[0]) : Infinity;
+    assert(sectionTokens <= 150,
+      `(d D3) the ## Memory Index section measures <= 150 tokens (command, not content) — measured ${sectionTokens}`);
+    assert(!slice.prompt.includes('# Índice de memória por arquivo-fonte'),
+      '(d D3) rendered plan-slice prompt does NOT contain the memory-index artifact\'s own header');
+    assert(!/—\s*origem:\s*/.test(slice.prompt),
+      '(d D3) rendered plan-slice prompt does NOT contain an index fact line ("— origem: ")');
+
+    // (e) registered in main().
+    const mainBody = fs.readFileSync(__filename, 'utf8').slice(fs.readFileSync(__filename, 'utf8').lastIndexOf('async function main()'));
+    assert(/smokeMemoryIndexCommandRendered\(\);/.test(mainBody), '(e) Section 103 is registered in main()');
+  } finally {
+    cleanup(dir);
+  }
+  pass('(final) Section 103: the memory-index query command lands in shared/templates/dispatch/plan-slice.md (the '
+    + 'executable template, never the prose mirror — MEM002) and in a real rendered plan-slice prompt with placeholders '
+    + 'resolved and --cwd quoted; execute-task carries neither (template nor render), proven with a positive control '
+    + 'ordered first; and the section itself measures <= 150 tokens with no index fact line ever landing in the '
+    + 'rendered prompt — command, not content (D3)');
+}
+
+// ── Section 104: canonical Forge script call sites ────────────────────────
+function smokeScriptsCallSitesCanonical() {
+  process.stdout.write('\n▸ Section 104: canonical Forge script call sites\n');
+  const guard = require('./forge-scripts-callsites.js');
+  const report = guard.scan({ root: path.resolve(__dirname, '..') });
+  assert(report.outcome === 'clean', 'real tree is clean above the per-family census floor');
+  for (const family of guard.CALL_SITE_FAMILIES) assert(report.scanned_by_family[family] > 0, `family scanned: ${family}`);
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeScriptsCallSitesCanonical\(\); \}/.test(mainBody), '(e) Section 104 is registered in main()');
+  pass('Section 104: canonical path guard is clean, census is non-silent, and registration is biting');
+}
+
+// ── Section 105: the contract-miss branch exists in all three orchestrators ──
+//
+// The defect this guards is an ABSENCE, which is the hardest kind to keep
+// fixed: before this work, grepping skills/forge-{auto,next,task} for missing
+// result-block handling returned nothing at all, so a truncated worker had no
+// named branch and the model improvised one at runtime. A guard on the canonical
+// prose alone would repeat the MEM002 / PR #77 mistake — shared/forge-dispatch.md
+// is the spec, but the SKILL.md files are what the orchestrator actually reads,
+// so both are asserted, and the classifier is exercised behaviorally so the
+// section can never go green over a wired-but-inert helper.
+function smokeContractMissBranch() {
+  process.stdout.write('\n▸ Section 105: contract-miss (Layer 0) branch wired in all three orchestrators\n');
+  const repoRoot = path.dirname(SCRIPTS);
+  const wr = require('./forge-worker-result.js');
+
+  // (a) canonical spec — the section, its ladder and its boundary.
+  const dispatch = readRepoText(path.join(repoRoot, 'shared', 'forge-dispatch.md'));
+  assert(dispatch.includes('## Missing worker result (contract miss)'),
+    '(a) shared/forge-dispatch.md carries the canonical § Missing worker result (contract miss)');
+  const section = dispatch.slice(dispatch.indexOf('## Missing worker result (contract miss)'),
+    dispatch.indexOf('## Node Repair'));
+  for (const rung of ['worker-event', 'summary-file', 'plan-status', 'vcs-delta']) {
+    assert(section.includes(rung), `(a) the canonical section names the ${rung} probe`);
+  }
+  assert(/never carries a verdict/i.test(section),
+    '(a) the canonical section states that the VCS delta alone never carries a verdict');
+  assert(/must_haves_status`?\*{0,2}\s+is never synthesized/i.test(section),
+    '(a) the canonical section forbids synthesizing must_haves_status');
+  assert(/codex-invalid-json/.test(section),
+    '(a) the canonical section names the sidecar boundary rather than leaving it implied');
+
+  // (b) Layer 0 is in the precedence table — otherwise the ladder is a section
+  //     nothing routes into.
+  assert(/\|\s*\*\*0\*\*\s*\|\s*Missing Result Contract\s*\|/.test(dispatch),
+    '(b) the recovery-layer precedence table carries the Layer 0 row');
+
+  // (c) executable surfaces — all three skills classify BEFORE parsing status.
+  //     The call sites are shell lines, so the script name is followed by a
+  //     closing quote before the flag: anchoring on the bare `script --flag`
+  //     string matches nothing. That is not a nit — the first run of this
+  //     section failed on exactly that, which is the section doing its job on
+  //     itself before it ever guarded the feature.
+  const CLASSIFY_CALL = /forge-worker-result\.js"?\s+--classify/;
+  const SALVAGE_CALL = /forge-worker-result\.js"?\s+--salvage/;
+  for (const skill of ['forge-auto', 'forge-next', 'forge-task']) {
+    const text = readRepoText(path.join(repoRoot, 'skills', skill, 'SKILL.md'));
+    assert(CLASSIFY_CALL.test(text),
+      `(c) skills/${skill}/SKILL.md classifies the return before parsing it`);
+    assert(SALVAGE_CALL.test(text),
+      `(c) skills/${skill}/SKILL.md invokes the disk salvage`);
+    assert(text.includes('§ Missing worker result (contract miss)'),
+      `(c) skills/${skill}/SKILL.md names the canonical section instead of restating the ladder`);
+    const classifyAt = text.search(CLASSIFY_CALL);
+    const parseAt = text.search(/Parse the `---GSD-WORKER-RESULT---` block:|\*\*Process result:\*\*/);
+    assert(classifyAt !== -1 && parseAt !== -1 && classifyAt < parseAt,
+      `(c) skills/${skill}/SKILL.md runs the gate BEFORE the status parse — a Layer 0 that fires after Layer 2 read the status is inert`);
+  }
+
+  // (d) behavioral floor — the classifier separates the two returns that the
+  //     whole layer exists to tell apart, with the positive control first so
+  //     the negative assert is never blind.
+  const complete = wr.classifyReturn('did the work\n\n---GSD-WORKER-RESULT---\nstatus: done\nsummary: x\n');
+  assert(complete.shape === 'complete' && complete.status === 'done',
+    '(d control) positive control — a well-formed return still classifies as complete');
+  const truncated = wr.classifyReturn('Implemented T05, ran the gate, and then the message stops mid-sen');
+  assert(truncated.shape === 'absent' && truncated.status === null,
+    '(d) a truncated return does NOT resolve to a status');
+  const cutBlock = wr.classifyReturn('narration\n---GSD-WORKER-RESULT---\nunit_type: execute-ta');
+  assert(cutBlock.shape === 'status-missing',
+    '(d) a block cut before its status is status-missing, not a verdict');
+
+  // (e) salvage never invents: zero inputs yields a named reason and a full
+  //     probe census, never a bare empty object that reads like "all clear".
+  const empty = wr.salvageUnit({ unit: 'execute-task/T05' });
+  assert(empty.recovered === null && empty.reason === 'no-evidence',
+    '(e) a salvage with nothing to read recovers nothing and names why');
+  assert(empty.probes.length === 4 && empty.probes.every(p => ['hit', 'miss', 'unavailable'].includes(p.outcome)),
+    '(e) every probe is reported with a closed-set outcome — a report of only its hits is indistinguishable from one that never ran');
+
+  // (f) the hook stops laundering a failed-open escape into `done`.
+  const hook = readRepoText(path.join(SCRIPTS, 'forge-hook.js'));
+  assert(hook.includes('contract-miss.jsonl'),
+    '(f) forge-hook.js records the contract miss durably');
+  assert(/status\s*:\s*escaped\s*\?\s*'contract-missed'\s*:\s*'done'/.test(hook),
+    '(f) the SubagentStop escape path writes contract-missed, not done');
+
+  // (g) registered in main().
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeContractMissBranch\(\); \}/.test(mainBody), '(g) Section 105 is registered in main()');
+
+  pass('(final) Section 105: the Layer 0 contract-miss branch is canonical in shared/forge-dispatch.md (ladder, probe '
+    + 'names, the vcs-delta-never-decides rule and the sidecar boundary), sits in the recovery-layer precedence table, '
+    + 'and is wired BEFORE the status parse in all three orchestrator skills; the classifier separates a truncated '
+    + 'return from a complete one behaviorally, the salvage names its nothing instead of returning a silent empty, and '
+    + 'the SubagentStop escape no longer reports a contract-less worker as done');
+}
+
+// ── Section 106: the hook path that runs is the hook path that is managed ────
+//
+// Two files have to agree and neither can see the other: `merge-settings.js`
+// writes the hook command into settings.json, and `forge-source-manifest.json`
+// decides which destinations the installer maintains. They disagreed — settings
+// wired `~/.claude/forge-hook.js` while the manifest projected only
+// `~/.claude/hooks/forge-hook.js` — so the copy Claude Code actually executes
+// was maintained by nobody and sat frozen across releases while every
+// `--update` reported success. No unit test owns this pair, which is exactly
+// what a smoke section is for.
+function smokeHookPathManaged() {
+  process.stdout.write('\n▸ Section 106: the executed hook path is a managed projection\n');
+  const repoRoot = path.dirname(SCRIPTS);
+  const renderer = require('./forge-claude-renderer.js');
+
+  // (a) every hook command merge-settings.js emits, mined from its source.
+  const merge = readRepoText(path.join(SCRIPTS, 'merge-settings.js'));
+  const wired = [...merge.matchAll(/node\s+(~\/[^\s`'"]*forge-hook\.js)/g)].map((m) => m[1]);
+  assert(wired.length > 0,
+    '(a) merge-settings.js still emits at least one forge-hook.js command — the miner is not blind');
+  const wiredPaths = [...new Set(wired)];
+
+  // (b) the manifest's projected destinations for the hooks source, expressed in
+  //     the same `~/…` vocabulary merge-settings.js writes. The tilde is the
+  //     USER home, not the Claude home, so the fake home below is laid out the
+  //     way a real install is (`<home>/.claude`) and paths are made relative to
+  //     the user home — comparing against the Claude home instead yields
+  //     `~/forge-hook.js` and the agreement check silently never matches.
+  const userHome = path.join(os.tmpdir(), 'forge-smoke-hookpath-home');
+  const report = renderer.render({
+    repo: repoRoot,
+    projectRoot: repoRoot,
+    claudeHome: path.join(userHome, '.claude'),
+    forgeHome: path.join(userHome, '.forge-agent'),
+  });
+  const projected = report.artifacts
+    .filter((a) => a.source_id === 'hooks')
+    .map((a) => '~/' + path.relative(userHome, a.destination).split(path.sep).join('/'));
+  assert(projected.length > 0, '(b) the hooks source projects at least one destination');
+  assert(projected.every((p) => p.startsWith('~/.claude/')),
+    `(b) projected hook paths are expressed against the user home — got ${JSON.stringify(projected)}`);
+
+  // (c) the agreement itself.
+  for (const p of wiredPaths) {
+    assert(projected.includes(p),
+      `(c) settings.json runs ${p} but no projection maintains it — that copy will freeze silently`);
+  }
+
+  // (d) control — the predicate is capable of failing. A path nobody wires must
+  //     not be reported as wired, otherwise (c) is green for any input.
+  assert(!wiredPaths.includes('~/.claude/nonexistent-hook.js'),
+    '(d control) the wired-path miner does not invent paths');
+
+  // (e) script projections carry the ownership proof, so a second --update can
+  //     replace them. Without this the fix in (c) maintains a file the write
+  //     path still refuses to touch.
+  const hookArtifact = report.artifacts.find((a) => a.source_id === 'hooks');
+  assert(renderer.hasOriginMarker(hookArtifact.content),
+    '(e) the hook projection carries an origin marker — otherwise it is preserved as user_owned forever');
+  assert(hookArtifact.content.split('\n')[0].startsWith('#!'),
+    '(e) the shebang stays on line 1 — a marker above it stops the file executing');
+
+  // (f) registered in main().
+  const source = fs.readFileSync(__filename, 'utf8');
+  assert(/\(\) => \{ smokeHookPathManaged\(\); \}/.test(source.slice(source.lastIndexOf('async function main()'))),
+    '(f) Section 106 is registered in main()');
+
+  pass('(final) Section 106: every forge-hook.js path merge-settings.js wires into settings.json is a destination the '
+    + 'source manifest projects, so the copy Claude Code executes is maintained rather than frozen; and that projection '
+    + 'carries an origin marker below an intact shebang, so the installer can actually replace it on a later update');
+}
+
+// ── Merge note (origin/master → forge/M-20260813221024-controle-recursos) ──
+// The six sections below were authored as 105-110 on the milestone branch.
+// origin/master independently landed its own 105 and 106 while the milestone
+// ran, so these six were shifted +2 (105->107 … 110->112) at merge time,
+// preserving their creation order and leaving no gap. The provenance comments
+// inside each section are left VERBATIM: they record what was actually
+// measured at authoring time, and rewriting them to match the post-merge
+// numbers would fabricate measurements that were never taken.
+// ── Section 107: resolver + scanner bite bidirectionally, no real pressure ──
+// Verified against the file's ACTUAL highest section (grep -n "^// ── Section
+// [0-9]" | tail -3 → 102, 103, 104 — 104 is the real max at authoring time,
+// matching the verification convention of Sections 96-98/99/104), NOT the
+// number the task plan guessed (100) — the plan predates three later slices'
+// sections landing on this file concurrently. Both mordidas asserted via
+// real CLI spawns, never in-process require() of the resolver/scanner
+// modules — a spawn is the same boundary a real caller crosses.
+function smokeResourcesFoundation() {
+  process.stdout.write('\n▸ Section 107: resolver (T01) + scanner (T03) bite both ways, no real pressure\n');
+  const NODE = process.execPath;
+
+  // ── (a) resolver: forced critical pressure -> admit:false, named reason ──
+  const forcedCritical = spawnSync(NODE, [path.join(SCRIPTS, 'forge-resources.js'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, FORGE_RESOURCES_PRESSURE: '4' },
+  });
+  assert(forcedCritical.status === 0, '(a) resolver CLI always exits 0 (advisory posture) even under forced critical', String(forcedCritical.status));
+  let forcedCriticalContract;
+  try { forcedCriticalContract = JSON.parse(forcedCritical.stdout); } catch (e) { forcedCriticalContract = null; }
+  assert(!!forcedCriticalContract, '(a) forced-critical CLI output parses as JSON', forcedCritical.stdout);
+  if (forcedCriticalContract) {
+    assert(forcedCriticalContract.admit === false, '(a) FORGE_RESOURCES_PRESSURE=4 -> admit:false (forced, never real pressure)', JSON.stringify(forcedCriticalContract));
+    assert(forcedCriticalContract.reason === 'pressure-critical:forced-env',
+      '(a) reason names the FORCED source, distinct from a measured-pressure reason', forcedCriticalContract.reason);
+    assert(forcedCriticalContract.reason !== 'pressure-critical:measured',
+      '(a) forced reason is never confusable with the measured-critical reason', forcedCriticalContract.reason);
+  }
+
+  // ── (b) resolver: forced normal pressure -> admit:true, sized budget ─────
+  const forcedNormal = spawnSync(NODE, [path.join(SCRIPTS, 'forge-resources.js'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, FORGE_RESOURCES_PRESSURE: '1' },
+  });
+  assert(forcedNormal.status === 0, '(b) resolver CLI exits 0 under forced normal pressure', String(forcedNormal.status));
+  let forcedNormalContract;
+  try { forcedNormalContract = JSON.parse(forcedNormal.stdout); } catch (e) { forcedNormalContract = null; }
+  assert(!!forcedNormalContract, '(b) forced-normal CLI output parses as JSON', forcedNormal.stdout);
+  if (forcedNormalContract) {
+    assert(forcedNormalContract.admit === true, '(b) FORGE_RESOURCES_PRESSURE=1 -> admit:true (forced, never real pressure)', JSON.stringify(forcedNormalContract));
+    assert(Number.isInteger(forcedNormalContract.workers) && forcedNormalContract.workers >= 1,
+      '(b) admitted budget sizes at least one worker', String(forcedNormalContract.workers));
+    assert(Number.isFinite(forcedNormalContract.heapMb) && forcedNormalContract.heapMb > 0,
+      '(b) admitted budget sizes a positive heapMb', String(forcedNormalContract.heapMb));
+  }
+
+  // ── (c) scanner: real scripts/ tree -> clean, scanned > 0 ────────────────
+  const realScan = spawnSync(NODE, [path.join(SCRIPTS, 'forge-freemem-callsites.js'), '--check', '--json'], { encoding: 'utf8' });
+  let realScanResult;
+  try { realScanResult = JSON.parse(realScan.stdout); } catch (e) { realScanResult = null; }
+  assert(!!realScanResult, '(c) real-tree scanner CLI output parses as JSON', realScan.stdout);
+  if (realScanResult) {
+    assert(realScanResult.scanned > 0, '(c) real scripts/ tree scan reaches scanned > 0 (anti-silence floor cleared)', String(realScanResult.scanned));
+    assert(realScanResult.outcome === 'clean', '(c) real scripts/ tree has zero banned call sites -> clean', JSON.stringify(realScanResult));
+    assert(realScan.status === 0, '(c) clean outcome exits 0', String(realScan.status));
+  }
+
+  // ── (d) scanner: temp tree with a planted violation -> non-zero, named file ──
+  const violDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-freemem-viol-'));
+  const violFile = path.join(violDir, 'planted.js');
+  // Built by concatenation so this smoke section's own source is not itself a
+  // false positive against forge-freemem-callsites.js's own ban.
+  const plantedCall = 'os' + '.' + 'free' + 'mem' + '(';
+  try {
+    fs.writeFileSync(violFile, `'use strict';\nconst fs = require('fs');\nfunction reportFree() { return ${plantedCall}); }\nmodule.exports = { reportFree };\n`);
+    const violScan = spawnSync(NODE, [path.join(SCRIPTS, 'forge-freemem-callsites.js'), '--check', '--json', '--root', violDir], { encoding: 'utf8' });
+    assert(violScan.status !== 0, '(d) planted-violation temp tree exits non-zero', String(violScan.status));
+    let violResult;
+    try { violResult = JSON.parse(violScan.stdout); } catch (e) { violResult = null; }
+    assert(!!violResult, '(d) planted-violation CLI output parses as JSON', violScan.stdout);
+    if (violResult) {
+      assert(violResult.outcome === 'violations', '(d) outcome is violations, not clean and not anti-silence', violResult.outcome);
+      assert(violResult.violations.some((v) => v.file === violFile),
+        '(d) the violation names the planted file exactly', JSON.stringify(violResult.violations));
+    }
+  } finally {
+    try { fs.rmSync(violDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (e) scanner: empty temp dir -> non-zero, anti-silence reason ─────────
+  const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-freemem-empty-'));
+  try {
+    const emptyScan = spawnSync(NODE, [path.join(SCRIPTS, 'forge-freemem-callsites.js'), '--check', '--json', '--root', emptyDir], { encoding: 'utf8' });
+    assert(emptyScan.status !== 0, '(e) empty temp dir scan exits non-zero (never a silent pass)', String(emptyScan.status));
+    let emptyResult;
+    try { emptyResult = JSON.parse(emptyScan.stdout); } catch (e) { emptyResult = null; }
+    assert(!!emptyResult, '(e) empty-dir CLI output parses as JSON', emptyScan.stdout);
+    if (emptyResult) {
+      assert(emptyResult.outcome === 'anti-silence', '(e) empty dir outcome is anti-silence, never clean', emptyResult.outcome);
+      assert(emptyResult.scanned === 0, '(e) empty dir scanned count is 0', String(emptyResult.scanned));
+      assert(typeof emptyResult.reason === 'string' && emptyResult.reason.length > 0
+        && emptyResult.reason !== (realScanResult && realScanResult.reason),
+        '(e) anti-silence reason is present and distinct from a violations-found reason', emptyResult.reason);
+      if (realScanResult === null || realScanResult === undefined) {
+        // no-op — real scan already asserted above; this branch only guards
+        // against a null-vs-string comparison silently passing.
+      }
+    }
+  } finally {
+    try { fs.rmSync(emptyDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (f) registration: the section verifies it is wired into main() ───────
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeResourcesFoundation\(\); \}/.test(mainBody),
+    '(f) Section 107 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass('Section 107: forge-resources.js resolver admits/refuses on forced env (never real pressure), and '
+    + 'forge-freemem-callsites.js scanner is clean on the real tree, red on a planted violation naming the '
+    + 'file, and red-with-anti-silence-reason on an empty directory — all three via real CLI spawns');
+}
+
+// ── Section 108: resource pool (S02) — CLI census, two-process sum, resolver byte-stability ──
+// Section number MEASURED at execution time (MEM013), not assumed: grepped
+// "Section [0-9]+" across this file and took max+1 (105 was the real max —
+// three later sections had already landed on this file by the time this
+// section was authored, same drift class MEM013 documents). All three
+// mordidas spawn real CLIs (child_process.spawn/spawnSync), never
+// require() of forge-resource-pool.js / forge-resources.js in-process — a
+// spawn is the same boundary a real caller (and forge-resource-pool.concurrency.test.js)
+// crosses.
+async function smokeResourcePool() {
+  process.stdout.write('\n▸ Section 108: resource pool CLI census, real two-process sum, resolver byte-stability\n');
+  const NODE = process.execPath;
+  const POOL_CLI = path.join(SCRIPTS, 'forge-resource-pool.js');
+  const RESOURCES_CLI = path.join(SCRIPTS, 'forge-resources.js');
+
+  // ── (a) pool CLI --status --json census on a seeded temp pool ────────────
+  const censusDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-pool-census-'));
+  try {
+    fs.mkdirSync(path.join(censusDir, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(censusDir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 3, written_at: Date.now() }), 'utf8');
+    const status = spawnSync(NODE, [POOL_CLI, '--status', '--json', '--pool-dir', censusDir], { encoding: 'utf8' });
+    assert(status.status === 0, '(a) pool CLI --status --json exits 0 on a seeded temp pool', String(status.status));
+    let statusContract;
+    try { statusContract = JSON.parse(status.stdout); } catch (e) { statusContract = null; }
+    assert(!!statusContract, '(a) pool CLI --status --json output parses as JSON', status.stdout);
+    if (statusContract) {
+      assert(statusContract.ok === true, '(a) census on a seeded pool is ok:true', JSON.stringify(statusContract));
+      assert(statusContract.ceiling === 3, '(a) census reports the seeded ceiling (3), not a recomputed value', String(statusContract.ceiling));
+      assert(statusContract.held === 0, '(a) census reports 0 held on a fresh pool', String(statusContract.held));
+      assert(statusContract.free === 3, '(a) census reports free === ceiling on a fresh pool', String(statusContract.free));
+      assert(Array.isArray(statusContract.slots) && statusContract.slots.length === 3, '(a) census enumerates one slot entry per ceiling unit', JSON.stringify(statusContract.slots));
+    }
+  } finally {
+    try { fs.rmSync(censusDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (b) two-process real dispute (compact version of the concurrency suite) ──
+  // Ceiling 4, each of two real spawned node processes requests 3 (< ceiling,
+  // matches the concurrency test's design — see that file's comment: this
+  // keeps the assertion out of the separately-named
+  // pool-exhausted-minimum-grant floor and inside the positive grant path).
+  const disputeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-pool-dispute-'));
+  try {
+    fs.mkdirSync(path.join(disputeDir, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(disputeDir, 'pool-config.json'), JSON.stringify({ protocol: 1, ceiling: 4, written_at: Date.now() }), 'utf8');
+    const outA = path.join(disputeDir, 'out-a.json');
+    const outB = path.join(disputeDir, 'out-b.json');
+    const readyA = path.join(disputeDir, 'ready-a');
+    const readyB = path.join(disputeDir, 'ready-b');
+    const goFile = path.join(disputeDir, 'go');
+    const workerSrc = `
+      'use strict';
+      const fs = require('fs');
+      const pool = require(process.env.POOL_MODULE);
+      const start = Date.now();
+      fs.writeFileSync(process.env.READY_FILE, String(process.pid));
+      while (!fs.existsSync(process.env.GO_FILE)) {
+        if (Date.now() - start > 5000) throw new Error('go barrier deadline exceeded');
+      }
+      const result = pool.acquireSlots(3, { poolDir: process.env.FORGE_RESOURCE_POOL_DIR, ownerToken: 'owner-' + process.pid });
+      fs.writeFileSync(process.env.OUT_FILE, JSON.stringify(result));
+    `;
+    const { spawn } = require('child_process');
+    const envBase = { ...process.env, POOL_MODULE: POOL_CLI, FORGE_RESOURCE_POOL_DIR: disputeDir, GO_FILE: goFile };
+    const childA = spawn(NODE, ['-e', workerSrc], { env: { ...envBase, OUT_FILE: outA, READY_FILE: readyA } });
+    const childB = spawn(NODE, ['-e', workerSrc], { env: { ...envBase, OUT_FILE: outB, READY_FILE: readyB } });
+    const exitedA = new Promise((resolve) => childA.once('exit', resolve));
+    const exitedB = new Promise((resolve) => childB.once('exit', resolve));
+    const deadline = Date.now() + 8000;
+    while (!(fs.existsSync(readyA) && fs.existsSync(readyB))) {
+      if (Date.now() > deadline) throw new Error('(b) both dispute children failed to reach the ready barrier in time');
+    }
+    fs.writeFileSync(goFile, 'go');
+    const outDeadline = Date.now() + 8000;
+    while (!(fs.existsSync(outA) && fs.existsSync(outB))) {
+      if (Date.now() > outDeadline) throw new Error('(b) both dispute children failed to write output in time');
+    }
+    await exitedA; await exitedB;
+    const resultA = JSON.parse(fs.readFileSync(outA, 'utf8'));
+    const resultB = JSON.parse(fs.readFileSync(outB, 'utf8'));
+    assert(resultA.ok === true && resultB.ok === true, '(b) both real dispute processes report ok:true', JSON.stringify({ resultA, resultB }));
+    const sum = resultA.granted + resultB.granted;
+    assert(sum === 4, '(b) two real processes disputing a shared ceiling-4 pool sum to exactly the ceiling', String(sum));
+  } finally {
+    try { fs.rmSync(disputeDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (c) forge-resources.js CLI: stable prefix keys + maxConcurrentClamp, pool absent without the seam ──
+  const resourcesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-pool-resources-'));
+  try {
+    fs.mkdirSync(path.join(resourcesDir, '.gsd'), { recursive: true });
+    const resources = spawnSync(NODE, [RESOURCES_CLI, '--json', '--cwd', resourcesDir], { encoding: 'utf8' });
+    assert(resources.status === 0, '(c) forge-resources.js CLI always exits 0 (advisory posture)', String(resources.status));
+    let contract;
+    try { contract = JSON.parse(resources.stdout); } catch (e) { contract = null; }
+    assert(!!contract, '(c) forge-resources.js CLI output parses as JSON', resources.stdout);
+    if (contract) {
+      for (const key of ['admit', 'workers', 'heapMb', 'playwrightWorkers', 'reason', 'pressureLevel', 'enforcement', 'shadowWait', 'source']) {
+        assert(Object.prototype.hasOwnProperty.call(contract, key), `(c) S01 stable prefix key present: ${key}`, JSON.stringify(contract));
+      }
+      assert(Object.prototype.hasOwnProperty.call(contract, 'maxConcurrentClamp'), '(c) additive maxConcurrentClamp key is always present (S02)', JSON.stringify(contract));
+      assert(!Object.prototype.hasOwnProperty.call(contract, 'pool'), '(c) additive pool key is ABSENT via the CLI, which never injects opts.pool — proves the seam stays optional', JSON.stringify(contract));
+    }
+  } finally {
+    try { fs.rmSync(resourcesDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+
+  // ── (d) real-default-root guard ────────────────────────────────────────
+  const realRoot = path.join(os.homedir(), '.claude', 'forge', 'resource-pool');
+  assert(!fs.existsSync(realRoot) || fs.statSync(realRoot).isDirectory(),
+    '(d) this section never creates the real machine pool root under an unexpected shape (sanity)', realRoot);
+
+  // ── (e) registration: the section verifies it is wired into main() ───────
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ await smokeResourcePool\(\); \}/.test(mainBody),
+    '(e) Section 108 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass('Section 108: pool CLI census on a seeded temp pool, two REAL spawned processes disputing a shared '
+    + 'ceiling sum to exactly it, and forge-resources.js CLI keeps the S01 prefix stable with maxConcurrentClamp '
+    + 'always present and pool absent without the opts.pool seam — all via real CLI/process spawns');
+}
+
+// ── Section 109: S03/T04 — B1 latency ceiling, E2E child-side equivalence, census ──
+// Section number MEASURED at execution time (`grep -nE "^// ── Section
+// [0-9]+" scripts/forge-smoke.js | tail`), not assumed: 106 was the real max
+// (T03's S02 section) at authoring time. Never require()s forge-hook.js —
+// every mordida spawns the real hook CLI as a child process, the same
+// boundary forge-hook-rewrite.test.js (T03) crosses. FORGE_RESOURCE_POOL_DIR
+// always points at a temp pool — the real ~/.claude/forge/resource-pool is
+// never touched.
+function smokeRewriteCeilingAndE2E() {
+  process.stdout.write('\n▸ Section 109: B1 latency ceiling, child-side E2E equivalence, census sum\n');
+  const NODE = process.execPath;
+  const HOOK = path.join(SCRIPTS, 'forge-hook.js');
+  const rewriteMod = require(path.join(SCRIPTS, 'forge-command-rewrite.js'));
+
+  function tmpWorkspace(prefix) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
+    return dir;
+  }
+  function runPre(cmd, { cwd, env = {}, sessionId } = {}) {
+    const payload = { session_id: sessionId || 'sess-109', cwd, tool_name: 'Bash', tool_input: { command: cmd } };
+    const r = spawnSync(NODE, [HOOK, 'pre'], {
+      input: JSON.stringify(payload), encoding: 'utf8', cwd: cwd || os.tmpdir(),
+      env: Object.assign({}, process.env, env),
+    });
+    return { status: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+  }
+  function readEvents(cwd) {
+    const p = path.join(cwd, '.gsd', 'forge', 'events.jsonl');
+    try { return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
+    catch { return []; }
+  }
+  function releaseBridge(sessionId, poolDir) {
+    const bridgeFile = path.join(os.tmpdir(), `forge-rewrite-grant-${String(sessionId).replace(/[^\w.\-]/g, '_')}.json`);
+    if (!fs.existsSync(bridgeFile)) return;
+    try {
+      const bridge = JSON.parse(fs.readFileSync(bridgeFile, 'utf8'));
+      const poolMod = require(path.join(SCRIPTS, 'forge-resource-pool.js'));
+      poolMod.releaseSlots(bridge.grant.slots, { poolDir });
+    } catch { /* best-effort test hygiene */ }
+    try { fs.unlinkSync(bridgeFile); } catch { /* ignore */ }
+  }
+
+  // ── (a) B1 ceiling — 10,000 calls of looksLikeRunnerCommand over a 20-command,
+  // representative NON-runner corpus, MEASURED (never asserted a made-up
+  // number), ceiling declared here: < 200 ms total for the 10,000-call loop.
+  const corpus = [
+    'ls -la', 'git status', 'cat package.json', 'node scripts/x.js', 'curl https://example.com',
+    'echo hello', 'pwd', 'mkdir -p tmp', 'rm -rf tmp', 'cp a b', 'mv a b', 'grep -n foo bar.js',
+    'find . -name "*.js"', 'sed -n "1,5p" file.txt', 'awk "{print $1}" file.txt', 'chmod +x script.sh',
+    'python3 script.py', 'go build ./...', 'docker ps', 'kubectl get pods',
+  ];
+  const iterations = 10000;
+  const t0 = Date.now();
+  for (let i = 0; i < iterations; i += 1) {
+    rewriteMod.looksLikeRunnerCommand(corpus[i % corpus.length]);
+  }
+  const measuredMs = Date.now() - t0;
+  const CEILING_MS = 200;
+  process.stdout.write(`  measured: ${iterations} calls over a ${corpus.length}-command non-runner corpus took ${measuredMs}ms (declared ceiling: ${CEILING_MS}ms)\n`);
+  assert(measuredMs < CEILING_MS, `(a) B1 in-process ceiling: ${iterations} looksLikeRunnerCommand calls over a ${corpus.length}-command corpus complete in under ${CEILING_MS}ms`, `measured ${measuredMs}ms`);
+
+  // ── (b) B1 outside-the-process direction — a real spawned hook process on a
+  // non-runner command performs ZERO fs/pool operations: empty stdout AND the
+  // temp pool directory has zero entries afterward (I/O-free short-circuit
+  // observed from OUTSIDE the process, not by inspecting require.cache).
+  const bDir = tmpWorkspace('smoke109-b-');
+  const bPool = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke109-b-pool-'));
+  try {
+    const res = runPre('git status', { cwd: bDir, env: { FORGE_RESOURCE_POOL_DIR: bPool } });
+    assert(res.status === 0, '(b) non-runner command (git status) is allowed', String(res.status));
+    assert(res.stdout === '', '(b) non-runner command emits no rewrite stdout', res.stdout);
+    const poolEntries = fs.existsSync(bPool) ? fs.readdirSync(bPool) : [];
+    assert(poolEntries.length === 0, '(b) temp pool dir remains untouched (zero slot files created) for a non-candidate command', JSON.stringify(poolEntries));
+  } finally {
+    try { fs.rmSync(bDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(bPool, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  // ── (c)-(f) E2E child-side equivalence — real fixture, real npm, real spawned
+  // dump shims. `sh -c <updatedInput.command>` executes the hook's OWN output
+  // string against a fixture whose "vitest"/"jest" node_modules/.bin shims
+  // dump their argv+env to a file — proving hook-output → executed-child
+  // equivalence without spending claude tokens (the claude-honors-updatedInput
+  // half was proven once, live, in T02 and is cited here, not re-run).
+  const fixture = tmpWorkspace('smoke109-fixture-');
+  const cPool = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke109-fixture-pool-'));
+  try {
+    fs.writeFileSync(path.join(fixture, 'package.json'), JSON.stringify({
+      name: 'smoke109-fixture', version: '1.0.0', scripts: { test: 'vitest', testjest: 'jest' },
+    }), 'utf8');
+    fs.writeFileSync(path.join(fixture, 'package-lock.json'), JSON.stringify({ name: 'smoke109-fixture', version: '1.0.0', lockfileVersion: 3 }), 'utf8');
+    const binDir = path.join(fixture, 'node_modules', '.bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const shimSrc = [
+      '#!/usr/bin/env node',
+      "const fs = require('fs');",
+      'fs.writeFileSync(process.env.DUMP_FILE, JSON.stringify({',
+      '  argv: process.argv.slice(2),',
+      '  env: {',
+      '    VITEST_MAX_FORKS: process.env.VITEST_MAX_FORKS || null,',
+      '    VITEST_MAX_THREADS: process.env.VITEST_MAX_THREADS || null,',
+      '    NODE_OPTIONS: process.env.NODE_OPTIONS || null,',
+      '  },',
+      '}));',
+      '',
+    ].join('\n');
+    for (const bin of ['vitest', 'jest']) {
+      const binPath = path.join(binDir, bin);
+      fs.writeFileSync(binPath, shimSrc, 'utf8');
+      fs.chmodSync(binPath, 0o755);
+    }
+
+    let candidatesSent = 0;
+
+    // (c) recognized: `npm test` → rewritten (env-prefix path, vitest) — dump
+    // shows the clamped VITEST_MAX_FORKS/VITEST_MAX_THREADS/NODE_OPTIONS.
+    const dumpA = path.join(fixture, 'dump-a.json');
+    const sessA = 'sess-109-a';
+    const resA = runPre('npm test', { cwd: fixture, sessionId: sessA, env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resA.status === 0, '(c) recognized npm-test payload: hook exits 0', String(resA.status));
+    candidatesSent += 1;
+    const linesA = resA.stdout.trim().split('\n').filter(Boolean);
+    assert(linesA.length === 1, '(c) recognized path: exactly one stdout JSON line', resA.stdout);
+    let parsedA = null;
+    try { parsedA = JSON.parse(linesA[0]); } catch { /* asserted below */ }
+    assert(!!(parsedA && parsedA.hookSpecificOutput && parsedA.hookSpecificOutput.updatedInput), '(c) recognized path: updatedInput.command present', resA.stdout);
+    if (parsedA) {
+      const rewritten = parsedA.hookSpecificOutput.updatedInput.command;
+      const forksMatch = /VITEST_MAX_FORKS='(\d+)'/.exec(rewritten);
+      const heapMatch = /--max-old-space-size=(\d+)/.exec(rewritten);
+      assert(!!forksMatch, '(c) rewritten command carries a VITEST_MAX_FORKS env prefix', rewritten);
+      if (forksMatch && heapMatch) {
+        // R11: this suite is measured on win32 too — `/bin/sh` does not exist
+        // there. Reuse the same resolvePosixSh() the mock-codex shim already
+        // uses (:2033-2034), prepending its `bin` to the child PATH.
+        const { sh: shA, bin: shBinA } = resolvePosixSh();
+        const envA = shBinA
+          ? Object.assign({}, process.env, { DUMP_FILE: dumpA, PATH: shBinA + path.delimiter + (process.env.PATH || '') })
+          : Object.assign({}, process.env, { DUMP_FILE: dumpA });
+        const exec = spawnSync(shA, ['-c', rewritten], {
+          cwd: fixture, encoding: 'utf8', env: envA,
+        });
+        assert(exec.status === 0, '(c) executing the hook-emitted command via sh -c exits 0', `status=${exec.status} stderr=${exec.stderr}`);
+        let dumpA_ = null;
+        try { dumpA_ = JSON.parse(fs.readFileSync(dumpA, 'utf8')); } catch { /* asserted below */ }
+        assert(!!dumpA_, '(c) fixture shim wrote its argv/env dump', String(fs.existsSync(dumpA)));
+        if (dumpA_) {
+          assert(dumpA_.env.VITEST_MAX_FORKS === forksMatch[1], '(c) child process observed the SAME clamped VITEST_MAX_FORKS the hook emitted (child-side equivalence)', JSON.stringify(dumpA_.env));
+          assert(dumpA_.env.NODE_OPTIONS && dumpA_.env.NODE_OPTIONS.includes(`--max-old-space-size=${heapMatch[1]}`), '(c) child process observed the SAME NODE_OPTIONS heap clamp the hook emitted', JSON.stringify(dumpA_.env));
+        }
+      }
+      const events = readEvents(fixture);
+      assert(events.some((e) => e.event === 'rewrite-applied'), '(c) rewrite-applied event recorded for the recognized payload', JSON.stringify(events));
+    }
+    releaseBridge(sessA, cPool);
+
+    // (d) intact/skip: a DIRECT vitest invocation with an explicit --shard is
+    // left intact (never overrides a human choice, T03's shipped "intact"
+    // semantics) — no stdout, byte-identical (branch never touches the
+    // string), rewrite-skipped event present with a named enum reason.
+    const sessD = 'sess-109-d';
+    const resD = runPre('vitest run --shard=1/2', { cwd: fixture, sessionId: sessD, env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resD.status === 0, '(d) intact/skip payload: hook exits 0', String(resD.status));
+    assert(resD.stdout === '', '(d) intact/skip payload: no updatedInput emission — command stays byte-identical', resD.stdout);
+    candidatesSent += 1;
+    releaseBridge(sessD, cPool);
+
+    // (e) chain: `true && npm run testjest` — only the npm-run segment is a
+    // runner candidate (T03's shipped chain semantics); rewritten to append
+    // the jest argv flag after `--`. Dump shows the clamped --maxWorkers flag.
+    const dumpE = path.join(fixture, 'dump-e.json');
+    const sessE = 'sess-109-e';
+    const resE = runPre('true && npm run testjest', { cwd: fixture, sessionId: sessE, env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resE.status === 0, '(e) chain payload: hook exits 0', String(resE.status));
+    candidatesSent += 1;
+    let parsedE = null;
+    try { parsedE = JSON.parse(resE.stdout.trim().split('\n').filter(Boolean)[0]); } catch { /* asserted below */ }
+    assert(!!(parsedE && parsedE.hookSpecificOutput && parsedE.hookSpecificOutput.updatedInput), '(e) chain payload: updatedInput.command present for the rewritten segment', resE.stdout);
+    if (parsedE) {
+      const rewrittenE = parsedE.hookSpecificOutput.updatedInput.command;
+      const workersMatch = /--maxWorkers=(\d+)/.exec(rewrittenE);
+      assert(!!workersMatch, '(e) chain rewrite carries a --maxWorkers argv flag (jest, via npm -- forwarding)', rewrittenE);
+      if (workersMatch) {
+        const { sh: shE, bin: shBinE } = resolvePosixSh();
+        const envE = shBinE
+          ? Object.assign({}, process.env, { DUMP_FILE: dumpE, PATH: shBinE + path.delimiter + (process.env.PATH || '') })
+          : Object.assign({}, process.env, { DUMP_FILE: dumpE });
+        const execE = spawnSync(shE, ['-c', rewrittenE], {
+          cwd: fixture, encoding: 'utf8', env: envE,
+        });
+        assert(execE.status === 0, '(e) executing the chain-rewritten command via sh -c exits 0 (the `true` segment ran too)', `status=${execE.status} stderr=${execE.stderr}`);
+        let dumpE_ = null;
+        try { dumpE_ = JSON.parse(fs.readFileSync(dumpE, 'utf8')); } catch { /* asserted below */ }
+        assert(!!dumpE_, '(e) fixture jest shim wrote its argv/env dump', String(fs.existsSync(dumpE)));
+        if (dumpE_) {
+          assert(dumpE_.argv.includes(`--maxWorkers=${workersMatch[1]}`), '(e) child process observed the SAME clamped --maxWorkers the hook emitted (child-side equivalence)', JSON.stringify(dumpE_.argv));
+        }
+      }
+    }
+    releaseBridge(sessE, cPool);
+
+    // (f) literal subshell: `(npm test)` fails tokenization entirely — the B1
+    // lexical gate returns false BEFORE planRewrite is ever reached, so this
+    // is NOT a "candidate" (S03-PLAN Notes: commands that fail the lexical
+    // gate emit nothing from the pre-hook). Deliberately excluded from
+    // `candidatesSent` below — its zero-event, zero-stdout outcome is the
+    // proof, not an omission.
+    const resF = runPre('(npm test)', { cwd: fixture, sessionId: 'sess-109-f', env: { FORGE_RESOURCE_POOL_DIR: cPool } });
+    assert(resF.status === 0, '(f) syntactically-refused subshell command is allowed through unrewritten', String(resF.status));
+    assert(resF.stdout === '', '(f) subshell command emits no rewrite stdout — byte-identical, branch never engaged', resF.stdout);
+
+    // ── (g) census (W3): rewrite-applied + rewrite-skipped events sum EXACTLY
+    // to the number of LEXICAL-GATE-CANDIDATE payloads sent — no remainder.
+    // The subshell (f) is excluded by construction (never a candidate); a
+    // full reconciliation against the PostToolUse evidence log (which
+    // records 100% of Bash calls, including non-candidates) is S05's
+    // `--check resources` per S03-PLAN Notes — this section asserts only the
+    // candidate half.
+    const finalEvents = readEvents(fixture).filter((e) => e.event === 'rewrite-applied' || e.event === 'rewrite-skipped');
+    assert(finalEvents.length === candidatesSent, `(g) census: rewrite-applied + rewrite-skipped events sum EXACTLY to the ${candidatesSent} candidate payloads sent, no remainder`, JSON.stringify(finalEvents));
+
+    // ── (h) self-bite — FORGE_REWRITE_FAULT='emission' (existing seam, T03)
+    // deliberately breaks the recognized path AFTER tokenizer/resolver/pool
+    // succeed: the emitted command must fall back byte-identical (no
+    // VITEST_MAX_FORKS prefix), proving this section's own assertions are
+    // sensitive to a broken rewrite path, not tautological.
+    const sessH = 'sess-109-h';
+    const resH = runPre('npm test', { cwd: fixture, sessionId: sessH, env: { FORGE_RESOURCE_POOL_DIR: cPool, FORGE_REWRITE_FAULT: 'emission' } });
+    assert(resH.status === 0, '(h) self-bite: faulted emission stage still exits 0', String(resH.status));
+    assert(resH.stdout === '', '(h) self-bite: faulted emission stage emits NO rewrite stdout — falls through byte-identical', resH.stdout);
+    releaseBridge(sessH, cPool);
+  } finally {
+    try { fs.rmSync(fixture, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(cPool, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  // ── (i) registration: the section verifies it is wired into main() ───────
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeRewriteCeilingAndE2E\(\); \}/.test(mainBody),
+    '(i) Section 109 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass(`Section 109: B1 ceiling measured at ${measuredMs}ms/${iterations} calls (< ${CEILING_MS}ms), outside-process zero-pool-I/O `
+    + 'proven, real npm+sh -c child-side equivalence for env-prefix (vitest) and argv-flag (jest via chain) rewrites, '
+    + 'census sums exactly to candidates sent, and a faulted emission stage falls back byte-identical (self-bite)');
+}
+
+// ── Section 110: S04/T04 — verify.js/reverify.js child-side clamp E2E, byte-identity, W5 census ──
+// Section number MEASURED at execution time (`grep -oE "Section ([0-9]+)"
+// scripts/forge-smoke.js | grep -oE "[0-9]+" | sort -n | tail -1`), not
+// assumed: 107 was the real max at authoring time. Never require()s
+// forge-verify.js/forge-reverify.js — every assertion spawns the REAL CLI as
+// a child process, and every clamp claim is read from a dump the CHILD
+// process itself writes (never inferred from what the parent intended to
+// pass — the exact "environment is only proven by the child" lesson S04's
+// own plan cites from S03/T02).
+function smokeVerifyReverifyChildSideE2E() {
+  process.stdout.write('\n▸ Section 110: forge-verify.js/forge-reverify.js child-side clamp E2E, byte-identity, W5 census\n');
+  const NODE = process.execPath;
+  const VERIFY_CLI = path.join(SCRIPTS, 'forge-verify.js');
+  const REVERIFY_CLI = path.join(SCRIPTS, 'forge-reverify.js');
+  const POOL_CLI = path.join(SCRIPTS, 'forge-resource-pool.js');
+  const isPosix = process.platform !== 'win32';
+
+  function tmpWorkspace(prefix) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
+    return dir;
+  }
+  function poolCensus(poolDir) {
+    const r = spawnSync(NODE, [POOL_CLI, '--status', '--json', '--pool-dir', poolDir], { encoding: 'utf8' });
+    try { return JSON.parse(r.stdout); } catch { return { ok: false, held: -1 }; }
+  }
+  function shimBody(dumpFile, { exitCode = 0, delayMs = 0 } = {}) {
+    return [
+      '#!/usr/bin/env node',
+      "const fs = require('fs');",
+      `fs.writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({ argv: process.argv, env: process.env }));`,
+      delayMs > 0 ? `setTimeout(() => { process.exit(${exitCode}); }, ${delayMs});` : `process.exit(${exitCode});`,
+      '',
+    ].join('\n');
+  }
+  function writeShim(binPath, dumpFile, opts) {
+    fs.mkdirSync(path.dirname(binPath), { recursive: true });
+    fs.writeFileSync(binPath, shimBody(dumpFile, opts), { mode: 0o755 });
+  }
+  function hasMakeBinary() {
+    try { return spawnSync('make', ['--version'], { encoding: 'utf8' }).status === 0; } catch { return false; }
+  }
+  // Runs `fn` against a COPY of scripts/ (in tmp) with
+  // forge-command-rewrite.js deleted from the copy — so a FRESHLY spawned
+  // child's require() throws MODULE_NOT_FOUND (the strongest form of
+  // "wiring disabled": the module genuinely absent from disk), WITHOUT ever
+  // mutating the real tracked checkout (R10, S04 review). The original
+  // in-place rename left a window — covered by `finally`, but not SIGKILL —
+  // where a concurrent Forge process on the same machine (this milestone's
+  // own premise) could observe the module missing, or a killed smoke run
+  // could leave the checkout without it. `fn` receives the copy's scripts/
+  // dir so callers can build CLI paths (`path.join(copyScriptsDir, ...)`)
+  // that resolve `require()`s inside the copy, never the real tree. Some
+  // scripts reach up to `../shared/**` (e.g. forge-xllm.js's
+  // `../shared/schemas/*.json`) — a symlink from the copy root back to the
+  // REAL `shared/` dir preserves that relative resolution read-only,
+  // without copying (or ever writing to) it.
+  function withRewriteModuleDisabled(fn) {
+    const copyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-repo-copy-'));
+    const copyScriptsDir = path.join(copyRoot, 'scripts');
+    try {
+      fs.cpSync(SCRIPTS, copyScriptsDir, { recursive: true });
+      fs.rmSync(path.join(copyScriptsDir, 'forge-command-rewrite.js'), { force: true });
+      fs.symlinkSync(path.join(SCRIPTS, '..', 'shared'), path.join(copyRoot, 'shared'), 'dir');
+      return fn(copyScriptsDir);
+    } finally {
+      try { fs.rmSync(copyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+  function writeResultFile(p) {
+    const result = { must_haves_status: [{ status: 'unmet', scope: 'environment', reason: 'sandbox-exec-blocked', note: 'run the test suite' }] };
+    fs.writeFileSync(p, JSON.stringify(result), 'utf8');
+    return p;
+  }
+
+  // ── Real pool root: never created/touched by anything in this section ────
+  const realPoolRoot = path.join(os.homedir(), '.claude', 'forge', 'resource-pool');
+  const realPoolExistedBefore = fs.existsSync(realPoolRoot);
+  const realPoolListingBefore = realPoolExistedBefore ? fs.readdirSync(realPoolRoot).sort() : null;
+
+  if (!isPosix) {
+    skip('Section 110: verify.js/reverify.js child-side clamp E2E', 'posix-only shebang fixtures (mirrors T02/T03 suites)');
+    return;
+  }
+
+  // ═══ Consumer A: forge-verify.js ══════════════════════════════════════
+  const aDir = tmpWorkspace('smoke110-verify-');
+  const aPoolOn = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-verify-pool-on-'));
+  const aPoolOff = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-verify-pool-off-'));
+  const aPoolFail = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-verify-pool-fail-'));
+  const aPoolTimeout = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-verify-pool-to-'));
+  try {
+    // (a) clamp ON: taskPlanVerify:'vitest' resolved via a PATH-injected shim.
+    const binOnDir = path.join(aDir, 'bin-on');
+    const dumpOn = path.join(aDir, 'dump-on.json');
+    writeShim(path.join(binOnDir, 'vitest'), dumpOn);
+    const planA = path.join(aDir, 'plan-a.md');
+    fs.writeFileSync(planA, '---\nverify: vitest\n---\n# fixture\n', 'utf8');
+    const envA = Object.assign({}, process.env, {
+      PATH: binOnDir + path.delimiter + process.env.PATH,
+      FORGE_RESOURCE_POOL_DIR: aPoolOn, FORGE_RESOURCES_PRESSURE: '1',
+    });
+    const resA = spawnSync(NODE, [VERIFY_CLI, '--plan', planA, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke110-a'], { encoding: 'utf8', env: envA });
+    assert(resA.status === 0, '(a) forge-verify.js CLI exits 0 for the clamp-ON fixture', String(resA.status) + resA.stderr);
+    assert(fs.existsSync(dumpOn), '(a) the CHILD process wrote its own argv/env dump — clamp observed child-side, never inferred', dumpOn);
+    const dumpOnJson = JSON.parse(fs.readFileSync(dumpOn, 'utf8'));
+    assert(typeof dumpOnJson.env.NODE_OPTIONS === 'string' && /--max-old-space-size=\d+/.test(dumpOnJson.env.NODE_OPTIONS),
+      '(a) clamp ON: child dump carries NODE_OPTIONS from the resource contract', JSON.stringify(dumpOnJson.env));
+    assert(typeof dumpOnJson.env.VITEST_MAX_FORKS === 'string' && dumpOnJson.env.VITEST_MAX_FORKS.length > 0,
+      '(a) clamp ON: child dump carries the VITEST_MAX_FORKS worker clamp', JSON.stringify(dumpOnJson.env));
+
+    // (b) clamp OFF: SAME fixture body, non-runner binary name — bite reverses.
+    const binOffDir = path.join(aDir, 'bin-off');
+    const dumpOff = path.join(aDir, 'dump-off.json');
+    const offBin = path.join(binOffDir, 'not-a-real-runner');
+    writeShim(offBin, dumpOff);
+    const planB = path.join(aDir, 'plan-b.md');
+    fs.writeFileSync(planB, `---\nverify: ${offBin}\n---\n# fixture\n`, 'utf8');
+    const envB = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: aPoolOff, FORGE_RESOURCES_PRESSURE: '1' });
+    const resB = spawnSync(NODE, [VERIFY_CLI, '--plan', planB, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke110-b'], { encoding: 'utf8', env: envB });
+    assert(resB.status === 0, '(b) forge-verify.js CLI exits 0 for the clamp-OFF fixture', String(resB.status) + resB.stderr);
+    const dumpOffJson = JSON.parse(fs.readFileSync(dumpOff, 'utf8'));
+    assert(dumpOffJson.env.NODE_OPTIONS === undefined, '(b) clamp OFF: NODE_OPTIONS is ABSENT from the child env (bite reverses)', JSON.stringify(dumpOffJson.env));
+    assert(dumpOffJson.env.VITEST_MAX_FORKS === undefined, '(b) clamp OFF: VITEST_MAX_FORKS is ABSENT from the child env', JSON.stringify(dumpOffJson.env));
+
+    // (c) W5 outside-process: a FAILING command releases the lease.
+    const binFailDir = path.join(aDir, 'bin-fail');
+    const dumpFail = path.join(aDir, 'dump-fail.json');
+    writeShim(path.join(binFailDir, 'vitest'), dumpFail, { exitCode: 7 });
+    const planC = path.join(aDir, 'plan-c.md');
+    fs.writeFileSync(planC, '---\nverify: vitest\n---\n# fixture\n', 'utf8');
+    const envC = Object.assign({}, process.env, {
+      PATH: binFailDir + path.delimiter + process.env.PATH,
+      FORGE_RESOURCE_POOL_DIR: aPoolFail, FORGE_RESOURCES_PRESSURE: '1',
+    });
+    const resC = spawnSync(NODE, [VERIFY_CLI, '--plan', planC, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke110-c'], { encoding: 'utf8', env: envC });
+    let parsedC = null;
+    try { parsedC = JSON.parse(resC.stdout); } catch { /* asserted below */ }
+    assert(!!parsedC && parsedC.passed === false && parsedC.checks[0].exitCode === 7,
+      '(c) failing command reports the project exit code (7) through the real CLI', resC.stdout);
+    const censusC = poolCensus(aPoolFail);
+    assert(censusC.ok === true && censusC.held === 0, '(c) W5 outside-process: pool census shows ZERO held slots after a FAILED forge-verify.js command', JSON.stringify(censusC));
+
+    // (d) W5 outside-process: a TIMING-OUT command releases the lease.
+    const binToDir = path.join(aDir, 'bin-timeout');
+    const dumpTo = path.join(aDir, 'dump-timeout.json');
+    writeShim(path.join(binToDir, 'vitest'), dumpTo, { delayMs: 4000 });
+    const planD = path.join(aDir, 'plan-d.md');
+    fs.writeFileSync(planD, '---\nverify: vitest\n---\n# fixture\n', 'utf8');
+    const envD = Object.assign({}, process.env, {
+      PATH: binToDir + path.delimiter + process.env.PATH,
+      FORGE_RESOURCE_POOL_DIR: aPoolTimeout, FORGE_RESOURCES_PRESSURE: '1',
+    });
+    const resD = spawnSync(NODE, [VERIFY_CLI, '--plan', planD, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke110-d', '--timeout', '300'], { encoding: 'utf8', env: envD });
+    let parsedD = null;
+    try { parsedD = JSON.parse(resD.stdout); } catch { /* asserted below */ }
+    assert(!!parsedD && parsedD.checks[0].exitCode === 124 && parsedD.checks[0].skipped === 'timeout',
+      '(d) timing-out command maps to exitCode 124 through the real CLI', resD.stdout);
+    const censusD = poolCensus(aPoolTimeout);
+    assert(censusD.ok === true && censusD.held === 0, '(d) W5 outside-process: pool census shows ZERO held slots after a TIMED-OUT forge-verify.js command', JSON.stringify(censusD));
+
+    // (e) byte-identity (consumer A): an unrecognized command runs
+    // identically whether the command-rewrite module is present or
+    // genuinely absent from disk.
+    const binUnrecDir = path.join(aDir, 'bin-unrec');
+    const unrecBin = path.join(binUnrecDir, 'totally-unrecognized-runner');
+    const dumpUnrec1 = path.join(aDir, 'dump-unrec-1.json');
+    const dumpUnrec2 = path.join(aDir, 'dump-unrec-2.json');
+    const planE = path.join(aDir, 'plan-e.md');
+    fs.writeFileSync(planE, `---\nverify: ${unrecBin} --flag x\n---\n# fixture\n`, 'utf8');
+    const envE = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: aPoolOn, FORGE_RESOURCES_PRESSURE: '1' });
+
+    writeShim(unrecBin, dumpUnrec1);
+    const resE1 = spawnSync(NODE, [VERIFY_CLI, '--plan', planE, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke110-e1'], { encoding: 'utf8', env: envE });
+    writeShim(unrecBin, dumpUnrec2);
+    const resE2 = withRewriteModuleDisabled((copyScriptsDir) => spawnSync(NODE, [path.join(copyScriptsDir, 'forge-verify.js'), '--plan', planE, '--cwd', aDir, '--gsd-dir', path.join(aDir, '.gsd'), '--unit', 'smoke110-e2'], { encoding: 'utf8', env: envE }));
+
+    assert(resE1.status === 0 && resE2.status === 0, '(e) both unrecognized-command runs (wiring present/absent) exit 0', `${resE1.status}/${resE2.status}`);
+    const dumpUnrec1Json = JSON.parse(fs.readFileSync(dumpUnrec1, 'utf8'));
+    const dumpUnrec2Json = JSON.parse(fs.readFileSync(dumpUnrec2, 'utf8'));
+    assert(JSON.stringify(dumpUnrec1Json.argv) === JSON.stringify(dumpUnrec2Json.argv),
+      '(e) byte-identity (consumer A): the child process observed the SAME argv with the rewrite module present vs genuinely absent from disk — strict equality',
+      JSON.stringify({ a: dumpUnrec1Json.argv, b: dumpUnrec2Json.argv }));
+    const parsedE1 = JSON.parse(resE1.stdout);
+    const parsedE2 = JSON.parse(resE2.stdout);
+    assert(parsedE1.checks[0].command === parsedE2.checks[0].command && parsedE1.checks[0].exitCode === parsedE2.checks[0].exitCode,
+      '(e) byte-identity (consumer A): the reported command/exitCode is IDENTICAL in both modes', JSON.stringify({ e1: parsedE1.checks[0], e2: parsedE2.checks[0] }));
+  } finally {
+    try { fs.rmSync(aDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    for (const d of [aPoolOn, aPoolOff, aPoolFail, aPoolTimeout]) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
+  // ═══ Consumer B: forge-reverify.js ════════════════════════════════════
+  const bDir = tmpWorkspace('smoke110-reverify-');
+  const bPoolOn = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-reverify-pool-on-'));
+  const bPoolOff = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-reverify-pool-off-'));
+  const bPoolFail = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-reverify-pool-fail-'));
+  const bPoolTimeout = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-reverify-pool-to-'));
+  const bPoolMake = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-reverify-pool-make-'));
+  let offDir = null;
+  let makeDir = null;
+  try {
+    // (f) clamp ON: package.json's "test" script is a single-segment
+    // "vitest" body — npm resolves node_modules/.bin/vitest, the REAL shim,
+    // over a REAL spawned npm (S03/T04 Section 109's precedent).
+    const dumpF = path.join(bDir, 'dump-f.json');
+    fs.writeFileSync(path.join(bDir, 'package.json'), JSON.stringify({ name: 'smoke110-b', version: '1.0.0', scripts: { test: 'vitest' } }), 'utf8');
+    fs.writeFileSync(path.join(bDir, 'package-lock.json'), JSON.stringify({ name: 'smoke110-b', version: '1.0.0', lockfileVersion: 3 }), 'utf8');
+    writeShim(path.join(bDir, 'node_modules', '.bin', 'vitest'), dumpF);
+    const resultF = writeResultFile(path.join(bDir, 'result-f.json'));
+    const envF = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolOn, FORGE_RESOURCES_PRESSURE: '1' });
+    const resF = spawnSync(NODE, [REVERIFY_CLI, '--result', resultF, '--code-dir', bDir, '--gsd-dir', path.join(bDir, '.gsd'), '--apply'], { encoding: 'utf8', cwd: bDir, env: envF });
+    assert(resF.status === 0, '(f) forge-reverify.js CLI exits 0 for the clamp-ON fixture', String(resF.status) + resF.stderr);
+    assert(fs.existsSync(dumpF), '(f) the CHILD process wrote its own argv/env dump (child-side observation)', dumpF);
+    const dumpFJson = JSON.parse(fs.readFileSync(dumpF, 'utf8'));
+    assert(typeof dumpFJson.env.NODE_OPTIONS === 'string' && /--max-old-space-size=\d+/.test(dumpFJson.env.NODE_OPTIONS),
+      '(f) clamp ON: reverify child dump carries NODE_OPTIONS from the resource contract', JSON.stringify(dumpFJson.env));
+    assert(typeof dumpFJson.env.VITEST_MAX_FORKS === 'string' && dumpFJson.env.VITEST_MAX_FORKS.length > 0,
+      '(f) clamp ON: reverify child dump carries VITEST_MAX_FORKS', JSON.stringify(dumpFJson.env));
+    assert(!dumpFJson.argv.slice(2).some((tok) => /^[A-Za-z_]\w*=/.test(tok)),
+      '(f) NO argv element is a NAME=value assignment — the structural guarantee of T01/T03 (shell:false)', JSON.stringify(dumpFJson.argv));
+    const parsedF = JSON.parse(resF.stdout);
+    assert(parsedF.verdict === 'verified', '(f) re-verification applied a "verified" outcome for the environment must-have', resF.stdout);
+
+    // (g) clamp OFF: same shape, package.json's "test" script is NOT a
+    // recognized runner body — bite reverses on the SAME code path.
+    const dumpG = path.join(bDir, 'dump-g.json');
+    offDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-reverify-off-'));
+    fs.mkdirSync(path.join(offDir, '.gsd', 'forge'), { recursive: true });
+    fs.writeFileSync(path.join(offDir, 'package.json'), JSON.stringify({ name: 'smoke110-b-off', version: '1.0.0', scripts: { test: 'node dump.js' } }), 'utf8');
+    fs.writeFileSync(path.join(offDir, 'dump.js'), `const fs=require('fs');fs.writeFileSync(${JSON.stringify(dumpG)}, JSON.stringify({argv:process.argv,env:process.env}));`, 'utf8');
+    const resultG = writeResultFile(path.join(offDir, 'result-g.json'));
+    const envG = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolOff, FORGE_RESOURCES_PRESSURE: '1' });
+    const resG = spawnSync(NODE, [REVERIFY_CLI, '--result', resultG, '--code-dir', offDir, '--gsd-dir', path.join(offDir, '.gsd'), '--apply'], { encoding: 'utf8', cwd: offDir, env: envG });
+    assert(resG.status === 0, '(g) forge-reverify.js CLI exits 0 for the clamp-OFF fixture', String(resG.status) + resG.stderr);
+    const dumpGJson = JSON.parse(fs.readFileSync(dumpG, 'utf8'));
+    assert(dumpGJson.env.VITEST_MAX_FORKS === undefined, '(g) clamp OFF: VITEST_MAX_FORKS is ABSENT — command is not runner-shaped, bite reverses', JSON.stringify(dumpGJson.env));
+
+    // (h) W5 outside-process: a FAILING command releases the lease.
+    const dumpH = path.join(bDir, 'dump-h.json');
+    writeShim(path.join(bDir, 'node_modules', '.bin', 'vitest'), dumpH, { exitCode: 5 });
+    const resultH = writeResultFile(path.join(bDir, 'result-h.json'));
+    const envH = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolFail, FORGE_RESOURCES_PRESSURE: '1' });
+    const resH = spawnSync(NODE, [REVERIFY_CLI, '--result', resultH, '--code-dir', bDir, '--gsd-dir', path.join(bDir, '.gsd')], { encoding: 'utf8', cwd: bDir, env: envH });
+    const parsedH = JSON.parse(resH.stdout);
+    assert(parsedH.verdict === 'failed' && parsedH.exit_code === 5, '(h) failing command reports the project exit code (5) through the real CLI', resH.stdout);
+    const censusH = poolCensus(bPoolFail);
+    assert(censusH.ok === true && censusH.held === 0, '(h) W5 outside-process: pool census shows ZERO held slots after a FAILED forge-reverify.js command', JSON.stringify(censusH));
+
+    // (i) W5 outside-process: a TIMING-OUT command releases the lease.
+    const dumpI = path.join(bDir, 'dump-i.json');
+    writeShim(path.join(bDir, 'node_modules', '.bin', 'vitest'), dumpI, { delayMs: 4000 });
+    const resultI = writeResultFile(path.join(bDir, 'result-i.json'));
+    const envI = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolTimeout, FORGE_RESOURCES_PRESSURE: '1' });
+    const resI = spawnSync(NODE, [REVERIFY_CLI, '--result', resultI, '--code-dir', bDir, '--gsd-dir', path.join(bDir, '.gsd'), '--timeout-ms', '300'], { encoding: 'utf8', cwd: bDir, env: envI });
+    const parsedI = JSON.parse(resI.stdout);
+    assert(parsedI.verdict === 'no-command', '(i) timed-out command surfaces as no-command through the real CLI (ETIMEDOUT mapping)', resI.stdout);
+    const censusI = poolCensus(bPoolTimeout);
+    assert(censusI.ok === true && censusI.held === 0, '(i) W5 outside-process: pool census shows ZERO held slots after a TIMED-OUT forge-reverify.js command', JSON.stringify(censusI));
+
+    // (j) byte-identity (consumer B): a Makefile-resolved command
+    // (unrecognized runner form — S04-PLAN step 6's own example, and
+    // resolveVerifyCommand's own precedent) runs byte-identical whether the
+    // command-rewrite module is present or genuinely absent from disk.
+    if (hasMakeBinary()) {
+      makeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke110-make-'));
+      fs.mkdirSync(path.join(makeDir, '.gsd', 'forge'), { recursive: true });
+      const dumpJ1 = path.join(makeDir, 'dump-j1.json');
+      const dumpJ2 = path.join(makeDir, 'dump-j2.json');
+      fs.writeFileSync(path.join(makeDir, 'dump.js'), "const fs=require('fs');fs.writeFileSync(process.env.SMOKE110_DUMP_FILE, JSON.stringify({argv:process.argv}));", 'utf8');
+      fs.writeFileSync(path.join(makeDir, 'Makefile'), 'test:\n\tnode dump.js\n', 'utf8');
+
+      const resultJ1 = writeResultFile(path.join(makeDir, 'result-j1.json'));
+      const envJ1 = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolMake, FORGE_RESOURCES_PRESSURE: '1', SMOKE110_DUMP_FILE: dumpJ1 });
+      const resJ1 = spawnSync(NODE, [REVERIFY_CLI, '--result', resultJ1, '--code-dir', makeDir, '--gsd-dir', path.join(makeDir, '.gsd')], { encoding: 'utf8', cwd: makeDir, env: envJ1 });
+
+      const resultJ2 = writeResultFile(path.join(makeDir, 'result-j2.json'));
+      const envJ2 = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: bPoolMake, FORGE_RESOURCES_PRESSURE: '1', SMOKE110_DUMP_FILE: dumpJ2 });
+      const resJ2 = withRewriteModuleDisabled((copyScriptsDir) => spawnSync(NODE, [path.join(copyScriptsDir, 'forge-reverify.js'), '--result', resultJ2, '--code-dir', makeDir, '--gsd-dir', path.join(makeDir, '.gsd')], { encoding: 'utf8', cwd: makeDir, env: envJ2 }));
+
+      assert(resJ1.status === 0 && resJ2.status === 0, '(j) both make-test runs (wiring present/absent) exit 0', `${resJ1.status}/${resJ2.status}`);
+      const parsedJ1 = JSON.parse(resJ1.stdout);
+      const parsedJ2 = JSON.parse(resJ2.stdout);
+      assert(parsedJ1.verdict === parsedJ2.verdict && parsedJ1.exit_code === parsedJ2.exit_code && parsedJ1.command === parsedJ2.command,
+        '(j) byte-identity (consumer B): reverify CLI outcome (verdict/exit_code/command) is IDENTICAL with the rewrite module present vs genuinely absent from disk',
+        JSON.stringify({ parsedJ1, parsedJ2 }));
+      const dumpJ1Json = JSON.parse(fs.readFileSync(dumpJ1, 'utf8'));
+      const dumpJ2Json = JSON.parse(fs.readFileSync(dumpJ2, 'utf8'));
+      assert(JSON.stringify(dumpJ1Json.argv) === JSON.stringify(dumpJ2Json.argv),
+        '(j) byte-identity (consumer B): the child process observed the SAME argv in both runs — strict equality, not "looks equal"',
+        JSON.stringify({ a: dumpJ1Json.argv, b: dumpJ2Json.argv }));
+    } else {
+      skip('(j) byte-identity Makefile scenario', 'no `make` binary on PATH on this machine');
+    }
+  } finally {
+    try { fs.rmSync(bDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (offDir) { try { fs.rmSync(offDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    if (makeDir) { try { fs.rmSync(makeDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    for (const d of [bPoolOn, bPoolOff, bPoolFail, bPoolTimeout, bPoolMake]) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
+  // ── (k) real pool root untouched by ANY spawn above ───────────────────
+  const realPoolExistedAfter = fs.existsSync(realPoolRoot);
+  const realPoolListingAfter = realPoolExistedAfter ? fs.readdirSync(realPoolRoot).sort() : null;
+  assert(realPoolExistedBefore === realPoolExistedAfter && JSON.stringify(realPoolListingBefore) === JSON.stringify(realPoolListingAfter),
+    '(k) the real machine pool root (~/.claude/forge/resource-pool) is untouched — every fixture above used FORGE_RESOURCE_POOL_DIR pointed at a tmpdir',
+    JSON.stringify({ before: realPoolListingBefore, after: realPoolListingAfter }));
+
+  // ── (l) registration: the section verifies it is wired into main() ───
+  const source = fs.readFileSync(__filename, 'utf8');
+  const mainBody = source.slice(source.lastIndexOf('async function main()'));
+  assert(/\(\) => \{ smokeVerifyReverifyChildSideE2E\(\); \}/.test(mainBody),
+    '(l) Section 110 is registered in main() by closure — an unregistered section vanishes silently');
+
+  pass('Section 110: forge-verify.js and forge-reverify.js clamp/unclamp proven CHILD-side via real CLI spawns, '
+    + 'W5 census zeroed after failure AND timeout for both consumers, byte-identity proven for an unrecognized command '
+    + 'with the rewrite module genuinely absent from disk (both consumers), and the real machine pool root never touched');
+}
+
+// ── Section 111: S05/T04 — forge-doctor --check resources + statusline clamp indicator, census bite both ways ──
+// Section number MEASURED at execution time (`grep -o "Section [0-9]\+"
+// scripts/forge-smoke.js | sort -n -k2 | tail -1` -> 108 was the real max),
+// never assumed (MEM013: S01 assumed 100/real 104, S04 measured 107->108).
+// Every claim here is proven by spawning the REAL `forge-doctor.js` and
+// `forge-statusline.js` CLIs as child processes — never by requiring their
+// modules in-process and reading return values, and never by reading a
+// source comment.
+function smokeResourcesObservabilityCensus() {
+  process.stdout.write('\n▸ Section 111: forge-doctor --check resources + statusline clamp indicator, census bite both ways\n');
+  const NODE = process.execPath;
+  const DOCTOR_CLI = path.join(SCRIPTS, 'forge-doctor.js');
+  const STATUSLINE_CLI = path.join(SCRIPTS, 'forge-statusline.js');
+
+  function mkTmp(label) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `smoke111-${label}-`));
+    fs.mkdirSync(path.join(dir, '.gsd', 'forge'), { recursive: true });
+    return dir;
+  }
+  function eventsPath(root) { return path.join(root, '.gsd', 'forge', 'events.jsonl'); }
+  function appendEvent(root, obj) { fs.appendFileSync(eventsPath(root), `${JSON.stringify(obj)}\n`, 'utf8'); }
+  function sha256File(p) {
+    if (!fs.existsSync(p)) return null;
+    return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+  }
+  function runStatusline(cwd, poolDir) {
+    const input = JSON.stringify({ cwd, model: { display_name: 'smoke111' }, context_window: { used_percentage: 1 } });
+    const env = Object.assign({}, process.env, { FORGE_RESOURCE_POOL_DIR: poolDir });
+    return spawnSync(NODE, [STATUSLINE_CLI], { input, encoding: 'utf8', env, cwd: SCRIPTS });
+  }
+
+  // ── Real machine surfaces: never touched by anything in this section ─────
+  const realPoolRoot = path.join(os.homedir(), '.claude', 'forge', 'resource-pool');
+  const realPoolExistedBefore = fs.existsSync(realPoolRoot);
+  const realPoolListingBefore = realPoolExistedBefore ? fs.readdirSync(realPoolRoot).sort() : null;
+
+  const degradedRoot = mkTmp('degraded');
+  const cleanRoot = mkTmp('empty');
+  const dualFieldRoot = mkTmp('dualfield');
+  const platformRoot = mkTmp('platform');
+  const pollutionRoot = mkTmp('pollution');
+  // R6 fix: every doctor spawn below reads through `checkResources ->
+  // poolStatus`, which without `--pool-dir` resolves to the REAL machine-wide
+  // `~/.claude/forge/resource-pool`. Reads are harmless (poolStatus/observe
+  // never mutate), but they still touch an unowned machine surface, and
+  // assertion (i) below claims every fixture used an isolated pool dir — a
+  // claim that must be true, not just plausible. Give each doctor fixture its
+  // own tmp pool dir, same isolation discipline the statusline fixtures (f)
+  // already use.
+  const doctorPoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke111-doctor-pool-'));
+  let stlHeldDir = null;
+  let stlEmptyDir = null;
+  let stlPoolHeldRoot = null;
+  let stlPoolEmptyRoot = null;
+
+  try {
+    // ── (a) advisory absolute: real spawn exit 0, degraded fixture ─────────
+    appendEvent(degradedRoot, { ts: new Date().toISOString(), kind: 'resource-admission', reason: 'platform-unsupported:linux' });
+    const resA1 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', degradedRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
+    assert(resA1.status === 0, '(a) `--check resources` exits 0 by real spawn, with a degraded fixture present', String(resA1.status) + resA1.stderr);
+    assert(/degraded/.test(resA1.stdout), '(a) degraded fixture surfaces the degraded verdict in stdout', resA1.stdout);
+    // `--check all` also runs the (unrelated) non-advisory schema check —
+    // stamp SCHEMA-VERSION so THIS assertion isolates the resources check
+    // specifically (same fixture shape as forge-doctor-resources.test.js's
+    // own `--check all` case; derived from the module, never hand-written).
+    const { CURRENT_SCHEMA: DOCTOR_CURRENT_SCHEMA } = require(path.join(SCRIPTS, 'forge-doctor.js'));
+    fs.writeFileSync(path.join(degradedRoot, '.gsd', 'SCHEMA-VERSION'), `${DOCTOR_CURRENT_SCHEMA}\n`, 'utf8');
+    const resA2 = spawnSync(NODE, [DOCTOR_CLI, '--check', 'all', '--cwd', degradedRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
+    assert(resA2.status === 0, '(a) `--check all` also exits 0 by real spawn with the same degraded fixture', String(resA2.status) + resA2.stderr);
+    assert(/Resource control/.test(resA2.stdout), '(a) `--check all` output includes the resources check', resA2.stdout);
+
+    // ── (b) anti-silence floor: zero events -> inconclusive, never clean ───
+    const resB = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', cleanRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
+    assert(resB.status === 0, '(b) zero-events fixture still exits 0', String(resB.status) + resB.stderr);
+    assert(/inconclusive/.test(resB.stdout), '(b) zero events examined reads inconclusive', resB.stdout);
+    assert(!/\bclean\b/.test(resB.stdout), '(b) zero events examined NEVER reads clean — the floor is first in verdict order', resB.stdout);
+
+    // ── (c) positive bite: BOTH field names (`kind` and `event`), reason count >= 1 ──
+    appendEvent(dualFieldRoot, { ts: new Date().toISOString(), kind: 'resource-admission', reason: 'platform-unsupported:linux' });
+    appendEvent(dualFieldRoot, { ts: new Date().toISOString(), event: 'resource-degradation', reason: 'platform-unsupported:linux' });
+    const resC = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', dualFieldRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
+    assert(resC.status === 0, '(c) dual-field-name fixture exits 0', String(resC.status) + resC.stderr);
+    assert(/platform-unsupported:linux/.test(resC.stdout) && /2/.test(resC.stdout),
+      '(c) BOTH `kind` and `event` field names are counted into the same reason with count >= 1 (a `kind`-only reader would see half the stream — the exact S03 rewrite-event blind spot this slice exists to close)',
+      resC.stdout);
+
+    // ── (d) forced platform degradation is NAMED, not passed clean ─────────
+    const resD = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', platformRoot, '--platform', 'linux', '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
+    assert(resD.status === 0, '(d) forced-platform fixture exits 0', String(resD.status) + resD.stderr);
+    assert(/platform-unsupported:linux/.test(resD.stdout), '(d) --platform linux is NAMED in the live pressure line, never silently passed', resD.stdout);
+
+    // ── (e) non-pollution: events.jsonl is byte-identical before/after ─────
+    appendEvent(pollutionRoot, { ts: new Date().toISOString(), kind: 'shadow-wait', reason: 'shadow-wait' });
+    const beforeHash = sha256File(eventsPath(pollutionRoot));
+    const resE = spawnSync(NODE, [DOCTOR_CLI, '--check', 'resources', '--cwd', pollutionRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
+    assert(resE.status === 0, '(e) non-pollution fixture check exits 0', String(resE.status) + resE.stderr);
+    const afterHash = sha256File(eventsPath(pollutionRoot));
+    assert(beforeHash !== null && beforeHash === afterHash,
+      '(e) events.jsonl is byte-identical before/after `--check resources` — the diagnostic never contaminates the census it reports (noEvents:true)',
+      `before=${beforeHash} after=${afterHash}`);
+
+    // ── (f) statusline: pool occupied -> indicator present; empty -> absent ──
+    stlHeldDir = mkTmp('stl-held-dir');
+    stlPoolHeldRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke111-stl-pool-held-'));
+    let acquireSlots = null;
+    try { ({ acquireSlots } = require(path.join(SCRIPTS, 'forge-resource-pool.js'))); } catch { /* asserted below */ }
+    const granted = acquireSlots ? acquireSlots(1, { poolDir: stlPoolHeldRoot, ncpu: 4, commandTimeoutMs: 120000, ownerToken: 'smoke111' }) : null;
+    assert(!!granted && granted.ok, '(f) setup: real pool grant succeeds via forge-resource-pool.js (never a hand-authored lease file)', JSON.stringify(granted));
+    const resF1 = runStatusline(stlHeldDir, stlPoolHeldRoot);
+    assert(resF1.status === 0, '(f) statusline exits 0 with a held slot', JSON.stringify({ status: resF1.status, stderr: resF1.stderr }));
+    assert((resF1.stdout || '').includes('\u{1F9EE}'), '(f) clamp indicator glyph is PRESENT when the pool holds a slot, by real spawn with JSON on stdin', resF1.stdout);
+
+    stlEmptyDir = mkTmp('stl-empty-dir');
+    stlPoolEmptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke111-stl-pool-empty-'));
+    const resF2 = runStatusline(stlEmptyDir, stlPoolEmptyRoot);
+    assert(resF2.status === 0, '(f) statusline exits 0 with an empty pool', JSON.stringify({ status: resF2.status, stderr: resF2.stderr }));
+    assert(!(resF2.stdout || '').includes('\u{1F9EE}'), '(f) clamp indicator glyph is ABSENT when the pool is free and no degradation event exists — bite reverses on the SAME code path', resF2.stdout);
+
+    // ── (g) negative-direction bite: neuter the anti-silence floor in a COPY,
+    // never in the real checkout (precedent: S04/T04 R10 — copy to tmp, mutate
+    // the copy, never rename/edit the tracked tree). Confirm the mutated copy
+    // FAILS to read inconclusive on a zero-events fixture, proving assertion
+    // (b) above actually bites; the real checkout is never touched, so no
+    // restore step is needed — the copy is simply discarded.
+    const mutCopyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke111-mutcopy-'));
+    const mutScriptsDir = path.join(mutCopyRoot, 'scripts');
+    // R7 fix: hoisted to the outer scope (was declared inside the inner try,
+    // whose `finally` removed only `mutCopyRoot`) — every smoke run leaked a
+    // `smoke111-mut-fixture-*` tmpdir. Cleaned up in this block's own
+    // `finally` below, alongside `mutCopyRoot`.
+    let mutRoot = null;
+    try {
+      fs.cpSync(SCRIPTS, mutScriptsDir, { recursive: true });
+      const censusPath = path.join(mutScriptsDir, 'forge-resources-census.js');
+      const originalSrc = fs.readFileSync(censusPath, 'utf8');
+      const originalOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-census.js'), 'utf8');
+      // Both halves of the floor are neutered (buildCensus's own header names
+      // both as "proven to BITE" — neutering only the first would still catch
+      // a truly-empty fixture on the second `resource_events === 0` branch and
+      // produce a false-negative bite that looks like a real one).
+      assert(/if \(events_scanned === 0\) \{/.test(originalSrc) && /else if \(resource_events === 0\) \{/.test(originalSrc),
+        '(g) precondition: BOTH halves of the anti-silence floor exist verbatim in the copy before mutation', 'floor lines not found');
+      const neuteredSrc = originalSrc
+        .replace('if (events_scanned === 0) {', 'if (false) {')
+        .replace('else if (resource_events === 0) {', 'else if (false) {');
+      assert(neuteredSrc !== originalSrc, '(g) the floor-neutering replacement actually changed the source (not a no-op substitution)', 'replace() produced no change');
+      fs.writeFileSync(censusPath, neuteredSrc, 'utf8');
+      const mutDoctorCli = path.join(mutScriptsDir, 'forge-doctor.js');
+      mutRoot = mkTmp('mut-fixture');
+      const resG = spawnSync(NODE, [mutDoctorCli, '--check', 'resources', '--cwd', mutRoot, '--pool-dir', doctorPoolDir], { encoding: 'utf8' });
+      assert(resG.status === 0, '(g) mutated-copy CLI still exits 0 (advisory posture survives the mutation)', String(resG.status) + resG.stderr);
+      assert(!/inconclusive/.test(resG.stdout),
+        '(g) MORDIDA NEGATIVA: with the anti-silence floor neutered, a zero-events fixture NO LONGER reads inconclusive — the assertion in (b) would FAIL against this build, proving the floor is what makes (b) pass, not coincidence',
+        resG.stdout);
+      // Real checkout on disk is provably untouched by this mutation (we only
+      // ever wrote to mutScriptsDir, a tmp copy) — restore is implicit.
+      const stillOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-census.js'), 'utf8');
+      assert(stillOnDisk === originalOnDisk, '(g) the REAL checkout file is byte-identical before/after this mutation exercise — only the tmp copy was ever written', 'checkout file drifted');
+    } finally {
+      try { fs.rmSync(mutCopyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      if (mutRoot) { try { fs.rmSync(mutRoot, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    }
+
+    // ── (h) registration: the section verifies it is wired into main() ─────
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeResourcesObservabilityCensus\(\); \}/.test(mainBody),
+      '(h) Section 111 is registered in main() by closure — an unregistered section vanishes silently');
+  } finally {
+    for (const d of [degradedRoot, cleanRoot, dualFieldRoot, platformRoot, pollutionRoot, stlHeldDir, stlEmptyDir, stlPoolHeldRoot, stlPoolEmptyRoot, doctorPoolDir]) {
+      if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    }
+  }
+
+  // ── (i) real pool root and real .gsd/ never touched by any fixture above ─
+  // R6 fix: the doctor-CLI fixtures (a)-(e)/(g) now also pass `--pool-dir`
+  // pointed at `doctorPoolDir` — this label previously overclaimed
+  // ("every fixture above used ...") while those spawns actually read the
+  // real machine-wide pool root via `poolStatus`'s default resolution.
+  const realPoolExistedAfter = fs.existsSync(realPoolRoot);
+  const realPoolListingAfter = realPoolExistedAfter ? fs.readdirSync(realPoolRoot).sort() : null;
+  assert(realPoolExistedBefore === realPoolExistedAfter && JSON.stringify(realPoolListingBefore) === JSON.stringify(realPoolListingAfter),
+    '(i) the real machine pool root (~/.claude/forge/resource-pool) is untouched — every statusline fixture used FORGE_RESOURCE_POOL_DIR and every doctor-CLI fixture used --pool-dir, all pointed at a tmpdir',
+    JSON.stringify({ before: realPoolListingBefore, after: realPoolListingAfter }));
+
+  pass('Section 111: forge-doctor --check resources and the statusline clamp indicator proven exit-0-always by real spawn, '
+    + 'dual event-field-name census bite proven positive, anti-silence floor bite proven negative via copy-mutation, '
+    + 'zero pollution of events.jsonl, and the real machine pool root never touched');
+}
+
+// ── Section 112: S06/T01-T04 guard — signal-not-clock SIGINT, enforcement:off ─
+// bypass contrast, bench JSONL+prefs-restore, and anti-silence floor bite on
+// the bench harness — number MEASURED at execution time (max observed was
+// 109; 110 is the first free slot), never assumed (MEM013). Every claim is
+// proven by spawning the REAL `forge-status.js` and `forge-resources-bench.js`
+// CLIs (and `forge-verify.js`'s CLI entrypoint for the enforcement contrast)
+// as child processes — never by requiring the modules under test in-process.
+function smokeResourcesFlakeAndBenchGuard() {
+  process.stdout.write('\n▸ Section 112: T01 signal-not-clock SIGINT, T03 enforcement:off contrast, T04 bench JSONL+restore, T04 anti-silence bite\n');
+  const NODE = process.execPath;
+  const STATUS_CLI = path.join(SCRIPTS, 'forge-status.js');
+  const VERIFY_CLI = path.join(SCRIPTS, 'forge-verify.js');
+  const BENCH_CLI = path.join(SCRIPTS, 'forge-resources-bench.js');
+
+  // ── shared fixture helpers ────────────────────────────────────────────────
+  const ROADMAP_TEXT = [
+    '# M-20260101120000-alpha: Alpha Milestone — Roadmap',
+    '',
+    '- [x] **S01: Done one** `risk:low`',
+    '- [ ] **S02: Active one** `risk:high`',
+    '',
+  ].join('\n');
+  const PLAN_TEXT = [
+    '# S02 Plan',
+    '',
+    '- [x] T01: plain done',
+    '- [ ] T02: plain active',
+    '',
+  ].join('\n');
+  function stateText(milestoneId) {
+    const nowIso = new Date().toISOString();
+    return [
+      '---',
+      `milestone: ${milestoneId}`,
+      'kind: milestone',
+      `created: ${nowIso}`,
+      `last_updated: ${nowIso}`,
+      'isolation_mode: shared',
+      '---',
+      '',
+      `# ${milestoneId} State`,
+      '',
+      '**Active Slice:** S02',
+      '**Active Task:** T02',
+      '**Phase:** execute-task',
+      '**Auto-mode:** on',
+      '**Next Action:** Continue T02',
+      '',
+    ].join('\n');
+  }
+  function makeStatusFixture() {
+    const milestoneId = 'M-20260101120000-alpha';
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke112-status-'));
+    const mDir = path.join(dir, '.gsd', 'milestones', milestoneId);
+    fs.mkdirSync(path.join(mDir, 'slices', 'S02'), { recursive: true });
+    fs.writeFileSync(path.join(mDir, `${milestoneId}-ROADMAP.md`), ROADMAP_TEXT, 'utf8');
+    fs.writeFileSync(path.join(mDir, `${milestoneId}-STATE.md`), stateText(milestoneId), 'utf8');
+    fs.writeFileSync(path.join(mDir, 'slices', 'S02', 'S02-PLAN.md'), PLAN_TEXT, 'utf8');
+    return dir;
+  }
+
+  const isPosix = process.platform !== 'win32';
+  const dirsToClean = [];
+
+  try {
+    // ── (a) T01: flaky-by-order fixed — wait for an OBSERVABLE readiness ────
+    // signal (the child's own "refresh #1" output), never a fixed-duration
+    // sleep. Named-reason ceiling (READY_TIMEOUT) replaces the sleep-0.2
+    // gamble the original R2 test used — same mechanism forge-status.test.js
+    // R2 introduced, read from there, not re-invented here.
+    if (!isPosix) {
+      skip('Section 112(a): forge-status --watch SIGINT-after-readiness-signal', 'posix-only /bin/sh + kill fixture (mirrors forge-status.test.js R2)');
+    } else {
+      const statusDir = makeStatusFixture();
+      dirsToClean.push(statusDir);
+      const outFile = path.join(statusDir, '.watch-out.txt');
+      const script = `"${NODE}" "${STATUS_CLI}" --watch=0.5 --cwd "${statusDir}" >"${outFile}" 2>&1 & pid=$!; i=0; while ! grep -q "refresh #1" "${outFile}" 2>/dev/null; do i=$((i+1)); if [ "$i" -ge 150 ]; then echo READY_TIMEOUT; kill -INT "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; exit 0; fi; sleep 0.02; done; kill -INT "$pid"; wait "$pid"; echo "EXIT:$?"`;
+      const resA = spawnSync('/bin/sh', ['-c', script], { encoding: 'utf8', timeout: 8000 });
+      assert(!/READY_TIMEOUT/.test(resA.stdout || ''),
+        '(a) child signaled readiness ("refresh #1" observed) within the named ceiling — never a fixed-duration sleep',
+        `stdout=${resA.stdout} stderr=${resA.stderr}`);
+      const m = (resA.stdout || '').match(/EXIT:(\d+)/);
+      assert(m, '(a) EXIT:<code> marker present in stdout', String(resA.stdout));
+      assert(!!m && m[1] === '0', '(a) real spawn: --watch child exits 0 on SIGINT sent right after the readiness signal, by a REAL spawned CLI (D5: only a process this block itself created)', String(resA.stdout));
+    }
+
+    // ── (b) T03: resources.enforcement:off bypass — CONTRAST with `clamp` on ─
+    // the exact same entry (positive control). Only the `off` cell would pass
+    // green under a bypass that is always-on; only `clamp` would pass green
+    // under a bypass that is inert — asserting both is what proves the toggle
+    // actually gates the rewrite (S06-PLAN.md A1).
+    if (!isPosix) {
+      skip('Section 112(b): forge-verify.js CLI enforcement:off/clamp contrast', 'posix-only shebang fixture (mirrors forge-resources-enforcement.test.js)');
+    } else {
+      function runVerifyCell(enforcement) {
+        const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `smoke112-enf-${enforcement}-`));
+        dirsToClean.push(cwd);
+        fs.mkdirSync(path.join(cwd, '.gsd', 'forge'), { recursive: true });
+        fs.writeFileSync(path.join(cwd, '.gsd', 'forge-prefs.jsonc'), JSON.stringify({ resources: { enforcement } }, null, 2) + '\n', 'utf8');
+        const binDir = path.join(cwd, 'bin');
+        fs.mkdirSync(binDir, { recursive: true });
+        const dumpFile = path.join(cwd, 'dump.json');
+        fs.writeFileSync(path.join(binDir, 'vitest'),
+          `#!/usr/bin/env node\nconst fs = require('fs');\nfs.writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({ env: process.env, argv: process.argv }));\nprocess.exit(0);\n`,
+          { mode: 0o755 });
+        const poolDir = fs.mkdtempSync(path.join(os.tmpdir(), `smoke112-enf-pool-${enforcement}-`));
+        dirsToClean.push(poolDir);
+        const env = Object.assign({}, process.env, {
+          PATH: binDir + path.delimiter + process.env.PATH,
+          FORGE_RESOURCE_POOL_DIR: poolDir,
+          FORGE_RESOURCES_PRESSURE: '1',
+          NODE_OPTIONS: '',
+        });
+        const res = spawnSync(NODE, [VERIFY_CLI, '--cwd', cwd, '--unit', 'smoke112', '--gsd-dir', path.join(cwd, '.gsd'), '--preference', 'vitest'], { encoding: 'utf8', env });
+        assert(res.status === 0, `(b) forge-verify.js CLI exits 0 under enforcement:${enforcement}`, `status=${res.status} stderr=${res.stderr}`);
+        assert(fs.existsSync(dumpFile), `(b) fixture never ran under enforcement:${enforcement} — real spawn produced no child-observed dump`, res.stdout + res.stderr);
+        return JSON.parse(fs.readFileSync(dumpFile, 'utf8'));
+      }
+      const dumpOff = runVerifyCell('off');
+      const dumpClamp = runVerifyCell('clamp');
+      assert(dumpOff.env.VITEST_MAX_FORKS === undefined, '(b) enforcement:off — the verification command reaches the child argv/env byte-identical (no VITEST_MAX_FORKS injected)', String(dumpOff.env.VITEST_MAX_FORKS));
+      assert(dumpOff.env.NODE_OPTIONS === undefined || dumpOff.env.NODE_OPTIONS === '', '(b) enforcement:off — no heap NODE_OPTIONS injected', String(dumpOff.env.NODE_OPTIONS));
+      assert(typeof dumpClamp.env.VITEST_MAX_FORKS === 'string' && dumpClamp.env.VITEST_MAX_FORKS.length > 0,
+        '(b) POSITIVE CONTROL: the SAME entry under enforcement:clamp IS rewritten (VITEST_MAX_FORKS present) — proves the off-cell above passed because of the toggle, not because the rewrite is dead',
+        JSON.stringify(dumpClamp.env.VITEST_MAX_FORKS));
+      assert(typeof dumpClamp.env.NODE_OPTIONS === 'string' && /--max-old-space-size=\d+/.test(dumpClamp.env.NODE_OPTIONS),
+        '(b) clamp cell also carries the heap NODE_OPTIONS overlay', String(dumpClamp.env.NODE_OPTIONS));
+    }
+
+    // ── (c) T04: bench harness — real CLI spawn, incremental JSONL, prefs restored ──
+    const benchCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke112-bench-cwd-'));
+    dirsToClean.push(benchCwd);
+    fs.mkdirSync(path.join(benchCwd, '.gsd', 'forge'), { recursive: true });
+    const prefsPath = path.join(benchCwd, '.gsd', 'forge-prefs.jsonc');
+    const originalPrefs = JSON.stringify({ marker: 'smoke112-untouched', other: 42 }, null, 2) + '\n';
+    fs.writeFileSync(prefsPath, originalPrefs, 'utf8');
+    const outFile = path.join(benchCwd, 'bench-out.jsonl');
+    const shortCmd = JSON.stringify([NODE, '-e', 'process.exit(0)']);
+    const resC = spawnSync(NODE, [
+      BENCH_CLI, '--cwd', benchCwd, '--cells', 'solo/off', '--reps', '3',
+      '--out', outFile, '--command', shortCmd, '--timeout-ms', '10000',
+    ], { encoding: 'utf8' });
+    assert(resC.status === 0, '(c) forge-resources-bench.js CLI real spawn exits 0 with an injected instant command', `status=${resC.status} stdout=${resC.stdout} stderr=${resC.stderr}`);
+    const lines = fs.readFileSync(outFile, 'utf8').split('\n').filter(Boolean);
+    assert(lines.length === 3, '(c) JSONL has exactly one valid line per corrida — written incrementally (survives interruption by A4 design), never batched at the end', String(lines.length));
+    for (const line of lines) {
+      const rec = JSON.parse(line);
+      assert(rec.cell === 'solo/off', '(c) each JSONL record names its cell', line);
+      assert(rec.status === 'ok', '(c) each corrida of the injected instant command completed ok', line);
+    }
+    const restoredPrefs = fs.readFileSync(prefsPath, 'utf8');
+    assert(restoredPrefs === originalPrefs, '(c) the project-local prefs file is byte-identical to its original content after the bench run — every corrida\'s enforcement write is restored on exit, never left mutated', restoredPrefs);
+
+    // ── (d) T04: anti-silence floor bite — neutered in a COPY only ──────────
+    // (precedent: S04/T04, S05/T04) — copy scripts/ to a tmpdir, mutate ONLY
+    // the copy, spawn the mutated copy's CLI, and prove the floor's absence
+    // produces a false "measured" verdict where the REAL script correctly
+    // reports "inconclusive". The checkout is never edited in place; the
+    // mutation-copy tmpdir is removed in this block's own cleanup (R7 of S05
+    // — the mutation-fixture leak precedent — never repeated).
+    const mutCopyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke112-mutcopy-'));
+    let mutFixtureRoot = null;
+    try {
+      const mutScriptsDir = path.join(mutCopyRoot, 'scripts');
+      fs.cpSync(SCRIPTS, mutScriptsDir, { recursive: true });
+      const benchPath = path.join(mutScriptsDir, 'forge-resources-bench.js');
+      const originalSrc = fs.readFileSync(benchPath, 'utf8');
+      const originalOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-bench.js'), 'utf8');
+      const target = "if (ok.length === 0) {";
+      assert(originalSrc.includes(target), '(d) precondition: the anti-silence-floor guard line exists verbatim in the copy before mutation', 'guard line not found');
+      const neuteredSrc = originalSrc.replace(target, 'if (false) {');
+      assert(neuteredSrc !== originalSrc, '(d) the floor-neutering replacement actually changed the source (not a no-op substitution)', 'replace() produced no change');
+      fs.writeFileSync(benchPath, neuteredSrc, 'utf8');
+
+      mutFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke112-mut-fixture-'));
+      const mutOutFile = path.join(mutFixtureRoot, 'bench-out.jsonl');
+      // Zero-ok fixture: the injected command always FAILS, so there are zero
+      // `ok` corridas — exactly the case the anti-silence floor exists to
+      // catch and report as `inconclusive`.
+      const failCmd = JSON.stringify([NODE, '-e', 'process.exit(1)']);
+      const resD = spawnSync(NODE, [
+        path.join(mutScriptsDir, 'forge-resources-bench.js'),
+        '--cwd', mutFixtureRoot, '--cells', 'solo/off', '--reps', '3',
+        '--out', mutOutFile, '--command', failCmd, '--timeout-ms', '10000',
+      ], { encoding: 'utf8' });
+      assert(resD.status === 0, '(d) mutated-copy CLI still exits 0 (the harness never fails hard on a zero-ok cell)', `status=${resD.status} stderr=${resD.stderr}`);
+      assert(!/inconclusive/.test(resD.stdout),
+        '(d) MORDIDA NEGATIVA: with the anti-silence floor neutered, a zero-ok cell no longer reads inconclusive — this is the exact assertion the REAL script satisfies below, proving the floor (not coincidence) is what makes it pass',
+        resD.stdout);
+
+      const stillOnDisk = fs.readFileSync(path.join(SCRIPTS, 'forge-resources-bench.js'), 'utf8');
+      assert(stillOnDisk === originalOnDisk, '(d) the REAL checkout file is byte-identical before/after this mutation exercise — only the tmp copy was ever written', 'checkout file drifted');
+
+      // Contrast: the REAL (unmutated) script, same zero-ok fixture, DOES read inconclusive.
+      const realFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke112-real-fixture-'));
+      dirsToClean.push(realFixtureRoot);
+      const realOutFile = path.join(realFixtureRoot, 'bench-out.jsonl');
+      const resReal = spawnSync(NODE, [
+        BENCH_CLI, '--cwd', realFixtureRoot, '--cells', 'solo/off', '--reps', '3',
+        '--out', realOutFile, '--command', failCmd, '--timeout-ms', '10000',
+      ], { encoding: 'utf8' });
+      assert(resReal.status === 0, '(d) real script also exits 0 on the same zero-ok fixture', `status=${resReal.status} stderr=${resReal.stderr}`);
+      assert(/inconclusive/.test(resReal.stdout), '(d) the REAL (unmutated) script correctly reads inconclusive on the same zero-ok fixture — the positive half of the bidirectional bite', resReal.stdout);
+    } finally {
+      try { fs.rmSync(mutCopyRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      if (mutFixtureRoot) { try { fs.rmSync(mutFixtureRoot, { recursive: true, force: true }); } catch { /* best-effort */ } }
+    }
+
+    // ── (e) registration: the section verifies it is wired into main() ──────
+    const source = fs.readFileSync(__filename, 'utf8');
+    const mainBody = source.slice(source.lastIndexOf('async function main()'));
+    assert(/\(\) => \{ smokeResourcesFlakeAndBenchGuard\(\); \}/.test(mainBody),
+      '(e) Section 112 is registered in main() by closure — an unregistered section vanishes silently');
+  } finally {
+    for (const d of dirsToClean) {
+      try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
+
+  pass('Section 112: forge-status --watch SIGINT-after-signal proven by real spawn (T01), forge-verify.js enforcement:off/clamp '
+    + 'contrast proven child-side on the same entry (T03), forge-resources-bench.js CLI proven to write per-corrida JSONL and '
+    + 'restore prefs byte-identical (T04), and the bench anti-silence floor proven to bite bidirectionally via copy-mutation (T04)');
+}
+
 async function main() {
   process.stdout.write('forge-smoke — M004+ multi-run primitives\n');
   process.stdout.write('─'.repeat(50) + '\n');
@@ -15558,6 +17209,17 @@ async function main() {
       () => { smokeInertRoutes(); },
       () => { smokeTransportField(); },
       () => { smokeRoutingDomainsRendered(); },
+      () => { smokeLedgerSnapshotRendered(); },
+      () => { smokeMemoryIndexCommandRendered(); },
+      () => { smokeScriptsCallSitesCanonical(); },
+      () => { smokeContractMissBranch(); },
+      () => { smokeHookPathManaged(); },
+      () => { smokeResourcesFoundation(); },
+      async () => { await smokeResourcePool(); },
+      () => { smokeRewriteCeilingAndE2E(); },
+      () => { smokeVerifyReverifyChildSideE2E(); },
+      () => { smokeResourcesObservabilityCensus(); },
+      () => { smokeResourcesFlakeAndBenchGuard(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {

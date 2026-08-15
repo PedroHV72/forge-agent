@@ -291,7 +291,10 @@ function commentedRootKeys(text) {
   let offset = 0;
   let sectionKey = null;
   let sectionStart = 0;
-  for (const line of text.split(/(?<=\n)/)) {
+  // Tolerant segmentation: the boundaries computed here drive the range splice in
+  // rescaffoldCatalog over the operator's own catalogue bytes. Splitting on LF only
+  // would fuse every line of a CR-terminated source into one segment.
+  for (const line of text.split(/(?<=\r\n|\n|\r)/)) {
     const trimmed = line.trimStart();
     // Section banners are presentation, not JSON.  Read them character by
     // character and use the following OFF_MARKER line to confirm the key.
@@ -375,8 +378,11 @@ function catalogDiff(text, schema) {
   return { missingSections: Object.keys(schema.properties).filter((key) => key !== '$schema' && !present.has(key)) };
 }
 
-function generatedSection(key, node, isLast) {
-  return renderSection(key, node, isLast).map((line) => `  ${line}`).join('\n') + '\n';
+// Form B: `eol` is the line ending of the catalogue this section is spliced into.
+// Defaults to LF for a catalogue being generated from nothing.
+function generatedSection(key, node, isLast, eol) {
+  const nl = eol || '\n';
+  return renderSection(key, node, isLast).map((line) => `  ${line}`).join(nl) + nl;
 }
 
 /**
@@ -421,14 +427,18 @@ function rescaffoldCatalog(existingText, schema, opts = {}) {
   // no trailing newline (e.g. a single-line `{"$schema":"..."}` catalogue, or
   // a root close with no preceding newline) would fuse the banner onto the
   // previous line as a trailing comment — silently invisible to the parser.
-  const withNewline = (text) => (text === '' || text.endsWith('\n') ? text : `${text}\n`);
+  // Form B: every user-owned slice is copied verbatim, so the newly rendered
+  // sections must carry the EOL the operator's catalogue already uses. Captured
+  // from the source itself; LF only when the source has no line ending at all.
+  const eol = (String(existingText).match(/\r\n|\n|\r/) || ['\n'])[0];
+  const withNewline = (text) => (text === '' || /(?:\r\n|\n|\r)$/.test(text) ? text : `${text}${eol}`);
   let output = '';
   const hasSchema = segments.some((segment) => segment.key === '$schema');
   for (let index = 0; index < segments.length; index++) {
     output += segments[index].raw;
     const keys = additions.get(index) || [];
     if (keys.length) output = withNewline(output);
-    for (const key of keys) output += generatedSection(key, schema.properties[key], false);
+    for (const key of keys) output += generatedSection(key, schema.properties[key], false, eol);
   }
   if (additions.has(-1)) {
     // No keyed segment exists anywhere in the catalogue (zero-anchor case: an
@@ -436,20 +446,20 @@ function rescaffoldCatalog(existingText, schema, opts = {}) {
     // after the full per-segment loop would land the generated sections AFTER
     // the root's own closing `}`, producing knobs that live outside the JSON
     // object entirely. Splice them in front of the root close instead.
-    const generated = additions.get(-1).map((key) => generatedSection(key, schema.properties[key], false)).join('');
+    const generated = additions.get(-1).map((key) => generatedSection(key, schema.properties[key], false, eol)).join('');
     const closeIndex = rootClose(stripJsonc(output));
     if (closeIndex >= 0 && closeIndex < output.length) {
       output = `${withNewline(output.slice(0, closeIndex))}${generated}${output.slice(closeIndex)}`;
     } else {
       // No root close found at all (malformed/empty input) — fall back to a
       // synthesized root object so the output is still valid JSONC.
-      output = `{\n${generated}}\n`;
+      output = `{${eol}${generated}}${eol}`;
     }
   }
   if (!hasSchema) {
     const ref = opts.schemaRef || 'forge-prefs.schema.json';
     const open = output.indexOf('{');
-    if (open !== -1) output = `${output.slice(0, open + 1)}\n  "$schema": ${JSON.stringify(ref)},\n${output.slice(open + 1)}`;
+    if (open !== -1) output = `${output.slice(0, open + 1)}${eol}  "$schema": ${JSON.stringify(ref)},${eol}${output.slice(open + 1)}`;
   }
   const parsed = parseJsonc(output);
   if (!parsed.ok) throw new Error(`rescaffold produced invalid JSONC: ${parsed.error.message}`);
