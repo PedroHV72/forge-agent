@@ -306,6 +306,42 @@ test('mordida: withAddressDefaults default removed -> legacy read no longer null
   try { fs.unlinkSync(baitPath); } catch { /* best effort */ }
 });
 
+// ── R8 (review R3): code_dir validado na ESCRITA ───────────────────────────
+//
+// `code_dir` é fato DADO — o que não significa "qualquer coisa". Um valor
+// não-string era persistido verbatim (só `source` era checado) e, na leitura,
+// `path.isAbsolute` lançava dentro do comparador, cujo catch global devolvia
+// exit 0 SEM veredicto e SEM censo: um registro ruim calava a comparação de
+// todas as runs. Recusado aqui, no único ponto que escreve.
+test('R8a: normalizeClaim recusa code_dir não-string, nomeando valor e tipo', () => {
+  for (const bad of [42, true, {}, ['/x'], 0]) {
+    let threw = null;
+    try {
+      normalizeClaim({ source: 'manual', code_dir: bad });
+    } catch (e) { threw = e; }
+    assert(threw !== null, `code_dir ${JSON.stringify(bad)} (${typeof bad}) deveria ter sido recusado`);
+    assert(/code_dir/.test(threw.message), `a mensagem deve nomear o campo, veio: ${threw.message}`);
+  }
+});
+
+test('R8b: os valores legítimos continuam passando (a recusa não é larga demais)', () => {
+  assertEqual(normalizeClaim({ source: 'manual', code_dir: '/code/dir' }).code_dir, '/code/dir');
+  assertEqual(normalizeClaim({ source: 'manual' }).code_dir, null, 'ausente -> null, nunca derivado');
+  assertEqual(normalizeClaim({ source: 'manual', code_dir: null }).code_dir, null);
+  assertEqual(normalizeClaim({ source: 'manual', code_dir: '' }).code_dir, null);
+});
+
+test('R8c: nada é gravado quando o code_dir é recusado', () => {
+  const { wsDir, runFile } = makeFixture('M-20260813-badcodedir');
+  const before = sha256(runFile);
+  let threw = false;
+  try {
+    recordClaim(wsDir, 'M-20260813-badcodedir', { source: 'manual', code_dir: 42, paths: ['a.js'] });
+  } catch (_) { threw = true; }
+  assert(threw, 'recordClaim deveria propagar a recusa');
+  assertEqual(sha256(runFile), before, 'um claim recusado NÃO pode ter tocado o registro');
+});
+
 // ── Suite close ──────────────────────────────────────────────────────────
 cleanup();
 

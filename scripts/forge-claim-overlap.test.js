@@ -40,7 +40,7 @@ const MODULE = path.join(__dirname, 'forge-claim-overlap.js');
 const mod = require('./forge-claim-overlap.js');
 const {
   collectRunClaims, claimsConflict, compareClaims, formatClaimOverlap,
-  sameCodeDir, VERDICTS, CONFLICT_CAUSES, CLAIM_SKIP_REASONS, CLAIM_NOTE_REASONS,
+  sameCodeDir, codeDirScope, VERDICTS, CONFLICT_CAUSES, CLAIM_SKIP_REASONS, CLAIM_NOTE_REASONS,
 } = mod;
 
 // ── Runner ──────────────────────────────────────────────────────────────────
@@ -251,6 +251,125 @@ test('R4: code_dir desconhecido -> par COMPARADO, incerteza em notes[]', () => {
   assert(r.notes.some((n) => n.reason === 'code-dir-unknown'), 'a incerteza deve ir para notes[] com razão nomeada');
   assertEqual(r.verdict, 'conflict');
   assertEqual(r.conflicts[0].cause, 'overlap');
+});
+
+// ── R11 (review R1): a NON-ABSOLUTE code_dir was never measured ─────────────
+//
+// Both halves of the same defect, asserted separately — never one assert
+// assuming the other follows:
+//   (a) two EQUAL relative strings used to answer `same`: an identity nobody
+//       measured, since the base each one hangs off was never recorded;
+//   (b) relative-vs-absolute naming ONE directory used to answer `different`,
+//       which skips the pair (D2) and SUPPRESSES a real collision — the exact
+//       polarity D1 forbids.
+test('R11a: dois code_dir relativos IGUAIS -> unknown, nunca same', () => {
+  assertEqual(sameCodeDir(claim(['a'], 'code/dir'), claim(['a'], 'code/dir')), 'unknown',
+    'igualdade de string relativa não é identidade de diretório — ninguém mediu a base');
+  assertEqual(codeDirScope(claim(['a'], 'code/dir'), claim(['a'], 'code/dir')).note,
+    'code-dir-relative', 'a incerteza tem de sair nomeada');
+});
+
+test('R11b: relativo × absoluto -> unknown, nunca different (colisão não pode ser suprimida)', () => {
+  assertEqual(sameCodeDir(claim(['a'], 'code/dir'), claim(['a'], '/code/dir')), 'unknown');
+  assertEqual(sameCodeDir(claim(['a'], '/code/dir'), claim(['a'], 'code/dir')), 'unknown');
+});
+
+test('R11c: par com code_dir relativo é COMPARADO e a colisão aparece (D-c preservada)', () => {
+  const r = record(compareClaims(collected([
+    { id: 'M-rel', claim: claim(['src/a.ts'], 'code/dir') },
+    { id: 'M-abs', claim: claim(['src/a.ts'], '/code/dir') },
+  ])));
+  assertEqual(r.pairs_compared, 1, 'unknown nunca exclui o par');
+  assertEqual(r.verdict, 'conflict');
+  assertEqual(r.conflicts[0].cause, 'overlap');
+  assert(r.notes.some((n) => n.reason === 'code-dir-relative'),
+    'a razão da incerteza tem de ser nomeada em notes[]');
+  assert(!r.skipped.some((s) => s.reason === 'different-code-dir'),
+    'relativo NUNCA pode virar different-code-dir — seria a colisão suprimida');
+});
+
+// ── R12 (review R2): identidade de diretório é REAL, não léxica ─────────────
+test('R12a: symlink/junction para o MESMO diretório -> same (identidade real, não léxica)', () => {
+  const tmp = mktmp();
+  const real = path.join(tmp, 'real');
+  const link = path.join(tmp, 'link');
+  fs.mkdirSync(real, { recursive: true });
+  let linked = true;
+  try {
+    fs.symlinkSync(real, link, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (_) {
+    linked = false; // sem privilégio de symlink — o caso é reportado, nunca fingido
+  }
+  assert(linked, 'não foi possível criar o link — este assert NÃO pode passar em silêncio');
+
+  // Controle: as duas strings SÃO lexicamente diferentes; sem realpath o
+  // comparador responderia `different` e pularia o par.
+  assert(path.resolve(real) !== path.resolve(link), 'controle: os caminhos são léxicamente distintos');
+
+  assertEqual(sameCodeDir(claim(['a'], real), claim(['a'], link)), 'same',
+    'dois nomes do MESMO diretório têm de ser `same` — léxico aqui suprimiria a colisão');
+
+  const r = record(compareClaims(collected([
+    { id: 'M-real', claim: claim(['src/a.ts'], real) },
+    { id: 'M-link', claim: claim(['src/a.ts'], link) },
+  ])));
+  assertEqual(r.pairs_compared, 1, 'o par tem de ser confrontado');
+  assertEqual(r.verdict, 'conflict', 'a colisão real não pode ser suprimida por um skip léxico');
+});
+
+test('R12b: caminho absoluto irresolvível -> cai para léxico COM a degradação nomeada', () => {
+  const gone = path.resolve(path.join(mktmp(), 'worktree-que-nao-existe'));
+  const scope = codeDirScope(claim(['a'], gone), claim(['a'], gone));
+  assertEqual(scope.scope, 'same', 'léxico ainda decide — mas não em silêncio');
+  assertEqual(scope.note, 'code-dir-unresolved', 'a degradação tem de ser nomeada, nunca silenciosa');
+
+  const r = record(compareClaims(collected([
+    { id: 'M-a', claim: claim(['src/a.ts'], gone) },
+    { id: 'M-b', claim: claim(['src/a.ts'], gone) },
+  ])));
+  assert(r.notes.some((n) => n.reason === 'code-dir-unresolved'),
+    'a nota de degradação tem de chegar ao censo');
+  assertEqual(r.verdict, 'conflict');
+});
+
+test('R12c: diretórios REAIS e distintos continuam different (D2 intacta)', () => {
+  const tmp = mktmp();
+  const one = path.join(tmp, 'one');
+  const two = path.join(tmp, 'two');
+  fs.mkdirSync(one); fs.mkdirSync(two);
+  assertEqual(sameCodeDir(claim(['a'], one), claim(['a'], two)), 'different');
+});
+
+// ── R13 (review R3): registro malformado nunca cala o censo ─────────────────
+test('R13a: code_dir não-string persistido -> unknown com nota nomeada, sem throw', () => {
+  const scope = codeDirScope(claim(['a'], 42), claim(['a'], '/code/dir'));
+  assertEqual(scope.scope, 'unknown');
+  assertEqual(scope.note, 'code-dir-invalid');
+});
+
+test('R13b: registro malformado -> o censo AINDA emite veredicto (não fica mudo)', () => {
+  const r = record(compareClaims(collected([
+    { id: 'M-bad', claim: claim(['src/a.ts'], 42) },
+    { id: 'M-good', claim: claim(['src/a.ts'], '/code/dir') },
+  ])));
+  assertEqual(r.pairs_compared, 1, 'um registro ruim não pode tirar o par da comparação');
+  assertEqual(r.verdict, 'conflict', 'o veredicto tem de existir apesar do registro ruim');
+  assert(r.notes.some((n) => n.reason === 'code-dir-invalid'), 'a razão tem de ser nomeada');
+});
+
+test('R13c: CLI com registro malformado em disco -> exit 0 COM veredicto e censo', () => {
+  const { wsDir } = makeFixture([
+    { id: 'M-bad', write_claim: claim(['src/shared.ts'], 42) },
+    { id: 'M-good', write_claim: claim(['src/shared.ts'], '/code/dir') },
+  ]);
+  const res = runCli(['--check', '--json', '--cwd', wsDir]);
+  assertEqual(res.status, 0, `advisory: exit 0 sempre, stderr=${res.stderr}`);
+  assert(res.stdout.trim() !== '',
+    'o censo NÃO pode ficar mudo por causa de um registro ruim — era exatamente o defeito R3');
+  const parsed = JSON.parse(res.stdout);
+  assertEqual(parsed.verdict, 'conflict');
+  assertEqual(parsed.pairs_compared, 1);
+  assert(parsed.notes.some((n) => n.reason === 'code-dir-invalid'));
 });
 
 // ── R5: the floor, with an EXECUTED bite ────────────────────────────────────

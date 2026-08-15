@@ -72,6 +72,20 @@ function normalizeClaim(input) {
       `forge-write-claim: unknown source ${JSON.stringify(opts.source)} — ` +
       `must be one of ${JSON.stringify(CLAIM_SOURCES)}`);
   }
+  // `code_dir` is GIVEN, never derived — but "given" is not "anything". A
+  // non-string value used to be persisted verbatim (only `source` was
+  // checked), and downstream `path.isAbsolute` then threw
+  // ERR_INVALID_ARG_TYPE inside the comparator, where the CLI's global catch
+  // turned it into exit 0 with NO verdict and NO census: one malformed record
+  // silenced the comparison of every run. Validated here, at the only place
+  // that writes; the read side classifies a legacy malformed value as
+  // `code-dir-invalid` rather than trusting this gate retroactively.
+  if (!(opts.code_dir === undefined || opts.code_dir === null || opts.code_dir === ''
+        || typeof opts.code_dir === 'string')) {
+    throw new Error(
+      `forge-write-claim: invalid code_dir ${JSON.stringify(opts.code_dir)} ` +
+      `(${typeof opts.code_dir}) — must be a non-empty string or null`);
+  }
   const paths = Array.isArray(opts.paths)
     ? opts.paths.map(normalizePath).filter((p) => p !== '')
     : [];
@@ -80,7 +94,8 @@ function normalizeClaim(input) {
     unit: opts.unit || null,
     source: opts.source,
     // GIVEN, never derived. See module header.
-    code_dir: (opts.code_dir === undefined || opts.code_dir === '') ? null : opts.code_dir,
+    code_dir: (opts.code_dir === undefined || opts.code_dir === null || opts.code_dir === '')
+      ? null : opts.code_dir,
     paths,
   };
 }

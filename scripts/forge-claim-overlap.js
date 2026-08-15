@@ -57,6 +57,7 @@
 
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 
 const { readClaim } = require('./forge-write-claim.js');
@@ -104,8 +105,50 @@ const CLAIM_SKIP_REASONS = [
 const CLAIM_NOTE_REASONS = [
   'claim-absent',     // the run never recorded a claim. It STAYS comparable on purpose: D1 requires "did not declare" to be a VISIBLE conflict, not a run quietly dropped from the universe.
   'claim-empty',      // the run recorded a claim whose `paths` is empty — declared, and honestly empty. Still `undeclared-writes` cross-run (D1), and still distinct from `claim-absent` as a FACT about the record.
-  'code-dir-unknown', // one or both sides did not record a `code_dir`. The pair IS compared — excluding on unknown would be the exact polarity D1 forbids, one level up.
+  'code-dir-unknown',    // one or both sides did not record a `code_dir`. The pair IS compared — excluding on unknown would be the exact polarity D1 forbids, one level up.
+  'code-dir-relative',   // one or both sides recorded a NON-ABSOLUTE `code_dir`. A relative string names a directory only together with a base nobody recorded, so neither identity NOR difference was measured (R1). Treated as `unknown`: compared, never skipped, never called `same`.
+  'code-dir-invalid',    // one or both sides persisted a `code_dir` that is not a string at all (a malformed record predating the write-side validation). Same posture: `unknown`, compared, named (R3).
+  'code-dir-unresolved', // both sides are absolute but at least one could not be resolved to a real path (removed worktree, permissions). The comparison DEGRADED to lexical identity, and the degradation is named here rather than passing silently (R2).
 ];
+
+/**
+ * What kind of `code_dir` value is this? Closed set, because every kind below
+ * routes to a DIFFERENT named outcome and a silent boolean here is precisely
+ * how R1/R3 produced a fabricated `same` and a fabricated `different`.
+ *
+ *   'absent'   -> never recorded (`null`/`undefined`/`''`)
+ *   'invalid'  -> persisted, but not a string (malformed record)
+ *   'relative' -> a string, but not absolute: names a directory only relative
+ *                 to a base NOBODY recorded. Identity was not measured.
+ *   'absolute' -> the only kind from which identity or difference may be
+ *                 CONCLUDED.
+ */
+function classifyCodeDir(value) {
+  if (value === undefined || value === null || value === '') return { kind: 'absent' };
+  if (typeof value !== 'string') return { kind: 'invalid' };
+  if (!path.isAbsolute(value)) return { kind: 'relative' };
+  return { kind: 'absolute', value };
+}
+
+/**
+ * Resolve an absolute path to its REAL path. Symlinks, Windows junctions,
+ * `subst` drives and `/tmp` -> `/private/tmp` all make two lexically different
+ * strings name one and the same directory; a purely lexical comparison calls
+ * those `different`, skips the pair (D2) and SUPPRESSES a real collision —
+ * the polarity D1 forbids. Same precedent as M-20260803205433 PR1, which
+ * replaced a lexical comparison with real-vs-real for exactly this reason (and
+ * this code runs from a worktree, where the difference is not hypothetical).
+ *
+ * `{ ok: false }` when the directory cannot be resolved (removed worktree,
+ * permissions): the caller degrades to lexical and NAMES the degradation.
+ */
+function realPathOf(p) {
+  try {
+    return { ok: true, value: fs.realpathSync.native(p) };
+  } catch (_) {
+    return { ok: false, value: path.resolve(p) };
+  }
+}
 
 /** POSIX-normalise and strip a trailing separator, for path identity. */
 function posix(p) {
@@ -122,29 +165,55 @@ function posix(p) {
  *                  identical relative paths under different working trees
  *                  denote different files and flagging them would be a
  *                  fabricated collision;
- *   'unknown'   -> at least one side did not record a `code_dir`. The pair is
- *                  STILL COMPARED and the uncertainty is noted. Excluding on
- *                  unknown would be "absence of information = safe", which is
- *                  exactly the polarity D1 forbids one level down.
+ *   'unknown'   -> the identity of the two directories was NOT MEASURED: a side
+ *                  recorded nothing, recorded a non-string, or recorded a
+ *                  RELATIVE path (which names a directory only together with a
+ *                  base nobody recorded). The pair is STILL COMPARED and the
+ *                  uncertainty is noted. Excluding on unknown would be
+ *                  "absence of information = safe", exactly the polarity D1
+ *                  forbids one level down.
+ *
+ * `same` and `different` are CONCLUSIONS, and are therefore reachable only
+ * from two ABSOLUTE paths resolved real-vs-real. Two equal relative strings
+ * used to answer `same` (an identity nobody measured) and a relative/absolute
+ * pair naming ONE directory used to answer `different` (a real collision
+ * suppressed by a skip) — R1, both directions of the same defect.
+ *
+ * `codeDirScope` carries the note alongside the outcome; `sameCodeDir` is the
+ * outcome-only view kept for callers that only branch on scope.
  */
-function sameCodeDir(a, b) {
-  const ca = a && a.code_dir ? a.code_dir : null;
-  const cb = b && b.code_dir ? b.code_dir : null;
-  if (ca === null || cb === null) return 'unknown';
+function codeDirScope(a, b) {
+  const ka = classifyCodeDir(a && a.code_dir !== undefined ? a.code_dir : null);
+  const kb = classifyCodeDir(b && b.code_dir !== undefined ? b.code_dir : null);
 
-  let na = posix(ca);
-  let nb = posix(cb);
-  if (path.isAbsolute(ca) && path.isAbsolute(cb)) {
-    na = posix(path.resolve(ca));
-    nb = posix(path.resolve(cb));
+  // Order names the MOST specific defect first; all three route to `unknown`.
+  if (ka.kind === 'invalid' || kb.kind === 'invalid') {
+    return { scope: 'unknown', note: 'code-dir-invalid' };
   }
+  if (ka.kind === 'absent' || kb.kind === 'absent') {
+    return { scope: 'unknown', note: 'code-dir-unknown' };
+  }
+  if (ka.kind === 'relative' || kb.kind === 'relative') {
+    return { scope: 'unknown', note: 'code-dir-relative' };
+  }
+
+  const ra = realPathOf(ka.value);
+  const rb = realPathOf(kb.value);
+  const note = (ra.ok && rb.ok) ? null : 'code-dir-unresolved';
+
+  let na = posix(ra.value);
+  let nb = posix(rb.value);
   // Windows paths are case-insensitive; comparing case-sensitively there would
   // manufacture a `different-code-dir` skip for one and the same directory.
   if (process.platform === 'win32') {
     na = na.toLowerCase();
     nb = nb.toLowerCase();
   }
-  return na === nb ? 'same' : 'different';
+  return { scope: na === nb ? 'same' : 'different', note };
+}
+
+function sameCodeDir(a, b) {
+  return codeDirScope(a, b).scope;
 }
 
 /** A claim that declares nothing: never recorded, or recorded with no paths. */
@@ -279,15 +348,17 @@ function compareClaims(collected) {
       const A = comparable[i];
       const B = comparable[j];
 
-      const scope = sameCodeDir(A.claim, B.claim);
+      const { scope, note } = codeDirScope(A.claim, B.claim);
+      // The note is recorded BEFORE the skip branch and independently of it: a
+      // degraded comparison that ends in `different` still degraded, and a
+      // skip whose basis was lexical-only must say so. Silence about HOW the
+      // scope was decided is the failure mode R1/R2 were both instances of.
+      if (note) notes.push({ id: `${A.id} × ${B.id}`, reason: note });
       if (scope === 'different') {
         // D2: skipped BEFORE the counter — a pair that was not confronted
         // must never inflate the census that makes `clean` reachable.
         skipped.push({ id: `${A.id} × ${B.id}`, reason: 'different-code-dir' });
         continue;
-      }
-      if (scope === 'unknown') {
-        notes.push({ id: `${A.id} × ${B.id}`, reason: 'code-dir-unknown' });
       }
 
       pairs_compared += 1;
@@ -475,6 +546,8 @@ module.exports = {
   formatClaimOverlap,
   formatClaimList,
   sameCodeDir,
+  codeDirScope,
+  classifyCodeDir,
   isUndeclared,
   VERDICTS,
   CONFLICT_CAUSES,
