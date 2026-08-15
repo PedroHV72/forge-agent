@@ -528,6 +528,29 @@ test('CLI recusa argumento inválido com código 2', () => {
   assert.strictEqual(result.status, 2, result.stderr);
 });
 
+// Guard de regressão do defeito achado em T04: exportar os helpers só serve se
+// requerer o arquivo NÃO rodar a suíte. A asserção é sobre o stdout do require
+// (vazio), não sobre o exit code — sem a guarda o require roda os 29 testes,
+// imprime as linhas "✓" e ainda assim sai 0, então exit code não morde.
+test('requerer a suíte expõe os helpers sem executar nenhum teste', () => {
+  const probe = [
+    `const m = require(${JSON.stringify(path.join(__dirname, 'forge-sweep-delete.test.js'))});`,
+    'const p = m._private || {};',
+    "for (const name of ['makeFixtureRepo', 'writeAmendment', 'digestTree', 'cleanup']) {",
+    "  if (typeof p[name] !== 'function') { process.stderr.write('faltou ' + name); process.exit(3); }",
+    '}',
+  ].join('\n');
+  const result = cp.spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8' });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(result.stdout, '', `require executou a suíte: ${result.stdout.slice(0, 200)}`);
+});
+
 module.exports = { _private: { makeFixtureRepo, writeAmendment, digestTree, cleanup } };
 
-run();
+// T04 (dogfood) achou o defeito: o comentário de makeFixtureRepo promete a
+// exportação "para T04 reproduzir a mesma medição", mas `run()` sem guarda
+// executava a suíte inteira — e chamava process.exit — no ATO do require,
+// tornando a exportação inalcançável. run-tests.js spawna cada suíte como
+// processo próprio (scripts/run-tests.js:152), então a guarda não muda nada
+// para o runner: quem roda o arquivo continua rodando os testes.
+if (require.main === module) run();
