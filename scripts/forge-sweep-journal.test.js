@@ -77,6 +77,16 @@ function makeLedgerContainer(cwd, id, content) {
   return path.relative(cwd, file).split(path.sep).join('/');
 }
 
+// Unlike a fragment-store container, this belongs to the byte vault. The
+// journal must accept it so a pre-apply snapshot can drive a real --undo.
+function makeVaultContainer(cwd, id) {
+  const dir = path.join(cwd, '.gsd', 'forge', 'sweep-vault');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${id}.md`);
+  fs.writeFileSync(file, '# vault fixture\n', 'utf-8');
+  return path.relative(cwd, file).split(path.sep).join('/');
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 console.log('\n=== forge-sweep-journal.js — pointer-only undo journal ===\n');
 
@@ -131,6 +141,17 @@ test('(c) round-trip: ids distinct, order preserved', () => {
 
 // ── Section 3: latestUndoable ───────────────────────────────────────────────
 console.log('\nSection 3: latestUndoable\n');
+
+test('(vault) latestUndoable accepts a vault container pointer', () => {
+  const ROOT = freshFixture();
+  const vault = makeVaultContainer(ROOT, 'undo-bytes');
+  const intent = appendIntent(ROOT, { operation: 'dedupe', containers: [vault] });
+  const result = latestUndoable(ROOT);
+  assert(result.ok === true, 'latestUndoable should succeed for a vault pointer');
+  assert(result.entry && result.entry.id === intent.id, 'vault intent should remain undoable');
+  assert(result.entry.containers.length === 1 && result.entry.containers[0] === vault, 'vault path should survive validation');
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
 
 test('(d) latestUndoable falls back to older entry when newest container is gone', () => {
   const ROOT = freshFixture();

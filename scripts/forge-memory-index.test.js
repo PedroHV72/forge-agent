@@ -34,9 +34,18 @@ const {
   queryIndex,
   renderQuery,
   DEFAULT_INDEX_PATH,
+  independentMentionEvidence,
+  citationDetectionBreakdown,
+  citationCoverageSummary,
+  citationCoverageIsPrecise,
+  citationCoverageGaps,
+  citationGapCount,
+  hasCitationCoverageIdentity,
 } = require('./forge-memory-index.js');
 
 const { writeFragment } = require('./forge-memory.js');
+const { buildUnitAxis, buildSubjectAxis, renderSubjectAxis } = require('./forge-memory-axes.js');
+const { detectMentions, measureF2 } = require('./forge-index-f2.js');
 
 // Derived, never a literal: the fixture must mean "one major AHEAD of this
 // tooling". A hardcoded version stops being ahead the moment CURRENT_SCHEMA is
@@ -128,6 +137,28 @@ function cleanup(root) {
   } catch (_) {
     // best-effort — a leftover temp dir is not a test failure
   }
+}
+
+// Runs a measurement with the pre-T01 narrow registry. This is intentionally
+// local to the test: the production registry remains immutable to callers, and
+// the metric proof exercises the same store before and after the correction.
+function withLegacyCitationRegistry(fn) {
+  const barePath = CITATION_REGEXES.find((entry) => entry.name === 'bare-path');
+  const bareBasename = CITATION_REGEXES.find((entry) => entry.name === 'bare-basename');
+  const savedPath = barePath.regex;
+  const savedBasename = bareBasename.regex;
+  try {
+    barePath.regex = new RegExp('(?<![`\\w./\\-@])([\\w.\\-]+(?:/[\\w.\\-]+)+\\.(?:js|mjs|cjs|ts|tsx|jsx|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg))(?::(\\d+))?(?![`\\w])', 'g');
+    bareBasename.regex = new RegExp('(?<![`\\w./\\-@])([A-Za-z][\\w.\\-]*\\.(?:js|mjs|cjs|ts|tsx|jsx|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg))(?![`\\w])', 'g');
+    return fn();
+  } finally {
+    barePath.regex = savedPath;
+    bareBasename.regex = savedBasename;
+  }
+}
+
+function unresolvedCount(index) {
+  return Number(index.coverage.citations_total) - Number(index.coverage.citations_resolved);
 }
 
 // ── Section 1: extraction ────────────────────────────────────────────────────
@@ -535,8 +566,10 @@ test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, 
     const result = buildFileIndex(root, {});
     const coverage = result.coverage;
     assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-a'), 'expected bucket (a)');
-    assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-eg'), 'e.g/payload.side must be bucket (a)');
-    assert(!coverage.facts_missed_by_extractor.some((f) => f.mem_id === 'mem-eg'), 'e.g/payload.side must not be bucket (b)');
+    assert(!coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-eg'), 'detector-recognized payload.side must no longer be bucket (a)');
+    const independentMiss = coverage.facts_missed_by_extractor.find((f) => f.mem_id === 'mem-eg');
+    assert(independentMiss, 'payload.side must be bucket (b) under the independent detector');
+    assertEq(independentMiss.sample_token, 'e.g', 'the detector reports its first independent file-shaped token verbatim');
     const missed = coverage.facts_missed_by_extractor.find((f) => f.mem_id === 'mem-b|pipe');
     assert(missed, 'expected bucket (b) enumeration');
     assertEq(missed.storage_key, 'T01', 'bucket (b) must enumerate storage_key');
@@ -555,7 +588,7 @@ test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, 
     );
 
     const md = renderIndex(result, {});
-    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator'), 'renderer must label bucket (a) and its reason');
+    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário do detector independente'), 'renderer must label bucket (a) and its reason');
     assert(md.includes('(b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator'), 'renderer must label bucket (b) with the entirely-missed wording');
     assert(md.includes('captura PARCIAL'), 'renderer must caveat that partial capture is not counted in bucket (b)');
     assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo'), 'renderer must label bucket (c) with the resolved-to-a-file wording');
@@ -572,7 +605,7 @@ test('IN-17: empty store still renders all three labelled buckets at zero', () =
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-index-test-'));
   try {
     const md = renderIndex(buildFileIndex(root, {}), {});
-    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário atual do extrator: 0'), 'bucket (a) must render at zero');
+    assert(md.includes('(a) fatos sem menção reconhecida pelo vocabulário do detector independente: 0'), 'bucket (a) must render at zero');
     assert(md.includes('(b) fatos cuja citação de arquivo não foi capturada inteiramente pelo extrator: 0'), 'bucket (b) must render at zero');
     assert(md.includes('(c) fatos com citações extraídas, mas nenhuma resolvida a um arquivo: 0'), 'bucket (c) must render at zero');
   } finally {
@@ -1474,7 +1507,332 @@ test('R2: um valor que apenas PARECE flag mas não é KNOWN continua aceito (o g
   }
 });
 
+// ── Section 18: T02 extraction precision and independently measured recall ───
+console.log('\nSection 18: T02 precision guard and F2 recall\n');
+
+test('T02 bite: legacy bare-basename misses underscore-prefixed token, current registry catches it', () => {
+  const text = 'O preview usa _preview.tsx.';
+  const current = extractCitations(text);
+  const legacy = withLegacyCitationRegistry(() => extractCitations(text));
+  assert(current.some((citation) => citation.path === '_preview.tsx'), 'current registry must capture the measured underscore class');
+  assertEq(legacy.length, 0, 'legacy registry must miss the underscore-prefixed token');
+});
+
+test('T02 bite: legacy bare-path misses versioned path, current registry keeps the full token', () => {
+  const text = 'Ajuste em services@1.2.0/src/config/config.ts.';
+  const current = extractCitations(text);
+  const legacy = withLegacyCitationRegistry(() => extractCitations(text));
+  assertEq(current[0].path, 'services@1.2.0/src/config/config.ts');
+  assertEq(legacy.length, 0, 'legacy registry must not start a partial citation after @');
+});
+
+test('T02 bite: quoted and parenthesized paths retain punctuation outside the citation span', () => {
+  const cases = [
+    ['"scripts/quoted-path.js"', 'scripts/quoted-path.js'],
+    ['(scripts/parenthesized-path.js)', 'scripts/parenthesized-path.js'],
+    ["'scripts/apostrophe-path.js'", 'scripts/apostrophe-path.js'],
+  ];
+  for (const [text, expected] of cases) {
+    const citation = extractCitations(`Veja ${text} agora.`).find((item) => item.path === expected);
+    assert(citation, `expected punctuation-wrapped citation ${expected}`);
+    assertEq(citation.raw, expected, 'wrapping punctuation must not leak into raw path');
+  }
+});
+
+test('T02 precision: T##-PLAN.md emits no ghost -PLAN.md citation', () => {
+  const citations = extractCitations('O plano T##-PLAN.md foi revisado.');
+  assert(!citations.some((citation) => citation.path === '-PLAN.md'), 'plan token must never produce the -PLAN.md suffix citation');
+  assertEq(citations.length, 0, 'the whole plan token is not a file citation');
+});
+
+test('T02 precision: legitimate neighboring T01-PLAN.md remains a bare-basename citation', () => {
+  const citations = extractCitations('A unidade T01-PLAN.md documenta o trabalho.');
+  assertEq(citations.length, 1);
+  assertEq(citations[0].path, 'T01-PLAN.md');
+  assertEq(citations[0].pattern, 'bare-basename');
+});
+
+test('T02 precision guard: same synthetic store cannot gain unresolved citations', () => {
+  const root = mkStore(
+    [
+      { unitId: 'T01', mem_id: 'mem-precision-plan', text: 'Plano T##-PLAN.md e arquivo scripts/real.js.' },
+      { unitId: 'T01', mem_id: 'mem-precision-underscore', text: 'Preview _preview.tsx.' },
+      { unitId: 'T02', mem_id: 'mem-precision-version', text: 'Versão services@1.2.0/src/config/config.ts.' },
+      { unitId: 'T02', mem_id: 'mem-precision-missing', text: 'Ausente scripts/missing.js.' },
+    ],
+    ['scripts/real.js', '_preview.tsx', 'services@1.2.0/src/config/config.ts'],
+  );
+  try {
+    const before = withLegacyCitationRegistry(() => buildFileIndex(root, {}));
+    const after = buildFileIndex(root, {});
+    assert(unresolvedCount(after) <= unresolvedCount(before), `unresolved citations grew: ${unresolvedCount(before)} -> ${unresolvedCount(after)}`);
+    assert(after.coverage.citations_total >= after.coverage.citations_resolved, 'citation counters must be ordered');
+    const unresolved = after.coverage.unresolved.reduce((sum, item) => sum + item.count, 0);
+    assertEq(after.coverage.citations_resolved + unresolved, after.coverage.citations_total, 'coverage identity must hold after the precision check');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('T02 recall: measureF2 reaches >= 0.99 after registry correction and bites below 0.99 before it', () => {
+  const root = mkStore(
+    [
+      { unitId: 'T01', mem_id: 'mem-f2-underscore', text: 'Preview _preview.tsx.' },
+      { unitId: 'T01', mem_id: 'mem-f2-version', text: 'Ajuste services@1.2.0/src/config/config.ts.' },
+      { unitId: 'T01', mem_id: 'mem-f2-parens', text: 'Leia (scripts/quoted-path.js).' },
+      { unitId: 'T02', mem_id: 'mem-f2-normal', text: 'Leia scripts/normal.js.' },
+      { unitId: 'T02', mem_id: 'mem-f2-backtick', text: 'Leia `scripts/backtick.js`.' },
+    ],
+    ['_preview.tsx', 'services@1.2.0/src/config/config.ts', 'scripts/quoted-path.js', 'scripts/normal.js', 'scripts/backtick.js'],
+  );
+  try {
+    const before = withLegacyCitationRegistry(() => measureF2(root));
+    const after = measureF2(root);
+    assert(before.f2_recall < 0.99, `legacy recall must bite below threshold, got ${before.f2_recall}`);
+    assert(after.f2_recall >= 0.99, `current recall must meet threshold, got ${after.f2_recall}`);
+    assertEq(after.verdict, 'MEASURED');
+    assertEq(after.coverage_identity, true);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('T02 gap: extension outside CODE_EXT is named, reported, and remains visible to F2', () => {
+  const root = mkStore(
+    [{ unitId: 'T01', mem_id: 'mem-gap-extension-outside-code-ext', text: 'A configuração está em config.weird.' }],
+    ['config.weird'],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const report = measureF2(root);
+    assertEq(extractCitations('config.weird').length, 0, 'gap must not be hidden by a broad suffix predicate');
+    assert(result.coverage.citation_gaps.some((gap) => gap.name === 'extension-outside-code-ext'), 'index must report the named gap');
+    assert(report.facts_missed_total.some((fact) => fact.mem_id === 'mem-gap-extension-outside-code-ext'), 'independent instrument must keep the gap visible');
+    assert(detectMentions('config.weird').length === 1, 'detector evidence must not share CODE_EXT');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('T02 bucket (b): independent detector, not findSampleFileToken vocabulary, classifies an unknown suffix as missed', () => {
+  const root = mkStore(
+    [{ unitId: 'T01', mem_id: 'mem-independent-detector', text: 'Veja payload.side para detalhes.' }],
+    ['payload.side'],
+  );
+  try {
+    const coverage = buildFileIndex(root, {}).coverage;
+    const missed = coverage.facts_missed_by_extractor.find((item) => item.mem_id === 'mem-independent-detector');
+    assert(missed, 'detector-recognized suffix must be bucket (b) even outside CODE_EXT');
+    assertEq(missed.sample_token, 'payload.side');
+    assert(!coverage.facts_no_file_mention.some((item) => item.mem_id === 'mem-independent-detector'));
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('T02 bucket (a): label names the independent detector vocabulary and preserves locked coverage fields', () => {
+  const root = mkStore(
+    [{ unitId: 'T01', mem_id: 'mem-detector-no-mention', text: 'Decisão arquitetural sem token de arquivo.' }],
+    [],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const markdown = renderIndex(result, {});
+    assert(markdown.includes('vocabulário do detector independente'), 'bucket (a) label must identify the detector boundary');
+    assert(Array.isArray(result.coverage.facts_no_file_mention), 'locked bucket (a) field remains present');
+    assert(Array.isArray(result.coverage.facts_missed_by_extractor), 'locked bucket (b) field remains present');
+    assert(Array.isArray(result.coverage.facts_without_citation), 'legacy additive field remains present');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('T02 resolver remains total for every citation produced by the corrected registry', () => {
+  const root = mkStore([], ['scripts/real.js', '_preview.tsx']);
+  try {
+    const index = { byBasename: new Map([['real.js', ['scripts/real.js']], ['_preview.tsx', ['_preview.tsx']]]) };
+    for (const citation of extractCitations('scripts/real.js _preview.tsx T##-PLAN.md')) {
+      const resolution = resolveCitation(citation, root, index);
+      assert(['RESOLVED', 'UNRESOLVED'].includes(resolution.state), 'resolver must return a total tagged result');
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('T02 registry order and locked names remain stable while adding no broad catch-all rule', () => {
+  const names = CITATION_REGEXES.map((entry) => entry.name);
+  assertEq(names.slice(0, 4), ['backticked-path', 'bare-path', 'backticked-basename', 'bare-basename']);
+  assert(!names.includes('any-extension'), 'precision guard forbids a catch-all extension rule');
+  assert(CITATION_REGEXES.every((entry) => entry.regex instanceof RegExp), 'every registry entry remains executable');
+});
+
+test('T02 diagnostic boundary keeps detector and extractor observations distinguishable', () => {
+  const text = 'Veja scripts/real.js e config.weird.';
+  const citations = extractCitations(text);
+  const evidence = independentMentionEvidence(text, citations);
+  const breakdown = citationDetectionBreakdown(text, citations);
+  assertEq(evidence.mentions.length, 2, 'independent detector must see both suffix-shaped tokens');
+  assertEq(evidence.unmatched.map((mention) => mention.raw), ['config.weird.']);
+  assertEq(breakdown.detector_unmatched, ['config.weird.']);
+  assertEq(breakdown.extractor_only, []);
+  assertEq(breakdown.detector_mentions, 2);
+  assertEq(evidence.unmatched[0].normalized, 'config.weird');
+  assertEq(citations[0].path, 'scripts/real.js');
+});
+
+test('T02 coverage helpers preserve the unresolved identity without hidden counters', () => {
+  const before = {
+    citations_total: 4,
+    citations_resolved: 2,
+    unresolved: [{ count: 2 }],
+    citation_gaps: [{ name: 'extension-outside-code-ext', reason: 'precision' }],
+  };
+  const after = {
+    citations_total: 5,
+    citations_resolved: 4,
+    unresolved: [{ count: 1 }],
+    citation_gaps: [{ name: 'extension-outside-code-ext', reason: 'precision' }],
+  };
+  const summary = citationCoverageSummary(after);
+  assertEq(summary, {
+    total: 5,
+    resolved: 4,
+    unresolved: 1,
+    identity_holds: true,
+    gaps: ['extension-outside-code-ext'],
+  });
+  assertEq(hasCitationCoverageIdentity(after), true);
+  assertEq(citationCoverageIsPrecise(before, after), true, 'one extra citation is allowed only when unresolved count does not grow');
+  assertEq(citationCoverageGaps(after).length, 1);
+  assertEq(citationGapCount(after), 1);
+});
+
+test('T02 coverage helpers reject a broken citation identity and an unresolved precision regression', () => {
+  const broken = {
+    citations_total: 3,
+    citations_resolved: 1,
+    unresolved: [{ count: 1 }],
+    citation_gaps: [],
+  };
+  const preciseBefore = {
+    citations_total: 2,
+    citations_resolved: 1,
+    unresolved: [{ count: 1 }],
+    citation_gaps: [],
+  };
+  const impreciseAfter = {
+    citations_total: 4,
+    citations_resolved: 2,
+    unresolved: [{ count: 2 }],
+    citation_gaps: [],
+  };
+  assertEq(hasCitationCoverageIdentity(broken), false);
+  assertEq(citationCoverageSummary(broken).identity_holds, false);
+  assertEq(citationCoverageIsPrecise(preciseBefore, impreciseAfter), false);
+  assertEq(citationCoverageGaps(broken), []);
+  assertEq(citationGapCount(broken), 0);
+  assertEq(citationCoverageSummary(broken).unresolved, 1);
+  assertEq(citationCoverageSummary(broken).total, 3);
+  assertEq(citationCoverageSummary(broken).resolved, 1);
+});
+
 // ── Summary ────────────────────────────────────────────────────────────────────
+test('T03: buildFileIndex exposes additive facts with citation counters', () => {
+  const root = mkStore([{ unitId: 'T01', text: 'Fixed `scripts/forge-alpha.js`.', mem_id: 'mem-facts-additive', category: 'pattern', source_unit: 'T99' }], ['scripts/forge-alpha.js']);
+  try { const result = buildFileIndex(root, {}); assert(Array.isArray(result.facts)); assertEq(result.facts.length, result.coverage.facts_total); assertEq(result.facts[0].citations_total, 1); assertEq(result.entries.length, 1); } finally { cleanup(root); }
+});
+test('T03: renderIndex always emits the unit axis, including an empty store', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-empty-axis-'));
+  try { const rendered = renderIndex(buildFileIndex(root, {}), {}); assert(rendered.includes('## Eixo unidade de origem')); assert(rendered.includes('Nenhuma unidade com fatos lidos')); assert(rendered.indexOf('## Eixo unidade de origem') < rendered.indexOf('## Cobertura e descarte')); } finally { cleanup(root); }
+});
+test('T03: CLI --unit matches envelope storage key and unit id without writing', () => {
+  const root = mkStore([{ unitId: 'T01', milestoneId: 'M001', text: 'Fixed `scripts/forge-alpha.js`.', mem_id: 'mem-unit-cli' }], ['scripts/forge-alpha.js'], { milestoneId: 'M001' });
+  try { for (const query of ['M001__T01', 'T01']) { const res = spawnSync(process.execPath, [SCRIPT_PATH, '--unit', query, '--cwd', root], { encoding: 'utf8' }); assertEq(res.status, 0, res.stderr); assert(res.stdout.includes('mem-unit-cli')); } } finally { cleanup(root); }
+});
+test('T03: --unit plus --write is rejected before reading the store', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-memory-unit-write-'));
+  try { const res = spawnSync(process.execPath, [SCRIPT_PATH, '--unit', 'T01', '--write', '--cwd', root], { encoding: 'utf8' }); assertEq(res.status, 2); assert(!fs.existsSync(path.join(root, '.gsd'))); } finally { cleanup(root); }
+});
+test('T03: axis coverage is deterministic and scoped to readable facts', () => {
+  const root = mkStore([{ unitId: 'T01', text: 'Stable fact in `scripts/forge-alpha.js`.', mem_id: 'mem-axis-deterministic' }], ['scripts/forge-alpha.js']);
+  try { const first = buildUnitAxis(buildFileIndex(root, {})); const second = buildUnitAxis(buildFileIndex(root, {})); assertEq(first, second); assertEq(first.coverage.facts_total, 1); assertEq(first.coverage.facts_with_unit, 1); assertEq(first.coverage.facts_not_read.unreadable_fragments, 0); } finally { cleanup(root); }
+});
+test('T03: facts preserve envelope milestone and source metadata independently', () => {
+  const root = mkStore([{ unitId: 'T01', milestoneId: 'M001', source_unit: 'T99', text: 'See `scripts/forge-alpha.js`.', mem_id: 'mem-envelope-fields' }], ['scripts/forge-alpha.js'], { milestoneId: 'M001' });
+  try {
+    const result = buildFileIndex(root, {});
+    assertEq(result.facts[0].storage_key, 'M001__T01');
+    assertEq(result.facts[0].unit_id, 'T01');
+    assertEq(result.facts[0].milestone_id, 'M001');
+    assertEq(result.facts[0].source_unit, 'T99');
+    assertEq(result.facts[0].citations_resolved_count, 1);
+  } finally { cleanup(root); }
+});
+test('T03: repeated --unit values are accepted and rendered together', () => {
+  const root = mkStore([{ unitId: 'T01', text: 'See `scripts/forge-alpha.js`.', mem_id: 'mem-unit-repeat-a' }, { unitId: 'T02', text: 'See `scripts/forge-beta.js`.', mem_id: 'mem-unit-repeat-b' }], ['scripts/forge-alpha.js', 'scripts/forge-beta.js']);
+  try {
+    const res = spawnSync(process.execPath, [SCRIPT_PATH, '--unit', 'T01', '--unit', 'T02', '--cwd', root], { encoding: 'utf8' });
+    assertEq(res.status, 0, res.stderr);
+    assert(res.stdout.includes('mem-unit-repeat-a')); assert(res.stdout.includes('mem-unit-repeat-b'));
+  } finally { cleanup(root); }
+});
+test('T03: JSON unit query is an additive envelope', () => {
+  const root = mkStore([{ unitId: 'T01', text: 'See `scripts/forge-alpha.js`.', mem_id: 'mem-unit-json' }], ['scripts/forge-alpha.js']);
+  try {
+    const res = spawnSync(process.execPath, [SCRIPT_PATH, '--unit', 'T01', '--json', '--cwd', root], { encoding: 'utf8' });
+    assertEq(res.status, 0, res.stderr);
+    const parsed = JSON.parse(res.stdout);
+    assert(parsed.unit_axis); assertEq(parsed.units, ['T01']); assert(parsed.coverage); assert(parsed.counts);
+  } finally { cleanup(root); }
+});
+
+test('T04: renderIndex always emits subject axis and reports partial capture as a measurement', () => {
+  const root = mkStore([{ unitId: 'T04', mem_id: 'subject-1', text: 'Arquitetura parser e captura' }], []);
+  try {
+    const rendered = renderIndex(buildFileIndex(root));
+    assert(rendered.includes('## Eixo assunto'));
+    assert(rendered.includes('captura PARCIAL') && rendered.includes('medida nesta execução'));
+  } finally { cleanup(root); }
+});
+test('T04: subject CLI is repeatable and subject+write is rejected', () => {
+  const root = mkStore([{ unitId: 'T04', mem_id: 'subject-cli', text: 'Arquitetura parser' }], []);
+  try {
+    const query = spawnSync(process.execPath, [SCRIPT_PATH, '--subject', 'parser', '--subject', 'arquitetura', '--cwd', root], { encoding: 'utf8' });
+    assertEq(query.status, 0);
+    assert(query.stdout.includes('## Eixo assunto'));
+    const rejected = spawnSync(process.execPath, [SCRIPT_PATH, '--subject', 'parser', '--write', '--cwd', root], { encoding: 'utf8' });
+    assertEq(rejected.status, 2);
+  } finally { cleanup(root); }
+});
+test('T04: unresolved cause attribution is an exact partition of bucket c', () => {
+  const root = mkStore([{ unitId: 'T04', mem_id: 'design', text: 'uses npm@1.0.0' }, { unitId: 'T04', mem_id: 'missing', text: 'uses `missing.js`' }], []);
+  try {
+    const result = buildFileIndex(root);
+    const causes = result.coverage.unresolved_cause_counts;
+    assertEq(causes.por_design_nao_e_arquivo + causes.citacao_de_arquivo_nao_localizada, result.coverage.facts_unresolved_only.length);
+    assert(renderIndex(result).includes('por design não são arquivo'));
+  } finally { cleanup(root); }
+});
+
+// S02 R2 (review-fix): o rótulo "medida nesta execução" não pode reportar o
+// número de uma render anterior. Cache keyed pelo objeto `result` da render.
+test('S02 R2: segundo render no mesmo cwd reflete o store mudado (sem número stale)', () => {
+  const root = mkStore([{ unitId: 'T01', mem_id: 'plain', text: 'Decisão sem arquivo.' }], []);
+  try {
+    const first = renderIndex(buildFileIndex(root, {}), {});
+    const label = /captura PARCIAL não incluída neste total, medida nesta execução: (\S+?)\./;
+    assertEq(first.match(label)[1], '0', 'store sem fato parcial mede 0');
+
+    // Muda o store DENTRO do mesmo processo: um fato com uma menção capturada e
+    // outra não → captura parcial.
+    writeFragment(root, { unit_id: 'T02', facts: [{ mem_id: 'partial', category: 'test', text: '`scripts/covered.js` e other.weird', created_at: '2026-01-01T00:00:00Z', source_unit: 'T02' }] });
+
+    const second = renderIndex(buildFileIndex(root, {}), {});
+    assertEq(second.match(label)[1], '1', 'a segunda render deve medir o store novo, não devolver o valor cacheado por cwd');
+  } finally { cleanup(root); }
+});
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {
   console.log('Failures:');

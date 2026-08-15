@@ -709,10 +709,25 @@ run `--runtime claude` não derrubar os destinos do Codex.
 
 ## Estado atual
 
-- **Milestone ativo:** M-20260813221024-controle-recursos — **Concluído** (6/6 slices).
-- **Fase:** complete — todos os 6 slices terminados, LEDGER entry gravada, branch pronto para PR.
-- **Status:** 32 commits no branch `forge/M-20260813221024-controle-recursos` (intentionally unmerged per operator's documented PR workflow). Medição honesta-negativa: baseline não reproduziu, ganho não apareceu, enforcement provado ativo 12/12 child-side. Review dialético: 46 objections, 38 concedidas, 0 abertas ao fecho. Flakies I-20260802213721 e I-20260814113610 consertados na raiz.
-- **Próxima ação:** Operador abre PR de `forge/M-20260813221024-controle-recursos` para master.
+- **Milestone ativo:** — (nenhum em curso).
+- **Fase:** idle.
+- **Último estado verde conhecido:** `v4.11.0` (merge `9b3f9fc`) — 170/170 suítes, smoke 2674/0/7.
+- **Mergeado desde então, com CI vermelha, por decisão explícita do operador em 2026-08-15:**
+  PR #91 (varredura da classe EOL), PR #94 (evidence PR1/2) e PR #98 (curadoria do `.gsd`).
+  As três estavam ~50 commits atrás da master e vermelhas nas três plataformas antes do merge.
+  **Consequência medida:** #91/#94 alteraram superfícies do golden (`agents/`, `skills/`,
+  `scripts/forge-hook.js`) sem regenerá-lo, quebrando `forge-claude-renderer.test.js` na master;
+  o golden foi regenerado pelo render path no merge da #98.
+- **Pendências nomeadas herdadas da curadoria** (ver `.gsd/KNOWLEDGE.md § Review follow-ups` e itens
+  `I-20260815052212-curate-undo-recusa-pos` / `I-20260815042115-preview-delete-wrappers`): `curate
+  --undo` recusa pós-apply real (`restoreVault` de S08 é delete/recria, incompatível com reescrita-
+  no-lugar); exit code do preview de `delete-wrappers` não distingue recusa-por-cerca de
+  sem-candidatos; gate índice-verde (D-2) medido **vermelho** neste repo (`f2_recall=0,4286` < piso
+  0,99) — deleção física segue estruturalmente bloqueada até a extração de citações melhorar; WDMA
+  nunca recebeu apply/preview real; caps 3/8 de S05 seguem provisórios.
+- **Backlog aberto do controle de recursos:** `I-20260814142227` (flakies, parcial),
+  `I-20260815014759` (Windows, 11 suítes), `I-20260814021202` + `I-20260815042402` (heap/RSS).
+- **Próxima ação:** rodar a suíte completa na master e tratar o vermelho herdado dos três merges.
 
 ## GSD — Início de sessão obrigatório (dogfood)
 

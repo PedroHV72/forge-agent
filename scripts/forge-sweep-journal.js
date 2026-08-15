@@ -18,6 +18,7 @@ const crypto = require('crypto');
 
 const { nowTimestamp } = require('./forge-ids');
 const { STORE_TARGETS, WRAPPER_TARGETS, isDirectChild } = require('./forge-epoch-group');
+const { vaultDir } = require('./forge-sweep-vault');
 
 function journalPath(cwd) {
   return path.join(cwd, '.gsd', 'forge', 'sweep-journal.jsonl');
@@ -52,6 +53,9 @@ function storeRoots(cwd) {
   for (const wrapper of WRAPPER_TARGETS) {
     try { roots.push(wrapper.parent(cwd)); } catch (_) { /* ignore */ }
   }
+  // Sweep vaults are content containers referenced by pointer-only journal
+  // entries; without this root latestUndoable silently drops their pointers.
+  roots.push(vaultDir(cwd));
   return roots;
 }
 
