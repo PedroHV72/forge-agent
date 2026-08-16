@@ -61,10 +61,27 @@ const { measureF2 } = require('./forge-index-f2');
 const { buildFileIndex } = require('./forge-memory-index');
 const { buildUnitAxis, buildSubjectAxis } = require('./forge-memory-axes');
 
-// Where the versioned allow-list lives, relative to the measured workspace
-// root. Overridable via opts.allowedPath / CLI --allowed. A workspace without
-// this file is REFUSED (named reason), never measured "sem lista".
-const DEFAULT_ALLOWED_RELPATH = path.join('scripts', 'fixtures', 'index-green', 'allowed-misses.json');
+// Where the allow-list lives, relative to the measured workspace root, in
+// search order. Overridable via opts.allowedPath / CLI --allowed.
+//
+// The list is PER-WORKSPACE data: its keys are `<mem_id>::<mention>` from THAT
+// workspace's store, so a list written here means nothing in another project.
+// `.gsd/` is therefore the canonical home — consumer projects commit `.gsd/`,
+// so the list is versioned exactly where the misses live. This repo is the
+// exception that keeps the fallback alive: its own `.gsd/` is gitignored
+// dogfood, so its list stays under `scripts/fixtures/`, versioned and testable.
+//
+// Only ENOENT advances the search. A candidate that exists but is unreadable,
+// is a directory, or holds invalid JSON REFUSES naming that path — falling
+// through to the next candidate on garbage would silently weaken the very
+// posture this gate installs.
+const ALLOWED_SEARCH_RELPATHS = [
+  path.join('.gsd', 'index-green-allowed-misses.json'),
+  path.join('scripts', 'fixtures', 'index-green', 'allowed-misses.json'),
+];
+// Kept as the documented default for callers that ask for "the" path; the
+// search above is what the gate actually walks.
+const DEFAULT_ALLOWED_RELPATH = ALLOWED_SEARCH_RELPATHS[1];
 
 // ---------------------------------------------------------------------------
 // Miss enumeration and the stable key
@@ -266,7 +283,21 @@ function loadAllowedMisses(allowedPath, explicit) {
   }
   const resolved = resolveAllowedMisses(text);
   if (!resolved.ok) return { ok: false, reason: 'allowed-misses-invalid', errors: resolved.errors };
-  return { ok: true, entries: resolved.entries, source: 'file' };
+  return { ok: true, entries: resolved.entries, source: 'file', path: allowedPath };
+}
+
+// Walks ALLOWED_SEARCH_RELPATHS in order for the default case. Only ENOENT
+// advances: a candidate that exists and is broken refuses right there, naming
+// itself — the search must never turn garbage into "the next one, then".
+// `path` travels with the answer so "which file spoke" is never implicit.
+function loadAllowedMissesDefault(root) {
+  for (const rel of ALLOWED_SEARCH_RELPATHS) {
+    const candidate = path.join(root, rel);
+    const loaded = loadAllowedMisses(candidate, false);
+    if (loaded.source === 'default-absent') continue;
+    return loaded;
+  }
+  return { ok: true, entries: [], source: 'default-absent', searched: ALLOWED_SEARCH_RELPATHS.slice() };
 }
 
 function computeUnitAxisCriterion(axis) {
@@ -349,8 +380,9 @@ function measureGreenUnsafe(cwd, opts) {
   // Critério 1: lista enumerada, duas direções. Tudo aqui deriva do relatório
   // que measureF2 já produziu — o gate nunca relê o store por conta própria.
   const explicitAllowed = !!options.allowedPath;
-  const allowedPath = options.allowedPath || path.join(root, DEFAULT_ALLOWED_RELPATH);
-  const loaded = loadAllowedMisses(allowedPath, explicitAllowed);
+  const loaded = explicitAllowed
+    ? loadAllowedMisses(options.allowedPath, true)
+    : loadAllowedMissesDefault(root);
   const misses = enumerateMisses(f2);
   const counts = f2.fact_counts || {};
   const factsEvaluated = Number(counts.covered || 0) + Number(counts.partial || 0)
@@ -362,7 +394,7 @@ function measureGreenUnsafe(cwd, opts) {
     allowedCriterion = {
       ok: false,
       code: loaded.reason,
-      path: allowedPath,
+      path: loaded.path || (explicitAllowed ? options.allowedPath : null),
       // Which mode asked for the file that failed — an explicit path refusing
       // and a default path refusing (unreadable/invalid) are both refusals,
       // but the reader should see who asked.
@@ -386,7 +418,10 @@ function measureGreenUnsafe(cwd, opts) {
     allowedCriterion = {
       ok: verdict.ok,
       code: verdict.code,
-      path: allowedPath,
+      // The file that ANSWERED, not the one we hoped for: null under
+      // `default-absent`, and `searched` below says where we looked.
+      path: loaded.path || null,
+      searched: loaded.searched || undefined,
       // `file` = the list came from a real file (even an empty one);
       // `default-absent` = no file at the default path, empty list assumed.
       // Both are an empty-or-populated list; the ORIGIN differs and it shows.

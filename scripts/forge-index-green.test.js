@@ -640,4 +640,96 @@ test('scripts/fixtures/index-green/allowed-misses.json resolves clean and every 
   }
 });
 
+
+// ── Section 18: search order — .gsd first, repo fixture as fallback ─────────
+//
+// The list is PER-WORKSPACE data (keys are this store's mem_ids), so `.gsd/` is
+// its canonical home: consumer projects commit `.gsd/`, which versions the list
+// exactly where the misses live. This repo keeps the fixture fallback alive
+// because its own `.gsd/` is gitignored dogfood.
+
+console.log('\nSection 18: allow-list search order and its floor\n');
+
+function gsdListPath(cwd) { return path.join(cwd, '.gsd', 'index-green-allowed-misses.json'); }
+function writeGsdList(cwd, body) {
+  const target = gsdListPath(cwd);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, typeof body === 'string' ? body : JSON.stringify({ allowed: body }, null, 2));
+}
+
+test('the .gsd list WINS over the repo fixture — and the report names which file answered', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', 'cita `scripts/covered.js`')] });
+    writeAllowed(cwd, []);       // repo-shaped fallback, present
+    writeGsdList(cwd, []);       // workspace list, present — must win
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.allowed_misses.source, 'file');
+    assert.strictEqual(report.allowed_misses.path, gsdListPath(cwd),
+      'the report must name the file that ANSWERED, not the one we hoped for');
+  } finally { cleanup(cwd); }
+});
+
+test('with no .gsd list, the repo fixture answers — the fallback is not dead code', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', 'cita `scripts/covered.js`')] });
+    writeAllowed(cwd, []);
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.allowed_misses.source, 'file');
+    assert.strictEqual(report.allowed_misses.path, allowedPathFor(cwd));
+  } finally { cleanup(cwd); }
+});
+
+test('neither candidate present → default-absent, and the report ENUMERATES where it looked', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', 'cita `scripts/covered.js`')] });
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.allowed_misses.source, 'default-absent');
+    assert.strictEqual(report.allowed_misses.path, null, 'no file answered, so no file is named');
+    assert.deepStrictEqual(report.allowed_misses.searched,
+      [path.join('.gsd', 'index-green-allowed-misses.json'),
+       path.join('scripts', 'fixtures', 'index-green', 'allowed-misses.json')],
+      'a search that reports nothing about where it looked is indistinguishable from one that never ran');
+  } finally { cleanup(cwd); }
+});
+
+test('absence does NOT loosen the gate: default-absent + one miss is still red', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', missFactText('prefs-x.md'))] });
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.allowed_misses.source, 'default-absent');
+    assert.strictEqual(report.green, false, 'an empty list accepts nothing — every miss is unlisted');
+    assert.ok(report.reasons.some((r) => r.startsWith('unlisted-miss:')), report.reasons.join(', '));
+  } finally { cleanup(cwd); }
+});
+
+test('a BROKEN first candidate refuses naming itself — it never falls through to the second', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', 'cita `scripts/covered.js`')] });
+    writeAllowed(cwd, []);            // a perfectly good fallback sits behind it...
+    writeGsdList(cwd, 'nao-e-json');  // ...and must NOT be reached
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.green, false);
+    assert.strictEqual(report.allowed_misses.code, 'allowed-misses-invalid',
+      'readable garbage is a refusal wherever it sits — falling through would silently weaken the posture');
+    assert.ok(report.reasons.includes('allowed-misses-invalid'), report.reasons.join(', '));
+  } finally { cleanup(cwd); }
+});
+
+test('an EXPLICIT path still refuses when absent — the search order does not soften --allowed', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', 'cita `scripts/covered.js`')] });
+    writeGsdList(cwd, []);  // a valid workspace list exists — must be IGNORED when a path is asked for
+    const report = measureGreen(cwd, { allowedPath: path.join(cwd, 'nao-existe.json') });
+    assert.strictEqual(report.green, false);
+    assert.strictEqual(report.allowed_misses.code, 'allowed-misses-file-missing');
+    assert.strictEqual(report.allowed_misses.source, 'explicit');
+  } finally { cleanup(cwd); }
+});
+
 console.log(`\n${passed} passed`);
