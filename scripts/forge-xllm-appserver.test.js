@@ -269,7 +269,17 @@ async function testHappyAndWire(mock, root) {
   assert.strictEqual(wire.turnParams.outputSchema.type, 'object');
   assert.strictEqual(wire.turnParams.outputSchema.additionalProperties, false);
   assert.deepStrictEqual(wire.turnParams.outputSchema.required, ['status', 'summary', 'must_haves_status', 'files_changed']);
-  assert.deepStrictEqual(wire.turnParams.sandboxPolicy, { type: 'workspaceWrite', networkAccess: false });
+  // Derived FROM the exported capability→policy gate, exactly as the gate's
+  // own comment in forge-xllm.js prescribes ("what lets a test derive the
+  // expected policy FROM the capability"). A hardcoded workspaceWrite literal
+  // asserted the posix policy on every platform, but on win32 production
+  // deliberately returns {type:'dangerFullAccess'} (documented escape hatch
+  // for upstream Codex sandbox breakage — see the platform branch at
+  // forge-xllm.js#buildAppServerSandboxPolicy). runExecute defaults the
+  // capability to 'workspace-write' and the running platform, so the same
+  // call here is the contract, not a copy of it; the per-platform table
+  // itself is pinned by the explicit-platform asserts further down.
+  assert.deepStrictEqual(wire.turnParams.sandboxPolicy, buildAppServerSandboxPolicy('workspace-write'));
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(resultFile, 'utf8')), result);
 }
 

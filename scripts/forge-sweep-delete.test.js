@@ -380,12 +380,18 @@ test('apply recusa quando o índice fica vermelho entre o plan e o apply', () =>
     assert.strictEqual(plan.targets.length, 1, 'plano nasceu verde');
     // O índice fica vermelho DEPOIS do plano: um fato novo menciona um arquivo
     // que o extrator de citações não captura → f2_recall cai abaixo do piso.
+    // A extensão precisa ser sinal para o detector F2 e ficar FORA de CODE_EXT:
+    // `.txt` servia até entrar em CODE_EXT (junto de jsonl/jsonc/swift, para
+    // fechar misses reais como `events.jsonl` e `seed.txt`), o que tornava a
+    // menção capturada e deixava o índice verde — o teste passava a não medir
+    // nada. `.py` é sinal para o detector (lista curada, deliberadamente mais
+    // larga) e não é extraído, que é exatamente o gap que este caso precisa.
     memory.writeFragment(cwd, {
       unit_id: UNIT_ID,
       facts: [{
         mem_id: 'MEM009',
         category: 'gotcha',
-        text: 'Veja tambem notas/leia.txt para o resto da historia.',
+        text: 'Veja tambem notas/leia.py para o resto da historia.',
         created_at: '2026-08-15',
         source_unit: `complete-milestone/${UNIT_ID}`,
         confidence_base: '0.85',

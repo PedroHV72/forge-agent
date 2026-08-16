@@ -1,0 +1,6 @@
+{
+  "_comment": "Known-failures baseline for scripts/run-tests.js --baseline. HUMAN, versioned list: adding an entry is a decision made by whoever opens the PR, never automatic. Keyed by process.platform. Each entry: suite (exact *.test.js filename), item (backlog id tracking it), reason (short phrase). The comparison is two-way: a failure missing here blocks the run, and an entry whose suite now passes also blocks until removed.",
+  "win32": [],
+  "darwin": [],
+  "linux": []
+}

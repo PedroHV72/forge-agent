@@ -5929,6 +5929,22 @@ test("GitDefaultBranch: este repositório, no disco de verdade, é master") {
     let repo = URL(fileURLWithPath: #filePath)          // …/app/Sources/ForgeKitTests/main.swift
         .deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent().deletingLastPathComponent().path
+    // Dogfood deliberado — mas só quando origin/HEAD nomeia a padrão. Sem ele
+    // (fetch manual, alguns CI), `resolve` cai para os candidatos na ordem
+    // `main > master`, e o resultado vira fato do CLONE, não do código: uma
+    // branch local `main` faria isto falhar sem defeito nenhum. Skip nomeado.
+    let dir = GitDefaultBranch.commonDir(repoPath: repo)
+    let loose = dir.flatMap {
+        try? String(contentsOfFile: $0 + "/refs/remotes/origin/HEAD", encoding: .utf8)
+    } ?? ""
+    let packed = dir.flatMap {
+        try? String(contentsOfFile: $0 + "/packed-refs", encoding: .utf8)
+    } ?? ""
+    guard loose.contains("ref: refs/remotes/origin/")
+            || packed.contains("ref: refs/remotes/origin/") else {
+        print("  (skipped — este checkout não tem origin/HEAD; o nome da padrão viria dos candidatos e é fato do clone, não do código)")
+        return
+    }
     assertEqual(GitDefaultBranch.resolve(repoPath: repo), "master",
                 "resolveu em \(repo)")
 }
@@ -6076,17 +6092,24 @@ test("GitBaselineMark: todo símbolo da marca de padrão existe de verdade") {
 }
 
 test("Git.baseline: estar NA padrão não gasta processo nenhum, e é um fato próprio") {
-    // Este repositório: HEAD numa feature branch, padrão master, 5 à frente.
+    // O que este teste mede é o ATALHO estrutural (currentBranch == padrão ⇒
+    // 0/0 sem rev-list), não o nome da padrão — que é fato do clone: sem
+    // origin/HEAD, os candidatos `main > master` decidem diferente. Por isso
+    // resolvemos o nome primeiro e passamos o resolvido como currentBranch:
+    // a relação vale em qualquer checkout.
     let repo = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent().deletingLastPathComponent().path
-    guard let s = Git.baseline(at: repo, currentBranch: "master").state else {
+    guard let def = GitDefaultBranch.resolve(repoPath: repo) else {
         return assertTrue(false, "não resolveu a padrão deste repositório")
     }
+    guard let s = Git.baseline(at: repo, currentBranch: def).state else {
+        return assertTrue(false, "baseline não mediu com a padrão resolvida (\(def))")
+    }
     // currentBranch == padrão: respondido sem rev-list, e `onDefault` distingue
-    // "você ESTÁ na master" de "seu branch não tem nada além da master".
+    // "você ESTÁ na padrão" de "seu branch não tem nada além da padrão".
     assertTrue(s.onDefault)
-    assertEqual(s.defaultBranch, "master")
+    assertEqual(s.defaultBranch, def)
     assertEqual(s.ahead, 0); assertEqual(s.behind, 0)
     assertEqual(GitBaselineMark.of(.measured(s)).text, "padrão")
 
@@ -6121,8 +6144,12 @@ test("Git.status enche a divergência da padrão junto — este repo, medido de 
     guard let b = snap.baseline?.state else {
         return assertTrue(false, "Git.status não mediu a padrão: \(String(describing: snap.baseline))")
     }
-    assertEqual(b.defaultBranch, "master")
-    assertEqual(b.onDefault, snap.branch == "master")
+    // O NOME da padrão é fato do clone, não do código: sem origin/HEAD (fetch
+    // manual, alguns CI), `resolve` cai para os candidatos na ordem
+    // `main > master`, e um checkout assim com uma branch local `main`
+    // resolveria "main". Afirmamos só relações internas da própria medição.
+    assertFalse(b.defaultBranch.isEmpty, "padrão resolvida vazia")
+    assertEqual(b.onDefault, snap.branch == b.defaultBranch)
     // Divergência é contagem: nunca negativa, e zero-zero quando se está NA padrão.
     assertTrue(b.ahead >= 0 && b.behind >= 0, "divergência negativa: \(b.ahead)/\(b.behind)")
     if b.onDefault { assertEqual(b.ahead, 0); assertEqual(b.behind, 0) }

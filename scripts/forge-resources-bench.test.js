@@ -16,7 +16,16 @@ const bench = require('./forge-resources-bench.js');
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 const failures = [];
+
+// Named skip: the reason MUST reach stdout — a silent skip is treated as a
+// defect in this repo (indistinguishable from coverage that never existed).
+function skip(name, reason) {
+  skipped += 1;
+  console.log(`  ↷ SKIP ${name}`);
+  console.log(`      reason: ${reason}`);
+}
 
 function test(name, fn) {
   try {
@@ -345,7 +354,18 @@ await testAsync('runMatrix / --dry-run: the CLI plans without executing anything
   assertEqual(plan.plan.length, 6, 'dry-run must still report the full interleaved plan');
 });
 
-await testAsync('runMatrix (via CLI subprocess): SIGINT mid-run leaves an already-finished JSONL line intact and restores prefs byte-identically', async () => {
+// Windows signal semantics make this test unrunnable as written: on win32
+// `child.kill('SIGINT')` is TerminateProcess — the child dies immediately and
+// its SIGINT handler NEVER runs, so the prefs-restore path under test cannot
+// execute and the byte-identical restore assert fails against correct code.
+// Real Windows coverage would require GenerateConsoleCtrlEvent delivered to a
+// console process group — its own piece of work, not a weaker assert here.
+const SIGINT_TEST_NAME = 'runMatrix (via CLI subprocess): SIGINT mid-run leaves an already-finished JSONL line intact and restores prefs byte-identically';
+if (process.platform === 'win32') {
+  skip(SIGINT_TEST_NAME,
+    'win32 signal semantics: kill("SIGINT") is TerminateProcess, the SIGINT handler never runs; real coverage needs GenerateConsoleCtrlEvent (separate work)');
+} else {
+await testAsync(SIGINT_TEST_NAME, async () => {
   const dir = tmpDir('forge-bench-sigint-');
   const prefsPath = bench.localPrefsPath(dir);
   const original = JSON.stringify({ resources: { enforcement: 'clamp' } });
@@ -398,6 +418,7 @@ await testAsync('runMatrix (via CLI subprocess): SIGINT mid-run leaves an alread
   for (const line of lines) JSON.parse(line); // no torn/partial line
   assertEqual(lines[0], firstLine, 'the exact finished record must survive byte-identically');
 });
+}
 
 // ── R2: the instrument must observe the CHILD, not the parent's intent ─────
 
@@ -490,7 +511,7 @@ await testAsync('spawnCompetitor: a timed-out competitor takes its grandchild wi
 }
 
 runAsyncTests().then(() => {
-  console.log(`\n${passed} passed, ${failed} failed`);
+  console.log(`\n${passed} passed, ${failed} failed${skipped > 0 ? `, ${skipped} skipped (named above)` : ''}`);
   if (failed > 0) {
     console.log('\nFailures:');
     for (const f of failures) console.log(`  - ${f.name}: ${f.error}`);

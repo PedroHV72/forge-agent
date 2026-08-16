@@ -38,6 +38,7 @@ const { spawnSync } = require('child_process');
 
 const { runVerificationGate } = require('./forge-verify.js');
 const { runVerification } = require('./forge-reverify.js');
+const { REASON_CODES } = require('./forge-resources.js');
 
 const HOOK_PATH = path.join(__dirname, 'forge-hook.js');
 const POOL_PATH = path.join(__dirname, 'forge-resource-pool.js');
@@ -46,6 +47,13 @@ const POOL_PATH = path.join(__dirname, 'forge-resource-pool.js');
 // silent (D8). Kept as one constant so a rename in the producers cannot leave
 // this suite asserting a string nobody emits any more.
 const OFF_REASON = 'intact:enforcement-off';
+
+// The reason the three consumers emit when the FORMULA refused admission
+// (critical pressure → admit:false, workers:0). Taken from the owning enum,
+// not re-typed: the producers and this suite must drift together or not at
+// all (D8). Distinct from OFF_REASON — this one names pressure, not the
+// operator's toggle.
+const REFUSED_REASON = REASON_CODES.INTACT_ADMISSION_REFUSED_ADVISORY;
 
 // ── Runner boilerplate (mirrors forge-verify-resources.test.js) ─────────────
 
@@ -141,7 +149,9 @@ function findEvent(events, name, reason) {
     (reason === undefined || e.reason === reason));
 }
 
-function runPreHook(command, { cwd, poolDir }) {
+// `pressure` defaults to '1' (normal — admission granted); '4' forces the
+// critical level where the formula returns admit:false / workers:0.
+function runPreHook(command, { cwd, poolDir, pressure }) {
   const payload = { session_id: crypto.randomUUID(), cwd, tool_name: 'Bash', tool_input: { command } };
   const result = spawnSync(process.execPath, [HOOK_PATH, 'pre'], {
     input: JSON.stringify(payload),
@@ -149,7 +159,7 @@ function runPreHook(command, { cwd, poolDir }) {
     cwd,
     env: Object.assign({}, process.env, {
       FORGE_RESOURCE_POOL_DIR: poolDir,
-      FORGE_RESOURCES_PRESSURE: '1',
+      FORGE_RESOURCES_PRESSURE: pressure || '1',
       NODE_OPTIONS: '',
     }),
   });
@@ -365,6 +375,84 @@ test('fail-safe: an unknown enforcement value leaves the control ON (only the ex
     'an unknown enforcement value took the enforcement:off bypass — fail-safe violated');
   assert(findEvent(events, 'rewrite-applied'),
     `the control did not act under an unknown enforcement value: ${JSON.stringify(events)}`);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. forge-hook.js — admit:false guard (critical pressure), parity with
+//    forge-verify.js / forge-reverify.js
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The defect this section locks down: under critical pressure the formula
+// returns `admit:false, workers:0`, and `--maxWorkers=0` / `VITEST_MAX_FORKS=0`
+// are FALSY to the runners — a rewrite emitted from that contract announces a
+// cap that does not exist (full parallelism), and playwright's `--workers=0`
+// can break the command outright. verify/reverify already skip the rewrite on
+// this path; before this guard the hook rewrote anyway and logged
+// `rewrite-applied` — telemetry claiming control at the exact moment there was
+// none. Revert the guard and every assert in the first test below fails: the
+// hook emits `updatedInput` with a zero-worker command and a `rewrite-applied`
+// event, and no `rewrite-skipped` with REFUSED_REASON is written.
+
+test('forge-hook PreToolUse: admit:false (pressão crítica) emits NO updatedInput — command passes through byte-identical', () => {
+  const cwd = workspaceWith('clamp');   // control ON — the bypass under test is pressure, not the toggle
+  const poolDir = tmpDir('forge-adm-hpool-refused-');
+  const res = runPreHook('vitest run', { cwd, poolDir, pressure: '4' });
+
+  assertEqual(res.status, 0, 'hook must never block (MEM008/B2), even under critical pressure');
+  assertEqual(res.stdout.trim(), '', `stdout must be empty under admit:false — a rewrite here announces a cap that does not exist: ${res.stdout}`);
+
+  const events = readEvents(cwd);
+  // D8: named, never silent — and named with the SAME reason the other two
+  // consumers emit, taken from the owning enum.
+  assert(findEvent(events, 'rewrite-skipped', REFUSED_REASON),
+    `no rewrite-skipped event with reason ${REFUSED_REASON}: ${JSON.stringify(events)}`);
+  // The core lie the guard removes: `rewrite-applied` must NEVER be claimed
+  // on a refused admission.
+  assert(!findEvent(events, 'rewrite-applied'),
+    `rewrite-applied emitted under admit:false — telemetry claims a cap that does not exist: ${JSON.stringify(events)}`);
+  // The two bypasses stay distinguishable: pressure never masquerades as the
+  // operator's toggle.
+  assert(!findEvent(events, 'rewrite-skipped', OFF_REASON),
+    'admission refusal emitted the enforcement-off reason — the two causes collapsed');
+
+  // W5: no lease leaks through the refused path (admit:false holds no slots
+  // today, but a leak here would be invisible without this census).
+  assertEqual(poolCensus(poolDir).held, 0, 'lease leaked on the admission-refused bypass');
+});
+
+test('forge-hook PreToolUse: admission granted (positive control) — the same command IS rewritten under normal pressure', () => {
+  // Guards the guard: an over-broad predicate that skips the rewrite for
+  // admitted contracts too would pass the test above and fail here.
+  const cwd = workspaceWith('clamp');
+  const poolDir = tmpDir('forge-adm-hpool-granted-');
+  const res = runPreHook('vitest run', { cwd, poolDir, pressure: '1' });
+
+  assertEqual(res.status, 0, 'hook must never block');
+  const lines = res.stdout.trim().split('\n').filter(Boolean);
+  assertEqual(lines.length, 1, `single-stdout invariant broken: ${res.stdout}`);
+  const parsed = JSON.parse(lines[0]);
+  assert(parsed.hookSpecificOutput && parsed.hookSpecificOutput.updatedInput &&
+    parsed.hookSpecificOutput.updatedInput.command !== 'vitest run',
+    'the admitted command was not rewritten — the admit guard swallowed the granted path');
+  assert(!findEvent(readEvents(cwd), 'rewrite-skipped', REFUSED_REASON),
+    `${REFUSED_REASON} emitted for an admitted contract`);
+});
+
+test('forge-hook PreToolUse: enforcement:off + critical pressure — the toggle reason wins (ordering parity with forge-verify.js)', () => {
+  // verify/reverify check `enforcement === 'off'` BEFORE `admit === false` so
+  // the emitted reason names the operator's toggle, not the pressure that
+  // happened to coincide with it. The hook must keep the same order.
+  const cwd = workspaceWith('off');
+  const poolDir = tmpDir('forge-adm-hpool-off-crit-');
+  const res = runPreHook('vitest run', { cwd, poolDir, pressure: '4' });
+
+  assertEqual(res.status, 0, 'hook must never block');
+  assertEqual(res.stdout.trim(), '', 'stdout must be empty when both bypasses apply');
+  const events = readEvents(cwd);
+  assert(findEvent(events, 'rewrite-skipped', OFF_REASON),
+    `toggle reason missing when off+critical coincide: ${JSON.stringify(events)}`);
+  assert(!findEvent(events, 'rewrite-skipped', REFUSED_REASON),
+    'pressure reason emitted although the operator toggle takes precedence');
 });
 
 // ── Report ─────────────────────────────────────────────────────────────────

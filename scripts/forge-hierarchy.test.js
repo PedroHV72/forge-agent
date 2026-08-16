@@ -71,6 +71,15 @@ function cleanup() {
   }
 }
 
+// Fixture-path lens. The code under test canonicalises every path through
+// `path.resolve` (containmentCounts keys, resolveRole/deriveEntryKind's
+// `self`), and on Windows `path.resolve('/a')` anchors on the current drive
+// (`D:\a` on the CI runner) — so a POSIX literal used as an object key or
+// compared byte-for-byte only matches on POSIX, where resolve is the
+// identity. Passing fixtures through the same lens proves the same thing on
+// both platforms.
+const P = (s) => path.resolve(s);
+
 // ── Constants ───────────────────────────────────────────────────────────────
 
 console.log('\nROLE_KINDS / REGISTRABLE_ROLES');
@@ -92,16 +101,18 @@ test('REGISTRABLE_ROLES não contém folder', () => {
 console.log('\ncontainmentCounts');
 
 test('transitividade: avô conta o neto', () => {
-  const counts = containmentCounts(['/a', '/a/b', '/a/b/c']);
-  assertEq(counts['/a'], 2, 'avô conta filho e neto');
-  assertEq(counts['/a/b'], 1, 'pai conta só o filho direto');
-  assertEq(counts['/a/b/c'], 0, 'folha não conta ninguém');
+  // Lookup keys go through P too: containmentCounts keys its result by the
+  // RESOLVED path, so `counts['/a']` is undefined on Windows (real key: D:\a).
+  const counts = containmentCounts([P('/a'), P('/a/b'), P('/a/b/c')]);
+  assertEq(counts[P('/a')], 2, 'avô conta filho e neto');
+  assertEq(counts[P('/a/b')], 1, 'pai conta só o filho direto');
+  assertEq(counts[P('/a/b/c')], 0, 'folha não conta ninguém');
 });
 
 test('guarda de separador: prefixo de string comum não conta', () => {
-  const counts = containmentCounts(['/a/Dev', '/a/Development']);
-  assertEq(counts['/a/Dev'], 0, '/a/Dev não contém /a/Development (mero prefixo de string)');
-  assertEq(counts['/a/Development'], 0, 'nem o inverso');
+  const counts = containmentCounts([P('/a/Dev'), P('/a/Development')]);
+  assertEq(counts[P('/a/Dev')], 0, '/a/Dev não contém /a/Development (mero prefixo de string)');
+  assertEq(counts[P('/a/Development')], 0, 'nem o inverso');
 });
 
 test('independência de ordem', () => {
@@ -119,37 +130,41 @@ test('independência de ordem', () => {
 
 console.log('\nresolveRole (classifyFn puro, sem disco)');
 
+// The maps handed to pureClassify must be keyed by the RESOLVED spelling:
+// resolveRole calls classifyFn with `path.resolve(absPath)`, so on Windows a
+// map keyed '/a' misses (`D:\a` arrives), the miss degrades to 'none' and the
+// role silently downgrades — the drive-anchoring trap again.
 function pureClassify(map) {
   return (dir) => ({ kind: map[dir] || 'none', signals: [], entries: [] });
 }
 
 test('workspace: projeto que contém outro ativo em qualquer profundidade', () => {
-  const cls = pureClassify({ '/a': 'project', '/a/b/c': 'project' });
-  assertEq(resolveRole('/a', ['/a', '/a/b/c'], cls), 'workspace', 'avô-projeto com neto ativo');
+  const cls = pureClassify({ [P('/a')]: 'project', [P('/a/b/c')]: 'project' });
+  assertEq(resolveRole(P('/a'), [P('/a'), P('/a/b/c')], cls), 'workspace', 'avô-projeto com neto ativo');
 });
 
 test('project: projeto folha, sem descendente ativo', () => {
-  const cls = pureClassify({ '/a/b/c': 'project' });
-  assertEq(resolveRole('/a/b/c', ['/a/b/c'], cls), 'project', 'folha sem filhos ativos');
+  const cls = pureClassify({ [P('/a/b/c')]: 'project' });
+  assertEq(resolveRole(P('/a/b/c'), [P('/a/b/c')], cls), 'project', 'folha sem filhos ativos');
 });
 
 test('folder: não-projeto ancestral estrito de pelo menos um ativo', () => {
-  const cls = pureClassify({ '/a': 'none', '/a/b/c': 'project' });
-  assertEq(resolveRole('/a', ['/a/b/c'], cls), 'folder', 'diretório neutro ancestral de um ativo');
+  const cls = pureClassify({ [P('/a')]: 'none', [P('/a/b/c')]: 'project' });
+  assertEq(resolveRole(P('/a'), [P('/a/b/c')], cls), 'folder', 'diretório neutro ancestral de um ativo');
 });
 
 test('folder: caso decisivo — touched com ativo abaixo é folder, não workspace (forma de lookchina/services)', () => {
-  const cls = pureClassify({ '/lookchina/services': 'touched', '/lookchina/services/freyr': 'project' });
+  const cls = pureClassify({ [P('/lookchina/services')]: 'touched', [P('/lookchina/services/freyr')]: 'project' });
   assertEq(
-    resolveRole('/lookchina/services', ['/lookchina/services', '/lookchina/services/freyr'], cls),
+    resolveRole(P('/lookchina/services'), [P('/lookchina/services'), P('/lookchina/services/freyr')], cls),
     'folder',
     'touched com filho ativo não é workspace'
   );
 });
 
 test('null: resto — não-projeto sem nenhum descendente ativo', () => {
-  const cls = pureClassify({ '/a/x': 'none' });
-  assertEq(resolveRole('/a/x', ['/a/b/c'], cls), null, 'diretório sem relação com nenhum ativo');
+  const cls = pureClassify({ [P('/a/x')]: 'none' });
+  assertEq(resolveRole(P('/a/x'), [P('/a/b/c')], cls), null, 'diretório sem relação com nenhum ativo');
 });
 
 // ── CLI end-to-end contra um registry-fixture ───────────────────────────────
@@ -255,9 +270,10 @@ console.log('\nsmoke: deriveEntryKind ainda exportado e coerente com resolveRole
 
 test('deriveEntryKind e resolveRole concordam quando self é projeto', () => {
   const { deriveEntryKind } = require('./forge-workspace.js');
-  const cls = pureClassify({ '/a': 'project', '/a/b': 'project' });
-  assertEq(deriveEntryKind('/a', ['/a', '/a/b'], cls), 'workspace');
-  assertEq(resolveRole('/a', ['/a', '/a/b'], cls), 'workspace');
+  // Same lens as above: both functions classify the resolved self.
+  const cls = pureClassify({ [P('/a')]: 'project', [P('/a/b')]: 'project' });
+  assertEq(deriveEntryKind(P('/a'), [P('/a'), P('/a/b')], cls), 'workspace');
+  assertEq(resolveRole(P('/a'), [P('/a'), P('/a/b')], cls), 'workspace');
 });
 
 // ── Report ────────────────────────────────────────────────────────────────

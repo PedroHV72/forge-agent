@@ -10,13 +10,48 @@ const { listFragments, parseFragment, readFragmentText } = require('./forge-memo
 // Vocabulário próprio. Não usar CODE_EXT/CITATION_REGEXES aqui: o detector deve
 // ser uma segunda observação, mais larga, do mesmo texto.
 const TRAILING_PUNCTUATION = '.,;:!?)]}>';
+const LEADING_PUNCTUATION = '(\'"[';
 const VERSION_RE = /^\d+(?:\.\d+)+$/;
 const PLAIN_NOISE = new Set(['e/ou', 'n/a', 'na', 'ou']);
+// Latin prose abbreviations that survive punctuation stripping as `x.y` tokens.
+const LATIN_ABBREVIATION_RE = /^(?:e\.g|i\.e|p\.ex)$/;
+// Template markers (`T##-PLAN.md`), interpolations (`{id}`, `${N}`), angle
+// placeholders (`<abs>`) and globs (`*`) name a FAMILY of files, never one file.
+const PLACEHOLDER_RE = /##|[{}<>*]/;
+// Real file extensions the detector accepts as "file-shaped" (<= 6 chars, the
+// same bound mentionKind imposes). Deliberately much broader than the
+// extractor's CODE_EXT — the detector stays an independent, wider observation —
+// but bounded to extensions that exist in the world, so `JSON.parse`, `turn.id`
+// or `v2.0` stop counting as files the extractor "missed". Binaries (exe, dll,
+// so) are excluded on purpose: prose naming `cmd.exe` names a program, not a
+// citable source artifact.
+const REAL_FILE_EXT = new Set([
+  'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte',
+  'py', 'rb', 'go', 'rs', 'java', 'kt', 'kts', 'swift', 'c', 'h', 'cc', 'cpp', 'hpp', 'cs',
+  'php', 'pl', 'lua', 'r', 'scala', 'exs', 'erl', 'sql', 'sh', 'bash', 'zsh', 'ps1', 'psm1',
+  'bat', 'cmd', 'dart', 'zig', 'nim', 'hs', 'clj', 'cljs', 'proto', 'gql',
+  'json', 'jsonl', 'jsonc', 'json5', 'yml', 'yaml', 'toml', 'ini', 'cfg', 'conf', 'env',
+  'xml', 'csv', 'tsv', 'lock', 'plist', 'pem',
+  'md', 'mdx', 'txt', 'rst', 'adoc', 'tex', 'log',
+  'html', 'htm', 'css', 'scss', 'sass', 'less', 'styl', 'svg', 'aspx', 'ejs', 'hbs', 'pug',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'bmp', 'pdf', 'zip', 'tar', 'gz', 'tgz',
+  'woff', 'woff2', 'ttf', 'otf', 'map', 'wasm', 'ipynb',
+]);
 
 function cleanToken(raw) {
   let value = String(raw || '');
+  // Strip wrapping punctuation on BOTH sides: `(forge-smoke.js` and
+  // `'forge-runs.js` are the same mention as their unwrapped forms — leaving
+  // the `(` in place made the normalized basename diverge from the citation
+  // the extractor correctly produced (measured: 8 phantom misses).
+  while (value.length > 1 && LEADING_PUNCTUATION.includes(value[0])) value = value.slice(1);
   while (value.length > 1 && TRAILING_PUNCTUATION.includes(value[value.length - 1])) value = value.slice(0, -1);
   return value;
+}
+
+function dotSuffix(value) {
+  const match = /\.([A-Za-z0-9]{1,6})$/.exec(String(value || ''));
+  return match ? match[1].toLowerCase() : null;
 }
 
 function basename(value) {
@@ -57,6 +92,25 @@ function detectorFalsePositive(mention) {
   if (VERSION_RE.test(normalized)) return 'número decimal ou versão nua';
   if (/^[a-z]\/([a-z]|\d)$/i.test(raw)) return 'abreviação com barra';
   if (mention.why === 'slash' && !/[.][A-Za-z0-9]{1,6}$/.test(normalized)) return 'token com barra sem aparência de arquivo';
+  // Each rule below is enumerated in detector_false_positives with its own
+  // named reason — a discarded class is COUNTED, never silently dropped.
+  if (LATIN_ABBREVIATION_RE.test(normalized)) return 'abreviação latina (e.g/i.e), não arquivo';
+  if (PLACEHOLDER_RE.test(raw) || PLACEHOLDER_RE.test(normalized)) return 'placeholder/template/glob (##, {x}, <x>, *), não um arquivo concreto';
+  const core = cleanToken(mention.raw);
+  const wrapped = core.length >= 2 && core[0] === '`' && core[core.length - 1] === '`';
+  const inner = wrapped ? core.slice(1, -1) : core;
+  const suffix = dotSuffix(normalized);
+  // A trailing slash names a DIRECTORY (`.gsd/`): its basename is empty, so it
+  // could never match a file citation — enumerate instead of leaving a
+  // permanently unmatchable mention in the denominator.
+  if (inner.endsWith('/')) return 'referência a diretório (termina em /), não arquivo';
+  // Backticks alone are not evidence of a file: `--cwd`, `default`, `domain:`
+  // are keywords/flags. A backticked token only stays signal with a slash or a
+  // real file extension.
+  if (wrapped && !inner.includes('/') && (!suffix || !REAL_FILE_EXT.has(suffix))) return 'keyword/flag entre crases, sem extensão de arquivo nem barra';
+  // Dotted identifiers (`JSON.parse`, `turn.id`, `v2.0`, `cmd.exe`) end in a
+  // "suffix" that is not a real file extension — prose, not a citation target.
+  if (suffix && !REAL_FILE_EXT.has(suffix)) return 'sufixo não é extensão de arquivo real (identificador com ponto)';
   return null;
 }
 

@@ -27,7 +27,7 @@
 const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
-const { execSync, spawnSync } = require('child_process');
+const { execSync, spawnSync, execFileSync } = require('child_process');
 const { readPrefsCached } = require('./forge-prefs.js');
 const { detectVcs } = require('./forge-vcs.js');
 const ws = require('./forge-workspace.js');
@@ -296,9 +296,19 @@ function resolveBranchName(pattern, runId) {
 }
 
 function gitDefaultBranch(repoPath) {
-  // Try origin/HEAD first; fall back to "main" then "master"
+  // Try origin/HEAD first; fall back to "main" then "master".
+  //
+  // execFileSync WITHOUT a shell (measured on the Windows CI runner): the old
+  // form appended `2>/dev/null` inside a shell:true string, and cmd.exe parses
+  // `/dev/null` as a literal (invalid) path — the whole command failed, so on
+  // Windows this ALWAYS fell through to the main/master fallback even when
+  // origin/HEAD was set. Same failure family as the "worktree born 13 commits
+  // behind" incident: a silently wrong branch base. stderr is discarded via
+  // stdio (portable), not a redirect; the error semantics are unchanged —
+  // any failure still lands in the catch and takes the fallback ladder.
   try {
-    const out = execSync('git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null', { cwd: repoPath, encoding: 'utf8', shell: true }).trim();
+    const out = execFileSync('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+      { cwd: repoPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     return out.replace(/^origin\//, '') || 'main';
   } catch {}
   for (const b of ['main', 'master']) {
@@ -639,11 +649,34 @@ function cleanupWorktreeOne(repoPath, worktreePath) {
 // Hence: git is the source, the registry is reinforcement whose divergence is
 // REPORTED, never absorbed.
 
-// git prints resolved (realpath) paths; on macOS os.tmpdir() is a symlink
-// (/var/... → /private/var/...), so raw string comparison would miss matches.
+// ── Canonical on-disk path spelling — ONE implementation ────────────────────
+// git prints fully resolved paths: on macOS os.tmpdir() is a symlink
+// (/var/... → /private/var/...), and on Windows os.tmpdir() can come back in
+// 8.3 short form (C:\Users\RUNNER~1\...) while git (`--git-common-dir`,
+// `git worktree list`) prints the long form (C:\Users\runneradmin\...).
+// Measured on the GitHub Windows runner: plain fs.realpathSync resolves
+// symlinks but does NOT expand 8.3 short names, so the same repo produced two
+// distinct identities and worktree matching matched nothing ("expected
+// [removed]" failures). fs.realpathSync.native calls GetFinalPathNameByHandle,
+// which expands 8.3 — but it can fail where the libuv fallback still works
+// (e.g. some network drives), hence a ladder, not a swap:
+//   .native → realpathSync → path.resolve (path may not exist yet: lexical).
+// This is the THIRD time this repo pays "lexical comparison where only
+// real-vs-real is truth" (memory-index path containment, the sweep vault in
+// PR #100, now worktree identity). Every consumer — normalizeWorktreePath
+// here, repoIdentity in forge-touch.js, and the test normalizer in
+// forge-isolation.test.js — MUST route through this helper; a fourth private
+// copy of the relation is the defect, not a convenience.
+function realpathCanonical(p) {
+  const abs = path.resolve(p);
+  try { return fs.realpathSync.native(abs); } catch {}
+  try { return fs.realpathSync(abs); } catch {}
+  return abs;
+}
+
 function normalizeWorktreePath(p) {
   if (!p || typeof p !== 'string') return '';
-  try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+  return realpathCanonical(p);
 }
 
 // Parses `git worktree list --porcelain`: blank-line separated blocks, each
@@ -1075,6 +1108,7 @@ module.exports = {
   resolveEffectiveMode, detectExternalWriteEngine, resolveRequireWorktree, resolveCleanupMode,
   deriveShapeMode,
   listWorktreesForBranch, listForgeWorktrees, listWorktrees, parseWorktreePorcelain, normalizeWorktreePath,
+  realpathCanonical,
   cleanupWorktreeOne, setupWorktreeOne, deriveWorktreePath,
   resolveWorktreeAnchor, validateWorktreeDirName, findContainingRoot, loadRegistryRoots,
   resolveBranchName, gitDefaultBranch, gitCurrentBranch,
