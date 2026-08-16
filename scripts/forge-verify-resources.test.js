@@ -460,8 +460,16 @@ test('verdict table (no-command / timeout=124 / not-found: 127 on sh, cmd.exe st
       assertEqual(nfOff.checks[0].exitCode, 127);
     }
 
-    // project's own exit code, via a plain non-runner command
-    const exitCmd = 'node -e "process.exit(3)"';
+    // project's own exit code, via a plain non-runner command.
+    // The code lives in a file instead of `node -e "…"`: on win32 the gate
+    // spawns `cmd /c <command>`, and cmd.exe eats the quotes around the inline
+    // program — measured, the child then exited 0 and the table asserted
+    // nothing. A script path carries no quoting, so the same command string
+    // means the same thing to /bin/sh and to cmd.exe.
+    // Referenced by basename, resolved against the gate's own cwd: an absolute
+    // temp path would drag a space-or-backslash quoting problem back in.
+    fs.writeFileSync(path.join(cwdTable, 'exit-three.js'), 'process.exit(3);\n');
+    const exitCmd = 'node exit-three.js';
     const exOn = runVerificationGate({ cwd: cwdTable, taskPlanVerify: exitCmd, commandTimeoutMs: 5000 });
     const exOff = runVerificationGate({
       cwd: cwdTable, taskPlanVerify: exitCmd, commandTimeoutMs: 5000,

@@ -253,23 +253,40 @@ process.stdout.write('Section 5: fixture integrity against the suites on disk\n'
     assert(resolved.ok === true, `fixture resolves cleanly for ${platform}`, (resolved.errors || []).join('; '));
   }
 
+  // What is asserted about the live fixture is its SHAPE, never its contents.
+  // An earlier version pinned "exactly the 11 chronic suites" and went red the
+  // moment the same PR fixed eight of them — a test that has to be edited every
+  // time the list legitimately shrinks teaches people to edit it, which is how a
+  // baseline rots. The count is data; these are the invariants:
   const win32 = resolveBaseline({ text, platform: 'win32', availableSuites: realSuites });
   if (win32.ok) {
-    assertEqual(win32.entries.length, 11, 'win32 baseline lists exactly the 11 chronic suites');
     assert(
-      win32.entries.every(e => e.item === 'I-20260815014759'),
-      'all win32 entries tracked by backlog item I-20260815014759'
+      win32.entries.every(e => e.item && /^I-\d{14}$/.test(e.item)),
+      'every entry names a backlog item — an entry with no owner is how a red becomes scenery'
+    );
+    assert(
+      win32.entries.every(e => e.reason && e.reason.trim().length > 0),
+      'every entry states a reason'
     );
     assert(
       win32.entries.every(e => realSuites.includes(e.suite)),
       'every win32 baseline suite exists on disk (no ghosts — a rename here must break this test)'
     );
-    assert(
-      win32.entries.some(e => e.suite === 'forge-isolation.test.js') &&
-        !win32.entries.some(e => e.suite === 'forge-isolation-runtime.test.js'),
-      'baseline pins forge-isolation.test.js exactly, not its -runtime sibling'
-    );
   }
+
+  // Exact-name matching, proven on the resolver instead of on the fixture: a
+  // prefix match would swallow the `-runtime` sibling and silence a real red.
+  const siblingProbe = resolveBaseline({
+    text: JSON.stringify({ win32: [{ suite: 'forge-isolation.test.js', item: 'I-20260815014759', reason: 'probe' }], darwin: [], linux: [] }),
+    platform: 'win32',
+    availableSuites: ['forge-isolation.test.js', 'forge-isolation-runtime.test.js'],
+  });
+  assert(siblingProbe.ok === true, 'sibling probe fixture resolves');
+  const siblingNames = siblingProbe.entries.map(e => e.suite);
+  assert(
+    siblingNames.includes('forge-isolation.test.js') && !siblingNames.includes('forge-isolation-runtime.test.js'),
+    'an entry matches its suite exactly, never the -runtime sibling by prefix'
+  );
 
   const darwin = resolveBaseline({ text, platform: 'darwin', availableSuites: realSuites });
   const linux = resolveBaseline({ text, platform: 'linux', availableSuites: realSuites });

@@ -335,6 +335,17 @@ test('SVN working-copy root guard is zero-spawn and preserves capture sentinel',
 });
 
 test('SVN captureDirty converts an unknown XML item into a primitive-level failure', () => {
+  if (process.platform === 'win32') {
+    // The stub below is an extension-less `#!/bin/sh` file: Windows cannot
+    // execute it, so `svn` fails to spawn and the primitive reports
+    // `svn-status-failed` — a spawn failure, never the XML propagation this
+    // case exists to prove. Named skip instead of a baseline entry, so the
+    // absence of coverage is stated in the output rather than tallied as a
+    // chronic red. Real Windows coverage needs a `.cmd` stub emitting the
+    // same XML (separate work).
+    console.log('  (skip: the svn stub is a POSIX #!/bin/sh script — on win32 it cannot spawn, so this asserts spawn failure instead of XML propagation)');
+    return;
+  }
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-vcs-svn-wc-'));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-vcs-svn-bin-'));
   try {

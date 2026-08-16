@@ -1334,7 +1334,12 @@ test('F2: Windows 8.3 rung — short (RUNNER~1-style) and long spellings converg
     const longDir = path.join(base, 'averylongdirectoryname-for-eightdotthree');
     fs.mkdirSync(longDir);
     const res = spawnSync('cmd', ['/d', '/s', '/c', `for %I in ("${longDir}") do @echo %~sI`], { encoding: 'utf8' });
-    const shortDir = (res.stdout || '').trim();
+    // Measured on the CI runner: `%~sI` came back WITH the surrounding quotes
+    // (`"c:\...\"`), and path.resolve on that string anchors it to the current
+    // drive — the comparison then read `d:\"c:\users\runner~1\..."` and the
+    // helper under test was never exercised. Strip them here rather than trust
+    // one cmd.exe quoting behaviour: the fixture must hand over a bare path.
+    const shortDir = (res.stdout || '').trim().replace(/^"+/, '').replace(/"+$/, '');
     if (!shortDir || path.resolve(shortDir).toLowerCase() === path.resolve(longDir).toLowerCase()) {
       console.log('  (skip: 8.3 name generation is disabled on this volume (fsutil 8dot3name) — no short alias exists to compare)');
       return;
