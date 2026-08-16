@@ -5342,6 +5342,26 @@ function smokeDomainEmission() {
   assert(!/Dimension 11/.test(planCheckerTxt),
     '(j) agents/forge-plan-checker.md NÃO contém "Dimension 11" (extensão aditiva à dim-7, sem 11ª dimensão)',
     'ocorrência inesperada de "Dimension 11"');
+
+  // (k) CRLF real em disco (T-20260811190103) — extractFrontmatter normaliza
+  // \r\n?/\n na entrada; um arquivo CRLF real (formato exato da repro do
+  // brief), não apenas conteúdo sintetizado LF, deve ler legacy:false/valid:true.
+  const rK = runCheck(structuredWith('domain: backend').replace(/\n/g, '\r\n'));
+  assert(rK.status === 0 && rK.parsed && rK.parsed.legacy === false && rK.parsed.valid === true && rK.parsed.domain === 'backend',
+    '(k) plano CRLF real em disco → legacy:false, valid:true, domain:"backend" preservado', JSON.stringify(rK));
+
+  // (l) BOM real em disco — a outra metade da mesma classe. Um editor Windows
+  // grava UTF-8 com BOM; `^---` erra, o plano lê como legacy, o gate enforcing
+  // desliga E o `domain` some (degradando o routing de `routing.<domain>`).
+  // Cobre BOM+LF e BOM+CRLF, que é o que Notepad + autocrlf produzem juntos.
+  for (const [rotulo, transform] of [
+    ['BOM+LF', (t) => '\uFEFF' + t],
+    ['BOM+CRLF', (t) => '\uFEFF' + t.replace(/\n/g, '\r\n')],
+  ]) {
+    const rL = runCheck(transform(structuredWith('domain: backend')));
+    assert(rL.status === 0 && rL.parsed && rL.parsed.legacy === false && rL.parsed.valid === true && rL.parsed.domain === 'backend',
+      `(l) plano ${rotulo} real em disco → legacy:false, valid:true, domain:"backend" preservado`, JSON.stringify(rL));
+  }
 }
 
 // ── Section 35: guard de integração 3-família (gemini) + R5 whitelist ──────
@@ -15495,6 +15515,66 @@ function smokeRoutingDomainsRendered() {
   pass('(final) Section 101: real rendered planner prompts carry routing and repository values with a biting fixture guard');
 }
 
+// ── Section 113: VERSION acompanha a linha de release das tags ──────────────
+//
+// `.github/workflows/release.yml` calcula o semver pelos commits convencionais
+// e cria a tag SOZINHO a cada merge com `feat:`/`fix:` — e nunca toca
+// `scripts/forge-version.js`. O resultado é drift silencioso: medido em
+// 2026-08-15, VERSION dizia `4.11.0` num checkout tagueado `v4.14.2`, ou seja
+// quem instalasse da master recebia projeções com `version=4.11.0` no marcador
+// de origem. O bump manual anterior tratou UMA instância; a causa é o workflow.
+//
+// A comparação é por MAJOR.MINOR, de propósito. Um gate literal
+// `VERSION === <tag>` ficaria vermelho logo após todo merge de `fix:` (patch
+// automático), e um gate permanentemente vermelho é um gate mudo — pior que
+// nenhum. Patch é ruído auto-corrigido no próximo release de feature; minor e
+// major são release de produto e EXIGEM o bump deliberado, com a regeneração
+// do golden e os dois literais fixados (o ritual está escrito no
+// forge-version.js).
+//
+// Vive no smoke porque só o job do smoke faz checkout com `fetch-depth: 0` —
+// o job de testes é depth-1 e não enxerga tag nenhuma. Mesmo precedente do
+// gate de escopo S07, e pela mesma razão.
+function smokeVersionTagLine() {
+  process.stdout.write('\n▸ Section 113: VERSION acompanha a linha de release das tags\n');
+  // A linha-resumo desta seção só é emitida se os asserts acima seguraram. O
+  // padrão da casa a emite incondicionalmente, o que imprime um ✓ afirmando
+  // sucesso ao lado de um ✗ real — uma alegação falsa no artefato cuja função é
+  // não fazer alegações falsas. Local a esta seção, sem tocar as outras.
+  const failsBefore = fails;
+  const { VERSION } = require('./forge-version.js');
+  const repoRoot = path.resolve(__dirname, '..');
+
+  const shown = spawnSync('git', ['tag', '-l', 'v*', '--sort=-v:refname'],
+    { cwd: repoRoot, encoding: 'utf8' });
+  const tags = shown.status === 0
+    ? shown.stdout.split('\n').map(line => line.trim()).filter(Boolean)
+    : [];
+
+  // Sem tag legível não há como medir — e um gate que passa limpo quando não
+  // mediu nada é indistinguível de um detector quebrado. Falha, nomeando.
+  assert(tags.length > 0,
+    '(a) há ao menos uma tag v* para medir (o job do smoke usa fetch-depth: 0)',
+    `git tag saiu ${shown.status}: ${(shown.stderr || '').trim()}`);
+
+  const line = (value) => String(value).replace(/^v/, '').split('.').slice(0, 2).join('.');
+  const latest = tags[0];
+  assert(line(VERSION) === line(latest),
+    `(b) VERSION (${VERSION}) e a tag mais recente (${latest}) compartilham major.minor`,
+    `bumpe scripts/forge-version.js para a linha ${line(latest)}.x — e no mesmo commit regenere o `
+    + `golden PELO RENDER PATH (o marcador embute version=) e atualize os literais fixados em `
+    + `forge-installer.test.js e forge-package.test.js`);
+
+  // Controle positivo: a comparação precisa MORDER. Uma linha deliberadamente
+  // diferente tem de reprovar pelo mesmo predicado.
+  assert(line('9.99.0') !== line(latest),
+    '(c) controle positivo: uma linha divergente é reprovada pelo mesmo predicado');
+
+  if (fails === failsBefore) {
+    pass('Section 113: VERSION e a tag mais recente compartilham major.minor, com piso anti-silêncio');
+  }
+}
+
 // ── Section 102: ledger snapshot proven in the RENDERED prompt + D1 exclusion ──
 //
 // S02's whole claim in one section: the ledger snapshot reaches plan-slice —
@@ -17298,6 +17378,7 @@ async function main() {
       () => { smokeVerifyReverifyChildSideE2E(); },
       () => { smokeResourcesObservabilityCensus(); },
       () => { smokeResourcesFlakeAndBenchGuard(); },
+      () => { smokeVersionTagLine(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
