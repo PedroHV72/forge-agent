@@ -60,8 +60,10 @@
 //
 // ── Posture ────────────────────────────────────────────────────────────────
 //
-// Read-only and advisory. This task's CLI has NO `--write` and emits NO event
-// (T02 adds both). Nothing on disk is mutated, which the suite proves by
+// Advisory, and its writes are exactly two, both its own (T02): the
+// `## File Audit (cross-run)` section of the target SUMMARY, and one appended
+// `work-lost` line per finding. `auditClaims` itself stays read-only, which the
+// suite proves by
 // SHA-256 of every `.gsd/forge/runs/<run-id>.json`, of `events.jsonl` and of the
 // (the glob is spelled out on purpose: a `slash-star` inside a line comment
 // opens a phantom block comment for the source scanner of the suite, which
@@ -72,9 +74,11 @@
 // CLI:
 //   node forge-claim-audit.js --slice S07 --milestone M-… [--cwd <dir>]
 //                             [--code-dir <dir>] [--run <id>] [--json]
+//                             [--write <SUMMARY>]
 
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 
 const { writtenByUnit, unitKeyFor } = require('./forge-unit-delta.js');
@@ -378,6 +382,11 @@ function compareClaimAudit(input) {
   const findings = [];
   let pairs_compared = 0;
   let units_compared = 0;
+  // Distinct written paths that entered the comparison. T02's `clean` sentence
+  // is an ASSERTION ABOUT WORK PERFORMED, and "N pairs" alone does not say over
+  // how much surface: two runs and one file is a different claim from two runs
+  // and four hundred. Counted from the units actually walked, never derived.
+  const pathsSeen = new Set();
 
   for (const unit of written) {
     if (!unit.files || unit.files.length === 0) {
@@ -385,6 +394,7 @@ function compareClaimAudit(input) {
       continue;
     }
     units_compared += 1;
+    for (const f of unit.files) pathsSeen.add(f);
     const declared = declaredBy instanceof Map ? (declaredBy.get(unit.unit) || null) : (declaredBy[unit.unit] || null);
 
     for (const c of claims) {
@@ -468,6 +478,7 @@ function compareClaimAudit(input) {
       claim_sources_contributing: contributing,
       claims_considered: claims.length,
       pairs_compared,
+      paths_compared: pathsSeen.size,
       findings: findings.length,
       skipped: skipped.length,
     },
@@ -551,11 +562,191 @@ function formatClaimAudit(result) {
   return lines.join('\n');
 }
 
+// ── The section, written BY CODE and UNCONDITIONALLY ───────────────────────
+//
+// The heading is `## File Audit (cross-run)`, anchored on its own literal and
+// therefore DISJOINT from the intra-slice `## File Audit` that sub-step 1.6
+// owns: `^## File Audit\r?$` cannot match this one and this one cannot match
+// that one. Two neighbouring sections, two owners, neither overwriting the
+// other — asserted in both directions by the suite.
+//
+// Emitted for ALL THREE verdicts, `clean` included. The instruction this
+// replaces ("if both are empty, omit the section entirely") is the origin
+// defect: an omitted section is byte-for-byte indistinguishable from a detector
+// that never ran. A clean section therefore does not merely exist — it STATES
+// THE WORK PERFORMED ("confrontei N pares sobre M caminhos"), which is a claim
+// a broken detector cannot make.
+const AUDIT_SECTION_HEADING = '## File Audit (cross-run)';
+const AUDIT_SECTION_ANCHOR = /^## File Audit \(cross-run\)\r?$/m;
+
+function formatClaimAuditMd(result) {
+  const cs = result.census;
+  const lines = [
+    AUDIT_SECTION_HEADING,
+    '',
+    '_Advisory — o que esta slice ESCREVEU (delta de VCS) confrontado com o que OUTRA run CLAIMOU. Sinaliza; não ordena runs, não bloqueia merge, não sugere quem mergeia primeiro._',
+    '',
+  ];
+  // Verdict + reason first, census second — the same two-line contract as the
+  // human rendering, so `inconclusive` can never be read as a quiet pass.
+  lines.push(`- Veredicto: **${result.verdict}** — ${result.reason}.`);
+  lines.push(
+    `- Censo: units ${cs.units_compared}/${cs.units_examined}`
+    + ` · fontes ${cs.claim_sources_contributing}/${cs.claim_sources_examined}`
+    + ` · claims ${cs.claims_considered} · pares ${cs.pairs_compared}`
+    + ` · caminhos ${cs.paths_compared} · achados ${cs.findings} · skipped ${cs.skipped}.`,
+  );
+
+  if (result.verdict === 'overlap') {
+    for (const f of result.findings) {
+      const paths = f.paths.length ? f.paths.map((p) => `\`${p}\``).join(', ') : '(nenhum caminho nomeado)';
+      const declared = f.declared_by_own_plan === null
+        ? 'declaração do próprio plano ilegível'
+        : (f.declared_by_own_plan ? 'declarado no próprio plano' : 'NÃO declarado no próprio plano');
+      lines.push(`- ⚠ \`${f.unit}\` × run \`${f.counterpart_run}\` — ${f.cause} (fonte: ${f.claim_source}): ${paths} — ${declared}.`);
+      if (f.note) lines.push(`  - nota: ${f.note} (incerteza transportada, não resolvida aqui).`);
+    }
+  } else if (result.verdict === 'clean') {
+    lines.push(`- Confrontei ${cs.pairs_compared} par(es) sobre ${cs.paths_compared} caminho(s) escrito(s) e não achei colisão.`);
+  } else {
+    lines.push(`- Inconclusivo: ${result.reason}. Não é uma afirmação de limpeza — nenhum par foi confrontado, então nada foi verificado.`);
+  }
+
+  for (const s of result.claim_sources) {
+    lines.push(`- Fonte \`${s.source}\`: consultada=${s.consulted}, contribuiu ${s.contributed}.`);
+  }
+  // Every discarded row surfaces with its reason. A census that reconciles but
+  // does not enumerate is a gate that counts without naming.
+  for (const s of result.skipped) {
+    lines.push(`- Fora da comparação [${s.kind}]: \`${s.id}\` — ${s.reason}${s.detail ? ` (${s.detail})` : ''}.`);
+  }
+  for (const n of result.notes) {
+    lines.push(`- Nota: \`${n.id}\` — ${n.reason}.`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Upsert the section into a SUMMARY. Mould: `forge-route-audit.upsertRouteSection`
+ * — no second section-writing mechanism enters this repo.
+ *
+ * Three NAMED refusals, and on each of them the target keeps its bytes: a write
+ * that cannot be proven safe does not happen partially and does not happen
+ * quietly somewhere else.
+ */
+function upsertClaimAuditSection(summaryPath, md, cwd) {
+  try {
+    if (!fs.existsSync(summaryPath)) return { written: false, reason: 'target-missing' };
+    const stat = fs.lstatSync(summaryPath);
+    if (stat.isSymbolicLink()) return { written: false, reason: 'target-symlink' };
+    const root = fs.realpathSync(path.resolve(cwd || process.cwd(), '.gsd'));
+    const realParent = fs.realpathSync(path.dirname(summaryPath));
+    const target = path.resolve(realParent, path.basename(summaryPath));
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) return { written: false, reason: 'outside-gsd' };
+
+    // Operate on the ORIGINAL bytes. Normalizing the whole file would rewrite
+    // line endings in sections this tool does not own; only the injected
+    // section is normalized, and it adopts the file's own convention.
+    const current = fs.readFileSync(summaryPath, 'utf8');
+    const crlf = /\r\n/.test(current);
+    const eol = crlf ? '\r\n' : '\n';
+    const section = md.replace(/\r\n/g, '\n').replace(/\n*$/, '\n').replace(/\n/g, eol);
+
+    let next;
+    const hit = AUDIT_SECTION_ANCHOR.exec(current);
+    if (hit) {
+      const tail = current.slice(hit.index + hit[0].length);
+      const nextHeader = /^## /m.exec(tail);
+      const end = nextHeader ? hit.index + hit[0].length + nextHeader.index : current.length;
+      next = current.slice(0, hit.index) + section + (nextHeader ? `${eol}${current.slice(end)}` : '');
+    } else {
+      const anchors = [/^## Checker Memory/m, /^## ⚠ Review Flags/m, /^## Security Flags/m, /^## Forward Intelligence/m, /^## Drill/m];
+      const anchor = anchors.map((re) => re.exec(current)).find(Boolean);
+      next = anchor
+        ? current.slice(0, anchor.index).replace(/[\r\n]*$/, eol + eol) + section + eol + current.slice(anchor.index)
+        : current.replace(/[\r\n]*$/, eol + eol) + section;
+    }
+    if (next !== current) fs.writeFileSync(summaryPath, next, 'utf8');
+    return { written: true, reason: null };
+  } catch (error) { return { written: false, reason: error.code || error.message }; }
+}
+
+// ── The event, written BY CODE ─────────────────────────────────────────────
+//
+// Why the event name did NOT change (SCOPE open question (e)): `work-lost`
+// already names this fact in the histories that exist, and renaming it would
+// orphan every historical line — the reader would have to know both names to
+// see one phenomenon. The legibility of the narrated lines is kept; what is
+// added is the ability to TELL THEM APART, through an ADDITIVE marker. An old
+// reader ignoring the two keys stays correct; a new one can say whether the
+// line was measured by a detector or written by a model about itself.
+const WORK_LOST_EMITTER = 'forge-claim-audit';
+const WORK_LOST_ORIGINS = ['code', 'narrated'];
+
+/**
+ * Classify one `work-lost` line. Accepts the raw JSON string or the parsed
+ * object. Closed set `{ code, narrated }`; a line that is not `work-lost` at
+ * all is LOUD here rather than silently bucketed as narrated.
+ */
+function originOf(line) {
+  let ev = line;
+  if (typeof line === 'string') {
+    try { ev = JSON.parse(line); } catch (e) {
+      throw new Error(`forge-claim-audit: linha work-lost ilegível: ${(e && e.message) || String(e)}`);
+    }
+  }
+  if (!ev || typeof ev !== 'object' || ev.event !== 'work-lost') {
+    throw new Error(`forge-claim-audit: originOf só classifica linhas work-lost, veio: ${ev && ev.event}`);
+  }
+  if (ev.origin === 'code' && ev.emitter === WORK_LOST_EMITTER) return 'code';
+  // No marker: the hand-written historical form. Named, never discarded.
+  return 'narrated';
+}
+
+/**
+ * Append ONE `work-lost` line PER FINDING to `.gsd/forge/events.jsonl` of the
+ * WORKSPACE `cwd` (never the CODE_DIR — the log lives with the artifacts).
+ *
+ * Field shape follows the historical narrated line verbatim (`milestone`,
+ * `slice`, `unit`, `cause`, `other_run`, `files`) so both forms read alike,
+ * plus the additive origin marker. Mould: `forge-claim-gate.emitGateEvent` —
+ * a failure to log NEVER swallows the finding and never hides that it failed.
+ */
+function emitWorkLostEvent(cwd, result) {
+  if (result.verdict !== 'overlap' || result.findings.length === 0) {
+    return { event_written: false, event_error: null, event_lines: 0, event_skipped: 'no-finding' };
+  }
+  const file = path.join(path.resolve(cwd || process.cwd()), '.gsd', 'forge', 'events.jsonl');
+  const payload = result.findings.map((f) => JSON.stringify({
+    ts: new Date().toISOString(),
+    event: 'work-lost',
+    milestone: result.milestone,
+    slice: result.slice,
+    unit: f.unit,
+    cause: f.cause,
+    other_run: f.counterpart_run,
+    files: f.paths,
+    claim_source: f.claim_source,
+    declared_by_own_plan: f.declared_by_own_plan,
+    // ADDITIVE marker — see WORK_LOST_ORIGINS above.
+    origin: 'code',
+    emitter: WORK_LOST_EMITTER,
+  })).join('\n');
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${payload}\n`, 'utf8');
+    return { event_written: true, event_error: null, event_lines: result.findings.length, event_skipped: null };
+  } catch (e) {
+    return { event_written: false, event_error: (e && e.message) || String(e), event_lines: 0, event_skipped: null };
+  }
+}
+
 // ── CLI ────────────────────────────────────────────────────────────────────
 const USAGE = [
   'uso: node scripts/forge-claim-audit.js --slice <S##> --milestone <id>',
   '                                       [--cwd <dir>] [--code-dir <dir>]',
   '                                       [--run <id>] [--json]',
+  '                                       [--write <SUMMARY.md>]',
   '',
   'Sinal advisory cross-run: confronta o que a unidade ESCREVEU (delta de VCS)',
   'contra o que OUTRA run CLAIMOU (registry vivo + histórico claim-gate).',
@@ -565,11 +756,13 @@ const USAGE = [
   '`clean` exige ter confrontado ao menos um par; sem par, o veredicto é',
   '`inconclusive` — nunca `clean`.',
   '',
-  'Esta CLI é read-only: não escreve seção e não emite evento (T02 acrescenta).',
+  'Com --write, o script é o dono da seção `## File Audit (cross-run)` do SUMMARY',
+'e a escreve nos TRÊS veredictos — seção omitida é indistinguível de detector',
+'quebrado. O evento `work-lost` (origin: code) é appendado só em `overlap`.',
 ].join('\n');
 
 function parseArgs(argv) {
-  const out = { slice: null, milestone: null, cwd: null, codeDir: null, run: null, json: false, help: false };
+  const out = { slice: null, milestone: null, cwd: null, codeDir: null, run: null, write: null, json: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') out.json = true;
@@ -579,6 +772,7 @@ function parseArgs(argv) {
     else if (a === '--cwd') out.cwd = argv[++i];
     else if (a === '--code-dir') out.codeDir = argv[++i];
     else if (a === '--run') out.run = argv[++i];
+    else if (a === '--write') out.write = argv[++i];
   }
   return out;
 }
@@ -593,6 +787,20 @@ function main(argv) {
     const result = auditClaims({
       cwd: args.cwd, codeDir: args.codeDir, milestone: args.milestone, slice: args.slice, run: args.run,
     });
+    if (args.write) {
+      const cwd = path.resolve(args.cwd || process.cwd());
+      // The section FIRST, and unconditionally: it is written even when the
+      // event fails, and even when the verdict is clean. Order matters — a
+      // logging failure must never be able to suppress the finding's rendering.
+      const up = upsertClaimAuditSection(path.resolve(args.write), formatClaimAuditMd(result), cwd);
+      result.write = up;
+      const ev = emitWorkLostEvent(cwd, result);
+      Object.assign(result, ev);
+      process.stderr.write(up.written
+        ? `forge-claim-audit: cross-run file audit: ${args.write}\n`
+        : `forge-claim-audit: refused: ${up.reason}\n`);
+      if (ev.event_error) process.stderr.write(`forge-claim-audit: evento work-lost NÃO registrado: ${ev.event_error}\n`);
+    }
     process.stdout.write(args.json
       ? `${JSON.stringify(result, null, 2)}\n`
       : `${formatClaimAudit(result)}\n`);
@@ -625,6 +833,14 @@ module.exports = {
   compareClaimAudit,
   auditClaims,
   formatClaimAudit,
+  formatClaimAuditMd,
+  upsertClaimAuditSection,
+  emitWorkLostEvent,
+  originOf,
+  AUDIT_SECTION_HEADING,
+  AUDIT_SECTION_ANCHOR,
+  WORK_LOST_EMITTER,
+  WORK_LOST_ORIGINS,
   runIdsForMilestone,
   parseArgs,
   main,
