@@ -71,6 +71,11 @@ const {
   probeClaim, classifyRelease, measureBaseline, CLAIM_RELEASE_REASONS,
 } = require('./forge-claim-release.js');
 const { readPrefs } = require('./forge-prefs.js');
+// S06/T02 — D8. The FACT ("a physical-isolation requirement was asked for and
+// refused") is `resolveEffectiveMode`'s to produce (S06/T01); this gate only
+// CONSUMES it. It is imported, never re-derived: a second reading of the SVN
+// short-circuit here would drift from the one the activation path uses.
+const { resolveEffectiveMode } = require('./forge-isolation.js');
 const runs = require('./forge-runs.js');
 
 // ── Closed sets ────────────────────────────────────────────────────────────
@@ -153,7 +158,39 @@ const GATE_NOTE_REASONS = [
   // ── Baseline measured at RECORD time (S05/T03, B2 posture).
   'vcs-baseline-absent',     // no `code_dir` was GIVEN, so nothing could be measured: `vcs_baseline: null`, NAMED, never derived from root/branch.
   'vcs-baseline-unmeasured', // a `code_dir` was given and the measurement FAILED (`detail` carries the seam's named error): `vcs_baseline: null`, NAMED.
+  // ── Isolation probe notes (S06/T02, D8). BOTH mean the same thing about the
+  // decision — the posture the PREF resolved STANDS, untouched — and different
+  // things about WHY the tree could not be measured, which is why they are two.
+  //
+  // A measurement that could not be made NEVER hardens and NEVER loosens
+  // (inherited verbatim from S05's release probes). The justification is
+  // specific to this gate: under a conflict, `defer` and `block` are BOTH safe
+  // — neither proceeds — so a missing measurement is not a reason to invent
+  // possession in either direction. It is a reason to say what was not known.
+  'isolation-unmeasured',  // no `code_dir` on the own claim NOR on the counterpart's: there is no tree to measure. NEVER derived from root/branch (B2).
+  'isolation-probe-threw', // the resolver (default `resolveEffectiveMode`) threw. `detail` carries its message. Posture unchanged — a broken probe never decides.
 ];
+
+// ── D8: the posture OVERRIDE, closed sets ──────────────────────────────────
+//
+// `svn-unmet-worktree` is the only override this gate knows how to justify:
+// the tree the own claim writes to has NO physical isolation and somebody ASKED
+// for it (S06/T01 named who, in `unmet_requirement`). In a shared tree,
+// "go do another task" does not lower the risk — it only changes WHICH file
+// gets trampled — so `defer` stops being an option (CONTEXT D8).
+const POSTURE_OVERRIDES = Object.freeze([
+  'svn-unmet-worktree', // SVN working copy + a refused worktree request. The only value; grown here, never inline.
+]);
+
+// The EFFECT is reported separately from the override, and that separation is
+// the point: an operator reading `block` must be able to tell a block the pref
+// already asked for from one D8 imposed. Collapsing them would make the
+// hardening invisible exactly where it changed nothing — and a hardening nobody
+// can see is indistinguishable from a hardening that never ran.
+const OVERRIDE_EFFECTS = Object.freeze([
+  'hardened',     // the pref said `defer`; D8 made it `block`. The decision CHANGED.
+  'already-block' // the pref already said `block`. Reported anyway: the fact that D8 also applies is not the pref's doing.
+]);
 
 // Escalations are a FIELD of the result, never a fifth decision value. The
 // decision stays `block` and the CONSUMER acts on the escalation — a gate that
@@ -303,31 +340,98 @@ function deriveClaimFromConcededItems(items) {
   };
 }
 
-// ── Posture: a SEAM for S06/D8, not an implementation ──────────────────────
+// ── Posture: the seam S04 left open, FILLED by S06/D8 ──────────────────────
 
 /**
- * `{ posture, override: null, note }`.
+ * The DEFAULT isolation resolver, held by REFERENCE (same mould as
+ * `DEFAULT_RELEASE_PROBE` below) so the suite asserts the wiring by IDENTITY
+ * instead of re-testing behaviour that already has its own suite one module
+ * over. The injectable seam is what makes the D8 pair deterministic: the same
+ * gate input, run twice, differing ONLY in whether the field comes back.
+ */
+const DEFAULT_ISOLATION_RESOLVER = resolveEffectiveMode;
+
+/**
+ * The `code_dir` of a run's persisted claim, or `null`.
  *
- * Today it validates the preference and returns it. The signature takes BOTH
- * complete `RunRecord`s on purpose (W3/D8): S06 will add the `defer` -> `block`
- * override by reading the additive field of `resolveEffectiveMode` on the
- * COUNTERPART's record, and it must be able to do so WITHOUT rewriting the
- * gate. `override` is the field that override will populate; it is `null` here
- * because D8 belongs to S06 by ROADMAP decision, not because it was forgotten.
+ * B2/S03: `code_dir` is a fact that was GIVEN at record time. It is read here
+ * and never derived from `root`+`branch`+`isolation_mode` — a derived string
+ * names a tree that may not exist, and measuring the wrong tree is worse than
+ * measuring none (the latter is at least NAMED).
+ */
+function claimCodeDirOf(record) {
+  const cd = record && record.write_claim && record.write_claim.code_dir;
+  return typeof cd === 'string' && cd !== '' ? cd : null;
+}
+
+/**
+ * `{ posture, override, override_effect, note, isolation_note, detail }`.
  *
- * The test asserts that the counterpart's record — including its
- * `isolation_mode` — actually reaches this function; a seam nobody feeds is a
- * seam that will be discovered broken in S06.
+ * ── What it decides (D8) ───────────────────────────────────────────────────
+ *
+ * 1. The pref, validated exactly as before (`posture-invalid` -> `defer`, named).
+ * 2. The tree: the OWN claim's `code_dir` FIRST, the counterpart's as fallback.
+ *    Own first because it is the tree THIS run is about to write to — and the
+ *    gate's own scope already guarantees the counterpart in confrontation sits
+ *    on the same tree or on an unmeasurable one (`different` is the only scope
+ *    that leaves, upstream in `evaluateGate`).
+ * 3. No tree, or a resolver that threw: the pref's posture STANDS and the hole
+ *    in the evidence is NAMED (`isolation_note`). Never hardened, never loosened.
+ * 4. `unmet_requirement` present -> `block`, `override: 'svn-unmet-worktree'`,
+ *    and the effect says whether that CHANGED anything.
+ *
+ * ── Two notes, never one ───────────────────────────────────────────────────
+ *
+ * `note` (the pref's validity) and `isolation_note` (the measurement) are
+ * DIFFERENT facts about different inputs, and both can be true at once. They
+ * ride in separate fields for the same reason `mechanism` and
+ * `persisted_mechanism` do below: a census where two findings collapse into one
+ * silently drops whichever the writer thought less important.
  */
 function resolvePosture(opts) {
   const o = opts || {};
+  let posture;
+  let note = null;
   if (POSTURES.includes(o.pref)) {
-    return { posture: o.pref, override: null, note: null };
+    posture = o.pref;
+  } else {
+    // Fail toward the softer of the two ONLY because the D3 floor below still
+    // converts a useless `defer` into `block`; the invalid value is NAMED, never
+    // silently accepted.
+    posture = 'defer';
+    note = 'posture-invalid';
   }
-  // Fail toward the softer of the two ONLY because the D3 floor below still
-  // converts a useless `defer` into `block`; the invalid value is NAMED, never
-  // silently accepted.
-  return { posture: 'defer', override: null, note: 'posture-invalid' };
+  const clean = (isolation_note, detail) => ({
+    posture, override: null, override_effect: null, note, isolation_note, detail: detail || null,
+  });
+
+  const codeDir = claimCodeDirOf(o.ownRun) || claimCodeDirOf(o.counterpartRun);
+  if (codeDir === null) return clean('isolation-unmeasured', 'nenhum claim em confronto trouxe code_dir');
+
+  const resolver = typeof o.isolationResolver === 'function' ? o.isolationResolver : DEFAULT_ISOLATION_RESOLVER;
+  let effective;
+  try {
+    effective = resolver(codeDir);
+  } catch (e) {
+    return clean('isolation-probe-threw', e && e.message ? e.message : String(e));
+  }
+
+  // THE line that consumes S06/T01's field — exactly one in this file, and the
+  // target of the suite's EXECUTED bite. Neutralising it must turn the
+  // `presente` case red; if it does not, the assert never reached its target.
+  const unmet = effective && effective.unmet_requirement;
+  if (!unmet) return clean(null, null);
+
+  return {
+    posture: 'block',
+    override: 'svn-unmet-worktree',
+    // `already-block` is not a no-op report: it says D8 ALSO applies here, which
+    // the operator cannot infer from a `block` the pref alone would have given.
+    override_effect: posture === 'block' ? 'already-block' : 'hardened',
+    note,
+    isolation_note: null,
+    detail: null,
+  };
 }
 
 // ── The decision ───────────────────────────────────────────────────────────
@@ -682,8 +786,33 @@ function evaluateGate(opts) {
     pref: o.posture,
     ownRun,
     counterpartRun: firstConflicting ? firstConflicting.record : null,
+    // S06/T02: the injectable isolation seam travels from here, so the
+    // operational entry point cannot silently fall back to the default while the
+    // suite exercises an injection.
+    isolationResolver: o.isolationResolver,
   });
   if (resolved.note) census.notes.push({ id: runId, reason: resolved.note });
+  if (resolved.isolation_note) {
+    const n = { id: runId, reason: resolved.isolation_note };
+    if (resolved.detail) n.detail = resolved.detail;
+    census.notes.push(n);
+  }
+  // Same seam discipline as the scope note and the conflict cause above: this
+  // function is reached through `module.exports`, so a substituted
+  // implementation (or a future value grown without teaching the sets) must be
+  // LOUD here. An unlabelled override string would be read as absence by every
+  // `if (result.posture_override)` downstream — silence wearing a field name.
+  if (!POSTURES.includes(resolved.posture)) {
+    throw new Error(`forge-claim-gate: postura fora de POSTURES: ${JSON.stringify(resolved.posture)}`);
+  }
+  if (resolved.override !== null && resolved.override !== undefined
+      && !POSTURE_OVERRIDES.includes(resolved.override)) {
+    throw new Error(`forge-claim-gate: override fora de POSTURE_OVERRIDES: ${JSON.stringify(resolved.override)}`);
+  }
+  if (resolved.override_effect !== null && resolved.override_effect !== undefined
+      && !OVERRIDE_EFFECTS.includes(resolved.override_effect)) {
+    throw new Error(`forge-claim-gate: efeito fora de OVERRIDE_EFFECTS: ${JSON.stringify(resolved.override_effect)}`);
+  }
 
   let decision = resolved.posture;
   let floor = null;
@@ -704,7 +833,14 @@ function evaluateGate(opts) {
     floor,
     counterparts,
     paths: matchedPaths,
+    // ADDITIVE, all three (same convention as `released_counterparts`): a reader
+    // that ignores them stays correct. `posture` KEEPS its meaning — the posture
+    // resolved from the PREF — because changing it would retroactively falsify
+    // every `claim-gate` line already in events.jsonl. `posture_effective` is
+    // the one that decided.
+    posture_effective: resolved.posture,
     posture_override: resolved.override,
+    posture_override_effect: resolved.override_effect,
   }, base);
 }
 
@@ -869,6 +1005,13 @@ function emitGateEvent(cwd, result) {
     undeclared_side: result.undeclared_side === undefined ? null : result.undeclared_side,
     posture: result.posture === undefined ? null : result.posture,
     posture_source: result.posture_source === undefined ? null : result.posture_source,
+    // ADDITIVE (S06/T02, D8). `posture` above is unchanged and still means "the
+    // posture the pref resolved to" — the three keys below say what actually
+    // decided and whether D8 hardened it. An old reader ignoring them stays
+    // correct; a new one can explain a `block` the pref never asked for.
+    posture_effective: result.posture_effective === undefined ? null : result.posture_effective,
+    posture_override: result.posture_override === undefined ? null : result.posture_override,
+    posture_override_effect: result.posture_override_effect === undefined ? null : result.posture_override_effect,
     escalation: result.escalation === undefined ? null : result.escalation,
     floor: result.floor === undefined ? null : result.floor,
     counterparts: result.counterparts || [],
@@ -1005,6 +1148,8 @@ function recordAndEvaluate(opts) {
     releaseProbe: o.releaseProbe,
     releaseClassify: o.releaseClassify,
     releaseProbeOpts: o.releaseProbeOpts,
+    // S06/T02 — same reason as the release seam directly above.
+    isolationResolver: o.isolationResolver,
   });
 
   let result = evaluate();
@@ -1100,6 +1245,13 @@ function formatGate(result) {
   if (result.posture) {
     lines.push(`  postura: ${result.posture} (origem: ${result.posture_source})`);
   }
+  if (result.posture_override) {
+    // A hardening nobody can read is inert hardening (S06-PLAN acceptance #7).
+    lines.push(
+      `  endurecimento D8: ${result.posture_override} — postura efetiva ${result.posture_effective}`
+      + ` (${result.posture_override_effect}: sem isolamento físico, "escolher outra task" só troca qual arquivo é atropelado)`,
+    );
+  }
   if (result.wait) {
     lines.push(`  espera: ${result.wait.polls} polls · ${result.wait.waited_ms}ms de teto ${result.wait.ceiling_ms}ms`);
   }
@@ -1142,6 +1294,12 @@ const USAGE = [
   'Counterpart cujo claim já foi LIBERADO (S05) sai do universo com skip nomeado',
   '(claim-released:<mecanismo>), contado no censo — nunca vira claim-absent. Sonda de',
   'release que não pôde responder MANTÉM o counterpart em escopo, com note nomeada.',
+  '',
+  'D8: se a árvore do claim (code_dir) não tem isolamento físico e alguém o pediu',
+  '(unmet_requirement do resolveEffectiveMode), a postura defer é ENDURECIDA para',
+  'block — reportada em posture_effective/posture_override/posture_override_effect.',
+  'Árvore que não pôde ser medida NÃO endurece e NÃO afrouxa: mantém a postura da',
+  'pref e diz por quê (isolation-unmeasured | isolation-probe-threw).',
   '',
   'Este gate é ENFORCING: erro interno sai com exit != 0. O consumidor que',
   'receber exit != 0 ou stdout não-JSON trata como block/gate-unavailable.',
@@ -1317,6 +1475,12 @@ module.exports = {
   GATE_NOTE_REASONS,
   UNCOVERED_BOUNDARIES,
   POSTURES,
+  // S06/T02 (D8): closed sets + the default seam, exported so the suite can
+  // cross them in BOTH directions and assert the wiring by reference identity
+  // against `forge-isolation.resolveEffectiveMode`.
+  POSTURE_OVERRIDES,
+  OVERRIDE_EFFECTS,
+  DEFAULT_ISOLATION_RESOLVER,
   // S05/T03: exported so the suite can assert the default seam by REFERENCE
   // IDENTITY against `forge-claim-release.probeClaim` — behaviour is T02's to
   // prove, wiring is this module's.

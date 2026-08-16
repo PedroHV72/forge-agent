@@ -32,6 +32,16 @@
 //       the two S03 polarity suites stay green BY SPAWN, without edition.
 //   G12 CLI posture: exit 0 when it evaluated (any decision), 2 on usage, != 0
 //       on an internal error — this gate is ENFORCING, not advisory.
+//   G23 D8 (S06/T02): the SAME gate input decides `block` when the isolation
+//       resolver returns `unmet_requirement` and `defer` when it does not —
+//       the ONLY difference between the two runs being the presence of the
+//       field. Plus the same pair against a REAL fixture (an `.svn` working
+//       copy with `require_worktree: true` × a git checkout) with NO injected
+//       resolver, an EXECUTED bite on the single line that reads the field,
+//       both new closed sets crossed in both directions, the two
+//       non-measurement notes (which never harden and never loosen), and the
+//       interaction with the D3 floor (D8 fires BEFORE it, so `floor` is null
+//       and the two routes to `block` stay distinguishable).
 //
 // Zero deps. Standalone runner, repo convention: exit != 0 on failure.
 
@@ -43,6 +53,7 @@ const { spawnSync } = require('child_process');
 const MODULE = path.join(__dirname, 'forge-claim-gate.js');
 const POLARITY_TEST = path.join(__dirname, 'forge-claim-polarity.test.js');
 const OVERLAP_TEST = path.join(__dirname, 'forge-claim-overlap.test.js');
+const LEASE_REPRO_TEST = path.join(__dirname, 'forge-claim-lease-repro.test.js');
 
 const gate = require('./forge-claim-gate.js');
 const {
@@ -1640,6 +1651,352 @@ console.log('\nG22: release — skip nomeado, mordida nos dois sentidos, sonda f
     assert(!/colide com o release/.test(cs.reason),
       'a razão antiga virou mentira enumerada: o release de IN-6 foi entregue nesta slice');
     assert(/Deferred do CONTEXT/.test(cs.reason), 'a razão precisa dizer que a fronteira está fora por DECISÃO');
+  });
+}
+
+// ── G23: D8 — o gate CONSOME o campo de S06/T01 ────────────────────────────
+//
+// A prova NÃO é "o gate lê o campo" (T02/S04 desta milestone pagou por medir a
+// coisa errada). A prova é: a MESMA entrada de gate decide DIFERENTE conforme a
+// presença do campo, e a única diferença entre as duas execuções é essa.
+console.log('\nG23: D8 — a MESMA entrada decide diferente conforme a presença de unmet_requirement');
+{
+  const { POSTURE_OVERRIDES, OVERRIDE_EFFECTS, DEFAULT_ISOLATION_RESOLVER } = gate;
+  const isolation = require('./forge-isolation.js');
+
+  // A forma EXATA que S06/T01 entrega (lida do T01-SUMMARY, não suposta).
+  const UNMET = Object.freeze({
+    requirement: 'worktree',
+    asked_by: ['require_worktree:true'],
+    blocked_by: 'vcs:svn',
+    write_engine: null,
+  });
+
+  // Um ÚNICO retorno base. O caso `presente` é ele MAIS a chave; o caso
+  // `ausente` é ele. Construir os dois de bases separadas deixaria a frase "a
+  // única diferença é o campo" como afirmação; assim ela é construção.
+  const BASE_EFF = Object.freeze({
+    mode: 'shared', user_mode: 'shared', mode_origin: 'default',
+    require_worktree: 'true', elevated: false, write_engine: null, vcs: 'svn',
+  });
+  const effAusente = () => Object.assign({}, BASE_EFF);
+  const effPresente = () => Object.assign({}, BASE_EFF, { unmet_requirement: UNMET });
+
+  /** A MESMA colisão, sempre: duas runs reivindicando o mesmo arquivo. */
+  function d8Fixture(codeDir) {
+    return makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js'], codeDir) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js'], codeDir) },
+    ]);
+  }
+  function decide(ws, resolver, over) {
+    return record(evaluateGate(Object.assign({
+      cwd: ws,
+      runId: 'M-own',
+      claim: claim(['scripts/x.js'], over && 'codeDir' in over ? over.codeDir : undefined),
+      posture: 'defer',
+      readyAlternatives: 2, // longe do piso D3, para o block NUNCA vir dele aqui
+      isolationResolver: resolver,
+    }, (over && over.gate) || {})));
+  }
+
+  test('G23a: o delta entre os dois retornos do resolvedor é EXATAMENTE a chave unmet_requirement', () => {
+    const a = Object.keys(effAusente()).sort();
+    const b = Object.keys(effPresente()).sort();
+    assertEqual(JSON.stringify(b.filter((k) => !a.includes(k))), JSON.stringify(['unmet_requirement']),
+      'o caso presente só pode ter A MAIS a chave do campo');
+    assertEqual(JSON.stringify(a.filter((k) => !b.includes(k))), JSON.stringify([]),
+      'e nada a menos — senão a comparação de decisão mediria outra coisa junto');
+  });
+
+  test('G23b: PAR D8 — campo PRESENTE endurece defer em block (override nomeado, sem piso)', () => {
+    const r = decide(d8Fixture(), effPresente);
+    assertEqual(r.decision, 'block', 'com o campo presente, defer deixa de ser opção (D8)');
+    assertEqual(r.posture_effective, 'block');
+    assertEqual(r.posture_override, 'svn-unmet-worktree');
+    assertEqual(r.posture_override_effect, 'hardened');
+    assertEqual(r.floor, null, 'este block vem de D8, não do piso D3 — as duas rotas não são a mesma coisa');
+    assertEqual(r.cause, 'overlap');
+  });
+
+  test('G23c: PAR D8 — MESMA entrada, campo AUSENTE: decisão defer, nenhum override', () => {
+    const r = decide(d8Fixture(), effAusente);
+    assertEqual(r.decision, 'defer', 'sem o campo, a pref decide como sempre decidiu');
+    assertEqual(r.posture_effective, 'defer');
+    assertEqual(r.posture_override, null);
+    assertEqual(r.posture_override_effect, null);
+    assert(!r.census.notes.some((n) => /^isolation-/.test(n.reason)),
+      'a árvore FOI medida (o resolvedor respondeu) — nenhuma note de não-medição cabe aqui');
+  });
+
+  test('G23d: pref block + campo presente -> segue block, mas o endurecimento é REPORTADO (already-block)', () => {
+    const r = decide(d8Fixture(), effPresente, { gate: { posture: 'block' } });
+    assertEqual(r.decision, 'block');
+    assertEqual(r.posture_override, 'svn-unmet-worktree');
+    assertEqual(r.posture_override_effect, 'already-block',
+      'um block que a pref já pedia precisa ser distinguível de um que D8 impôs');
+    // E o contraste que dá sentido ao rótulo:
+    assertEqual(decide(d8Fixture(), effPresente).posture_override_effect, 'hardened');
+  });
+
+  test('G23e: piso D3 — com campo, block com override e floor null; sem campo, block por defer-floor', () => {
+    const semAlternativa = { gate: { readyAlternatives: 0 } };
+    const comCampo = decide(d8Fixture(), effPresente, semAlternativa);
+    assertEqual(comCampo.decision, 'block');
+    assertEqual(comCampo.posture_override, 'svn-unmet-worktree');
+    assertEqual(comCampo.floor, null,
+      'o endurecimento acontece ANTES do piso: o piso só vê `defer`, e já não há defer');
+
+    const semCampo = decide(d8Fixture(), effAusente, semAlternativa);
+    assertEqual(semCampo.decision, 'block', 'a mesma entrada sem campo também bloqueia — por outra rota');
+    assertEqual(semCampo.floor, 'defer-floor');
+    assertEqual(semCampo.posture_override, null,
+      'o piso NUNCA se disfarça de endurecimento D8 — as duas rotas para block são nomeadas separadamente');
+  });
+
+  test('G23f: sem code_dir em NENHUM dos lados -> zero override + note isolation-unmeasured (com controle)', () => {
+    let chamadas = 0;
+    const contando = (dir) => { chamadas++; return effPresente(dir); };
+    const r = decide(d8Fixture(null), contando, { codeDir: null });
+    assertEqual(r.decision, 'defer', 'não-medição não endurece — a postura da pref permanece');
+    assertEqual(r.posture_override, null);
+    assertEqual(chamadas, 0, 'sem árvore não há o que medir: o resolvedor sequer é chamado');
+    const note = r.census.notes.find((n) => n.reason === 'isolation-unmeasured');
+    assert(note, 'a não-medição precisa ser NOMEADA, nunca silenciosa');
+
+    // Controle positivo: a MESMA fixture, com code_dir, produz o override —
+    // prova de que o `defer` acima veio da ausência de árvore, não de um
+    // resolvedor que nunca teria endurecido nada.
+    assertEqual(decide(d8Fixture(), contando).posture_override, 'svn-unmet-worktree');
+    assertEqual(chamadas, 1, 'e agora o resolvedor FOI chamado — o controle não é vacuidade');
+  });
+
+  test('G23g: resolvedor que LANÇA -> zero override + note isolation-probe-threw carregando o erro', () => {
+    const r = decide(d8Fixture(), () => { throw new Error('probe boom'); });
+    assertEqual(r.decision, 'defer', 'sonda quebrada nunca endurece nem afrouxa');
+    assertEqual(r.posture_override, null);
+    const note = r.census.notes.find((n) => n.reason === 'isolation-probe-threw');
+    assert(note, 'a sonda que lançou precisa ser nomeada');
+    assert(/probe boom/.test(note.detail || ''), `a note deve carregar o erro: ${JSON.stringify(note)}`);
+  });
+
+  test('G23h: o code_dir PRÓPRIO tem precedência; o do counterpart é o fallback', () => {
+    const medidos = [];
+    const espia = (dir) => { medidos.push(dir); return effAusente(); };
+    // Próprio com code_dir, counterpart com outro: mede o PRÓPRIO.
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js'], '/arvore/propria') },
+      { id: 'M-other', write_claim: claim(['scripts/x.js'], '/arvore/propria') },
+    ]);
+    record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js'], '/arvore/propria'),
+      posture: 'defer', readyAlternatives: 2, isolationResolver: espia,
+    }));
+    assertEqual(JSON.stringify(medidos), JSON.stringify(['/arvore/propria']),
+      'é a árvore em que ESTA run vai escrever que decide');
+
+    // Próprio SEM code_dir: cai para o do counterpart (que segue em escopo por
+    // `unknown` — fail closed), e mede aquele.
+    medidos.length = 0;
+    const ws2 = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js'], null) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js'], '/arvore/do/outro') },
+    ]);
+    record(evaluateGate({
+      cwd: ws2, runId: 'M-own', claim: claim(['scripts/x.js'], null),
+      posture: 'defer', readyAlternatives: 2, isolationResolver: espia,
+    }));
+    assertEqual(JSON.stringify(medidos), JSON.stringify(['/arvore/do/outro']),
+      'sem árvore própria, a do counterpart em confronto é a melhor medição disponível');
+  });
+
+  test('G23i: o default do seam é resolveEffectiveMode de S06/T01 — por IDENTIDADE DE REFERÊNCIA', () => {
+    assertEqual(DEFAULT_ISOLATION_RESOLVER, isolation.resolveEffectiveMode,
+      'o wiring é deste módulo; o COMPORTAMENTO já tem suíte um módulo ao lado');
+  });
+
+  test('G23j: valor fora dos conjuntos fechados é LOUD no seam — nunca string sem rótulo', () => {
+    const real = gate.resolvePosture;
+    const ws = d8Fixture();
+    const call = () => evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'defer', readyAlternatives: 2,
+    });
+    try {
+      gate.resolvePosture = () => ({ posture: 'defer', override: 'inventado', override_effect: null, note: null });
+      let threw = null;
+      try { call(); } catch (e) { threw = e.message; }
+      assert(threw && /POSTURE_OVERRIDES/.test(threw), `override fora do conjunto tem de gritar: ${threw}`);
+
+      gate.resolvePosture = () => ({ posture: 'defer', override: null, override_effect: 'inventado', note: null });
+      threw = null;
+      try { call(); } catch (e) { threw = e.message; }
+      assert(threw && /OVERRIDE_EFFECTS/.test(threw), `efeito fora do conjunto tem de gritar: ${threw}`);
+
+      gate.resolvePosture = () => ({ posture: 'talvez', override: null, override_effect: null, note: null });
+      threw = null;
+      try { call(); } catch (e) { threw = e.message; }
+      assert(threw && /POSTURES/.test(threw), `postura fora do conjunto tem de gritar: ${threw}`);
+    } finally {
+      gate.resolvePosture = real;
+    }
+    // E o seam restaurado volta a decidir normalmente — o teste não deixa
+    // destroço para os blocos seguintes.
+    assertEqual(record(call()).decision, 'defer');
+  });
+
+  test('G23k: cruzamento dos conjuntos novos nos DOIS sentidos', () => {
+    const overridesSeen = new Set();
+    const effectsSeen = new Set();
+    for (const r of [
+      decide(d8Fixture(), effPresente),
+      decide(d8Fixture(), effPresente, { gate: { posture: 'block' } }),
+    ]) {
+      overridesSeen.add(r.posture_override);
+      effectsSeen.add(r.posture_override_effect);
+    }
+    // Direção 1: tudo que o código emitiu está declarado.
+    for (const v of overridesSeen) assert(POSTURE_OVERRIDES.includes(v), `override fora do conjunto: ${v}`);
+    for (const v of effectsSeen) assert(OVERRIDE_EFFECTS.includes(v), `efeito fora do conjunto: ${v}`);
+    // Direção 2: tudo que está declarado foi emitido por >= 1 caso.
+    for (const v of POSTURE_OVERRIDES) assert(overridesSeen.has(v), `override declarado e nunca emitido: ${v}`);
+    for (const v of OVERRIDE_EFFECTS) assert(effectsSeen.has(v), `efeito declarado e nunca emitido: ${v}`);
+    assert(Object.isFrozen(POSTURE_OVERRIDES) && Object.isFrozen(OVERRIDE_EFFECTS), 'conjuntos fechados são congelados');
+  });
+
+  test('G23l: os três campos viajam no evento, no --json e no render; `posture` NÃO muda de sentido', () => {
+    const ws = d8Fixture();
+    const r = recordEsc(recordAndEvaluate({
+      cwd: ws,
+      runId: 'M-own',
+      unit: 'execute-task/T02',
+      paths: ['scripts/x.js'],
+      codeDir: '/code/dir',
+      readyAlternatives: 2,
+      prefsOpts: prefsOpts(),
+      isolationResolver: effPresente,
+    }));
+    assertEqual(r.decision, 'block');
+    assertEqual(r.posture, 'defer',
+      '`posture` continua sendo a postura RESOLVIDA DA PREF — trocar seu sentido falsificaria retroativamente todo events.jsonl já escrito');
+    assertEqual(r.posture_effective, 'block', 'a que decidiu viaja em campo PRÓPRIO');
+
+    const ev = JSON.parse(fs.readFileSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), 'utf8').trim().split('\n').pop());
+    assertEqual(ev.event, 'claim-gate');
+    assertEqual(ev.posture, 'defer');
+    assertEqual(ev.posture_effective, 'block');
+    assertEqual(ev.posture_override, 'svn-unmet-worktree');
+    assertEqual(ev.posture_override_effect, 'hardened');
+    // Leitor ANTIGO que ignora as chaves novas continua correto.
+    for (const k of ['decision', 'cause', 'census', 'counterparts', 'not_covered', 'posture', 'posture_source']) {
+      assert(Object.prototype.hasOwnProperty.call(ev, k), `campo pré-existente sumiu do evento: ${k}`);
+    }
+
+    const rendered = gate.formatGate(r);
+    assert(/endurecimento D8: svn-unmet-worktree/.test(rendered), `o render precisa mostrar o endurecimento:\n${rendered}`);
+    assert(/hardened/.test(rendered), 'e o efeito — endurecimento que ninguém lê é endurecimento inerte');
+    // O --json é o próprio resultado serializado: as chaves estão nele.
+    const asJson = JSON.parse(JSON.stringify(r));
+    for (const k of ['posture_effective', 'posture_override', 'posture_override_effect']) {
+      assert(Object.prototype.hasOwnProperty.call(asJson, k), `chave ausente do --json: ${k}`);
+    }
+  });
+
+  // ── G23m: o par PRESENÇA/AUSÊNCIA contra FIXTURE REAL, sem resolvedor injetado ──
+  //
+  // O seam injetado prova o DETERMINISMO (a decisão muda só pelo campo); a
+  // fixture real prova o FIO (o campo que o gate lê é mesmo o que
+  // `resolveEffectiveMode` produz numa árvore de verdade). Nenhuma das duas
+  // substitui a outra.
+  test('G23m: fixture REAL — working copy .svn + require_worktree:true bloqueia; checkout git defere', () => {
+    const home = mktmp(); // HOME neutro: as prefs globais do operador nunca decidem um teste
+    const prevHome = process.env.HOME;
+    const prevUp = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      const svnTree = mktmp();
+      fs.mkdirSync(path.join(svnTree, '.svn'), { recursive: true });
+      fs.mkdirSync(path.join(svnTree, '.gsd'), { recursive: true });
+      fs.writeFileSync(path.join(svnTree, '.gsd', 'forge-prefs.jsonc'),
+        `${JSON.stringify({ workers: { require_worktree: 'true' } }, null, 2)}\n`, 'utf8');
+
+      const gitTree = mktmp();
+      fs.mkdirSync(path.join(gitTree, '.git'), { recursive: true });
+      fs.mkdirSync(path.join(gitTree, '.gsd'), { recursive: true });
+      fs.writeFileSync(path.join(gitTree, '.gsd', 'forge-prefs.jsonc'),
+        `${JSON.stringify({ workers: { require_worktree: 'true' } }, null, 2)}\n`, 'utf8');
+
+      // Controle: a fixture PODERIA produzir o campo — e a irmã, não.
+      const effSvn = isolation.resolveEffectiveMode(svnTree);
+      assertEqual(effSvn.vcs, 'svn');
+      assert(effSvn.unmet_requirement, 'a working copy SVN com require_worktree:true precisa nomear o requisito recusado');
+      const effGit = isolation.resolveEffectiveMode(gitTree);
+      assertEqual(effGit.vcs, 'git');
+      assert(!('unmet_requirement' in effGit), 'em git com worktree possível NADA é recusado — o campo é ausente');
+
+      // Sem `isolationResolver`: o default é quem mede.
+      const bloqueado = record(evaluateGate({
+        cwd: d8Fixture(svnTree), runId: 'M-own', claim: claim(['scripts/x.js'], svnTree),
+        posture: 'defer', readyAlternatives: 2,
+      }));
+      assertEqual(bloqueado.decision, 'block', 'árvore SVN sem isolamento físico e com pedido recusado -> block');
+      assertEqual(bloqueado.posture_override, 'svn-unmet-worktree');
+
+      const deferido = record(evaluateGate({
+        cwd: d8Fixture(gitTree), runId: 'M-own', claim: claim(['scripts/x.js'], gitTree),
+        posture: 'defer', readyAlternatives: 2,
+      }));
+      assertEqual(deferido.decision, 'defer', 'em git NADA muda — é a metade do par que prova a ausência de dano');
+      assertEqual(deferido.posture_override, null);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      if (prevUp === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUp;
+    }
+  });
+
+  // ── G23n: A MORDIDA, EXECUTADA ─────────────────────────────────────────────
+  //
+  // Mecanismo escolhido (dos dois que o plano admite): CÓPIA DESCARTÁVEL ao lado
+  // do original — os `require` relativos continuam resolvendo e o arquivo real
+  // NUNCA é escrito. A restauração byte-idêntica é conferida mesmo assim
+  // (`Buffer.compare` antes/depois), porque "não escrevi" é premissa, e premissa
+  // conferida custa uma linha. O teste REPORTA o vermelho que observou.
+  test('G23n: MORDIDA — neutralizar a única linha que lê o campo deixa o caso PRESENTE vermelho', () => {
+    const antes = fs.readFileSync(MODULE);
+    const src = antes.toString('utf8');
+    const needle = '  const unmet = effective && effective.unmet_requirement;';
+    assertEqual(src.split(needle).length - 1, 1,
+      'a mordida precisa casar EXATAMENTE a leitura do campo — 0 ou 2 casamentos a tornariam vazia');
+
+    const biteFile = path.join(__dirname, 'forge-claim-gate.__bite-d8__.js');
+    fs.writeFileSync(biteFile, src.replace(needle, '  const unmet = null;'), 'utf8');
+    let observado = null;
+    try {
+      // eslint-disable-next-line global-require
+      const bitten = require(biteFile);
+      const ws = d8Fixture();
+      observado = bitten.evaluateGate({
+        cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']),
+        posture: 'defer', readyAlternatives: 2, isolationResolver: effPresente,
+      });
+      assertEqual(observado.decision, 'defer',
+        'com a leitura neutralizada o caso PRESENTE deixa de bloquear — G23b ficaria vermelho: a mordida morde');
+      assertEqual(observado.posture_override, null, 'e o override some junto');
+
+      // O módulo real, na MESMA entrada, segue bloqueando.
+      assertEqual(decide(d8Fixture(), effPresente).decision, 'block',
+        'o módulo real permanece intacto após a mordida');
+    } finally {
+      delete require.cache[require.resolve(biteFile)];
+      fs.rmSync(biteFile, { force: true });
+    }
+    const depois = fs.readFileSync(MODULE);
+    assertEqual(Buffer.compare(antes, depois), 0, 'o arquivo real precisa sair byte-idêntico da mordida');
+  });
+
+  test('G23o: forge-claim-lease-repro.test.js segue verde por SPAWN, sem uma linha de edição', () => {
+    const r = spawnSync(process.execPath, [LEASE_REPRO_TEST], { encoding: 'utf8' });
+    assertEqual(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
   });
 }
 
