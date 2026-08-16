@@ -370,23 +370,42 @@ function claimCodeDirOf(record) {
  * ── What it decides (D8) ───────────────────────────────────────────────────
  *
  * 1. The pref, validated exactly as before (`posture-invalid` -> `defer`, named).
- * 2. The tree: the OWN claim's `code_dir` FIRST, the counterpart's as fallback.
- *    Own first because it is the tree THIS run is about to write to — and the
- *    gate's own scope already guarantees the counterpart in confrontation sits
- *    on the same tree or on an unmeasurable one (`different` is the only scope
- *    that leaves, upstream in `evaluateGate`).
- * 3. No tree, or a resolver that threw: the pref's posture STANDS and the hole
- *    in the evidence is NAMED (`isolation_note`). Never hardened, never loosened.
+ * 2. The tree(s). The OWN claim's `code_dir` FIRST, and when it is present it is
+ *    the ONLY one measured — that is the branch where the scope guarantee
+ *    actually holds: with an own `code_dir`, `different` leaves upstream in
+ *    `evaluateGate`, so the counterpart in confrontation sits on the same tree
+ *    or on an unmeasurable one.
+ * 2b. WITHOUT an own `code_dir` that guarantee is VACUOUS (S06/R1, conceded):
+ *    `codeDirScope` classifies an absent side as `unknown`, and the gate only
+ *    drops `different`, so EVERY counterpart stays in scope regardless of the
+ *    tree it lives on. Probing only the first one made the effective posture
+ *    depend on the registry's ITERATION ORDER — a git counterpart iterated
+ *    first produced no override even with an SVN `unmet_requirement` right
+ *    behind it (silent under-block, the exact hole D8 exists to close). So in
+ *    this branch EVERY conflicting counterpart carrying a usable `code_dir` is
+ *    probed (bounded by `counterparts_in_scope`, deduplicated by tree), and the
+ *    aggregation is: harden if ANY MEASURED probe reports `unmet_requirement`.
+ *    OR over measured probes is order-independent by construction — which is
+ *    the property the suite asserts, running the same pair under BOTH persisted
+ *    orders.
+ * 3. No tree, or a resolver that threw: the pref's posture STANDS and every
+ *    hole in the evidence is NAMED (`isolation_notes`, one entry per probe that
+ *    could not answer). Never hardened, never loosened — S05's rule, verbatim:
+ *    a measurement that could not be made is never evidence, in EITHER
+ *    direction. A probe that threw therefore never decides, and never suppresses
+ *    the verdict of a sibling that did measure.
  * 4. `unmet_requirement` present -> `block`, `override: 'svn-unmet-worktree'`,
  *    and the effect says whether that CHANGED anything.
  *
  * ── Two notes, never one ───────────────────────────────────────────────────
  *
- * `note` (the pref's validity) and `isolation_note` (the measurement) are
+ * `note` (the pref's validity) and the isolation notes (the measurement) are
  * DIFFERENT facts about different inputs, and both can be true at once. They
  * ride in separate fields for the same reason `mechanism` and
  * `persisted_mechanism` do below: a census where two findings collapse into one
- * silently drops whichever the writer thought less important.
+ * silently drops whichever the writer thought less important. `isolation_note`
+ * (singular) is kept as the FIRST hole so an old reader stays correct;
+ * `isolation_notes` is the additive, complete enumeration.
  */
 function resolvePosture(opts) {
   const o = opts || {};
@@ -401,26 +420,77 @@ function resolvePosture(opts) {
     posture = 'defer';
     note = 'posture-invalid';
   }
-  const clean = (isolation_note, detail) => ({
-    posture, override: null, override_effect: null, note, isolation_note, detail: detail || null,
-  });
+  // Every probe that could NOT answer lands here, one entry each. The list is
+  // reported whatever the verdict — including a hardened one: the operator who
+  // sees a `block` still needs to know which trees nobody could measure.
+  const isolation_notes = [];
+  const clean = () => {
+    const first = isolation_notes[0] || null;
+    return {
+      posture,
+      override: null,
+      override_effect: null,
+      note,
+      isolation_note: first ? first.reason : null,
+      detail: first ? first.detail : null,
+      isolation_notes,
+    };
+  };
 
-  const codeDir = claimCodeDirOf(o.ownRun) || claimCodeDirOf(o.counterpartRun);
-  if (codeDir === null) return clean('isolation-unmeasured', 'nenhum claim em confronto trouxe code_dir');
-
-  const resolver = typeof o.isolationResolver === 'function' ? o.isolationResolver : DEFAULT_ISOLATION_RESOLVER;
-  let effective;
-  try {
-    effective = resolver(codeDir);
-  } catch (e) {
-    return clean('isolation-probe-threw', e && e.message ? e.message : String(e));
+  const ownDir = claimCodeDirOf(o.ownRun);
+  // The own tree, when declared, is the ONLY one measured — unchanged from
+  // T02, and deliberately so (see 2/2b above: this is the branch where the
+  // scope guarantee is real).
+  const dirs = [];
+  if (ownDir !== null) {
+    dirs.push(ownDir);
+  } else {
+    // `counterpartRuns` is the complete conflicting set; `counterpartRun` stays
+    // accepted as the single-counterpart form so an old caller keeps working.
+    const list = Array.isArray(o.counterpartRuns) && o.counterpartRuns.length > 0
+      ? o.counterpartRuns
+      : [o.counterpartRun];
+    for (const rec of list) {
+      const d = claimCodeDirOf(rec);
+      // Dedup by TREE, not by run: two runs on the same tree measure the same
+      // thing, and a repeated probe would only inflate the census.
+      if (d !== null && !dirs.includes(d)) dirs.push(d);
+    }
+  }
+  if (dirs.length === 0) {
+    isolation_notes.push({
+      reason: 'isolation-unmeasured',
+      detail: 'nenhum claim em confronto trouxe code_dir',
+    });
+    return clean();
   }
 
-  // THE line that consumes S06/T01's field — exactly one in this file, and the
-  // target of the suite's EXECUTED bite. Neutralising it must turn the
-  // `presente` case red; if it does not, the assert never reached its target.
-  const unmet = effective && effective.unmet_requirement;
-  if (!unmet) return clean(null, null);
+  const resolver = typeof o.isolationResolver === 'function' ? o.isolationResolver : DEFAULT_ISOLATION_RESOLVER;
+  let hardened = false;
+  for (const dir of dirs) {
+    let effective;
+    try {
+      effective = resolver(dir);
+    } catch (e) {
+      // Named, and it does NOT decide: neither hardening nor suppressing the
+      // verdict of a sibling probe that did measure.
+      isolation_notes.push({
+        reason: 'isolation-probe-threw',
+        detail: e && e.message ? e.message : String(e),
+      });
+      continue;
+    }
+
+    // THE line that consumes S06/T01's field — exactly one in this file, and the
+    // target of the suite's EXECUTED bite. Neutralising it must turn the
+    // `presente` case red; if it does not, the assert never reached its target.
+    const unmet = effective && effective.unmet_requirement;
+    if (unmet) hardened = true;
+    // No early exit: the remaining probes are cheap and their holes belong in
+    // the census even when the verdict is already decided.
+  }
+
+  if (!hardened) return clean();
 
   return {
     posture: 'block',
@@ -431,6 +501,7 @@ function resolvePosture(opts) {
     note,
     isolation_note: null,
     detail: null,
+    isolation_notes,
   };
 }
 
@@ -776,7 +847,13 @@ function evaluateGate(opts) {
   // reachable here is the counterpart's — stated as a derived fact, not assumed.
   const undeclared_side = sawUndeclared ? 'counterpart' : null;
 
-  const firstConflicting = inScope.find((c) => counterparts.some((r) => r.id === c.id && r.cause));
+  // ALL the conflicting counterparts, not the first one (S06/R1). Without an
+  // own `code_dir` the scope filter keeps every counterpart in the universe,
+  // so picking one made the verdict a function of the registry's iteration
+  // order. Bounded by `counterparts_in_scope`; `resolvePosture` still measures
+  // ONLY the own tree whenever the own claim declares one.
+  const conflicting = inScope.filter((c) => counterparts.some((r) => r.id === c.id && r.cause));
+  const firstConflicting = conflicting[0] || null;
   // Called through `module.exports` ON PURPOSE: this is the S06/D8 seam, and a
   // seam nobody can observe is a seam that will be discovered broken later. The
   // indirection lets the suite substitute a spy and PROVE that the counterpart's
@@ -786,15 +863,24 @@ function evaluateGate(opts) {
     pref: o.posture,
     ownRun,
     counterpartRun: firstConflicting ? firstConflicting.record : null,
+    counterpartRuns: conflicting.map((c) => c.record),
     // S06/T02: the injectable isolation seam travels from here, so the
     // operational entry point cannot silently fall back to the default while the
     // suite exercises an injection.
     isolationResolver: o.isolationResolver,
   });
   if (resolved.note) census.notes.push({ id: runId, reason: resolved.note });
-  if (resolved.isolation_note) {
-    const n = { id: runId, reason: resolved.isolation_note };
-    if (resolved.detail) n.detail = resolved.detail;
+  // Every hole gets its own line (S06/R1): with several counterparts probed,
+  // collapsing them into one would hide exactly the trees nobody could measure.
+  // The singular field is still honoured for a substituted seam that only
+  // knows the old shape.
+  const isolationHoles = Array.isArray(resolved.isolation_notes)
+    ? resolved.isolation_notes
+    : (resolved.isolation_note ? [{ reason: resolved.isolation_note, detail: resolved.detail }] : []);
+  for (const hole of isolationHoles) {
+    if (!hole || !hole.reason) continue;
+    const n = { id: runId, reason: hole.reason };
+    if (hole.detail) n.detail = hole.detail;
     census.notes.push(n);
   }
   // Same seam discipline as the scope note and the conflict cause above: this

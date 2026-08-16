@@ -1973,7 +1973,15 @@ console.log('\nG23: D8 — a MESMA entrada decide diferente conforme a presença
     assertEqual(src.split(needle).length - 1, 1,
       'a mordida precisa casar EXATAMENTE a leitura do campo — 0 ou 2 casamentos a tornariam vazia');
 
-    const biteFile = path.join(__dirname, 'forge-claim-gate.__bite-d8__.js');
+    // O DIRETÓRIO é escolha medida (os `require` relativos do módulo mordido
+    // precisam resolver de `scripts/`); o NOME fixo nunca foi exigido por isso
+    // (S06/R3). Sufixo único por processo: duas execuções concorrentes na mesma
+    // árvore deixam de disputar o mesmo caminho, e cada invocação limpa só o
+    // seu — sem mover a mordida para um tmpdir, que quebraria os `require`.
+    const biteFile = path.join(
+      __dirname,
+      `forge-claim-gate.__bite-d8__.${process.pid}-${Math.random().toString(36).slice(2, 10)}.js`,
+    );
     fs.writeFileSync(biteFile, src.replace(needle, '  const unmet = null;'), 'utf8');
     let observado = null;
     try {
@@ -1997,6 +2005,147 @@ console.log('\nG23: D8 — a MESMA entrada decide diferente conforme a presença
     }
     const depois = fs.readFileSync(MODULE);
     assertEqual(Buffer.compare(antes, depois), 0, 'o arquivo real precisa sair byte-idêntico da mordida');
+  });
+
+  // ── G23p/q/r (S06/R1): sem code_dir PRÓPRIO, TODO counterpart em conflito é
+  // sondado — e o veredicto não pode depender da ordem de iteração do registry.
+  //
+  // A ordem persistida é a única variável entre as duas execuções: mesma
+  // colisão, mesmas duas árvores, mesmo resolvedor. Um teste que rodasse uma só
+  // ordem não detectaria o defeito — ele ERA a ordem.
+  const SVN_TREE = '/arvore/svn-unmet';
+  const GIT_TREE = '/arvore/git-ok';
+  // Resolvedor por ÁRVORE: só a SVN recusa o worktree.
+  const porArvore = (medidos) => (dir) => {
+    if (medidos) medidos.push(dir);
+    return dir === SVN_TREE ? effPresente() : effAusente();
+  };
+  /** Own SEM code_dir; dois counterparts em conflito, um por árvore, na ordem dada. */
+  function multiFixture(ordem) {
+    return makeFixture([{ id: 'M-own', write_claim: claim(['scripts/x.js'], null) }].concat(
+      ordem.map(([id, dir]) => ({ id, write_claim: claim(['scripts/x.js'], dir) })),
+    ));
+  }
+  function decideMulti(ordem, medidos) {
+    return record(evaluateGate({
+      cwd: multiFixture(ordem),
+      runId: 'M-own',
+      claim: claim(['scripts/x.js'], null),
+      posture: 'defer',
+      readyAlternatives: 2, // longe do piso D3: o block só pode vir de D8
+      isolationResolver: porArvore(medidos),
+    }));
+  }
+  // Os ids são POSICIONAIS de propósito: a iteração do registry é por id, então
+  // trocar só a posição no array não trocaria nada — a ordem seria a mesma nas
+  // duas execuções e o teste mediria a coisa errada (medido: com ids `M-git`/
+  // `M-svn` o mordido devolvia `defer` nas duas). Aqui a árvore é atribuída à
+  // POSIÇÃO, e a ordem de iteração realmente inverte.
+  const ORDEM_GIT_PRIMEIRO = [['M-1', GIT_TREE], ['M-2', SVN_TREE]];
+  const ORDEM_SVN_PRIMEIRO = [['M-1', SVN_TREE], ['M-2', GIT_TREE]];
+
+  test('G23p: MESMO veredicto nas DUAS ordens persistidas — a ordem de iteração deixou de decidir', () => {
+    const medidosA = [];
+    const a = decideMulti(ORDEM_GIT_PRIMEIRO, medidosA);
+    const medidosB = [];
+    const b = decideMulti(ORDEM_SVN_PRIMEIRO, medidosB);
+
+    // Antes do fix, `firstConflicting` sondava só a primeira: git primeiro ->
+    // `defer`. É esta linha que fica vermelha com o comportamento anterior.
+    assertEqual(a.decision, 'block',
+      'counterpart git iterado PRIMEIRO não pode esconder o SVN-unmet que vem atrás (under-block silencioso)');
+    assertEqual(b.decision, 'block', 'e com o SVN primeiro o veredicto é o mesmo');
+    assertEqual(a.posture_effective, b.posture_effective);
+    assertEqual(a.posture_override, b.posture_override);
+    assertEqual(a.posture_override_effect, b.posture_override_effect);
+    assertEqual(a.posture_override, 'svn-unmet-worktree');
+    assertEqual(a.floor, null, 'este block é D8, não o piso D3');
+
+    // E as DUAS árvores foram efetivamente medidas nas duas ordens — sem isso
+    // o assert acima poderia estar verde por acaso de fixture.
+    assertEqual(JSON.stringify(medidosA.slice().sort()), JSON.stringify([GIT_TREE, SVN_TREE].sort()));
+    assertEqual(JSON.stringify(medidosB.slice().sort()), JSON.stringify([GIT_TREE, SVN_TREE].sort()));
+    assertEqual(a.census.counterparts_in_scope, 2, 'a sondagem é limitada por counterparts_in_scope');
+  });
+
+  test('G23q: controle negativo — dois counterparts SEM unmet nenhum: segue defer, sem override', () => {
+    const medidos = [];
+    const r = decideMulti([['M-1', GIT_TREE], ['M-2', '/arvore/git-ok-2']], medidos);
+    assertEqual(r.decision, 'defer', 'sondar todos não endurece por sondar — endurece por MEDIR o campo');
+    assertEqual(r.posture_override, null);
+    assertEqual(medidos.length, 2, 'e ambas foram medidas — o defer não veio de não ter olhado');
+  });
+
+  test('G23r: sonda que LANÇA é nomeada e NUNCA decide — nem endurece, nem cala a irmã que mediu', () => {
+    // Uma árvore lança, a outra mede `unmet`: a que mediu decide, a que lançou
+    // vira note. (S05, verbatim: medição que não pôde ser feita não é evidência.)
+    const resolverMisto = (dir) => {
+      if (dir === GIT_TREE) throw new Error('probe boom multi');
+      return effPresente();
+    };
+    const comMedicao = record(evaluateGate({
+      cwd: multiFixture(ORDEM_GIT_PRIMEIRO),
+      runId: 'M-own',
+      claim: claim(['scripts/x.js'], null),
+      posture: 'defer',
+      readyAlternatives: 2,
+      isolationResolver: resolverMisto,
+    }));
+    assertEqual(comMedicao.decision, 'block', 'a sonda que lançou não pode suprimir a que mediu');
+    const nota = comMedicao.census.notes.find((n) => n.reason === 'isolation-probe-threw');
+    assert(nota, 'a sonda que lançou precisa ser NOMEADA mesmo num veredicto endurecido');
+    assert(/probe boom multi/.test(nota.detail || ''), `a note carrega o erro: ${JSON.stringify(nota)}`);
+
+    // E o espelho: TODAS lançam -> a postura da pref permanece, com uma note
+    // por sonda. Nunca endurece por não ter conseguido medir.
+    const todasLancam = record(evaluateGate({
+      cwd: multiFixture(ORDEM_GIT_PRIMEIRO),
+      runId: 'M-own',
+      claim: claim(['scripts/x.js'], null),
+      posture: 'defer',
+      readyAlternatives: 2,
+      isolationResolver: () => { throw new Error('todas boom'); },
+    }));
+    assertEqual(todasLancam.decision, 'defer');
+    assertEqual(todasLancam.posture_override, null);
+    assertEqual(todasLancam.census.notes.filter((n) => n.reason === 'isolation-probe-threw').length, 2,
+      'uma note POR sonda — colapsar em uma esconderia justamente a árvore que ninguém mediu');
+  });
+
+  test('G23s: com code_dir PRÓPRIO nada muda — só a árvore própria é medida (a garantia de escopo vale aqui)', () => {
+    const medidos = [];
+    // Counterpart SEM code_dir (escopo `unknown` — segue em confronto, fail
+    // closed) e próprio na árvore git: mede-se a PRÓPRIA, e só ela.
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js'], GIT_TREE) },
+      { id: 'M-outro', write_claim: claim(['scripts/x.js'], null) },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws,
+      runId: 'M-own',
+      claim: claim(['scripts/x.js'], GIT_TREE),
+      posture: 'defer',
+      readyAlternatives: 2,
+      isolationResolver: porArvore(medidos),
+    }));
+    assertEqual(JSON.stringify(medidos), JSON.stringify([GIT_TREE]),
+      'com árvore própria declarada, é ELA que decide — e é a única medida');
+    assertEqual(r.decision, 'defer');
+    assertEqual(r.posture_override, null);
+
+    // No nível da unidade, a mesma fronteira dita explicitamente: mesmo com
+    // `counterpartRuns` carregando a árvore SVN-unmet, o ramo com code_dir
+    // próprio NÃO a sonda — é onde a garantia de escopo do projeto vale.
+    const medidosUnit = [];
+    const semAlargar = resolvePosture({
+      pref: 'defer',
+      ownRun: { write_claim: { code_dir: GIT_TREE } },
+      counterpartRuns: [{ write_claim: { code_dir: SVN_TREE } }],
+      isolationResolver: porArvore(medidosUnit),
+    });
+    assertEqual(JSON.stringify(medidosUnit), JSON.stringify([GIT_TREE]));
+    assertEqual(semAlargar.posture, 'defer');
+    assertEqual(semAlargar.override, null);
   });
 
   test('G23o: forge-claim-lease-repro.test.js segue verde por SPAWN, sem uma linha de edição', () => {
@@ -2050,6 +2199,64 @@ console.log('\nG24: shared/forge-claim-gate.md documenta D8 literalmente (POSTUR
     for (const field of ['posture_effective', 'posture_override', 'posture_override_effect']) {
       assert(specText.includes(field), `campo do evento ausente do spec: ${field}`);
     }
+  });
+
+  // ── G24e/f/g (S06/R2): o eixo que faltava — a FORMA do evento ─────────────
+  //
+  // G24a–d conferem que os MEMBROS dos conjuntos fechados aparecem no spec.
+  // Isso passou verde ao lado de uma forma de evento que o código não produzia
+  // (`posture_effective` documentado como `defer|block`, emitido como `null` em
+  // todo proceed/refuse). Um assert de conformidade que escolhe o eixo mais
+  // fácil de medir passa verde ao lado do eixo que importa — então aqui o eixo
+  // é o evento EMITIDO, lido do disco.
+  const TRES = ['posture_effective', 'posture_override', 'posture_override_effect'];
+  function ultimoEvento(ws) {
+    const linhas = fs.readFileSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), 'utf8').trim().split('\n');
+    return JSON.parse(linhas[linhas.length - 1]);
+  }
+
+  test('G24e: o evento de um PROCEED carrega os três campos, e os três são null', () => {
+    // Sem counterpart: nada foi confrontado, logo nenhuma postura foi resolvida.
+    const ws = makeFixture([{ id: 'M-own', write_claim: claim(['scripts/x.js']) }]);
+    const r = recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths: ['scripts/x.js'],
+      readyAlternatives: 2, prefsOpts: prefsOpts(),
+    });
+    assertEqual(r.decision, 'proceed');
+    const ev = ultimoEvento(ws);
+    for (const k of TRES) {
+      assert(Object.prototype.hasOwnProperty.call(ev, k), `chave ausente do evento de proceed: ${k}`);
+      assertEqual(ev[k], null,
+        `${k} num proceed precisa ser null — nenhuma colisão foi confrontada, nenhuma postura foi resolvida`);
+    }
+  });
+
+  test('G24f: o evento de um REFUSE também carrega os três como null (postura nunca participa)', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim([]) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+    const r = recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths: [],
+      readyAlternatives: 2, prefsOpts: prefsOpts(),
+    });
+    assertEqual(r.decision, 'refuse');
+    const ev = ultimoEvento(ws);
+    for (const k of TRES) {
+      assert(Object.prototype.hasOwnProperty.call(ev, k), `chave ausente do evento de refuse: ${k}`);
+      assertEqual(ev[k], null, `${k} num refuse precisa ser null`);
+    }
+  });
+
+  test('G24g: e o spec DIZ isso — `defer|block|null` e a frase do null fora de colisão', () => {
+    assert(specText.includes('"posture_effective":"defer|block|null"'),
+      'o spec precisa declarar o `|null` que o código emite — os dois irmãos já o declaravam');
+    assert(/`null` whenever no collision was confronted/.test(specText),
+      'o spec precisa dizer, em prosa, que os três são null quando nada foi confrontado');
+    assert(!/All three come straight from `resolvePosture`'s return — the event never\nre-derives them\./.test(specText),
+      'a prosa antiga afirmava que os três vêm SEMPRE do retorno de resolvePosture — nesses desfechos ele nunca rodou');
+    assert(/supplied by `emitGateEvent` itself/.test(specText),
+      'e precisa dizer quem fabrica o null nesses desfechos');
   });
 }
 

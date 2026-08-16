@@ -415,7 +415,7 @@ Shape appended to `.gsd/forge/events.jsonl` of `WORKING_DIR` — documented for 
 retyping:
 
 ```json
-{"event":"claim-gate","ts":"<ISO-8601>","run":"<run id>","unit":"<unit verbatim>","decision":"proceed|defer|block|refuse","cause":"overlap|undeclared-writes|pathless-conceded-item|null","undeclared_side":"own|counterpart|both|null","posture":"defer|block","posture_source":"prefs|fallback|invalid-pref|explicit","posture_effective":"defer|block","posture_override":"svn-unmet-worktree|null","posture_override_effect":"hardened|already-block|null","escalation":"wait-ceiling|defer-cap|null","floor":"defer-floor|null","counterparts":[{"id":"<run>","cause":"...","paths":["..."],"scope":"same|unknown","note":"<S03 note|null>"}],"census":{"runs_examined":N,"counterparts_considered":N,"counterparts_in_scope":N,"skipped":[{"id":"<run>","reason":"different-code-dir"}],"notes":[{"id":"...","reason":"..."}]},"not_covered":[{"boundary":"...","reason":"..."}]}
+{"event":"claim-gate","ts":"<ISO-8601>","run":"<run id>","unit":"<unit verbatim>","decision":"proceed|defer|block|refuse","cause":"overlap|undeclared-writes|pathless-conceded-item|null","undeclared_side":"own|counterpart|both|null","posture":"defer|block","posture_source":"prefs|fallback|invalid-pref|explicit","posture_effective":"defer|block|null","posture_override":"svn-unmet-worktree|null","posture_override_effect":"hardened|already-block|null","escalation":"wait-ceiling|defer-cap|null","floor":"defer-floor|null","counterparts":[{"id":"<run>","cause":"...","paths":["..."],"scope":"same|unknown","note":"<S03 note|null>"}],"census":{"runs_examined":N,"counterparts_considered":N,"counterparts_in_scope":N,"skipped":[{"id":"<run>","reason":"different-code-dir"}],"notes":[{"id":"...","reason":"..."}]},"not_covered":[{"boundary":"...","reason":"..."}]}
 ```
 
 Additive-field convention, same as `tier`/`reason` from M002: readers that do not recognise a field
@@ -428,8 +428,21 @@ by § Step 0, before D8 is consulted. `posture_effective`, `posture_override` an
 the module actually decided with after the isolation check; `posture_override` names which override
 fired (`svn-unmet-worktree`) or `null` when none did; `posture_override_effect` is `hardened` when
 D8 changed the outcome, `already-block` when the pref's own posture was already `block`, or `null`
-when D8 did not fire. All three come straight from `resolvePosture`'s return — the event never
-re-derives them.
+when D8 did not fire.
+
+**All three are `null` whenever no collision was confronted** — that is, on every `proceed`
+(`no-active-counterpart`, `no-conflict`) and on every `refuse`. In those outcomes the posture was
+never resolved: `resolvePosture` does not run at all, so there is nothing to report and `null` is the
+honest value ("not evaluated"), distinguishable from "evaluated and no override fired"
+(`posture_effective: "defer"` with `posture_override: null`). Resolving them outside a collision
+would mean running a live tree probe in evaluations that never consume the result, emitting isolation
+notes into clean proceeds, and asserting a "decided" posture in a `refuse` where posture plays no
+part.
+
+So the three fields come straight from `resolvePosture`'s return **in the collision branch, which is
+the only branch that resolves a posture**; in the outcomes above `resolvePosture` never ran and the
+`null` is supplied by `emitGateEvent` itself. Either way the event never re-derives a posture — it
+reports one or reports its absence.
 
 **Mandatory enumeration.** Every gate execution — including `proceed` — carries `not_covered` with
 three boundaries, and the consumer **prints it** every time:
