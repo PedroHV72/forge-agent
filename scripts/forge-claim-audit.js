@@ -109,6 +109,91 @@ const CLAIM_SOURCES = [
   'gate-events',  // `claim-gate` lines of `.gsd/forge/events.jsonl`; their `counterparts[].paths` SURVIVE the release of the claim (D2/S05).
 ];
 
+// ── Finding groups (triage of the milestone, 2026-08-16) ───────────────────
+//
+// Running this detector over the real corpus of this repository produced 45
+// findings, ALL `undeclared-writes`, ALL against runs that wrote before the
+// claim existed. They are TRUE — those runs did write those paths without ever
+// recording a claim. What they are not is ACTIONABLE: the counterpart run is
+// over, and there is nobody left to coordinate with.
+//
+// The temptation is a filter. The operator refused it, and the reasoning is the
+// thesis of this whole module: a section that prints 45 identical rows every
+// time is a section people stop reading, and a detector nobody reads is
+// indistinguishable from a broken one — the exact defect of origin. But so is
+// dropping rows. So NOTHING is filtered, NOTHING is thresholded and NOTHING is
+// hidden: the findings are PARTITIONED into two named groups, both rendered,
+// both counted, and the census reconciles by arithmetic equality
+// (`findings === findings_actionable + findings_historical`).
+const FINDING_GROUPS = [
+  'actionable',  // the counterpart may still be writing, OR its state could not be measured. Rendered first, and the ONLY group that emits `work-lost`.
+  'historical',  // MEASURED as ended: the counterpart run is recorded `active: false`. Rendered, counted, never dropped — and never an incident.
+];
+
+// ── Counterpart activity — a MEASUREMENT, never a heuristic ────────────────
+//
+// The classification reads ONE recorded fact: the `active` field of the
+// counterpart's `RunRecord`, written by the run lifecycle itself. It does not
+// infer liveness from a timestamp, from an id's date, from whether the work
+// "looks merged", nor from any other shape-of-the-data guess dressed as a
+// measurement. Where the fact CANNOT be read — the counterpart is not in the
+// registry, or its record never carried the field — the answer is `unmeasured`,
+// and `unmeasured` groups with `actionable`. Ambiguity fails toward BEING SEEN,
+// never toward the inert bucket: the same polarity as D1 one level down.
+const COUNTERPART_ACTIVITY = ['live', 'ended', 'unmeasured'];
+
+const ACTIVITY_REASONS = [
+  'registry-active',       // the counterpart's `RunRecord` records `active: true`. Measured.
+  'registry-inactive',     // the counterpart's `RunRecord` records `active: false`. Measured — the ONLY route into `historical`.
+  'run-not-registered',    // no `RunRecord` for this counterpart id (pruned registry, or a counterpart known only through a historical `claim-gate` line). Unmeasured → stays visible.
+  'activity-not-recorded', // a record exists but carries no boolean `active` (a record predating the field, or malformed). Unmeasured → stays visible.
+];
+
+/** Seam: an activity outside the closed set is LOUD, never a silent bucket. */
+function groupOf(activity) {
+  if (!COUNTERPART_ACTIVITY.includes(activity)) {
+    throw new Error(`forge-claim-audit: atividade fora de COUNTERPART_ACTIVITY: ${activity}`);
+  }
+  // Only a MEASURED end is inert. `live` and `unmeasured` both stay visible.
+  return activity === 'ended' ? 'historical' : 'actionable';
+}
+
+/**
+ * Classify ONE counterpart from its `RunRecord` (or its absence). Pure — the
+ * caller owns the registry read, so this stays testable without disk.
+ */
+function classifyActivity(record) {
+  if (!record || typeof record !== 'object') {
+    return { activity: 'unmeasured', activity_reason: 'run-not-registered' };
+  }
+  if (record.active === true) return { activity: 'live', activity_reason: 'registry-active' };
+  if (record.active === false) return { activity: 'ended', activity_reason: 'registry-inactive' };
+  return { activity: 'unmeasured', activity_reason: 'activity-not-recorded' };
+}
+
+/**
+ * Read the activity a collector STAMPED on a claim row. A row that carries no
+ * stamp at all (a hand-built input, a collector that could not reach the
+ * registry) is `unmeasured` — never assumed inert. A stamp from OUTSIDE either
+ * closed set THROWS: a bogus value that quietly became `historical` would
+ * suppress a real incident, which is the one failure this partition must not
+ * be able to produce.
+ */
+function activityOf(claim) {
+  const a = claim && claim.activity;
+  if (a === undefined || a === null) {
+    return { activity: 'unmeasured', activity_reason: 'activity-not-recorded' };
+  }
+  if (!COUNTERPART_ACTIVITY.includes(a)) {
+    throw new Error(`forge-claim-audit: atividade fora de COUNTERPART_ACTIVITY: ${a}`);
+  }
+  const r = claim.activity_reason;
+  if (!ACTIVITY_REASONS.includes(r)) {
+    throw new Error(`forge-claim-audit: razão fora de ACTIVITY_REASONS: ${r}`);
+  }
+  return { activity: a, activity_reason: r };
+}
+
 // ── Skip kinds ─────────────────────────────────────────────────────────────
 //
 // Which census equation a skip belongs to. The census reconciles by ARITHMETIC
@@ -232,6 +317,22 @@ function collectDeclared(cwd, opts) {
   return { byUnit, notes, plans_seen: byUnit.size };
 }
 
+/**
+ * `id -> RunRecord` for the WHOLE registry — the single disk read behind the
+ * activity measurement. An unreadable registry yields an EMPTY map, and an
+ * empty map makes every counterpart `run-not-registered`, i.e. `unmeasured`,
+ * i.e. VISIBLE. A failure to measure can therefore never mute a finding.
+ */
+function runRecordsById(cwd) {
+  const byId = new Map();
+  let records = [];
+  try { records = runs.listAll(cwd); } catch { records = []; }
+  for (const rec of records) {
+    if (rec && typeof rec.id === 'string') byId.set(rec.id, rec);
+  }
+  return byId;
+}
+
 /** Every run id that belongs to this milestone (own id, or `milestone_dir`). */
 function runIdsForMilestone(cwd, milestone) {
   const ids = new Set();
@@ -271,6 +372,10 @@ function collectClaims(cwd, opts) {
   const notes = [];
   const sources = [];
   const selfRun = o.run || null;
+  // ONE registry read for both sources, so a counterpart reached through the
+  // history is measured by exactly the same fact as one reached live.
+  const recordsById = o.runRecords || runRecordsById(cwd);
+  const activityFor = (id) => classifyActivity(recordsById.get(id));
 
   // (1) run-registry — live claims.
   let registryContributed = 0;
@@ -291,6 +396,7 @@ function collectClaims(cwd, opts) {
         scope_source: 'code-dir',
         scope: null,
         note: null,
+        ...activityFor(c.id),
       });
       registryContributed += 1;
     }
@@ -371,6 +477,9 @@ function collectClaims(cwd, opts) {
           scope_source: 'event',
           scope: cp.scope === 'same' ? 'same' : 'unknown',
           note: AUDIT_NOTE_REASONS.includes(cp.note) ? cp.note : (cp.scope === 'same' ? null : 'code-dir-unknown'),
+          // A counterpart named only by the history is very often absent from
+          // the registry — `run-not-registered`, hence VISIBLE.
+          ...activityFor(cp.id),
         });
         eventContributed += 1;
       }
@@ -468,6 +577,7 @@ function compareClaimAudit(input) {
       if (!CONFLICT_CAUSES.includes(hit.cause)) {
         throw new Error(`forge-claim-audit: causa fora de CONFLICT_CAUSES: ${hit.cause}`);
       }
+      const act = activityOf(c);
       findings.push({
         unit: unit.unit,
         counterpart_run: c.run,
@@ -476,11 +586,22 @@ function compareClaimAudit(input) {
         paths: hit.paths,
         note: note || null,
         declared_by_own_plan: declared === null ? null : hit.paths.some((p) => declared.includes(p.split(' × ')[0])),
+        counterpart_activity: act.activity,
+        activity_reason: act.activity_reason,
+        group: groupOf(act.activity),
       });
     }
   }
 
-  findings.sort((a, b) => (`${a.unit}|${a.counterpart_run}`).localeCompare(`${b.unit}|${b.counterpart_run}`));
+  // Actionable rows FIRST, then historical — a stable, total order (the group
+  // rank breaks ties before the existing key, never instead of it). This is
+  // PRESENTATION ORDER, not selection: both groups are rendered in full.
+  const rank = (f) => (f.group === 'actionable' ? 0 : 1);
+  findings.sort((a, b) => (rank(a) - rank(b))
+    || (`${a.unit}|${a.counterpart_run}`).localeCompare(`${b.unit}|${b.counterpart_run}`));
+
+  const actionable = findings.filter((f) => f.group === 'actionable');
+  const historical = findings.filter((f) => f.group === 'historical');
 
   const unitSkips = skipped.filter((s) => s.kind === 'unit').length;
   const sources = (i.claims && i.claims.sources) || [];
@@ -493,8 +614,13 @@ function compareClaimAudit(input) {
     verdict = 'inconclusive';
     reason = `${units_compared} unidade(s) com escrita e ${claims.length} claim(s), 0 par(es) confrontado(s)`;
   } else if (findings.length > 0) {
+    // The verdict does NOT soften when every finding is historical. The
+    // findings are TRUE; the partition governs how they are read, never
+    // whether they exist. Reporting `clean` over 45 true findings would be the
+    // silent filter the operator refused — the failure this design forbids.
     verdict = 'overlap';
-    reason = `${findings.length} achado(s) em ${pairs_compared} par(es) confrontado(s)`;
+    reason = `${findings.length} achado(s) em ${pairs_compared} par(es) confrontado(s)`
+      + ` — ${actionable.length} acionável(is), ${historical.length} histórico(s)`;
   } else {
     verdict = 'clean';
     reason = `${pairs_compared} par(es) confrontado(s), nenhuma colisão`;
@@ -523,6 +649,13 @@ function compareClaimAudit(input) {
       pairs_compared,
       paths_compared: pathsSeen.size,
       findings: findings.length,
+      // The partition reconciles by ARITHMETIC EQUALITY:
+      //   findings === findings_actionable + findings_historical
+      // Both terms are counted from the walked findings, never derived from a
+      // formula — a counter computed on the side stays correct while the loop
+      // it describes fails to run (the same lie in a smaller font).
+      findings_actionable: actionable.length,
+      findings_historical: historical.length,
       skipped: skipped.length,
     },
     claim_sources: sources,
@@ -588,13 +721,17 @@ function formatClaimAudit(result) {
     `  censo: units ${cs.units_compared}/${cs.units_examined}`
     + ` · fontes ${cs.claim_sources_contributing}/${cs.claim_sources_examined}`
     + ` · claims ${cs.claims_considered} · pares ${cs.pairs_compared}`
-    + ` · achados ${cs.findings} · skipped ${cs.skipped}`,
+    + ` · achados ${cs.findings} (acionáveis ${cs.findings_actionable}, históricos ${cs.findings_historical})`
+    + ` · skipped ${cs.skipped}`,
   );
   for (const s of result.claim_sources) {
     lines.push(`  · fonte ${s.source}: contribuiu ${s.contributed}`);
   }
   for (const f of result.findings) {
-    lines.push(`  ⚠ ${f.unit} × ${f.counterpart_run} — ${f.cause} (${f.claim_source}): ${f.paths.join(', ') || '(nada declarado)'}`);
+    // Two markers, one list: the historical rows are never dropped and never
+    // collapsed into a count — they are simply not shouted at.
+    const mark = f.group === 'actionable' ? '⚠' : '·';
+    lines.push(`  ${mark} [${f.group}/${f.counterpart_activity}] ${f.unit} × ${f.counterpart_run} — ${f.cause} (${f.claim_source}): ${f.paths.join(', ') || '(nada declarado)'}`);
   }
   for (const s of result.skipped) {
     lines.push(`  · fora da comparação [${s.kind}]: ${s.id} (${s.reason})`);
@@ -637,18 +774,34 @@ function formatClaimAuditMd(result) {
     `- Censo: units ${cs.units_compared}/${cs.units_examined}`
     + ` · fontes ${cs.claim_sources_contributing}/${cs.claim_sources_examined}`
     + ` · claims ${cs.claims_considered} · pares ${cs.pairs_compared}`
-    + ` · caminhos ${cs.paths_compared} · achados ${cs.findings} · skipped ${cs.skipped}.`,
+    + ` · caminhos ${cs.paths_compared} · achados ${cs.findings}`
+    + ` (acionáveis ${cs.findings_actionable}, históricos ${cs.findings_historical})`
+    + ` · skipped ${cs.skipped}.`,
   );
 
   if (result.verdict === 'overlap') {
-    for (const f of result.findings) {
+    const row = (f) => {
       const paths = f.paths.length ? f.paths.map((p) => `\`${p}\``).join(', ') : '(nenhum caminho nomeado)';
       const declared = f.declared_by_own_plan === null
         ? 'declaração do próprio plano ilegível'
         : (f.declared_by_own_plan ? 'declarado no próprio plano' : 'NÃO declarado no próprio plano');
-      lines.push(`- ⚠ \`${f.unit}\` × run \`${f.counterpart_run}\` — ${f.cause} (fonte: ${f.claim_source}): ${paths} — ${declared}.`);
+      const mark = f.group === 'actionable' ? '⚠' : '·';
+      lines.push(`- ${mark} \`${f.unit}\` × run \`${f.counterpart_run}\` — ${f.cause} (fonte: ${f.claim_source}): ${paths} — ${declared} — contraparte ${f.counterpart_activity} (${f.activity_reason}).`);
       if (f.note) lines.push(`  - nota: ${f.note} (incerteza transportada, não resolvida aqui).`);
-    }
+    };
+    const actionable = result.findings.filter((f) => f.group === 'actionable');
+    const historical = result.findings.filter((f) => f.group === 'historical');
+
+    // Both groups get a heading line NAMING their count, and both are listed in
+    // full. Nothing is filtered, nothing is thresholded, nothing is collapsed
+    // into "and N more" — a row a reader cannot see is a row that was dropped.
+    lines.push(`- **Acionáveis (${actionable.length})** — contraparte viva, ou cujo estado não pôde ser medido (a ambiguidade fica VISÍVEL):`);
+    if (actionable.length === 0) lines.push('  - nenhum.');
+    for (const f of actionable) row(f);
+
+    lines.push(`- **Históricos/inertes (${historical.length})** — contraparte MEDIDA como encerrada (\`active: false\` no registry): o achado é verdadeiro e não é acionável. Listado, contado, nunca filtrado; não emite incidente \`work-lost\`:`);
+    if (historical.length === 0) lines.push('  - nenhum.');
+    for (const f of historical) row(f);
   } else if (result.verdict === 'clean') {
     lines.push(`- Confrontei ${cs.pairs_compared} par(es) sobre ${cs.paths_compared} caminho(s) escrito(s) e não achei colisão.`);
   } else {
@@ -762,9 +915,42 @@ function workLostIdentity(ev) {
   ]);
 }
 
+// ── Which findings become an INCIDENT ──────────────────────────────────────
+//
+// Only the ACTIONABLE ones — and the argument is about what the event MEANS,
+// not about volume. `work-lost` is an incident feed: a line saying "someone may
+// have lost work here, go look". A finding whose counterpart run is MEASURED
+// as ended names no one to go look at, and no coordination is possible with a
+// run that is over.
+//
+// The asymmetry with the section is deliberate and rests on a property of the
+// two artifacts. The section is rewritten idempotently and byte-surgically, so
+// carrying 45 historical rows there costs a reader some scrolling and NOTHING
+// else. `events.jsonl` is append-only and PERMANENT: 45 non-incidents written
+// into it are non-incidents forever, in the very feed whose job is to say
+// something happened. R4's identity suppression bounds the DUPLICATION, not the
+// pollution.
+//
+// And nothing is filtered away, because the section — the artifact whose job IS
+// enumeration — carries every historical row in full, and this function REPORTS
+// the suppression by name (`event_historical_suppressed`, plus the named
+// `historical-only` skip), which the CLI prints on stderr. `unmeasured`
+// counterparts are ACTIONABLE and therefore DO emit: an incident is never
+// suppressed by a fact nobody could measure.
 function emitWorkLostEvent(cwd, result) {
+  const historical = result.findings.filter((f) => f.group === 'historical');
   if (result.verdict !== 'overlap' || result.findings.length === 0) {
-    return { event_written: false, event_error: null, event_lines: 0, event_skipped: 'no-finding' };
+    return {
+      event_written: false, event_error: null, event_lines: 0,
+      event_skipped: 'no-finding', event_historical_suppressed: 0,
+    };
+  }
+  const actionable = result.findings.filter((f) => f.group === 'actionable');
+  if (actionable.length === 0) {
+    return {
+      event_written: false, event_error: null, event_lines: 0,
+      event_skipped: 'historical-only', event_historical_suppressed: historical.length,
+    };
   }
   const file = path.join(path.resolve(cwd || process.cwd()), '.gsd', 'forge', 'events.jsonl');
 
@@ -785,12 +971,18 @@ function emitWorkLostEvent(cwd, result) {
     }
   } catch { /* an unreadable log suppresses nothing: at worst we append again */ }
 
-  const fresh = result.findings.filter((f) => !seen.has(workLostIdentity({
+  // The identity tuple is UNCHANGED (R4): adding a field to it would make every
+  // line already on disk stop matching, and a re-run would multiply the very
+  // incidents that suppression exists to keep singular.
+  const fresh = actionable.filter((f) => !seen.has(workLostIdentity({
     milestone: result.milestone, slice: result.slice, unit: f.unit, cause: f.cause,
     other_run: f.counterpart_run, files: f.paths, claim_source: f.claim_source, origin: 'code',
   })));
   if (fresh.length === 0) {
-    return { event_written: false, event_error: null, event_lines: 0, event_skipped: 'already-recorded' };
+    return {
+      event_written: false, event_error: null, event_lines: 0,
+      event_skipped: 'already-recorded', event_historical_suppressed: historical.length,
+    };
   }
 
   const payload = fresh.map((f) => JSON.stringify({
@@ -804,6 +996,9 @@ function emitWorkLostEvent(cwd, result) {
     files: f.paths,
     claim_source: f.claim_source,
     declared_by_own_plan: f.declared_by_own_plan,
+    // ADDITIVE, and OUTSIDE the identity tuple: says WHY this finding earned an
+    // incident, without changing what makes two lines the same fact.
+    counterpart_activity: f.counterpart_activity,
     // ADDITIVE marker — see WORK_LOST_ORIGINS above.
     origin: 'code',
     emitter: WORK_LOST_EMITTER,
@@ -812,9 +1007,15 @@ function emitWorkLostEvent(cwd, result) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, `${payload}\n`, 'utf8');
     // `event_lines` reports what was ACTUALLY appended, never the finding count.
-    return { event_written: true, event_error: null, event_lines: fresh.length, event_skipped: null };
+    return {
+      event_written: true, event_error: null, event_lines: fresh.length,
+      event_skipped: null, event_historical_suppressed: historical.length,
+    };
   } catch (e) {
-    return { event_written: false, event_error: (e && e.message) || String(e), event_lines: 0, event_skipped: null };
+    return {
+      event_written: false, event_error: (e && e.message) || String(e), event_lines: 0,
+      event_skipped: null, event_historical_suppressed: historical.length,
+    };
   }
 }
 
@@ -835,7 +1036,11 @@ const USAGE = [
   '',
   'Com --write, o script é o dono da seção `## File Audit (cross-run)` do SUMMARY',
 'e a escreve nos TRÊS veredictos — seção omitida é indistinguível de detector',
-'quebrado. O evento `work-lost` (origin: code) é appendado só em `overlap`.',
+'quebrado. Os achados saem PARTICIONADOS em acionáveis (contraparte viva ou',
+'imedível) e históricos (contraparte medida como encerrada): nada é filtrado,',
+'os dois grupos são listados e o censo fecha por igualdade. O evento',
+'`work-lost` (origin: code) é appendado só para os ACIONÁVEIS, e a supressão',
+'dos históricos é anunciada no stderr.',
 ].join('\n');
 
 function parseArgs(argv) {
@@ -877,6 +1082,11 @@ function main(argv) {
         ? `forge-claim-audit: cross-run file audit: ${args.write}\n`
         : `forge-claim-audit: refused: ${up.reason}\n`);
       if (ev.event_error) process.stderr.write(`forge-claim-audit: evento work-lost NÃO registrado: ${ev.event_error}\n`);
+      // The suppression is ANNOUNCED. A partition whose inert half disappears
+      // without a word is the silent filter this design exists to refuse.
+      if (ev.event_historical_suppressed > 0) {
+        process.stderr.write(`forge-claim-audit: ${ev.event_historical_suppressed} achado(s) histórico(s) — contraparte encerrada: listado(s) na seção, NÃO emitido(s) como incidente work-lost\n`);
+      }
     }
     process.stdout.write(args.json
       ? `${JSON.stringify(result, null, 2)}\n`
@@ -899,6 +1109,13 @@ if (require.main === module) process.exit(main(process.argv.slice(2)));
 module.exports = {
   VERDICTS,
   CLAIM_SOURCES,
+  FINDING_GROUPS,
+  COUNTERPART_ACTIVITY,
+  ACTIVITY_REASONS,
+  groupOf,
+  classifyActivity,
+  activityOf,
+  runRecordsById,
   AUDIT_SKIP_KINDS,
   AUDIT_SKIP_REASONS,
   AUDIT_NOTE_REASONS,

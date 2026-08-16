@@ -764,6 +764,194 @@ test('formato legível: a razão está na primeira linha e o censo na segunda, i
   assert(lines[1].includes('censo:'), `veio: ${lines[1]}`);
 });
 
+// ── Bloco J — a PARTIÇÃO acionável × histórico (triagem, 2026-08-16) ───────
+//
+// O detector rodado sobre o corpo real deste repositório produziu 45 achados,
+// todos `undeclared-writes`, todos contra runs que já acabaram. São
+// VERDADEIROS e não são ACIONÁVEIS. O remédio NÃO é filtrar: é particionar,
+// mostrar os dois grupos e fechar o censo. Este bloco prova as duas metades —
+// que nada some, e que a classificação é MEDIÇÃO, nunca heurística.
+console.log('\nBloco J: partição acionável × histórico — nada é filtrado, a ambiguidade fica VISÍVEL');
+
+const { FINDING_GROUPS, COUNTERPART_ACTIVITY, ACTIVITY_REASONS, groupOf, classifyActivity } = mod;
+
+// Um workspace com registry REAL: a run própria, e contrapartes cujo `active`
+// é o único fato lido. Nada é montado à mão do lado da classificação.
+function mkRegistry(label, counterparts) {
+  const cwd = mkWorkspace(label);
+  writeRun(cwd, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: null });
+  for (const rec of counterparts) writeRun(cwd, rec);
+  return cwd;
+}
+
+function findingsOver(cwd, files) {
+  const collected = collectClaims(cwd, { milestone: 'M-x', slice: 'S07', run: 'M-x', codeDir: ABS_A });
+  return {
+    collected,
+    result: compareClaimAudit(input({
+      written: { units: [writtenUnit('M-x::S07/T01', files)], skipped: [] },
+      claims: collected,
+    })),
+  };
+}
+
+test('contraparte MEDIDA como encerrada (active:false no registry) → historical/ended/registry-inactive', () => {
+  const cwd = mkRegistry('grp-ended', [
+    { id: 'RUN-MORTA', kind: 'milestone', active: false, write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+  ]);
+  const { result: r } = findingsOver(cwd, ['scripts/a.js']);
+  eq(r.findings.length, 1, 'o achado continua existindo — particionar não é filtrar');
+  eq(r.findings[0].group, 'historical');
+  eq(r.findings[0].counterpart_activity, 'ended');
+  eq(r.findings[0].activity_reason, 'registry-inactive', 'a razão nomeia o FATO LIDO, não uma inferência');
+  eq(r.verdict, 'overlap', 'o veredicto não amolece: o achado é verdadeiro');
+});
+
+test('contraparte MEDIDA como viva (active:true) → actionable/live/registry-active', () => {
+  const cwd = mkRegistry('grp-live', [
+    { id: 'RUN-VIVA', kind: 'milestone', active: true, write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+  ]);
+  const { result: r } = findingsOver(cwd, ['scripts/a.js']);
+  eq(r.findings.length, 1);
+  eq(r.findings[0].group, 'actionable');
+  eq(r.findings[0].counterpart_activity, 'live');
+  eq(r.findings[0].activity_reason, 'registry-active');
+});
+
+test('record SEM o campo active → unmeasured/activity-not-recorded, e o grupo é ACIONÁVEL (a ambiguidade fica visível)', () => {
+  const cwd = mkRegistry('grp-nofield', [
+    { id: 'RUN-ANTIGA', kind: 'milestone', write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+  ]);
+  const { result: r } = findingsOver(cwd, ['scripts/a.js']);
+  eq(r.findings.length, 1);
+  eq(r.findings[0].counterpart_activity, 'unmeasured');
+  eq(r.findings[0].activity_reason, 'activity-not-recorded');
+  eq(r.findings[0].group, 'actionable', 'fato imedível NUNCA cai no balde inerte');
+});
+
+test('contraparte fora do registry (achada só pelo histórico) → unmeasured/run-not-registered e ACIONÁVEL', () => {
+  const cwd = mkWorkspace('grp-unregistered');
+  writeRun(cwd, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: null });
+  writeEvents(cwd, [
+    { event: 'claim-gate', run: 'M-x', unit: 'execute-task/T01', decision: 'defer',
+      counterparts: [{ id: 'RUN-FANTASMA', cause: 'overlap', paths: ['scripts/a.js'], scope: 'same', note: null }] },
+  ]);
+  const { result: r } = findingsOver(cwd, ['scripts/a.js']);
+  eq(r.findings.length, 1);
+  eq(r.findings[0].claim_source, 'gate-events');
+  eq(r.findings[0].activity_reason, 'run-not-registered');
+  eq(r.findings[0].group, 'actionable', 'contraparte que o registry não conhece continua VISÍVEL');
+});
+
+test('registry ILEGÍVEL: toda contraparte vira unmeasured → ACIONÁVEL (falha ao medir jamais silencia achado)', () => {
+  // A ponte run→milestone é injetada, então o histórico é admitido mesmo com o
+  // registry inacessível — e é exatamente aí que a polaridade importa.
+  const cwd = mkWorkspace('grp-registry-dead');
+  writeEvents(cwd, [
+    { event: 'claim-gate', run: 'M-x', unit: 'execute-task/T01', decision: 'defer',
+      counterparts: [{ id: 'RUN-B', cause: 'overlap', paths: ['scripts/a.js'], scope: 'same', note: null }] },
+  ]);
+  const collected = collectClaims(cwd, {
+    milestone: 'M-x', slice: 'S07', run: 'M-x', codeDir: ABS_A,
+    scopeRunIds: new Set(['M-x']),
+    runRecords: new Map(), // o que `runRecordsById` devolve quando listAll lança
+  });
+  const r = compareClaimAudit(input({
+    written: { units: [writtenUnit('M-x::S07/T01', ['scripts/a.js'])], skipped: [] },
+    claims: collected,
+  }));
+  eq(r.findings.length, 1);
+  eq(r.findings[0].group, 'actionable');
+  eq(r.census.findings_historical, 0, 'nenhum achado pode virar inerte por causa de um registry que não pôde ser lido');
+});
+
+test('conjuntos fechados nas DUAS direções, e só `ended` alcança o balde inerte', () => {
+  eq(FINDING_GROUPS.join(','), 'actionable,historical');
+  eq(COUNTERPART_ACTIVITY.join(','), 'live,ended,unmeasured');
+  const groups = new Set();
+  for (const a of COUNTERPART_ACTIVITY) {
+    const g = groupOf(a);
+    assert(FINDING_GROUPS.includes(g), `grupo fora do conjunto: ${g}`);
+    groups.add(g);
+    if (g === 'historical') eq(a, 'ended', `só a atividade MEDIDA como encerrada pode ser inerte, veio: ${a}`);
+  }
+  eq(groups.size, 2, 'os dois grupos têm de ser alcançáveis');
+  for (const r of ACTIVITY_REASONS) {
+    assert(typeof r === 'string' && r.length > 0, 'razão de atividade vazia');
+  }
+});
+
+test('seam: atividade inventada LANÇA — nunca vira `historical` em silêncio (as duas direções)', () => {
+  eq(groupOf('ended'), 'historical', 'o valor do conjunto passa');
+  throws(() => groupOf('provavelmente-morta'), 'fora de COUNTERPART_ACTIVITY',
+    'uma atividade inventada que virasse inerte suprimiria um incidente real');
+  throws(() => compareClaimAudit(input({
+    written: { units: [writtenUnit('u', ['a.js'])], skipped: [] },
+    claims: {
+      claims: [claimRow('R', ['a.js'], { activity: 'meio-morta', activity_reason: 'registry-active' })],
+      sources: sources(1, 0), skipped: [], notes: [],
+    },
+  })), 'fora de COUNTERPART_ACTIVITY');
+  throws(() => compareClaimAudit(input({
+    written: { units: [writtenUnit('u', ['a.js'])], skipped: [] },
+    claims: {
+      claims: [claimRow('R', ['a.js'], { activity: 'ended', activity_reason: 'achei-que-sim' })],
+      sources: sources(1, 0), skipped: [], notes: [],
+    },
+  })), 'fora de ACTIVITY_REASONS');
+});
+
+test('classifyActivity lê UM fato e nada mais (registro ausente, sem campo, true, false)', () => {
+  eq(classifyActivity(null).activity, 'unmeasured');
+  eq(classifyActivity(null).activity_reason, 'run-not-registered');
+  eq(classifyActivity({ id: 'R' }).activity_reason, 'activity-not-recorded');
+  eq(classifyActivity({ id: 'R', active: true }).activity, 'live');
+  eq(classifyActivity({ id: 'R', active: false }).activity, 'ended');
+  // Nada além de `active` decide: um record "que parece velho" pela data ainda
+  // é `live` se o fato registrado disser isso. Heurística não entra aqui.
+  eq(classifyActivity({ id: 'R', active: true, ts: '1999-01-01T00:00:00Z' }).activity, 'live');
+});
+
+test('CENSO fecha por igualdade: findings === acionáveis + históricos, sobre registry REAL misto', () => {
+  const cwd = mkRegistry('grp-census', [
+    { id: 'RUN-VIVA', kind: 'milestone', active: true, write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+    { id: 'RUN-MORTA-1', kind: 'milestone', active: false, write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+    { id: 'RUN-MORTA-2', kind: 'milestone', active: false, write_claim: { paths: ['scripts/b.js'], code_dir: ABS_A } },
+  ]);
+  const { result: r } = findingsOver(cwd, ['scripts/a.js', 'scripts/b.js']);
+  eq(r.census.findings, 3, 'os TRÊS achados continuam existindo — a partição não descarta nenhum');
+  eq(r.census.findings_actionable, 1);
+  eq(r.census.findings_historical, 2);
+  eq(r.census.findings, r.census.findings_actionable + r.census.findings_historical,
+    'a partição tem de fechar por igualdade aritmética');
+  eq(r.findings.length, r.census.findings, 'o censo tem de contar as linhas que existem, não uma fórmula');
+  // E cada linha pertence a um dos dois grupos: nenhuma órfã.
+  for (const f of r.findings) assert(FINDING_GROUPS.includes(f.group), `achado sem grupo: ${f.group}`);
+});
+
+test('ORDEM de apresentação: acionáveis primeiro, históricos depois (o sinal não afoga no ruído)', () => {
+  const cwd = mkRegistry('grp-order', [
+    { id: 'AAA-MORTA', kind: 'milestone', active: false, write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+    { id: 'ZZZ-VIVA', kind: 'milestone', active: true, write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+  ]);
+  const { result: r } = findingsOver(cwd, ['scripts/a.js']);
+  eq(r.findings.length, 2);
+  // `AAA-MORTA` vence `ZZZ-VIVA` na ordenação alfabética antiga: só o rank de
+  // grupo põe a viva na frente, então este assert morde de verdade.
+  eq(r.findings[0].counterpart_run, 'ZZZ-VIVA', 'o acionável tem de vir primeiro');
+  eq(r.findings[1].counterpart_run, 'AAA-MORTA');
+});
+
+test('TODOS os achados históricos: o veredicto continua overlap e a razão NOMEIA os dois grupos', () => {
+  const cwd = mkRegistry('grp-all-hist', [
+    { id: 'RUN-MORTA', kind: 'milestone', active: false, write_claim: { paths: ['scripts/a.js'], code_dir: ABS_A } },
+  ]);
+  const { result: r } = findingsOver(cwd, ['scripts/a.js']);
+  eq(r.verdict, 'overlap', 'relatar `clean` sobre achados verdadeiros seria o filtro silencioso recusado');
+  assert(/0 acionável\(is\), 1 histórico\(s\)/.test(r.reason), `a razão tem de nomear os dois grupos, veio: ${r.reason}`);
+  assert(formatClaimAudit(r).includes('acionáveis 0'), 'a forma legível também tem de nomear a partição');
+});
+
 // ── Suite close ────────────────────────────────────────────────────────────
 cleanup();
 

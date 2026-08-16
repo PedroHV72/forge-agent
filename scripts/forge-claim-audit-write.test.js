@@ -461,14 +461,19 @@ function plantWorkspace(label, opts) {
 
   const runsDir = path.join(cwd, '.gsd', 'forge', 'runs');
   fs.mkdirSync(runsDir, { recursive: true });
-  const rec = (id, claim) => fs.writeFileSync(
+  const rec = (id, claim, active) => fs.writeFileSync(
     path.join(runsDir, `${id}.json`),
-    `${JSON.stringify({ id, kind: 'milestone', active: true, cwd: repo, code_dir: repo, write_claim: claim }, null, 2)}\n`,
+    `${JSON.stringify({ id, kind: 'milestone', active: active !== false, cwd: repo, code_dir: repo, write_claim: claim }, null, 2)}\n`,
     'utf8',
   );
   rec(MILESTONE, null);
   // A CONTRAPARTE: outra run, MESMO code_dir, claimando o arquivo escrito aqui.
   rec('RUN-CONTRAPARTE', { paths: [claimPath], code_dir: repo, ts: new Date().toISOString() });
+  // Contrapartes extras — usadas pelo bloco da partição para plantar uma run
+  // MEDIDA como encerrada ao lado da viva, na forma REAL de produção.
+  for (const extra of ((opts && opts.extraRuns) || [])) {
+    rec(extra.id, { paths: [extra.claimPath || claimPath], code_dir: repo, ts: new Date().toISOString() }, extra.active);
+  }
 
   const summary = path.join(cwd, '.gsd', 'milestones', MILESTONE, 'slices', 'S07', 'S07-SUMMARY.md');
   fs.mkdirSync(path.dirname(summary), { recursive: true });
@@ -615,6 +620,137 @@ test('workspace sem .gsd nenhum: exit 0 e recusa nomeada (advisory absoluto)', (
 
 // ── Suite close ────────────────────────────────────────────────────────────
 cleanup();
+
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\nBloco J: a partição é RENDERIZADA inteira e só o ACIONÁVEL vira incidente (triagem 2026-08-16)');
+
+// Um resultado MISTO montado pelo núcleo puro: uma contraparte viva e duas
+// medidas como encerradas, todas colidindo com o mesmo arquivo escrito.
+function mixedResult() {
+  const claim = (run, activity, activity_reason) => ({
+    run, source: 'run-registry', paths: ['scripts/a.js'],
+    claim: { paths: ['scripts/a.js'], code_dir: ABS_A },
+    scope_source: 'code-dir', scope: null, note: null, activity, activity_reason,
+  });
+  return compareClaimAudit({
+    milestone: 'M-x', slice: 'S07', code_dir: ABS_A, declared: { byUnit: new Map(), notes: [] },
+    written: { units: [{ unit: 'M-x::S07/T02', owner: 'M-x', slice: 'S07', task: 'T02', files: ['scripts/a.js'] }], skipped: [] },
+    claims: {
+      claims: [
+        claim('RUN-VIVA', 'live', 'registry-active'),
+        claim('RUN-MORTA-1', 'ended', 'registry-inactive'),
+        claim('RUN-MORTA-2', 'ended', 'registry-inactive'),
+      ],
+      sources: [{ source: 'run-registry', consulted: true, contributed: 3, runs_examined: 4 }],
+      skipped: [], notes: [],
+    },
+  });
+}
+
+test('a seção lista os DOIS grupos por inteiro, com contagem nomeada — nenhuma linha some, nenhum "e mais N"', () => {
+  const r = mixedResult();
+  eq(r.census.findings, 3);
+  const md = formatClaimAuditMd(r);
+  assert(/\*\*Acionáveis \(1\)\*\*/.test(md), `o grupo acionável tem de sair com contagem; veio:\n${md}`);
+  assert(/\*\*Históricos\/inertes \(2\)\*\*/.test(md), `o grupo histórico tem de sair com contagem; veio:\n${md}`);
+  for (const run of ['RUN-VIVA', 'RUN-MORTA-1', 'RUN-MORTA-2']) {
+    assert(md.includes(run), `linha suprimida da seção: ${run} — particionar não é filtrar`);
+  }
+  assert(md.includes('acionáveis 1, históricos 2'), 'o censo da seção tem de nomear os dois termos');
+  assert(!/e mais \d+/.test(md), 'nenhuma linha pode ser colapsada em contagem');
+});
+
+test('só históricos: a seção AINDA lista tudo e diz explicitamente que há zero acionáveis', () => {
+  const r = mixedResult();
+  r.findings = r.findings.filter((f) => f.group === 'historical');
+  r.census.findings = 2; r.census.findings_actionable = 0; r.census.findings_historical = 2;
+  const md = formatClaimAuditMd(r);
+  assert(/\*\*Acionáveis \(0\)\*\*/.test(md), 'o grupo vazio tem de aparecer nomeado, nunca omitido');
+  assert(md.includes('- nenhum.'), 'o grupo vazio tem de dizer "nenhum" — ausência de linha é ambígua');
+  assert(md.includes('RUN-MORTA-1') && md.includes('RUN-MORTA-2'), 'os históricos continuam listados por inteiro');
+});
+
+test('evento: só os ACIONÁVEIS viram linha, e a supressão dos históricos é REPORTADA por número', () => {
+  const dir = mktmp('ev-partition');
+  const r = emitWorkLostEvent(dir, mixedResult());
+  eq(r.event_written, true, `evento não escrito: ${r.event_error}`);
+  eq(r.event_lines, 1, 'uma linha por achado ACIONÁVEL, e só');
+  eq(r.event_historical_suppressed, 2, 'a supressão tem de ser NOMEADA por número, nunca silenciosa');
+  const lines = fs.readFileSync(eventsPath(dir), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  eq(lines.length, 1);
+  eq(lines[0].other_run, 'RUN-VIVA', 'o incidente emitido é o da contraparte viva');
+  eq(lines[0].counterpart_activity, 'live', 'a linha carrega a atividade medida (aditiva)');
+  eq(originOf(lines[0]), 'code', 'o marcador de origem tem de sobreviver à partição');
+});
+
+test('achados TODOS históricos: nenhuma linha, razão NOMEADA (historical-only) e o log nem é criado', () => {
+  const dir = mktmp('ev-hist-only');
+  const r = mixedResult();
+  r.findings = r.findings.filter((f) => f.group === 'historical');
+  const out = emitWorkLostEvent(dir, r);
+  eq(out.event_written, false);
+  eq(out.event_error, null, 'não é erro: é uma decisão sobre o SIGNIFICADO do evento');
+  eq(out.event_skipped, 'historical-only', 'a razão tem de ser nomeada, não um false mudo');
+  eq(out.event_historical_suppressed, 2);
+  assert(!fs.existsSync(eventsPath(dir)), 'nenhum incidente para uma contraparte encerrada');
+});
+
+test('idempotência R4 sobrevive à partição: a SEGUNDA emissão do mesmo misto appenda ZERO', () => {
+  const dir = mktmp('ev-partition-idem');
+  eq(emitWorkLostEvent(dir, mixedResult()).event_lines, 1);
+  const second = emitWorkLostEvent(dir, mixedResult());
+  eq(second.event_lines, 0);
+  eq(second.event_skipped, 'already-recorded', 'a supressão por IDENTIDADE continua valendo');
+  eq(second.event_historical_suppressed, 2, 'e a contagem histórica continua reportada');
+  eq(fs.readFileSync(eventsPath(dir), 'utf8').trim().split('\n').length, 1);
+});
+
+// ── A reconciliação sobre a FORMA REAL DE PRODUÇÃO, por SPAWN ─────────────
+//
+// Não um fixture montado à mão: um repositório git de verdade, um registry de
+// verdade com uma contraparte VIVA e uma MEDIDA COMO ENCERRADA, a CLI real, e
+// o censo lido do JSON que o processo imprimiu. Foi exatamente a asserção sobre
+// forma montada à mão que produziu o defeito recorrente desta milestone.
+let mixedPlant = null;
+try {
+  mixedPlant = plantWorkspace('partition-real', {
+    extraRuns: [{ id: 'RUN-ENCERRADA', active: false }],
+  });
+} catch (e) { mixedPlant = { error: e.message }; }
+
+test('FORMA REAL por SPAWN: censo fecha por igualdade, os DOIS grupos saem na seção em disco, e só o acionável vira work-lost', () => {
+  if (mixedPlant.error) skip(`fixture git indisponível: ${mixedPlant.error}`);
+  const { cwd, repo, summary } = mixedPlant;
+  const res = runCli(['--milestone', MILESTONE, '--slice', 'S07', '--cwd', cwd, '--code-dir', repo,
+    '--run', MILESTONE, '--write', summary, '--json'], cwd);
+  eq(res.status, 0, `exit code LIDO DO PROCESSO tem de ser 0, veio ${res.status} — stderr: ${res.stderr}`);
+  const out = JSON.parse(res.stdout);
+  eq(out.verdict, 'overlap', `o detector não mordeu — censo: ${JSON.stringify(out.census)}`);
+
+  // (1) o censo reconcilia por IGUALDADE ARITMÉTICA, na forma de produção.
+  eq(out.census.findings, 2, `duas contrapartes colidem; censo: ${JSON.stringify(out.census)}`);
+  eq(out.census.findings, out.census.findings_actionable + out.census.findings_historical,
+    'a partição tem de fechar por igualdade sobre a saída REAL do processo');
+  eq(out.census.findings_actionable, 1);
+  eq(out.census.findings_historical, 1);
+  eq(out.findings.length, out.census.findings, 'o censo conta as linhas que existem');
+  const unitSkips = out.skipped.filter((s) => s.kind === 'unit').length;
+  eq(out.census.units_examined, out.census.units_compared + unitSkips, 'a conta de unidades continua fechando');
+
+  // (2) NADA foi filtrado: a seção em disco nomeia as DUAS contrapartes.
+  const written = fs.readFileSync(summary, 'utf8');
+  assert(written.includes('RUN-CONTRAPARTE'), 'a contraparte viva sumiu da seção');
+  assert(written.includes('RUN-ENCERRADA'), 'a contraparte encerrada foi FILTRADA da seção — o defeito recusado pelo operador');
+  assert(/\*\*Históricos\/inertes \(1\)\*\*/.test(written), 'o grupo histórico tem de sair nomeado e contado em disco');
+
+  // (3) só o acionável virou incidente, e a supressão foi ANUNCIADA no stderr.
+  const lost = fs.readFileSync(eventsPath(cwd), 'utf8').trim().split('\n')
+    .filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.event === 'work-lost');
+  eq(lost.length, 1, `só o achado acionável vira incidente; veio: ${JSON.stringify(lost.map((l) => l.other_run))}`);
+  eq(lost[0].other_run, 'RUN-CONTRAPARTE');
+  assert(/1 achado\(s\) histórico\(s\)/.test(res.stderr),
+    `a supressão tem de ser anunciada no stderr; veio: ${res.stderr}`);
+});
 
 console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped`);
 if (failed > 0) {
