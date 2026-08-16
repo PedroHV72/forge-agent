@@ -47,7 +47,7 @@
     {
       "source_id": "configuration",
       "target": "forge-capabilities.json;forge-prefs.schema.json",
-      "sha256": "e990cd959cb7dd36682a39602d5f1d7ad75b4f9ab1abc9c0a7c4cde0f654c9ba"
+      "sha256": "2b7434304f9a72d3dea9df7c901d13dd2f391879b7dd364dc19715ea87956bab"
     }
   ]
 }

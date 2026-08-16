@@ -189,6 +189,51 @@ were confronted and none collided; `no-active-counterpart` means **nothing was c
 When echoing a proceed, echo the reason — a proceed that compared nothing must never be reported in
 the language of a clean comparison.
 
+## D8 — Posture hardening where there is no physical isolation
+
+The pref (§ Step 0) resolves a **default** posture, `defer` or `block`. D8 is the one case where the
+module overrides that default **regardless of what the pref says**, because `defer` stops meaning
+"safe" the moment the two colliding runs share the same physical tree: telling one of them to "go do
+another task" does not lower the risk of the collision, it only changes **which** file gets
+trampled. `defer` is only ever a safe answer when the counterpart truly writes somewhere else.
+
+**Where the fact comes from.** `resolveEffectiveMode` (`scripts/forge-isolation.js`, S06/T01) derives
+`unmet_requirement` when a run's isolation setup **asked** for a worktree (`workers.require_worktree:
+'true'` or `'auto'` with a matching write-engine) and did not get one — the SVN short-circuit is the
+first case that produces it. This is **measured live**, by calling the resolver against the claim's
+`code_dir` at the moment `resolvePosture` runs; it is **not** a field persisted on the `RunRecord`,
+and the gate never reads a stale copy of it.
+
+**What does NOT trigger it:**
+
+- `workers.require_worktree: 'false'` (or unset) with no explicit pref asking for one — nothing was
+  refused, so there is nothing to harden against.
+- `mode: 'branch'` — a branch is not physical isolation from the counterpart's tree either, but D8
+  only fires on the SVN short-circuit `resolveEffectiveMode` already names; a plain `branch` mode
+  with no `unmet_requirement` field leaves the posture exactly as the pref set it.
+- Measurement unavailable — no `code_dir` on either the own or the counterpart claim
+  (`isolation-unmeasured`), or the resolver throwing (`isolation-probe-threw`). Same rule as the
+  release probes (§ Release lifecycle): **a measurement that could not be taken never hardens and
+  never loosens.** The pref's posture stands, and the hole in the evidence is named in
+  `isolation_note`, never silently folded into `note`.
+
+**The effect on the consumer: none.** The two orchestrators keep acting on `decision` exactly as
+before — `defer`/`block`/`proceed`/`refuse`, per the table in **§ Step 3**. D8 changes only what the
+*module* returns as the decision; it does not add a fifth decision, a new flag the consumer must
+branch on, or any call the consumer must make differently. The posture is resolved and applied
+**inside** `resolvePosture` (§ Step 0's rule extends here without exception), and its outcome is
+readable by the consumer only through the fields documented in **§ Step 5**.
+
+The closed sets are exported for callers that need to validate against them (the doc↔code
+conformance assert in `scripts/forge-claim-gate.test.js` is one):
+
+- `POSTURE_OVERRIDES` — `['svn-unmet-worktree']`. The only override this gate knows how to justify.
+- `OVERRIDE_EFFECTS` — `['hardened', 'already-block']`. Reported **separately** from the override on
+  purpose: an operator reading `block` must be able to tell a block the pref already asked for
+  (`already-block`) from a block D8 imposed (`hardened`) — collapsing them would make the hardening
+  invisible exactly where it changed nothing, and a hardening nobody can see is indistinguishable
+  from one that never ran.
+
 ## Step 4 — Escalation (the Account Handoff Procedure form)
 
 Triggered when `.escalation` is `wait-ceiling` or `defer-cap`, and used as the surfacing shape for
@@ -370,12 +415,21 @@ Shape appended to `.gsd/forge/events.jsonl` of `WORKING_DIR` — documented for 
 retyping:
 
 ```json
-{"event":"claim-gate","ts":"<ISO-8601>","run":"<run id>","unit":"<unit verbatim>","decision":"proceed|defer|block|refuse","cause":"overlap|undeclared-writes|pathless-conceded-item|null","undeclared_side":"own|counterpart|both|null","posture":"defer|block","posture_source":"prefs|fallback|invalid-pref|explicit","escalation":"wait-ceiling|defer-cap|null","floor":"defer-floor|null","counterparts":[{"id":"<run>","cause":"...","paths":["..."],"scope":"same|unknown","note":"<S03 note|null>"}],"census":{"runs_examined":N,"counterparts_considered":N,"counterparts_in_scope":N,"skipped":[{"id":"<run>","reason":"different-code-dir"}],"notes":[{"id":"...","reason":"..."}]},"not_covered":[{"boundary":"...","reason":"..."}]}
+{"event":"claim-gate","ts":"<ISO-8601>","run":"<run id>","unit":"<unit verbatim>","decision":"proceed|defer|block|refuse","cause":"overlap|undeclared-writes|pathless-conceded-item|null","undeclared_side":"own|counterpart|both|null","posture":"defer|block","posture_source":"prefs|fallback|invalid-pref|explicit","posture_effective":"defer|block","posture_override":"svn-unmet-worktree|null","posture_override_effect":"hardened|already-block|null","escalation":"wait-ceiling|defer-cap|null","floor":"defer-floor|null","counterparts":[{"id":"<run>","cause":"...","paths":["..."],"scope":"same|unknown","note":"<S03 note|null>"}],"census":{"runs_examined":N,"counterparts_considered":N,"counterparts_in_scope":N,"skipped":[{"id":"<run>","reason":"different-code-dir"}],"notes":[{"id":"...","reason":"..."}]},"not_covered":[{"boundary":"...","reason":"..."}]}
 ```
 
 Additive-field convention, same as `tier`/`reason` from M002: readers that do not recognise a field
 ignore it. `scope: unknown` with an S03 `note` is what lets an operator tell a block backed by
 **measured** identity from a block backed by unknown identity.
+
+`posture` **keeps** its established meaning — the posture resolved from `parallelism.cross_run_overlap`
+by § Step 0, before D8 is consulted. `posture_effective`, `posture_override` and
+`posture_override_effect` are the three fields **D8 adds** (§ D8 above): `posture_effective` is what
+the module actually decided with after the isolation check; `posture_override` names which override
+fired (`svn-unmet-worktree`) or `null` when none did; `posture_override_effect` is `hardened` when
+D8 changed the outcome, `already-block` when the pref's own posture was already `block`, or `null`
+when D8 did not fire. All three come straight from `resolvePosture`'s return — the event never
+re-derives them.
 
 **Mandatory enumeration.** Every gate execution — including `proceed` — carries `not_covered` with
 three boundaries, and the consumer **prints it** every time:

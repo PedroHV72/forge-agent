@@ -359,7 +359,7 @@ Execução paralela de execute-task dentro do mesmo slice + comportamento em ove
 - **Tipo:** string
 - **Default:** `"defer"`
 - **Valores permitidos:** `defer`, `block`
-- **Descrição:** Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff). Lido por scripts/forge-claim-gate.js (resolvePostureFromPrefs) — um valor fora de {defer, block} cai para defer com note nomeada invalid-posture-pref.
+- **Descrição:** Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff). Lido por scripts/forge-claim-gate.js (resolvePostureFromPrefs) — um valor fora de {defer, block} cai para defer com note nomeada invalid-posture-pref. Esta posture pode ser ENDURECIDA de defer para block pela regra D8 do gate (nenhum isolamento físico entre as duas árvores em conflito) — ver shared/forge-claim-gate.md § D8, a fonte única; não é restatada aqui.
 
 ### `parallelism.block_wait_ms`
 

@@ -42,6 +42,9 @@
 //       non-measurement notes (which never harden and never loosen), and the
 //       interaction with the D3 floor (D8 fires BEFORE it, so `floor` is null
 //       and the two routes to `block` stay distinguishable).
+//   G24 doc↔code conformance (S06/T03): POSTURE_OVERRIDES/OVERRIDE_EFFECTS and
+//       the three new event fields appear literally in shared/forge-claim-gate.md,
+//       proved non-vacuous by a positive control (an invented member is NOT found).
 //
 // Zero deps. Standalone runner, repo convention: exit != 0 on failure.
 
@@ -59,8 +62,10 @@ const gate = require('./forge-claim-gate.js');
 const {
   deriveClaimFromPlan, deriveClaimFromConcededItems, resolvePosture, evaluateGate,
   GATE_DECISIONS, GATE_CAUSES, PROCEED_REASONS, GATE_SKIP_REASONS, GATE_NOTE_REASONS,
-  UNCOVERED_BOUNDARIES,
+  UNCOVERED_BOUNDARIES, POSTURE_OVERRIDES, OVERRIDE_EFFECTS,
 } = gate;
+
+const SPEC_PATH = path.join(__dirname, '..', 'shared', 'forge-claim-gate.md');
 const { CLAIM_NOTE_REASONS } = require('./forge-claim-overlap.js');
 
 // ── Runner ─────────────────────────────────────────────────────────────────
@@ -2017,6 +2022,34 @@ console.log('\nG9: direção 2 — todo valor declarado foi emitido por >= 1 tes
   });
   test('G9e: toda note de GATE_NOTE_REASONS foi emitida por >= 1 teste', () => {
     for (const n of GATE_NOTE_REASONS) assert(notesSeen.has(n), `note declarada e nunca emitida: ${n}`);
+  });
+}
+
+// ── G24 (S06/T03): the spec doc↔code conformance — D8's closed sets appear
+// literally in shared/forge-claim-gate.md, and the search is PROVED to bite
+// with a positive control (an invented member is NOT found).
+console.log('\nG24: shared/forge-claim-gate.md documenta D8 literalmente (POSTURE_OVERRIDES/OVERRIDE_EFFECTS)');
+{
+  const specText = fs.readFileSync(SPEC_PATH, 'utf8');
+
+  test('G24a: todo membro de POSTURE_OVERRIDES aparece literalmente no spec', () => {
+    for (const m of POSTURE_OVERRIDES) {
+      assert(specText.includes(m), `membro exportado ausente do spec: ${m}`);
+    }
+  });
+  test('G24b: todo membro de OVERRIDE_EFFECTS aparece literalmente no spec', () => {
+    for (const m of OVERRIDE_EFFECTS) {
+      assert(specText.includes(m), `membro exportado ausente do spec: ${m}`);
+    }
+  });
+  test('G24c: controle positivo — um membro INVENTADO não é encontrado (a busca morde)', () => {
+    const invented = 'svn-unmet-worktree-INVENTED-CONTROL-XYZ';
+    assert(!specText.includes(invented), 'o membro inventado apareceu no spec — a busca não morde');
+  });
+  test('G24d: o spec nomeia os três campos novos do evento claim-gate', () => {
+    for (const field of ['posture_effective', 'posture_override', 'posture_override_effect']) {
+      assert(specText.includes(field), `campo do evento ausente do spec: ${field}`);
+    }
   });
 }
 
