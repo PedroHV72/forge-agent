@@ -19,7 +19,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
 1. Write `S##-SUMMARY.md` — compress all task summaries:
    - YAML frontmatter: id, milestone, provides (up to 8), key_files (up to 10), key_decisions (up to 5), patterns_established
-   > Note: `## Evidence Flags` (sub-step 1.5), `## File Audit` (sub-step 1.6), and `## Verification Summary` (sub-step 1.8) sections may appear in the body — written by the sub-steps below.
+   > Note: `## Evidence Flags` (sub-step 1.5), `## File Audit` (sub-step 1.6), `## Verification Summary` (sub-step 1.8), and `## File Audit (cross-run)` (sub-step 1.87) sections may appear in the body — written by the sub-steps below.
    - One substantive liner for the slice
    - `## What Was Built` narrative
    - `## Verification Gate` section (commands, exit codes, discovery source, total duration) — populated in step 3
@@ -198,11 +198,13 @@ Given all `T##-SUMMARY.md` files from the slice:
        - `unexpected` = ACTUAL_AM \ EXPECTED (files changed but not promised by any plan).
        - `missing` = EXPECTED \ ACTUAL_AM (files promised but no AM diff entry).
 
-    f. **Write `## File Audit` section** to `S##-SUMMARY.md`. Write the section only if at least one of `unexpected` or `missing` is non-empty; if both are empty, omit the section entirely.
+    f. **Write `## File Audit` section** to `S##-SUMMARY.md`, **unconditionally** — including when both `unexpected` and `missing` are empty. An omitted section is indistinguishable from a broken detector (the defect IN-8 names, in this same file); a clean run must say what was compared, not go silent.
        ```markdown
        ## File Audit
 
        _Advisory — git diff `--diff-filter=AM` vs union of `expected_output:` across all T##-PLAN.md. Deletions not audited per M003 decision D4. Ignore list applied from `file_audit.ignore_list` prefs._
+
+       **Compared:** N paths from `expected_output:` (EXPECTED) vs M changed paths (ACTUAL_AM). None unexpected, none missing.
 
        **Unexpected (changed but not promised):**
        - `scripts/forge-stray.js` (added — not in any expected_output)
@@ -212,7 +214,7 @@ Given all `T##-SUMMARY.md` files from the slice:
 
        Advisory only — no action taken; recorded for auditing.
        ```
-       If only one list has entries, include only that sub-heading.
+       If both lists are empty, include only the **Compared** line (omit the `**Unexpected**`/`**Missing**` sub-headings). If only one list has entries, include the **Compared** line plus that sub-heading.
 
     This sub-step is advisory. Do NOT return `status: blocked`. Do NOT abort merge. Git failures and malformed plans surface as warn notes, not errors.
 
@@ -294,6 +296,30 @@ Given all `T##-SUMMARY.md` files from the slice:
        ```
 
     This sub-step is advisory: never return `status: blocked` from route findings and never abort merge. Installed copies of `agents/` and `skills/` require `/forge-update` before this wiring takes effect.
+
+1.87. **Cross-run claim audit — invoke detector + write `## File Audit (cross-run)` to `S##-SUMMARY.md`** (advisory; always runs).
+
+    a. **Invoke the detector CLI:**
+       ```bash
+       FORGE_SCRIPTS_DIR=$([ -f scripts/forge-claim-audit.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
+       node "$FORGE_SCRIPTS_DIR/forge-claim-audit.js" \
+         --slice {S##} \
+         --milestone {M###} \
+         --cwd {WORKING_DIR} \
+         --code-dir {CODE_DIR} \
+         --run {RUN_ID} \
+         --write "{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-SUMMARY.md"
+       ```
+       Capture stdout and the exit code separately. If exit is non-zero **or** stdout is not valid JSON, write the fallback below; the script itself owns the normal `## File Audit (cross-run)` upsert, and it writes that section in all three verdicts (`overlap`, `clean`, `inconclusive`) — the invocation is not conditioned on any finding, verdict, or pref. The section is emitted even when clean; the script is the owner of the upsert, not this agent — do not hand-author the section's content.
+
+    b. **Fallback (detector unavailable):**
+       ```markdown
+       ## File Audit (cross-run) (unavailable)
+
+       _Cross-run claim audit failed to run: {reason from stderr or "unknown"}. Advisory — does not block closure._
+       ```
+
+    This sub-step is advisory: never return `status: blocked` from cross-run findings and never abort merge. Installed copies of `agents/` require `/forge-update` before this wiring takes effect.
 
 1.9. **Checker Memory update — emit quality events to fragment store** (advisory; skipped when `checker_memory.mode: disabled`).
 
@@ -387,7 +413,7 @@ Given all `T##-SUMMARY.md` files from the slice:
       - `{file}:{line}` — pattern `{pattern}` — {one-line context from snippet}
       ```
       Write rules:
-      - `PATTERN_HITS` empty AND `REVIEW_OUTCOME` empty → omit the section entirely.
+      - `PATTERN_HITS` empty AND `REVIEW_OUTCOME` empty → skip writing the `## ⚠ Review Flags` section (nothing to report).
       - `PATTERN_HITS` empty → omit the `### Pattern Hits` sub-heading (keep the dialectic-review line if present).
 
       Append to `S##-SUMMARY.md`. This is documentation only — never a blocker.
