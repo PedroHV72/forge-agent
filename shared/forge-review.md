@@ -4,7 +4,7 @@ Authoritative spec for the **review gate**: a two-agent confrontation on a compl
 
 | Consumer | Boundary | DIFF_CMD | Artifact | MODE |
 |----------|----------|----------|----------|------|
-| `forge-auto` / `forge-next` (before `complete-slice`) | per-slice — branch `gsd/{M###}/{S##}` still **unmerged** | git: `git diff {merge-base}...HEAD` · svn: `forge-review-diff.js` (Step 1, VCS-aware) | `{S##}-REVIEW.md` | `auto` / `interactive` |
+| `forge-auto` / `forge-next` (before `complete-slice`) | per-slice — run branch `forge/{run}` still **unmerged** (it stays unmerged until the operator integrates it) | git: `git diff {merge-base}...HEAD` · svn: `forge-review-diff.js` (Step 1, VCS-aware) | `{S##}-REVIEW.md` | `auto` / `interactive` |
 | `forge-task` (Step 5.5) | standalone task | git: `git diff {START_SHA}..HEAD` (worktree fallback) · svn: `forge-review-diff.js` | `{TASK_ID}-REVIEW.md` | `interactive` |
 
 Steps 2–8 below are boundary-agnostic — only the four bindings above differ. Step 9 (milestone-final triage) applies only to the per-slice boundary. The rest of this doc is written in slice terms (`{S##}-REVIEW.md`); substitute the task bindings when invoked from `forge-task`.
@@ -316,13 +316,13 @@ If `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already e
 ## Step 1 — Compute the slice diff
 
 Detect the VCS of `WORKING_DIR` first, then compute `DIFF_CMD` accordingly. Git is the default
-(slice-branch range, `auto_commit: true`, branch still unmerged). SVN working copies have no
-per-slice branch and no merge-base — the team works on trunk and holds commits — so the reviewable
+(run-branch range, `auto_commit: true`, branch still unmerged). SVN working copies have no
+run branch and no merge-base — the team works on trunk and holds commits — so the reviewable
 change is the uncommitted working copy. Run this from INSIDE `WORKING_DIR` (the diff target lives there).
 
 ```bash
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # git — default to the slice-branch range (auto_commit: true — common case, branch still unmerged)
+  # git — default to the run-branch range (auto_commit: true — common case, branch still unmerged)
   BASE=$(git merge-base HEAD master 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD~10)
   DIFF_CMD="git diff ${BASE}...HEAD"
   # Fallback for auto_commit: false (work uncommitted in the worktree) or an empty branch range:
@@ -344,7 +344,7 @@ fi
 **Why the SVN branch is a program and not `svn diff`.** Three properties the bare command
 cannot deliver, each observed in the field:
 
-- **Scope.** `svn diff` with no paths is the ENTIRE working copy. With no per-slice branch and
+- **Scope.** `svn diff` with no paths is the ENTIRE working copy. With no run branch and
   a working copy shared by several developers at once, it carries their uncommitted work —
   measured: 49 files, 8 of them the unit's. The challenger then spends its budget objecting to
   code this slice does not own. `--unit-dir` mines the slice's `T##-PLAN.md`/`*-SUMMARY.md` for
@@ -892,7 +892,7 @@ Omit any section with zero items — **exceto** o bloco de indisponibilidade do 
 
 ## Step 7a — Conceded fix dispatch (both modes)
 
-A CONCEDED objection is a problem **both agents agree is real** — the confrontation already settled it. Recording it for a human to maybe-read later defeats the purpose of the debate. Fix it now, while the boundary diff is still intact (slice branch unmerged / task uncommitted scope).
+A CONCEDED objection is a problem **both agents agree is real** — the confrontation already settled it. Recording it for a human to maybe-read later defeats the purpose of the debate. Fix it now, while the boundary diff is still intact (run branch `forge/{run}` unmerged / task uncommitted scope).
 
 Skip if `fixConceded == false` (pref opt-out → conceded items fall through to Step 7b posture as before) or there are zero CONCEDED items.
 
@@ -905,7 +905,7 @@ Agent({ subagent_type: 'forge-executor',
 
 - On success → update each conceded R# in `{S##}-REVIEW.md`: `**Correção:** aplicada — commit {sha}`.
 - On `Agent()` throw or `status != done` → update each: `**Correção:** falhou — deferida para triagem final`. These items join the OPEN items in the milestone-final triage (Step 9). **Never blocks** — the gate proceeds to `complete-slice` regardless.
-- **No re-review.** The fix commit is NOT re-run through the reviewer (deliberate — prevents review ping-pong). The fix lands on the slice branch and flows through the normal `complete-slice` merge.
+- **No re-review.** The fix commit is NOT re-run through the reviewer (deliberate — prevents review ping-pong). The fix lands on the run branch `forge/{run}` and reaches the default branch only when the operator integrates that branch — there is no `complete-slice` merge; no unit of the loop integrates.
 
 ## Step 7b — Posture (handle OPEN items)
 
@@ -1045,7 +1045,7 @@ Shape written (for readers, not for retyping):
 
 ## Step 9 — Milestone-final triage (before `complete-milestone`)
 
-Consumer: `forge-auto` / `forge-next`, when the derived unit is `complete-milestone` — **before dispatching `forge-completer`**. This is the operator's arbitration moment: all slice work is done, but the milestone has not yet been finalized (no final merge close-out, no LEDGER entry, no cleanup). Deferred review items get decided HERE, while acting on them is still cheap.
+Consumer: `forge-auto` / `forge-next`, when the derived unit is `complete-milestone` — **before dispatching `forge-completer`**. This is the operator's arbitration moment: all slice work is done, but the milestone has not yet been finalized (no close-out, no LEDGER entry, no cleanup — and nothing has been integrated: the slices live on the still-unmerged `forge/{run}` branch, which only the operator integrates). Deferred review items get decided HERE, while acting on them is still cheap.
 
 > **AUTONOMY RULE exception (explicit):** asking the user at this gate does NOT violate the forge-auto AUTONOMY RULE. The rule protects the *middle* of the loop; at this point every slice is complete and the only remaining unit is the milestone close-out. This gate is the designed human-arbitration point that `defer` postponed to.
 
@@ -1056,7 +1056,7 @@ Consumer: `forge-auto` / `forge-next`, when the derived unit is `complete-milest
 2. **If zero pending items** → skip silently, dispatch `complete-milestone` normally.
 3. **Digest.** Print a digest table to the user — one row per item: `slice · R# · path:line · objeção (one-liner) · status (aberta | concedida-sem-fix)`.
 4. **Triage.** For each item (batched up to 4 per `AskUserQuestion`, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
-5. **Act.** All `Refatorar agora` items → ONE `review-fix` dispatch (Step 7a shape, `UNIT: review-fix/{M###}-triage`, items grouped in a single prompt; slices are merged by now so fixes are normal commits on the current branch). On throw → mark those items `**Decisão:** refatorar — dispatch falhou, virou follow-up` and continue.
+5. **Act.** All `Refatorar agora` items → ONE `review-fix` dispatch (Step 7a shape, `UNIT: review-fix/{M###}-triage`, items grouped in a single prompt; the slices have NOT been integrated at this point — the fix commits on the still-checked-out `forge/{run}` branch). On throw → mark those items `**Decisão:** refatorar — dispatch falhou, virou follow-up` and continue.
 6. **Write back.** Update the `**Decisão:**` line of every triaged R# in its `{S##}-REVIEW.md`. `Criar follow-up` items create an item per **§ Item capture** (source `review/{S##}/{R#}`) and append ONLY the pointer line — `- {I-id} — {title}` — to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing; never the full content) so they survive `milestone_cleanup`.
 7. **Headless fallback.** When `AskUserQuestion` is unavailable at this boundary (headless session, no gate mailbox configured for this junction), Step 4's per-item ask cannot run: instead, create one item per still-pending deferred objection (source `review/{S##}/{R#}`, status `inbox`, `body` noting `triagem não realizada — headless`) so the deferrals survive `milestone_cleanup` rather than dying silently in a `REVIEW.md` that will be cleaned up. Skip Steps 3–6's human-facing digest/triage in this branch; proceed straight to Step 8.
 8. **Event.** Append to `events.jsonl`: `{"ts":"<ISO>","event":"review-triage","milestone":"{M###}","pending":N,"kept":N,"fixed":N,"follow_up":N}`. `follow_up` counts items created in either Step 6 or Step 7 — schema unchanged from before this cutover.

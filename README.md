@@ -20,7 +20,7 @@
 - Hierarquia **Milestone → Slice → Task** com contexto fresco por unidade
 - Agentes especializados por fase (Opus para pensar, Sonnet para executar)
 - Memória emergente — o sistema aprende padrões e gotchas do seu projeto
-- Git automático — branch por slice, squash merge, commits semânticos
+- Git automático — branch por run (`forge/{run}`), commits semânticos; a branch chega pushada e pronta para PR — a integração na branch principal é sempre do operador
 - Tudo em arquivos `.md` — recuperável após crash, auditável, versionável
 
 ---
@@ -335,7 +335,7 @@ Preferências e arquivos de projeto nunca são sobrescritos.
 
 ## Créditos
 
-Reimplementação dos conceitos do **[GSD-2 (gsd-pi)](https://github.com/gsd-build/gsd-2)** para o sistema nativo de agentes do Claude Code. Hierarquia Milestone → Slice → Task, contexto fresco por unidade, memória emergente, workflow de fases e git branch-per-slice são designs originários do gsd-2.
+Reimplementação dos conceitos do **[GSD-2 (gsd-pi)](https://github.com/gsd-build/gsd-2)** para o sistema nativo de agentes do Claude Code. Hierarquia Milestone → Slice → Task, contexto fresco por unidade, memória emergente, workflow de fases e isolamento do trabalho em branch git dedicada são designs originários do gsd-2 (lá com branch por slice; aqui uma branch por run, integrada pelo operador).
 
 Este repositório não distribui nem modifica código do gsd-2 — apenas reimplementa os conceitos usando arquivos `.md`.
 

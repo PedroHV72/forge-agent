@@ -22,4 +22,6 @@ If auto_commit is true:
 3. Write final git tag or note
 If auto_commit is false:
 3. Skip — do NOT run any git commands.
+4. **NEVER integrate** — the OPERATOR does that. Only add, commit, tag and read-only inspection
+   are permitted; see `## Git boundary — complete-milestone`.
 Return ---GSD-WORKER-RESULT---.

@@ -311,7 +311,7 @@ node "{WORKING_DIR}/scripts/forge-overlap.js" --check --cwd "{WORKING_DIR}" || t
 ```
 Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqueia o `complete-slice`, nunca ordena runs, nunca faz merge. Verdict `inconclusive` significa "não havia o que comparar" e **não** deve ser lido como limpo.
 
-**Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the slice branch `gsd/{M###}/{S##}` is still unmerged here, so the diff is intact). This is the challenger × defender confrontation:
+**Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the run branch `forge/{run}` is still unmerged here — it stays unmerged until the operator integrates it — so the diff is intact). This is the challenger × defender confrontation:
 
 1. Idempotency: if `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already exists → skip the gate, proceed to `complete-slice`.
 2. Read `review.{mode,style,rounds,ask_in_auto,engine,challenger,challenger_model}` via the cascade in `shared/forge-review.md § Step 0`. If `mode == disabled` → skip.
@@ -337,7 +337,7 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
 
 > Fires ONLY when the derived unit is `complete-slice`. Boundary is per-slice; standalone `/forge-task` keeps its own step-5.5 review. After the gate, dispatch `forge-completer` normally.
 
-**Slice git guard (around complete-slice):** `complete-slice` never integrates a branch — that is `complete-milestone`'s competence (`agents/forge-completer.md § Git boundary — complete-slice`). Snapshot the checkout **before** dispatching, verify **after** the worker returns:
+**Slice git guard (around complete-slice):** `complete-slice` never integrates a branch — no unit of the loop does; integration is the operator's act on the delivered `forge/{run}` branch (`agents/forge-completer.md § Git boundary — complete-slice`). Snapshot the checkout **before** dispatching, verify **after** the worker returns:
 
 ```bash
 # before Agent("forge-completer", ...)
@@ -1544,6 +1544,11 @@ node "$FORGE_SCRIPTS_DIR/forge-isolation.js" --cleanup --run "$ISO_RUN" --cwd "$
 ```
 
 Display the progress line AND the next action (read from the per-run `M###-STATE.md` you just updated, not the root dashboard). The user needs to know what comes next to decide whether to continue. Do not add summaries, explanations, or other follow-up text beyond these two lines.
+
+Exception — when the unit just processed was `complete-milestone` with `status: done`, add ONE line naming the deliverable:
+```
+Entregável: branch `forge/{run}` — pronta para push e PR. Pronta para PR — a integração na branch default é do operador; o loop nunca integra.
+```
 
 ---
 

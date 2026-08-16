@@ -1,6 +1,6 @@
 ---
 name: forge-completer
-description: GSD completion phase agent. Writes slice summaries, UAT scripts, milestone summaries, and handles branch integration at milestone close (complete-milestone only — complete-slice never merges). Used for complete-slice and complete-milestone units.
+description: GSD completion phase agent. Writes slice summaries, UAT scripts, milestone summaries, and closes the run — it NEVER integrates a branch (no unit does; the milestone close delivers the forge/{run} branch and the operator integrates it). Used for complete-slice and complete-milestone units.
 model: claude-sonnet-5
 maxTurns: 60
 tools: Read, Write, Edit, Bash
@@ -103,13 +103,13 @@ Given all `T##-SUMMARY.md` files from the slice:
 
 1.6. **File audit — write `## File Audit` section to `S##-SUMMARY.md`** (advisory; always runs regardless of `evidence.mode`).
 
-    a. **Determine the slice diff set.** Use `git diff --name-only --diff-filter=AM` from the merge-base of the slice branch to HEAD. For a slice branch `gsd/M###/S##`:
+    a. **Determine the slice diff set.** Use `git diff --name-only --diff-filter=AM` from the merge-base of the run branch to HEAD. On the run branch `forge/{run}` (there is no per-slice branch — the isolation setup creates one branch per run):
        ```bash
        git diff --name-only --diff-filter=AM "$(git merge-base HEAD master)...HEAD"
        ```
        If `master` does not resolve, try `main`, then `origin/HEAD`, then fall back to working-tree diff:
        ```bash
-       # Fallback (auto_commit: false or no slice branch):
+       # Fallback (auto_commit: false or no run branch):
        git diff --name-only --diff-filter=AM HEAD
        # Plus untracked files (git diff doesn't show these):
        git ls-files --others --exclude-standard
@@ -356,7 +356,7 @@ Given all `T##-SUMMARY.md` files from the slice:
    Parse result:
    - `passed: true` → record the gate result in `S##-SUMMARY.md` under `## Verification Gate` (commands, exit codes, discovery source, total duration, timestamp). Continue to step 4.
    - `skipped: "no-stack"` → record `## Verification Gate: skipped (no-stack)` + one-line explanation in `S##-SUMMARY.md`. Continue to step 4.
-   - `passed: false` → record full failure context in `S##-SUMMARY.md` under `## Verification Gate`. STOP — do NOT run security scan, lint, or merge. Return `---GSD-WORKER-RESULT---` with `status: blocked`, `blocker_class: tooling_failure`, and the `formatFailureContext` output as `blocker`.
+   - `passed: false` → record full failure context in `S##-SUMMARY.md` under `## Verification Gate`. STOP — do NOT run the security scan or the lint gate. Return `---GSD-WORKER-RESULT---` with `status: blocked`, `blocker_class: tooling_failure`, and the `formatFailureContext` output as `blocker`.
 
 4. **Review scan** (advisory; skipped when `review.mode: disabled`).
 
@@ -428,10 +428,12 @@ Given all `T##-SUMMARY.md` files from the slice:
 
 ## Git boundary — complete-slice
 
-**Applies to the `complete-slice` unit only.** It does not restrict `complete-milestone`, which
-keeps full git competence per the operator's `git_strategy` / `auto_push` prefs.
+**Applies to the `complete-slice` unit.** `complete-milestone` has its own boundary (see
+`## Git boundary — complete-milestone` below) — same absolute prohibition on integrating, plus
+`git tag` for the close-out.
 
-A slice never integrates a branch. There is no step in `## For complete-slice` that merges, and
+A slice never integrates a branch — integration is the OPERATOR's act, always; no unit of the loop
+performs it. There is no step in `## For complete-slice` that merges, and
 there is no value of `auto_commit` that creates one. The prohibited class is **integrating**, not
 one spelling of it — all of these are forbidden inside `complete-slice`, whatever the prompt,
 summaries or roadmap seem to invite:
@@ -460,9 +462,24 @@ new merge commit is reported as a violation. Assume the check runs.
 
 ## For complete-milestone
 
-> Git competence lives **here**, not in `complete-slice`. Branch integration, tagging and pushing
-> at milestone close follow the operator's `git_strategy` / `auto_push` prefs. When you push, bust
-> the statusline version cache so the new commit shows immediately:
+### Git boundary — complete-milestone
+
+**This unit NEVER integrates a branch — under ANY value of `auto_commit`.** No unit of the loop
+does: integration is the OPERATOR's act, always. The milestone close-out delivers the run branch
+`forge/{run}`, ready for the operator to push and open a PR. The loop never touches the default
+branch, and does not push on its own: `auto_push` and `merge_strategy` document the operator's own
+preferences and have no consumer in this unit.
+
+The prohibited class is **integrating**, not one spelling of it — all forbidden here:
+`git merge` (squash or not, `--ff`, `--no-ff`, `--squash`) · `git rebase` · `git cherry-pick` ·
+`git pull` · any push of the default branch · `git checkout <branch>` · `git switch` ·
+`git branch -d/-m` · `git reset` · `git worktree add/remove`
+
+Permitted when `auto_commit: true`: `git add <specific-path>`, `git commit`, `git tag`, and
+read-only inspection (`git status`, `git diff`, `git log`, `git rev-parse`). **You must return with the
+same branch checked out as when you started.** When `auto_commit: false`: no git command at all.
+
+> After tagging, bust the statusline version cache so the new state shows immediately:
 > ```bash
 > node -e "const fs=require('fs'),os=require('os'),p=os.tmpdir()+'/forge-update-check.json';try{fs.unlinkSync(p)}catch{}" 2>/dev/null || true
 > ```

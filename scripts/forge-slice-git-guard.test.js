@@ -94,27 +94,52 @@ for (const surface of SLICE_SURFACES) {
   });
 }
 
-// The control: the positive case must still exist somewhere, or the fix would
-// have removed the capability from the whole agent rather than from the slice.
-test('complete-milestone retains git competence', () => {
+// CONTRACT CHANGE, deliberate: these two guards used to encode #96's rule —
+// "the ban is scoped to the slice; complete-milestone RETAINS git competence".
+// That rule described a competence nobody implemented: complete-milestone never
+// had a merge step, only a blockquote claiming it did, while the loop shipped a
+// guard whose whole purpose is detecting a worker that integrates. The contract
+// is now repo-wide — NO unit integrates; the operator does — so the guards move
+// with it instead of being deleted.
+//
+// The control the old test provided is preserved and is the reason this one is
+// phrased over PERMITTED verbs: a blanket "no git" edit would disarm the
+// close-out's tagging and run-branch push, which are not integration and must
+// survive.
+test('complete-milestone keeps the non-integrating verbs it needs', () => {
   const text = read('agents/forge-completer.md');
   const start = text.indexOf('## For complete-milestone');
   assert.ok(start !== -1, 'complete-milestone section missing');
   const section = text.slice(start);
-  assert.ok(/git_strategy|auto_push|Branch integration/.test(section),
-    'complete-milestone lost its git competence — the fix was supposed to be scoped to the slice');
+  assert.ok(/auto_push/.test(section),
+    'complete-milestone no longer names auto_push — a blanket git ban would have eaten the run-branch push');
+  assert.ok(/git tag|`git commit`/.test(section),
+    'complete-milestone no longer names the permitted verbs (tag/commit) — the ban stopped being about INTEGRATING');
 });
 
-// Guard against the fix rotting: the boundary must stay scoped, not become a
-// blanket ban that would also disarm complete-milestone.
-test('Git boundary section declares its own scope', () => {
+// Guard against the new contract rotting: BOTH boundaries must state it, and
+// neither may quietly re-grant integration to the unit it covers.
+test('both Git boundary sections state the non-integration rule', () => {
   const text = read('agents/forge-completer.md');
-  const start = text.indexOf('## Git boundary — complete-slice');
-  assert.ok(start !== -1, 'Git boundary section missing from forge-completer.md');
-  const section = text.slice(start, text.indexOf('\n## For complete-milestone'));
-  assert.ok(/complete-slice.{0,40}only/i.test(section), 'boundary does not scope itself to complete-slice');
-  assert.ok(/does not restrict `complete-milestone`/.test(section),
-    'boundary does not exempt complete-milestone');
+  for (const heading of ['## Git boundary — complete-slice', '### Git boundary — complete-milestone']) {
+    // Anchored at line start: both headings are also CITED inside the prose
+    // ("see `## Git boundary — complete-slice` below"), and a bare indexOf
+    // lands on the citation — extracting the wrong span and asserting about
+    // text that isn't the section. The previous version of this guard had the
+    // same flaw and passed by coincidence.
+    const at = new RegExp(`^${heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm').exec(text);
+    assert.ok(at, `Git boundary section missing from forge-completer.md: ${heading}`);
+    const start = at.index;
+    const rest = text.slice(start + heading.length);
+    const end = rest.search(/\n#{2,3} /);
+    const section = end === -1 ? rest : rest.slice(0, end);
+    assert.ok(/NEVER integrates|does NOT integrate|NO merge step/i.test(section),
+      `${heading} does not state that this unit never integrates`);
+    assert.ok(/rebase/.test(section) && /cherry-pick/.test(section),
+      `${heading} does not state the prohibition as a class — sibling verbs (rebase/cherry-pick) unnamed`);
+    assert.ok(/OPERATOR/.test(section),
+      `${heading} does not name who does integrate — a ban with no owner reads as an oversight`);
+  }
 });
 
 test('both dispatching skills wire the guard', () => {

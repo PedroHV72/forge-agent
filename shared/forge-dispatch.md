@@ -523,7 +523,8 @@ Read if exists: {WORKING_DIR}/.gsd/milestones/{M###}/{M###}-SUMMARY.md
 4. Security scan — search changed files for risky patterns (eval, innerHTML, dangerouslySetInnerHTML, raw SQL concatenation, console.log near secrets, hardcoded credentials). If found, add ## ⚠ Security Flags to S##-SUMMARY.md. Not a blocker — document and continue.
 5. Run lint gate — if lint commands exist, run on changed files. Fix violations.
 6. **Git — this unit has NO merge step, under either value of auto_commit.** Integrating a branch is
-   `complete-milestone`'s competence, never a slice's. FORBIDDEN here regardless of auto_commit, and
+   the OPERATOR's act, never the loop's — no unit (slice or milestone) integrates; the loop delivers
+   the pushed `forge/{run}` branch for the operator to merge. FORBIDDEN here regardless of auto_commit, and
    the prohibition is on INTEGRATING, not on any one spelling of it: `git merge` (squash or not,
    --ff or --no-ff), `git rebase`, `git cherry-pick`, `git pull`, `git push`, `git checkout <branch>`,
    `git switch`, `git branch -d/-m`, `git reset`, `git worktree`.
@@ -568,9 +569,24 @@ Read if exists: {WORKING_DIR}/.gsd/milestones/{M###}/{M###}-SUMMARY.md
 1. Write final M###-SUMMARY.md
 2. Mark milestone as complete in STATE.md (do modify STATE.md for this)
 If auto_commit is true:
-3. Write final git tag or note
+3. Write final git tag or note. Then read the resolved `auto_push` pref
+   (node "$FORGE_SCRIPTS_DIR/forge-prefs.js" --resolved --key auto_push --cwd "{WORKING_DIR}");
+   if true, push the run branch itself — the `forge/{run}` branch already checked out — to origin.
+   Never push the default branch.
 If auto_commit is false:
 3. Skip — do NOT run any git commands.
+4. **Git — this unit does NOT integrate, under either value of auto_commit.** No unit of the loop
+   integrates a branch — integration is the OPERATOR's act, always. FORBIDDEN here, and the
+   prohibition is on INTEGRATING, not on any one spelling of it: `git merge` (squash or not,
+   --ff or --no-ff), `git rebase`, `git cherry-pick`, `git pull`, any push of the default branch,
+   `git checkout <branch>`, `git switch`, `git branch -d/-m`, `git reset`, `git worktree`.
+   - If auto_commit is true: the ONLY git verbs permitted are `git add <specific-path>`,
+     `git commit`, `git tag`, the run-branch push from step 3, and read-only inspection
+     (`git status`, `git diff`, `git log`, `git rev-parse`). You must return on the same branch
+     you started on.
+   - If auto_commit is false: run no git command at all.
+   The close-out delivers the pushed `forge/{run}` branch, ready for the operator to open a PR
+   and integrate. The loop never touches the default branch.
 Return ---GSD-WORKER-RESULT---.
 ```
 
@@ -2310,7 +2326,7 @@ This ordering ensures task-specific overrides take precedence, falls back to pro
 
 **Completer (`complete-slice`):** If `forge-verify.js` exits non-zero and the result is not `skipped:"no-stack"`:
 
-1. STOP immediately — do not proceed to the security scan, lint gate, or squash-merge.
+1. STOP immediately — do not proceed to the security scan or the lint gate.
 2. Write the failure context into `S##-SUMMARY.md` under a `## Verification Gate` section. Include: commands run, exit codes, discovery source, per-command durations, and truncated stderr for each failing check.
 3. Return `blocked` with `blocker_class: tooling_failure`.
 4. The orchestrator surfaces this to the user with the full verification context so the failure can be diagnosed without re-running the slice.
@@ -2319,7 +2335,7 @@ This ordering ensures task-specific overrides take precedence, falls back to pro
 
 Two skip conditions exist and are treated differently:
 
-**`skipped:"no-stack"` (whole-gate skip):** The verifier found no commands via any discovery step — the repo has no recognisable test/lint stack. The gate records a verify event with `skipped:"no-stack"` and exits `0`. Workers treat this as a pass: log the event, continue to summary/merge. Do not surface as a warning to the user.
+**`skipped:"no-stack"` (whole-gate skip):** The verifier found no commands via any discovery step — the repo has no recognisable test/lint stack. The gate records a verify event with `skipped:"no-stack"` and exits `0`. Workers treat this as a pass: log the event, continue to the summary. Do not surface as a warning to the user.
 
 **Per-check `timeout`:** An individual command exceeded its timeout budget. That check is marked `passed: false` and assigned exit code `124` (POSIX timeout convention). The overall gate fails (exit non-zero) unless all other checks pass. The `timeout` flag is surfaced in the failure context so the user can investigate flaky or slow test suites. This is not a skip — it is a failure.
 

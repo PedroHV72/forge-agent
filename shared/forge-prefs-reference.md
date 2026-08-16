@@ -52,7 +52,7 @@
 
 - **Tipo:** boolean
 - **Default:** `true`
-- **Descrição:** false = agentes NÃO fazem commits/merges — o usuário gerencia o git manualmente. Afeta executor (commit por task), completer (squash-merge) e isolation cleanup.
+- **Descrição:** false = agentes NÃO fazem commit algum — o usuário gerencia o git manualmente. Afeta executor (commit por task), completer (tag e push da branch do run no complete-milestone) e isolation cleanup. Nenhum valor autoriza merge: o loop nunca integra — a integração é ato do operador.
 
 ## merge_strategy
 
@@ -61,7 +61,7 @@
 - **Tipo:** string
 - **Default:** `"squash"`
 - **Valores permitidos:** `squash`, `merge`, `rebase`
-- **Descrição:** Estratégia de merge do branch do slice na main ao completar. Ignorado quando auto_commit: false.
+- **Descrição:** Estratégia de integração preferida pelo OPERADOR ao integrar a branch do run (forge/{run}) na branch principal. Documental: o loop nunca integra — nenhuma unidade executa merge nem consome esta chave; a integração acontece fora do loop (PR/merge manual).
 
 ## auto_push
 
@@ -69,7 +69,7 @@
 
 - **Tipo:** boolean
 - **Default:** `false`
-- **Descrição:** true = push automático após o squash-merge do slice/milestone. Ignorado quando auto_commit: false.
+- **Descrição:** Preferência do OPERADOR sobre empurrar a branch do run após o fecho. SEM CONSUMIDOR no runtime: nenhuma unidade do loop empurra branch nem integra — o loop entrega forge/{run} local e o operador empurra e abre o PR. Mantida para o operador declarar a intenção; dar-lhe consumidor (ou aposentá-la) é decisão de contrato.
 
 ## main_branch
 
@@ -77,7 +77,7 @@
 
 - **Tipo:** string
 - **Default:** `"master"`
-- **Descrição:** Nome da branch principal do repositório (alvo dos merges). Ajuste para main em repositórios que usam esse padrão.
+- **Descrição:** Nome da branch principal do repositório (alvo da integração feita pelo operador — o loop nunca a toca). Ajuste para main em repositórios que usam esse padrão.
 
 ## milestone_cleanup
 
@@ -188,7 +188,7 @@ Default de effort (intensidade de raciocínio) por fase (unit_type). Eixo ortogo
 - **Tipo:** string
 - **Default:** `"low"`
 - **Valores permitidos:** `low`, `medium`, `high`, `xhigh`, `max`
-- **Descrição:** Effort da fase complete-slice (summaries, UAT, merge).
+- **Descrição:** Effort da fase complete-slice (summaries, UAT — sem merge; o loop nunca integra).
 
 ### `effort.complete-milestone`
 
@@ -499,7 +499,7 @@ Eixo sidecars: isolamento do ambiente entregue aos processos externos codex e ag
 
 ## verification
 
-Verification gate (lint/typecheck/test) antes de marcar task como DONE e antes do squash-merge do slice. Discovery chain: T##-PLAN verify: → preference_commands → package.json scripts do allow-list [typecheck, lint, test] → skipped: no-stack.
+Verification gate (lint/typecheck/test) antes de marcar task como DONE e no fecho do slice (complete-slice). Discovery chain: T##-PLAN verify: → preference_commands → package.json scripts do allow-list [typecheck, lint, test] → skipped: no-stack.
 
 ### `verification.preference_commands`
 
@@ -629,7 +629,7 @@ Review gate dialético antes de complete-slice (branch ainda não-mergeado): cha
 
 - **Tipo:** boolean
 - **Default:** `true`
-- **Descrição:** true = objeções concedidas (ambos concordam que o problema é real) disparam um review-fix imediato pelo forge-executor no branch do slice (sem re-review, evita ping-pong). false = concedidas apenas registradas.
+- **Descrição:** true = objeções concedidas (ambos concordam que o problema é real) disparam um review-fix imediato pelo forge-executor na branch do run, ainda não integrada (sem re-review, evita ping-pong). false = concedidas apenas registradas.
 
 ### `review.challenger`
 
