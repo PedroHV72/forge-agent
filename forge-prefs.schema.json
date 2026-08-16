@@ -30,7 +30,7 @@
     "auto_commit": {
       "type": "boolean",
       "default": true,
-      "description": "false = agentes NÃO fazem commits/merges — o usuário gerencia o git manualmente. Afeta executor (commit por task), completer (squash-merge) e isolation cleanup."
+      "description": "false = agentes NÃO fazem commit algum — o usuário gerencia o git manualmente. Afeta executor (commit por task), completer (tag e push da branch do run no complete-milestone) e isolation cleanup. Nenhum valor autoriza merge: o loop nunca integra — a integração é ato do operador."
     },
     "merge_strategy": {
       "type": "string",
@@ -40,17 +40,17 @@
         "rebase"
       ],
       "default": "squash",
-      "description": "Estratégia de merge do branch do slice na main ao completar. Ignorado quando auto_commit: false."
+      "description": "Estratégia de integração preferida pelo OPERADOR ao integrar a branch do run (forge/{run}) na branch principal. Documental: o loop nunca integra — nenhuma unidade executa merge nem consome esta chave; a integração acontece fora do loop (PR/merge manual)."
     },
     "auto_push": {
       "type": "boolean",
       "default": false,
-      "description": "true = push automático após o squash-merge do slice/milestone. Ignorado quando auto_commit: false."
+      "description": "Preferência do OPERADOR sobre empurrar a branch do run após o fecho. SEM CONSUMIDOR no runtime: nenhuma unidade do loop empurra branch nem integra — o loop entrega forge/{run} local e o operador empurra e abre o PR. Mantida para o operador declarar a intenção; dar-lhe consumidor (ou aposentá-la) é decisão de contrato."
     },
     "main_branch": {
       "type": "string",
       "default": "master",
-      "description": "Nome da branch principal do repositório (alvo dos merges). Ajuste para main em repositórios que usam esse padrão."
+      "description": "Nome da branch principal do repositório (alvo da integração feita pelo operador — o loop nunca a toca). Ajuste para main em repositórios que usam esse padrão."
     },
     "milestone_cleanup": {
       "type": "string",
@@ -200,7 +200,7 @@
             "max"
           ],
           "default": "low",
-          "description": "Effort da fase complete-slice (summaries, UAT, merge)."
+          "description": "Effort da fase complete-slice (summaries, UAT — sem merge; o loop nunca integra)."
         },
         "complete-milestone": {
           "type": "string",
@@ -578,7 +578,7 @@
     },
     "verification": {
       "type": "object",
-      "description": "Verification gate (lint/typecheck/test) antes de marcar task como DONE e antes do squash-merge do slice. Discovery chain: T##-PLAN verify: → preference_commands → package.json scripts do allow-list [typecheck, lint, test] → skipped: no-stack.",
+      "description": "Verification gate (lint/typecheck/test) antes de marcar task como DONE e no fecho do slice (complete-slice). Discovery chain: T##-PLAN verify: → preference_commands → package.json scripts do allow-list [typecheck, lint, test] → skipped: no-stack.",
       "properties": {
         "preference_commands": {
           "type": "array",
@@ -751,7 +751,7 @@
         "fix_conceded": {
           "type": "boolean",
           "default": true,
-          "description": "true = objeções concedidas (ambos concordam que o problema é real) disparam um review-fix imediato pelo forge-executor no branch do slice (sem re-review, evita ping-pong). false = concedidas apenas registradas."
+          "description": "true = objeções concedidas (ambos concordam que o problema é real) disparam um review-fix imediato pelo forge-executor na branch do run, ainda não integrada (sem re-review, evita ping-pong). false = concedidas apenas registradas."
         },
         "challenger": {
           "type": "string",
