@@ -238,7 +238,7 @@ measurement — never a presumption, never the clock alone — is what ends it.
 
 The core is `scripts/forge-claim-release.js`; this section is its contract for consumers.
 
-### The three release mechanisms
+### The release mechanisms
 
 `released` is written into the `RunRecord` with the mechanism that produced it. The set is closed
 (`CLAIM_RELEASE_REASONS`), and precedence between reasons is fixed in the module:
@@ -250,6 +250,7 @@ The core is `scripts/forge-claim-release.js`; this section is its contract for c
 | `explicit` | `released-explicit` | the claim already carried the `released` envelope — an earlier corroborated release, or the operator's escape hatch (§ Step 4 exit 2). Nothing to measure, nothing to write. |
 | `committed` | `released-committed` | **the only positive proof of commit**: both probes below agreed. |
 | `ttl-expired` | `released-ttl-expired` | the net (D2): the `ttl + grace` window elapsed **and** the owning run was measured **inactive**. |
+| `manual` | *(no reason — `classifyRelease` never emits it)* | the operator released it by hand. It **asserts no measurement**, which is exactly why it exists (S05/review R4): `committed` and `ttl-expired` are names that CLAIM one, and the `forge-write-claim.js --release` CLI writes without probing anything. That CLI therefore accepts **only** `manual` (its default) and **refuses the corroborated names by name**; corroborated releases route exclusively through `forge-claim-release.js`, which measures them. This is auditing integrity, not capability — the registry was always hand-editable JSON; the official tool simply must not offer the lie as a flag. |
 
 ### Two probes, and why the conjunction is the design
 
@@ -258,7 +259,11 @@ Proof of commit requires **both**, always:
 - **A — the baseline advanced.** `baselineId(code_dir, {vcs})` differs from the `vcs_baseline.id`
   recorded when the claim was written.
 - **B — the claimed paths left flight.** No path of the claim appears in `workingStatus(code_dir)`
-  with `kind ∈ {modified, added, deleted}`.
+  with `kind ∈ {modified, added, deleted, untracked}`. `untracked` is **in** (S05/review R2): a new
+  file is the most common output of an executor (`forge-vcs.js` emits git `??` / svn `unversioned`
+  as `untracked`), and excluding it made probe B answer `false` for uncommitted work — which, with a
+  neighbour's commit advancing the shared tree's baseline, released a **live** claim. `ignored` stays
+  **out**; entries are filtered by the claim's own path coverage first, so only *claimed* paths hold.
 
 Each probe **alone releases wrongly, in opposite directions**. A alone releases on the *neighbour's*
 commit in a shared tree — literally the SVN/WDMA scenario that originated this milestone, since the
@@ -289,7 +294,7 @@ the net is for.
 ### Released ≠ absent ≠ empty, at the gate
 
 A released claim **stays** in the `RunRecord`. The gate drops that counterpart from the universe
-with a **named** skip (`claim-released:committed` / `:ttl-expired` / `:explicit`), counted in the
+with a **named** skip (`claim-released:committed` / `:ttl-expired` / `:explicit` / `:manual`), counted in the
 census — it never falls through to `claim-absent`, which would turn a release into
 `undeclared-writes` and make the release *worsen* the block it came to fix.
 
@@ -297,7 +302,14 @@ census — it never falls through to `claim-absent`, which would turn a release 
 
 At the **unit boundary**, by both orchestrators, in Post-unit housekeeping — `skills/forge-auto`
 (step 6) and `skills/forge-next` (§ 6) — after the unit's own commit has had its chance to land, and
-by nobody else. `complete-slice` deliberately stays out of it (§ Step 5, `not_covered`).
+by nobody else.
+
+The write itself is **atomic against the claim's identity** (S05/review R1): `releaseClaim` re-reads
+the claim **inside** the registry lock (`forge-runs.updateWith`) and compares `{at, unit,
+vcs_baseline.id}` with the claim the caller measured. If the owner recorded a newer claim in that
+window, the release is **refused by name** (`stale-claim`) and nothing is written — never an
+overwrite, which would cover live in-flight writes with a released claim and re-open the fence at
+the exact place this milestone exists to close it. `complete-slice` deliberately stays out of it (§ Step 5, `not_covered`).
 
 ### The canonical release invocation
 

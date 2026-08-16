@@ -166,12 +166,21 @@ function covers(claimPath, statusPath) {
 
 /**
  * Sonda B: quais paths DO CLAIM ainda estão em voo. `kind ∈ {modified, added,
- * deleted}` é o conjunto que significa "escrito e não commitado"; `untracked` e
- * `ignored` ficam de fora de propósito — não são trabalho pendente de commit
- * neste sentido, e incluí-los faria todo `.gsd/` ignorado segurar claim para
- * sempre.
+ * deleted, untracked}` é o conjunto que significa "escrito e não commitado".
+ *
+ * `untracked` entrou na revisão de S05 (R2). Ficava de fora, e a justificativa
+ * antiga ("incluir faria todo `.gsd/` ignorado segurar claim para sempre")
+ * media outra coisa: quem segura `.gsd/` é `ignored`, que continua FORA — e,
+ * mais decisivo, as entradas já são filtradas por cobertura de path do claim
+ * (`claimed.some(covers)`, abaixo), então só path REIVINDICADO pode segurar.
+ * `forge-vcs.js:751,780` mostra que arquivo NOVO sai como `untracked` (git
+ * `??`, svn `unversioned`) — ou seja, o output mais comum de um executor. Cego
+ * para ele, a sonda B respondia `false` para trabalho não commitado e, com um
+ * commit do VIZINHO avançando o baseline da árvore compartilhada (o cenário
+ * originante desta milestone), a conjunção liberava um claim vivo. Incluí-lo
+ * erra na direção SEGURA: `held`.
  */
-const IN_FLIGHT_KINDS = Object.freeze(['modified', 'added', 'deleted']);
+const IN_FLIGHT_KINDS = Object.freeze(['modified', 'added', 'deleted', 'untracked']);
 
 /**
  * Coleta os FATOS. Toda pergunta que não pôde ser feita vira campo com o erro
@@ -387,11 +396,16 @@ function releaseIfObservable(cwd, runId, opts = {}) {
     // A persistência NÃO é reimplementada: `releaseClaim` roda sob o
     // `runs.update` locado (forge-runs.js:243-252), nunca `fs.writeFileSync`
     // direto no registry.
+    // `expect` = o claim que ESTA função mediu. Entre a sonda e a escrita o dono
+    // pode ter gravado o claim da unidade seguinte; sem a identidade, o objeto
+    // velho (já com envelope) sobrescreveria o novo e cobriria escritas VIVAS
+    // com um claim liberado (review R1). Com ela, `releaseClaim` recusa por
+    // nome (`stale-claim`) sob o lock e nada é gravado.
     write = releaseClaim(cwd, runId, {
       at: typeof opts.now === 'number' ? opts.now : Date.now(),
       mechanism: verdict.mechanism,
       evidence: probesOf(facts),
-    });
+    }, { expect: claim });
     released = !!(write && write.ok);
   }
 
@@ -400,7 +414,13 @@ function releaseIfObservable(cwd, runId, opts = {}) {
   return Object.assign(base, {
     released,
     already_released: verdict.reason === 'released-explicit',
-    refusal: verdict.held ? 'not-observable' : null,
+    // Recusa de sonda (`not-observable`) e recusa de ESCRITA (`stale-claim`,
+    // `no-claim`) são fatos diferentes e nomeados separadamente: a primeira diz
+    // "não pude provar", a segunda diz "provei, mas o mundo mudou embaixo".
+    // Colapsar as duas em `null` esconderia exatamente a corrida que R1 fechou.
+    refusal: verdict.held
+      ? 'not-observable'
+      : (write && write.ok === false ? write.reason : null),
     write,
     event_written: event.event_written,
     event_error: event.event_error,

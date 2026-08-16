@@ -251,6 +251,44 @@ function update(cwd, id, patch) {
   });
 }
 
+/**
+ * ADDITIVE sibling of `update` (S05/review R1) — `update` keeps its signature
+ * and its behaviour, byte for byte. The difference is WHERE the read happens.
+ *
+ * `update(cwd, id, patch)` locks the WRITE. A caller that computed `patch`
+ * from a `get()` taken BEFORE the call performs a read-modify-write ACROSS
+ * the lock: the file write is serialized, the identity of what was read is
+ * not. When the patch replaces a whole slot (`write_claim`), a record written
+ * by someone else in that window is silently overwritten by the stale object.
+ * That is not a hypothetical here — it is exactly how a fresh claim could be
+ * replaced by an older one already carrying a `released` envelope, which turns
+ * live in-flight writes into unfenced ones (under-block).
+ *
+ * `updateWith` closes the window by running the mutator INSIDE the lock, over
+ * the record read inside the same lock. The mutator decides:
+ *   - return an object -> that patch is applied  -> `{ updated: true,  record }`
+ *   - return `null`/`undefined` -> ABORT, nothing is written -> `{ updated: false, record }`
+ * Abort is a first-class outcome, not an error: a caller that finds the world
+ * changed under it must be able to refuse in a NAMED way rather than write
+ * anyway. The return shape is deliberately DIFFERENT from `update`'s (which
+ * returns the record) so no caller can confuse the two.
+ */
+function updateWith(cwd, id, mutator) {
+  if (typeof mutator !== 'function') {
+    throw new Error('forge-runs.updateWith: mutator must be a function');
+  }
+  return withRunLock(cwd, id, () => {
+    const current = get(cwd, id);
+    if (!current) throw new Error(`forge-runs.updateWith: run ${id} not found`);
+    const patch = mutator(current);
+    if (patch === null || patch === undefined) return { updated: false, record: current };
+    const next = Object.assign({}, current, normalizeMetadataPatch(patch));
+    writeAtomic(runFile(cwd, id), next);
+    refreshLegacyAlias(cwd);
+    return { updated: true, record: next };
+  });
+}
+
 function remove(cwd, id) {
   return withRunLock(cwd, id, () => {
     const f = runFile(cwd, id);
@@ -491,7 +529,7 @@ if (require.main === module) cliMain();
 
 module.exports = {
   listAll, listActive, get,
-  add, update, remove,
+  add, update, updateWith, remove,
   bumpHeartbeat, cleanupStale,
   resolveBySessionId, oldestActive,
   refreshLegacyAlias, migrateLegacyState,

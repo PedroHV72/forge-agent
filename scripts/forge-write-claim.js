@@ -94,7 +94,24 @@ const RELEASE_MECHANISMS = [
   // gated on run inactivity by the caller (forge-claim-release.js), never
   // by this module.
   'ttl-expired',
+  // The operator's own hand, and NOTHING else (S05/review R4). The other three
+  // names ASSERT A MEASUREMENT: `committed` says two probes agreed, and
+  // `ttl-expired` says a window elapsed over a run measured inactive. The CLI
+  // could stamp either onto an active, dirty claim without probing anything,
+  // and the forged envelope then read as `persisted_mechanism` — corroboration
+  // in the eyes of the gate and of the audit trail. Forging was always possible
+  // (the registry is hand-editable JSON), so this is not new capability being
+  // withheld; it is the official tool refusing to OFFER the lie as a flag.
+  // `manual` claims no measurement, so it cannot lie. The CLI accepts this one
+  // and refuses the corroborated names by name (see `main`); corroborated
+  // releases route exclusively through forge-claim-release.js.
+  'manual',
 ];
+
+// The subset the CLI may write. Library callers (T02) keep the full set — the
+// restriction is about what the OPERATOR-facing surface may assert, not about
+// removing the primitive.
+const CLI_RELEASE_MECHANISMS = ['manual'];
 
 /**
  * Pure — no disk. Validates and shapes a claim input into the persisted form
@@ -255,17 +272,75 @@ function clearClaim(cwd, runId) {
  *
  * A run with no claim returns a NAMED result and never invents one:
  * `{ ok: false, reason: 'no-claim' }`, nothing written.
+ *
+ * ── The read happens under the SAME lock as the write (review R1) ───────────
+ *
+ * This used to `runs.get` OUTSIDE the lock, build `nextClaim` from that stale
+ * read, and hand the whole slot to the locked `runs.update`. The lock made the
+ * FILE write atomic and left the claim's IDENTITY unprotected: a fresh claim
+ * written in that window was replaced by an older object already carrying a
+ * `released` envelope — so writes in flight for the new unit ended up covered
+ * by a released claim, the counterparts' gates skipped them, and the fence
+ * this milestone exists to build opened exactly where it matters (under-block).
+ * "Writing through a locked function" is NOT the same as "the read and the
+ * write happened under the same lock", and the check that concluded otherwise
+ * measured the wrong thing (S05-REVIEW § Nota de método).
+ *
+ * Now the read is inside `runs.updateWith`'s lock. `opts.expect` carries the
+ * claim the CALLER measured (T02 probes before asking); when the persisted
+ * claim's identity `{at, unit, vcs_baseline.id}` no longer matches it, the
+ * write is REFUSED by name — `{ ok: false, reason: 'stale-claim', expected,
+ * found }` — and NOTHING is written. Never silently, never overwriting: the
+ * refusal is the whole point. Without `expect` the call is still atomic (the
+ * read is under the lock), it simply has no identity to compare against.
  */
-function releaseClaim(cwd, runId, release) {
-  const rec = runs.get(cwd, runId);
-  const claim = readClaim(rec);
-  if (claim === null) {
-    return { ok: false, reason: 'no-claim' };
-  }
+function claimIdentity(claim) {
+  if (!claim) return null;
+  return {
+    at: typeof claim.at === 'number' ? claim.at : null,
+    unit: claim.unit === undefined ? null : claim.unit,
+    baseline_id: claim.vcs_baseline && typeof claim.vcs_baseline.id === 'string'
+      ? claim.vcs_baseline.id : null,
+  };
+}
+
+function sameIdentity(a, b) {
+  if (a === null || b === null) return false;
+  return a.at === b.at && a.unit === b.unit && a.baseline_id === b.baseline_id;
+}
+
+function releaseClaim(cwd, runId, release, opts) {
+  const o = opts || {};
+  const expected = o.expect === undefined || o.expect === null ? null : claimIdentity(o.expect);
+  // Shape is validated BEFORE the lock is taken: a malformed envelope must
+  // throw the same way it always did, and holding a lock to do it buys nothing.
   const released = normalizeReleased(release);
-  const nextClaim = Object.assign({}, claim, { released });
-  runs.update(cwd, runId, { write_claim: nextClaim });
-  return { ok: true, claim: nextClaim };
+
+  // A run that does not exist at all reads as "no claim", exactly as it did
+  // when the pre-lock `runs.get` returned `null` — `updateWith` throws for a
+  // missing record, so the mapping is explicit here rather than a behaviour
+  // change smuggled in by the fix.
+  if (runs.get(cwd, runId) === null) return { ok: false, reason: 'no-claim' };
+
+  let outcome = null;
+  const result = runs.updateWith(cwd, runId, (current) => {
+    const claim = readClaim(current);
+    if (claim === null) { outcome = { ok: false, reason: 'no-claim' }; return null; }
+    const found = claimIdentity(claim);
+    if (expected !== null && !sameIdentity(expected, found)) {
+      outcome = { ok: false, reason: 'stale-claim', expected, found };
+      return null;
+    }
+    const nextClaim = Object.assign({}, claim, { released });
+    outcome = { ok: true, claim: nextClaim };
+    return { write_claim: nextClaim };
+  });
+  // `updated` and `outcome.ok` are the same fact seen from two sides; asserting
+  // the agreement here keeps a future edit to either side from drifting them.
+  if (result.updated !== (outcome !== null && outcome.ok === true)) {
+    throw new Error('forge-write-claim: releaseClaim write/outcome disagreement');
+  }
+  return outcome;
 }
 
 /**
@@ -318,9 +393,12 @@ Flags:
                        record a write claim for the run (source default: manual)
   --show <run-id>      print the run's currently recorded claim
   --clear <run-id>     reset the run's claim to null (PRIMITIVE erase — not a release)
-  --release <run-id> --mechanism <m> [--evidence <json>]
-                       write the released envelope, preserving the rest of the claim
-                       (mechanism must be one of: explicit, committed, ttl-expired)
+  --release <run-id> [--mechanism manual] [--evidence <json>]
+                       write the released envelope, preserving the rest of the claim.
+                       The CLI only writes the mechanism 'manual' (default), which
+                       asserts NO measurement. 'committed'/'ttl-expired'/'explicit'
+                       claim corroboration and are refused here — they are written
+                       only by forge-claim-release.js, which measures them.
   --json               emit JSON instead of the human-readable form
   --cwd <path>         where to look for the run registry (default: process.cwd())
   --help               this text
@@ -350,16 +428,24 @@ function main(argv) {
 
   try {
     if (typeof args.release === 'string') {
+      // R4: the CLI may only write a mechanism that asserts NO measurement.
+      // Refused by name, nothing written — never a silent downgrade to
+      // `manual`, which would let the operator believe a corroborated release
+      // was recorded.
+      const mechanism = typeof args.mechanism === 'string' ? args.mechanism : 'manual';
+      if (!CLI_RELEASE_MECHANISMS.includes(mechanism)) {
+        throw new Error(
+          `forge-write-claim: --mechanism ${JSON.stringify(mechanism)} não pode ser gravado pela CLI — ` +
+          `ela só aceita ${JSON.stringify(CLI_RELEASE_MECHANISMS)}, que não alega medição nenhuma. ` +
+          `${JSON.stringify(RELEASE_MECHANISMS.filter((m) => !CLI_RELEASE_MECHANISMS.includes(m)))} ` +
+          `afirmam corroboração e só podem ser gravados por forge-claim-release.js, que a mede.`);
+      }
       let evidence = {};
       if (typeof args.evidence === 'string') {
         try { evidence = JSON.parse(args.evidence); }
         catch (e) { throw new Error(`forge-write-claim: --evidence must be valid JSON, got ${JSON.stringify(args.evidence)}`); }
       }
-      const result = releaseClaim(cwd, args.release, {
-        at: Date.now(),
-        mechanism: typeof args.mechanism === 'string' ? args.mechanism : undefined,
-        evidence,
-      });
+      const result = releaseClaim(cwd, args.release, { at: Date.now(), mechanism, evidence });
       if (!result.ok) {
         process.stdout.write(args.json ? `${JSON.stringify(result)}\n` : `(sem claim para liberar: ${result.reason})\n`);
         return 0;
@@ -408,6 +494,7 @@ module.exports = {
   isHeld,
   CLAIM_SOURCES,
   RELEASE_MECHANISMS,
+  CLI_RELEASE_MECHANISMS,
   parseArgs,
   main,
   USAGE,

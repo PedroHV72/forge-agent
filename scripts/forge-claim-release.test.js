@@ -651,6 +651,109 @@ test('R10b: probeClaim é a ÚNICA função com I/O — measureBaseline delega t
   assertEqual(JSON.stringify(calls), JSON.stringify(['detectVcs', 'baselineId']), 'nenhuma chamada além do seam');
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// R11 (review R2) — arquivo NOVO reivindicado está EM VOO
+// ════════════════════════════════════════════════════════════════════════════
+//
+// O cenário exato da classe originante: o worker cria um arquivo novo (o output
+// mais comum de um executor, que o git reporta como `??` -> `untracked`) e o
+// VIZINHO commita outra coisa na árvore compartilhada. Com `untracked` fora da
+// sonda B, a conjunção virava `baseline_advanced && !paths_in_flight` e liberava
+// um claim VIVO. Agora `untracked` coberto por path reivindicado segura.
+test('R11a: arquivo NOVO reivindicado (untracked) + commit do vizinho -> held, NUNCA released-committed', () => {
+  const { wsDir, repo, head } = makeScenario('M-r11a');
+  // Reivindica um path que ainda não existe no repo — o worker vai criá-lo.
+  recordClaim(wsDir, 'M-r11a', {
+    at: 1785763253000, unit: 'execute-task/T02', source: 'plan-writes',
+    code_dir: repo, paths: ['novo.js'], vcs_baseline: { vcs: 'git', id: head },
+  });
+  fs.writeFileSync(path.join(repo, 'novo.js'), 'module.exports = 1;\n', 'utf8'); // untracked
+  // O vizinho commita outra coisa: o baseline da ÁRVORE avança.
+  fs.writeFileSync(path.join(repo, 'vizinho.txt'), 'do vizinho\n', 'utf8');
+  git(repo, ['add', 'vizinho.txt']);
+  git(repo, ['commit', '-q', '-m', 'commit do vizinho']);
+
+  const s = statusOf(wsDir, 'M-r11a');
+  assertEqual(s.facts.baseline_advanced, true, 'pré-condição: sonda A avançou pelo commit do vizinho');
+  assertEqual(s.facts.paths_in_flight, true, 'sonda B deve enxergar o arquivo NOVO reivindicado');
+  assert(s.facts.dirty_paths.includes('novo.js'), 'o path novo deve aparecer nomeado em dirty_paths');
+  assertEqual(s.reason, 'held-uncommitted', 'o claim vivo NUNCA pode sair released-committed');
+  assertEqual(s.held, true, 'claim mantido');
+  noteReason(s.reason);
+});
+
+test('R11b: `ignored` continua FORA — só path REIVINDICADO segura, e nunca por ser ignorado', () => {
+  const claim = {
+    at: 1, unit: 'u', source: 'manual', code_dir: '/code', paths: ['dir'],
+    vcs_baseline: { vcs: 'git', id: 'antes' }, released: null,
+  };
+  const seam = {
+    detectVcs: () => 'git',
+    baselineId: () => ({ ok: true, id: 'depois' }),
+    workingStatus: () => ({ ok: true, entries: [{ kind: 'ignored', path: 'dir/lixo.log' }] }),
+  };
+  const f = probeClaim(claim, { vcsSeam: seam });
+  assertEqual(f.paths_in_flight, false, '`ignored` não é trabalho em voo, mesmo sob path reivindicado');
+  assertEqual(classifyRelease(f).reason, 'released-committed', 'com prova das duas sondas, libera');
+  noteReason('released-committed');
+});
+
+test('R11c: untracked FORA do claim não segura — a cobertura de path continua sendo o filtro', () => {
+  const claim = {
+    at: 1, unit: 'u', source: 'manual', code_dir: '/code', paths: ['src'],
+    vcs_baseline: { vcs: 'git', id: 'antes' }, released: null,
+  };
+  const seam = {
+    detectVcs: () => 'git',
+    baselineId: () => ({ ok: true, id: 'depois' }),
+    workingStatus: () => ({ ok: true, entries: [{ kind: 'untracked', path: 'outro/novo.js' }] }),
+  };
+  const f = probeClaim(claim, { vcsSeam: seam });
+  assertEqual(f.paths_in_flight, false, 'untracked fora do claim não é do claim');
+  assertEqual(classifyRelease(f).reason, 'released-committed');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// R12 (review R1) — a corrida entre a sonda e a escrita, pelo caminho real
+// ════════════════════════════════════════════════════════════════════════════
+//
+// O claim novo é gravado DURANTE a sonda (dentro do `workingStatus`, que
+// acontece depois da leitura do claim e antes do `releaseClaim`) — a janela
+// exata que o RMW através do lock deixava aberta. O release tem de RECUSAR e
+// deixar o claim fresco intocado, e a recusa tem de aparecer NOMEADA no
+// resultado.
+test('R12: claim novo gravado DENTRO da janela -> release recusado (stale-claim), claim fresco intacto', () => {
+  const { wsDir, repo, head } = makeScenario('M-r12');
+  let injected = false;
+  const seam = {
+    detectVcs: () => 'git',
+    baselineId: () => ({ ok: true, id: 'baseline-avancado' }),
+    workingStatus: () => {
+      if (!injected) {
+        injected = true;
+        // O DONO grava o claim da próxima unidade, no meio da sonda.
+        recordClaim(wsDir, 'M-r12', {
+          at: 1785763299000, unit: 'execute-task/T03', source: 'plan-writes',
+          code_dir: repo, paths: ['outro.txt'], vcs_baseline: { vcs: 'git', id: head },
+        });
+      }
+      return { ok: true, entries: [] };
+    },
+  };
+
+  const r = releaseIfObservable(wsDir, 'M-r12', { vcsSeam: seam });
+  assertEqual(r.reason, 'released-committed', 'a sonda mediu o claim VELHO e concluiu liberável');
+  assertEqual(r.released, false, 'mas NADA pode ter sido gravado — o mundo mudou embaixo');
+  assertEqual(r.write.ok, false, 'a escrita deve ter sido recusada');
+  assertEqual(r.write.reason, 'stale-claim', 'a recusa de escrita é NOMEADA, distinta de not-observable');
+  assertEqual(r.refusal, 'stale-claim', 'e sobe ao resultado — colapsar em null esconderia a corrida');
+
+  const after = readClaim(runs.get(wsDir, 'M-r12'));
+  assertEqual(after.unit, 'execute-task/T03', 'o claim FRESCO sobreviveu');
+  assertEqual(after.released, null, 'e NÃO saiu liberado por um release da unidade anterior');
+  noteReason(r.reason);
+});
+
 // ── R6 (segundo sentido): toda entrada do conjunto foi emitida por ≥1 teste ──
 test('R6b: cruzamento no segundo sentido — toda razão do conjunto foi observada', () => {
   for (const reason of CLAIM_RELEASE_REASONS) {

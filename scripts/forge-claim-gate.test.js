@@ -1463,6 +1463,33 @@ console.log('\nG22: release — skip nomeado, mordida nos dois sentidos, sonda f
     assert(badMech.census.notes.some((n) => n.reason === 'release-probe-unrecognised'));
   });
 
+  // Review R4: `manual` — o release de mão do operador, que NÃO alega medição.
+  // `classifyRelease` nunca o emite (por construção: não há razão que o
+  // produza), então o skip é alcançado pela MESMA seam injetada que prova os
+  // ramos fail-closed acima. O que a produção mostra hoje de um claim liberado
+  // à mão é `persisted_mechanism: 'manual'`, asserido junto — os dois fatos
+  // (mecanismo DESTE veredito × mecanismo que aposentou o claim) nunca colapsam.
+  test('G22f2: `manual` produz o skip nomeado claim-released:manual, e o envelope persistido aparece', () => {
+    const releasedClaim = Object.assign(claim(['scripts/x.js']), {
+      released: { at: 1, mechanism: 'manual', evidence: {} },
+    });
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: releasedClaim },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+      releaseProbe: factsProbe({}),
+      releaseClassify: () => ({ held: false, reason: 'released-explicit', mechanism: 'manual' }),
+    }));
+    assertEqual(r.decision, 'proceed', 'o counterpart liberado sai do universo');
+    assert(r.census.skipped.some((s) => s.reason === 'claim-released:manual'),
+      'o skip precisa NOMEAR o mecanismo — um skip sem nome é uma saída invisível');
+    assertEqual(r.released_counterparts[0].mechanism, 'manual');
+    assertEqual(r.released_counterparts[0].persisted_mechanism, 'manual',
+      'o envelope persistido é reportado ao lado do veredito, nunca no lugar dele');
+  });
+
   test('G22g: sem sonda injetada, o DEFAULT roda e um claim sem baseline segue em escopo', () => {
     const ws = makeFixture([
       { id: 'M-own', write_claim: claim(['scripts/x.js']) },

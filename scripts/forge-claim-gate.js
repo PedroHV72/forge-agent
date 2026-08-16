@@ -114,6 +114,11 @@ const GATE_SKIP_REASONS = [
   'claim-released:committed',   // the two probes agreed: the baseline advanced AND no claimed path is still in flight.
   'claim-released:ttl-expired', // the TTL net (D2) fired: `ttl + grace` elapsed over a run measured INACTIVE. Never age alone.
   'claim-released:explicit',    // the claim already carried the `released` envelope, written by an earlier corroborated release.
+  'claim-released:manual',      // the operator released it by hand (S05/review R4). Asserts NO measurement — the one mechanism
+                                // the CLI may write, precisely because it cannot lie about corroboration. `classifyRelease`
+                                // never emits it, so this skip is reached only through an injected classifier (the same seam
+                                // the fail-closed branches use) or a future probe taught to read the persisted envelope;
+                                // the hand-released claim's mechanism surfaces today as `persisted_mechanism`.
 ];
 
 /**

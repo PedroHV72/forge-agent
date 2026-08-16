@@ -533,6 +533,122 @@ test('R15: source scan — every write path uses runs.update, never fs.writeFile
   assert(forbidden.test(planted), 'controle positivo: a varredura deve acusar o padrão plantado');
 });
 
+// ── R16 (review R1): the release is atomic against the claim's IDENTITY ─────
+//
+// The race, simulated at the only point where it can be observed from a single
+// process: the caller measures a claim, the OWNER records the next unit's claim
+// in that window, and only then is the release asked for. Before the fix, the
+// stale object (already carrying the `released` envelope) overwrote the fresh
+// one — live in-flight writes covered by a released claim, which is the
+// under-block this milestone exists to prevent.
+test('R16a: a claim recorded between the read and the write makes the release REFUSE (stale-claim)', () => {
+  const { wsDir } = makeFixture('M-20260813-r16a');
+  recordClaim(wsDir, 'M-20260813-r16a', {
+    at: 1000, unit: 'execute-task/T01', source: 'plan-writes',
+    code_dir: '/code', paths: ['a.js'], vcs_baseline: { vcs: 'git', id: 'aaa' },
+  });
+  // The caller measures THIS claim...
+  const observed = readClaim(runs.get(wsDir, 'M-20260813-r16a'));
+  assertEqual(observed.unit, 'execute-task/T01', 'pré-condição: o claim medido é o da T01');
+
+  // ...and the owner records the NEXT unit's claim in the window.
+  recordClaim(wsDir, 'M-20260813-r16a', {
+    at: 2000, unit: 'execute-task/T02', source: 'plan-writes',
+    code_dir: '/code', paths: ['b.js'], vcs_baseline: { vcs: 'git', id: 'bbb' },
+  });
+
+  const result = releaseClaim(
+    wsDir, 'M-20260813-r16a',
+    { at: 3000, mechanism: 'committed', evidence: {} },
+    { expect: observed });
+
+  assertEqual(result.ok, false, 'o release deve RECUSAR — o claim medido não é mais o persistido');
+  assertEqual(result.reason, 'stale-claim', 'a recusa deve ser NOMEADA, nunca silenciosa');
+
+  const after = readClaim(runs.get(wsDir, 'M-20260813-r16a'));
+  assertEqual(after.unit, 'execute-task/T02', 'o claim FRESCO deve sobreviver — jamais sobrescrito pelo velho');
+  assertEqual(after.at, 2000, 'o `at` fresco deve sobreviver');
+  assertEqual(after.released, null, 'o claim fresco NÃO pode sair liberado por um release da unidade anterior');
+  assertEqual(JSON.stringify(after.paths), JSON.stringify(['b.js']), 'os paths frescos devem sobreviver');
+});
+
+test('R16b: identity matching — the SAME claim still releases (a refusal that refuses everything is inert)', () => {
+  const { wsDir } = makeFixture('M-20260813-r16b');
+  recordClaim(wsDir, 'M-20260813-r16b', {
+    at: 1000, unit: 'execute-task/T01', source: 'plan-writes',
+    code_dir: '/code', paths: ['a.js'], vcs_baseline: { vcs: 'git', id: 'aaa' },
+  });
+  const observed = readClaim(runs.get(wsDir, 'M-20260813-r16b'));
+  const result = releaseClaim(
+    wsDir, 'M-20260813-r16b',
+    { at: 3000, mechanism: 'committed', evidence: {} },
+    { expect: observed });
+  assertEqual(result.ok, true, 'sem corrida, o release deve acontecer');
+  assertEqual(readClaim(runs.get(wsDir, 'M-20260813-r16b')).released.mechanism, 'committed');
+});
+
+test('R16c: the read happens INSIDE the lock — releaseClaim goes through runs.updateWith', () => {
+  const src = fs.readFileSync(MODULE, 'utf8');
+  const body = src.slice(src.indexOf('function releaseClaim('), src.indexOf('function isHeld('));
+  const stripped = body.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert(/runs\.updateWith\s*\(/.test(stripped),
+    'releaseClaim deve escrever pelo mutator locado (runs.updateWith)');
+  assert(!/runs\.update\s*\(/.test(stripped),
+    'releaseClaim NÃO pode voltar ao runs.update com patch derivado de leitura fora do lock');
+  // Positive control: the same predicate must go red on a planted regression.
+  const planted = `${stripped}\n runs.update(cwd, runId, { write_claim: nextClaim });`;
+  assert(/runs\.update\s*\(/.test(planted), 'controle positivo: a varredura deve acusar o padrão plantado');
+});
+
+// ── R17 (review R4): the CLI may not stamp a mechanism it never measured ────
+test('R17a: CLI --release --mechanism committed is REFUSED by name, nothing written', () => {
+  const { wsDir, runFile } = makeFixture('M-20260813-r17a');
+  recordClaim(wsDir, 'M-20260813-r17a', { unit: 'execute-task/T01', source: 'manual', paths: ['a.js'] });
+  const before = sha256(runFile);
+  const res = runCli(['--release', 'M-20260813-r17a', '--mechanism', 'committed', '--cwd', wsDir]);
+  assertEqual(res.status, 1, 'a CLI deve sair 1 ao recusar');
+  assert(/committed/.test(res.stderr), 'a recusa deve NOMEAR o mecanismo rejeitado');
+  assert(/forge-claim-release/.test(res.stderr), 'a recusa deve apontar quem MEDE o mecanismo corroborado');
+  assertEqual(sha256(runFile), before, 'nada pode ser gravado numa recusa');
+  const claim = readClaim(runs.get(wsDir, 'M-20260813-r17a'));
+  assertEqual(claim.released, null, 'o envelope forjado não pode existir');
+});
+
+test('R17b: CLI --release --mechanism ttl-expired is REFUSED too (both corroborated names)', () => {
+  const { wsDir } = makeFixture('M-20260813-r17b');
+  recordClaim(wsDir, 'M-20260813-r17b', { unit: 'execute-task/T01', source: 'manual', paths: [] });
+  const res = runCli(['--release', 'M-20260813-r17b', '--mechanism', 'ttl-expired', '--cwd', wsDir]);
+  assertEqual(res.status, 1, 'ttl-expired também afirma medição — deve ser recusado');
+  assertEqual(readClaim(runs.get(wsDir, 'M-20260813-r17b')).released, null, 'nada gravado');
+});
+
+test('R17c: CLI --release writes `manual` (the mechanism that asserts NOTHING) — default and explicit', () => {
+  const { wsDir } = makeFixture('M-20260813-r17c');
+  recordClaim(wsDir, 'M-20260813-r17c', { unit: 'execute-task/T01', source: 'manual', paths: ['a.js'] });
+  const res = runCli(['--release', 'M-20260813-r17c', '--cwd', wsDir, '--json']);
+  assertEqual(res.status, 0, 'o caminho permitido continua saindo 0');
+  const claim = readClaim(runs.get(wsDir, 'M-20260813-r17c'));
+  assertEqual(claim.released.mechanism, 'manual', 'o default da CLI é `manual`');
+  assertEqual(JSON.stringify(claim.paths), JSON.stringify(['a.js']), 'o resto do claim é preservado');
+
+  const { wsDir: ws2 } = makeFixture('M-20260813-r17d');
+  recordClaim(ws2, 'M-20260813-r17d', { unit: 'execute-task/T01', source: 'manual', paths: [] });
+  const res2 = runCli(['--release', 'M-20260813-r17d', '--mechanism', 'manual', '--cwd', ws2]);
+  assertEqual(res2.status, 0, '`manual` explícito também é aceito');
+  assertEqual(readClaim(runs.get(ws2, 'M-20260813-r17d')).released.mechanism, 'manual');
+});
+
+test('R17e: the library seam keeps the full set — the restriction is CLI-only (T02 depends on it)', () => {
+  assert(claimMod.RELEASE_MECHANISMS.includes('committed'), 'a biblioteca mantém `committed`');
+  assert(claimMod.RELEASE_MECHANISMS.includes('manual'), '`manual` entrou no conjunto fechado');
+  assertEqual(JSON.stringify(claimMod.CLI_RELEASE_MECHANISMS), JSON.stringify(['manual']),
+    'a CLI só pode gravar `manual`');
+  const { wsDir } = makeFixture('M-20260813-r17e');
+  recordClaim(wsDir, 'M-20260813-r17e', { unit: 'execute-task/T01', source: 'manual', paths: [] });
+  const r = releaseClaim(wsDir, 'M-20260813-r17e', { at: 1, mechanism: 'committed', evidence: {} });
+  assertEqual(r.ok, true, 'a chamada de biblioteca com `committed` segue possível');
+});
+
 // ── Suite close ──────────────────────────────────────────────────────────
 cleanup();
 
