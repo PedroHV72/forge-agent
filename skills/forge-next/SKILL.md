@@ -354,6 +354,13 @@ fi
 Mapeamento por decisão (`MODE == interactive` — `shared/forge-claim-gate.md § Step 3`, agido por
 referência, nenhuma tabela restatada aqui):
 
+O gateamento aqui é **afirmativo**, e essa é a diferença de polaridade em relação ao `forge-auto`
+(onde a task fica em `BATCH` por default): o dispatch só é alcançado pela linha `proceed`. `$DECISION`
+só é atribuída no ramo `else` do fence acima — o ramo fail-closed a deixa **não-atribuída de
+propósito**, e valor não-atribuído (ou fora do conjunto de quatro) não casa com nenhuma das linhas
+abaixo, portanto nunca alcança a instrução de despachar. Não importar a forma do `forge-auto` aqui é
+deliberado.
+
 - `proceed` → dispatch normal (Step 4 segue).
 - `defer` → se `$BATCH_JSON` (ready set real da slice) tem outra task além desta, dispatchar ELA
   nesta invocação (eco nomeando a troca: "↷ Claim gate: {T##} adiada (colisão com run {counterpart}) —

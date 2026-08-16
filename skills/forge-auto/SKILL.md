@@ -584,7 +584,10 @@ BATCH_UNION_PATHS=$(claim_union "${BATCH_PLAN_PATHS[@]}")   # BATCH_PLAN_PATHS =
 UNION_EXIT=$?
 if [ "$UNION_EXIT" -ne 0 ] || ! record_union "BATCH:$BATCH_IDS_CSV" "$BATCH_UNION_PATHS"; then
   echo "⛔ Claim gate indisponível: a união do batch não pôde ser derivada/gravada — block/gate-unavailable. Nenhum dispatch." >&2
-  # DECISION=block, cause gate-unavailable, BATCH=() — § Step 4 (checkpoint + deactivate). STOP.
+  # Sentinel + explicit drop (see the per-task branch below for why a comment is not enough here).
+  CLAIM_GATE_DECISION=block
+  CLAIM_GATE_CAUSE=gate-unavailable
+  BATCH=()   # explicit drop — § Step 4 (checkpoint + deactivate). STOP.
 fi
 
 # 2. Evaluate per task with --check-only, --ready-alternatives = (tasks ready remaining in BATCH − 1).
@@ -605,7 +608,15 @@ for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id: T##, planPath}
   # Fail-closed (spec § Fail-closed): exit != 0 or non-JSON stdout -> block/gate-unavailable, LOUD.
   if [ "$GATE_EXIT" -ne 0 ] || ! printf '%s' "$GATE_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{JSON.parse(d);process.exit(0)}catch(e){process.exit(1)}})"; then
     echo "⛔ Claim gate indisponível (exit $GATE_EXIT) para ${ENTRY_ID} — tratando como block/gate-unavailable. Nenhum dispatch." >&2
-    # 3-decision -> block: checkpoint + deactivate this run + actionable message, per § Step 4 below. STOP.
+    # Sentinel + explicit drop. NOT a bare comment (same rule as the isolation-setup precedent above):
+    # in THIS skill a task stays in BATCH by default, so falling through a gate failure would DISPATCH.
+    # The assignments below remove that default; the bold halt paragraph after this fence is what the
+    # sentinel then makes reachable — it never depends on a comment to carry the halt.
+    CLAIM_GATE_DECISION=block
+    CLAIM_GATE_CAUSE=gate-unavailable
+    SURVIVOR_IDS=(); SURVIVOR_PLAN_PATHS=(); BATCH=()   # explicit drop: no task survives an unavailable gate
+    BATCH_CHANGED=1
+    break   # § Step 4 (checkpoint + deactivate this run). STOP — never dispatch.
   fi
   # Parse .decision / .cause / .escalation / .not_covered / .counterparts.
   # proceed -> keep ${ENTRY_ID} in BATCH (append to SURVIVOR_IDS / SURVIVOR_PLAN_PATHS).
@@ -635,7 +646,10 @@ if [ "$BATCH_CHANGED" = "1" ]; then
     UNION_EXIT=$?
     if [ "$UNION_EXIT" -ne 0 ] || ! record_union "BATCH:$SURVIVOR_IDS_CSV" "$SURVIVOR_UNION_PATHS"; then
       echo "⛔ Claim gate indisponível: a união dos sobreviventes não pôde ser regravada — block/gate-unavailable." >&2
-      # DECISION=block, cause gate-unavailable, BATCH=() — § Step 4 (checkpoint + deactivate). STOP.
+      # Sentinel + explicit drop (see the per-task branch above for why a comment is not enough here).
+      CLAIM_GATE_DECISION=block
+      CLAIM_GATE_CAUSE=gate-unavailable
+      BATCH=()   # explicit drop — § Step 4 (checkpoint + deactivate). STOP.
     fi
   fi
 fi
