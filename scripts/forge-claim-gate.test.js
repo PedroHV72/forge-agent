@@ -2154,6 +2154,272 @@ console.log('\nG23: D8 — a MESMA entrada decide diferente conforme a presença
   });
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// G25 (triagem final) — S05/R3: o release observado vira REGISTRO
+//                       S07/R2c: a propriedade do operando vira MEDIDA
+// ══════════════════════════════════════════════════════════════════════════
+console.log('\nG25: R3 — o veredito `committed` corroborado é PERSISTIDO (e a recusa é NOMEADA)');
+{
+  const { evaluateGate, DEFAULT_RELEASE_PERSIST, OPERAND_OWNERS, LABEL_SEPARATOR } = gate;
+  const { releaseClaim: releaseClaimReal, readClaim: readClaim25 } = require('./forge-write-claim.js');
+  const runsApi25 = require('./forge-runs.js');
+
+  /** Sonda injetada que satisfaz as DUAS provas -> veredito `committed`. */
+  function committedProbe() {
+    return () => ({
+      claim_present: true, explicit_release: false, code_dir: '/code/dir', vcs: 'git',
+      baseline_before: 'aaa', baseline_now: 'bbb', baseline_advanced: true,
+      dirty_paths: [], paths_in_flight: false,
+      age_ms: 1, ttl_ms: 10, grace_ms: 1, ttl_expired: false, owner_active: true, probe_error: null,
+    });
+  }
+  /** TTL: liberado por rede, NÃO corroborado por este gate. */
+  function ttlProbe() {
+    return () => ({
+      claim_present: true, explicit_release: false, code_dir: '/code/dir', vcs: 'git',
+      baseline_before: 'aaa', baseline_now: 'aaa', baseline_advanced: false,
+      dirty_paths: [], paths_in_flight: true,
+      age_ms: 99, ttl_ms: 10, grace_ms: 1, ttl_expired: true, owner_active: false, probe_error: null,
+    });
+  }
+  function twoRuns() {
+    return makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js']) },
+    ]);
+  }
+  const baseArgs = (ws) => ({
+    cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 1,
+  });
+
+  test('G25a: o seam de persistência É `forge-write-claim.releaseClaim`, por IDENTIDADE de referência', () => {
+    assertEqual(DEFAULT_RELEASE_PERSIST === releaseClaimReal, true,
+      'a escrita nunca é reimplementada aqui — se o seam divergir, a atomicidade de R1 fica de fora');
+  });
+
+  test('G25b: veredito `committed` corroborado é GRAVADO no RunRecord do counterpart', () => {
+    const ws = twoRuns();
+    const before = readClaim25(runsApi25.get(ws, 'M-other'));
+    assertEqual(before.released, undefined, 'o claim não pode nascer liberado — senão o teste é vazio');
+
+    const r = record(evaluateGate(Object.assign(baseArgs(ws), { releaseProbe: committedProbe() })));
+    assertEqual(r.decision, 'proceed');
+    assertEqual(r.released_counterparts[0].mechanism, 'committed');
+    assertEqual(r.released_counterparts[0].persisted, true, 'o campo aditivo diz que o registro concordou');
+
+    const after = readClaim25(runsApi25.get(ws, 'M-other'));
+    assert(after.released, 'REGRESSÃO R3: o veredito vivo não virou registro — re-bloqueia na próxima unidade');
+    assertEqual(after.released.mechanism, 'committed');
+    assertEqual(after.released.evidence.observed_by, 'claim-gate');
+    assertEqual(after.released.evidence.baseline_advanced, true, 'a evidência é a MEDIDA, não um envelope vazio');
+    assertEqual(JSON.stringify(after.paths), JSON.stringify(['scripts/x.js']),
+      'persistir ACRESCENTA o envelope — nunca apaga o claim');
+  });
+
+  test('G25c: mordida — sem a persistência, a MESMA fixture volta a não ter registro nenhum', () => {
+    const ws = twoRuns();
+    // A mordida neutraliza o seam (mesma fixture, mesmo veredito): o único delta
+    // é a escrita. Se o registro continuasse gravado aqui, o assert de G25b
+    // estaria medindo outra coisa.
+    const r = record(evaluateGate(Object.assign(baseArgs(ws), {
+      releaseProbe: committedProbe(),
+      releasePersist: () => ({ ok: false, reason: 'no-claim' }),
+    })));
+    assertEqual(r.decision, 'proceed', 'o VEREDITO VIVO segue de pé — a persistência não decide nada');
+    assertEqual(r.released_counterparts[0].persisted, false);
+    assertEqual(r.released_counterparts[0].persist_refusal, 'no-claim');
+    assert(r.census.notes.some((n) => n.id === 'M-own × M-other' && n.reason === 'release-persist-failed'),
+      'uma persistência recusada é NOTA nomeada, nunca silêncio');
+    assertEqual(readClaim25(runsApi25.get(ws, 'M-other')).released, undefined,
+      'com o seam neutralizado nada pode ter sido gravado');
+  });
+
+  test('G25d: `expect` viaja com a IDENTIDADE medida — nunca um read-then-write', () => {
+    const ws = twoRuns();
+    const seen = [];
+    record(evaluateGate(Object.assign(baseArgs(ws), {
+      releaseProbe: committedProbe(),
+      releasePersist: (cwd, id, released, opts) => { seen.push({ cwd, id, released, opts }); return { ok: true }; },
+    })));
+    assertEqual(seen.length, 1, 'uma escrita, para o counterpart medido');
+    assertEqual(seen[0].id, 'M-other');
+    assert(seen[0].opts && seen[0].opts.expect, 'sem `expect` a escrita cross-run reabre a corrida RMW de R1');
+    assertEqual(seen[0].opts.expect.at, claim(['scripts/x.js']).at, 'o `expect` é o claim que ESTE gate mediu');
+    assertEqual(seen[0].released.mechanism, 'committed');
+  });
+
+  test('G25e: corrida PERDIDA de verdade — dono grava claim novo na janela -> `stale-claim`, nada escrito', () => {
+    const ws = twoRuns();
+    // A escrita usa o `releaseClaim` REAL; o wrapper só simula o dono gravando
+    // um claim novo entre a sonda e a escrita — a janela exata que R1 fechou.
+    const r = record(evaluateGate(Object.assign(baseArgs(ws), {
+      releaseProbe: committedProbe(),
+      releasePersist: (cwd, id, released, opts) => {
+        runsApi25.update(cwd, id, { write_claim: claim(['scripts/y.js'], undefined, { at: 1785763999000, unit: 'execute-task/T02' }) });
+        return releaseClaimReal(cwd, id, released, opts);
+      },
+    })));
+    assertEqual(r.decision, 'proceed', 'o veredito vivo continua valendo PARA ESTA avaliação');
+    assertEqual(r.released_counterparts[0].persisted, false);
+    assertEqual(r.released_counterparts[0].persist_refusal, 'stale-claim');
+    assert(r.census.notes.some((n) => n.reason === 'release-persist-stale-claim'),
+      'perder a corrida é "não consegui persistir" — NOMEADO, nunca inferido como "o release não aconteceu"');
+    const after = readClaim25(runsApi25.get(ws, 'M-other'));
+    assertEqual(after.released, undefined, 'o claim NOVO do dono não pode ter sido coberto por um envelope');
+    assertEqual(after.unit, 'execute-task/T02', 'o claim novo sobreviveu intacto');
+  });
+
+  test('G25f: seam que LANÇA -> `release-persist-failed`, e o veredito vivo segue de pé', () => {
+    const ws = twoRuns();
+    const r = record(evaluateGate(Object.assign(baseArgs(ws), {
+      releaseProbe: committedProbe(),
+      releasePersist: () => { throw new Error('registry em chamas'); },
+    })));
+    assertEqual(r.decision, 'proceed');
+    assertEqual(r.released_counterparts[0].persist_refusal, 'persist-threw');
+    const n = r.census.notes.find((x) => x.reason === 'release-persist-failed');
+    assert(n && /registry em chamas/.test(n.detail), 'o detalhe do erro é carregado, não engolido');
+  });
+
+  test('G25g: só `committed` é persistido — `ttl-expired` e `explicit` NUNCA são gravados por este gate', () => {
+    const wsTtl = twoRuns();
+    const calls = [];
+    const spy = () => { calls.push(1); return { ok: true }; };
+    const ttl = record(evaluateGate(Object.assign(baseArgs(wsTtl), { releaseProbe: ttlProbe(), releasePersist: spy })));
+    assertEqual(ttl.released_counterparts[0].mechanism, 'ttl-expired');
+    assertEqual(calls.length, 0, 'a rede do TTL é veredito sobre run MORTA alheia — carvá-lo num registro alheio não é corroboração deste gate');
+    assertEqual(ttl.released_counterparts[0].persisted, undefined, 'sem tentativa, sem campo — ausência não é `false`');
+
+    const wsExp = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim(['scripts/x.js'], undefined, { released: { at: 1, mechanism: 'committed', evidence: {} } }) },
+    ]);
+    record(evaluateGate(Object.assign(baseArgs(wsExp), { releasePersist: spy })));
+    assertEqual(calls.length, 0, 'um claim que JÁ carrega o envelope não é reescrito');
+  });
+}
+
+console.log('\nG26: R2c — a propriedade do operando é MEDIDA e viaja no evento (campo aditivo)');
+{
+  const { evaluateGate, recordAndEvaluate, OPERAND_OWNERS } = gate;
+  const ownersSeen = new Set();
+
+  function collide(ownPaths, cpPaths) {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(ownPaths) },
+      { id: 'M-other', write_claim: claim(cpPaths) },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(ownPaths), posture: 'block', readyAlternatives: 0,
+    }));
+    for (const cp of r.counterparts) {
+      for (const po of (cp.path_operands || [])) for (const op of po.operands) ownersSeen.add(op.owner);
+    }
+    return { ws, r };
+  }
+
+  test('G26a: rótulo COMPOSTO carrega os operandos com dono medido — e o `label` fica intocado', () => {
+    const { r } = collide(['src/**'], ['src/a.js']);
+    assertEqual(r.cause, 'overlap');
+    const cp = r.counterparts[0];
+    assertEqual(JSON.stringify(cp.paths), JSON.stringify(['src/** × src/a.js']),
+      'o campo pré-existente NÃO pode ser reescrito — linhas históricas seguem legíveis');
+    assertEqual(cp.path_operands.length, 1);
+    assertEqual(cp.path_operands[0].label, 'src/** × src/a.js');
+    assertEqual(JSON.stringify(cp.path_operands[0].operands), JSON.stringify([
+      { value: 'src/**', owner: 'own', run: 'M-own' },
+      { value: 'src/a.js', owner: 'counterpart', run: 'M-other' },
+    ]), 'cada operando nomeia o dono E a run — o fato que o schema não garantia');
+  });
+
+  test('G26b: a propriedade segue o CONTEÚDO, não a posição — fixture espelhada', () => {
+    const { r } = collide(['src/a.js'], ['src/**']);
+    const ops = r.counterparts[0].path_operands[0].operands;
+    assertEqual(r.counterparts[0].paths[0], 'src/a.js × src/**', 'a posição dos operandos inverteu');
+    assertEqual(ops[0].owner, 'own');
+    assertEqual(ops[0].value, 'src/a.js', 'quem é dono de QUAL path acompanhou a claim, não a casa no rótulo');
+    assertEqual(ops[1].owner, 'counterpart');
+    assertEqual(ops[1].value, 'src/**');
+  });
+
+  test('G26c: rótulo NÃO-composto -> um operando `both` (os dois lados declararam o mesmo path)', () => {
+    const { r } = collide(['scripts/x.js'], ['scripts/x.js']);
+    const po = r.counterparts[0].path_operands[0];
+    assertEqual(po.label, 'scripts/x.js');
+    assertEqual(JSON.stringify(po.operands), JSON.stringify([{ value: 'scripts/x.js', owner: 'both', run: null }]),
+      '`both` não nomeia run: nomear uma das duas afirmaria uma medição que ninguém fez');
+  });
+
+  test('G26d: path que CONTÉM o separador -> `unknown` nomeado, nunca atribuído por posição', () => {
+    const { r } = collide(['src/a × b.js'], ['src/a × b.js']);
+    const po = r.counterparts[0].path_operands[0];
+    assertEqual(po.label, 'src/a × b.js', 'o rótulo bruto é preservado');
+    assertEqual(po.operands.length, 2, 'o split não distingue separador de conteúdo — e é justamente por isso que existe `unknown`');
+    for (const op of po.operands) assertEqual(op.owner, 'unknown');
+    for (const op of po.operands) assertEqual(op.run, null);
+  });
+
+  test('G26e: `undeclared-writes` não inventa operando — sem colisão medida, sem campo', () => {
+    const ws = makeFixture([
+      { id: 'M-own', write_claim: claim(['scripts/x.js']) },
+      { id: 'M-other', write_claim: claim([]) },
+    ]);
+    const r = record(evaluateGate({
+      cwd: ws, runId: 'M-own', claim: claim(['scripts/x.js']), posture: 'block', readyAlternatives: 0,
+    }));
+    assertEqual(r.cause, 'undeclared-writes');
+    assertEqual(r.counterparts[0].path_operands, undefined,
+      'sem overlap não há operando a possuir — um campo vazio aqui seria estrutura sem medição');
+  });
+
+  test('G26f: o evento claim-gate carrega `path_operands`, LIDO do events.jsonl, sem perder campo antigo', () => {
+    const ws = makeFixture([
+      { id: 'M-own', active: true },
+      { id: 'M-other', write_claim: claim(['src/a.js']) },
+    ]);
+    const r = record(recordAndEvaluate({
+      cwd: ws, runId: 'M-own', unit: 'execute-task/T01', source: 'manual',
+      codeDir: '/code/dir', paths: ['src/**'],
+      vcsSeam: { detectVcs: () => 'git', baselineId: () => ({ ok: true, id: 'zzz' }) },
+    }));
+    assertEqual(r.cause, 'overlap');
+    const lines = fs.readFileSync(path.join(ws, '.gsd', 'forge', 'events.jsonl'), 'utf8').trim().split('\n');
+    const ev = JSON.parse(lines[lines.length - 1]);
+    const cp = ev.counterparts.find((c) => c.id === 'M-other');
+    assertEqual(JSON.stringify(cp.path_operands[0].operands), JSON.stringify([
+      { value: 'src/**', owner: 'own', run: 'M-own' },
+      { value: 'src/a.js', owner: 'counterpart', run: 'M-other' },
+    ]), 'a linha gravada é o que torna a propriedade MEDÍVEL para o consumidor de S07');
+    for (const k of ['decision', 'cause', 'census', 'counterparts', 'not_covered', 'run', 'unit', 'released_counterparts']) {
+      assert(Object.prototype.hasOwnProperty.call(ev, k), `campo pré-existente sumiu do evento: ${k}`);
+    }
+    assertEqual(JSON.stringify(cp.paths), JSON.stringify(['src/** × src/a.js']), '`paths` mantém o significado de sempre');
+  });
+
+  test('G26g: OPERAND_OWNERS cruzado nos DOIS sentidos', () => {
+    for (const o of ownersSeen) assert(OPERAND_OWNERS.includes(o), `dono emitido fora do conjunto: ${o}`);
+    for (const o of OPERAND_OWNERS) assert(ownersSeen.has(o), `dono declarado e nunca emitido: ${o}`);
+  });
+
+  test('G26h: o separador é o MESMO literal que forge-claim-overlap.js renderiza (guard de drift)', () => {
+    const src = fs.readFileSync(path.join(__dirname, 'forge-claim-overlap.js'), 'utf8');
+    assert(src.includes(`\${a}${gate.LABEL_SEPARATOR}\${b}`),
+      'o separador divergiu do vizinho — o split pararia de dividir e produziria operandos de aparência medida');
+    // Controle positivo: um separador inventado NÃO é encontrado.
+    assert(!src.includes('${a} ×× ${b}'), 'o predicado não morde — controle positivo falhou');
+  });
+
+  test('G26i: o spec documenta o campo novo e os quatro donos (conformance doc↔código)', () => {
+    const specText = fs.readFileSync(SPEC_PATH, 'utf8');
+    assert(specText.includes('path_operands'), 'campo do evento ausente do spec — foi exatamente o defeito de S06/R2');
+    for (const o of OPERAND_OWNERS) assert(specText.includes(`\`${o}\``), `dono ausente do spec: ${o}`);
+    for (const f of ['release-persist-stale-claim', 'release-persist-failed']) {
+      assert(specText.includes(f), `note nova ausente do spec: ${f}`);
+    }
+    assert(!specText.includes('path_operands_INVENTED_CONTROL'), 'a busca não morde');
+  });
+}
+
 // ── G9: direção 2 dos conjuntos fechados — depois de TUDO ter rodado ───────
 console.log('\nG9: direção 2 — todo valor declarado foi emitido por >= 1 teste');
 {

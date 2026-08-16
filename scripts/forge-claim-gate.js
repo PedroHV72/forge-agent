@@ -61,7 +61,8 @@ const {
 } = require('./forge-claim-overlap.js');
 const { declaredFor } = require('./forge-write-coverage.js');
 const {
-  normalizeClaim, recordClaim, readClaim, isHeld, CLAIM_SOURCES, RELEASE_MECHANISMS,
+  normalizeClaim, recordClaim, readClaim, isHeld, releaseClaim,
+  CLAIM_SOURCES, RELEASE_MECHANISMS,
 } = require('./forge-write-claim.js');
 // S05/T03 — the release DECISION is never re-implemented here. `probeClaim`
 // collects the facts (the only function in that module with I/O) and
@@ -169,7 +170,42 @@ const GATE_NOTE_REASONS = [
   // possession in either direction. It is a reason to say what was not known.
   'isolation-unmeasured',  // no `code_dir` on the own claim NOR on the counterpart's: there is no tree to measure. NEVER derived from root/branch (B2).
   'isolation-probe-threw', // the resolver (default `resolveEffectiveMode`) threw. `detail` carries its message. Posture unchanged — a broken probe never decides.
+  // ── Cross-run persistence of an observed release (S05/review R3) ──────────
+  //
+  // The gate now WRITES the `committed` verdict it corroborated into the
+  // counterpart's RunRecord, so the release stops being a live-probe opinion
+  // that evaporates and re-blocks at the next unit once the tree goes dirty
+  // from unrelated work (non-monotonic release, contradicting the persisted
+  // lifecycle this spec documents).
+  //
+  // The write is cross-run, into a FOREIGN record, and it is only safe because
+  // `releaseClaim` re-reads under the registry lock and compares the claim
+  // IDENTITY the gate measured (`opts.expect`, S05/review R1). When that compare
+  // loses, NOTHING is written and the refusal is NAMED. It is never retried and
+  // never inferred: losing the race means "I could not persist", which is
+  // neither "the release did not happen" nor "it did". The LIVE verdict — the
+  // one that was actually corroborated — still stands for THIS evaluation, and
+  // that is exactly the asymmetry the two notes below record.
+  'release-persist-stale-claim', // the identity compare lost the race: the owner wrote a newer claim between the probe and the write. Nothing persisted, verdict stands.
+  'release-persist-failed',      // the persistence was refused for another NAMED reason (`no-claim`) or the seam threw. `detail` carries it. Nothing persisted, verdict stands.
 ];
+
+// ── Operand ownership on a composite overlap label (S07/review R2c) ────────
+//
+// `claimsConflict` renders a collision between two DIFFERENT paths as the
+// composite label `"<a> × <b>"` (forge-claim-overlap.js) — a *rendering*, not a
+// structure. Which operand belongs to whom was, until here, a POSITIONAL
+// invariant of one emitter in one version, and a historical line does not
+// certify which version wrote it. So the gate MEASURES the ownership (path
+// membership in each side's declared claim) and persists it as ADDITIVE fields.
+// The label itself is NOT rewritten: lines already in events.jsonl must stay
+// readable exactly as they are.
+const OPERAND_OWNERS = Object.freeze([
+  'own',         // the operand is in the OWN claim's declared paths, and not in the counterpart's.
+  'counterpart', // the operand is in the COUNTERPART's declared paths, and not in the own claim's.
+  'both',        // both sides declared this exact path (the non-composite label case, and any literal coincidence).
+  'unknown',     // measured against both claims and found in NEITHER. Never attributed by position — an unmeasurable owner is named, never guessed.
+]);
 
 // ── D8: the posture OVERRIDE, closed sets ──────────────────────────────────
 //
@@ -564,6 +600,7 @@ function counterpartRelease(claim, opts) {
   const probe = typeof o.releaseProbe === 'function' ? o.releaseProbe : DEFAULT_RELEASE_PROBE;
   const classify = typeof o.releaseClassify === 'function' ? o.releaseClassify : DEFAULT_RELEASE_CLASSIFY;
   let verdict;
+  let probeFacts = null;
   try {
     // The counterpart's COMPLETE RunRecord travels with the claim: `runRecord`
     // is what lets `releaseIfObservable`-shaped probes (and any future seam,
@@ -575,6 +612,7 @@ function counterpartRelease(claim, opts) {
       runId: o.runId,
       runRecord: o.runRecord || null,
     }));
+    probeFacts = facts && typeof facts === 'object' && !Array.isArray(facts) ? facts : null;
     verdict = classify(facts);
   } catch (e) {
     return {
@@ -624,9 +662,112 @@ function counterpartRelease(claim, opts) {
     reason: verdict.reason,
     skip,
     note: null,
+    // The facts the probe actually produced, carried so the persistence
+    // (S05/review R3) can write the evidence it MEASURED instead of an empty
+    // envelope. `null` when the probe returned a non-object — never `{}`, which
+    // would read as "measured, and empty".
+    facts: probeFacts,
     detail: verdict.mechanism === 'explicit' && isHeld(claim)
       ? 'envelope released ausente no claim persistido' : null,
   };
+}
+
+// ── S05/review R3: persist the release the gate OBSERVED ───────────────────
+//
+// The default seam is `releaseClaim` itself (forge-write-claim.js) — the ONE
+// function in this repo that writes a `released` envelope, reached by reference
+// so a substituted implementation is observable by the suite and so the write
+// is never re-implemented here.
+const DEFAULT_RELEASE_PERSIST = releaseClaim;
+
+/** The probe fields worth persisting, picked — never the whole facts object. */
+const PERSISTED_EVIDENCE_FIELDS = [
+  'baseline_before', 'baseline_now', 'baseline_advanced',
+  'paths_in_flight', 'dirty_paths', 'age_ms', 'ttl_expired', 'owner_active', 'probe_error',
+];
+
+function releaseEvidence(rel) {
+  const ev = { observed_by: 'claim-gate', reason: rel.reason };
+  const f = rel.facts;
+  if (f) for (const k of PERSISTED_EVIDENCE_FIELDS) if (f[k] !== undefined) ev[k] = f[k];
+  return ev;
+}
+
+/**
+ * `{ persisted, refusal, note, detail }` — writes the corroborated verdict onto
+ * the counterpart's claim, NEVER read-then-write: the identity the gate measured
+ * travels in `opts.expect` and `releaseClaim` compares it INSIDE the registry
+ * lock (S05/review R1). Losing that compare is a refusal by name, not a retry
+ * and not a fabrication.
+ *
+ * Nothing here can change the live verdict. Every branch returns and the caller
+ * keeps the skip: a persistence that failed is a hole in the RECORD, not
+ * evidence about the world.
+ */
+function persistCounterpartRelease(cwd, counterpartId, claim, rel, opts) {
+  const persist = typeof opts.releasePersist === 'function' ? opts.releasePersist : DEFAULT_RELEASE_PERSIST;
+  let out;
+  try {
+    out = persist(cwd, counterpartId, {
+      at: typeof opts.now === 'number' ? opts.now : Date.now(),
+      mechanism: rel.mechanism,
+      evidence: releaseEvidence(rel),
+    }, { expect: claim });
+  } catch (e) {
+    return {
+      persisted: false, refusal: 'persist-threw', note: 'release-persist-failed',
+      detail: e && e.message ? e.message : String(e),
+    };
+  }
+  if (out && out.ok === true) {
+    return { persisted: true, refusal: null, note: null, detail: null };
+  }
+  const reason = out && out.reason ? out.reason : 'sem razão';
+  if (reason === 'stale-claim') {
+    return {
+      persisted: false, refusal: 'stale-claim', note: 'release-persist-stale-claim',
+      detail: 'o dono gravou um claim novo entre a sonda e a escrita — nada foi persistido; o veredito vivo vale só para esta avaliação',
+    };
+  }
+  return {
+    persisted: false, refusal: reason, note: 'release-persist-failed',
+    detail: `releaseClaim recusou: ${reason}`,
+  };
+}
+
+// ── S07/review R2c: the operand, and who owns it ───────────────────────────
+//
+// The separator `claimsConflict` renders composites with. It is NOT exported by
+// `forge-claim-overlap.js`, so this is a second literal — and a second literal
+// that drifts would silently stop splitting, producing single-operand entries
+// that look measured. The suite therefore asserts this exact string appears in
+// the neighbour's source, with a positive control.
+const LABEL_SEPARATOR = ' × ';
+
+function splitLabel(label) {
+  return String(label).split(LABEL_SEPARATOR);
+}
+
+function declaredPaths(claim) {
+  return claim && Array.isArray(claim.paths) ? claim.paths : [];
+}
+
+/**
+ * `{ value, owner, run }` — ownership by MEMBERSHIP, the only thing actually
+ * measurable from here. `run` is filled only for an unambiguous owner; `both`
+ * and `unknown` carry `null` and let `owner` say the truth, rather than naming
+ * one of the two runs and implying a measurement nobody made.
+ */
+function operandOwnership(value, ownClaim, cpClaim, ownRunId, cpRunId) {
+  const inOwn = declaredPaths(ownClaim).includes(value);
+  const inCp = declaredPaths(cpClaim).includes(value);
+  if (inOwn && inCp) return { value, owner: 'both', run: null };
+  if (inOwn) return { value, owner: 'own', run: ownRunId };
+  if (inCp) return { value, owner: 'counterpart', run: cpRunId };
+  // Reachable when a path contains the separator, or when a future comparator
+  // renders a label that is not a verbatim declared path. Named, never guessed
+  // from position — guessing here is exactly the defect R2 measured.
+  return { value, owner: 'unknown', run: null };
 }
 
 /**
@@ -717,6 +858,26 @@ function evaluateGate(opts) {
       // misleading about the history.
       if (c.claim.released && c.claim.released.mechanism) {
         entry.persisted_mechanism = c.claim.released.mechanism;
+      }
+      // S05/review R3 — make the release MONOTONIC. Only `committed` is
+      // persisted from here: it is the one mechanism this gate corroborated
+      // itself (the two probes agreed). `explicit` is already persisted by
+      // definition; `ttl-expired` is the NET firing on someone else's dead run
+      // and `manual` asserts no measurement at all — writing either from a
+      // counterpart's gate would carve a verdict this gate did not corroborate
+      // into a foreign record.
+      if (rel.mechanism === 'committed') {
+        const p = persistCounterpartRelease(cwd, c.id, c.claim, rel, o);
+        // ADDITIVE on the entry: `persisted` says whether the RECORD now agrees
+        // with the verdict. It never restates the verdict — the skip above is
+        // the verdict, and it stands in every branch.
+        entry.persisted = p.persisted;
+        if (p.refusal) entry.persist_refusal = p.refusal;
+        if (p.note) {
+          const pn = { id: `${runId} × ${c.id}`, reason: p.note };
+          if (p.detail) pn.detail = p.detail;
+          notes.push(pn);
+        }
       }
       released_counterparts.push(entry);
       continue;
@@ -817,13 +978,26 @@ function evaluateGate(opts) {
         sawUndeclared = true;
       }
     }
-    counterparts.push({
+    const cpEntry = {
       id: c.id,
       cause: hit ? hit.cause : null,
       paths: hit ? hit.paths : [],
       scope: c.scope,
       note: c.note,
-    });
+    };
+    // ADDITIVE (S07/review R2c). `paths` KEEPS its meaning — the labels
+    // `claimsConflict` rendered — because rewriting it would retroactively
+    // falsify every `claim-gate` line already on disk. `path_operands` is the
+    // structure beside it: each label split into its operands, each operand's
+    // owner MEASURED by membership in the two declared claims, never inferred
+    // from its position in the label.
+    if (hit && hit.cause === 'overlap' && hit.paths.length > 0) {
+      cpEntry.path_operands = hit.paths.map((label) => ({
+        label,
+        operands: splitLabel(label).map((value) => operandOwnership(value, claim, c.claim, runId, c.id)),
+      }));
+    }
+    counterparts.push(cpEntry);
   }
 
   if (!sawOverlap && !sawUndeclared) {
@@ -1574,11 +1748,20 @@ module.exports = {
   DEFAULT_RELEASE_CLASSIFY,
   RELEASE_SKIP_BY_MECHANISM,
   counterpartRelease,
+  // S05/review R3: the persistence seam, exported so the suite can assert it by
+  // REFERENCE IDENTITY against `forge-write-claim.releaseClaim` (the wiring is
+  // this module's to prove; the atomic write is T01's).
+  DEFAULT_RELEASE_PERSIST,
+  persistCounterpartRelease,
+  // S07/review R2c: the closed set of operand owners, crossed in both directions.
+  OPERAND_OWNERS,
+  LABEL_SEPARATOR,
   parseArgs,
   main,
   USAGE,
   _private: {
     ownEligibility, parseConceded, readDeferLedger, writeDeferLedger, deferLedgerPath, deferKey,
+    operandOwnership, splitLabel, releaseEvidence,
   },
 };
 

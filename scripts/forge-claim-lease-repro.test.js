@@ -335,11 +335,23 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
     assertEqual(original.split(needle).length - 1, 1,
       'a mordida precisa casar EXATAMENTE a conjunção — 0 ou 2 casamentos a tornariam vazia');
 
+    // Fixture NOVA, e isso é o ponto: desde S05/review R3 o gate PERSISTE o
+    // veredito `committed` que corroborou, então a `fx` da F2 já carrega o
+    // envelope e uma reavaliação ali sairia por `released-explicit` — a prova
+    // neutralizada nunca seria consultada e a mordida ficaria VAZIA (verde por
+    // ausência de premissa, não por mérito). A mordida precisa de um mundo onde
+    // nenhuma avaliação anterior persistiu nada.
+    const bfx = buildFixture();
+    git(bfx.repo, ['add', 'src/a.js']);
+    git(bfx.repo, ['commit', '-q', '-m', 'A commita seu trabalho']);
+    assertEqual(git(bfx.repo, ['status', '--porcelain']).trim(), '', 'a fixture da mordida está commitada');
+    assertEqual(readRun(bfx.ws, RUN_A).write_claim.released, null,
+      'a fixture da mordida NÃO pode nascer com envelope — senão a mordida é vazia');
+
     let bitten = null;
     try {
       fs.writeFileSync(RELEASE_MODULE, original.replace(needle, 'if (false) {'), 'utf8');
-      // A MESMA invocação da F2, sobre a MESMA fixture já commitada.
-      bitten = cliJson(GATE_CLI, fx.bArgs);
+      bitten = cliJson(GATE_CLI, bfx.bArgs);
     } finally {
       fs.writeFileSync(RELEASE_MODULE, original, 'utf8');
     }
@@ -350,10 +362,34 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
       `com a prova neutralizada a F2 tem de ficar vermelha, veio ${bitten && bitten.decision}`);
     assertEqual(bitten.cause, 'overlap');
     assertEqual(bitten.released_counterparts.length, 0, 'sem prova, ninguém sai do universo');
+    assertEqual(readRun(bfx.ws, RUN_A).write_claim.released, null,
+      'sem veredito corroborado, NADA pode ter sido persistido no claim alheio');
 
     // E o módulo restaurado volta a decidir como antes — controle positivo da restauração.
-    assertEqual(cliJson(GATE_CLI, fx.bArgs).decision, 'proceed',
+    assertEqual(cliJson(GATE_CLI, bfx.bArgs).decision, 'proceed',
       'restaurado, o mesmo comando volta a passar');
+  });
+
+  // ── S05/review R3, sobre git REAL: o veredito vivo virou registro ─────────
+  test('R3: o `committed` que a F2 corroborou foi PERSISTIDO no claim de A (release monotônico)', () => {
+    const claimA = readRun(fx.ws, RUN_A).write_claim;
+    assert(claimA.released, 'o envelope tem de existir — sem persistência o release re-bloqueia na próxima unidade');
+    assertEqual(claimA.released.mechanism, 'committed');
+    assertEqual(claimA.released.evidence.observed_by, 'claim-gate',
+      'a origem do envelope é nomeada: quem observou foi o gate de B, não o dono');
+    assertEqual(claimA.paths.includes('src/a.js'), true, 'persistir NUNCA apaga o claim — só acrescenta o envelope');
+    const rel = f2.released_counterparts.find((r) => r.id === RUN_A);
+    assertEqual(rel.persisted, true, 'o resultado diz que o REGISTRO passou a concordar com o veredito');
+
+    // A monotonicidade, medida: sujar o path de novo (trabalho NÃO relacionado)
+    // não pode ressuscitar o bloqueio — que era exatamente a objeção R3.
+    fs.writeFileSync(path.join(fx.repo, 'src', 'a.js'), '// trabalho novo, alheio ao claim de A\n', 'utf8');
+    assert(git(fx.repo, ['status', '--porcelain']).trim() !== '', 'a árvore precisa estar suja de novo');
+    const after = cliJson(GATE_CLI, fx.bArgs);
+    assertEqual(after.decision, 'proceed',
+      'REGRESSÃO R3: o path sujo re-bloqueou um counterpart já provado committed — release não-monotônico');
+    const rel2 = after.released_counterparts.find((r) => r.id === RUN_A);
+    assertEqual(rel2.mechanism, 'explicit', 'a segunda avaliação sai pelo ENVELOPE persistido, não por sondar de novo');
   });
 }
 

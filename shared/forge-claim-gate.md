@@ -346,8 +346,28 @@ census — it never falls through to `claim-absent`, which would turn a release 
 ### Where the release is asked for
 
 At the **unit boundary**, by both orchestrators, in Post-unit housekeeping — `skills/forge-auto`
-(step 6) and `skills/forge-next` (§ 6) — after the unit's own commit has had its chance to land, and
-by nobody else.
+(step 6) and `skills/forge-next` (§ 6) — after the unit's own commit has had its chance to land.
+
+**And by the gate, for the one verdict it corroborates itself (S05/review R3).** When a
+counterpart's release is proved `committed` — the two probes agreeing — the gate **persists** that
+verdict into the counterpart's `RunRecord`. Without it the release was a live-probe opinion that
+evaporated: a counterpart proved `committed` at unit N re-blocked at N+1 as soon as the path went
+dirty from unrelated work, which is a **non-monotonic** release contradicting the persisted lifecycle
+this section documents. The write is cross-run, into a foreign record, and it is only admissible
+because `releaseClaim` compares the claim identity **under the lock** (below): the gate passes the
+claim it measured as `expect` and **never** reads-then-writes.
+
+Only `committed` is written from here. `explicit` is already persisted by definition; `ttl-expired`
+is the net firing on someone else's dead run and `manual` asserts no measurement at all — carving
+either into a foreign record from a counterpart's gate would persist a verdict this gate did not
+corroborate.
+
+When the identity compare **loses** the race, nothing is written, nothing is retried, and the
+refusal is named — `release-persist-stale-claim` in the census notes, `persist_refusal` on the
+`released_counterparts` entry (`release-persist-failed` for any other named refusal or a throwing
+seam). The **live verdict still stands for that evaluation**: losing the race means "I could not
+persist", which is neither "the release did not happen" nor "it did". A measurement that could not be
+made is never evidence — in either direction.
 
 The write itself is **atomic against the claim's identity** (S05/review R1): `releaseClaim` re-reads
 the claim **inside** the registry lock (`forge-runs.updateWith`) and compares `{at, unit,
@@ -415,8 +435,27 @@ Shape appended to `.gsd/forge/events.jsonl` of `WORKING_DIR` — documented for 
 retyping:
 
 ```json
-{"event":"claim-gate","ts":"<ISO-8601>","run":"<run id>","unit":"<unit verbatim>","decision":"proceed|defer|block|refuse","cause":"overlap|undeclared-writes|pathless-conceded-item|null","undeclared_side":"own|counterpart|both|null","posture":"defer|block","posture_source":"prefs|fallback|invalid-pref|explicit","posture_effective":"defer|block|null","posture_override":"svn-unmet-worktree|null","posture_override_effect":"hardened|already-block|null","escalation":"wait-ceiling|defer-cap|null","floor":"defer-floor|null","counterparts":[{"id":"<run>","cause":"...","paths":["..."],"scope":"same|unknown","note":"<S03 note|null>"}],"census":{"runs_examined":N,"counterparts_considered":N,"counterparts_in_scope":N,"skipped":[{"id":"<run>","reason":"different-code-dir"}],"notes":[{"id":"...","reason":"..."}]},"not_covered":[{"boundary":"...","reason":"..."}]}
+{"event":"claim-gate","ts":"<ISO-8601>","run":"<run id>","unit":"<unit verbatim>","decision":"proceed|defer|block|refuse","cause":"overlap|undeclared-writes|pathless-conceded-item|null","undeclared_side":"own|counterpart|both|null","posture":"defer|block","posture_source":"prefs|fallback|invalid-pref|explicit","posture_effective":"defer|block|null","posture_override":"svn-unmet-worktree|null","posture_override_effect":"hardened|already-block|null","escalation":"wait-ceiling|defer-cap|null","floor":"defer-floor|null","counterparts":[{"id":"<run>","cause":"...","paths":["..."],"path_operands":[{"label":"<label>","operands":[{"value":"<path>","owner":"own|counterpart|both|unknown","run":"<run|null>"}]}],"scope":"same|unknown","note":"<S03 note|null>"}],"released_counterparts":[{"id":"<run>","mechanism":"committed|ttl-expired|explicit|manual","reason":"released-*","persisted_mechanism":"<mechanism|absent>","persisted":true,"persist_refusal":"<named refusal|absent>"}],"census":{"runs_examined":N,"counterparts_considered":N,"counterparts_in_scope":N,"skipped":[{"id":"<run>","reason":"different-code-dir"}],"notes":[{"id":"...","reason":"..."}]},"not_covered":[{"boundary":"...","reason":"..."}]}
 ```
+
+**Operand ownership on a composite label (S07/review R2c).** `counterparts[].paths` carries the
+labels `claimsConflict` rendered, and a collision between two *different* paths is rendered as the
+composite `"<a> × <b>"` — a rendering, not a structure. Which operand belonged to whom used to be a
+**positional invariant of one emitter in one version**, and a historical line does not certify which
+version wrote it. The gate therefore emits, **additively**, `counterparts[].path_operands`:
+
+```json
+"path_operands":[{"label":"src/** × src/a.js","operands":[{"value":"src/**","owner":"own","run":"<own run>"},{"value":"src/a.js","owner":"counterpart","run":"<counterpart run>"}]}]
+```
+
+`paths` **keeps** its meaning and its bytes — rewriting it would retroactively falsify every
+`claim-gate` line already on disk. `owner` comes from a closed set and is **measured** by membership
+in the two declared claims, never inferred from position: `own`, `counterpart`, `both` (both sides
+declared that exact path — the non-composite case) and `unknown` (found in neither claim, e.g. a path
+that itself contains the separator). `run` is filled only for an unambiguous owner; `both` and
+`unknown` carry `null`, because naming one of the two runs there would assert a measurement nobody
+made. The field is present **only** on a counterpart with a measured `overlap` — never on
+`undeclared-writes`, where there is no operand to own.
 
 Additive-field convention, same as `tier`/`reason` from M002: readers that do not recognise a field
 ignore it. `scope: unknown` with an S03 `note` is what lets an operator tell a block backed by
