@@ -1328,24 +1328,26 @@ test('F2: Windows 8.3 rung — short (RUNNER~1-style) and long spellings converg
     console.log('  (skip: 8.3 short names exist only on Windows/NTFS — this exact effect cannot be reproduced on POSIX; the shared-helper source guard above bites on every platform)');
     return;
   }
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-canon-83-'));
-  try {
-    // A name long enough that NTFS must mint an 8.3 alias for it.
-    const longDir = path.join(base, 'averylongdirectoryname-for-eightdotthree');
-    fs.mkdirSync(longDir);
-    const res = spawnSync('cmd', ['/d', '/s', '/c', `for %I in ("${longDir}") do @echo %~sI`], { encoding: 'utf8' });
-    // Measured twice on the CI runner: `%~sI` came back wrapped in ESCAPED
-    // quotes — `\"c:\users\runner~1\...\"`, not `"c:\..."`. Stripping `"` left
-    // the leading backslash, path.resolve anchored that to the current drive
-    // (`d:\"c:\users\...`) and the helper under test was never exercised.
-    // Guessing the exact quoting form is a losing game, so the fixture stops
-    // parsing delimiters and extracts the only thing it actually wants: the
-    // first drive-absolute path in the output. Trailing separators go too —
-    // `%~sI` may hand back `...\`.
-    const shortMatch = /[A-Za-z]:\\[^"\r\n]*/.exec(res.stdout || '');
-    const shortDir = shortMatch ? shortMatch[0].trim().replace(/\\+$/, '') : '';
-    if (!shortDir || path.resolve(shortDir).toLowerCase() === path.resolve(longDir).toLowerCase()) {
-      console.log('  (skip: 8.3 name generation is disabled on this volume (fsutil 8dot3name) — no short alias exists to compare)');
+  // The 8.3 alias comes from the OS, not from parsing a shell.
+  //
+  // Three CI rounds were spent trying to read `%~sI` out of cmd.exe and each one
+  // came back in a different shape — `"c:\...\"`, then `\"c:\...\"` (escaped
+  // quote), then nothing the extractor could find, which fed the helper an empty
+  // string and compared the CWD against the fixture. The measured environment
+  // makes all of that unnecessary: the runner's own `os.tmpdir()` IS
+  // `C:\Users\RUNNER~1\AppData\Local\Temp` — the short spelling is already in
+  // hand, and `.native` supplies the long one. That is also the exact real-world
+  // shape of the bug (tmpdir short, git's answer long), so the fixture now
+  // reproduces the incident instead of simulating it.
+  // No fixture directory is created, so there is nothing to clean up — and the
+  // absence of a `finally` here is deliberate: the previous version removed the
+  // temp tree it had made, and keeping that block while the paths became
+  // `os.tmpdir()` would have pointed a recursive delete at the system temp dir.
+  const shortDir = os.tmpdir();
+  const longDir = fs.realpathSync.native(shortDir);
+  {
+    if (shortDir.toLowerCase() === longDir.toLowerCase()) {
+      console.log('  (skip: this runner\'s tmpdir carries no 8.3 component (fsutil 8dot3name may be disabled) — no short alias exists to compare)');
       return;
     }
     assertEq(realpathCanonical(shortDir).toLowerCase(), realpathCanonical(longDir).toLowerCase(),
@@ -1359,7 +1361,7 @@ test('F2: Windows 8.3 rung — short (RUNNER~1-style) and long spellings converg
     // the guard should be re-evaluated — never silently weakened.
     assert(fs.realpathSync(shortDir).toLowerCase() !== fs.realpathSync.native(shortDir).toLowerCase(),
       'sanity (non-vacuous): plain fs.realpathSync must still differ from .native on the 8.3 alias — otherwise this test no longer distinguishes the regression');
-  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  }
 });
 
 // ── F7 — gitDefaultBranch: no shell, no /dev/null, same fallback semantics ──
