@@ -7928,6 +7928,13 @@ function smokePrefsCutoverGuards() {
     // than silently missed by the repository-wide scan.
     'bin/forge-accounts', 'bin/forge-run', 'bin/forge-status',
     'skills/forge-doctor/SKILL.md', 'CLAUDE.md',
+    // The index-green allowed-misses list keys each accepted miss as
+    // `<mem_id>::<normalized mention>`, and one accepted miss IS a memory fact
+    // that mentions the legacy prefs filename. The occurrence is a RECORD of
+    // what an old fact says — not a live reference to the legacy file, and not
+    // something the cutover can rewrite without changing the key and breaking
+    // the match. Audited here rather than missed by the scan.
+    'scripts/fixtures/index-green/allowed-misses.json',
   ]);
   const untrackedProbe = path.join(REPO, '.forge-smoke-untracked-prefs-probe');
   fs.writeFileSync(untrackedProbe, 'forge-agent-prefs.md\n', 'utf8');
