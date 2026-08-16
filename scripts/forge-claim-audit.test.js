@@ -283,19 +283,38 @@ test('units_examined === units_compared + Σ skipped(kind=unit)', () => {
   eq(unitSkips, 2, 'uma sem escrita + uma sem delta');
 });
 
-test('claim_sources_examined === claim_sources_contributing + Σ skipped(kind=claim-source) quando nenhuma contribuiu zero', () => {
+// R3 — a reconciliação alimentada pelo RESULTADO REAL de `collectClaims` sob
+// falha, nunca por um `sources` montado à mão. A versão anterior deste teste
+// passava só porque o fixture fornecia DUAS linhas `consulted:true` mais um skip
+// manual SEM a linha `consulted:false` irmã — uma forma que a produção NUNCA
+// emite: no `catch`, `collectClaims` empurra as duas coisas. Com a forma de
+// produção, a igualdade que o teste alegava provar QUEBRAVA (2 fontes, 1
+// falhando → examinadas 3, contribuindo 1 + skips 1 = 2).
+test('censo de fontes fecha sobre o resultado REAL de collectClaims com uma fonte falhando', () => {
+  const cwd = mkWorkspace('census-real');
+  writeRun(cwd, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: null });
+  writeRun(cwd, { id: 'RUN-B', kind: 'milestone', active: true, write_claim: { paths: ['a.js'], code_dir: ABS_A } });
+  // Falha REAL dentro do try de `gate-events`: a fonte lança ao ser percorrida,
+  // exatamente como um log ilegível — e o resultado consumido abaixo é o que a
+  // produção produz, não um fixture.
+  const collected = collectClaims(cwd, {
+    milestone: 'M-x', run: 'M-x', codeDir: ABS_A,
+    scopeRunIds: new Set(['M-x']),
+    events: { [Symbol.iterator]() { throw new Error('log ilegível'); } },
+  });
+  eq(collected.sources.length, 2, 'as duas fontes têm de aparecer, inclusive a que falhou');
+  const gate = collected.sources.find((s) => s.source === 'gate-events');
+  eq(gate.consulted, false, 'a fonte que falhou é a MESMA linha, com consulted:false');
+  eq(collected.skipped.filter((s) => s.kind === 'claim-source').length, 1, 'e o skip nomeado existe');
+
   const r = compareClaimAudit(input({
     written: { units: [writtenUnit('u1', ['a.js'])], skipped: [] },
-    claims: {
-      claims: [claimRow('RUN-B', ['a.js']), claimRow('RUN-C', ['a.js'], { source: 'gate-events' })],
-      sources: sources(1, 1),
-      skipped: [{ kind: 'claim-source', id: 'x', reason: 'source-unavailable', detail: 'ilegível' }],
-      notes: [],
-    },
+    claims: collected,
   }));
   const srcSkips = r.skipped.filter((s) => s.kind === 'claim-source').length;
+  eq(r.census.claim_sources_examined, 2, 'existem DUAS fontes; contar a falha em dobro é inflar o censo');
   eq(r.census.claim_sources_examined, r.census.claim_sources_contributing + srcSkips,
-    'a conta de fontes tem de fechar por igualdade');
+    'a conta de fontes tem de fechar por igualdade NA FORMA DE PRODUÇÃO');
 });
 
 test('uma fonte que contribuiu ZERO aparece NOMEADA com contributed: 0, nunca ausente', () => {
@@ -429,10 +448,172 @@ test('a própria run é excluída por skip NOMEADO (same-run), nunca confrontada
   assert(collected.skipped.some((s) => s.reason === 'same-run'), 'a exclusão tem de ser um skip nomeado');
 });
 
+// R1 — escopo imedível NÃO é permissão máxima.
+test('registry sem nenhuma run desta milestone: gate-events contribui ZERO com razão nomeada (scope-unresolved)', () => {
+  const cwd = mkWorkspace('scope-unresolved');
+  // Uma linha histórica de OUTRA run, de outra milestone. Sem ponte
+  // run→milestone (o registry não conhece M-x), a pertinência dela é imedível.
+  writeEvents(cwd, [
+    { event: 'claim-gate', run: 'RUN-ALHEIA', unit: 'execute-task/T09', decision: 'defer',
+      counterparts: [{ id: 'RUN-B', cause: 'overlap', paths: ['scripts/alvo.js'], scope: 'same', note: null }] },
+  ]);
+  const collected = collectClaims(cwd, { milestone: 'M-x', slice: 'S07', run: 'M-x', codeDir: ABS_A });
+  const gate = collected.sources.find((s) => s.source === 'gate-events');
+  eq(gate.contributed, 0, 'escopo imedível não pode admitir TODO o histórico do workspace');
+  eq(gate.consulted, false);
+  const skip = collected.skipped.find((s) => s.reason === 'scope-unresolved');
+  assert(skip, 'a impossibilidade tem de virar razão NOMEADA do conjunto fechado');
+  eq(skip.kind, 'claim-source');
+  eq(collected.claims.length, 0, 'nenhum claim fabricado a partir de linha de pertinência imedível');
+
+  const r = compareClaimAudit(input({
+    written: { units: [writtenUnit('M-x::S07/T01', ['scripts/alvo.js'])], skipped: [] },
+    claims: collected,
+  }));
+  eq(r.verdict, 'inconclusive', 'sem escopo medível o resultado caminha para inconclusive, nunca para achado');
+  eq(r.findings.length, 0, 'nenhum achado fabricado — e portanto nenhum work-lost falso em disco');
+});
+
+test('controle positivo de R1: COM a ponte run→milestone no registry, a mesma linha histórica É admitida', () => {
+  const cwd = mkWorkspace('scope-resolved');
+  writeRun(cwd, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: null });
+  writeEvents(cwd, [
+    { event: 'claim-gate', run: 'M-x', unit: 'execute-task/T01', decision: 'defer',
+      counterparts: [{ id: 'RUN-B', cause: 'overlap', paths: ['scripts/alvo.js'], scope: 'same', note: null }] },
+  ]);
+  const collected = collectClaims(cwd, { milestone: 'M-x', slice: 'S07', run: 'M-x', codeDir: ABS_A });
+  eq(collected.sources.find((s) => s.source === 'gate-events').contributed, 1,
+    'o guard de R1 não pode cegar o caminho medível — controle positivo');
+  assert(!collected.skipped.some((s) => s.reason === 'scope-unresolved'), 'com escopo medido não há razão a registrar');
+});
+
+// R2 — o schema NÃO preserva de quem é o operando do rótulo composto.
+test('rótulo COMPOSTO em linha histórica: operandos NÃO viram claim da contraparte; nota nomeada, e nada em silêncio', () => {
+  const cwd = mkWorkspace('composite');
+  writeRun(cwd, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: null });
+  writeEvents(cwd, [
+    { event: 'claim-gate', run: 'M-x', unit: 'execute-task/T01', decision: 'defer',
+      counterparts: [{ id: 'RUN-B', cause: 'overlap', paths: ['src/meu.js × outro/dele.js'], scope: 'same', note: null }] },
+  ]);
+  const collected = collectClaims(cwd, { milestone: 'M-x', slice: 'S07', run: 'M-x', codeDir: ABS_A });
+  eq(collected.claims.length, 0, 'nenhum operando de rótulo composto pode virar caminho claimado pela contraparte');
+  assert(collected.notes.some((n) => n.reason === 'composite-label-ownership' && n.id === 'RUN-B'),
+    'a incerteza tem de ser CARREGADA com nota nomeada');
+  const skip = collected.skipped.find((s) => s.reason === 'no-attributable-paths');
+  assert(skip, 'a linha sem caminho atribuível sai da comparação NOMEADA, nunca por continue mudo');
+
+  // E o dano concreto que isso evita: `src/meu.js` é escrito por ESTA slice.
+  const r = compareClaimAudit(input({
+    written: { units: [writtenUnit('M-x::S07/T01', ['src/meu.js'])], skipped: [] },
+    claims: collected,
+  }));
+  eq(r.findings.length, 0, 'atribuir o operando fabricaria overlap contra o arquivo da própria run');
+});
+
+test('rótulo NÃO-composto (a === b) segue atribuível — foi claimado pelos dois lados', () => {
+  const cwd = mkWorkspace('non-composite');
+  writeRun(cwd, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: null });
+  writeEvents(cwd, [
+    { event: 'claim-gate', run: 'M-x', unit: 'execute-task/T01', decision: 'defer',
+      counterparts: [{ id: 'RUN-B', cause: 'overlap', paths: ['scripts/alvo.js × scripts/alvo.js'], scope: 'same', note: null }] },
+  ]);
+  const collected = collectClaims(cwd, { milestone: 'M-x', slice: 'S07', run: 'M-x', codeDir: ABS_A });
+  eq(collected.claims.length, 1, 'operandos idênticos nomeiam UM arquivo real dos dois lados');
+  eq(collected.claims[0].paths.join(','), 'scripts/alvo.js');
+  assert(!collected.notes.some((n) => n.reason === 'composite-label-ownership'), 'não há ambiguidade de propriedade aqui');
+});
+
+test('contraparte sem caminho algum também sai NOMEADA (o continue mudo de :326 não voltou pela porta dos fundos)', () => {
+  const cwd = mkWorkspace('nopaths');
+  writeRun(cwd, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: null });
+  writeEvents(cwd, [
+    { event: 'claim-gate', run: 'M-x', unit: 'execute-task/T01', decision: 'proceed',
+      counterparts: [{ id: 'RUN-B', cause: null, paths: [], scope: 'same', note: null }] },
+  ]);
+  const collected = collectClaims(cwd, { milestone: 'M-x', run: 'M-x', codeDir: ABS_A });
+  assert(collected.skipped.some((s) => s.reason === 'no-attributable-paths' && s.id === 'RUN-B'),
+    'descarte silencioso é o defeito de origem deste módulo');
+});
+
 test('sem run própria identificada, a incerteza é NOMEADA (self-run-unknown), não assumida inofensiva', () => {
   const cwd = mkWorkspace('noself');
   const collected = collectClaims(cwd, { milestone: 'M-x', codeDir: ABS_A });
   assert(collected.notes.some((n) => n.reason === 'self-run-unknown'), 'a incerteza tem de aparecer nomeada');
+});
+
+test('conjunto fechado CRUZADO nos dois sentidos: toda razão listada é alcançada por >= 1 cenário', () => {
+  const seenSkips = new Set();
+  const seenNotes = new Set();
+  const collect = (r) => {
+    for (const s of (r.skipped || [])) seenSkips.add(s.reason);
+    for (const n of (r.notes || [])) seenNotes.add(n.reason);
+  };
+
+  // unit: no-written-files + delta-unavailable · pair: different-code-dir
+  collect(compareClaimAudit(input({
+    written: {
+      units: [writtenUnit('u-vazia', []), writtenUnit('u', ['a.js'])],
+      skipped: [{ kind: 'unit', id: 'u4', reason: 'delta-unavailable', detail: 'no-attributed-commits' }],
+    },
+    claims: {
+      claims: [claimRow('RUN-B', ['a.js'], { claim: { paths: ['a.js'], code_dir: ABS_B } })],
+      sources: sources(1, 0), skipped: [], notes: [],
+    },
+  })));
+  // notas de code_dir herdadas de S03
+  for (const value of [null, 42, 'relativo/nao/absoluto']) {
+    collect(compareClaimAudit(input({
+      written: { units: [writtenUnit('u', ['a.js'])], skipped: [] },
+      claims: {
+        claims: [claimRow('R', ['a.js'], { claim: { paths: ['a.js'], code_dir: value } })],
+        sources: sources(1, 0), skipped: [], notes: [],
+      },
+    })));
+  }
+  // code-dir-unresolved: dois absolutos, ao menos um irresolvível em disco
+  collect(compareClaimAudit(input({
+    written: { units: [writtenUnit('u', ['a.js'])], skipped: [] },
+    claims: {
+      claims: [claimRow('R', ['a.js'], { claim: { paths: ['a.js'], code_dir: path.join(ABS_A, 'nao-existe-jamais') } })],
+      sources: sources(1, 0), skipped: [], notes: [],
+    },
+  })));
+  // collector-failed
+  collect(auditClaims({
+    cwd: mkWorkspace('cross-collector'), milestone: 'M-x', run: 'M-x',
+    collectors: {
+      written: () => { throw new Error('VCS ausente'); },
+      declared: () => ({ byUnit: new Map(), notes: [] }),
+      claims: () => ({ claims: [], sources: sources(0, 0), skipped: [], notes: [] }),
+    },
+  }));
+  // source-unavailable (forma de produção) + self-run-unknown
+  const cwdSrc = mkWorkspace('cross-source');
+  collect(collectClaims(cwdSrc, {
+    milestone: 'M-x', codeDir: ABS_A, scopeRunIds: new Set(['M-x']),
+    events: { [Symbol.iterator]() { throw new Error('log ilegível'); } },
+  }));
+  // scope-unresolved
+  collect(collectClaims(mkWorkspace('cross-scope'), { milestone: 'M-x', run: 'M-x', codeDir: ABS_A }));
+  // same-run + no-attributable-paths + composite-label-ownership
+  const cwdEv = mkWorkspace('cross-events');
+  writeRun(cwdEv, { id: 'M-x', kind: 'milestone', active: true, milestone_dir: '.gsd/milestones/M-x/', write_claim: { paths: ['a.js'], code_dir: ABS_A } });
+  writeEvents(cwdEv, [
+    { event: 'claim-gate', run: 'M-x', unit: 'execute-task/T01', decision: 'defer',
+      counterparts: [{ id: 'RUN-B', cause: 'overlap', paths: ['x/a.js × y/b.js'], scope: 'same', note: null }] },
+  ]);
+  collect(collectClaims(cwdEv, { milestone: 'M-x', run: 'M-x', codeDir: ABS_A }));
+  // plan-legacy-schema é nota de `collectDeclared`; alcançada pela sua própria
+  // rota, mas o cruzamento aqui exige que ela seja alcançável — construída
+  // diretamente pelo seam, que é o único produtor legítimo.
+  collect({ notes: recordNote([], 'u', 'plan-legacy-schema') });
+
+  for (const reason of AUDIT_SKIP_REASONS) {
+    assert(seenSkips.has(reason), `razão de skip listada e NUNCA alcançada por cenário: ${reason}`);
+  }
+  for (const reason of AUDIT_NOTE_REASONS) {
+    assert(seenNotes.has(reason), `razão de nota listada e NUNCA alcançada por cenário: ${reason}`);
+  }
 });
 
 // ── Bloco F — `code-dir-unknown` é CARREGADA, nunca descartada ─────────────

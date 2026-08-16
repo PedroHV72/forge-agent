@@ -130,6 +130,8 @@ const AUDIT_SKIP_REASONS = [
   'different-code-dir', // kind `pair`: D2 — the two sides write from DIFFERENT `code_dir`s, so identical relative paths denote different files. Pair skipped; `pairs_compared` NOT incremented.
   'same-run',           // kind `pair`: the counterpart IS the run under audit. Confronting a run with itself would manufacture a finding out of its own bookkeeping.
   'collector-failed',   // kind `collector`: a collector THREW (absent VCS, corrupt registry). The report still exists — an exception never becomes silence and never becomes a crash (S02/R2 precedent, where a reader's throw escaped the whole measurement).
+  'scope-unresolved',   // kind `claim-source`: R1 — the run→milestone bridge is EMPTY, so no historical `claim-gate` line can be shown to belong to this milestone. The `claim-gate` payload carries no `milestone` field, so the registry is the ONLY bridge; empty means the fact is genuinely UNMEASURABLE. The source contributes ZERO. Admitting every historical line instead would turn an unmeasured scope into MAXIMUM permission — the exact inversion of this module's floor.
+  'no-attributable-paths', // kind `pair`: R2 — the counterpart entry named no path this audit may attribute (either it carried none, or every label was COMPOSITE and ownership of the operands is not recorded). The row leaves the comparison NAMED; the previous `continue` dropped it in silence, which is the defect of origin.
 ];
 
 // ── Note reasons ───────────────────────────────────────────────────────────
@@ -146,6 +148,7 @@ const AUDIT_NOTE_REASONS = [
   'code-dir-unresolved', // both absolute, at least one unresolvable: the comparison degraded to lexical identity, and the degradation is named.
   'plan-legacy-schema',  // the unit's own plan carries no structured `must_haves:`, so the DECLARED side is unreadable. The unit stays compared — under D1, an unreadable declaration is not evidence of safety.
   'self-run-unknown',    // the run under audit could not be identified in the registry, so `same-run` exclusion could not be applied. Named rather than assumed harmless.
+  'composite-label-ownership', // R2 — a HISTORICAL line recorded a COMPOSITE label (`a` and `b` joined by the rendering separator). Nothing in the written line preserves WHICH operand belongs to the counterpart: the label is a rendering born in `forge-claim-overlap` (`claimA.paths` × `claimB.paths`), and the positional order is an invariant of ONE implementation at ONE version, never a contract of the record — a historical line does not certify which version wrote it. So the operands are NOT attributed as counterpart claim paths (attributing them would FABRICATE overlap against this run's own files); the uncertainty is CARRIED here instead. Making the gate persist explicit operand ownership is an event-schema change, raised to the operator's final triage.
 ];
 
 /** Seam: a reason from outside the closed set throws instead of leaking. */
@@ -254,9 +257,12 @@ function runIdsForMilestone(cwd, milestone) {
  * finding reachable ONLY through the history must still be found — the suite
  * proves exactly that case.
  *
- * A composite label (`a × b`) recorded by S03 for a matched pair is split back
- * into its two path operands: the label is a rendering of two real paths, and
- * re-deriving them here is reading S03's record, not inventing a path.
+ * A NON-composite label recorded by S03 is read as a claimed path — both sides
+ * named that same file, so the attribution is safe. A COMPOSITE label is NOT
+ * split into counterpart paths: re-deriving the BYTES is reading S03's record,
+ * but re-deriving the OWNERSHIP is inventing it (R2). The uncertainty is
+ * carried as `composite-label-ownership` and the row leaves the comparison
+ * NAMED, never in silence.
  */
 function collectClaims(cwd, opts) {
   const o = opts || {};
@@ -302,13 +308,28 @@ function collectClaims(cwd, opts) {
     const file = o.eventsFile || path.join(cwd, '.gsd', 'forge', 'events.jsonl');
     const events = o.events || readEvents(file);
     const scopeIds = o.scopeRunIds || runIdsForMilestone(cwd, o.milestone);
+    // R1 — a scope that could not be MEASURED is not maximum permission.
+    // `claim-gate` lines carry no `milestone` field, so the run registry is the
+    // ONLY run→milestone bridge. An empty bridge (unreadable registry, runs
+    // never registered or already pruned) means pertinence is UNMEASURABLE, and
+    // the rest of this module treats absence of measurement as non-evidence —
+    // that is literally the thesis of the `inconclusive` floor. Admitting every
+    // historical line here would invert it, manufacturing findings AND writing
+    // false `work-lost` lines to disk, which are permanent.
+    if (scopeIds.size === 0) {
+      recordSkip(skipped, 'claim-source', 'gate-events', 'scope-unresolved',
+        'nenhuma run desta milestone no registry: a pertinência das linhas históricas é imedível');
+      sources.push({ source: 'gate-events', consulted: false, contributed: 0, events_seen: 0, events_in_scope: 0 });
+      if (!selfRun) recordNote(notes, '(self)', 'self-run-unknown');
+      return { claims, sources, skipped, notes };
+    }
     for (const ev of events) {
       if (!ev || ev.event !== 'claim-gate') continue;
       eventsSeen += 1;
       // The query boundary: only lines emitted by a run of THIS milestone. This
       // is the scope of the question, not a discarded remainder — the census
       // reports both counts so the narrowing stays visible.
-      if (scopeIds.size > 0 && !scopeIds.has(ev.run)) continue;
+      if (!scopeIds.has(ev.run)) continue;
       eventsInScope += 1;
       for (const cp of (ev.counterparts || [])) {
         if (!cp || typeof cp.id !== 'string') continue;
@@ -316,14 +337,29 @@ function collectClaims(cwd, opts) {
           recordSkip(skipped, 'pair', cp.id, 'same-run', 'contraparte é a run sob auditoria');
           continue;
         }
+        // R2 — a NON-composite label stays attributable (the path was claimed
+        // by both sides, so it names a real file of the counterpart). A
+        // COMPOSITE one does not: see `composite-label-ownership`.
         const paths = [];
+        let composite = 0;
         for (const raw of (cp.paths || [])) {
-          for (const part of String(raw).split(' × ')) {
-            const p = posix(part.trim());
-            if (p && !paths.includes(p)) paths.push(p);
-          }
+          const parts = String(raw).split(' × ').map((s) => posix(s.trim())).filter(Boolean);
+          const distinct = parts.filter((p, ix) => parts.indexOf(p) === ix);
+          if (distinct.length > 1) { composite += 1; continue; }
+          const p = distinct[0];
+          if (p && !paths.includes(p)) paths.push(p);
         }
-        if (paths.length === 0) continue;
+        if (composite > 0) recordNote(notes, cp.id, 'composite-label-ownership');
+        if (paths.length === 0) {
+          // NOT a silent `continue`. The row leaves the comparison NAMED, so a
+          // counterpart dropped for lack of attributable paths is countable in
+          // the census instead of vanishing through the back door.
+          recordSkip(skipped, 'pair', cp.id, 'no-attributable-paths',
+            composite > 0
+              ? `${composite} rótulo(s) composto(s): propriedade do operando não registrada`
+              : 'a contraparte não nomeou caminho algum');
+          continue;
+        }
         claims.push({
           run: cp.id,
           source: 'gate-events',
@@ -447,7 +483,6 @@ function compareClaimAudit(input) {
   findings.sort((a, b) => (`${a.unit}|${a.counterpart_run}`).localeCompare(`${b.unit}|${b.counterpart_run}`));
 
   const unitSkips = skipped.filter((s) => s.kind === 'unit').length;
-  const sourceSkips = skipped.filter((s) => s.kind === 'claim-source').length;
   const sources = (i.claims && i.claims.sources) || [];
   const contributing = sources.filter((s) => s.contributed > 0).length;
 
@@ -474,7 +509,15 @@ function compareClaimAudit(input) {
     census: {
       units_examined: units_compared + unitSkips,
       units_compared,
-      claim_sources_examined: sources.length + sourceSkips,
+      // R3 — the number of sources EXAMINED is the number of source rows, full
+      // stop. A source that failed is ALREADY one of those rows, named, with
+      // `consulted: false`; adding its skip on top counted it twice and broke
+      // the very equality this census claims to reconcile (2 sources, 1 failing
+      // → `examined 3` while `contributing 1 + skips 1 = 2`). The skip stays as
+      // ENUMERATION — it names WHY the row contributed nothing — never as a
+      // term of the equation. Claiming more examination than happened is the
+      // same lie in a smaller font as computing `pairs_compared` as `n*m`.
+      claim_sources_examined: sources.length,
       claim_sources_contributing: contributing,
       claims_considered: claims.length,
       pairs_compared,
@@ -712,12 +755,45 @@ function originOf(line) {
  * plus the additive origin marker. Mould: `forge-claim-gate.emitGateEvent` —
  * a failure to log NEVER swallows the finding and never hides that it failed.
  */
+function workLostIdentity(ev) {
+  return JSON.stringify([
+    ev.milestone || null, ev.slice || null, ev.unit || null, ev.other_run || null,
+    ev.cause || null, (ev.files || []).slice().sort(), ev.claim_source || null, ev.origin || null,
+  ]);
+}
+
 function emitWorkLostEvent(cwd, result) {
   if (result.verdict !== 'overlap' || result.findings.length === 0) {
     return { event_written: false, event_error: null, event_lines: 0, event_skipped: 'no-finding' };
   }
   const file = path.join(path.resolve(cwd || process.cwd()), '.gsd', 'forge', 'events.jsonl');
-  const payload = result.findings.map((f) => JSON.stringify({
+
+  // R4 — re-running the closing (retry after `partial`, resume, manual CLI) must
+  // not multiply a TRUE finding into N incidents for whoever counts them. The
+  // section T02 owns is byte-surgical and idempotent for exactly this reason;
+  // the event was not, and the asymmetry lives inside one task.
+  //
+  // This does NOT violate the append-only idiom, which forbids REWRITING and
+  // DELETING — never declining to append the redundant. A line already on disk
+  // with the SAME identity tuple is the same fact, and re-measuring a fact is
+  // not a new occurrence. The mould (`emitGateEvent`) appends blindly because
+  // there each invocation IS a distinct event: a decision taken at a dispatch.
+  const seen = new Set();
+  try {
+    for (const ev of readEvents(file)) {
+      if (ev && ev.event === 'work-lost' && originOf(ev) === 'code') seen.add(workLostIdentity(ev));
+    }
+  } catch { /* an unreadable log suppresses nothing: at worst we append again */ }
+
+  const fresh = result.findings.filter((f) => !seen.has(workLostIdentity({
+    milestone: result.milestone, slice: result.slice, unit: f.unit, cause: f.cause,
+    other_run: f.counterpart_run, files: f.paths, claim_source: f.claim_source, origin: 'code',
+  })));
+  if (fresh.length === 0) {
+    return { event_written: false, event_error: null, event_lines: 0, event_skipped: 'already-recorded' };
+  }
+
+  const payload = fresh.map((f) => JSON.stringify({
     ts: new Date().toISOString(),
     event: 'work-lost',
     milestone: result.milestone,
@@ -735,7 +811,8 @@ function emitWorkLostEvent(cwd, result) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, `${payload}\n`, 'utf8');
-    return { event_written: true, event_error: null, event_lines: result.findings.length, event_skipped: null };
+    // `event_lines` reports what was ACTUALLY appended, never the finding count.
+    return { event_written: true, event_error: null, event_lines: fresh.length, event_skipped: null };
   } catch (e) {
     return { event_written: false, event_error: (e && e.message) || String(e), event_lines: 0, event_skipped: null };
   }

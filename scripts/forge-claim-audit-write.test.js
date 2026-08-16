@@ -548,6 +548,63 @@ test('workspace GENUINAMENTE limpo (pares confrontados, zero colisão): exit 0, 
   eq(log.filter((e) => e.event === 'work-lost').length, 0, 'evento emitido sem achado');
 });
 
+// R4 — o espelho exato do assert de idempotência que a seção já tem. Re-rodar o
+// fechamento (retry após `partial`, resume, CLI manual) re-afirma um achado
+// VERDADEIRO; appendar de novo corrompe a MULTIPLICIDADE — um overlap lido como
+// N perdas por quem conta incidentes. Deixar de appendar o redundante não viola
+// o idioma append-only, que proíbe reescrever e deletar.
+test('duas invocações idênticas da CLI: a SEGUNDA appenda ZERO linha work-lost (evento idempotente como a seção)', () => {
+  let p;
+  try { p = plantWorkspace('idem-event'); } catch (e) { skip(`fixture git indisponível: ${e.message}`); }
+  const args = ['--milestone', MILESTONE, '--slice', 'S07', '--cwd', p.cwd, '--code-dir', p.repo,
+    '--run', MILESTONE, '--write', p.summary, '--json'];
+
+  const first = runCli(args, p.cwd);
+  eq(first.status, 0, `exit 0 na primeira, veio ${first.status} — ${first.stderr}`);
+  const out1 = JSON.parse(first.stdout);
+  eq(out1.verdict, 'overlap', 'o fixture precisa achar de verdade para o caso valer');
+  assert(out1.event_lines >= 1, 'a primeira invocação tem de appendar o achado');
+  const lostAfterFirst = fs.readFileSync(eventsPath(p.cwd), 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.parse(l)).filter((e) => e.event === 'work-lost').length;
+  eq(lostAfterFirst, out1.event_lines, 'o relatado tem de bater com o que está em disco');
+
+  const second = runCli(args, p.cwd);
+  eq(second.status, 0, `exit 0 na segunda, veio ${second.status} — ${second.stderr}`);
+  const out2 = JSON.parse(second.stdout);
+  eq(out2.verdict, 'overlap', 'o mesmo achado continua verdadeiro — não é o achado que some, é a duplicata');
+  eq(out2.event_lines, 0, 'a segunda invocação NÃO pode appendar linha alguma');
+  eq(out2.event_skipped, 'already-recorded', 'e a supressão tem de ser NOMEADA, nunca silenciosa');
+  const lostAfterSecond = fs.readFileSync(eventsPath(p.cwd), 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.parse(l)).filter((e) => e.event === 'work-lost').length;
+  eq(lostAfterSecond, lostAfterFirst, 'o achado foi multiplicado no log');
+});
+
+test('a supressão é por IDENTIDADE do achado, não por "já existe alguma linha": um achado NOVO ainda é appendado', () => {
+  const dir = mktmp('idem-newfinding');
+  const r = result('overlap');
+  eq(emitWorkLostEvent(dir, r).event_lines, 1);
+  eq(emitWorkLostEvent(dir, r).event_lines, 0, 'o mesmo achado não repete');
+  const other = result('overlap');
+  other.findings = other.findings.map((f) => ({ ...f, counterpart_run: 'RUN-C' }));
+  eq(emitWorkLostEvent(dir, other).event_lines, 1, 'contraparte diferente é OUTRO achado e tem de ser registrado');
+  const lost = fs.readFileSync(eventsPath(dir), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  eq(lost.length, 2);
+  eq(lost.map((e) => e.other_run).join(','), 'RUN-B,RUN-C');
+});
+
+test('linha HISTÓRICA narrada (sem marcador) NÃO suprime o achado medido por código', () => {
+  const dir = mktmp('idem-narrated');
+  const r = result('overlap');
+  const f = r.findings[0];
+  fs.mkdirSync(path.dirname(eventsPath(dir)), { recursive: true });
+  fs.appendFileSync(eventsPath(dir), `${JSON.stringify({
+    ts: '2026-08-13T04:07:30Z', event: 'work-lost', milestone: r.milestone, slice: r.slice,
+    unit: f.unit, cause: f.cause, other_run: f.counterpart_run, files: f.paths,
+  })}\n`, 'utf8');
+  eq(emitWorkLostEvent(dir, r).event_lines, 1,
+    'a narrada e a medida são fatos de origens distintas — a primeira não pode calar a segunda');
+});
+
 test('workspace sem .gsd nenhum: exit 0 e recusa nomeada (advisory absoluto)', () => {
   const cwd = mktmp('cli-bare');
   const res = runCli(['--milestone', MILESTONE, '--slice', 'S07', '--cwd', cwd, '--code-dir', cwd,
