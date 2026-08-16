@@ -1252,6 +1252,136 @@ test('dogfood: a synthetic registry listing ONLY this repo never promotes it to 
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
+// ── S06/T01: unmet_requirement — the SVN short-circuit names what it refused ─
+
+const { UNMET_ASK_REASONS } = isolation;
+
+// Tracks which UNMET_ASK_REASONS members were actually emitted across this
+// block, so the closed-set cross-reference at the end is not vacuous.
+const reachedUnmetReasons = new Set();
+
+function withSvn(prefs, opts, fn) {
+  return withShape(prefs, opts, (s) => {
+    fs.mkdirSync(path.join(s.ws, '.svn'), { recursive: true });
+    return fn(s);
+  });
+}
+
+test('unmet_requirement: require_worktree:true in SVN names requirement/asked_by/blocked_by', () => {
+  withSvn({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'true' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assertEq(eff.vcs, 'svn');
+      assert(eff.unmet_requirement, 'unmet_requirement must be present');
+      assertEq(eff.unmet_requirement.requirement, 'worktree');
+      assert(eff.unmet_requirement.asked_by.includes('require_worktree:true'),
+        `asked_by must include require_worktree:true, got ${JSON.stringify(eff.unmet_requirement.asked_by)}`);
+      assertEq(eff.unmet_requirement.blocked_by, 'vcs:svn');
+      reachedUnmetReasons.add('require_worktree:true');
+    });
+});
+
+test('unmet_requirement: an explicit worktree pref + require_worktree:false is STILL emitted (pref:worktree)', () => {
+  withSvn({ forge_isolation: { mode: 'worktree', auto_pull_main: false }, workers: { require_worktree: 'false' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assert(eff.unmet_requirement, 'false forbids elevation, it does not undo an explicit pref request');
+      assert(eff.unmet_requirement.asked_by.includes('pref:worktree'),
+        `asked_by must include pref:worktree, got ${JSON.stringify(eff.unmet_requirement.asked_by)}`);
+      reachedUnmetReasons.add('pref:worktree');
+    });
+});
+
+test('unmet_requirement: require_worktree:auto + an external write engine names asked_by AND write_engine (the WDMA case)', () => {
+  withSvn({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'auto', 'execute-task': 'codex' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assert(eff.unmet_requirement, 'unmet_requirement must be present');
+      assert(eff.unmet_requirement.asked_by.includes('require_worktree:auto'),
+        `asked_by must include require_worktree:auto, got ${JSON.stringify(eff.unmet_requirement.asked_by)}`);
+      assert(/codex/.test(eff.unmet_requirement.write_engine || ''),
+        `write_engine must name the detected engine: ${eff.unmet_requirement.write_engine}`);
+      reachedUnmetReasons.add('require_worktree:auto');
+    });
+});
+
+test('unmet_requirement: require_worktree:false with no worktree pref is ABSENT — nothing was asked (with positive control)', () => {
+  withSvn({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'false' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assert(!('unmet_requirement' in eff), `unmet_requirement must be ABSENT, got ${JSON.stringify(eff.unmet_requirement)}`);
+    });
+  // Positive control: the SAME fixture shape, with require_worktree:true, DOES
+  // produce the field — proving the assert above is not vacuously passing.
+  withSvn({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'true' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assert(eff.unmet_requirement, 'positive control: the same fixture WITH require_worktree:true must emit the field');
+    });
+});
+
+test('unmet_requirement: forge_isolation.mode: branch in SVN is ABSENT — branch is not physical filesystem isolation (D8)', () => {
+  withSvn({ forge_isolation: { mode: 'branch', auto_pull_main: false }, workers: { require_worktree: 'false' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assertEq(eff.mode, 'shared', 'SVN still short-circuits to shared regardless of a branch pref');
+      assert(!('unmet_requirement' in eff),
+        `branch is not physical isolation (D8) — unmet_requirement must be ABSENT, got ${JSON.stringify(eff.unmet_requirement)}`);
+    });
+});
+
+// ── Additive purity: in git, the key SET is byte-identical to before T01 ────
+
+const FROZEN_GIT_KEYS = [
+  'mode', 'user_mode', 'mode_origin', 'require_worktree', 'elevated', 'elevation_reason',
+  'write_engine', 'vcs',
+].sort();
+
+function assertKeySetEq(obj, expectedKeys, msg) {
+  const actual = Object.keys(obj).filter(k => k !== 'shape_role' && k !== 'shape_reason').sort();
+  const expected = [...expectedKeys].sort();
+  assertEq(JSON.stringify(actual), JSON.stringify(expected), msg || 'key set must match exactly, both directions');
+}
+
+test('unmet_requirement: in git (derived worktree, shared, elevated true, elevated auto), the key SET is frozen — no new key leaks outside SVN', () => {
+  // derived worktree
+  withShape(NO_MODE_PREFS, { members: ['alpha'] }, (s) => {
+    assertKeySetEq(resolveEffectiveMode(s.ws), FROZEN_GIT_KEYS, 'derived-worktree case');
+  });
+  // shared (no shape, no elevation)
+  withShape(NO_MODE_PREFS, { members: [] }, (s) => {
+    assertKeySetEq(resolveEffectiveMode(s.ws), FROZEN_GIT_KEYS, 'shared case');
+  });
+  // elevated by require_worktree:true
+  withShape({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'true' } },
+    { members: [] }, (s) => {
+      assertKeySetEq(resolveEffectiveMode(s.ws), FROZEN_GIT_KEYS, 'require_worktree:true elevation case');
+    });
+  // elevated by auto + engine
+  withShape({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'auto', 'execute-task': 'codex' } },
+    { members: [] }, (s) => {
+      assertKeySetEq(resolveEffectiveMode(s.ws), FROZEN_GIT_KEYS, 'require_worktree:auto+engine elevation case');
+    });
+});
+
+// ── UNMET_ASK_REASONS: closed set, cross-referenced both ways ───────────────
+
+test('UNMET_ASK_REASONS: every asked_by emitted above belongs to the closed set', () => {
+  for (const reason of reachedUnmetReasons) {
+    assert(UNMET_ASK_REASONS.includes(reason), `${reason} must be a member of UNMET_ASK_REASONS`);
+  }
+});
+
+test('UNMET_ASK_REASONS: every member of the closed set was reached by at least one test case above', () => {
+  for (const member of UNMET_ASK_REASONS) {
+    assert(reachedUnmetReasons.has(member), `${member} must be reached by at least one test case`);
+  }
+});
+
+test('UNMET_ASK_REASONS: is frozen (Object.freeze)', () => {
+  assert(Object.isFrozen(UNMET_ASK_REASONS), 'UNMET_ASK_REASONS must be frozen');
+});
+
 // ── Summary ─────────────────────────────────────────────────────────────────
 console.log(`\n=== Result: ${passed} passed, ${failed} failed ===`);
 

@@ -187,6 +187,37 @@ function detectExternalWriteEngine(cwd) {
   } catch { return { detected: true, reason: 'detect-error (fail-safe: elevating)' }; }
 }
 
+// S06/T01 — closed set of reasons that can populate `unmet_requirement.asked_by`
+// in the SVN short-circuit. Cross-referenced both ways by the test suite: every
+// asked_by member emitted belongs here, and every member here is reached by at
+// least one test case.
+const UNMET_ASK_REASONS = Object.freeze(['pref:worktree', 'require_worktree:true', 'require_worktree:auto']);
+
+// Derives the S06/T01 `unmet_requirement` field for the SVN short-circuit, or
+// `null` when nothing was actually asked for. `false` never contributes B or C
+// here — same invariant as elevation (:279, "false never elevates") — but it
+// does NOT suppress A: an explicit `mode: worktree` pref is a standing request,
+// not something elevation produced, and the same distinction is asserted for
+// elevation itself at the test `require_worktree:false forbids ELEVATION, it
+// does not undo the DERIVED default` (:1065). Never throws: `req` and `iso` are
+// pre-computed by the caller, and detectExternalWriteEngine is fail-safe by
+// construction (:187).
+function deriveUnmetRequirement({ iso, req, cwd }) {
+  const askedBy = [];
+  if (iso.modeSource === 'pref' && iso.mode === 'worktree') askedBy.push('pref:worktree');
+  if (req === 'true') askedBy.push('require_worktree:true');
+  let writeEngine = null;
+  if (req === 'auto') {
+    const det = detectExternalWriteEngine(cwd);
+    if (det.detected) {
+      askedBy.push('require_worktree:auto');
+      writeEngine = det.reason;
+    }
+  }
+  if (askedBy.length === 0) return null;
+  return { requirement: 'worktree', asked_by: askedBy, blocked_by: 'vcs:svn', write_engine: writeEngine };
+}
+
 /**
  * D4 — the default isolation mode derived from the project's SHAPE, not from a
  * second flag the operator has to keep in sync with the first.
@@ -252,11 +283,13 @@ function resolveEffectiveMode(cwd, opts) {
   // every elevation branch, including an explicit worktree user preference:
   // a named shared degradation is safer than attempting git setup and STOPing.
   if (vcs === 'svn') {
+    const unmet = deriveUnmetRequirement({ iso, req, cwd });
     return {
       ...base,
       mode: 'shared',
       elevated: false,
       elevation_reason: 'vcs:svn — worktree/branch isolation unsupported in SVN (M017 Fase 1 runs shared)',
+      ...(unmet ? { unmet_requirement: unmet } : {}),
     };
   }
 
@@ -1073,7 +1106,7 @@ if (require.main === module) cliMain();
 module.exports = {
   setupForRun, cleanupForRun, attachForRun, readIsolationPrefs,
   resolveEffectiveMode, detectExternalWriteEngine, resolveRequireWorktree, resolveCleanupMode,
-  deriveShapeMode,
+  deriveShapeMode, UNMET_ASK_REASONS,
   listWorktreesForBranch, listForgeWorktrees, listWorktrees, parseWorktreePorcelain, normalizeWorktreePath,
   cleanupWorktreeOne, setupWorktreeOne, deriveWorktreePath,
   resolveWorktreeAnchor, validateWorktreeDirName, findContainingRoot, loadRegistryRoots,
