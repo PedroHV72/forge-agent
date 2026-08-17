@@ -77,12 +77,17 @@ test('legacy Claude 3.1.4 migration preserves source bytes and reports provenanc
   } finally { data.cleanup(); }
 });
 
+// The fossil in these fixtures is named `forge-fossil.js` on purpose. It used to
+// be `fossil.js` — a name Forge cannot prove is its own — and the assertion that
+// it got moved encoded exactly the defect this suite now guards against:
+// retirement renamed the whole directory, taking the operator's own scripts with
+// it. Retiring a fossil is the intent; retiring a stranger never was.
 test('dry-run lists legacy retire without changing a byte', () => {
   const data = fixture();
   try {
     const legacyScripts = path.join(data.userHome, '.claude', 'scripts');
     fs.mkdirSync(legacyScripts, { recursive: true });
-    fs.writeFileSync(path.join(legacyScripts, 'fossil.js'), 'legacy bytes\n');
+    fs.writeFileSync(path.join(legacyScripts, 'forge-fossil.js'), 'legacy bytes\n');
     const before = snapshot(data.root);
     const report = updater.update({ ...data, runtime: 'claude', skipCapabilityCheck: true });
     assert.strictEqual(report.applied, false);
@@ -102,7 +107,7 @@ test('dry-run plans retire without capability probing on the CLI path (no skip f
   try {
     const legacyScripts = path.join(data.userHome, '.claude', 'scripts');
     fs.mkdirSync(legacyScripts, { recursive: true });
-    fs.writeFileSync(path.join(legacyScripts, 'fossil.js'), 'legacy bytes\n');
+    fs.writeFileSync(path.join(legacyScripts, 'forge-fossil.js'), 'legacy bytes\n');
     const before = snapshot(data.root);
     const spawns = [];
     let report;
@@ -122,17 +127,41 @@ test('apply retires legacy scripts and a second update reports skipped', () => {
   try {
     const legacyScripts = path.join(data.userHome, '.claude', 'scripts');
     fs.mkdirSync(legacyScripts, { recursive: true });
-    fs.writeFileSync(path.join(legacyScripts, 'fossil.js'), 'legacy bytes\n');
+    fs.writeFileSync(path.join(legacyScripts, 'forge-fossil.js'), 'legacy bytes\n');
     const first = updater.update({ ...data, runtime: 'claude', apply: true, skipCapabilityCheck: true });
     const retire = first.installer.plan.find((entry) => entry.op === 'retire');
-    assert(retire && fs.existsSync(path.join(retire.destination, 'fossil.js')));
-    assert.strictEqual(fs.existsSync(path.join(legacyScripts, 'fossil.js')), false);
+    assert(retire && fs.existsSync(path.join(retire.destination, 'forge-fossil.js')));
+    assert.strictEqual(fs.existsSync(path.join(legacyScripts, 'forge-fossil.js')), false);
     assert(fs.existsSync(path.join(legacyScripts, 'README.md')), 'apply writes a tombstone');
     const second = updater.update({ ...data, runtime: 'claude', skipCapabilityCheck: true });
     const skipped = second.retirements.find((entry) => entry.op === 'skip' && entry.reason === 'already-retired');
     assert(skipped, 'second update must report skipped retirement');
     assert.strictEqual(skipped.source, legacyScripts);
     assert.match(skipped.destination, /forge[\\/]backups[\\/]/);
+  } finally { data.cleanup(); }
+});
+
+// The operator running `/forge-update` reads THIS output, not the installer's.
+// A hook aimed inside the retired directory has to be visible here or the loss
+// is silent exactly where it was silent before.
+test('the update output names what was retained and warns about hooks aimed inside the retired directory', () => {
+  const data = fixture();
+  try {
+    const legacyScripts = path.join(data.userHome, '.claude', 'scripts');
+    fs.mkdirSync(legacyScripts, { recursive: true });
+    fs.writeFileSync(path.join(legacyScripts, 'forge-fossil.js'), 'legacy bytes\n');
+    fs.writeFileSync(path.join(legacyScripts, 'svn-session-reconcile.py'), 'print(1)\n');
+    fs.writeFileSync(path.join(data.userHome, '.claude', 'settings.json'), `${JSON.stringify({
+      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'python ~/.claude/scripts/svn-session-reconcile.py', timeout: 45 }] }] },
+    }, null, 2)}\n`);
+
+    const report = updater.update({ ...data, runtime: 'claude', apply: true, skipCapabilityCheck: true });
+    const output = updater.render(report);
+    assert(output.includes('moved: 1; retained: 1'), `o resumo do update não contabiliza os dois lados:\n${output}`);
+    assert(output.includes('[retained] svn-session-reconcile.py'), `o resumo do update não nomeia o que ficou:\n${output}`);
+    assert(/⚠.*svn-session-reconcile\.py.*preservado no lugar/.test(output), `o hook do operador não foi mencionado:\n${output}`);
+    assert.strictEqual(fs.readFileSync(path.join(legacyScripts, 'svn-session-reconcile.py'), 'utf8'), 'print(1)\n',
+      'o script do operador não sobreviveu ao update');
   } finally { data.cleanup(); }
 });
 
