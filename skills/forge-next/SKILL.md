@@ -361,6 +361,13 @@ propósito**, e valor não-atribuído (ou fora do conjunto de quatro) não casa 
 abaixo, portanto nunca alcança a instrução de despachar. Não importar a forma do `forge-auto` aqui é
 deliberado.
 
+**O que alcança o dispatch é `advised_action`, nunca `decision`.** O eixo advisory/enforcing é
+resolvido **pelo módulo** a partir de `parallelism.claim_gate` (spec § Step 0, § Enforcement) — o
+consumidor nunca relê a pref. `advised_action == dispatch` → despachar; qualquer outro valor
+(inclusive vazio/desconhecido) → **não** despachar. As quatro linhas abaixo governam a **mensagem**,
+não o dispatch. Quando `suppressed_action` está presente (postura `advisory`), prefixar o eco com
+`⚠ [advisory]` — a cerca computou a recusa e **não** agiu, e isso é dito, nunca silenciado.
+
 - `proceed` → dispatch normal (Step 4 segue).
 - `defer` → se `$BATCH_JSON` (ready set real da slice) tem outra task além desta, dispatchar ELA
   nesta invocação (eco nomeando a troca: "↷ Claim gate: {T##} adiada (colisão com run {counterpart}) —
@@ -377,7 +384,8 @@ deliberado.
   tem loop a desativar (só `MODE == auto` desativa a run).
 
 `not_covered` é ecoado ao operador em toda execução do gate (linha acima) — o Overlap advisory abaixo
-permanece intacto e distinto deste gate (um é advisory pós-hoc, este é enforcing pré-dispatch).
+permanece intacto e distinto deste gate (um é sinal pós-hoc de toque; este é cerca pré-dispatch, cuja
+execução é governada por `parallelism.claim_gate`).
 
 **Overlap advisory (before complete-slice):** grave o toque desta run e confronte com as demais runs ativas — o sinal existe para ser visto **antes do merge**.
 ```bash

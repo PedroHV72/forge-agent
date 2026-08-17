@@ -361,6 +361,19 @@ Execução paralela de execute-task dentro do mesmo slice + comportamento em ove
 - **Valores permitidos:** `defer`, `block`
 - **Descrição:** Quando uma task do batch tem expected_output que sobrepõe outra run ativa: defer = pula a task e escolhe outra ready (re-tenta no próximo batch); block = pausa o dispatch até a outra run liberar (polling com backoff). Lido por scripts/forge-claim-gate.js (resolvePostureFromPrefs) — um valor fora de {defer, block} cai para defer com note nomeada invalid-posture-pref. Esta posture pode ser ENDURECIDA de defer para block pela regra D8 do gate (nenhum isolamento físico entre as duas árvores em conflito) — ver shared/forge-claim-gate.md § D8, a fonte única; não é restatada aqui.
 
+### `parallelism.claim_gate`
+
+- **Tipo:** string
+- **Default:** `"advisory"`
+- **Valores permitidos:** `advisory`, `enforcing`
+- **Descrição:** Se o veredito do claim gate é EXECUTADO. Eixo ORTOGONAL a cross_run_overlap, e os dois não se fundem: cross_run_overlap diz QUAL veredito uma colisão produz (defer|block); claim_gate diz SE esse veredito para o dispatch. advisory = o módulo computa e emite a decisão real e o censo completo, mas devolve advised_action: dispatch e nomeia o suppressed_action (a supressão nunca é silenciosa); enforcing = advised_action: stop sempre que decision != proceed. Sob advisory o módulo NÃO polla em --wait (esperar o teto para prosseguir de qualquer jeito gasta o orçamento do consumidor sem cercar nada). Fronteira deliberada: gate-unavailable (falha de tooling) para o dispatch sob AMBOS os valores — não é veredito da cerca, e sem gate não existe o dado que justificaria o flip. CRITÉRIO DE FLIP para enforcing: 2 milestones consecutivas (FLIP_WINDOW_MILESTONES) com ZERO falsos positivos (FLIP_MAX_FALSE_POSITIVES) na amostra medida por scripts/forge-claim-flip.js — 0 pares comparados é inconclusive, nunca flip-ready. GATILHO DO FOLLOW-UP #1(b) (D6): taxa de held-uncommitted por milestone sob advisory. Lido por scripts/forge-claim-gate.js (resolveEnforcementFromPrefs) — um valor fora de {advisory, enforcing} cai para advisory com note nomeada invalid-enforcement-pref. Doutrina completa em shared/forge-claim-gate.md § Enforcement, a fonte única; não é restatada aqui.
+
+### `parallelism.orphan_run_ms`
+
+- **Tipo:** integer
+- **Default:** `1800000`
+- **Descrição:** Limiar de idade do last_heartbeat a partir do qual uma run ATIVA que nunca reivindicou nada (write_claim ausente/null) é DESATIVADA — nunca deletada — pelo reap oportunista. Reversível por desenho: um resume reativa a run e re-reivindica antes de despachar. Run COM claim nunca passa por aqui (o claim tem a própria escada de liberação). Mesmo número já documentado em forge-runs.js:29, re-apontado para uma ação reversível; nenhuma constante nova. Lido por scripts/forge-run-reaper.js (DEFAULT_THRESHOLD_MS), invocado oportunisticamente por scripts/forge-claim-gate.js — sem daemon e sem cron: quem paga o custo é o contendor que já ia esperar.
+
 ### `parallelism.block_wait_ms`
 
 - **Tipo:** integer

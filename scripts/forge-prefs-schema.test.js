@@ -114,6 +114,8 @@ const INVENTORY = [
   { key: 'parallelism.block_wait_ms', type: 'integer', default: 300000, source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.block_wait_ms (teto de UMA espera bloqueante)' },
   { key: 'parallelism.block_poll_ms', type: 'integer', default: 15000, source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.block_poll_ms' },
   { key: 'parallelism.defer_cap', type: 'integer', default: 3, source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.defer_cap (defers consecutivos da mesma unidade)' },
+  { key: 'parallelism.claim_gate', type: 'string', default: 'advisory', source: 'scripts/forge-claim-gate.js PARALLELISM_FALLBACKS.claim_gate (eixo advisory|enforcing — PR #110/D1)' },
+  { key: 'parallelism.orphan_run_ms', type: 'integer', default: 1800000, source: 'scripts/forge-run-reaper.js DEFAULT_THRESHOLD_MS (desativação REVERSÍVEL de run órfã sem claim)' },
   { key: 'resources.enforcement', type: 'string', default: 'clamp', source: 'scripts/forge-resources.js:195,200 (readResourcePrefs defaults + read)' },
   { key: 'resources.shadow_wait', type: 'boolean', default: true, source: 'scripts/forge-resources.js:195,201 (readResourcePrefs defaults + read)' },
   { key: 'resources.wait_cap_ms', type: 'integer', default: 30000, source: 'scripts/forge-resources.js:195,202 (readResourcePrefs defaults + read)' },
@@ -459,6 +461,8 @@ const WITNESSES = [
   ['parallelism.block_wait_ms', PARALLELISM_FALLBACKS.block_wait_ms, 'scripts/forge-claim-gate.js readParallelism fallback (imported)'],
   ['parallelism.block_poll_ms', PARALLELISM_FALLBACKS.block_poll_ms, 'scripts/forge-claim-gate.js readParallelism fallback (imported)'],
   ['parallelism.defer_cap', PARALLELISM_FALLBACKS.defer_cap, 'scripts/forge-claim-gate.js readParallelism fallback (imported)'],
+  ['parallelism.claim_gate', PARALLELISM_FALLBACKS.claim_gate, 'scripts/forge-claim-gate.js resolveEnforcementFromPrefs fallback (imported)'],
+  ['parallelism.orphan_run_ms', PARALLELISM_FALLBACKS.orphan_run_ms, 'scripts/forge-claim-gate.js readParallelism fallback (imported)'],
   ['forge_isolation.repos.exclude', ['node_modules/**', 'vendor/**', '.forge-worktrees/**', '.gsd/**', 'dist/**', 'build/**', '.next/**'], 'scripts/forge-repos.js:20 DEFAULT_EXCLUDE'],
 ];
 check(`witness defaults identity (${WITNESSES.length} >= 12 asserts, each cited)`, () => {

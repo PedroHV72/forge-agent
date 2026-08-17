@@ -19,17 +19,57 @@ consumer that restates any of them creates a second source that will drift, and 
 two orchestrators is exactly the failure this decomposition exists to prevent (S04-PLAN contract #1,
 W5 of the risk radar). Consumers **reference**; they never re-derive, re-tabulate or re-implement.
 
-## Posture: ENFORCING (this gate is not advisory)
+## Enforcement: advisory na estreia, enforcing por decisão do operador
 
-Nearly every other mechanism in this repo is advisory — it writes a flag into a summary and lets the
-loop continue. **This one is not.** Its whole purpose is to refuse a dispatch, so:
+**Dois eixos, e eles não se fundem.** `parallelism.cross_run_overlap` decide **qual veredito** uma
+colisão produz (`defer` × `block`). `parallelism.claim_gate` decide **se esse veredito é executado**
+(`advisory` × `enforcing`, default `advisory`). Fundi-los foi explicitamente recusado (D1): a
+postura responde "o que a colisão significa", a enforcement responde "quanto poder essa cerca tem
+hoje" — e é só a segunda que muda enquanto a cerca ainda está provando que mede bem.
 
-- A decision of `block` or `refuse` **stops the unit**. There is no "proceed anyway" branch.
-- A `defer` with nowhere to defer to becomes `block` (the D3 floor, applied inside the module).
-- Tooling failure is treated as `block`, loud — see **§ Fail-closed**.
+**Advisory computa e emite TUDO; só o ATO é suprimido** (D2). Sob `advisory` o módulo continua
+percorrendo counterparts, aplicando o endurecimento D8, consultando a escada de release e chegando ao
+mesmo `decision` que produziria sob `enforcing`. Os campos são aditivos:
 
-The justification is the origin defect of this milestone: a gate that goes mute is byte-for-byte
-indistinguishable from a gate that approved. Silence must never be readable as consent.
+| campo | significado |
+|---|---|
+| `decision` | o **veredito real** (`proceed`/`defer`/`block`/`refuse`), sempre. É dele que o critério de flip é medido. |
+| `enforcement` / `enforcement_source` | a postura resolvida e de onde veio (`prefs`/`fallback`/`invalid-pref`/`explicit`). |
+| `advised_action` | `dispatch` \| `stop`. É **isto** que o consumidor obedece — nunca `decision`. Sob `enforcing`: `dispatch` sse `decision === proceed`. Sob `advisory`: sempre `dispatch`. |
+| `suppressed_action` | `null` sob `enforcing`; sob `advisory`, o `stop` que teria acontecido. **A supressão é nomeada, nunca silenciosa.** |
+
+Um advisory que atalhasse a computação tornaria o critério de flip **imedível** — a diferença entre
+uma estreia segura e um flag permanentemente cego.
+
+**`--wait` é um ATO.** Sob `advisory` o módulo **não polla**: gastar o teto de `block_wait_ms` para
+prosseguir de qualquer jeito queima o orçamento de tool-call do consumidor sem cercar nada. O
+`decision` continua sendo o `block` real e viaja no evento; o que **não** é emitido é
+`escalation: 'wait-ceiling'`, porque esse valor é a *medição de uma espera que não limpou*, e uma
+espera que não aconteceu não pode ser medida. O `defer-cap` não é afetado — ele sai do ledger, não da
+espera, e é emitido sob os dois valores.
+
+**Fronteira deliberada: `gate-unavailable` para o dispatch sob os DOIS valores.** Falha de tooling
+(`exit != 0`, stdout não-JSON) **não é veredito da cerca** — é a cerca ausente. E o critério de flip
+depende de o gate ter de fato rodado: um advisory que tolera gate quebrado deixa de produzir
+exatamente o dado que justificaria o flip. A justificativa é o defeito de origem desta milestone: um
+gate que emudece é byte a byte indistinguível de um gate que aprovou. **Silêncio nunca pode ser lido
+como consentimento.**
+
+Sob `enforcing`, então:
+
+- `block` ou `refuse` **param a unidade**. Não existe ramo "prosseguir mesmo assim".
+- Um `defer` sem para onde deferir vira `block` (o piso D3, aplicado dentro do módulo).
+- Falha de tooling é tratada como `block`, alto — ver **§ Fail-closed**.
+
+**O critério de flip, e onde ele mora.** O flip para `enforcing` exige **2 milestones consecutivas
+com zero falsos positivos** na amostra. Isso não é julgamento de quem estiver de plantão: é medido
+por `scripts/forge-claim-flip.js`, que confronta cada `decision != proceed` do evento `claim-gate`
+com o overlap **factual** e reporta `flip-ready` / `not-ready` / `inconclusive` — com o piso de que
+**zero pares comparados é `inconclusive`, nunca `flip-ready`**. Os limiares vivem exportados no
+script (`FLIP_WINDOW_MILESTONES`, `FLIP_MAX_FALSE_POSITIVES`) e são citados pela `description` da
+pref no `forge-prefs.schema.json` — os dois concordam **por referência**, nunca por transcrição.
+O gatilho do follow-up `#1(b)` é igualmente medido: **taxa de `held-uncommitted` por milestone sob
+advisory** (D6).
 
 ## Inputs
 
@@ -46,7 +86,7 @@ indistinguishable from a gate that approved. Silence must never be readable as c
 
 ## Step 0 — Prefs are read BY THE MODULE, not by the consumer
 
-`parallelism.cross_run_overlap` (the posture) and the three anti-livelock timings
+`parallelism.cross_run_overlap` (the posture), `parallelism.claim_gate` (the enforcement) and the anti-livelock timings
 (`parallelism.block_wait_ms`, `parallelism.block_poll_ms`, `parallelism.defer_cap`) are resolved
 **inside `scripts/forge-claim-gate.js`** through the canonical prefs engine.
 
@@ -293,8 +333,8 @@ The core is `scripts/forge-claim-release.js`; this section is its contract for c
 | mechanism | reason | what it means |
 |---|---|---|
 | `explicit` | `released-explicit` | the claim already carried the `released` envelope — an earlier corroborated release, or the operator's escape hatch (§ Step 4 exit 2). Nothing to measure, nothing to write. |
-| `committed` | `released-committed` | **the only positive proof of commit**: both probes below agreed. |
-| `ttl-expired` | `released-ttl-expired` | the net (D2): the `ttl + grace` window elapsed **and** the owning run was measured **inactive**. |
+| `committed` | `released-committed` | **the only positive proof of commit**: both probes below agreed **and** the owning run was measured **inactive** (`owner_active === false`). |
+| `ttl-expired` | `released-ttl-expired` | the net (D2): the `ttl + grace` window elapsed, the owning run was measured **inactive**, **and** the claimed paths are not measurably in flight (`paths_in_flight !== true`). |
 | `manual` | *(no reason — `classifyRelease` never emits it)* | the operator released it by hand. It **asserts no measurement**, which is exactly why it exists (S05/review R4): `committed` and `ttl-expired` are names that CLAIM one, and the `forge-write-claim.js --release` CLI writes without probing anything. That CLI therefore accepts **only** `manual` (its default) and **refuses the corroborated names by name**; corroborated releases route exclusively through `forge-claim-release.js`, which measures them. This is auditing integrity, not capability — the registry was always hand-editable JSON; the official tool simply must not offer the lie as a flag. |
 
 ### Two probes, and why the conjunction is the design
@@ -318,6 +358,25 @@ everything" when nobody looks at the baseline. Relaxing to one probe is a regres
 simplification, and both git and svn go through the same public seam of `scripts/forge-vcs.js` —
 the symmetry is deliberate, not a concession to SVN.
 
+### Liveness governs BOTH rungs — the clock is the named last resort (PR #110, `#1(a)`)
+
+The two probes are still not enough. `released-committed` also requires **`owner_active === false`**,
+matching the TTL rung right below, which already required it. The measured hole: a live owner mid-run
+has a moment where the neighbour's commit advanced the baseline (probe A) and its own edits are
+momentarily staged/clean (probe B) — and the fence it is still standing behind was handed away. The
+literals `=== true` / `=== false` are kept on purpose: `null` is **"I did not ask"** and never
+satisfies a probe.
+
+This is the same doctrine `forge-filelock.js` now enforces one layer down: **liveness beats the
+clock**, the clock is the last resort with a name, and the crashed owner is converted from live to
+ended by the reaper (`scripts/forge-run-reaper.js`), not by a fence quietly deciding to steal.
+
+**Custo aceito e nomeado.** Com `#1(a)` + `#2(c)` juntos, um dono **vivo** passa a liberar
+praticamente só por `explicit`. É o Risco 1 assumido no brainstorm, e é o motivo *técnico* — não
+político — de a postura `advisory` ser a de estreia: sob advisory esse aperto produz um **flag**, não
+um halt, e a taxa de `held-uncommitted` que ele gera é exatamente o gatilho medido do follow-up
+`#1(b)` (D6).
+
 ### A question that could not be asked keeps the claim
 
 A probe returning `{ok:false}` (missing binary, vanished directory), a `code_dir: null`, an absent
@@ -330,7 +389,18 @@ exactly the hole the gate exists to close.
 
 A claim expires by TTL only when **both** hold: the `ttl + grace` window has elapsed
 (`DEFAULT_TTL_MS`/`DEFAULT_GRACE_MS` imported from `forge-unit-lease.js` — no new pref, no knob) and
-the owning run is **inactive** (predicate reused from `forge-filelock.js`). A live run never loses
+the owning run is **inactive** (predicate reused from `forge-filelock.js`) **and** the claimed paths
+are not measurably in flight (`paths_in_flight !== true`, PR #110 `#2(c)`).
+
+`!== true`, **not** `=== false`, and the difference IS the design: the net exists to take out of the
+way a dead run whose **tree is gone** — precisely the case where `paths_in_flight` is `null`
+("I could not ask"). What the rung now refuses is the **measured refutation**: a dirty tree on the
+claimed paths is the signature of *checkpointed, not abandoned*. That signature is what this repo's
+own recoverable deactivations produce — pause, account handoff, and the gate's own `block`
+escalation all preserve the dirty tree for a resume. `last_heartbeat` cannot tell paused from dead
+(D4), so it is never consulted here; the dirty tree can, and is.
+
+A live run never loses
 its claim to the clock: a legitimate 40-minute worker is byte-for-byte indistinguishable from a dead
 one if only the clock is consulted. The TTL sits **above** `held-probe-unavailable` in the
 precedence on purpose — a dead run whose tree vanished still has to get out of the way; that is what

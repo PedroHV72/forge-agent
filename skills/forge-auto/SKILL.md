@@ -155,7 +155,7 @@ Branch on `$AUTO_STATE`:
 - **`stale`** — previous session died (Ctrl+C, terminal kill, OOM). The marker is lying. Clear it silently (M005+ aware of runs/*.json registry) and proceed normally to activation as a fresh start:
   ```bash
   # Clean any active runs in registry first
-  for f in .gsd/forge/runs/*.json 2>/dev/null; do
+  for f in .gsd/forge/runs/*.json; do
     [ -f "$f" ] || continue
     node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$(basename "$f" .json)" --json '{"active":false}' >/dev/null 2>&1 || true
   done
@@ -538,7 +538,7 @@ Skill({ skill: "forge-security", args: "{M###} {S##} {T##}" })
 ```
 The produced `T##-SECURITY.md` will be injected into that task's worker prompt as `## Security Checklist`. Skills run in the orchestrator context — loop them serially (fast enough; each is short) before dispatching the batch in parallel.
 
-**Cross-run claim gate (step 1.7 — execute-task and review-fix; ENFORCING, not advisory):** If `unit_type == execute-task`, before dispatching, fence every task in `BATCH` against the write claims of every other active run sharing the same `CODE_DIR`. Authoritative spec: `shared/forge-claim-gate.md` — this block only **invokes** it; the decision table, the causes and the escalation procedure are formula-once there and are never restated here (S04-PLAN contract #1). This gate is distinct from the Overlap advisory right below: that one is a **post-work, pre-merge signal** (touch/overlap, advisory, never blocks); this one is a **pre-dispatch fence** (claim, enforcing, stops the unit).
+**Cross-run claim gate (step 1.7 — execute-task and review-fix; enforcement resolved BY THE MODULE from `parallelism.claim_gate`, `advisory` on debut):** If `unit_type == execute-task`, before dispatching, fence every task in `BATCH` against the write claims of every other active run sharing the same `CODE_DIR`. Authoritative spec: `shared/forge-claim-gate.md` — this block only **invokes** it; the decision table, the causes and the escalation procedure are formula-once there and are never restated here (S04-PLAN contract #1). This gate is distinct from the Overlap advisory right below: that one is a **post-work, pre-merge signal** (touch/overlap, advisory, never blocks); this one is a **pre-dispatch fence** (claim, enforcing, stops the unit).
 
 Batch order (spec § Step 1 — fixed, not an implementation detail): (1) record the union of the whole ready `BATCH` first, as one claim, before evaluating anything; (2) evaluate per task, each against the counterpart universe; (3) drop every task whose decision is not `proceed`; (4) re-record the union of the survivors.
 
@@ -550,8 +550,11 @@ FORGE_SCRIPTS_DIR=$([ -f scripts/forge-claim-gate.js ] && echo scripts || echo "
 # itself. `worktree`/`branch` modes have not resolved the per-unit CODE_DIR yet, so the flag is
 # omitted here on purpose (code_dir: null -> scope unknown -> fail closed, spec contract #7). NEVER
 # $WORKTREE_DIR, NEVER a value derived from root+branch+isolation_mode (explicitly prohibited).
-GATE_CODE_DIR_FLAG=""
-[ "$ISOLATION_MODE" = "shared" ] && [ -n "$CODE_DIR" ] && GATE_CODE_DIR_FLAG="--code-dir $CODE_DIR"
+# Médio 2 (PR #110): the value travels QUOTED. `$GATE_CODE_DIR_FLAG` unquoted word-split a CODE_DIR
+# containing a space, producing a truncated `code_dir` -> fabricated `different-code-dir` -> the pair
+# left scope -> silent `proceed`. The canonical shape is the spec's own: `${CODE_DIR:+--code-dir "$CODE_DIR"}`.
+GATE_CODE_DIR="" 
+[ "$ISOLATION_MODE" = "shared" ] && [ -n "$CODE_DIR" ] && GATE_CODE_DIR="$CODE_DIR"
 
 # Claim extraction, used by every union computation below. `--evaluate` and `--check-only` both carry
 # `.claim` (the derived, normalised claim). FAIL CLOSED: a missing/invalid `.claim.paths` exits != 0
@@ -574,7 +577,7 @@ claim_union() {
 record_union() {
   local CSV; CSV=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).join(','))" "$2") || return 1
   node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check --paths "$CSV" --source manual \
-    --run "$RUN_ID" --unit "$1" $GATE_CODE_DIR_FLAG --ready-alternatives 0 \
+    --run "$RUN_ID" --unit "$1" ${GATE_CODE_DIR:+--code-dir "$GATE_CODE_DIR"} --ready-alternatives 0 \
     --cwd "$WORKING_DIR" --json > /dev/null
 }
 
@@ -601,7 +604,7 @@ REMAINING=$(( ${#BATCH[@]} - 1 ))
 for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id: T##, planPath}
   GATE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --check-only --wait \
     --run "$RUN_ID" --unit "execute-task/${ENTRY_ID}" --source plan-writes \
-    --plan "$WORKING_DIR/${ENTRY_PLAN_PATH}" $GATE_CODE_DIR_FLAG \
+    --plan "$WORKING_DIR/${ENTRY_PLAN_PATH}" ${GATE_CODE_DIR:+--code-dir "$GATE_CODE_DIR"} \
     --ready-alternatives "$REMAINING" --cwd "$WORKING_DIR" --json)
   GATE_EXIT=$?
   REMAINING=$((REMAINING - 1))
@@ -618,14 +621,27 @@ for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id: T##, planPath}
     BATCH_CHANGED=1
     break   # § Step 4 (checkpoint + deactivate this run). STOP — never dispatch.
   fi
-  # Parse .decision / .cause / .escalation / .not_covered / .counterparts.
-  # proceed -> keep ${ENTRY_ID} in BATCH (append to SURVIVOR_IDS / SURVIVOR_PLAN_PATHS).
-  # defer   -> drop ${ENTRY_ID} from BATCH; BATCH_CHANGED=1;
-  #            echo "⤳ ${ENTRY_ID} adiada — claim overlap com run {counterpart id}".
-  # block   -> the module already polled to the ceiling (--wait IS passed above). Drop ${ENTRY_ID};
-  #            BATCH_CHANGED=1. If .escalation is set -> § Step 4 (Account Handoff form) below.
-  #            Otherwise: stop this task only, do not dispatch.
-  # refuse  -> drop ${ENTRY_ID}; BATCH_CHANGED=1; surface .cause; do not retry (waiting cannot fix it).
+  # Médio 1 (PR #110): the keep/drop branch is a STATEMENT, never prose. A HEALTHY gate returning
+  # `block` used to depend on the model reading a comment, and in THIS skill a task stays in BATCH by
+  # default — so an unread comment DISPATCHED. `advised_action` (never `decision`) is what reaches the
+  # dispatch: the module owns the advisory/enforcing axis (spec § Step 0, § Enforcement) and the
+  # consumer never re-reads the pref. `decision` survives only to pick the message.
+  ADVISED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).advised_action||'')" "$GATE_JSON")
+  DECISION=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).decision||'')" "$GATE_JSON")
+  SUPPRESSED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).suppressed_action||'')" "$GATE_JSON")
+  case "$ADVISED" in
+    dispatch) SURVIVOR_IDS+=("$ENTRY_ID"); SURVIVOR_PLAN_PATHS+=("$ENTRY_PLAN_PATH") ;;
+    *)        BATCH_CHANGED=1 ;;   # includes empty/unknown advised_action — default DROP
+  esac
+  # The echo is keyed on the real verdict, and names the suppression when advisory let it through.
+  # `[advisory]` means the fence computed a refusal and did NOT act on it — never silent.
+  PREFIX=""; [ -n "$SUPPRESSED" ] && PREFIX="⚠ [advisory] "
+  case "$DECISION" in
+    proceed) ;;
+    defer)   echo "${PREFIX}⤳ ${ENTRY_ID} adiada — claim overlap com run $(node -e "process.stdout.write(((JSON.parse(process.argv[1]).counterparts||[])[0]||{}).id||'?')" "$GATE_JSON")" ;;
+    block)   echo "${PREFIX}⛔ ${ENTRY_ID} bloqueada — claim overlap. Sob enforcing o módulo já pollou até o teto (--wait). Se .escalation estiver setada -> § Step 4 (Account Handoff form)." ;;
+    refuse)  echo "${PREFIX}⛔ ${ENTRY_ID} recusada — causa: $(node -e "process.stdout.write(JSON.parse(process.argv[1]).cause||'?')" "$GATE_JSON"). Não retentar (esperar não conserta)." ;;
+  esac
   # Echo the 3 `.not_covered` boundaries once per slice (first execution of this gate in the session).
 done
 
