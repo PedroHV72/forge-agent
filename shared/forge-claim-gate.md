@@ -333,7 +333,7 @@ The core is `scripts/forge-claim-release.js`; this section is its contract for c
 | mechanism | reason | what it means |
 |---|---|---|
 | `explicit` | `released-explicit` | the claim already carried the `released` envelope — an earlier corroborated release, or the operator's escape hatch (§ Step 4 exit 2). Nothing to measure, nothing to write. |
-| `committed` | `released-committed` | **the only positive proof of commit**: both probes below agreed **and** the owning run was measured **inactive** (`owner_active === false`). |
+| `committed` | `released-committed` | **the only positive proof of commit**: both probes below agreed — probe A in its **precise** form (D16), i.e. a commit since the recorded baseline that **touches ≥ 1 claimed path**. `owner_active` is **measured and persisted as evidence**, and **no longer gates this rung** (D16 removed that third condition — see below). |
 | `ttl-expired` | `released-ttl-expired` | the net (D2): the `ttl + grace` window elapsed, the owning run was measured **inactive**, **and** the claimed paths are not measurably in flight (`paths_in_flight !== true`). |
 | `manual` | *(no reason — `classifyRelease` never emits it)* | the operator released it by hand. It **asserts no measurement**, which is exactly why it exists (S05/review R4): `committed` and `ttl-expired` are names that CLAIM one, and the `forge-write-claim.js --release` CLI writes without probing anything. That CLI therefore accepts **only** `manual` (its default) and **refuses the corroborated names by name**; corroborated releases route exclusively through `forge-claim-release.js`, which measures them. This is auditing integrity, not capability — the registry was always hand-editable JSON; the official tool simply must not offer the lie as a flag. |
 
@@ -341,8 +341,12 @@ The core is `scripts/forge-claim-release.js`; this section is its contract for c
 
 Proof of commit requires **both**, always:
 
-- **A — the baseline advanced.** `baselineId(code_dir, {vcs})` differs from the `vcs_baseline.id`
-  recorded when the claim was written.
+- **A — the baseline advanced, PRECISELY (D16).** Not "the tree's baseline moved" — that is a
+  property of the *tree*, not of this claim's work, and in a union claim (T01+T02) any neighbouring
+  commit satisfied it. The governing probe is: since the recorded `vcs_baseline.id`, a commit landed
+  that **touches at least one claimed path**. The raw movement is still recorded as `baseline_moved`
+  (auditable); `baseline_advanced` is what decides. The precise form is **monotonic** over the old
+  one — every state it releases, the old one released too; no new release path was created.
 - **B — the claimed paths left flight.** No path of the claim appears in `workingStatus(code_dir)`
   with `kind ∈ {modified, added, deleted, untracked}`. `untracked` is **in** (S05/review R2): a new
   file is the most common output of an executor (`forge-vcs.js` emits git `??` / svn `unversioned`
@@ -350,22 +354,45 @@ Proof of commit requires **both**, always:
   neighbour's commit advancing the shared tree's baseline, released a **live** claim. `ignored` stays
   **out**; entries are filtered by the claim's own path coverage first, so only *claimed* paths hold.
 
-Each probe **alone releases wrongly, in opposite directions**. A alone releases on the *neighbour's*
-commit in a shared tree — literally the SVN/WDMA scenario that originated this milestone, since the
-baseline is a property of the tree and not of this claim's work. B alone releases a claim whose
+Each probe **alone releases wrongly, in opposite directions**. A alone releases a claim whose worker
+has not started writing yet, when an *earlier* commit already touched those paths. (Before D16 made
+A precise, A alone was worse still: any *neighbour's* commit in a shared tree satisfied it —
+literally the SVN/WDMA scenario that originated this milestone.) B alone releases a claim whose
 worker **has not started writing**: zero dirty paths is indistinguishable from "committed
 everything" when nobody looks at the baseline. Relaxing to one probe is a regression, not a
 simplification, and both git and svn go through the same public seam of `scripts/forge-vcs.js` —
 the symmetry is deliberate, not a concession to SVN.
 
-### Liveness governs BOTH rungs — the clock is the named last resort (PR #110, `#1(a)`)
+### Liveness governs the TTL rung — the clock is the named last resort (PR #110 `#1(a)`, amended by D16)
 
-The two probes are still not enough. `released-committed` also requires **`owner_active === false`**,
-matching the TTL rung right below, which already required it. The measured hole: a live owner mid-run
-has a moment where the neighbour's commit advanced the baseline (probe A) and its own edits are
-momentarily staged/clean (probe B) — and the fence it is still standing behind was handed away. The
-literals `=== true` / `=== false` are kept on purpose: `null` is **"I did not ask"** and never
-satisfies a probe.
+**Only `released-ttl-expired` requires `owner_active === false`.** PR #110 had put that same
+condition on `released-committed` as well; **D16 removed it there**, and this section is the
+amendment — the two statements must not coexist, because a spec that says both is the very defect
+that finding 4b of this branch exists to close.
+
+Why it was removed: the condition did not close the hole it named — it made the rung **unreachable
+by the real gate**, by a two-bladed scissor measured at both sites. (1) `collectRunClaims`
+(`forge-claim-overlap.js`) skips every run with `active !== true` as `run-inactive` *before* any
+probe runs; (2) `probeClaim` derives `owner_active` from `isHolderRunActive`, which requires
+`run.active === true`. So an active counterpart yields `owner_active === true` and never fires, and
+an inactive one is never probed at all. No state emitted `claim-released:committed` — and since the
+`e-release` step of `forge-auto` asks for the release with the run **still active**, the claim could
+only ever leave by TTL after the run died. That is over-block, the class this milestone exists to
+close, reintroduced one layer up.
+
+The hole PR #110 actually pointed at is closed by **probe A precise** instead: the moment where a
+*neighbour's* commit advanced the tree baseline while this claim's edits were momentarily clean no
+longer satisfies probe A, because the neighbour's commit does not touch the claimed paths. Proof of
+commit is once again about **this claim's own work**, which is what it should always have measured.
+
+**`owner_active` did not disappear — it was demoted from trigger to evidence.** It is still measured
+by `probeClaim` and still carried in the persisted evidence and in the census; it simply no longer
+decides the `committed` rung. Where the owner's liveness still *governs* is (a) the TTL rung below
+and (b) the **persistence** of the verdict into a foreign `RunRecord` (`forge-claim-gate.js`) —
+neither of which D16 revokes.
+
+The literals `=== true` / `=== false` are kept on purpose wherever liveness still decides: `null` is
+**"I did not ask"** and never satisfies a probe.
 
 This is the same doctrine `forge-filelock.js` now enforces one layer down: **liveness beats the
 clock**, the clock is the last resort with a name, and the crashed owner is converted from live to

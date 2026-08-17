@@ -47,6 +47,12 @@ const LIVENESS_REASONS = [
   // Reachable BOTH from `classifyRunLiveness(null)` and from the race in `reapOrphanRuns`.
   'record-absent',
   'excluded',               // unmeasured — caller's own run, never reaped by itself
+  // The census said `expired`, but the record read INSIDE the lock no longer says so: the target
+  // bumped its heartbeat or wrote a claim between the census and the write. The mutator aborts and
+  // this is the named outcome. It is NOT `record-absent` — the record is right there and readable;
+  // what changed is the answer, and collapsing the two would hide a live run being spared behind a
+  // reason that says "the file vanished".
+  'reclassified-under-lock',
 ];
 
 /**
@@ -128,14 +134,39 @@ function reapOrphanRuns(cwd, opts) {
       continue;
     }
     // Deactivate. NEVER `runs.remove` — the file stays on disk so a resume can flip it back.
+    //
+    // The classification above came from a snapshot taken BEFORE the lock. Applying it
+    // unconditionally is a read-modify-write ACROSS the lock — the exact window `updateWith` exists
+    // to close (`forge-runs.js:285`). A target that bumps its heartbeat or writes a `write_claim` in
+    // that window would be deactivated while LIVE or while HOLDING A CLAIM, violating the two
+    // guarantees this module exists to sustain. So the mutator RE-ASKS `classifyRunLiveness` over
+    // the record read inside the lock and aborts unless it is still `expired`. Abort is a
+    // first-class outcome of `updateWith` (`updated: false`), not an error.
+    //
     // `updateWith` THROWS when the record is gone (it does not return `updated: false` for that —
     // that outcome is reserved for a mutator that aborts). Without this catch a run removed between
     // the census and the write aborts the whole sweep and LOSES the reaps already done, and the
     // `record-absent` skip below is unreachable — a declared reason nothing can produce.
     let res = null;
+    let recheck = null;
     try {
-      res = runs.updateWith(cwd, record.id, () => ({ active: false }));
+      res = runs.updateWith(cwd, record.id, (fresh) => {
+        recheck = classifyRunLiveness(fresh, o);
+        if (recheck.state !== 'expired') return null; // ABORT — the world changed under us
+        return { active: false };
+      });
     } catch (_) { res = null; }
+    if (res && res.updated !== true && recheck) {
+      // The mutator ran and refused. A DIFFERENT fact from `record-absent`: name it, and carry the
+      // fresh verdict so the census says WHY the run was spared.
+      out.skipped.push({
+        id: record.id,
+        state: recheck.state,
+        reason: 'reclassified-under-lock',
+        recheck: { state: recheck.state, reason: recheck.reason },
+      });
+      continue;
+    }
     if (!res || res.updated !== true) {
       out.skipped.push({ id: record.id, state: 'unmeasured', reason: 'record-absent' });
       continue;

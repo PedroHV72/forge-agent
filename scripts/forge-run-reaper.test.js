@@ -31,6 +31,11 @@
 //   L10 a record that disappears between the census and the write is a NAMED
 //       skip, never an exception that loses the reaps already done.
 //   L11 anti-vacuity: the census tests run over NON-EMPTY registries too.
+//   L12 TOCTOU (review R1): the classification is RE-ASKED inside the lock. A
+//       run that bumps its heartbeat or writes a claim between the census and
+//       the write is NOT deactivated, is NAMED in the census with its own
+//       reason (`reclassified-under-lock`, never `record-absent`), and emits no
+//       event. Crossed the other way: without a race the same orphan IS reaped.
 //
 // Zero deps. Standalone runner, repo convention: exit != 0 on failure.
 
@@ -393,6 +398,93 @@ test('L10: registro que some entre o censo e a escrita vira skip NOMEADO, não e
   const skip = out.skipped.find((s) => s.id === 'M-some');
   assert(skip, 'a que sumiu tem de aparecer NOMEADA — sumir dela é o silêncio que o censo existe para proibir');
   assertEqual(skip.reason, 'record-absent', 'razão do conjunto fechado');
+});
+
+// ── L12: TOCTOU between the census and the write (review R1) ────────────────
+//
+// The classification comes from a snapshot taken BEFORE the lock. If it were applied
+// unconditionally inside the lock, a target that bumps its heartbeat or writes a claim in that
+// window would be deactivated while LIVE / while HOLDING A CLAIM — the two guarantees this module
+// exists to sustain. Both directions of the race are asserted; each test FAILS (the run comes back
+// `active: false`) if the re-classification inside the mutator is removed.
+//
+// The race is staged, not hoped for: `updateWith` is wrapped so the record on disk changes between
+// the census and the real call. `updateWith` re-reads inside the lock, so the mutator sees it.
+function raceFixture(specs, mutateOnDisk) {
+  const { wsDir, runFiles } = makeFixture(specs);
+  const realUpdateWith = runs.updateWith;
+  runs.updateWith = function patched(cwd, id, mutator) {
+    mutateOnDisk(cwd, id);
+    return realUpdateWith(cwd, id, mutator);
+  };
+  try {
+    return { wsDir, runFiles, out: recordCensus(reapOrphanRuns(wsDir, { now: NOW })) };
+  } finally {
+    runs.updateWith = realUpdateWith;
+  }
+}
+function patchRecord(cwd, id, patch) {
+  const f = path.join(cwd, '.gsd', 'forge', 'runs', `${id}.json`);
+  const rec = JSON.parse(fs.readFileSync(f, 'utf8'));
+  fs.writeFileSync(f, JSON.stringify(Object.assign(rec, patch), null, 2), 'utf8');
+}
+
+test('L12: run que bumpa o heartbeat entre o censo e a escrita NÃO é desativada', () => {
+  const { wsDir, runFiles, out } = raceFixture(
+    [{ id: 'M-ressuscita', last_heartbeat: NOW - DEFAULT_THRESHOLD_MS * 3 }],
+    (cwd, id) => patchRecord(cwd, id, { last_heartbeat: NOW }),
+  );
+  assertEqual(out.reaped.length, 0, 'uma run VIVA no instante da escrita não pode ser ceifada');
+  assertEqual(JSON.parse(fs.readFileSync(runFiles[0], 'utf8')).active, true,
+    'o registro tem de continuar active:true — desativar aqui é exatamente o defeito');
+  const skip = out.skipped.find((s) => s.id === 'M-ressuscita');
+  assert(skip, 'o censo tem de NOMEAR a run poupada — poupar em silêncio é indistinguível de não olhar');
+  assertEqual(skip.reason, 'reclassified-under-lock', 'razão própria, do conjunto fechado');
+  assertEqual(skip.state, 'live', 'e o estado fresco medido dentro do lock');
+  assertEqual(skip.recheck.reason, 'heartbeat-fresh', 'a evidência da reavaliação viaja no censo');
+  assertEqual(eventsOf(wsDir).filter((e) => e.event === 'run-orphan-reaped').length, 0,
+    'evento só depois do update condicional ter sucedido');
+});
+
+test('L12: run que grava write_claim entre o censo e a escrita NÃO é desativada', () => {
+  const { runFiles, out } = raceFixture(
+    [{ id: 'M-claima', last_heartbeat: NOW - DEFAULT_THRESHOLD_MS * 3 }],
+    (cwd, id) => patchRecord(cwd, id, { write_claim: claim(['x.js']) }),
+  );
+  assertEqual(out.reaped.length, 0, 'o claim tem dono e ladder próprios — o relógio não decide aqui');
+  assertEqual(JSON.parse(fs.readFileSync(runFiles[0], 'utf8')).active, true, 'segue ativa');
+  const skip = out.skipped.find((s) => s.id === 'M-claima');
+  assertEqual(skip.reason, 'reclassified-under-lock', 'razão nomeada');
+  assertEqual(skip.recheck.reason, 'claim-present', 'a reavaliação mediu o claim recém-gravado');
+});
+
+test('L12 (o outro sentido): sem corrida, a mesma órfã É ceifada — o guard não é um freio geral', () => {
+  const { wsDir, runFiles } = makeFixture([
+    { id: 'M-morta', last_heartbeat: NOW - DEFAULT_THRESHOLD_MS * 3 },
+  ]);
+  const out = recordCensus(reapOrphanRuns(wsDir, { now: NOW }));
+  assertEqual(out.reaped.length, 1, 'sem mudança sob o lock a reavaliação confirma e o ceife acontece');
+  assertEqual(JSON.parse(fs.readFileSync(runFiles[0], 'utf8')).active, false, 'desativada');
+});
+
+test('L12: abort por reavaliação e record-absent são fatos SEPARADOS no censo', () => {
+  const { wsDir } = makeFixture([
+    { id: 'M-some', last_heartbeat: NOW - DEFAULT_THRESHOLD_MS * 3 },
+    { id: 'M-ressuscita', last_heartbeat: NOW - DEFAULT_THRESHOLD_MS * 3 },
+  ]);
+  const realUpdateWith = runs.updateWith;
+  runs.updateWith = function patched(cwd, id, mutator) {
+    if (id === 'M-some') throw new Error(`forge-runs.updateWith: run ${id} not found`);
+    patchRecord(cwd, id, { last_heartbeat: NOW });
+    return realUpdateWith(cwd, id, mutator);
+  };
+  let out;
+  try { out = recordCensus(reapOrphanRuns(wsDir, { now: NOW })); } finally { runs.updateWith = realUpdateWith; }
+  const byId = Object.fromEntries(out.skipped.map((s) => [s.id, s]));
+  assertEqual(byId['M-some'].reason, 'record-absent', 'o registro que sumiu');
+  assertEqual(byId['M-ressuscita'].reason, 'reclassified-under-lock', 'o que mudou de resposta');
+  assert(byId['M-some'].reason !== byId['M-ressuscita'].reason,
+    'colapsar os dois esconderia uma run viva poupada atrás de "o arquivo sumiu"');
 });
 
 // ── L7: closed sets, both directions ────────────────────────────────────────
