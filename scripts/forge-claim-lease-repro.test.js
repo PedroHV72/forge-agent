@@ -63,6 +63,14 @@ const WRITE_CLAIM_CLI = path.join(__dirname, 'forge-write-claim.js');
 const RELEASE_MODULE = path.join(__dirname, 'forge-claim-release.js');
 const SPEC = path.join(__dirname, '..', 'shared', 'forge-claim-gate.md');
 
+/**
+ * sha256 do módulo REAL no instante em que esta suíte começou. Toda mordida
+ * confere contra ele DEPOIS de rodar: a mutação vive numa cópia, e este valor é
+ * a prova de que ela ficou lá.
+ */
+const REAL_RELEASE_SHA = crypto.createHash('sha256')
+  .update(fs.readFileSync(RELEASE_MODULE)).digest('hex');
+
 const { CLAIM_RELEASE_REASONS, DEFAULT_TTL_MS, DEFAULT_GRACE_MS } = require('./forge-claim-release.js');
 const { GATE_SKIP_REASONS, GATE_DECISIONS, GATE_CAUSES } = require('./forge-claim-gate.js');
 
@@ -182,6 +190,41 @@ function writePlan(ws, taskId, file) {
     'expected_output: []', '---', '', `# ${taskId}`, '',
   ].join('\n'), 'utf8');
   return rel;
+}
+
+/**
+ * Uma cópia ISOLADA de `scripts/*.js` com UMA substituição aplicada, e o caminho
+ * da CLI do gate DENTRO dela.
+ *
+ * Por que copiar o diretório inteiro, e não só o módulo mordido: o gate é
+ * spawnado como processo e resolve `require('./forge-claim-release.js')` por
+ * caminho RELATIVO ao próprio arquivo. Mutar uma cópia solta em outro lugar não
+ * afetaria o filho — foi essa constatação que, na primeira versão desta suíte,
+ * levou a mutar o módulo REAL sob `__dirname` e restaurá-lo num `finally`.
+ *
+ * O modo de falha que isso deixava aberto é o motivo desta função existir:
+ * `finally` NÃO roda sob SIGKILL. Uma suíte morta no meio de uma mordida deixava
+ * a working tree do próprio repo com a prova de commit neutralizada — a cerca
+ * aberta, PERSISTIDA em disco — e `git status` sujo como único sinal. Copiando
+ * o diretório e spawnando de lá, a mutação vive num tmp dir descartável: nenhum
+ * sinal, nenhum kill e nenhuma ordem de execução pode alcançar o módulo real.
+ *
+ * Molde: `forge-hook-rewrite.test.js` (§7), que copia `scripts/*.js` para um dir
+ * isolado e roda dali uma cópia do script de entrada.
+ */
+function mutatedScriptsDir(needle, replacement) {
+  const dir = path.join(mktmp('forge-lease-bite-'), 'scripts');
+  fs.mkdirSync(dir, { recursive: true });
+  for (const f of fs.readdirSync(__dirname)) {
+    if (!f.endsWith('.js')) continue;
+    fs.copyFileSync(path.join(__dirname, f), path.join(dir, f));
+  }
+  const target = path.join(dir, path.basename(RELEASE_MODULE));
+  const original = fs.readFileSync(target, 'utf8');
+  assertEqual(original.split(needle).length - 1, 1,
+    'a mordida precisa casar EXATAMENTE uma vez — 0 ou 2 casamentos a tornariam vazia');
+  fs.writeFileSync(target, original.replace(needle, replacement), 'utf8');
+  return { dir, gate: path.join(dir, path.basename(GATE_CLI)) };
 }
 
 function cli(module, args) {
@@ -328,12 +371,13 @@ test('F2b: a linha claim-gate da F2 no events.jsonl carrega o counterpart libera
 // ══════════════════════════════════════════════════════════════════════════
 console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VERMELHA');
 {
-  test('BITE-a: com a prova de commit neutralizada no módulo REAL, a F2 volta a bloquear', () => {
-    const original = fs.readFileSync(RELEASE_MODULE, 'utf8');
-    const hashBefore = sha256(RELEASE_MODULE);
+  test('BITE-a: com a prova de commit neutralizada, a F2 volta a bloquear', () => {
     const needle = 'if (f.baseline_advanced === true && f.paths_in_flight === false) {';
-    assertEqual(original.split(needle).length - 1, 1,
-      'a mordida precisa casar EXATAMENTE a conjunção — 0 ou 2 casamentos a tornariam vazia');
+    // A conjunção precisa casar EXATAMENTE uma vez — conferido contra o módulo
+    // REAL (lido, nunca escrito) antes de qualquer cópia: se a needle deixar de
+    // existir no real, a mordida vira vazia mesmo casando na cópia.
+    assertEqual(fs.readFileSync(RELEASE_MODULE, 'utf8').split(needle).length - 1, 1,
+      'a needle precisa casar 1× no MÓDULO REAL — senão a mordida perdeu o sujeito');
 
     // Fixture NOVA, e isso é o ponto: desde S05/review R3 o gate PERSISTE o
     // veredito `committed` que corroborou, então a `fx` da F2 já carrega o
@@ -348,15 +392,13 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
     assertEqual(readRun(bfx.ws, RUN_A).write_claim.released, null,
       'a fixture da mordida NÃO pode nascer com envelope — senão a mordida é vazia');
 
-    let bitten = null;
-    try {
-      fs.writeFileSync(RELEASE_MODULE, original.replace(needle, 'if (false) {'), 'utf8');
-      bitten = cliJson(GATE_CLI, bfx.bArgs);
-    } finally {
-      fs.writeFileSync(RELEASE_MODULE, original, 'utf8');
-    }
-    assertEqual(sha256(RELEASE_MODULE), hashBefore,
-      'o módulo real precisa voltar byte-idêntico — sha256 conferido, não presumido');
+    // A mutação vive numa CÓPIA descartável de `scripts/`, e o gate é spawnado
+    // DE LÁ: nenhum `finally` é necessário, logo nenhum SIGKILL pode deixar o
+    // módulo real neutralizado na working tree.
+    const bite = mutatedScriptsDir(needle, 'if (false) {');
+    const bitten = cliJson(bite.gate, bfx.bArgs);
+    assertEqual(sha256(RELEASE_MODULE), REAL_RELEASE_SHA,
+      'o módulo real segue byte-idêntico — sha256 conferido, não presumido');
 
     assert(bitten && bitten.decision !== 'proceed',
       `com a prova neutralizada a F2 tem de ficar vermelha, veio ${bitten && bitten.decision}`);
@@ -365,9 +407,11 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
     assertEqual(readRun(bfx.ws, RUN_A).write_claim.released, null,
       'sem veredito corroborado, NADA pode ter sido persistido no claim alheio');
 
-    // E o módulo restaurado volta a decidir como antes — controle positivo da restauração.
+    // Controle positivo: a MESMA fixture, avaliada pelo gate REAL, passa. É o
+    // que garante que o vermelho acima veio da mutação e não da cópia — a cópia
+    // difere do real por essa única substituição, e por nada mais.
     assertEqual(cliJson(GATE_CLI, bfx.bArgs).decision, 'proceed',
-      'restaurado, o mesmo comando volta a passar');
+      'pelo gate real o mesmo comando passa — a única diferença é a mutação da cópia');
   });
 
   // ── BITE-b (D16): a mordida da doutrina NOVA ────────────────────────────
@@ -384,11 +428,9 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
   // INDEVIDAMENTE — a direção oposta à da BITE-a, e é essa oposição que prova
   // que as duas mordem coisas diferentes.
   test('BITE-b: com a PRECISÃO da sonda A neutralizada, um commit fora dos paths libera indevidamente', () => {
-    const original = fs.readFileSync(RELEASE_MODULE, 'utf8');
-    const hashBefore = sha256(RELEASE_MODULE);
     const needle = '  facts.baseline_advanced = hits.length > 0;';
-    assertEqual(original.split(needle).length - 1, 1,
-      'a mordida precisa casar EXATAMENTE a atribuição da sonda precisa — 0 ou 2 casamentos a tornariam vazia');
+    assertEqual(fs.readFileSync(RELEASE_MODULE, 'utf8').split(needle).length - 1, 1,
+      'a atribuição da sonda precisa tem de casar 1× no MÓDULO REAL — senão a mordida perdeu o sujeito');
 
     // Fixture onde A commita algo que NÃO é o path reivindicado (`src/a.js`), e
     // desfaz o próprio voo. É o instante do claim-união: árvore limpa, baseline
@@ -409,17 +451,13 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
     assertEqual(sane.cause, 'overlap');
     assertEqual(sane.released_counterparts.length, 0, 'ninguém sai do universo por um commit alheio ao claim');
 
-    let bitten = null;
-    try {
-      // A neutralização é EXATAMENTE a sonda pré-D16: a árvore andou.
-      fs.writeFileSync(RELEASE_MODULE,
-        original.replace(needle, '  facts.baseline_advanced = facts.baseline_moved;'), 'utf8');
-      bitten = cliJson(GATE_CLI, bfx.bArgs);
-    } finally {
-      fs.writeFileSync(RELEASE_MODULE, original, 'utf8');
-    }
-    assertEqual(sha256(RELEASE_MODULE), hashBefore,
-      'o módulo real precisa voltar byte-idêntico — sha256 conferido, não presumido');
+    // A neutralização é EXATAMENTE a sonda pré-D16 (a árvore andou) e vive numa
+    // cópia descartável de `scripts/` — o real nunca é escrito, então um SIGKILL
+    // aqui não pode deixar a cerca aberta na working tree do repo.
+    const bite = mutatedScriptsDir(needle, '  facts.baseline_advanced = facts.baseline_moved;');
+    const bitten = cliJson(bite.gate, bfx.bArgs);
+    assertEqual(sha256(RELEASE_MODULE), REAL_RELEASE_SHA,
+      'o módulo real segue byte-idêntico — sha256 conferido, não presumido');
 
     assertEqual(bitten.decision, 'proceed',
       'com a precisão neutralizada a cerca abre — é este o defeito que D16 fecha');
@@ -435,18 +473,18 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
     assert(envelope && envelope.mechanism === 'committed',
       'a mordida tem de deixar o envelope gravado — é o dano que ela cerca');
     assertEqual(cliJson(GATE_CLI, bfx.bArgs).decision, 'proceed',
-      'e com o módulo JÁ restaurado a cerca segue aberta: released-explicit, não há como desfazer');
+      'e pelo GATE REAL a cerca segue aberta: released-explicit, não há como desfazer');
 
-    // Controle positivo da restauração, sobre uma fixture VIRGEM — a de cima não
-    // serve mais, justamente porque foi contaminada. Sem este controle, um
-    // `finally` que falhasse passaria despercebido.
+    // Controle positivo sobre uma fixture VIRGEM — a de cima não serve mais,
+    // justamente porque foi contaminada. Sem este controle, uma cópia que
+    // divergisse do real por mais do que a mutação passaria despercebida.
     const cfx = buildFixture();
     git(cfx.repo, ['checkout', '--', 'src/a.js']);
     fs.writeFileSync(path.join(cfx.repo, 'outro.js'), '// idem\n', 'utf8');
     git(cfx.repo, ['add', 'outro.js']);
     git(cfx.repo, ['commit', '-q', '-m', 'A commita FORA dos paths reivindicados']);
     assert(cliJson(GATE_CLI, cfx.bArgs).decision !== 'proceed',
-      'restaurado, a MESMA situação volta a bloquear');
+      'pelo gate real, a MESMA situação bloqueia');
   });
 
   // ── S05/review R3, sobre git REAL: o veredito vivo virou registro ─────────
@@ -647,6 +685,56 @@ console.log('\nSETS: nada que esta repro observou cai fora dos conjuntos fechado
         assert(GATE_SKIP_REASONS.includes(s.reason), `skip fora do conjunto: ${s.reason}`);
       }
     }
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// GUARD — a mordida nunca mais escreve sob `scripts/` do repo
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Um conserto que depende de ninguém regredir não é conserto. As duas provas:
+// (a) o sha do módulo real no fim da suíte é o do começo — comportamental;
+// (b) o TEXTO desta suíte não contém escrita para dentro de `__dirname` —
+//     estrutural, o que morde a REINTRODUÇÃO do padrão, não só o seu efeito.
+console.log('\nGUARD: nenhuma mordida escreve no módulo real');
+{
+  const SELF = __filename;
+  // Escrita cujo destino é derivado de `__dirname` (onde vivem os módulos reais)
+  // ou a constante `RELEASE_MODULE`. A cópia da mordida escreve em `target`,
+  // derivado do tmp dir — fora deste predicado por construção.
+  // `copyFileSync` fica FORA da lista de propósito: o primeiro argumento dele é
+  // a ORIGEM, e `mutatedScriptsDir` legitimamente lê de `__dirname` para copiar
+  // PARA o tmp dir. Incluí-lo acusaria a própria correção. A limitação fica
+  // nomeada: uma cópia cujo DESTINO fosse `scripts/` escaparia deste predicado —
+  // o GUARD-a (sha do módulo real) é a rede comportamental para esse caso.
+  const FORBIDDEN_WRITE = /(?:writeFileSync|appendFileSync|rmSync|truncateSync|openSync)\s*\(\s*(?:RELEASE_MODULE|GATE_CLI|WRITE_CLAIM_CLI|RELEASE_CLI|SPEC|path\.join\(__dirname)/;
+
+  test('GUARD-a: o módulo real terminou a suíte byte-idêntico ao que começou', () => {
+    assertEqual(sha256(RELEASE_MODULE), REAL_RELEASE_SHA,
+      'alguma coisa nesta suíte escreveu em scripts/forge-claim-release.js');
+  });
+
+  test('GUARD-b: o TEXTO desta suíte não escreve em nenhum caminho sob scripts/ do repo', () => {
+    const text = fs.readFileSync(SELF, 'utf8');
+    assert(!FORBIDDEN_WRITE.test(text),
+      'reintroduziram escrita no módulo real: SIGKILL deixaria a cerca aberta na working tree');
+  });
+
+  test('GUARD-c: CONTROLE POSITIVO — o MESMO predicado acusa o padrão antigo', () => {
+    // Montado por concatenação DE PROPÓSITO: escrito inteiro, este literal
+    // seria acusado pelo GUARD-b acima — o detector morderia o próprio controle.
+    const W = 'writeFile' + 'Sync';
+    const PRE_FIX = [
+      '    try {',
+      `      fs.${W}(RELEASE_MODULE, original.replace(needle, 'if (false) {'), 'utf8');`,
+      '    } finally {',
+      `      fs.${W}(RELEASE_MODULE, original, 'utf8');`,
+      '    }',
+    ].join('\n');
+    assert(FORBIDDEN_WRITE.test(PRE_FIX),
+      'o predicado precisa morder a forma antiga — senão é detector cego');
+    assert(FORBIDDEN_WRITE.test(`fs.${W}(path.join(__` + `dirname, 'forge-claim-release.js'), x)`),
+      'e precisa morder o desvio óbvio: reconstruir o caminho a partir de __dirname');
   });
 }
 
