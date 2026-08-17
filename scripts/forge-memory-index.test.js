@@ -556,6 +556,7 @@ test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, 
     [
       { unitId: 'T01', text: 'Only architecture prose; no file is mentioned.', mem_id: 'mem-a' },
       { unitId: 'T01', text: 'A token with only e.g and payload.side is ordinary prose.', mem_id: 'mem-eg' },
+      { unitId: 'T01', text: 'A capture gap: payload.py was never extracted.', mem_id: 'mem-gap-real-ext' },
       { unitId: 'T01', text: 'The malformed file-shaped token .tsx was not captured.', mem_id: 'mem-b|pipe' },
       { unitId: 'T01', text: 'Only scripts/missing.js is mentioned.', mem_id: 'mem-c' },
       { unitId: 'T01', text: 'Resolved in scripts/forge-alpha.js.', mem_id: 'mem-resolved' },
@@ -566,10 +567,17 @@ test('IN-17: three buckets classify no-file, missed extractor, unresolved-only, 
     const result = buildFileIndex(root, {});
     const coverage = result.coverage;
     assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-a'), 'expected bucket (a)');
-    assert(!coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-eg'), 'detector-recognized payload.side must no longer be bucket (a)');
-    const independentMiss = coverage.facts_missed_by_extractor.find((f) => f.mem_id === 'mem-eg');
-    assert(independentMiss, 'payload.side must be bucket (b) under the independent detector');
-    assertEq(independentMiss.sample_token, 'e.g', 'the detector reports its first independent file-shaped token verbatim');
+    // Censo 2026-08-15: `e.g` (abreviação latina) e `payload.side` (sufixo que
+    // não é extensão real) são ruído do PRÓPRIO detector, enumerado com razão
+    // nomeada — não "arquivo que o extrator perdeu". Reverter as regras de
+    // ruído devolve mem-eg ao bucket (b) e este assert falha (o teste morde).
+    assert(coverage.facts_no_file_mention.some((f) => f.mem_id === 'mem-eg'), 'instrument noise (e.g/payload.side) must classify as bucket (a), not as an extractor miss');
+    assert(!coverage.facts_missed_by_extractor.some((f) => f.mem_id === 'mem-eg'), 'instrument noise must never inflate bucket (b)');
+    // Uma extensão REAL fora de CODE_EXT continua gap visível do extrator: a
+    // regra de ruído é bounded, não cega o instrumento.
+    const independentMiss = coverage.facts_missed_by_extractor.find((f) => f.mem_id === 'mem-gap-real-ext');
+    assert(independentMiss, 'payload.py must stay bucket (b) under the independent detector');
+    assertEq(independentMiss.sample_token, 'payload.py', 'the detector reports its first independent file-shaped token verbatim');
     const missed = coverage.facts_missed_by_extractor.find((f) => f.mem_id === 'mem-b|pipe');
     assert(missed, 'expected bucket (b) enumeration');
     assertEq(missed.storage_key, 'T01', 'bucket (b) must enumerate storage_key');
@@ -1597,33 +1605,38 @@ test('T02 recall: measureF2 reaches >= 0.99 after registry correction and bites 
   }
 });
 
+// Exemplo migrado de `config.weird` para `config.py` (censo 2026-08-15): o gap
+// canônico é uma extensão REAL fora de CODE_EXT — `.weird` passou a ser
+// enumerado como ruído do detector (sufixo que não é extensão de arquivo real).
 test('T02 gap: extension outside CODE_EXT is named, reported, and remains visible to F2', () => {
   const root = mkStore(
-    [{ unitId: 'T01', mem_id: 'mem-gap-extension-outside-code-ext', text: 'A configuração está em config.weird.' }],
-    ['config.weird'],
+    [{ unitId: 'T01', mem_id: 'mem-gap-extension-outside-code-ext', text: 'A configuração está em config.py.' }],
+    ['config.py'],
   );
   try {
     const result = buildFileIndex(root, {});
     const report = measureF2(root);
-    assertEq(extractCitations('config.weird').length, 0, 'gap must not be hidden by a broad suffix predicate');
+    assertEq(extractCitations('config.py').length, 0, 'gap must not be hidden by a broad suffix predicate');
     assert(result.coverage.citation_gaps.some((gap) => gap.name === 'extension-outside-code-ext'), 'index must report the named gap');
     assert(report.facts_missed_total.some((fact) => fact.mem_id === 'mem-gap-extension-outside-code-ext'), 'independent instrument must keep the gap visible');
-    assert(detectMentions('config.weird').length === 1, 'detector evidence must not share CODE_EXT');
+    assert(detectMentions('config.py').length === 1, 'detector evidence must not share CODE_EXT');
   } finally {
     cleanup(root);
   }
 });
 
 test('T02 bucket (b): independent detector, not findSampleFileToken vocabulary, classifies an unknown suffix as missed', () => {
+  // `.go` é extensão real fora de CODE_EXT — o stand-in anterior (`.side`) foi
+  // reclassificado como ruído do instrumento pelo censo 2026-08-15.
   const root = mkStore(
-    [{ unitId: 'T01', mem_id: 'mem-independent-detector', text: 'Veja payload.side para detalhes.' }],
-    ['payload.side'],
+    [{ unitId: 'T01', mem_id: 'mem-independent-detector', text: 'Veja payload.go para detalhes.' }],
+    ['payload.go'],
   );
   try {
     const coverage = buildFileIndex(root, {}).coverage;
     const missed = coverage.facts_missed_by_extractor.find((item) => item.mem_id === 'mem-independent-detector');
     assert(missed, 'detector-recognized suffix must be bucket (b) even outside CODE_EXT');
-    assertEq(missed.sample_token, 'payload.side');
+    assertEq(missed.sample_token, 'payload.go');
     assert(!coverage.facts_no_file_mention.some((item) => item.mem_id === 'mem-independent-detector'));
   } finally {
     cleanup(root);
@@ -1668,16 +1681,16 @@ test('T02 registry order and locked names remain stable while adding no broad ca
 });
 
 test('T02 diagnostic boundary keeps detector and extractor observations distinguishable', () => {
-  const text = 'Veja scripts/real.js e config.weird.';
+  const text = 'Veja scripts/real.js e config.py.';
   const citations = extractCitations(text);
   const evidence = independentMentionEvidence(text, citations);
   const breakdown = citationDetectionBreakdown(text, citations);
   assertEq(evidence.mentions.length, 2, 'independent detector must see both suffix-shaped tokens');
-  assertEq(evidence.unmatched.map((mention) => mention.raw), ['config.weird.']);
-  assertEq(breakdown.detector_unmatched, ['config.weird.']);
+  assertEq(evidence.unmatched.map((mention) => mention.raw), ['config.py.']);
+  assertEq(breakdown.detector_unmatched, ['config.py.']);
   assertEq(breakdown.extractor_only, []);
   assertEq(breakdown.detector_mentions, 2);
-  assertEq(evidence.unmatched[0].normalized, 'config.weird');
+  assertEq(evidence.unmatched[0].normalized, 'config.py');
   assertEq(citations[0].path, 'scripts/real.js');
 });
 
@@ -1826,11 +1839,49 @@ test('S02 R2: segundo render no mesmo cwd reflete o store mudado (sem número st
 
     // Muda o store DENTRO do mesmo processo: um fato com uma menção capturada e
     // outra não → captura parcial.
-    writeFragment(root, { unit_id: 'T02', facts: [{ mem_id: 'partial', category: 'test', text: '`scripts/covered.js` e other.weird', created_at: '2026-01-01T00:00:00Z', source_unit: 'T02' }] });
+    writeFragment(root, { unit_id: 'T02', facts: [{ mem_id: 'partial', category: 'test', text: '`scripts/covered.js` e other.py', created_at: '2026-01-01T00:00:00Z', source_unit: 'T02' }] });
 
     const second = renderIndex(buildFileIndex(root, {}), {});
     assertEq(second.match(label)[1], '1', 'a segunda render deve medir o store novo, não devolver o valor cacheado por cwd');
   } finally { cleanup(root); }
+});
+
+// ── CODE_EXT widening (2026-08-15): jsonl|jsonc|txt|swift ────────────────────
+// Adição estreita e MEDIDA (citations_total 142 -> 150 neste workspace), não o
+// precedente 311 -> 972 (que foi aceitar qualquer sufixo). Cada assert morde:
+// reverter a extensão correspondente em CODE_EXT devolve length 0.
+test('CODE_EXT widening: jsonl, jsonc, txt and swift citations are extracted', () => {
+  const jsonl = extractCitations('O log vive em events.jsonl.');
+  assertEq(jsonl.length, 1);
+  assertEq(jsonl[0].path, 'events.jsonl');
+  assertEq(jsonl[0].pattern, 'bare-basename');
+
+  const jsonc = extractCitations('Prefs em `.gsd/forge-prefs.jsonc`.');
+  assertEq(jsonc.length, 1);
+  assertEq(jsonc[0].path, '.gsd/forge-prefs.jsonc');
+  assertEq(jsonc[0].pattern, 'backticked-path');
+
+  const txt = extractCitations('Gravado em seed.txt hoje.');
+  assertEq(txt.length, 1);
+  assertEq(txt[0].path, 'seed.txt');
+
+  const swift = extractCitations('Ver app/Sources/ForgeKit/GitActivity.swift:219 e o bare GitActivity.swift.');
+  assertEq(swift.length, 2);
+  assertEq(swift[0].path, 'app/Sources/ForgeKit/GitActivity.swift');
+  assertEq(swift[0].line, 219);
+  assertEq(swift[1].path, 'GitActivity.swift');
+});
+
+test('CODE_EXT widening does not explode: dotted identifiers and versions still extract nothing', () => {
+  // Guarda anti-explosão (precedente 311 -> 972): a adição é uma lista fechada,
+  // então identificadores com ponto e versões continuam fora do extrator.
+  assertEq(extractCitations('4.2–4.9x e JSON.parse e it.skip e v2.0 e cmd.exe e turn.id.').length, 0);
+  // Placeholder com < > nunca vira citação; glob com a extensão nova permanece
+  // enumerado como dynamic (descarte nomeado), nunca resolvido em silêncio.
+  const globbed = extractCitations('subagents/agent-<id>.jsonl e evidence-*.jsonl');
+  assertEq(globbed.length, 1);
+  assertEq(globbed[0].pattern, 'dynamic');
+  assertEq(globbed[0].path, 'evidence-*.jsonl');
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

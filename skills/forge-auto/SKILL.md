@@ -664,7 +664,7 @@ node "{WORKING_DIR}/scripts/forge-overlap.js" --check --cwd "{WORKING_DIR}" || t
 ```
 Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqueia o `complete-slice`, nunca ordena runs, nunca faz merge. Verdict `inconclusive` significa "não havia o que comparar" e **não** deve ser lido como limpo.
 
-**Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the slice branch `gsd/{M###}/{S##}` is still unmerged here, so the diff is intact). This is the challenger × defender confrontation:
+**Review gate (before complete-slice):** If `unit_type == complete-slice`, run the **dialectic review** on the slice diff BEFORE dispatching `forge-completer` (the run branch `forge/{run}` is still unmerged here — it stays unmerged until the operator integrates it — so the diff is intact). This is the challenger × defender confrontation:
 
 1. Idempotency: if `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-REVIEW.md` already exists → skip the gate, proceed to `complete-slice`.
 2. Read `review.{mode,style,rounds,ask_in_auto,engine,challenger,challenger_model}` via the cascade in `shared/forge-review.md § Step 0`. If `mode == disabled` → skip.
@@ -690,7 +690,7 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
 
 > Fires ONLY when the derived unit is `complete-slice`. Boundary is per-slice; standalone `/forge-task` keeps its own step-5.5 review. After the gate, dispatch `forge-completer` normally.
 
-**Slice git guard (around complete-slice):** `complete-slice` never integrates a branch — that is `complete-milestone`'s competence (`agents/forge-completer.md § Git boundary — complete-slice`). Snapshot the checkout **before** dispatching, verify **after** the worker returns:
+**Slice git guard (around complete-slice):** `complete-slice` never integrates a branch — no unit of the loop does; integration is the operator's act on the delivered `forge/{run}` branch (`agents/forge-completer.md § Git boundary — complete-slice`). Snapshot the checkout **before** dispatching, verify **after** the worker returns:
 
 ```bash
 # before Agent("forge-completer", ...)
@@ -706,7 +706,7 @@ The snapshot is written to `.gsd/forge/` on purpose — shell variables do not s
 1. Scan all `{S##}-REVIEW.md` under `.gsd/milestones/{M###}/slices/*/` for pending items: `Decisão: deferido → triagem no fim da milestone`, `Correção: falhou — deferida para triagem final`, or legacy `Decisão: deferido (auto-mode)`.
 2. Zero pending → skip silently and dispatch `complete-milestone` normally.
 3. Otherwise **fire push (call-site 2):** use Push helper with message `"Forge {RUN_ID} — {N} item(ns) de review aguardam sua triagem antes de fechar a milestone."` (N = count of pending items). Then print the digest table (slice · R# · path:line · objeção · status) and triage each item via `AskUserQuestion` (batched up to 4, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
-4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (slices already merged — fixes are normal commits). **Before dispatching**, run the cross-run claim gate exactly as `shared/forge-review.md § Step 9` prescribes (it references `shared/forge-claim-gate.md § Step 1` for the `--conceded` claim derivation of the triage items — not repeated here); dispatch only when the gate decision is `proceed`. Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items create an item per `shared/forge-review.md § Item capture` (source `review/{S##}/{R#}`, status `inbox`, provenance from the digest row) and append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing — this survives `milestone_cleanup`; the item is the single destination for full content).
+4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (nothing has been integrated at this point — the fix commits on the still-checked-out `forge/{run}` branch). **Before dispatching**, run the cross-run claim gate exactly as `shared/forge-review.md § Step 9` prescribes (it references `shared/forge-claim-gate.md § Step 1` for the `--conceded` claim derivation of the triage items — not repeated here); dispatch only when the gate decision is `proceed`. Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items create an item per `shared/forge-review.md § Item capture` (source `review/{S##}/{R#}`, status `inbox`, provenance from the digest row) and append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing — this survives `milestone_cleanup`; the item is the single destination for full content).
 5. Append the `review-triage` event to `events.jsonl`. The triage **never blocks** the milestone close-out.
 
 > **This gate is the explicit exception to the AUTONOMY RULE** — at this point every slice is done; asking the operator here is the designed arbitration moment that `defer` postponed to. It does not fire on pause/blocked/partial exits — only when the derived unit is `complete-milestone`.
@@ -2075,6 +2075,9 @@ If the cleanup output contains `status: "error"` entries, surface them in the fi
 
 ```
 ✓ Milestone {M###} completo
+
+Entregável: branch `forge/{run}` — pronta para push e PR.
+Pronta para PR — a integração na branch default é do OPERADOR; o loop nunca integra.
 
 Slices entregues:
 | Slice | Título | Tasks |

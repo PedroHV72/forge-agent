@@ -78,7 +78,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y subversion
 
       - name: Run test suites
-        run: node scripts/run-tests.js
+        # The baseline is what makes "CI is red" carry information again. Every
+        # suite still runs and logs; only the exit code consults the known-failure
+        # set for this platform, and it compares BOTH ways — a new red fails, and
+        # a suite that healed while staying listed fails too, so the list cannot
+        # rot into a green-but-inert gate. Measured cause: 20 of the last 20 PRs
+        # merged with windows-latest red, which is why the wrapper-readers break
+        # (the #94 x #98 interaction) was indistinguishable from the chronic noise.
+        run: node scripts/run-tests.js --baseline scripts/fixtures/ci-baseline/known-failures.json
 
       - name: Smoke suite (release gate)
         if: runner.os != 'Windows'

@@ -169,9 +169,20 @@ if (remove) {
 }
 
 // ── ENABLE mode ─────────────────────────────────────────────────────────────
+// The statusline runs from the Forge home core (`~/.forge-agent/scripts/`),
+// the one copy the installer recopies wholesale on every install/update
+// (forge-installer.js MANAGED_CORE). Its companion modules (forge-runs.js,
+// forge-accounts.js, forge-prefs.js, forge-usage-poll.js) resolve as
+// `__dirname` siblings there. The previous flat `~/.claude/forge-statusline.js`
+// was a render target of no source in forge-source-manifest.json — it froze
+// across releases, and lost every companion once retireLegacyScripts removed
+// `~/.claude/scripts/`. REMOVE mode matches by basename
+// (`.includes('forge-statusline.js')`), so both the old and the new path stay
+// removable; and because this assignment is unconditional, existing installs
+// migrate to the maintained path on their next merge.
 settings.statusLine = {
   type           : 'command',
-  command        : 'node ~/.claude/forge-statusline.js',
+  command        : 'node ~/.forge-agent/scripts/forge-statusline.js',
   refreshInterval: 1,
 };
 

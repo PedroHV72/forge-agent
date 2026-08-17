@@ -38,7 +38,7 @@ Cada fase tem um agente dedicado com modelo configurável:
 | `forge-researcher` | **Opus** | research | Análise profunda de codebase e identificação de riscos |
 | `forge-planner` | **Opus** | plan | Decomposição arquitetural, boundary maps, task sizing |
 | `forge-executor` | **Sonnet** | execute | Implementação eficiente, boa relação custo/qualidade |
-| `forge-completer` | **Sonnet** | complete | Síntese de summaries, UAT scripts, squash merge |
+| `forge-completer` | **Sonnet** | complete | Síntese de summaries, UAT scripts; tag e push da branch do run no fecho — nunca integra (a integração é do operador) |
 | `forge-worker` | **Sonnet** | step mode | Worker genérico para execução manual |
 | `forge-memory` | **Haiku** | pós-unidade | Extração barata de memórias do transcript (fire-and-forget) |
 

@@ -6,7 +6,12 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { writeFragment } = require('./forge-memory');
-const { detectMentions, detectSignalMentions, classifyCitationPrecision, measureF2 } = require('./forge-index-f2');
+const { detectMentions, detectSignalMentions, detectorFalsePositive, classifyCitationPrecision, measureF2 } = require('./forge-index-f2');
+
+// Helper for the noise-rule tests: [raw, motivo] for every detected mention.
+function fpOf(text) {
+  return detectMentions(text).map((item) => [item.raw, detectorFalsePositive(item)]);
+}
 
 let passed = 0;
 function test(name, fn) {
@@ -37,7 +42,7 @@ function fixture() {
     unit_id: 'T01',
     facts: [
       fact('f-covered', '`scripts/covered.js`'),
-      fact('f-partial', '`scripts/partial.js` e other.weird'),
+      fact('f-partial', '`scripts/partial.js` e other.py'),
       fact('f-missed', 'Veja scripts/absent.js'),
       fact('f-no-mention', 'Uma decisão sem arquivo.'),
       fact('f-fp', 'O plano T01-PLAN.md foi revisado.'),
@@ -85,7 +90,7 @@ test('mede covered, partial, missed e no-mention por listas', () => {
     assert.strictEqual(report.facts_missed_total.length, 0);
     assert.strictEqual(report.facts_missed_partial.length, 1);
     assert.strictEqual(report.facts_no_mention.length, 2);
-    assert.strictEqual(report.facts_missed_partial[0].missing_mentions[0].normalized, 'other.weird');
+    assert.strictEqual(report.facts_missed_partial[0].missing_mentions[0].normalized, 'other.py');
     assert.strictEqual(report.f2_recall, 1 - 1 / 4);
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
@@ -170,7 +175,9 @@ test('menção só-ruído não conta como missed; menção real ainda conta', ()
       unit_id: 'T01',
       facts: [
         fact('só-ruído', 'A versão 3.1.2 apareceu e/ou não.'),
-        fact('menção-real', 'Veja outro.weird aqui.'),
+        // `.py` é extensão REAL fora do CODE_EXT do extrator: continua sinal
+        // (gap do extrator), diferente de `.weird`, que virou ruído enumerado.
+        fact('menção-real', 'Veja outro.py aqui.'),
       ],
     });
     const report = measureF2(cwd);
@@ -189,6 +196,105 @@ test('detectSignalMentions remove o ruído que detectMentions ainda reporta', ()
   const text = 'A versão 3.1.2 e/ou o arquivo real.js.';
   assert.strictEqual(detectMentions(text).length, 3);
   assert.deepStrictEqual(detectSignalMentions(text).map((item) => item.normalized), ['real.js']);
+});
+
+// ── Ruído do instrumento (censo 2026-08-15): cada regra com caso que morde ───
+// Cada teste asserta o MOTIVO exato: reverter a regra específica muda o motivo
+// (ou o torna null) e o teste falha — nenhuma regra é coberta por outra.
+
+test('cleanToken tira pontuação à esquerda: (forge-smoke.js normaliza igual à citação', () => {
+  // Revert da limpeza à esquerda → normalized vira '(forge-smoke.js' e diverge
+  // da citação que o extrator produz corretamente (8 misses fantasma medidos).
+  const mentions = detectMentions('Guard em (forge-smoke.js e (install.sh, hoje.');
+  assert.deepStrictEqual(mentions.map((item) => item.normalized), ['forge-smoke.js', 'install.sh']);
+  assert.deepStrictEqual(detectMentions("'forge-runs.js")[0].normalized, 'forge-runs.js');
+  // Continuam sinal — a limpeza não pode criar falso positivo.
+  assert.deepStrictEqual(detectSignalMentions('(forge-smoke.js').map((item) => item.normalized), ['forge-smoke.js']);
+});
+
+test('abreviação latina e.g/i.e é ruído nomeado, não arquivo', () => {
+  const motivo = 'abreviação latina (e.g/i.e), não arquivo';
+  // O motivo é assertado por igualdade: sem a regra dedicada, `(e.g.,` cairia
+  // na regra de sufixo genérica e o motivo mudaria — o teste morde a regra certa.
+  const eg = detectMentions('(e.g., exemplo')[0];
+  assert.strictEqual(eg.normalized, 'e.g');
+  assert.strictEqual(detectorFalsePositive(eg), motivo);
+  const ie = detectMentions('(i.e. isto')[0];
+  assert.strictEqual(detectorFalsePositive(ie), motivo);
+  // Composto ('threshold—e.g.,') não é a abreviação nua: cai na regra de sufixo
+  // — ainda ruído, mas com a razão que de fato o classifica.
+  assert.deepStrictEqual(
+    fpOf('threshold—e.g., fora.'),
+    [['threshold—e.g.,', 'sufixo não é extensão de arquivo real (identificador com ponto)']],
+  );
+});
+
+test('placeholder/template/glob é ruído nomeado: ##, {x}, <x>, *', () => {
+  const motivo = 'placeholder/template/glob (##, {x}, <x>, *), não um arquivo concreto';
+  // `T##-PLAN.md` morde: o sufixo `.md` é extensão REAL, então só a regra de
+  // placeholder o descarta — revert → volta a ser menção-sinal e o teste falha.
+  for (const raw of ['T##-PLAN.md', 'runs/{id}.json', 'agent-<id>.jsonl', 'evidence-*.jsonl', 'xllm-state-{unitId}.json']) {
+    const mention = detectMentions(raw)[0];
+    assert(mention, `${raw} deve ser detectado antes de ser classificado`);
+    assert.strictEqual(detectorFalsePositive(mention), motivo, raw);
+  }
+  // Um plano concreto continua sinal: a regra não engole T01-PLAN.md.
+  assert.strictEqual(detectorFalsePositive(detectMentions('T01-PLAN.md')[0]), null);
+});
+
+test('token entre crases sem extensão e sem barra é keyword/flag, não arquivo', () => {
+  const motivo = 'keyword/flag entre crases, sem extensão de arquivo nem barra';
+  // '`default`' morde: sem ponto e sem barra, NENHUMA outra regra o alcança —
+  // revert → detectorFalsePositive volta null e o strictEqual falha.
+  for (const raw of ['`default`', '`--cwd`', '`if`', '`domain:`', '`expected_output`']) {
+    assert.strictEqual(detectorFalsePositive(detectMentions(raw)[0]), motivo, raw);
+  }
+  // Crases com extensão real ou com barra continuam sinal.
+  assert.strictEqual(detectorFalsePositive(detectMentions('`forge-hook.js`')[0]), null);
+  assert.strictEqual(detectorFalsePositive(detectMentions('`scripts/forge-hook.js`')[0]), null);
+});
+
+test('referência a diretório entre crases (barra final) é ruído nomeado', () => {
+  // '`.gsd/`' morde: basename vazio escapa das regras de sufixo e de crases
+  // (tem barra) — sem esta regra vira menção permanentemente incasável.
+  assert.strictEqual(detectorFalsePositive(detectMentions('`.gsd/`')[0]), 'referência a diretório (termina em /), não arquivo');
+});
+
+test('sufixo que não é extensão de arquivo real é identificador, não arquivo', () => {
+  const motivo = 'sufixo não é extensão de arquivo real (identificador com ponto)';
+  // 'JSON.parse' morde: não é crase, não é placeholder, não é versão — só a
+  // regra de extensão-real o descarta; revert → volta a inflar o denominador.
+  for (const raw of ['JSON.parse', 'turn.id', 'cmd.exe', 'v2.0', 'it.skip', '.svn', 'evidence.mode']) {
+    const mention = detectMentions(raw)[0];
+    assert(mention, `${raw} deve ser detectado antes de ser classificado`);
+    assert.strictEqual(detectorFalsePositive(mention), motivo, raw);
+  }
+  // Extensões reais fora do CODE_EXT do extrator PERMANECEM sinal: o detector
+  // continua uma segunda observação mais larga (gap do extrator visível).
+  for (const raw of ['events.jsonl', 'seed.txt', 'GitActivity.swift', 'other.py', 'main.go']) {
+    assert.strictEqual(detectorFalsePositive(detectMentions(raw)[0]), null, raw);
+  }
+});
+
+test('descarte das novas classes é enumerado no relatório com motivo nomeado', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'f2-inst-'));
+  try {
+    writeFragment(cwd, {
+      unit_id: 'T01',
+      facts: [fact('só-instrumento', 'Formatos (e.g., `--cwd`) em T##-PLAN.md via JSON.parse e `.gsd/`.')],
+    });
+    const report = measureF2(cwd);
+    // O fato sai do denominador (nenhuma menção-sinal restante)...
+    assert.strictEqual(report.verdict, 'EMPTY-DENOMINATOR');
+    assert.deepStrictEqual(report.facts_no_mention.map((item) => item.mem_id), ['só-instrumento']);
+    // ...mas cada classe descartada aparece CONTADA com sua razão nomeada.
+    const byRaw = new Map(report.detector_false_positives.map((item) => [item.raw, item.motivo]));
+    assert.strictEqual(byRaw.get('(e.g.,'), 'abreviação latina (e.g/i.e), não arquivo');
+    assert.strictEqual(byRaw.get('`--cwd`)'), 'keyword/flag entre crases, sem extensão de arquivo nem barra');
+    assert.strictEqual(byRaw.get('T##-PLAN.md'), 'placeholder/template/glob (##, {x}, <x>, *), não um arquivo concreto');
+    assert.strictEqual(byRaw.get('JSON.parse'), 'sufixo não é extensão de arquivo real (identificador com ponto)');
+    assert.strictEqual(byRaw.get('`.gsd/`.'), 'referência a diretório (termina em /), não arquivo');
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
 console.log(`\n${passed} testes F2 passaram`);

@@ -956,6 +956,37 @@ process.stdin.on('end', () => {
                     return;
                   }
 
+                  if (contract && contract.admit === false) {
+                    // Critical pressure: admission refused — the same guard
+                    // forge-verify.js / forge-reverify.js already carry. D3
+                    // is LOCKED: never refuse the spawn. Skip the rewrite and
+                    // let the command through byte-identical rather than hand
+                    // the planner a zero-worker contract: `--maxWorkers=0` /
+                    // `VITEST_MAX_FORKS=0` are FALSY to the runners, so the
+                    // "cap" the rewrite would announce does not exist (full
+                    // parallelism), and playwright's `--workers=0` can break
+                    // the command outright. Emitting `rewrite-applied` here
+                    // would be telemetry claiming control at the exact moment
+                    // there is none. The reason reuses the enum member
+                    // forge-resources.js owns (D8) — if a stale installed
+                    // copy lacks REASON_CODES the member access throws and
+                    // the inner catch still falls through intact (MEM008).
+                    const refusedReason =
+                      resourcesMod.REASON_CODES.INTACT_ADMISSION_REFUSED_ADVISORY;
+                    if (acquiredHandle) {
+                      // W5: an admit:false contract holds no slots today
+                      // (acquireCommandBudget returns before the pool), but a
+                      // future acquire path that does grant one must not leak
+                      // its lease through this branch.
+                      try {
+                        recordRewriteStage('release-admission-refused');
+                        resourcesMod.releaseCommandBudget(acquiredHandle, { cwd });
+                      } catch { /* MEM008 */ }
+                    }
+                    appendRewriteEvent(cwd, 'rewrite-skipped', { reason: refusedReason });
+                    return;
+                  }
+
                   const plan = rewriteMod.planRewrite(cmd, contract, { cwd });
                   if (plan.outcome === 'rewritten') {
                     if (fault === 'emission') throw new Error('forced-fault:emission');

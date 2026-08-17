@@ -1,43 +1,43 @@
 {
   "runtime": "claude",
-  "version": "4.11.0",
+  "version": "4.15.0",
   "newline": "lf",
   "origin_header": "markdown-only",
   "surfaces": [
     {
       "source_id": "agents",
       "target": "agents",
-      "sha256": "e061ec917ea486aa0928e3ce8023619ad38e366d477a4c9bdbc0e99bbdc18259"
+      "sha256": "fdb7417d41412cfed34b5f0d516bad86f81c42ed160e289f7c8731212a6bc504"
     },
     {
       "source_id": "commands",
       "target": "commands",
-      "sha256": "26a9fb470c93b79501e101e5428de31b5e4bf5268a938a5e6ef3cf73d74ec69b"
+      "sha256": "947dfd9965956530ceb7f9cd028927333878d0369ab524d299f1e740cdc6ce0f"
     },
     {
       "source_id": "skills",
       "target": "skills",
-      "sha256": "000bd50d5a4af3792700c63afab1eb81eee0d5a1cb17ff57d1d454aa08705661"
+      "sha256": "735f6b50664d9149df952bc1169ec12a41657668f9c5621f9af39a866ff49772"
     },
     {
       "source_id": "dispatch-templates",
       "target": "shared/templates/dispatch",
-      "sha256": "9f9625f89e3c2164d8b9f4b1477bcfaddd2ec3fa36d73c9faa5bdcfb3ab3fabb"
+      "sha256": "f95e4f0c18eb79087dc29fb01a710caa344f9b8605377e32766d97415df38c8e"
     },
     {
       "source_id": "hooks",
       "target": "hooks/forge-hook.js",
-      "sha256": "8029158047e94a06c5424c97321de76e92fb88b0b87b750f5e2a65bb25052fd4"
+      "sha256": "f5849544404b5a249be935b7db634353a640bdd5c8062f1e4536c8d8f94e59ff"
     },
     {
       "source_id": "mcp",
       "target": "forge/forge-mcps.md",
-      "sha256": "35f693ffc959230dece66769bb1e468a36e3eeee930909f188f43fb2b6857fd0"
+      "sha256": "b404a201fa69876e118d52e40f5bcd542934d991b099a7f07076a67c41cbe6e9"
     },
     {
       "source_id": "claude-instructions",
       "target": "project/CLAUDE.md",
-      "sha256": "50eec0c035b7b2ed826b1a5265a535401a2183790b6b2c3d192a4eb0f4558565"
+      "sha256": "2dfb5c782590d564f19d7253cc43c295d0454628402211c48f0d67025c639eb6"
     },
     {
       "source_id": "claude-settings",
@@ -47,7 +47,7 @@
     {
       "source_id": "configuration",
       "target": "forge-capabilities.json;forge-prefs.schema.json",
-      "sha256": "2b7434304f9a72d3dea9df7c901d13dd2f391879b7dd364dc19715ea87956bab"
+      "sha256": "e300611f900fb1a3477bd7f715d3ab7277aef53466f55c865c280015f6f5823e"
     }
   ]
 }

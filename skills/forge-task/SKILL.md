@@ -1257,7 +1257,7 @@ Challenger routing (`review.challenger: claude|codex|gemini`) follows `shared/fo
 
 **Compute DIFF_CMD** (task boundary). VCS-aware — git keeps the `START_SHA` marker path unchanged; an SVN working copy routes through `scripts/forge-review-diff.js` (M017 Phase 2). In `worktree` mode the commits live in `CODE_DIR`, so every VCS call targets it.
 
-**SVN — write the unit manifest first.** The manifest is what keeps the review inside this unit's work: an SVN working copy has no per-slice branch and is routinely shared by several developers at once, so an unscoped `svn diff` carries a colleague's uncommitted files. Emit the result block's `files_changed` paths, one per line. This file is optional — `--unit-dir` also mines the task's own `*-PLAN.md`/`*-SUMMARY.md` — and an empty/absent manifest degrades to today's unscoped diff, never to an empty one:
+**SVN — write the unit manifest first.** The manifest is what keeps the review inside this unit's work: an SVN working copy has no isolation branch and is routinely shared by several developers at once, so an unscoped `svn diff` carries a colleague's uncommitted files. Emit the result block's `files_changed` paths, one per line. This file is optional — `--unit-dir` also mines the task's own `*-PLAN.md`/`*-SUMMARY.md` — and an empty/absent manifest degrades to today's unscoped diff, never to an empty one:
 ```bash
 printf '%s\n' {files_changed paths from the ---GSD-WORKER-RESULT--- block, one per line} \
   > .gsd/tasks/{TASK_ID}/.review-manifest 2>/dev/null || true

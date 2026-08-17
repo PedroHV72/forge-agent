@@ -101,8 +101,13 @@ function mkProject(dir) {
 }
 
 // Synthetic homes. Neither is the real one — that is the whole point.
-const HOME_A = '/synthetic/homeA';
-const HOME_B = '/synthetic/homeB';
+// Resolved through the same lens the code under test applies to every path
+// (`path.resolve`): on Windows a bare `/synthetic/homeA` anchors on the
+// current drive (`D:\synthetic\homeA` on the CI runner), so an unresolved
+// literal compared byte-for-byte against the code's output only matches on
+// POSIX, where resolve is the identity on these strings.
+const HOME_A = path.resolve('/synthetic/homeA');
+const HOME_B = path.resolve('/synthetic/homeB');
 const ROOTS = [{ path: '~/Development', primary: true }];
 
 // The pathological live entry: spaces, and under no root — one fixture that
@@ -149,10 +154,13 @@ test('under $HOME but outside every root → ~-relative, root null', () => {
 });
 
 test('outside $HOME entirely → absolute verbatim, root null', () => {
-  const abs = '/opt/work/thing';
+  // Resolved first: the codec stores `path.resolve(abs)`, and on Windows
+  // `path.resolve('/opt/work/thing')` is drive-anchored (`D:\opt\work\thing`),
+  // so "verbatim" means "the resolved spelling", on both platforms.
+  const abs = path.resolve('/opt/work/thing');
   const { enc, back } = roundTrip(abs, HOME_A, ROOTS);
   assertEq(enc.root, null, 'sem root');
-  assertEq(enc.path, '/opt/work/thing', 'absoluto preservado');
+  assertEq(enc.path, abs, 'absoluto preservado');
   assertEq(back, abs, 'round-trip');
 });
 
@@ -259,11 +267,14 @@ test('R4: relative root inside roots[] (encodeEntryPath containment scan) is ref
 console.log('\nportability across $HOME');
 
 test('a registry encoded under homeA resolves correctly under homeB', () => {
+  // Same drive-anchoring note as the codec test above: the code stores the
+  // `path.resolve`d spelling, so the fixture must speak it too.
+  const outsideAbs = path.resolve('/opt/outside/thing');
   const absA = [
     path.join(HOME_A, 'Development', 'forge-agent'),
     path.join(HOME_A, 'Development', 'lookchina', 'services', 'freyr'),
     path.join(HOME_A, 'Library', 'Application Support', 'Forge', 'Sandbox'),
-    '/opt/outside/thing',
+    outsideAbs,
   ];
   const encoded = absA.map(a => encodeEntryPath(a, ROOTS, HOME_A));
 
@@ -276,7 +287,7 @@ test('a registry encoded under homeA resolves correctly under homeB', () => {
   assertEq(backB[0], path.join(HOME_B, 'Development', 'forge-agent'), 'root-relativa migra');
   assertEq(backB[1], path.join(HOME_B, 'Development', 'lookchina', 'services', 'freyr'), 'aninhada migra');
   assertEq(backB[2], path.join(HOME_B, 'Library', 'Application Support', 'Forge', 'Sandbox'), 'Sandbox migra');
-  assertEq(backB[3], '/opt/outside/thing', 'fora do home permanece literal');
+  assertEq(backB[3], outsideAbs, 'fora do home permanece literal');
 });
 
 // ── Kind derivation ─────────────────────────────────────────────────────────
@@ -641,14 +652,17 @@ test('migrate() é puro — nenhuma chamada a fs no corpo da função', () => {
 });
 
 test('migrate() aceita fatos fabricados, sem tocar em disco algum', () => {
-  const home = '/synthetic/factsonly';
-  const dev = home + '/Development';
-  const oldPaths = [dev + '/forge-agent', dev + '/lookchina/services'];
+  // Resolved + path.join like every other synthetic home here: on Windows a
+  // bare `/synthetic/...` literal drive-anchors under `path.resolve`, and the
+  // codec inside migrate() compares the resolved spellings.
+  const home = path.resolve('/synthetic/factsonly');
+  const dev = path.join(home, 'Development');
+  const oldPaths = [path.join(dev, 'forge-agent'), path.join(dev, 'lookchina', 'services')];
   const facts = {
     home,
     entries: [
-      { path: dev + '/forge-agent', exists: true, kind: 'project' },
-      { path: dev + '/lookchina/services', exists: true, kind: 'touched' },
+      { path: path.join(dev, 'forge-agent'), exists: true, kind: 'project' },
+      { path: path.join(dev, 'lookchina', 'services'), exists: true, kind: 'touched' },
     ],
     ancestors: [],
     roots: [{ name: 'Development', path: dev, exists: true }],

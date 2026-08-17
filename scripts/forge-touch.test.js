@@ -438,6 +438,39 @@ test('R8d: a registered-but-absent worktree is SKIPPED with a name, never silent
   noteReason(r.reason);
 });
 
+// ── F2 — repoIdentity uses the SHARED canonicalizer, not a private realpath ──
+//
+// Measured on the Windows CI runner: os.tmpdir() hands paths in 8.3 short form
+// (C:\Users\RUNNER~1\...) while git prints the long form — a repoIdentity that
+// realpaths privately with plain fs.realpathSync (which does not expand 8.3)
+// minted TWO identities for one repo, so worktree/checkout matching matched
+// nothing. repoIdentity now delegates to realpathCanonical from
+// forge-isolation.js; the source guard proving no private fs.realpathSync(
+// call survives in this file lives in forge-isolation.test.js (F2), next to
+// the helper, and bites on every platform.
+
+test('F2: repoIdentity converges two spellings of one repo (symlink here; the Windows-only 8.3 divergence is covered by the shared helper\'s own test)', () => {
+  if (process.platform === 'win32') {
+    console.log('  (skip: on Windows the divergent spelling is an 8.3 short name, not a symlink, and symlink creation needs elevation — the 8.3 case is exercised against the SAME realpathCanonical helper in forge-isolation.test.js, so this is a declared platform split, not a silent pass)');
+    return;
+  }
+  const base = mktmp('forge-touch-canon-');
+  const real = path.join(base, 'real-repo');
+  makeCleanRepo(real);
+  const link = path.join(base, 'link-repo');
+  fs.symlinkSync(real, link);
+
+  const idReal = touch.repoIdentity(real);
+  const idLink = touch.repoIdentity(link);
+  assert(idReal !== null && idLink !== null, 'both spellings must yield an identity');
+  assertEqual(idLink, idReal,
+    'one repo reached through two spellings must yield ONE identity — two identities is the exact CI failure shape');
+  // Non-vacuous: a repoIdentity regressed to lexical path.resolve would keep
+  // the link spelling and the equality above would go red.
+  assert(path.resolve(link, '.git') !== idLink,
+    'sanity: the lexical spelling of the link\'s .git must differ from the canonical identity, or this test cannot bite');
+});
+
 // ── R4 — TOUCH_REASONS: every value reachable, nothing unreachable emitted ──
 
 test('R4: every emitted reason belongs to TOUCH_REASONS, and every TOUCH_REASONS value was actually seen', () => {

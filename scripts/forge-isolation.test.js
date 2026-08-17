@@ -37,6 +37,7 @@ const {
   listWorktreesForBranch, listForgeWorktrees, parseWorktreePorcelain,
   normalizeWorktreePath, cleanupForRun, setupForRun, deriveWorktreePath,
   resolveWorktreeAnchor, validateWorktreeDirName,
+  realpathCanonical, gitDefaultBranch,
 } = isolation;
 const workspace = require('./forge-workspace.js');
 
@@ -65,7 +66,13 @@ function assert(cond, msg) {
 function assertEq(actual, expected, msg) {
   const comparable = (value) => {
     if (typeof value !== 'string' || !(/^[\\/]/.test(value) || /^[A-Za-z]:[\\/]/.test(value))) return value;
-    return path.resolve(value).toLowerCase();
+    // The SAME canonicalizer the code under test uses (realpathCanonical),
+    // never a private lexical one: path.resolve() leaves Windows 8.3 short
+    // names (C:\Users\RUNNER~1\...) unexpanded while git prints the long
+    // form, so a lexical normalizer here compares two spellings of one path
+    // as different — the exact mismatch class this suite exists to catch,
+    // reproduced in the "expected [removed]" CI failures.
+    return realpathCanonical(value).toLowerCase();
   };
   const a = JSON.stringify(comparable(actual));
   const e = JSON.stringify(comparable(expected));
@@ -1380,6 +1387,210 @@ test('UNMET_ASK_REASONS: every member of the closed set was reached by at least 
 
 test('UNMET_ASK_REASONS: is frozen (Object.freeze)', () => {
   assert(Object.isFrozen(UNMET_ASK_REASONS), 'UNMET_ASK_REASONS must be frozen');
+});
+
+// ── F2 — realpathCanonical: one canonicalizer, 8.3-aware, symlink-aware ─────
+//
+// Windows CI measured: os.tmpdir() spells C:\Users\RUNNER~1\... (8.3 short
+// form) while git prints C:\Users\runneradmin\... . fs.realpathSync resolves
+// symlinks but does NOT expand 8.3; fs.realpathSync.native does. A helper that
+// regresses to plain realpathSync re-splits one repo into two identities.
+// Third occurrence of "lexical comparison where only real-vs-real is truth"
+// in this repo (memory-index containment, sweep vault PR #100, now this).
+
+test('F2: source guard — plain fs.realpathSync( survives ONLY inside realpathCanonical, and both consumers route through it', () => {
+  const isoSrc   = fs.readFileSync(path.join(__dirname, 'forge-isolation.js'), 'utf8');
+  const touchSrc = fs.readFileSync(path.join(__dirname, 'forge-touch.js'), 'utf8');
+
+  // `fs.realpathSync(` (with the open paren) never matches the `.native(`
+  // spelling. Positive control first, so a blind miner cannot go green.
+  const PLAIN = /fs\.realpathSync\(/g;
+  assert('try { return fs.realpathSync(x); }'.match(PLAIN).length === 1,
+    'positive control: the plain-call pattern must match a synthetic plain call');
+  assert('fs.realpathSync.native(x)'.match(PLAIN) === null,
+    'positive control: the plain-call pattern must NOT match the .native spelling');
+
+  // Exactly one plain call in forge-isolation.js: the middle rung of the
+  // ladder inside realpathCanonical (native → plain → path.resolve).
+  const isoPlain = isoSrc.match(PLAIN) || [];
+  assertEq(isoPlain.length, 1,
+    'forge-isolation.js: exactly ONE plain fs.realpathSync( call (the fallback rung inside realpathCanonical) — ' +
+    'a second one means a caller regressed to the 8.3-blind form');
+  const helperBody = isoSrc.slice(isoSrc.indexOf('function realpathCanonical'));
+  const helperHead = helperBody.slice(0, helperBody.indexOf('\n}'));
+  assert(/fs\.realpathSync\.native\(/.test(helperHead),
+    'realpathCanonical must keep fs.realpathSync.native as its first rung — removing it reintroduces the 8.3 split');
+  assert(/fs\.realpathSync\(/.test(helperHead),
+    'realpathCanonical must keep the plain fs.realpathSync fallback rung (.native can fail on network drives)');
+
+  // forge-touch.js: zero private realpath calls; repoIdentity delegates.
+  assertEq((touchSrc.match(PLAIN) || []).length, 0,
+    'forge-touch.js must have NO private fs.realpathSync( call — repoIdentity regressed to its own copy');
+  assert(/realpathCanonical\(/.test(touchSrc),
+    'forge-touch.js must call the shared realpathCanonical (repoIdentity)');
+  const normBody = isoSrc.slice(isoSrc.indexOf('function normalizeWorktreePath'));
+  assert(/realpathCanonical\(/.test(normBody.slice(0, normBody.indexOf('\n}'))),
+    'normalizeWorktreePath must delegate to realpathCanonical, not carry its own resolution');
+});
+
+test('F2: symlink rung — realpathCanonical converges link and target (bites a regression to lexical path.resolve)', () => {
+  if (process.platform === 'win32') {
+    console.log('  (skip: symlink creation needs elevation/dev-mode on Windows — the symlink rung is proven on POSIX; the Windows-only 8.3 rung has its own test below)');
+    return;
+  }
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-canon-link-'));
+  try {
+    const real = path.join(base, 'real-dir');
+    fs.mkdirSync(real);
+    const link = path.join(base, 'link-dir');
+    fs.symlinkSync(real, link);
+    assertEq(realpathCanonical(link), realpathCanonical(real),
+      'link and target must canonicalize to one spelling');
+    // Non-vacuous: a resolver regressed to lexical path.resolve would keep
+    // the two spellings apart, so the equality above genuinely bites.
+    assert(path.resolve(link) !== realpathCanonical(link),
+      'sanity: the link spelling must differ from the canonical one, or the equality above is vacuous');
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('F2: Windows 8.3 rung — short (RUNNER~1-style) and long spellings converge; plain realpathSync would not', () => {
+  if (process.platform !== 'win32') {
+    console.log('  (skip: 8.3 short names exist only on Windows/NTFS — this exact effect cannot be reproduced on POSIX; the shared-helper source guard above bites on every platform)');
+    return;
+  }
+  // The 8.3 alias comes from the OS, not from parsing a shell.
+  //
+  // Three CI rounds were spent trying to read `%~sI` out of cmd.exe and each one
+  // came back in a different shape — `"c:\...\"`, then `\"c:\...\"` (escaped
+  // quote), then nothing the extractor could find, which fed the helper an empty
+  // string and compared the CWD against the fixture. The measured environment
+  // makes all of that unnecessary: the runner's own `os.tmpdir()` IS
+  // `C:\Users\RUNNER~1\AppData\Local\Temp` — the short spelling is already in
+  // hand, and `.native` supplies the long one. That is also the exact real-world
+  // shape of the bug (tmpdir short, git's answer long), so the fixture now
+  // reproduces the incident instead of simulating it.
+  // No fixture directory is created, so there is nothing to clean up — and the
+  // absence of a `finally` here is deliberate: the previous version removed the
+  // temp tree it had made, and keeping that block while the paths became
+  // `os.tmpdir()` would have pointed a recursive delete at the system temp dir.
+  const shortDir = os.tmpdir();
+  const longDir = fs.realpathSync.native(shortDir);
+  {
+    if (shortDir.toLowerCase() === longDir.toLowerCase()) {
+      console.log('  (skip: this runner\'s tmpdir carries no 8.3 component (fsutil 8dot3name may be disabled) — no short alias exists to compare)');
+      return;
+    }
+    assertEq(realpathCanonical(shortDir).toLowerCase(), realpathCanonical(longDir).toLowerCase(),
+      'the 8.3 alias and the long name are ONE directory and must get ONE canonical spelling');
+    assertEq(normalizeWorktreePath(shortDir).toLowerCase(), normalizeWorktreePath(longDir).toLowerCase(),
+      'normalizeWorktreePath must inherit the 8.3 expansion — this is the exact comparison worktree matching does');
+    // The bite, stated as a measured fact: plain realpathSync leaves the 8.3
+    // component alone, so a helper regressed to it returns a DIFFERENT string
+    // for shortDir and the equality above goes red. If Node ever changes
+    // plain realpathSync to expand 8.3, this sanity assert fails loudly and
+    // the guard should be re-evaluated — never silently weakened.
+    assert(fs.realpathSync(shortDir).toLowerCase() !== fs.realpathSync.native(shortDir).toLowerCase(),
+      'sanity (non-vacuous): plain fs.realpathSync must still differ from .native on the 8.3 alias — otherwise this test no longer distinguishes the regression');
+  }
+});
+
+// ── F7 — gitDefaultBranch: no shell, no /dev/null, same fallback semantics ──
+//
+// The old `2>/dev/null` inside a shell:true string made cmd.exe fail the
+// symbolic-ref call itself (literal invalid path), so on Windows origin/HEAD
+// was ALWAYS ignored and the silent main/master fallback answered — the same
+// family as the "worktree born 13 commits behind" default-branch bug.
+
+test('F7: origin/HEAD set to a non-main branch is honored (on Windows the old redirect form always fell back)', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-defbranch-'));
+  try {
+    const bare = path.join(base, 'origin-trunk.git');
+    spawnSync('git', ['init', '--bare', '-b', 'trunk', bare], { encoding: 'utf8' });
+    const repo = path.join(base, 'clone');
+    git(['clone', '--quiet', bare, repo], base);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    git(['add', 'a.txt'], repo);
+    git(['commit', '-qm', 'init'], repo);
+    git(['push', '-q', '-u', 'origin', 'trunk'], repo);
+    git(['remote', 'set-head', 'origin', 'trunk'], repo);
+    // No 'main'/'master' branch exists here on purpose: under the pre-fix
+    // Windows behavior (symbolic-ref call fails at the shell) the ladder
+    // returns 'main' — which is a branch this repo does not even have.
+    assertEq(gitDefaultBranch(repo), 'trunk',
+      'origin/HEAD is set and readable — the fallback must not answer');
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('F7: failure semantics preserved — no origin/HEAD falls back to local main/master, garbage cwd falls back to main, never throws', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-defbranch-fb-'));
+  try {
+    // Local-only repo on master, no origin remote: symbolic-ref fails → the
+    // rev-parse ladder must answer 'master', exactly as before the fix.
+    const repo = path.join(base, 'local-master');
+    spawnSync('git', ['init', '-q', '-b', 'master', repo], { encoding: 'utf8' });
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    git(['add', 'a.txt'], repo);
+    git(['commit', '-qm', 'init'], repo);
+    assertEq(gitDefaultBranch(repo), 'master', 'no origin → local branch ladder answers');
+    // A cwd that is not a repo at all: every rung fails → 'main', no throw.
+    assertEq(gitDefaultBranch(path.join(base, 'does-not-exist')), 'main',
+      'total failure degrades to the historical default, never an exception');
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('F7: source guard — no exec call carries a POSIX /dev/null redirect, and symbolic-ref goes through execFileSync', () => {
+  const isoSrc = fs.readFileSync(path.join(__dirname, 'forge-isolation.js'), 'utf8');
+  const REDIRECT_CALL = /exec(?:File)?Sync\([^\n]*2>\/dev\/null/;
+  assert(REDIRECT_CALL.test("execSync('git foo 2>/dev/null', { shell: true })"),
+    'positive control: the miner must match a synthetic redirect-in-exec line');
+  assert(!REDIRECT_CALL.test(isoSrc),
+    'forge-isolation.js must not pass `2>/dev/null` to any exec call — cmd.exe reads it as a literal path and the call itself fails');
+  assert(/execFileSync\('git',\s*\['symbolic-ref'/.test(isoSrc),
+    'gitDefaultBranch must query origin/HEAD via execFileSync argv (no shell), or Windows regresses to permanent fallback');
+});
+
+// ── F4 — --migrate backup fsync: 'r+' fd, byte-compare stays ────────────────
+//
+// Windows CI measured: fsync maps to FlushFileBuffers, which needs WRITE
+// access on the handle — fsync over an fd opened 'r' fails with EPERM and
+// killed the migrate after the backup copy. POSIX accepts both modes, so the
+// behavioral case below cannot go red here pre-fix; the source guard is the
+// cross-platform bite, and this comment is the declaration of that limit.
+
+test('F4: --migrate on a legacy registry exits 0, writes a byte-identical .bak, and lands a versioned file', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-migrate-fsync-'));
+  try {
+    const home = path.join(base, 'home');
+    const proj = path.join(home, 'Projects', 'proj-a');
+    fs.mkdirSync(proj, { recursive: true });
+    const regFile = path.join(base, 'registry.json');
+    const legacy = JSON.stringify([proj]) + '\n';
+    fs.writeFileSync(regFile, legacy, 'utf8');
+
+    const res = spawnSync(process.execPath,
+      [path.join(__dirname, 'forge-workspace.js'), '--migrate', '--home', home, '--file', regFile],
+      { encoding: 'utf8' });
+    // Pre-fix on Windows this is where EPERM surfaced (fsync on a read-only
+    // fd), after the .bak was already copied — a half-done migrate.
+    assertEq(res.status, 0, `--migrate must exit 0 (stderr: ${(res.stderr || '').trim()})`);
+    const bak = regFile + '.bak';
+    assert(fs.existsSync(bak), '.bak must exist');
+    assert(fs.readFileSync(bak).equals(Buffer.from(legacy, 'utf8')),
+      '.bak must be byte-identical to the legacy original');
+    const migrated = JSON.parse(fs.readFileSync(regFile, 'utf8'));
+    assert(Number.isInteger(migrated.version) && migrated.version >= 1,
+      'the registry file must now carry a released schema version');
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("F4: source guard — the backup fd opens 'r+' (fsync needs write access on Windows) and the byte-compare proof stays", () => {
+  const wsSrc = fs.readFileSync(path.join(__dirname, 'forge-workspace.js'), 'utf8');
+  assert(wsSrc.includes("fs.openSync(bak, 'r+')"),
+    "the .bak fsync fd must open 'r+' — FlushFileBuffers rejects a read-only handle with EPERM on Windows");
+  assert(!wsSrc.includes("fs.openSync(bak, 'r')"),
+    "a plain 'r' open of the .bak fd is the measured Windows EPERM regression");
+  assert(/readFileSync\(bak\)\.equals\(original\)/.test(wsSrc),
+    'the byte-compare of .bak against the original is the real proof the backup landed — the fsync is not a substitute and the compare must never be removed');
 });
 
 // ── Summary ─────────────────────────────────────────────────────────────────

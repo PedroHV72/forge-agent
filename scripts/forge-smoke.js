@@ -5342,6 +5342,26 @@ function smokeDomainEmission() {
   assert(!/Dimension 11/.test(planCheckerTxt),
     '(j) agents/forge-plan-checker.md NÃO contém "Dimension 11" (extensão aditiva à dim-7, sem 11ª dimensão)',
     'ocorrência inesperada de "Dimension 11"');
+
+  // (k) CRLF real em disco (T-20260811190103) — extractFrontmatter normaliza
+  // \r\n?/\n na entrada; um arquivo CRLF real (formato exato da repro do
+  // brief), não apenas conteúdo sintetizado LF, deve ler legacy:false/valid:true.
+  const rK = runCheck(structuredWith('domain: backend').replace(/\n/g, '\r\n'));
+  assert(rK.status === 0 && rK.parsed && rK.parsed.legacy === false && rK.parsed.valid === true && rK.parsed.domain === 'backend',
+    '(k) plano CRLF real em disco → legacy:false, valid:true, domain:"backend" preservado', JSON.stringify(rK));
+
+  // (l) BOM real em disco — a outra metade da mesma classe. Um editor Windows
+  // grava UTF-8 com BOM; `^---` erra, o plano lê como legacy, o gate enforcing
+  // desliga E o `domain` some (degradando o routing de `routing.<domain>`).
+  // Cobre BOM+LF e BOM+CRLF, que é o que Notepad + autocrlf produzem juntos.
+  for (const [rotulo, transform] of [
+    ['BOM+LF', (t) => '\uFEFF' + t],
+    ['BOM+CRLF', (t) => '\uFEFF' + t.replace(/\n/g, '\r\n')],
+  ]) {
+    const rL = runCheck(transform(structuredWith('domain: backend')));
+    assert(rL.status === 0 && rL.parsed && rL.parsed.legacy === false && rL.parsed.valid === true && rL.parsed.domain === 'backend',
+      `(l) plano ${rotulo} real em disco → legacy:false, valid:true, domain:"backend" preservado`, JSON.stringify(rL));
+  }
 }
 
 // ── Section 35: guard de integração 3-família (gemini) + R5 whitelist ──────
@@ -7908,6 +7928,13 @@ function smokePrefsCutoverGuards() {
     // than silently missed by the repository-wide scan.
     'bin/forge-accounts', 'bin/forge-run', 'bin/forge-status',
     'skills/forge-doctor/SKILL.md', 'CLAUDE.md',
+    // The index-green allowed-misses list keys each accepted miss as
+    // `<mem_id>::<normalized mention>`, and one accepted miss IS a memory fact
+    // that mentions the legacy prefs filename. The occurrence is a RECORD of
+    // what an old fact says — not a live reference to the legacy file, and not
+    // something the cutover can rewrite without changing the key and breaking
+    // the match. Audited here rather than missed by the scan.
+    'scripts/fixtures/index-green/allowed-misses.json',
   ]);
   const untrackedProbe = path.join(REPO, '.forge-smoke-untracked-prefs-probe');
   fs.writeFileSync(untrackedProbe, 'forge-agent-prefs.md\n', 'utf8');
@@ -11842,14 +11869,18 @@ function smokeMultiRepoResolution() {
 // hashed, the OTHER run writes, and the first is re-hashed for byte-identity.
 //
 // Like Sections 84/85/86, every path lives under a synthetic `$HOME` in
-// mkdtemp/os.tmpdir(). The operator's real `~/.claude/forge-gate-workspaces.json`
-// is never read and never written — asserted at (h) by mtime, not claimed.
+// mkdtemp/os.tmpdir(). The registry every spawned CLI here can see is the
+// fixture's own copy inside that synthetic home — the no-write property is
+// measured on THAT copy at (h), with a positive control. A previous version
+// watched the operator's live `~/.claude/forge-gate-workspaces.json` by mtime
+// instead; that cannot prove the property, because the live file is
+// legitimately written by the app and by any concurrent forge session, so the
+// assert only held on an idle machine (same pathology as
+// forge-touch.test.js R5 / forge-resources-census R13, fixed in 0810c59).
 function smokeConcurrentRunAddresses() {
   process.stdout.write(
     '\n▸ Section 87: duas runs, mesmo projeto, branches diferentes — visíveis e não-corrompentes\n');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-concurrent-runs-'));
-  const liveRegistry = path.join(os.homedir(), '.claude', 'forge-gate-workspaces.json');
-  const liveMtimeBefore = fs.existsSync(liveRegistry) ? fs.statSync(liveRegistry).mtimeMs : null;
   try {
     const workspace = require(path.join(SCRIPTS, 'forge-workspace.js'));
     const { encodeEntryPath, writeRegistry } = workspace;
@@ -11879,6 +11910,14 @@ function smokeConcurrentRunAddresses() {
       quarantine: [],
     });
     runScript('forge-workspace.js', ['--home', home, '--file', file, '--sync-repos']);
+
+    // (h, opening half) After setup, no operation below may write the registry.
+    // The stamp is taken on the fixture's copy — the only registry any spawned
+    // process can reach, because every spawn below runs with HOME/USERPROFILE
+    // pointed at the synthetic home.
+    const registryStamp = () => `${fs.statSync(file).mtimeMs}:${fs.statSync(file).size}:`
+      + crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    const registryAfterSetup = registryStamp();
 
     const env = Object.assign({}, process.env, { HOME: home, USERPROFILE: home });
     const runsCli = args => runScript('forge-runs.js', ['--cwd', ws, ...args], { env });
@@ -12068,11 +12107,17 @@ function smokeConcurrentRunAddresses() {
       '(g) the one shared artifact (.gsd/STATE.md, under lock) lists BOTH runs — no run is clobbered by the other',
       dash.stdout + dash.stderr + '\n' + stateTxt.slice(0, 400));
 
-    // (h) Zero writes to the operator's live registry, proven by mtime.
-    const liveMtimeAfter = fs.existsSync(liveRegistry) ? fs.statSync(liveRegistry).mtimeMs : null;
-    assert(liveMtimeAfter === liveMtimeBefore,
-      "(h) the operator's live ~/.claude/forge-gate-workspaces.json mtime is unchanged — zero writes, measured",
-      `${liveMtimeBefore} → ${liveMtimeAfter}`);
+    // (h) Zero registry writes, measured on the isolated copy — not on the
+    //     operator's live file, which a concurrent forge session may
+    //     legitimately write at any moment.
+    assert(registryStamp() === registryAfterSetup,
+      '(h) the synthetic-home registry is byte-identical (mtime:size:sha256) after every runs/dashboard operation — the CLIs read it, never write it',
+      `${registryAfterSetup} → ${registryStamp()}`);
+    // Positive control: the same comparator must bite on a real write —
+    // an equality never seen failing proves nothing about what it detects.
+    fs.appendFileSync(file, '\n');
+    assert(registryStamp() !== registryAfterSetup,
+      '(h control) a deliberate append IS detected by the same comparator');
     assert(!fs.existsSync(path.join(process.cwd(), '.gsd', 'milestones', 'M-a')),
       '(h) no .gsd/ outside the fixture was created by this section');
 
@@ -12181,19 +12226,28 @@ function smokeDocClaimsGuard() {
 // --check`, `forge-doctor --check`), never just the modules: `exit 0 always`
 // is a property of the process, and only a process can be asked about it.
 //
-// Every fixture lives under a synthetic `$HOME` in mkdtemp/os.tmpdir(). The
-// operator's real ~/.claude/forge-gate-workspaces.json is read for its mtime
-// and nothing else — asserted at (g), by measurement, not by claim.
+// Every fixture lives under a synthetic `$HOME` in mkdtemp/os.tmpdir(), and
+// every registry a spawned CLI can see is a copy inside one of those synthetic
+// homes — including (c2), which runs against a real-shaped COPY of the
+// operator's registry, never the live file. The no-write property is measured
+// on those copies at (g), with a positive control. A previous version watched
+// the operator's live ~/.claude/forge-gate-workspaces.json by mtime:size;
+// that cannot prove the property, because the live file is legitimately
+// written by the app and by any concurrent forge session, so an innocent
+// suite failed whenever the machine was not idle (same pathology as
+// forge-touch.test.js R5 / forge-resources-census R13, fixed in 0810c59).
 function smokeRunOverlapSignal() {
   process.stdout.write('\n▸ Section 89: sinal de sobreposição entre runs — overlap, clean e o piso inconclusive\n');
 
   const ROOT = path.dirname(SCRIPTS);
   const liveRegistry = path.join(os.homedir(), '.claude', 'forge-gate-workspaces.json');
-  const liveStampBefore = fs.existsSync(liveRegistry)
-    ? `${fs.statSync(liveRegistry).mtimeMs}:${fs.statSync(liveRegistry).size}`
-    : null;
 
   const dirs = [];
+  // Every fixture registry, stamped at creation — compared at (g) against the
+  // same stamp to prove the spawned CLIs never write any registry they see.
+  const registryCopies = [];
+  const regStamp = (f) => `${fs.statSync(f).mtimeMs}:${fs.statSync(f).size}:`
+    + crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
   const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
   const sha = p => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
 
@@ -12246,6 +12300,7 @@ function smokeRunOverlapSignal() {
       entries: [{ path: 'ws', root: '~/Development', kind: 'workspace', repos: repoNames }],
       quarantine: [],
     }, null, 2), 'utf8');
+    registryCopies.push({ label, regFile, stamp: regStamp(regFile) });
 
     const env = Object.assign({}, process.env, { HOME: home, USERPROFILE: home });
     return { tmp, home, ws, env, repoNames };
@@ -12442,19 +12497,33 @@ function smokeRunOverlapSignal() {
       floorHuman.stdout);
     assert(floorHuman.status === 0, '(c) inconclusive exits 0 too', `status=${floorHuman.status}`);
 
-    // ── (c2) THE SAME FLOOR, AGAINST THE LIVE REGISTRY OF THIS REPO.
-    //    Read-only (proven at (d) above and (g) below). Today this tree has
-    //    runs but none carrying touch data, so the honest answer is
-    //    `inconclusive`; a build that answered `clean` here would be the bug,
-    //    reporting "no collisions" about a comparison it never performed. The
-    //    assertion is written as the IMPLICATION rather than the literal
-    //    verdict so it stays true — and stays load-bearing — on the day this
-    //    tree does have two recorded runs.
-    const liveRaw = runScript('forge-overlap.js', ['--check', '--json', '--cwd', ROOT]);
+    // ── (c2) THE SAME FLOOR, AGAINST THE REAL RUN RECORDS OF THIS REPO.
+    //    Today this tree has runs but none carrying touch data, so the honest
+    //    answer is `inconclusive`; a build that answered `clean` here would be
+    //    the bug, reporting "no collisions" about a comparison it never
+    //    performed. The assertion is written as the IMPLICATION rather than
+    //    the literal verdict so it stays true — and stays load-bearing — on
+    //    the day this tree does have two recorded runs.
+    //
+    //    The registry this spawn sees is a real-shaped COPY of the operator's
+    //    in a synthetic home (minimal valid fallback on machines without one,
+    //    so the assert still runs instead of skipping) — the live file is
+    //    copied once, read-only, and never pointed at by any HOME below. The
+    //    copy joins the (g) measurement like every other fixture registry.
+    const c2Tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'forge-smoke-overlap-c2home-')));
+    dirs.push(c2Tmp);
+    const c2Home = path.join(c2Tmp, 'home');
+    const c2Reg = path.join(c2Home, '.claude', 'forge-gate-workspaces.json');
+    fs.mkdirSync(path.dirname(c2Reg), { recursive: true });
+    if (fs.existsSync(liveRegistry)) fs.copyFileSync(liveRegistry, c2Reg);
+    else fs.writeFileSync(c2Reg, JSON.stringify({ version: 1, roots: [], entries: [], quarantine: [] }, null, 2), 'utf8');
+    registryCopies.push({ label: 'c2-real-shaped', regFile: c2Reg, stamp: regStamp(c2Reg) });
+    const c2Env = Object.assign({}, process.env, { HOME: c2Home, USERPROFILE: c2Home });
+    const liveRaw = runScript('forge-overlap.js', ['--check', '--json', '--cwd', ROOT], { env: c2Env });
     let live = null;
     try { live = JSON.parse(liveRaw.stdout); } catch { /* asserted next */ }
     assert(live && typeof live.verdict === 'string' && liveRaw.status === 0,
-      '(c2) the real registry of this repo answers, and exits 0', liveRaw.stdout + liveRaw.stderr);
+      '(c2) the real run records of this repo answer, and exit 0', liveRaw.stdout + liveRaw.stderr);
     assert(!live || live.runs_with_touch_data >= 2 || live.verdict !== 'clean',
       '(c2) live tree: fewer than two runs with touch data can NEVER yield "clean" — the distinction is load-bearing on real data, not only in fixtures',
       JSON.stringify(live));
@@ -12543,18 +12612,25 @@ function smokeRunOverlapSignal() {
       }
     }
 
-    // ── (g) Zero writes to the operator's live registry, by measurement.
-    const liveStampAfter = fs.existsSync(liveRegistry)
-      ? `${fs.statSync(liveRegistry).mtimeMs}:${fs.statSync(liveRegistry).size}`
-      : null;
-    if (liveStampBefore === null && liveStampAfter === null) {
-      skip('(g) operator registry untouched',
-        'no ~/.claude/forge-gate-workspaces.json on this machine — nothing to measure');
-    } else {
-      assert(liveStampAfter === liveStampBefore,
-        "(g) the operator's live ~/.claude/forge-gate-workspaces.json is unchanged (mtime:size) — zero writes, measured",
-        `${liveStampBefore} → ${liveStampAfter}`);
+    // ── (g) Zero registry writes, measured on the isolated copies only —
+    //    every registry a spawned CLI could see in this section, including the
+    //    real-shaped (c2) copy. The operator's live file is out of the
+    //    measurement on purpose: it is legitimately written by concurrent
+    //    forge sessions, and watching it made an innocent suite fail on a
+    //    busy machine.
+    assert(registryCopies.length >= 4,
+      `(g) the measurement covers every fixture registry plus the (c2) copy (${registryCopies.length} >= 4) — a census of one proves little`,
+      JSON.stringify(registryCopies.map(c => c.label)));
+    for (const c of registryCopies) {
+      assert(regStamp(c.regFile) === c.stamp,
+        `(g) registry copy "${c.label}" is byte-identical (mtime:size:sha256) — the CLIs read it, never write it`,
+        `${c.stamp} → ${regStamp(c.regFile)}`);
     }
+    // Positive control: the comparator must bite on a real write — an
+    // equality never seen failing proves nothing about what it detects.
+    fs.appendFileSync(registryCopies[0].regFile, '\n');
+    assert(regStamp(registryCopies[0].regFile) !== registryCopies[0].stamp,
+      '(g control) a deliberate append IS detected by the same comparator');
     assert(!fs.existsSync(path.join(ROOT, '.gsd', 'forge', 'runs', 'M-r1.json')),
       '(g) no fixture run leaked into this repo\'s own registry');
 
@@ -12572,7 +12648,7 @@ function smokeRunOverlapSignal() {
       `self=${idxSelf} isolation=${idxIso}`);
 
     pass('(final) Section 89: overlap nomeia arquivo/repo/runs e sai 0, clean só com par confrontado, '
-      + 'inconclusive nunca vira clean (fixture e registry vivo), o detector não escreve, '
+      + 'inconclusive nunca vira clean (fixture e run records reais), o detector não escreve, '
       + 'o doctor não bloqueia, e o diff da slice não toca app/ — com o piso visto vermelho antes de verde');
   } finally {
     for (const d of dirs) cleanup(d);
@@ -15446,6 +15522,66 @@ function smokeRoutingDomainsRendered() {
   pass('(final) Section 101: real rendered planner prompts carry routing and repository values with a biting fixture guard');
 }
 
+// ── Section 113: VERSION acompanha a linha de release das tags ──────────────
+//
+// `.github/workflows/release.yml` calcula o semver pelos commits convencionais
+// e cria a tag SOZINHO a cada merge com `feat:`/`fix:` — e nunca toca
+// `scripts/forge-version.js`. O resultado é drift silencioso: medido em
+// 2026-08-15, VERSION dizia `4.11.0` num checkout tagueado `v4.14.2`, ou seja
+// quem instalasse da master recebia projeções com `version=4.11.0` no marcador
+// de origem. O bump manual anterior tratou UMA instância; a causa é o workflow.
+//
+// A comparação é por MAJOR.MINOR, de propósito. Um gate literal
+// `VERSION === <tag>` ficaria vermelho logo após todo merge de `fix:` (patch
+// automático), e um gate permanentemente vermelho é um gate mudo — pior que
+// nenhum. Patch é ruído auto-corrigido no próximo release de feature; minor e
+// major são release de produto e EXIGEM o bump deliberado, com a regeneração
+// do golden e os dois literais fixados (o ritual está escrito no
+// forge-version.js).
+//
+// Vive no smoke porque só o job do smoke faz checkout com `fetch-depth: 0` —
+// o job de testes é depth-1 e não enxerga tag nenhuma. Mesmo precedente do
+// gate de escopo S07, e pela mesma razão.
+function smokeVersionTagLine() {
+  process.stdout.write('\n▸ Section 113: VERSION acompanha a linha de release das tags\n');
+  // A linha-resumo desta seção só é emitida se os asserts acima seguraram. O
+  // padrão da casa a emite incondicionalmente, o que imprime um ✓ afirmando
+  // sucesso ao lado de um ✗ real — uma alegação falsa no artefato cuja função é
+  // não fazer alegações falsas. Local a esta seção, sem tocar as outras.
+  const failsBefore = fails;
+  const { VERSION } = require('./forge-version.js');
+  const repoRoot = path.resolve(__dirname, '..');
+
+  const shown = spawnSync('git', ['tag', '-l', 'v*', '--sort=-v:refname'],
+    { cwd: repoRoot, encoding: 'utf8' });
+  const tags = shown.status === 0
+    ? shown.stdout.split('\n').map(line => line.trim()).filter(Boolean)
+    : [];
+
+  // Sem tag legível não há como medir — e um gate que passa limpo quando não
+  // mediu nada é indistinguível de um detector quebrado. Falha, nomeando.
+  assert(tags.length > 0,
+    '(a) há ao menos uma tag v* para medir (o job do smoke usa fetch-depth: 0)',
+    `git tag saiu ${shown.status}: ${(shown.stderr || '').trim()}`);
+
+  const line = (value) => String(value).replace(/^v/, '').split('.').slice(0, 2).join('.');
+  const latest = tags[0];
+  assert(line(VERSION) === line(latest),
+    `(b) VERSION (${VERSION}) e a tag mais recente (${latest}) compartilham major.minor`,
+    `bumpe scripts/forge-version.js para a linha ${line(latest)}.x — e no mesmo commit regenere o `
+    + `golden PELO RENDER PATH (o marcador embute version=) e atualize os literais fixados em `
+    + `forge-installer.test.js e forge-package.test.js`);
+
+  // Controle positivo: a comparação precisa MORDER. Uma linha deliberadamente
+  // diferente tem de reprovar pelo mesmo predicado.
+  assert(line('9.99.0') !== line(latest),
+    '(c) controle positivo: uma linha divergente é reprovada pelo mesmo predicado');
+
+  if (fails === failsBefore) {
+    pass('Section 113: VERSION e a tag mais recente compartilham major.minor, com piso anti-silêncio');
+  }
+}
+
 // ── Section 102: ledger snapshot proven in the RENDERED prompt + D1 exclusion ──
 //
 // S02's whole claim in one section: the ledger snapshot reaches plan-slice —
@@ -15772,34 +15908,50 @@ function smokeContractMissBranch() {
     + 'the SubagentStop escape no longer reports a contract-less worker as done');
 }
 
-// ── Section 106: the hook path that runs is the hook path that is managed ────
+// ── Section 106: the paths that run are the paths that are managed ───────────
 //
 // Two files have to agree and neither can see the other: `merge-settings.js`
-// writes the hook command into settings.json, and `forge-source-manifest.json`
-// decides which destinations the installer maintains. They disagreed — settings
-// wired `~/.claude/forge-hook.js` while the manifest projected only
-// `~/.claude/hooks/forge-hook.js` — so the copy Claude Code actually executes
-// was maintained by nobody and sat frozen across releases while every
-// `--update` reported success. No unit test owns this pair, which is exactly
-// what a smoke section is for.
+// writes commands into settings.json, and the maintained surfaces — the render
+// targets of `forge-source-manifest.json` plus the installer's MANAGED_CORE
+// recopy into `~/.forge-agent/` — decide which destinations an update actually
+// refreshes. They disagreed twice. First the hook command (settings wired
+// `~/.claude/forge-hook.js`, the manifest projected only
+// `~/.claude/hooks/forge-hook.js`). Then the statusline: settings wired
+// `~/.claude/forge-statusline.js`, a render target of NO source, so the copy
+// Claude Code executed froze across releases — and its `__dirname` companions
+// (forge-runs.js, forge-accounts.js, …) vanished when retireLegacyScripts
+// removed `~/.claude/scripts/`, degrading the account badge, the runs
+// indicator and the usage poll in silence. The first fix narrowed this miner
+// to `forge-hook\.js` only, which is exactly why the second freeze sailed
+// through it: a guard that enumerates one filename is blind to the next one.
+// The miner now matches every `forge-*.js` command merge-settings.js emits.
 function smokeHookPathManaged() {
-  process.stdout.write('\n▸ Section 106: the executed hook path is a managed projection\n');
+  process.stdout.write('\n▸ Section 106: every executed forge-*.js path is a managed projection\n');
   const repoRoot = path.dirname(SCRIPTS);
   const renderer = require('./forge-claude-renderer.js');
+  const { MANAGED_CORE } = require('./forge-installer.js');
 
-  // (a) every hook command merge-settings.js emits, mined from its source.
+  // (a) every `node ~/…forge-*.js` command merge-settings.js emits, mined from
+  //     its source — any forge script, not one enumerated filename.
+  const MINER = /node\s+(~\/[^\s`'"]*forge-[^\s`'"/]*\.js)/g;
   const merge = readRepoText(path.join(SCRIPTS, 'merge-settings.js'));
-  const wired = [...merge.matchAll(/node\s+(~\/[^\s`'"]*forge-hook\.js)/g)].map((m) => m[1]);
-  assert(wired.length > 0,
-    '(a) merge-settings.js still emits at least one forge-hook.js command — the miner is not blind');
+  const wired = [...merge.matchAll(MINER)].map((m) => m[1]);
   const wiredPaths = [...new Set(wired)];
+  assert(wiredPaths.some((p) => /\bforge-hook\.js$/.test(p)),
+    '(a) the miner still sees the hook commands — not blind to the family the old regex covered');
+  assert(wiredPaths.some((p) => /\bforge-statusline\.js$/.test(p)),
+    '(a) the miner sees the statusline command — the exact family the old forge-hook-only regex was blind to');
 
-  // (b) the manifest's projected destinations for the hooks source, expressed in
-  //     the same `~/…` vocabulary merge-settings.js writes. The tilde is the
-  //     USER home, not the Claude home, so the fake home below is laid out the
-  //     way a real install is (`<home>/.claude`) and paths are made relative to
-  //     the user home — comparing against the Claude home instead yields
-  //     `~/forge-hook.js` and the agreement check silently never matches.
+  // (b) the manifest's projected destinations, expressed in the same `~/…`
+  //     vocabulary merge-settings.js writes. The tilde is the USER home, not
+  //     the Claude home, so the fake home below is laid out the way a real
+  //     install is (`<home>/.claude`, `<home>/.forge-agent`) and paths are made
+  //     relative to the user home — comparing against the Claude home instead
+  //     yields `~/forge-hook.js` and the agreement check silently never
+  //     matches. No source_id filter: filtering to `hooks` was the same
+  //     enumeration mistake as the hook-only miner. Destinations outside the
+  //     user home (project files) cannot be wired as `~/…` commands and drop
+  //     out by construction.
   const userHome = path.join(os.tmpdir(), 'forge-smoke-hookpath-home');
   const report = renderer.render({
     repo: repoRoot,
@@ -15808,22 +15960,54 @@ function smokeHookPathManaged() {
     forgeHome: path.join(userHome, '.forge-agent'),
   });
   const projected = report.artifacts
+    .map((a) => path.relative(userHome, a.destination))
+    .filter((rel) => rel && !rel.startsWith('..') && !path.isAbsolute(rel))
+    .map((rel) => '~/' + rel.split(path.sep).join('/'));
+  assert(projected.length > 0, '(b) the manifest projects at least one destination under the user home');
+  const hooksProjected = report.artifacts
     .filter((a) => a.source_id === 'hooks')
     .map((a) => '~/' + path.relative(userHome, a.destination).split(path.sep).join('/'));
-  assert(projected.length > 0, '(b) the hooks source projects at least one destination');
-  assert(projected.every((p) => p.startsWith('~/.claude/')),
-    `(b) projected hook paths are expressed against the user home — got ${JSON.stringify(projected)}`);
+  assert(hooksProjected.length > 0 && hooksProjected.every((p) => p.startsWith('~/.claude/')),
+    `(b) projected hook paths are expressed against the user home — got ${JSON.stringify(hooksProjected)}`);
 
-  // (c) the agreement itself.
+  // (b2) the second maintained surface: the installer recopies MANAGED_CORE
+  //     verbatim from the repo into the Forge home on EVERY install/update
+  //     (forge-installer.js § MANAGED_CORE → copyTree), so a wired path under
+  //     `~/.forge-agent/` is maintained iff its top segment is a managed-core
+  //     item AND the same relative path exists in this repo. Both legs are
+  //     required: prefix alone would bless a typo'd filename that no copy will
+  //     ever produce.
+  const FORGE_HOME_PREFIX = '~/.forge-agent/';
+  const maintainedByCore = (p) => {
+    if (!p.startsWith(FORGE_HOME_PREFIX)) return false;
+    const rel = p.slice(FORGE_HOME_PREFIX.length).split('/');
+    if (!MANAGED_CORE.includes(rel[0])) return false;
+    return fs.existsSync(path.join(repoRoot, ...rel));
+  };
+
+  // (c) the agreement itself: every wired path is maintained by ONE of the two
+  //     surfaces — a manifest projection or the managed-core recopy.
+  const maintained = (p) => projected.includes(p) || maintainedByCore(p);
   for (const p of wiredPaths) {
-    assert(projected.includes(p),
-      `(c) settings.json runs ${p} but no projection maintains it — that copy will freeze silently`);
+    assert(maintained(p),
+      `(c) settings.json runs ${p} but nothing maintains it — that copy will freeze silently`);
   }
 
-  // (d) control — the predicate is capable of failing. A path nobody wires must
-  //     not be reported as wired, otherwise (c) is green for any input.
+  // (d) controls — every predicate above proven capable of failing, so (c) is
+  //     never green for any input.
   assert(!wiredPaths.includes('~/.claude/nonexistent-hook.js'),
     '(d control) the wired-path miner does not invent paths');
+  const minedSample = [...'run: node ~/.claude/forge-anything.js phase'.matchAll(MINER)].map((m) => m[1]);
+  assert(minedSample.length === 1 && minedSample[0] === '~/.claude/forge-anything.js',
+    '(d control) the widened miner catches an arbitrary forge-*.js command the old forge-hook-only regex ignored');
+  assert(maintained('~/.claude/forge-nonexistent.js') === false,
+    '(d control) an unprojected ~/.claude path is NOT maintained — the (c) loop can go red');
+  assert(maintainedByCore('~/.forge-agent/scripts/forge-statusline.js') === true,
+    '(d control) the managed-core predicate recognizes the real statusline copy under the Forge home');
+  assert(maintainedByCore('~/.forge-agent/scripts/forge-no-such-file.js') === false,
+    '(d control) a filename absent from the repo is NOT maintained — the managed prefix alone never passes');
+  assert(maintainedByCore('~/.forge-agent/unmanaged-dir/forge-hook.js') === false,
+    '(d control) a top segment outside MANAGED_CORE is NOT maintained even under the Forge home');
 
   // (e) script projections carry the ownership proof, so a second --update can
   //     replace them. Without this the fix in (c) maintains a file the write
@@ -15839,9 +16023,10 @@ function smokeHookPathManaged() {
   assert(/\(\) => \{ smokeHookPathManaged\(\); \}/.test(source.slice(source.lastIndexOf('async function main()'))),
     '(f) Section 106 is registered in main()');
 
-  pass('(final) Section 106: every forge-hook.js path merge-settings.js wires into settings.json is a destination the '
-    + 'source manifest projects, so the copy Claude Code executes is maintained rather than frozen; and that projection '
-    + 'carries an origin marker below an intact shebang, so the installer can actually replace it on a later update');
+  pass('(final) Section 106: every forge-*.js path merge-settings.js wires into settings.json — hook AND statusline — '
+    + 'is maintained either by a manifest projection or by the installer\'s MANAGED_CORE recopy into ~/.forge-agent, so '
+    + 'the copies Claude Code executes are refreshed rather than frozen; the hook projection carries an origin marker '
+    + 'below an intact shebang, and every predicate was shown capable of failing');
 }
 
 // ── Merge note (origin/master → forge/M-20260813221024-controle-recursos) ──
@@ -17200,6 +17385,7 @@ async function main() {
       () => { smokeVerifyReverifyChildSideE2E(); },
       () => { smokeResourcesObservabilityCensus(); },
       () => { smokeResourcesFlakeAndBenchGuard(); },
+      () => { smokeVersionTagLine(); },
       async () => { await smokeSectionIsolation(); },
     ]) await runSection(body);
   } catch (e) {
