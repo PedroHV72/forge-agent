@@ -488,6 +488,56 @@ test('collectRunClaims: run inativa fora por default, dentro com --all, sempre n
   assertEqual(r.pairs_compared, 1);
 });
 
+// ── collectRunClaims: um runs/*.json ILEGÍVEL é nomeado, nunca sumido ───────
+//
+// `run-record-unparseable` entrou em `CLAIM_NOTE_REASONS` sem que nenhum teste a
+// produzisse, e o guard de conjunto fechado (R7d) acusou exatamente isso. O
+// conserto é PRODUZI-LA pelo caminho real — um arquivo truncado no registry, que
+// é o único jeito de `runs.listAllDetailed` devolver `unparseable` — e nunca
+// relaxar o guard: uma razão declarada que nada emite é indistinguível de uma
+// razão morta, e o custo de descobrir isso é um censo que mente em silêncio.
+test('collectRunClaims: runs/*.json ilegível -> note run-record-unparseable, contado no censo', () => {
+  const { wsDir } = makeFixture([
+    { id: 'M-ok-a', write_claim: claim(['a.js']) },
+    { id: 'M-ok-b', write_claim: claim(['b.js']) },
+  ]);
+  // Truncado no meio: `JSON.parse` falha, `fs.readFileSync` não. É o estado que
+  // um kill durante a escrita deixa — o caso real, não um byte inventado.
+  fs.writeFileSync(path.join(wsDir, '.gsd', 'forge', 'runs', 'M-truncada.json'),
+    '{"kind":"milestone","id":"M-truncada","act', 'utf8');
+
+  const c = collectRunClaims(wsDir, {});
+  const note = c.notes.find((n) => n.id === 'M-truncada');
+  assert(note, 'o registro ilegível tem de aparecer NOMEADO — sumir dele é o silêncio que o conjunto fechado existe para proibir');
+  assertEqual(note.reason, 'run-record-unparseable', 'a razão é a do registro ilegível');
+  assert(note.reason !== 'claim-absent',
+    'ilegível NÃO é sem-claim: colapsar os dois faria um arquivo truncado ser lido como run que não declarou nada');
+  assertEqual(note.detail, 'json-parse-failed', 'o detalhe nomeia POR QUE não deu para ler, e não fica null');
+
+  // O censo conta COM ele, e ele CONTINUA no universo com `claim: null` — a
+  // mesma polaridade de `claim-absent`, uma camada abaixo. Um registro que não
+  // pôde ser lido não é um registro que não existe, e tirá-lo da comparação
+  // reportaria a própria cegueira como universo limpo.
+  assertEqual(c.runs_examined, 3, 'o ilegível entra no total examinado');
+  assertEqual(c.comparable.length, 3, 'e SEGUE comparável — ilegível é contraparte não-declarada, não contraparte ausente');
+  assertEqual(c.comparable.find((x) => x.id === 'M-truncada').claim, null,
+    'sem claim legível o claim é null MEDIDO, nunca um objeto inventado');
+
+  const r = record(compareClaims(c));
+  assert(r.notes.some((n) => n.id === 'M-truncada' && n.reason === 'run-record-unparseable'),
+    'a note atravessa compareClaims — nota que morre no coletor não chega a censo nenhum');
+  assert(r.conflicts.some((x) => x.runs.includes('M-truncada') && x.cause === 'undeclared-writes'),
+    'e ele conflita como undeclared-writes (D1): o arquivo ilegível vira colisão VISÍVEL, nunca uma linha ausente');
+
+  // E pelo caminho do OPERADOR: advisory, exit 0, com a note no JSON. D12 recusou
+  // `block` de propósito — um arquivo truncado não pode paralisar os vizinhos.
+  const cli = runCli(['--check', '--cwd', wsDir, '--json']);
+  assertEqual(cli.status, 0, 'um registry com arquivo ilegível continua advisory, nunca fatal');
+  const out = JSON.parse(cli.stdout);
+  assert((out.notes || []).some((n) => n.reason === 'run-record-unparseable'),
+    'a razão precisa chegar ao JSON da CLI, que é onde o operador a lê');
+});
+
 // ── R7: closed sets crossed in BOTH directions ──────────────────────────────
 test('R7a: VERDICTS — toda entrada foi emitida por >= 1 teste', () => {
   for (const v of VERDICTS) assert(verdictsSeen.has(v), `VERDICTS: ${v} nunca foi emitido por nenhum teste`);

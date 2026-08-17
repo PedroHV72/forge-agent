@@ -119,17 +119,44 @@ function withAddressDefaults(rec) {
   });
 }
 
-function listAll(cwd) {
+// Closed set. `id` is the basename without `.json` — the key the registry itself uses, so an
+// unreadable record can still be NAMED by the census that reports it.
+const UNPARSEABLE_REASONS = ['json-parse-failed', 'read-failed'];
+
+/**
+ * ADDITIVE (PR #110, finding 3). `listAll` used to `catch { return null }` + `.filter(Boolean)`, so
+ * a truncated `runs/*.json` vanished BEFORE any consumer could count it — and `runs_examined`
+ * downstream counted post-filter, making the census report a universe that silently shrank.
+ *
+ * This returns both halves. `listAll` stays byte-compatible as a wrapper over `parsed`: additive by
+ * READING, no migration, no SCHEMA-VERSION bump, every existing caller unchanged.
+ */
+function listAllDetailed(cwd) {
   const dir = runsDir(cwd);
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir)
-    .filter(f => f.endsWith('.json'))
-    .map(f => {
-      try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); }
-      catch { return null; }
-    })
-    .filter(Boolean)
-    .map(withAddressDefaults);
+  if (!fs.existsSync(dir)) return { parsed: [], unparseable: [] };
+  const parsed = [];
+  const unparseable = [];
+  for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.json'))) {
+    const file = path.join(dir, f);
+    const id = path.basename(f, '.json');
+    let raw;
+    try {
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (_) {
+      unparseable.push({ id, file, reason: 'read-failed' });
+      continue;
+    }
+    try {
+      parsed.push(withAddressDefaults(JSON.parse(raw)));
+    } catch (_) {
+      unparseable.push({ id, file, reason: 'json-parse-failed' });
+    }
+  }
+  return { parsed, unparseable };
+}
+
+function listAll(cwd) {
+  return listAllDetailed(cwd).parsed;
 }
 
 function listActive(cwd) {
@@ -528,7 +555,7 @@ Flags:
 if (require.main === module) cliMain();
 
 module.exports = {
-  listAll, listActive, get,
+  listAll, listAllDetailed, listActive, get,
   add, update, updateWith, remove,
   bumpHeartbeat, cleanupStale,
   resolveBySessionId, oldestActive,

@@ -109,6 +109,7 @@ const CLAIM_NOTE_REASONS = [
   'code-dir-relative',   // one or both sides recorded a NON-ABSOLUTE `code_dir`. A relative string names a directory only together with a base nobody recorded, so neither identity NOR difference was measured (R1). Treated as `unknown`: compared, never skipped, never called `same`.
   'code-dir-invalid',    // one or both sides persisted a `code_dir` that is not a string at all (a malformed record predating the write-side validation). Same posture: `unknown`, compared, named (R3).
   'code-dir-unresolved', // both sides are absolute but at least one could not be resolved to a real path (removed worktree, permissions). The comparison DEGRADED to lexical identity, and the degradation is named here rather than passing silently (R2).
+  'run-record-unparseable', // the `runs/*.json` could not be parsed at all. It STAYS in the universe as an undeclared counterpart, exactly like `claim-absent` — the same polarity, one layer lower. `block` was REFUSED (D12): one truncated file would paralyse every neighbour until a human deleted it by hand.
 ];
 
 /**
@@ -271,7 +272,8 @@ function claimsConflict(claimA, claimB) {
  */
 function collectRunClaims(cwd, opts) {
   const o = opts || {};
-  const all = runs.listAll(cwd);
+  const detailed = runs.listAllDetailed ? runs.listAllDetailed(cwd) : { parsed: runs.listAll(cwd), unparseable: [] };
+  const all = detailed.parsed;
 
   const comparable = [];
   const skipped = [];
@@ -296,8 +298,16 @@ function collectRunClaims(cwd, opts) {
 
     comparable.push({ id, claim, code_dir: (claim && claim.code_dir) || null });
   }
-
-  return { runs_examined: all.length, comparable, skipped, notes };
+  // Finding 3 (PR #110). A record we could not read is NOT a record that is not there. It is kept in
+  // the universe as an undeclared counterpart, and `runs_examined` counts it — a census whose count
+  // is computed AFTER the discard is a census that reports its own blindness as a clean universe.
+  // The skip is an ENUMERATION, never a term of the equation (the R3 lesson of
+  // forge-claim-audit.js:642-646).
+  for (const bad of detailed.unparseable) {
+    notes.push({ id: bad.id, reason: 'run-record-unparseable', detail: bad.reason });
+    comparable.push({ id: bad.id, claim: null, code_dir: null });
+  }
+  return { runs_examined: all.length + detailed.unparseable.length, comparable, skipped, notes };
 }
 
 /** Stable output: by the two run ids. */
