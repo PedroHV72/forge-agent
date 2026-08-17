@@ -27,9 +27,64 @@ function positive(value, fallback) { const n = value === undefined ? fallback : 
 function nowOf(opts) { return opts && typeof opts.now === 'function' ? opts.now() : Date.now(); }
 function newToken(opts) { return opts && typeof opts.tokenFactory === 'function' ? opts.tokenFactory() : crypto.randomUUID().replace(/-/g, ''); }
 function readLock(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
-function writeAtomic(file, meta) { const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`; fs.writeFileSync(temporary, JSON.stringify(meta), 'utf8'); fs.renameSync(temporary, file); }
+function writeAtomic(file, meta, guard) { const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`; try { if (guard) mutex.assertOwned(guard); fs.writeFileSync(temporary, JSON.stringify(meta), 'utf8'); if (guard) mutex.assertOwned(guard); fs.renameSync(temporary, file); } catch (error) { try { fs.unlinkSync(temporary); } catch {} if (error && /assert|owned|lost/i.test(error.message || '')) error.code = 'GUARD_LOST'; throw error; } }
 function ageOf(meta, now) { return meta ? now - (meta.renewed_at || meta.acquired_at || 0) : null; }
-function isHolderRunActive(cwd, runId) { if (!runs || !runId) return false; try { const run = runs.get(cwd, runId); return !!(run && run.active); } catch { return false; } }
+// ── D8 (PR #110): the doctrine of this module, rewritten in the SAME commit that changed the
+// behaviour. The losing comment used to read "A run/PID is never an authorization decision. It
+// remains diagnostic only." It lost, and leaving the contradiction implicit was never a third
+// option: `forge-claim-release.js` already refused to release a claim by age alone (its D2), so two
+// modules carried two conscious, opposite assertions — which is exactly how this defect was born.
+//
+// THE DOCTRINE IS NOW SINGLE: **liveness beats the clock.** A LIVE holder never loses its lock, stale
+// or not — a legitimate 40-minute worker is byte-for-byte indistinguishable from a dead one if only
+// the clock is consulted. The clock is the NAMED LAST RESORT, and it applies only to holders measured
+// `ended` or `unowned`. The crash recovery that the old age-steal provided is not deleted, it is
+// MOVED and named: `scripts/forge-run-reaper.js` converts a crashed owner from live to ended, and
+// only then does the clock reach it. See `shared/forge-claim-gate.md § Release lifecycle`.
+//
+// Tri-state, in the mould of `forge-claim-audit.classifyActivity` — the form is copied, not
+// reinvented. `unmeasured` is never collapsed into "dead": a question that could not be asked keeps
+// the lock (the repo's own credo, applied here).
+//
+// `unowned` exists by MEASUREMENT, not by symmetry: `forge-filelock.js` writes `runId || null`, so a
+// legacy lock with `run_id: null` has no owner to ask about. Without this state it would be
+// PERMANENTLY unbreakable — a fail-closed that freezes instead of protecting.
+const HOLDER_ACTIVITY = ['live', 'ended', 'unowned', 'unmeasured'];
+const HOLDER_REASONS = [
+  'registry-active',     // live      — measured
+  'registry-inactive',   // ended     — measured
+  'run-not-registered',  // ended     — no record on disk: plausibly dead, the only honest case
+  'run-id-absent',       // unowned   — nobody to ask about; age alone never governed this lock
+  'registry-unavailable',// unmeasured — the runs module itself is missing
+  'record-unreadable',   // unmeasured — truncated/illegible record (the SAME datum as listAllDetailed's `unparseable`)
+  'active-field-absent', // unmeasured — record present, `active` never written
+];
+function classifyHolder(cwd, runId) {
+  if (!runId) return { activity: 'unowned', reason: 'run-id-absent' };
+  if (!runs) return { activity: 'unmeasured', reason: 'registry-unavailable' };
+  let run;
+  try {
+    run = runs.get(cwd, runId);
+  } catch (_) {
+    return { activity: 'unmeasured', reason: 'record-unreadable' };
+  }
+  if (!run) {
+    // `runs.get` swallows its own read/parse failure into `null`, so "absent" and "illegible" arrive
+    // here identical. They are NOT the same fact and must not collapse: absent is plausibly dead,
+    // illegible is unmeasured. The file's existence on disk is what separates them.
+    let present = false;
+    try { present = Boolean(runs.runFile) && fs.existsSync(runs.runFile(cwd, runId)); } catch (_) { present = false; }
+    return present
+      ? { activity: 'unmeasured', reason: 'record-unreadable' }
+      : { activity: 'ended', reason: 'run-not-registered' };
+  }
+  if (run.active === true) return { activity: 'live', reason: 'registry-active' };
+  if (run.active === false) return { activity: 'ended', reason: 'registry-inactive' };
+  return { activity: 'unmeasured', reason: 'active-field-absent' };
+}
+// Kept exported and UNCHANGED in semantics — `forge-claim-release.js:232` and the diagnostic uses
+// depend on it. `classifyHolder` is the ADDITIVE export.
+function isHolderRunActive(cwd, runId) { return classifyHolder(cwd, runId).activity === 'live'; }
 // Mutex names are capped at 160 characters. Absolute paths routinely exceed
 // that once base64url-encoded (especially under Windows temp directories), so
 // use a stable digest for the internal guard while retaining the readable
@@ -38,38 +93,42 @@ function guardName(filePath) { return `filelock-${crypto.createHash('sha256').up
 function withGuard(cwd, filePath, fn) {
   const guard = mutex.tryAcquireSync(cwd, guardName(filePath), { ttlMs: 5_000 });
   if (!guard) return { acquired: false, reason: 'guard_busy', holder: null };
-  try { return fn(); } finally { guard.release(); }
+  let result; try { result = fn(guard); } finally { const released = guard.release(); if (released === false && result && typeof result === 'object') result.reason = 'guard_release_failed'; }
+  return result;
 }
 function publicHolder(existing, now) { return { run_id: existing.run_id, session_id: existing.session_id, file_path: existing.file_path, acquired_at: existing.acquired_at, age_ms: ageOf(existing, now) }; }
 
 function acquireFileLock(cwd, filePath, runId, sessionId, opts) {
   opts = opts || {}; const canonical = canonicalPath(cwd, filePath); const ttlMs = positive(opts.ttlMs, DEFAULT_TTL_MS); const now = nowOf(opts); const file = lockPathFor(cwd, canonical);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  return withGuard(cwd, canonical, () => {
+  return withGuard(cwd, canonical, (guard) => {
     const existing = readLock(file);
     if (existing && existing.owner_token === opts.ownerToken && opts.ownerToken) {
       const renewed = { ...existing, renewed_at: now, ttl_ms: ttlMs, session_id: sessionId || existing.session_id, intent: opts.intent || existing.intent };
-      writeAtomic(file, renewed); return { acquired: true, renewed: true, holder: null, owner_token: renewed.owner_token, generation: renewed.generation, release: () => releaseFileLock(cwd, filePath, runId, renewed.owner_token, renewed.generation) };
+      writeAtomic(file, renewed, guard); return { acquired: true, renewed: true, holder: null, owner_token: renewed.owner_token, generation: renewed.generation, release: () => releaseFileLock(cwd, filePath, runId, renewed.owner_token, renewed.generation) };
     }
     if (existing) {
       const age = ageOf(existing, now); const ownerTtl = positive(existing.ttl_ms, ttlMs); const stale = age !== null && age > ownerTtl;
-      // A run/PID is never an authorization decision. It remains diagnostic only.
-      const diagnostic = isHolderRunActive(cwd, existing.run_id) ? 'active-run' : 'inactive-run';
-      if (!stale) return { acquired: false, reason: 'busy', holder: { ...publicHolder(existing, now), run_diagnostic: diagnostic } };
+      // Liveness authorizes recovery: age is only the named final fallback for ended/unowned holders; the reaper converts crashed owners.
+      const classified = classifyHolder(cwd, existing.run_id);
+      const diagnostic = classified.activity === 'live' ? 'active-run' : classified.activity;
+      if (classified.activity === 'live' || !stale) return { acquired: false, reason: 'busy', holder: { ...publicHolder(existing, now), run_diagnostic: diagnostic } };
+      if (classified.activity === 'unmeasured') return { acquired: false, reason: 'holder_unmeasured', holder: { ...publicHolder(existing, now), run_diagnostic: 'unmeasured' } };
       const quarantine = `${file}.quarantine-${existing.generation || 'legacy'}-${crypto.randomUUID()}`;
-      try { fs.renameSync(file, quarantine); } catch { return { acquired: false, reason: 'contended_recovery', holder: publicHolder(existing, now) }; }
+      try { mutex.assertOwned(guard); fs.renameSync(file, quarantine); } catch { return { acquired: false, reason: 'contended_recovery', holder: publicHolder(existing, now) }; }
       try { fs.unlinkSync(quarantine); } catch { /* quarantine is diagnostic debris only */ }
     }
     const meta = { run_id: runId || null, session_id: sessionId || null, file_path: canonical, intent: opts.intent || 'edit', generation: newToken(opts), owner_token: newToken(opts), acquired_at: now, renewed_at: now, ttl_ms: ttlMs };
-    writeAtomic(file, meta);
+    writeAtomic(file, meta, guard);
     return { acquired: true, holder: null, owner_token: meta.owner_token, generation: meta.generation, stolen: existing ? { from: existing.run_id, reason: 'expired', age_ms: ageOf(existing, now) } : null, release: () => releaseFileLock(cwd, filePath, runId, meta.owner_token, meta.generation) };
   });
 }
 
 function renewFileLock(cwd, filePath, ownerToken, generation, opts) {
   opts = opts || {}; const canonical = canonicalPath(cwd, filePath); const now = nowOf(opts); const file = lockPathFor(cwd, canonical);
-  return withGuard(cwd, canonical, () => { const existing = readLock(file); if (!existing) return { ok: false, reason: 'already_released' }; if (existing.owner_token !== ownerToken || existing.generation !== generation) return { ok: false, reason: 'owner_mismatch' }; const renewed = { ...existing, renewed_at: now, ttl_ms: positive(opts.ttlMs, existing.ttl_ms || DEFAULT_TTL_MS) }; writeAtomic(file, renewed); return { ok: true, reason: 'renewed', metadata: renewed }; });
+  return withGuard(cwd, canonical, (guard) => { const existing = readLock(file); if (!existing) return { ok: false, reason: 'already_released' }; if (existing.owner_token !== ownerToken || existing.generation !== generation) return { ok: false, reason: 'owner_mismatch' }; const renewed = { ...existing, renewed_at: now, ttl_ms: positive(opts.ttlMs, existing.ttl_ms || DEFAULT_TTL_MS) }; writeAtomic(file, renewed, guard); return { ok: true, reason: 'renewed', metadata: renewed }; });
 }
+function touchFileLock(cwd, filePath, opts) { opts = opts || {}; const canonical = canonicalPath(cwd, filePath), file = lockPathFor(cwd, canonical); return withGuard(cwd, canonical, (guard) => { const existing = readLock(file); if (!existing || existing.run_id !== opts.runId || existing.session_id !== opts.sessionId) return { ok:false, reason:'owner_mismatch' }; const renewed = { ...existing, renewed_at: nowOf(opts) }; writeAtomic(file, renewed, guard); return { ok:true, reason:'renewed', metadata:renewed }; }); }
 function releaseFileLock(cwd, filePath, runId, ownerToken, generation) {
   // runId is retained for call-shape compatibility, but cannot prove ownership.
   if (!ownerToken || !generation) return false;
@@ -93,4 +152,4 @@ if (require.main === module) cliMain();
 // comportamento — só a visibilidade. Um helper privado conta como código
 // existente, então a saída para o TTL-como-rede de `forge-claim-release.js` é
 // exportar o dono, nunca uma terceira cópia do predicado de run inativa.
-module.exports = { acquireFileLock, renewFileLock, releaseFileLock, checkFileLock, lockPathFor, encodePath, isHolderRunActive, DEFAULT_TTL_MS };
+module.exports = { acquireFileLock, renewFileLock, touchFileLock, releaseFileLock, checkFileLock, lockPathFor, encodePath, isHolderRunActive, classifyHolder, HOLDER_ACTIVITY, HOLDER_REASONS, DEFAULT_TTL_MS };
