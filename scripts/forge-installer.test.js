@@ -389,6 +389,51 @@ test('a single-runtime run merges the record instead of replacing it', () => {
   } finally { data.cleanup(); }
 });
 
+// ── The exit out of a freeze is visible in the manifest and in the summary ───
+//
+// Rung 4 (digest) is unreachable for a destination that was already divergent
+// when it shipped: `recordOf` records what a run WROTE, and a `user_owned`
+// destination is what a run does not write. Rung 5 reads the source repo's
+// history instead. Here the resolver is INJECTED — this suite is about the
+// installer's reporting and persistence, not about git; the history behavior has
+// its own suite (forge-projection-provenance.test.js) with real repos.
+test('an adopted destination is named in the summary and recorded in the manifest', () => {
+  const data = fixture();
+  try {
+    installer.install({ ...data.options, runtime: 'claude' });
+    const frozen = path.join(data.claudeHome, 'forge-prefs.schema.json');
+    const edited = path.join(data.claudeHome, 'forge-capabilities.json');
+    fs.writeFileSync(frozen, '{"release":"antiga"}\n', 'utf8');  // ours, at some past release
+    fs.writeFileSync(edited, '{"meu":true}\n', 'utf8');          // genuinely the operator's
+
+    // The resolver answers only for the frozen file; everything else degrades to a
+    // named reason, exactly as a real run without history would.
+    const provenance = {
+      digestsFor: (source) => (source === 'forge-prefs.schema.json'
+        ? new Set([require('./forge-projection-ownership.js').digest('{"release":"antiga"}\n')])
+        : new Set()),
+      verdictFor: (source, content) => (source === 'forge-prefs.schema.json'
+        ? { matched: true, reason: 'release-match', revisions: 7, truncated: false }
+        : { matched: false, reason: 'operator-edit', revisions: 4, truncated: false }),
+    };
+
+    const report = installer.install({ ...data.options, runtime: 'claude', update: true, provenance });
+    const claude = report.manifest.adapters.claude;
+    assert(claude.adopted.includes(frozen), `a adoção não foi registrada no manifesto: ${JSON.stringify(claude.adopted)}`);
+    assert(!claude.conflicts.some((item) => item.destination === frozen), 'o adotado continuou listado como conflito');
+    const conflict = claude.conflicts.find((item) => item.destination === edited);
+    assert(conflict, 'a edição real do operador deixou de ser conflito');
+    assert.strictEqual(conflict.provenance, 'operator-edit');
+    assert.strictEqual(fs.readFileSync(edited, 'utf8'), '{"meu":true}\n', 'os bytes do operador foram sobrescritos');
+
+    const text = installer.render(report);
+    assert(text.includes(`  [adopted] ${frozen}`), `o resumo não nomeia o que foi adotado:\n${text}`);
+    assert.match(text, /Adopted from release history: \d+/, 'a linha de adoção sumiu do resumo');
+    assert(text.includes(`  [preserved] ${edited} (proveniência: operator-edit)`),
+      `o preservado não diz em que base foi preservado:\n${text}`);
+  } finally { data.cleanup(); }
+});
+
 test('a clean update names nothing — the section is absent, not empty', () => {
   const data = fixture();
   try {
