@@ -942,7 +942,13 @@ console.log('\nG16: B2 — sem --code-dir grava null, e a avaliação segue fail
 // ── G17: the ceiling ───────────────────────────────────────────────────────
 console.log('\nG17: teto de espera — escala, nunca prossegue por expiração');
 {
-  const TINY = { cross_run_overlap: 'block', block_wait_ms: 60, block_poll_ms: 10 };
+  // `--wait` É um ato, e sob `advisory` o módulo NÃO polla (esperar é agir). A
+  // máquina de espera só existe sob `enforcing`, então a fixture desta seção
+  // DECLARA a postura em vez de herdar o default advisory — sem isso os asserts
+  // abaixo mediriam a supressão, não o teto.
+  const TINY = {
+    cross_run_overlap: 'block', block_wait_ms: 60, block_poll_ms: 10, claim_gate: 'enforcing',
+  };
 
   test('G17a: --wait com teto curto e conflito persistente -> escalation wait-ceiling, decisão block', () => {
     const { ws, paths } = collidingFixture(TINY);
@@ -950,9 +956,13 @@ console.log('\nG17: teto de espera — escala, nunca prossegue por expiração')
       cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
       readyAlternatives: 2, wait: true, prefsOpts: prefsOpts(), emitEvent: false,
     }));
+    assertEqual(r.enforcement, 'enforcing',
+      'o teto só EXISTE sob enforcing — se a postura caísse para advisory este teste mediria a supressão');
     assertEqual(r.decision, 'block', 'expirar o teto NUNCA vira proceed');
     assertEqual(r.escalation, 'wait-ceiling');
     assert(r.wait.polls >= 1, `esperava >= 1 re-avaliação por poll, veio ${r.wait.polls}`);
+    assertEqual(r.wait.suppressed_by, undefined,
+      'sob enforcing a espera ACONTECEU — `suppressed_by` é o carimbo do ramo advisory e não pode aparecer aqui');
     assertEqual(r.wait.ceiling_ms, 60, 'o teto vem da pref, não de constante mágica (W6)');
   });
 
@@ -964,8 +974,10 @@ console.log('\nG17: teto de espera — escala, nunca prossegue por expiração')
       // The counterpart releases its claim between polls.
       onPoll: () => { runsApi.update(ws, 'M-other', { write_claim: claim(['scripts/outro.js']) }); },
     }));
+    assertEqual(r.enforcement, 'enforcing', 'o poll que limpa o conflito só corre sob enforcing');
     assertEqual(r.decision, 'proceed');
     assertEqual(r.reason, 'no-conflict', 'o proceed confrontou de verdade na última re-avaliação');
+    assert(r.wait.polls >= 1, 'o proceed veio de uma RE-avaliação, não da primeira passada');
     assertEqual(r.escalation, null);
   });
 
@@ -1073,7 +1085,12 @@ console.log('\nG19: evento claim-gate escrito por CÓDIGO em .gsd/forge/events.j
   });
 
   test('G19b: a escalação também viaja no evento', () => {
-    const { ws, paths } = collidingFixture({ cross_run_overlap: 'block', block_wait_ms: 40, block_poll_ms: 10 });
+    // `claim_gate: 'enforcing'` porque a escalação `wait-ceiling` é a MEDIDA de
+    // uma espera que não limpou: sob advisory não há espera, logo não há o que
+    // medir e o campo viaja `null` legitimamente (guardado em G24e/f).
+    const { ws, paths } = collidingFixture({
+      cross_run_overlap: 'block', block_wait_ms: 40, block_poll_ms: 10, claim_gate: 'enforcing',
+    });
     recordEsc(recordAndEvaluate({
       cwd: ws, runId: 'M-own', unit: 'execute-task/T02', paths,
       readyAlternatives: 2, wait: true, prefsOpts: prefsOpts(),
@@ -1408,14 +1425,20 @@ console.log('\nG22: release — skip nomeado, mordida nos dois sentidos, sonda f
     assertEqual(committed.released_counterparts[0].mechanism, 'committed');
     assert(committed.census.skipped.some((s) => s.reason === 'claim-released:committed'));
 
-    // A rede do TTL (D2): janela vencida SOBRE RUN INATIVA — nunca idade sozinha.
-    const ttl = withProbe({ ttl_expired: true, owner_active: false });
+    // A rede do TTL (D2): janela vencida SOBRE RUN INATIVA E SEM TRABALHO EM VOO
+    // nos paths reivindicados — nunca idade sozinha. O terceiro fato é exigência
+    // do degrau (`paths_in_flight !== true`): árvore suja é assinatura de
+    // pause/handoff, e a rede não pode confundir isso com abandono
+    // (par de polaridade em forge-claim-release.test.js R13c).
+    const ttl = withProbe({ ttl_expired: true, owner_active: false, paths_in_flight: false });
     assertEqual(ttl.decision, 'proceed');
     assertEqual(ttl.released_counterparts[0].mechanism, 'ttl-expired');
     assert(ttl.census.skipped.some((s) => s.reason === 'claim-released:ttl-expired'));
 
-    // Par de polaridade: MESMA janela vencida, run ATIVA -> segue em escopo.
-    const alive = withProbe({ ttl_expired: true, owner_active: true });
+    // Par de polaridade: MESMA janela vencida e MESMA árvore limpa, run ATIVA ->
+    // segue em escopo. O único delta contra `ttl` é `owner_active`, então o
+    // assert morde sobre a vitalidade do dono e não por acidente de outro fato.
+    const alive = withProbe({ ttl_expired: true, owner_active: true, paths_in_flight: false });
     assertEqual(alive.decision, 'block', 'run viva nunca perde o claim para o relógio (D2)');
     assertEqual(alive.cause, 'overlap');
     assertEqual(alive.census.counterparts_in_scope, 1);
@@ -2178,7 +2201,11 @@ console.log('\nG25: R3 — o veredito `committed` corroborado é PERSISTIDO (e a
     return () => ({
       claim_present: true, explicit_release: false, code_dir: '/code/dir', vcs: 'git',
       baseline_before: 'aaa', baseline_now: 'aaa', baseline_advanced: false,
-      dirty_paths: [], paths_in_flight: true,
+      // `paths_in_flight: false` é EXIGÊNCIA do degrau TTL, não conveniência:
+      // com a árvore suja nos paths reivindicados o degrau recusa (pause/handoff
+      // não é abandono) e esta sonda nunca produziria o mecanismo `ttl-expired`
+      // que o teste abaixo precisa observar.
+      dirty_paths: [], paths_in_flight: false,
       age_ms: 99, ttl_ms: 10, grace_ms: 1, ttl_expired: true, owner_active: false, probe_error: null,
     });
   }

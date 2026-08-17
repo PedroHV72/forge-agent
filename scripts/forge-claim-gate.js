@@ -788,6 +788,22 @@ function evaluateGate(opts) {
   const claim = o.claim || null;
   const readyAlternatives = Number.isFinite(o.readyAlternatives) ? o.readyAlternatives : 0;
 
+  // The enforcement axis is resolved BY THE MODULE (spec § Step 0). A caller may pass it down
+  // (`recordAndEvaluate` already resolved it once), but `evaluateGate` reached directly must never
+  // fall back to a hardcoded value without asking the prefs first.
+  // An EXPLICIT value out of the closed set THROWS — an operator typo must never be silently
+  // downgraded to the fallback, which is how a fence gets disabled without anyone noticing. An
+  // invalid PREF is different: it is named (`invalid-enforcement-pref`) and falls back, because a
+  // prefs file is shared and must not brick the loop.
+  if (o.enforcement !== undefined && o.enforcement !== null && !ENFORCEMENTS.includes(o.enforcement)) {
+    throw new Error(`forge-claim-gate: enforcement fora de ENFORCEMENTS: ${JSON.stringify(o.enforcement)}`);
+  }
+  const enforcementResolved = typeof o.enforcement === 'string'
+    ? { enforcement: o.enforcement, source: o.enforcement_source || 'explicit' }
+    : resolveEnforcementFromPrefs(cwd, o.prefsOpts);
+  const enforcement = enforcementResolved.enforcement;
+  const enforcementSource = enforcementResolved.source;
+
   const collected = collectRunClaims(cwd);
   const skipped = [];
   const notes = (collected.notes || []).slice();
@@ -913,6 +929,19 @@ function evaluateGate(opts) {
     not_covered: UNCOVERED_BOUNDARIES,
   };
 
+  // Every exit of this function goes through here. The enforcement fields are ADDITIVE and derived
+  // from the decision the exit carries — routing them through a single seam is what stops a new
+  // early return from silently shipping a result with `advised_action: undefined`, which a consumer
+  // whose `case` has a default-drop branch would read as "do not dispatch" (a fence appearing out of
+  // a missing field), and one with a default-keep branch would read as "dispatch" (a fence
+  // vanishing out of a missing field). Neither is acceptable, so the field is never optional.
+  const finish = (fields) => Object.assign({}, fields, base, {
+    enforcement,
+    enforcement_source: enforcementSource,
+    advised_action: adviseAction(enforcement, fields.decision),
+    suppressed_action: suppressedAction(enforcement, fields.decision),
+  });
+
   const own = ownEligibility(claim);
 
   // Nothing in scope: NOTHING was confronted, and the proceed says exactly
@@ -927,7 +956,7 @@ function evaluateGate(opts) {
       // Visible, never punished without a counterpart.
       census.notes.push({ id: runId, reason: 'own-claim-ineligible-no-counterpart' });
     }
-    return Object.assign({
+    return finish({
       decision: 'proceed',
       cause: null,
       reason: 'no-active-counterpart',
@@ -935,14 +964,14 @@ function evaluateGate(opts) {
       floor: null,
       counterparts: [],
       paths: [],
-    }, base);
+    });
   }
 
   // (c) Own side ineligible — D1/D7. Refuse only reaches here, i.e. only with
   // >= 1 counterpart in scope.
   if (!own.eligible) {
     const counterpartAlsoUndeclared = inScope.some((c) => isUndeclared(c.claim));
-    return Object.assign({
+    return finish({
       decision: 'refuse',
       cause: own.cause,
       reason: null,
@@ -953,7 +982,7 @@ function evaluateGate(opts) {
       counterparts: inScope.map((c) => ({
         id: c.id, cause: null, paths: [], scope: c.scope, note: c.note,
       })),
-    }, base);
+    });
   }
 
   // (d) Confrontation — the algebra is S03's, never a second copy.
@@ -1001,7 +1030,7 @@ function evaluateGate(opts) {
   }
 
   if (!sawOverlap && !sawUndeclared) {
-    return Object.assign({
+    return finish({
       decision: 'proceed',
       cause: null,
       reason: 'no-conflict',
@@ -1009,7 +1038,7 @@ function evaluateGate(opts) {
       floor: null,
       counterparts,
       paths: [],
-    }, base);
+    });
   }
 
   // A MEASURED collision outranks a missing declaration when both are present:
@@ -1085,7 +1114,7 @@ function evaluateGate(opts) {
     floor = 'defer-floor';
   }
 
-  return Object.assign({
+  return finish({
     decision,
     cause,
     reason: null,
@@ -1101,7 +1130,7 @@ function evaluateGate(opts) {
     posture_effective: resolved.posture,
     posture_override: resolved.override,
     posture_override_effect: resolved.override_effect,
-  }, base);
+  });
 }
 
 // ── The knob, made live (B1) ───────────────────────────────────────────────
@@ -1123,10 +1152,25 @@ function evaluateGate(opts) {
 // documented default a lie for anyone who never wrote a prefs file.
 const PARALLELISM_FALLBACKS = {
   cross_run_overlap: 'defer', // == forge-prefs.schema.json parallelism.cross_run_overlap.default
+  claim_gate: 'advisory', // == forge-prefs.schema.json parallelism.claim_gate.default
+  orphan_run_ms: 1800000,
   block_wait_ms: 300000,      // == parallelism.block_wait_ms.default (5 min — ceiling of ONE blocking wait)
   block_poll_ms: 15000,       // == parallelism.block_poll_ms.default
   defer_cap: 3,               // == parallelism.defer_cap.default (consecutive defers of the SAME unit)
 };
+const ENFORCEMENTS = ['advisory', 'enforcing'];
+const ADVISED_ACTIONS = ['dispatch', 'stop'];
+
+// The two axes, kept apart on purpose (D1). `cross_run_overlap` decides WHICH verdict a collision
+// produces; `claim_gate` decides WHETHER that verdict is executed. Fusing them would make the
+// advisory debut unmeasurable, because the flip criterion reads the verdict, not the act.
+function adviseAction(enforcement, decision) {
+  if (enforcement === 'advisory') return 'dispatch';
+  return decision === 'proceed' ? 'dispatch' : 'stop';
+}
+function suppressedAction(enforcement, decision) {
+  return enforcement === 'advisory' && decision !== 'proceed' ? 'stop' : null;
+}
 
 function positiveIntPref(value, fallback, key, notes) {
   if (Number.isInteger(value) && value > 0) return value;
@@ -1158,6 +1202,8 @@ function readParallelism(cwd, opts) {
   }
   return {
     cross_run_overlap: block.cross_run_overlap,
+    claim_gate: block.claim_gate,
+    orphan_run_ms: positiveIntPref(block.orphan_run_ms, PARALLELISM_FALLBACKS.orphan_run_ms, 'orphan_run_ms', notes),
     block_wait_ms: positiveIntPref(block.block_wait_ms, PARALLELISM_FALLBACKS.block_wait_ms, 'block_wait_ms', notes),
     block_poll_ms: positiveIntPref(block.block_poll_ms, PARALLELISM_FALLBACKS.block_poll_ms, 'block_poll_ms', notes),
     defer_cap: positiveIntPref(block.defer_cap, PARALLELISM_FALLBACKS.defer_cap, 'defer_cap', notes),
@@ -1189,6 +1235,12 @@ function resolvePostureFromPrefs(cwd, opts) {
     source: 'invalid-pref',
     note: 'invalid-posture-pref',
   };
+}
+function resolveEnforcementFromPrefs(cwd, opts) {
+  const raw = readParallelism(cwd, opts).claim_gate;
+  if (raw === undefined || raw === null) return { enforcement: PARALLELISM_FALLBACKS.claim_gate, source:'fallback', note:null };
+  if (ENFORCEMENTS.includes(raw)) return { enforcement:raw, source:'prefs', note:null };
+  return { enforcement:PARALLELISM_FALLBACKS.claim_gate, source:'invalid-pref', note:'invalid-enforcement-pref' };
 }
 
 // ── Anti-livelock: the defer ledger ────────────────────────────────────────
@@ -1265,6 +1317,10 @@ function emitGateEvent(cwd, result) {
     undeclared_side: result.undeclared_side === undefined ? null : result.undeclared_side,
     posture: result.posture === undefined ? null : result.posture,
     posture_source: result.posture_source === undefined ? null : result.posture_source,
+    enforcement: result.enforcement === undefined ? null : result.enforcement,
+    enforcement_source: result.enforcement_source === undefined ? null : result.enforcement_source,
+    advised_action: result.advised_action === undefined ? null : result.advised_action,
+    suppressed_action: result.suppressed_action === undefined ? null : result.suppressed_action,
     // ADDITIVE (S06/T02, D8). `posture` above is unchanged and still means "the
     // posture the pref resolved to" — the three keys below say what actually
     // decided and whether D8 hardened it. An old reader ignoring them stays
@@ -1351,6 +1407,12 @@ function recordAndEvaluate(opts) {
   const resolvedPref = typeof o.posture === 'string'
     ? { posture: o.posture, source: 'explicit', note: null }
     : resolvePostureFromPrefs(cwd, o.prefsOpts);
+  if (o.enforcement !== undefined && o.enforcement !== null && !ENFORCEMENTS.includes(o.enforcement)) {
+    throw new Error(`forge-claim-gate: enforcement fora de ENFORCEMENTS: ${JSON.stringify(o.enforcement)}`);
+  }
+  const resolvedEnforcement = typeof o.enforcement === 'string'
+    ? { enforcement: o.enforcement, source: 'explicit', note: null }
+    : resolveEnforcementFromPrefs(cwd, o.prefsOpts);
 
   // (1) RECORD — via S03's primitive, never `runs.update` directly. Under
   // `record: false` the same shape is DERIVED and not persisted: the batch
@@ -1395,12 +1457,26 @@ function recordAndEvaluate(opts) {
     : eligibilityOfPaths(claim.paths);
   const evalClaim = Object.assign({}, claim, elig);
 
+  // (1.5) OPPORTUNISTIC REAP — best-effort, before the counterparts are collected. No daemon, no
+  // cron, no new clock: the contender who was going to wait anyway pays the cost (molde
+  // `forge-resource-pool.reapStale`). Deliberately NOT inside `evaluateGate`: `--evaluate` is a
+  // read-only entry point that promises "no claim written, no event emitted" (G19d), and reaping
+  // writes. It lives HERE, on the path that already records, and never touches THIS run.
+  try {
+    require('./forge-run-reaper.js').reapOrphanRuns(cwd, {
+      thresholdMs: timings.orphan_run_ms,
+      exclude: [runId],
+    });
+  } catch (_) { /* failing to reap must never bring down an evaluation */ }
+
   // (2) EVALUATE — the recorded claim is the one confronted.
   const evaluate = () => evaluateGate({
     cwd,
     runId,
     claim: evalClaim,
     posture: resolvedPref.posture,
+    enforcement: resolvedEnforcement.enforcement,
+    enforcement_source: resolvedEnforcement.source,
     readyAlternatives,
     // The seam travels through: an injected probe must reach the counterpart
     // loop from here too, otherwise the operational entry point would silently
@@ -1419,7 +1495,19 @@ function recordAndEvaluate(opts) {
   // (3) The ceiling. Synchronous polling in-process: the consumer owns the tool
   // call timeout (contract in shared/forge-claim-gate.md, T03). Expiry NEVER
   // becomes `proceed` — it becomes a named escalation with the decision intact.
-  if (o.wait && result.decision === 'block') {
+  //
+  // `--wait` IS an act (PR #110, plan step 5). Under `advisory` the module does NOT poll: spending
+  // the whole `block_wait_ms` ceiling only to dispatch anyway burns the consumer's tool-call budget
+  // while fencing nothing. The `decision` stays the real `block` and still travels in the event.
+  // What is NOT emitted is `escalation: 'wait-ceiling'` — that value is the MEASUREMENT of a wait
+  // that did not clear, and a wait that never happened cannot be measured. Fabricating it would be
+  // the exact defect class this repo keeps paying for (a reading with no observation behind it).
+  // `defer-cap` is unaffected: it is computed from the ledger, not from waiting, and is emitted
+  // under both enforcements.
+  if (o.wait && result.decision === 'block' && resolvedEnforcement.enforcement === 'advisory') {
+    wait = { polls: 0, waited_ms: 0, ceiling_ms: timings.block_wait_ms, suppressed_by: 'advisory' };
+  }
+  if (o.wait && result.decision === 'block' && resolvedEnforcement.enforcement === 'enforcing') {
     const started = Date.now();
     let polls = 0;
     while (result.decision === 'block') {
@@ -1482,6 +1570,10 @@ function recordAndEvaluate(opts) {
     claim_persisted,
     posture: resolvedPref.posture,
     posture_source: resolvedPref.source,
+    enforcement: resolvedEnforcement.enforcement,
+    enforcement_source: resolvedEnforcement.source,
+    advised_action: resolvedEnforcement.enforcement === 'advisory' ? 'dispatch' : (result.decision === 'proceed' ? 'dispatch' : 'stop'),
+    suppressed_action: resolvedEnforcement.enforcement === 'advisory' && result.decision !== 'proceed' ? 'stop' : null,
     escalation,
     wait,
     defer_count: result.decision === 'defer' || escalation === 'defer-cap' ? deferCount : prior,
@@ -1679,6 +1771,9 @@ function main(argv) {
         derived,
         readyAlternatives,
         posture: typeof args.posture === 'string' ? args.posture : undefined,
+        // Operator override of the enforcement axis, same shape as --posture: absent => the module
+        // consults `parallelism.claim_gate` itself (spec § Step 0). Consumers never pass it.
+        enforcement: typeof args.enforcement === 'string' ? args.enforcement : undefined,
         wait: Boolean(args.wait),
         // R2: `--check-only` evaluates and LOGS without touching the persisted
         // claim, so a batch union recorded before the loop survives the loop.
@@ -1696,8 +1791,10 @@ function main(argv) {
       // — the fence never existed in runtime. `--claim-and-check` had carried
       // `claim` since T02; `--evaluate` did not, and only the latter is safe to
       // call while deriving a union.
-      result = Object.assign(evaluateGate({ cwd, runId: args.run, claim, posture, readyAlternatives }),
-        { claim, claim_recorded: false });
+      result = Object.assign(evaluateGate({
+        cwd, runId: args.run, claim, posture, readyAlternatives,
+        enforcement: typeof args.enforcement === 'string' ? args.enforcement : undefined,
+      }), { claim, claim_recorded: false });
     }
   } catch (e) {
     // ENFORCING, so this is NOT the advisory `return 0` of forge-claim-overlap:
@@ -1721,12 +1818,17 @@ module.exports = {
   deriveClaimFromConcededItems,
   resolvePosture,
   resolvePostureFromPrefs,
+  resolveEnforcementFromPrefs,
+  adviseAction,
+  suppressedAction,
   readParallelism,
   recordAndEvaluate,
   emitGateEvent,
   evaluateGate,
   formatGate,
   PARALLELISM_FALLBACKS,
+  ENFORCEMENTS,
+  ADVISED_ACTIONS,
   ESCALATIONS,
   GATE_DECISIONS,
   GATE_CAUSES,

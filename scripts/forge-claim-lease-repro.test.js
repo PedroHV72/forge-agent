@@ -328,7 +328,7 @@ test('F2b: a linha claim-gate da F2 no events.jsonl carrega o counterpart libera
 // ══════════════════════════════════════════════════════════════════════════
 console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VERMELHA');
 {
-  test('BITE: com a prova de commit neutralizada no módulo REAL, a F2 volta a bloquear', () => {
+  test('BITE-a: com a prova de commit neutralizada no módulo REAL, a F2 volta a bloquear', () => {
     const original = fs.readFileSync(RELEASE_MODULE, 'utf8');
     const hashBefore = sha256(RELEASE_MODULE);
     const needle = 'if (f.baseline_advanced === true && f.paths_in_flight === false) {';
@@ -370,6 +370,85 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
       'restaurado, o mesmo comando volta a passar');
   });
 
+  // ── BITE-b (D16): a mordida da doutrina NOVA ────────────────────────────
+  //
+  // A BITE-a morde a CONJUNÇÃO (duas sondas), que é doutrina de S05 e continua
+  // de pé. Ela não morde o que D16 acrescentou: que a sonda A é sobre O
+  // TRABALHO DESTE CLAIM, não sobre a árvore. Com a sonda A imprecisa ("a
+  // baseline andou"), um commit de A FORA dos paths que ela reivindicou
+  // satisfazia a prova e a cerca abria em definitivo — que é o defeito #1 do
+  // review, o caso do claim-união T01+T02.
+  //
+  // Esta mordida cerca exatamente isso: neutralizar a PRECISÃO (devolver a
+  // sonda A ao fato cru `baseline_moved`) tem de fazer a F2 LIBERAR
+  // INDEVIDAMENTE — a direção oposta à da BITE-a, e é essa oposição que prova
+  // que as duas mordem coisas diferentes.
+  test('BITE-b: com a PRECISÃO da sonda A neutralizada, um commit fora dos paths libera indevidamente', () => {
+    const original = fs.readFileSync(RELEASE_MODULE, 'utf8');
+    const hashBefore = sha256(RELEASE_MODULE);
+    const needle = '  facts.baseline_advanced = hits.length > 0;';
+    assertEqual(original.split(needle).length - 1, 1,
+      'a mordida precisa casar EXATAMENTE a atribuição da sonda precisa — 0 ou 2 casamentos a tornariam vazia');
+
+    // Fixture onde A commita algo que NÃO é o path reivindicado (`src/a.js`), e
+    // desfaz o próprio voo. É o instante do claim-união: árvore limpa, baseline
+    // andada, e o trabalho reivindicado AINDA POR VIR.
+    const bfx = buildFixture();
+    git(bfx.repo, ['checkout', '--', 'src/a.js']);
+    fs.writeFileSync(path.join(bfx.repo, 'outro.js'), '// commit da T01, fora do claim\n', 'utf8');
+    git(bfx.repo, ['add', 'outro.js']);
+    git(bfx.repo, ['commit', '-q', '-m', 'A commita FORA dos paths reivindicados']);
+    assertEqual(git(bfx.repo, ['status', '--porcelain']).trim(), '', 'a árvore da mordida está limpa');
+    assertEqual(readRun(bfx.ws, RUN_A).write_claim.released, null,
+      'a fixture da mordida NÃO pode nascer com envelope — senão a mordida é vazia');
+
+    // Estado SÃO, com o módulo real: a sonda A precisa recusa, B fica bloqueada.
+    const sane = cliJson(GATE_CLI, bfx.bArgs);
+    assert(sane.decision !== 'proceed',
+      `com a sonda A precisa, o commit fora dos paths NÃO pode liberar A, veio ${sane.decision}`);
+    assertEqual(sane.cause, 'overlap');
+    assertEqual(sane.released_counterparts.length, 0, 'ninguém sai do universo por um commit alheio ao claim');
+
+    let bitten = null;
+    try {
+      // A neutralização é EXATAMENTE a sonda pré-D16: a árvore andou.
+      fs.writeFileSync(RELEASE_MODULE,
+        original.replace(needle, '  facts.baseline_advanced = facts.baseline_moved;'), 'utf8');
+      bitten = cliJson(GATE_CLI, bfx.bArgs);
+    } finally {
+      fs.writeFileSync(RELEASE_MODULE, original, 'utf8');
+    }
+    assertEqual(sha256(RELEASE_MODULE), hashBefore,
+      'o módulo real precisa voltar byte-idêntico — sha256 conferido, não presumido');
+
+    assertEqual(bitten.decision, 'proceed',
+      'com a precisão neutralizada a cerca abre — é este o defeito que D16 fecha');
+    assert((bitten.released_counterparts || []).some((r) => r.id === RUN_A && r.mechanism === 'committed'),
+      'e abre pelo mecanismo errado: `committed` sobre um commit que não tocou o claim');
+
+    // O dano é IRREVERSÍVEL, e isso é medido, não narrado: o gate PERSISTIU o
+    // envelope no claim de A. Restaurar o módulo não fecha a cerca de volta —
+    // a próxima avaliação sai por `released-explicit`. É por isso que a
+    // imprecisão da sonda A não era um erro de leitura, e sim uma perda de
+    // cerca definitiva.
+    const envelope = readRun(bfx.ws, RUN_A).write_claim.released;
+    assert(envelope && envelope.mechanism === 'committed',
+      'a mordida tem de deixar o envelope gravado — é o dano que ela cerca');
+    assertEqual(cliJson(GATE_CLI, bfx.bArgs).decision, 'proceed',
+      'e com o módulo JÁ restaurado a cerca segue aberta: released-explicit, não há como desfazer');
+
+    // Controle positivo da restauração, sobre uma fixture VIRGEM — a de cima não
+    // serve mais, justamente porque foi contaminada. Sem este controle, um
+    // `finally` que falhasse passaria despercebido.
+    const cfx = buildFixture();
+    git(cfx.repo, ['checkout', '--', 'src/a.js']);
+    fs.writeFileSync(path.join(cfx.repo, 'outro.js'), '// idem\n', 'utf8');
+    git(cfx.repo, ['add', 'outro.js']);
+    git(cfx.repo, ['commit', '-q', '-m', 'A commita FORA dos paths reivindicados']);
+    assert(cliJson(GATE_CLI, cfx.bArgs).decision !== 'proceed',
+      'restaurado, a MESMA situação volta a bloquear');
+  });
+
   // ── S05/review R3, sobre git REAL: o veredito vivo virou registro ─────────
   test('R3: o `committed` que a F2 corroborou foi PERSISTIDO no claim de A (release monotônico)', () => {
     const claimA = readRun(fx.ws, RUN_A).write_claim;
@@ -399,6 +478,25 @@ console.log('\nMordida: neutralizar a conjunção das duas sondas deixa a F2 VER
 console.log('\nF4/F3: mesmo relógio, duas respostas — o que decide é a run estar viva');
 
 const fx2 = buildFixture();
+// A rede do TTL exige `paths_in_flight !== true` (PR #110, `#2(c)`): árvore suja
+// nos paths reivindicados é a assinatura de *checkpointed*, não de abandonado, e
+// a rede corretamente se recusa a recolher esse claim. A `buildFixture` deixa
+// `src/a.js` escrito e não commitado — o estado da F1/F2 — então a F3 precisa
+// desfazer o VOO para medir o que é o seu sujeito: a expiração por inatividade.
+//
+// O desfazer é `checkout --` do path reivindicado: limpa o voo SEM avançar a
+// baseline (HEAD intocado, conferido abaixo). Assim o único delta entre F4 e F3
+// continua sendo `active`, que é o controle que o par inteiro carrega — se a F3
+// commitasse para limpar, ela sairia por `released-committed` e o par não
+// provaria nada sobre o TTL.
+{
+  const headBefore = git(fx2.repo, ['rev-parse', 'HEAD']).trim();
+  git(fx2.repo, ['checkout', '--', 'src/a.js']);
+  assert(git(fx2.repo, ['status', '--porcelain']).trim() === '',
+    'a F3 exige a árvore limpa — senão a rede recusa por paths em voo');
+  assert(git(fx2.repo, ['rev-parse', 'HEAD']).trim() === headBefore,
+    'e exige a baseline PARADA — limpar o voo não pode virar prova de commit');
+}
 const AGED_MS = DEFAULT_TTL_MS + DEFAULT_GRACE_MS + 60000;
 const agedAt = ageClaim(fx2.ws, RUN_A, AGED_MS);
 let f4status = null;

@@ -12,19 +12,46 @@
 //
 // ── Por que DUAS sondas, e por que a conjunção é o desenho ──────────────────
 //
-//   A — o baseline avançou: `baselineId(code_dir, {vcs})` difere do
-//       `vcs_baseline.id` gravado no instante do claim.
+//   A — PRECISA (D16): existe, desde o baseline gravado, mudança commitada que
+//       TOCA ≥ 1 dos paths reivindicados. Não basta a baseline da árvore ter
+//       andado: `baseline_moved` é o fato cru (auditável), e
+//       `baseline_advanced` é a sonda que governa.
 //   B — os paths reivindicados saíram de voo: nenhum path do claim aparece em
-//       `workingStatus(code_dir, {vcs})` com `kind ∈ {modified, added, deleted}`.
+//       `workingStatus(code_dir, {vcs})` com `kind ∈ IN_FLIGHT_KINDS`.
 //
 // Cada sonda SOZINHA libera errado, e em direções OPOSTAS:
 //
-//   * Só A libera pelo commit do VIZINHO numa árvore compartilhada — que é
-//     literalmente o cenário SVN/WDMA que originou esta milestone. O baseline é
-//     uma propriedade da ÁRVORE, não do trabalho deste claim: qualquer commit
-//     de qualquer um a faz avançar.
+//   * Só A libera um claim cujo worker NEM COMEÇOU a escrever quando outro
+//     commit já tocou aqueles paths antes.
 //   * Só B libera um claim cujo worker NEM COMEÇOU a escrever. Zero paths sujos
-//     é indistinguível de "commitou tudo" quando ninguém olha o baseline.
+//     é indistinguível de "commitou tudo" quando ninguém olha o commit.
+//
+// ── Por que a sonda A precisa, e o que ela revoga (D16) ────────────────────
+//
+// A sonda A original era "a baseline da ÁRVORE andou" — propriedade da árvore,
+// não do trabalho deste claim. Num claim-união (T01+T02) QUALQUER commit a
+// satisfazia, inclusive um commit da T01 que não tocava os paths que a T02
+// ainda ia escrever. A precisa faz a distinção certa: **o dono que commitou os
+// paths que claimou libera; o que commitou outra coisa não.**
+//
+// D16 REVOGA a terceira condição `owner_active === false` que PR #110 tinha
+// posto no degrau `released-committed`. Ela tornava o degrau INALCANÇÁVEL pelo
+// gate real, por tesoura de duas lâminas MEDIDA nos dois sítios:
+//   1. `collectRunClaims` (forge-claim-overlap.js) pula toda run com
+//      `active !== true` como `run-inactive` ANTES de qualquer sonda;
+//   2. `probeClaim` deriva `owner_active` de `isHolderRunActive`, que exige
+//      `run.active === true`.
+// Contraparte ativa ⇒ `owner_active === true` ⇒ nunca dispara; inativa ⇒ nunca
+// sondada. Não existia estado que emitisse `claim-released:committed` — e o
+// step `e-release` do `forge-auto` pede o release COM a run ainda ativa, então
+// o claim só sairia por TTL depois da run morrer. Isso é over-block, a classe
+// que esta milestone existe para fechar, reintroduzida um nível acima.
+//
+// O que D16 NÃO revoga: a não-persistência do veredito no RunRecord alheio
+// enquanto o dono está ativo, que vive em `forge-claim-gate.js` e segue de pé.
+//
+// A precisão é MONOTÔNICA sobre a sonda antiga: todo estado que a precisa
+// libera, a antiga também liberava. Nenhum caminho novo de liberação é criado.
 //
 // Afrouxar para uma sonda só é REGRESSÃO, não simplificação. A razão fica aqui,
 // no cabeçalho, porque a suíte prova o par (cada sonda isolada NÃO libera) e um
@@ -183,6 +210,89 @@ function covers(claimPath, statusPath) {
 const IN_FLIGHT_KINDS = Object.freeze(['modified', 'added', 'deleted', 'untracked']);
 
 /**
+ * Sonda A PRECISA (D16): os paths que mudaram DESDE o baseline gravado, lidos
+ * pelo seam público — nunca por `git`/`svn` próprio.
+ *
+ * Duas funções do seam porque as duas perguntas são genuinamente diferentes no
+ * VCS, e a escolha é MEDIDA, não estética:
+ *
+ *   git → `postChanges(dir, baselineId, {vcs:'git'})`, que é `diff
+ *         --name-status <baseline>` (mais untracked). Ele inclui o working
+ *         tree, mas isso não contamina a decisão: o degrau só dispara com
+ *         `paths_in_flight === false`, ou seja, com os paths reivindicados
+ *         comprovadamente limpos — nesse estado a interseção com os paths do
+ *         claim é puramente COMMITADA.
+ *   svn → `svnLogChangedPaths(dir, {fromRev, toRev})`. `postChanges` NÃO serve
+ *         em svn: a implementação é derivada de `svn status`, cega ao
+ *         baseline, então depois de um commit ela devolve vazio e o degrau
+ *         ficaria estruturalmente inalcançável em svn — exatamente o
+ *         over-block que D16 veio fechar.
+ *
+ * O log do svn devolve paths REPO-ABSOLUTOS (`/trunk/src/a.ts`) e a working
+ * copy é um checkout de algum sub-caminho que este módulo não conhece (não há
+ * `svn info` no seam). Por isso o casamento em svn aceita o sufixo com
+ * fronteira de segmento, e a limitação fica NOMEADA aqui: ela pode casar um
+ * homônimo em outro diretório do repositório. Isso continua estritamente mais
+ * estreito que a sonda antiga (que casava QUALQUER commit em QUALQUER path),
+ * então nunca é regressão — só precisão parcial.
+ *
+ * NUNCA lança: toda pergunta que não pôde ser feita volta `{ok:false}` com o
+ * erro nomeado, e vira `held-probe-unavailable` lá em cima.
+ */
+function measureTouched(codeDir, vcs, baselineBefore, opts = {}) {
+  const seam = opts.vcsSeam || vcsDefault;
+  if (vcs === 'git') {
+    let res;
+    try { res = seam.postChanges(codeDir, baselineBefore, { vcs: 'git' }); }
+    catch (e) { return { ok: false, paths: null, error: `post-changes-threw:${e.message}` }; }
+    if (!res || !res.ok) {
+      return { ok: false, paths: null, error: `post-changes-failed:${(res && res.error) || 'sem entries'}` };
+    }
+    const out = [];
+    for (const entry of res.entries || []) {
+      const p = normalizePath(entry.path);
+      if (p !== '' && !out.includes(p)) out.push(p);
+    }
+    return { ok: true, paths: out, error: null };
+  }
+  if (vcs === 'svn') {
+    // `svnversion` pode devolver `42`, `42M` ou `40:42` — o baseline é o MAIOR
+    // número presente, isto é, o último. Um id que não carrega número nenhum é
+    // pergunta impossível, nunca um `1` inventado.
+    const m = /(\d+)\D*$/.exec(String(baselineBefore));
+    if (!m) return { ok: false, paths: null, error: `svn-baseline-unparsable:${baselineBefore}` };
+    const from = Number.parseInt(m[1], 10) + 1;
+    let log;
+    try { log = seam.svnLogChangedPaths(codeDir, { fromRev: from, toRev: 'HEAD' }); }
+    catch (e) { return { ok: false, paths: null, error: `svn-log-threw:${e.message}` }; }
+    if (!log || !log.ok) {
+      return { ok: false, paths: null, error: `svn-log-failed:${(log && log.error) || 'sem revisions'}` };
+    }
+    const out = [];
+    for (const r of log.revisions || []) {
+      for (const p of r.paths || []) {
+        const n = normalizePath(String(p.path).replace(/^\/+/, ''));
+        if (n !== '' && !out.includes(n)) out.push(n);
+      }
+    }
+    return { ok: true, paths: out, error: null };
+  }
+  return { ok: false, paths: null, error: `vcs-unknown:${vcs === undefined ? 'undefined' : vcs}` };
+}
+
+/**
+ * O path reivindicado ALCANÇA o path tocado? `covers` é a relação canônica
+ * (mesmo path, ou o claim é diretório ancestral). Em svn, e SÓ em svn, o
+ * sufixo com fronteira de segmento também vale — ver `measureTouched`.
+ */
+function reaches(claimPath, touchedPath, allowSuffix) {
+  if (covers(claimPath, touchedPath)) return true;
+  if (!allowSuffix) return false;
+  if (touchedPath.endsWith(`/${claimPath}`)) return true;
+  return touchedPath.includes(`/${claimPath}/`);
+}
+
+/**
  * Coleta os FATOS. Toda pergunta que não pôde ser feita vira campo com o erro
  * nomeado — nunca um `false` silencioso, que é indistinguível de uma resposta
  * negativa medida. Não decide nada: a decisão é de `classifyRelease`.
@@ -204,7 +314,14 @@ function probeClaim(claim, opts = {}) {
     vcs: null,
     baseline_before: null,
     baseline_now: null,
+    // Fato CRU: a baseline da árvore andou. Preservado para auditoria porque é
+    // o que a sonda A media antes de D16 — e um leitor futuro precisa poder ver
+    // os dois lados do estreitamento sem reconstruir nada.
+    baseline_moved: null,
+    // Sonda A PRECISA: há mudança commitada desde a baseline que TOCA ≥ 1 path
+    // reivindicado. É esta que governa o degrau `released-committed`.
     baseline_advanced: null,
+    touched_paths: null,
     dirty_paths: null,
     paths_in_flight: null,
     age_ms: null,
@@ -249,7 +366,7 @@ function probeClaim(claim, opts = {}) {
     return facts;
   }
   facts.baseline_now = measured.id;
-  facts.baseline_advanced = measured.id !== before.id;
+  facts.baseline_moved = measured.id !== before.id;
 
   let status;
   try {
@@ -272,6 +389,24 @@ function probeClaim(claim, opts = {}) {
   }
   facts.dirty_paths = dirty;
   facts.paths_in_flight = dirty.length > 0;
+
+  // Sonda A precisa. Baseline parada é resposta MEDIDA ("nada foi commitado,
+  // logo nada tocou os paths"), não pergunta impossível: nenhuma consulta é
+  // feita e o veredito é `false`, jamais `null`.
+  if (facts.baseline_moved === false) {
+    facts.touched_paths = [];
+    facts.baseline_advanced = false;
+    return facts;
+  }
+  const touched = measureTouched(facts.code_dir, measured.vcs, before.id, { vcsSeam: seam });
+  if (!touched.ok) {
+    facts.probe_error = touched.error;
+    return facts;
+  }
+  const allowSuffix = measured.vcs === 'svn';
+  const hits = touched.paths.filter((t) => claimed.some((c) => reaches(c, t, allowSuffix)));
+  facts.touched_paths = hits;
+  facts.baseline_advanced = hits.length > 0;
   return facts;
 }
 
@@ -294,6 +429,19 @@ function classifyRelease(facts) {
 
   // 2. As DUAS sondas, em conjunção. `=== true` / `=== false` são literais de
   //    propósito: `null` é "não perguntei" e NUNCA pode satisfazer uma sonda.
+  //
+  //    D16 REMOVEU daqui a terceira condição `owner_active === false` que PR #110
+  //    havia acrescentado. Ela não fechava o buraco que dizia fechar — ela tornava
+  //    o degrau INALCANÇÁVEL pelo gate real (a tesoura medida está no cabeçalho).
+  //    O buraco real era outro, e é a sonda A PRECISA que o fecha: o instante em
+  //    que o commit do VIZINHO avançava a baseline enquanto as edições deste claim
+  //    estavam momentaneamente limpas agora não satisfaz a sonda A, porque o commit
+  //    do vizinho não TOCA os paths reivindicados. A prova de commit voltou a ser
+  //    sobre o trabalho DESTE claim, que é o que ela sempre deveria ter medido.
+  //
+  //    `owner_active` continua MEDIDO e carregado na evidência — só não decide
+  //    mais aqui. Onde a liveness do dono ainda governa é a PERSISTÊNCIA do
+  //    veredito no RunRecord alheio (`forge-claim-gate.js`), que D16 não revoga.
   if (f.baseline_advanced === true && f.paths_in_flight === false) {
     return { held: false, reason: 'released-committed', mechanism: MECHANISM_BY_REASON['released-committed'] };
   }
@@ -301,7 +449,15 @@ function classifyRelease(facts) {
   // 3. A rede. VEM ANTES de probe-unavailable de propósito: uma run morta cuja
   //    árvore sumiu ainda tem de sair do caminho — é para isso que a rede existe.
   //    Exige run INATIVA: a idade sozinha nunca libera (D2).
-  if (f.ttl_expired === true && f.owner_active === false) {
+  //    E exige `paths_in_flight !== true` (PR #110, `#2(c)`). `!== true`, NÃO
+  //    `=== false`, e a diferença é o desenho: o caso que a rede existe para
+  //    resolver — árvore sumida — produz `null` ("não perguntei"), e continua
+  //    liberando. O que passa a ser recusado é a REFUTAÇÃO MEDIDA: árvore suja nos
+  //    paths reivindicados é a assinatura de *checkpointed, não abandonado* — que é
+  //    exatamente o que pause, handoff de conta e a escalação de `block` deste
+  //    próprio gate produzem. `last_heartbeat` não discrimina pausado de morto (D4);
+  //    a árvore suja discrimina, e é por isso que é ela que governa aqui.
+  if (f.ttl_expired === true && f.owner_active === false && f.paths_in_flight !== true) {
     return { held: false, reason: 'released-ttl-expired', mechanism: MECHANISM_BY_REASON['released-ttl-expired'] };
   }
 
@@ -354,7 +510,9 @@ function probesOf(facts) {
   return {
     baseline_before: facts.baseline_before,
     baseline_now: facts.baseline_now,
+    baseline_moved: facts.baseline_moved,
     baseline_advanced: facts.baseline_advanced,
+    touched_paths: facts.touched_paths,
     paths_in_flight: facts.paths_in_flight,
     dirty_paths: facts.dirty_paths,
     age_ms: facts.age_ms,
@@ -481,7 +639,7 @@ function formatRelease(result) {
     result.held ? 'claim MANTIDO — o commit não é observável' : 'claim LIBERADO',
   ];
   const f = result.facts || {};
-  lines.push(`sonda A (baseline avançou): ${f.baseline_advanced === null ? 'não perguntada' : f.baseline_advanced}`);
+  lines.push(`sonda A (commit tocou os paths do claim): ${f.baseline_advanced === null ? 'não perguntada' : f.baseline_advanced}`);
   lines.push(`sonda B (paths em voo): ${f.paths_in_flight === null ? 'não perguntada' : f.paths_in_flight}`);
   if (f.probe_error) lines.push(`erro de sonda: ${f.probe_error}`);
   if (result.refusal) lines.push(`pedido recusado: ${result.refusal} — nada foi gravado`);
@@ -524,6 +682,7 @@ if (require.main === module) process.exitCode = main(process.argv.slice(2));
 
 module.exports = {
   measureBaseline,
+  measureTouched,
   probeClaim,
   classifyRelease,
   releaseIfObservable,
@@ -537,5 +696,5 @@ module.exports = {
   parseArgs,
   main,
   USAGE,
-  _private: { covers, probesOf, formatRelease },
+  _private: { covers, reaches, probesOf, formatRelease },
 };

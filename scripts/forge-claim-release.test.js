@@ -201,7 +201,11 @@ test('R1b: paths limpos porque o worker nunca escreveu, baseline parado -> held-
 
 // (c) As duas juntas, em repo git REAL (init, commit, edição, commit).
 test('R1c: as DUAS sondas satisfeitas em repo git real -> released-committed', () => {
-  const { wsDir, repo } = makeScenario('M-r1c');
+  // `active: false` é herança da fixture de PR #110 e, depois de D16, NÃO é mais
+  // condição do degrau — R13b prova isso diretamente, com o par vivo/morto
+  // decidindo IGUAL. Fica como está para que a mudança de veredito não possa ser
+  // atribuída a uma edição de fixture.
+  const { wsDir, repo } = makeScenario('M-r1c', { active: false });
   fs.writeFileSync(path.join(repo, 'alvo.txt'), 'v1\n', 'utf8');
   git(repo, ['add', 'alvo.txt']);
   git(repo, ['commit', '-q', '-m', 'commit do proprio trabalho']);
@@ -209,13 +213,16 @@ test('R1c: as DUAS sondas satisfeitas em repo git real -> released-committed', (
   const s = statusOf(wsDir, 'M-r1c');
   assert(s.facts.baseline_advanced === true, 'sonda A satisfeita');
   assert(s.facts.paths_in_flight === false, 'sonda B satisfeita');
+  assertEqual(s.facts.owner_active, false, 'o dono segue MEDIDO — só não decide mais aqui (D16)');
+  assertEqual(s.facts.touched_paths.includes('alvo.txt'), true,
+    'a sonda A precisa NOMEIA o path commitado que a satisfez');
   assertEqual(s.reason, 'released-committed', 'as duas sondas juntas liberam');
   assertEqual(s.mechanism, 'committed', 'mecanismo deve ser committed');
   noteReason(s.reason);
 });
 
 test('R1d: released-committed grava o envelope via releaseClaim (T01), com evidência', () => {
-  const { wsDir, repo } = makeScenario('M-r1d');
+  const { wsDir, repo } = makeScenario('M-r1d', { active: false });
   fs.writeFileSync(path.join(repo, 'alvo.txt'), 'v1\n', 'utf8');
   git(repo, ['add', 'alvo.txt']);
   git(repo, ['commit', '-q', '-m', 'commit']);
@@ -228,6 +235,8 @@ test('R1d: released-committed grava o envelope via releaseClaim (T01), com evid�
   assertEqual(claim.released.mechanism, 'committed', 'mecanismo persistido');
   assert(claim.released.evidence.baseline_advanced === true, 'evidência carrega a sonda A');
   assert(claim.released.evidence.paths_in_flight === false, 'evidência carrega a sonda B');
+  assertEqual(claim.released.evidence.owner_active, false,
+    'a evidência PERSISTIDA carrega a inatividade do dono — o envelope é monotônico, então a terceira condição tem de ficar auditável nele');
   assertEqual(claim.paths.length, 1, 'paths do claim preservados pelo release');
 });
 
@@ -246,23 +255,59 @@ function svnSeam(calls, opts) {
     detectVcs(dir) { calls.push(['detectVcs', dir, null]); return 'svn'; },
     baselineId(dir, o) { calls.push(['baselineId', dir, o.vcs]); return { vcs: o.vcs, ok: true, id: opts.nowId }; },
     workingStatus(dir, o) { calls.push(['workingStatus', dir, o.vcs]); return { vcs: o.vcs, ok: true, entries: opts.entries }; },
+    // Sonda A precisa em svn (D16): `postChanges` NÃO serve aqui — a
+    // implementação svn dele é derivada de `svn status`, cega ao baseline, e
+    // devolveria vazio justamente depois do commit. O log é o que responde
+    // "quais paths mudaram entre duas revisões". Paths repo-ABSOLUTOS de
+    // propósito: é a forma real do `svn log -v`, e é ela que o casamento por
+    // sufixo com fronteira de segmento tem de atravessar.
+    svnLogChangedPaths(dir, o) {
+      calls.push(['svnLogChangedPaths', dir, 'svn', o]);
+      if (opts.log) return opts.log;
+      return { ok: true, revisions: [{ rev: 42, msg: 'c', paths: (opts.logPaths || []).map((p) => ({ action: 'M', path: p })) }] };
+    },
   };
 }
 
 test('R2a: caminho svn atravessa o seam público com {vcs:"svn"} e libera com as duas sondas', () => {
-  const { wsDir } = makeWorkspace('M-r2a');
+  const { wsDir } = makeWorkspace('M-r2a', { active: false });
   recordClaim(wsDir, 'M-r2a', {
     at: 1785763253000, unit: 'execute-task/T02', source: 'plan-writes',
     code_dir: path.join(wsDir, 'wc'), paths: ['src/a.ts'],
     vcs_baseline: { vcs: 'svn', id: '41' },
   });
   const calls = [];
-  const s = statusOf(wsDir, 'M-r2a', { vcsSeam: svnSeam(calls, { nowId: '42', entries: [] }) });
-  assertEqual(s.reason, 'released-committed', 'svn: baseline 41->42 e nada em voo libera');
+  const s = statusOf(wsDir, 'M-r2a', {
+    vcsSeam: svnSeam(calls, { nowId: '42', entries: [], logPaths: ['/trunk/src/a.ts'] }),
+  });
+  assertEqual(s.reason, 'released-committed', 'svn: commit tocou o path do claim e nada em voo libera');
   assertEqual(s.facts.vcs, 'svn', 'o vcs medido é svn');
   const seen = calls.filter((c) => c[0] !== 'detectVcs');
-  assert(seen.length >= 2, 'baselineId e workingStatus devem ter sido chamados');
+  assert(seen.length >= 3, 'baselineId, workingStatus e svnLogChangedPaths devem ter sido chamados');
   for (const [fn, , vcs] of seen) assertEqual(vcs, 'svn', `${fn} deve receber vcs svn pelo seam`);
+  const log = calls.find((c) => c[0] === 'svnLogChangedPaths');
+  assertEqual(log[3].fromRev, 42, 'o log parte da revisão SEGUINTE ao baseline gravado (41), nunca do 1');
+});
+
+// A precisão da sonda A tem de valer nos DOIS vcs — senão svn herda de volta o
+// "qualquer commit libera" que D16 acabou de fechar no git.
+test('R2d: svn — commit que NÃO toca o path do claim não libera (sonda A precisa em svn)', () => {
+  // Dono VIVO de propósito: senão a rede do TTL recolheria o claim pela idade da
+  // fixture e o teste mediria o degrau 3, não a sonda A que é o seu sujeito.
+  const { wsDir } = makeWorkspace('M-r2d', { active: true });
+  recordClaim(wsDir, 'M-r2d', {
+    at: 1785763253000, unit: 'execute-task/T02', source: 'plan-writes',
+    code_dir: path.join(wsDir, 'wc'), paths: ['src/a.ts'],
+    vcs_baseline: { vcs: 'svn', id: '41' },
+  });
+  const s = statusOf(wsDir, 'M-r2d', {
+    // A revisão avançou (41 -> 42), mas quem mudou foi o VIZINHO.
+    vcsSeam: svnSeam([], { nowId: '42', entries: [], logPaths: ['/trunk/src/vizinho.ts'] }),
+  });
+  assertEqual(s.facts.baseline_moved, true, 'o fato CRU: a revisão da árvore andou');
+  assertEqual(s.facts.baseline_advanced, false, 'mas nenhum commit tocou o path reivindicado');
+  assertEqual(s.reason, 'held-uncommitted', 'commit do vizinho não é prova sobre este claim, nem em svn');
+  noteReason(s.reason);
 });
 
 test('R2b: svn com path do claim em voo NÃO libera (mesma conjunção do git)', () => {
@@ -273,8 +318,10 @@ test('R2b: svn com path do claim em voo NÃO libera (mesma conjunção do git)',
     vcs_baseline: { vcs: 'svn', id: '41' },
   });
   const entries = [{ path: 'src/a.ts', code: 'M', kind: 'modified' }];
-  const s = statusOf(wsDir, 'M-r2b', { vcsSeam: svnSeam([], { nowId: '42', entries }) });
-  assertEqual(s.reason, 'held-uncommitted', 'baseline avançado sozinho não libera nem em svn');
+  const s = statusOf(wsDir, 'M-r2b', {
+    vcsSeam: svnSeam([], { nowId: '42', entries, logPaths: ['/trunk/src/a.ts'] }),
+  });
+  assertEqual(s.reason, 'held-uncommitted', 'sonda A sozinha não libera nem em svn');
 });
 
 test('R2c: guard de fonte — o módulo não ramifica em git/svn próprio (com controle positivo)', () => {
@@ -514,7 +561,7 @@ test('R8a: --release não observável recusa com not-observable, exit 0, e nada 
 });
 
 test('R8b: --release observável grava o envelope, exit 0', () => {
-  const { wsDir, repo } = makeScenario('M-r8b');
+  const { wsDir, repo } = makeScenario('M-r8b', { active: false });
   fs.writeFileSync(path.join(repo, 'alvo.txt'), 'v1\n', 'utf8');
   git(repo, ['add', 'alvo.txt']);
   git(repo, ['commit', '-q', '-m', 'commit']);
@@ -528,7 +575,10 @@ test('R8b: --release observável grava o envelope, exit 0', () => {
 });
 
 test('R8c: --status nunca grava', () => {
-  const { wsDir, repo } = makeScenario('M-r8c');
+  // A fixture precisa alcançar um veredicto LIBERÁVEL para que o invariante deste
+  // teste (`--status` não grava) seja exercido no caso perigoso: se a sonda
+  // dissesse `held`, o não-gravar seria trivial e o teste ficaria inerte.
+  const { wsDir, repo } = makeScenario('M-r8c', { active: false });
   fs.writeFileSync(path.join(repo, 'alvo.txt'), 'v1\n', 'utf8');
   git(repo, ['add', 'alvo.txt']);
   git(repo, ['commit', '-q', '-m', 'commit']);
@@ -546,7 +596,7 @@ test('R8d: invocação malformada -> exit 2; --help -> exit 0', () => {
 });
 
 test('R8e: claim já liberado -> released-explicit, sem regravar', () => {
-  const { wsDir, repo } = makeScenario('M-r8e');
+  const { wsDir, repo } = makeScenario('M-r8e', { active: false });
   fs.writeFileSync(path.join(repo, 'alvo.txt'), 'v1\n', 'utf8');
   git(repo, ['add', 'alvo.txt']);
   git(repo, ['commit', '-q', '-m', 'commit']);
@@ -580,7 +630,7 @@ function lastEvent(wsDir) {
 }
 
 test('R9a: release liberado emite claim-release no events.jsonl, lido do arquivo', () => {
-  const { wsDir, repo } = makeScenario('M-r9a');
+  const { wsDir, repo } = makeScenario('M-r9a', { active: false });
   fs.writeFileSync(path.join(repo, 'alvo.txt'), 'v1\n', 'utf8');
   git(repo, ['add', 'alvo.txt']);
   git(repo, ['commit', '-q', '-m', 'commit']);
@@ -628,7 +678,10 @@ test('R10: classifyRelease decide com fatos sintéticos, sem fixture e sem tocar
   const tmp = mktmp();
   const antes = fs.readdirSync(tmp);
   // Nenhum cwd, nenhum runId, nenhum path que exista: só fatos.
-  const v = classifyRelease({ explicit_release: false, baseline_advanced: true, paths_in_flight: false, probe_error: null });
+  const v = classifyRelease({
+    explicit_release: false, baseline_advanced: true, paths_in_flight: false,
+    owner_active: false, probe_error: null,
+  });
   assertEqual(v.reason, 'released-committed', 'decide só com os fatos dados');
   assertEqual(JSON.stringify(fs.readdirSync(tmp)), JSON.stringify(antes), 'nada foi escrito no disco');
   // E é total: qualquer entrada, inclusive vazia, produz uma razão do conjunto.
@@ -691,8 +744,12 @@ test('R11b: `ignored` continua FORA — só path REIVINDICADO segura, e nunca po
     detectVcs: () => 'git',
     baselineId: () => ({ ok: true, id: 'depois' }),
     workingStatus: () => ({ ok: true, entries: [{ kind: 'ignored', path: 'dir/lixo.log' }] }),
+    // Sonda A precisa satisfeita: o commit tocou um path SOB o diretório
+    // reivindicado. O SUJEITO deste teste é a sonda B (`ignored`), então a
+    // sonda A é dada como satisfeita para que a asserção tenha o que morder.
+    postChanges: () => ({ ok: true, entries: [{ path: 'dir/real.js', status: 'M' }] }),
   };
-  const f = probeClaim(claim, { vcsSeam: seam });
+  const f = probeClaim(claim, { vcsSeam: seam, runActive: false });
   assertEqual(f.paths_in_flight, false, '`ignored` não é trabalho em voo, mesmo sob path reivindicado');
   assertEqual(classifyRelease(f).reason, 'released-committed', 'com prova das duas sondas, libera');
   noteReason('released-committed');
@@ -707,8 +764,9 @@ test('R11c: untracked FORA do claim não segura — a cobertura de path continua
     detectVcs: () => 'git',
     baselineId: () => ({ ok: true, id: 'depois' }),
     workingStatus: () => ({ ok: true, entries: [{ kind: 'untracked', path: 'outro/novo.js' }] }),
+    postChanges: () => ({ ok: true, entries: [{ path: 'src/real.js', status: 'M' }] }),
   };
-  const f = probeClaim(claim, { vcsSeam: seam });
+  const f = probeClaim(claim, { vcsSeam: seam, runActive: false });
   assertEqual(f.paths_in_flight, false, 'untracked fora do claim não é do claim');
   assertEqual(classifyRelease(f).reason, 'released-committed');
 });
@@ -722,8 +780,14 @@ test('R11c: untracked FORA do claim não segura — a cobertura de path continua
 // exata que o RMW através do lock deixava aberta. O release tem de RECUSAR e
 // deixar o claim fresco intocado, e a recusa tem de aparecer NOMEADA no
 // resultado.
+// A fixture roda com o dono INATIVO por necessidade estrutural, não por gosto:
+// depois de PR #110 um dono vivo nunca alcança `released-committed`, então a
+// sonda pararia em `held-uncommitted` e o guard de escrita — que é o SUJEITO
+// deste teste — jamais seria exercido. Com o dono inativo o escritor concorrente
+// é outro ator (o reaper, um resume, o operador), e a corrida RMW que o teste
+// cerca é exatamente a mesma.
 test('R12: claim novo gravado DENTRO da janela -> release recusado (stale-claim), claim fresco intacto', () => {
-  const { wsDir, repo, head } = makeScenario('M-r12');
+  const { wsDir, repo, head } = makeScenario('M-r12', { active: false });
   let injected = false;
   const seam = {
     detectVcs: () => 'git',
@@ -731,7 +795,7 @@ test('R12: claim novo gravado DENTRO da janela -> release recusado (stale-claim)
     workingStatus: () => {
       if (!injected) {
         injected = true;
-        // O DONO grava o claim da próxima unidade, no meio da sonda.
+        // Um escritor concorrente grava o claim da próxima unidade, no meio da sonda.
         recordClaim(wsDir, 'M-r12', {
           at: 1785763299000, unit: 'execute-task/T03', source: 'plan-writes',
           code_dir: repo, paths: ['outro.txt'], vcs_baseline: { vcs: 'git', id: head },
@@ -739,6 +803,9 @@ test('R12: claim novo gravado DENTRO da janela -> release recusado (stale-claim)
       }
       return { ok: true, entries: [] };
     },
+    // O commit tocou o path do claim VELHO (`alvo.txt`) — sonda A precisa
+    // satisfeita. O SUJEITO deste teste é a corrida RMW, não a sonda.
+    postChanges: () => ({ ok: true, entries: [{ path: 'alvo.txt', status: 'M' }] }),
   };
 
   const r = releaseIfObservable(wsDir, 'M-r12', { vcsSeam: seam });
@@ -752,6 +819,107 @@ test('R12: claim novo gravado DENTRO da janela -> release recusado (stale-claim)
   assertEqual(after.unit, 'execute-task/T03', 'o claim FRESCO sobreviveu');
   assertEqual(after.released, null, 'e NÃO saiu liberado por um release da unidade anterior');
   noteReason(r.reason);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// R13 (D16) — a sonda A é sobre O TRABALHO DESTE CLAIM, não sobre a árvore
+// ════════════════════════════════════════════════════════════════════════════
+//
+// O defeito medido, e o que mudou de eixo:
+//
+//   PR #110 leu o defeito do claim-união como um problema de LIVENESS e pôs
+//   `owner_active === false` no degrau. O remédio não fechava o buraco — tornava
+//   o degrau INALCANÇÁVEL pelo gate real (contraparte ativa nunca satisfaz a
+//   condição; contraparte inativa nunca é sondada, porque `collectRunClaims` a
+//   pula antes). Over-block, a classe que esta milestone existe para fechar.
+//
+//   D16 lê o mesmo defeito onde ele de fato está: a sonda A media a ÁRVORE
+//   ("a baseline andou"), então num claim-união qualquer commit da T01 — mesmo
+//   sem tocar nada que a T02 ainda ia escrever — a satisfazia. A sonda precisa
+//   ("há commit desde a baseline que TOCA ≥ 1 path reivindicado") faz a
+//   distinção certa: o dono que commitou o que claimou libera; o que commitou
+//   outra coisa não.
+//
+// Estes testes são a mordida da doutrina NOVA: cada um VOLTA A FALHAR se a
+// precisão da sonda A for neutralizada (ver o BITE em forge-claim-lease-repro).
+// A liveness deixou de decidir AQUI — e R13b prova isso com o par vivo/morto
+// decidindo IGUAL, que é o oposto exato do que ele assertava antes.
+
+test('R13a: claim-união — commit que NÃO toca os paths reivindicados NÃO libera, mesmo com a árvore limpa', () => {
+  // Exatamente o cenário da T01 num claim-união: o dono commitou trabalho SEU,
+  // a árvore está limpa neste instante, e a T02 ainda vai escrever `alvo.txt`.
+  // O commit não toca `alvo.txt` — logo não é prova sobre este claim.
+  const { wsDir, repo } = makeScenario('M-r13a', { active: true });
+  fs.writeFileSync(path.join(repo, 'outra-coisa.txt'), 'da T01\n', 'utf8');
+  git(repo, ['add', 'outra-coisa.txt']);
+  git(repo, ['commit', '-q', '-m', 'commit da T01, fora dos paths reivindicados']);
+
+  const s = statusOf(wsDir, 'M-r13a');
+  assertEqual(s.facts.baseline_moved, true, 'fato CRU: a baseline da ÁRVORE andou (era isso que a sonda antiga media)');
+  assertEqual(s.facts.baseline_advanced, false, 'sonda A PRECISA: nenhum commit tocou os paths reivindicados');
+  assertEqual(s.facts.touched_paths.length, 0, 'e o conjunto de toques é NOMEADO vazio, não ausente');
+  assertEqual(s.facts.paths_in_flight, false, 'sonda B satisfeita (limpo ENTRE as tasks) — o instante que abria a cerca');
+  assert(s.reason !== 'released-committed',
+    'a cerca é monotônica e a T02 ainda vai escrever os paths reivindicados');
+  assertEqual(s.reason, 'held-uncommitted', 'e a razão é a do piso, não uma released-*');
+  assertEqual(s.held, true, 'claim mantido');
+  noteReason(s.reason);
+});
+
+test('R13b: o par difere SÓ no PATH commitado — mesma run viva, mesma árvore limpa, veredictos opostos', () => {
+  // Controle que fixa a atribuição: as duas fixtures são idênticas, as duas
+  // rodam com o dono VIVO, e a ÚNICA diferença é se o commit tocou o path
+  // reivindicado. Se o eixo fosse a liveness, os dois lados decidiriam igual.
+  const fora = makeScenario('M-r13b-fora', { active: true });
+  const dentro = makeScenario('M-r13b-dentro', { active: true });
+  fs.writeFileSync(path.join(fora.repo, 'outra-coisa.txt'), 'x\n', 'utf8');
+  git(fora.repo, ['add', 'outra-coisa.txt']);
+  git(fora.repo, ['commit', '-q', '-m', 'commit fora dos paths do claim']);
+  fs.writeFileSync(path.join(dentro.repo, 'alvo.txt'), 'v1\n', 'utf8');
+  git(dentro.repo, ['add', 'alvo.txt']);
+  git(dentro.repo, ['commit', '-q', '-m', 'commit DOS paths do claim']);
+
+  const sf = statusOf(fora.wsDir, 'M-r13b-fora');
+  const sd = statusOf(dentro.wsDir, 'M-r13b-dentro');
+
+  assertEqual(sf.facts.owner_active, true, 'os dois lados com o dono VIVO');
+  assertEqual(sd.facts.owner_active, true, 'os dois lados com o dono VIVO');
+  assertEqual(sf.facts.baseline_moved, sd.facts.baseline_moved, 'o fato CRU é idêntico nos dois lados');
+  assertEqual(sf.facts.paths_in_flight, sd.facts.paths_in_flight, 'sonda B idêntica nos dois lados');
+  assert(sf.reason !== sd.reason, 'as decisões divergem — logo o PATH commitado governa');
+  assertEqual(sd.reason, 'released-committed', 'quem commitou o que claimou libera');
+  assertEqual(sf.reason, 'held-uncommitted', 'quem commitou outra coisa não');
+});
+
+test('R13d: D16 — dono VIVO com a sonda A PRECISA satisfeita LIBERA (o degrau voltou a ser alcançável)', () => {
+  // Esta é a asserção que PR #110 tornava impossível e que D16 restaura. Ela é
+  // a mordida da REVOGAÇÃO: reintroduzir `owner_active === false` no degrau a
+  // derruba imediatamente.
+  const { wsDir, repo } = makeScenario('M-r13d', { active: true });
+  fs.writeFileSync(path.join(repo, 'alvo.txt'), 'v1\n', 'utf8');
+  git(repo, ['add', 'alvo.txt']);
+  git(repo, ['commit', '-q', '-m', 'commit dos paths reivindicados']);
+
+  const s = statusOf(wsDir, 'M-r13d');
+  assertEqual(s.facts.owner_active, true, 'pré-condição: o dono está VIVO — que é o estado do step e-release');
+  assertEqual(s.reason, 'released-committed', 'e ainda assim libera: a prova é o commit dos paths, não a morte da run');
+  assertEqual(s.mechanism, 'committed', 'mecanismo committed');
+  noteReason(s.reason);
+});
+
+// Mordida do segundo ajuste: o degrau TTL passou a exigir `paths_in_flight !== true`.
+// O `!== true` (e não `=== false`) é o desenho — R7c já guarda o outro lado,
+// provando que a árvore SUMIDA (`null`) continua liberando. Este cobre o lado
+// novo: a refutação MEDIDA.
+test('R13c: TTL vencido + dono inativo + paths do claim SUJOS -> não libera (checkpointed, não abandonado)', () => {
+  const v = classifyRelease(facts({
+    ttl_expired: true, owner_active: false, paths_in_flight: true,
+    dirty_paths: ['alvo.txt'], baseline_advanced: false,
+  }));
+  assert(v.reason !== 'released-ttl-expired',
+    'árvore suja nos paths reivindicados é assinatura de pause/handoff — a rede não pode confundir com abandono');
+  assertEqual(v.reason, 'held-uncommitted', 'segue mantido pelo piso');
+  assertEqual(v.held, true, 'held');
 });
 
 // ── R6 (segundo sentido): toda entrada do conjunto foi emitida por ≥1 teste ──
