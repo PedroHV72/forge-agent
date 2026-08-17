@@ -16,7 +16,14 @@ let spawnLog = null;
 childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
   if (spawnLog) {
     spawnLog.push(`${command} ${Array.isArray(args) ? args.join(' ') : ''}`.trim());
-    throw new Error(`spawn denied while previewing: ${command}`);
+    // `git` is allowed through and still recorded. Reading the source clone's own
+    // state (`rev-parse`, `status`, `rev-list`) is not a probe of an external
+    // runtime: no network, no writes — and the preview is exactly where an
+    // operator needs to learn the clone is stale before applying anything. Every
+    // other command stays denied, so the assertion below still proves no
+    // `claude`/`codex --version` happened, and the recorded log is checked to
+    // prove the git calls were read-only.
+    if (command !== 'git') throw new Error(`spawn denied while previewing: ${command}`);
   }
   return realSpawnSync.call(this, command, args, options);
 };
@@ -110,7 +117,13 @@ test('dry-run plans retire without capability probing on the CLI path (no skip f
     // Exactly what `forge-update.js --dry-run` builds: parseArgs never sets
     // skipCapabilityCheck or noModelProbe, so neither is passed here.
     try { report = updater.update({ ...data, runtime: 'claude' }); } finally { spawnLog = null; }
-    assert.deepStrictEqual(spawns, [], `dry-run must not spawn a capability probe; spawned: ${spawns.join(', ')}`);
+    const probes = spawns.filter((entry) => !entry.startsWith('git '));
+    assert.deepStrictEqual(probes, [], `dry-run must not spawn a capability probe; spawned: ${probes.join(', ')}`);
+    // What the preview IS allowed to spawn, it must spawn read-only: describing the
+    // source clone must never mutate it.
+    for (const entry of spawns) {
+      assert.match(entry, /^git\b.*\b(?:rev-parse|status|rev-list)\b/, `preview spawned a git that is not a read: ${entry}`);
+    }
     assert.strictEqual(report.applied, false);
     assert(report.retirements.find((entry) => entry.op === 'retire'), 'dry-run must still list retire');
     assert.deepStrictEqual(snapshot(data.root), before, 'dry-run must leave the fixture byte-identical');
@@ -225,6 +238,103 @@ test('precedence: an explicit --repo wins over provenance, and the entry point w
     const fromRepo = { ...base, entryRoot: data.repo };
     delete fromRepo.repo;
     assert.strictEqual(updater.resolveSourceRepo(fromRepo).origin, 'entry');
+  } finally { data.cleanup(); }
+});
+
+// ── The update says which bytes it is about to install ──────────────────────
+//
+// `/forge-update` reinstalls WHATEVER IS IN THE CLONE and never fetches. Measured:
+// a clone 113 commits behind (4.8.0 against 4.15.0 at the tip) "updated"
+// successfully to the same version, with no signal of it in the JSON or the
+// summary — the operator had to run `git fetch` by hand to find out.
+
+function git(root, args) {
+  const result = realSpawnSync('git', ['-C', root, ...args], { encoding: 'utf8', shell: false });
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr || result.error}`);
+  return result.stdout;
+}
+
+const gitProbe = realSpawnSync('git', ['--version'], { encoding: 'utf8', shell: false });
+if (!gitProbe || gitProbe.status !== 0) {
+  process.stdout.write('  ~ SKIP proveniência do clone: git indisponível; nada foi provado sobre sha/distância\n');
+} else {
+  test('the report carries the clone version, sha, dirtiness and distance from its tracking ref', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-source-repo-'));
+    try {
+      const origin = path.join(root, 'origin.git');
+      const clone = path.join(root, 'clone');
+      const other = path.join(root, 'other');
+      realSpawnSync('git', ['init', '-q', '--bare', origin], { encoding: 'utf8', shell: false });
+
+      realSpawnSync('git', ['clone', '-q', origin, clone], { encoding: 'utf8', shell: false });
+      git(clone, ['config', 'user.email', 'forge@test.invalid']);
+      git(clone, ['config', 'user.name', 'Forge Test']);
+      git(clone, ['config', 'commit.gpgsign', 'false']);
+      fs.mkdirSync(path.join(clone, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(clone, 'scripts', 'forge-version.js'), "const VERSION = '4.8.0';\n");
+      git(clone, ['add', '-A']);
+      git(clone, ['commit', '-q', '-m', 'v4.8.0']);
+      git(clone, ['push', '-q', 'origin', 'HEAD']);
+      git(clone, ['branch', '--set-upstream-to', 'origin/master']);
+
+      const atTip = updater.describeSourceRepo(clone);
+      assert.strictEqual(atTip.vcs, 'git');
+      assert.strictEqual(atTip.version, '4.8.0', 'a versão lida é a do clone, não a do código que está rodando');
+      assert.match(atTip.sha, /^[0-9a-f]{7,}$/);
+      assert.strictEqual(atTip.dirty, false);
+      assert.strictEqual(atTip.behind_tracking, 0);
+
+      // Someone else advances the remote. Until this clone FETCHES, the number is
+      // still 0 — and that is the honest answer, because it is measured on the
+      // local remote-tracking ref and this function never contacts a server.
+      realSpawnSync('git', ['clone', '-q', origin, other], { encoding: 'utf8', shell: false });
+      git(other, ['config', 'user.email', 'forge@test.invalid']);
+      git(other, ['config', 'user.name', 'Forge Test']);
+      git(other, ['config', 'commit.gpgsign', 'false']);
+      fs.writeFileSync(path.join(other, 'scripts', 'forge-version.js'), "const VERSION = '4.15.0';\n");
+      git(other, ['add', '-A']);
+      git(other, ['commit', '-q', '-m', 'v4.15.0']);
+      git(other, ['push', '-q', 'origin', 'HEAD']);
+
+      assert.strictEqual(updater.describeSourceRepo(clone).behind_tracking, 0,
+        'a distância veio de algum lugar que não o ref local — este número não pode falar do servidor');
+
+      git(clone, ['fetch', '-q', 'origin']);
+      const behind = updater.describeSourceRepo(clone);
+      assert.strictEqual(behind.behind_tracking, 1, 'depois do fetch a distância precisa aparecer');
+      assert.strictEqual(behind.tracking_ref, 'origin/master');
+      assert.strictEqual(behind.version, '4.8.0', 'o clone continua em 4.8.0 — é isso que um update instalaria');
+
+      fs.writeFileSync(path.join(clone, 'sujo.txt'), 'x\n');
+      assert.strictEqual(updater.describeSourceRepo(clone).dirty, true);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test('a source repo without git degrades by name instead of pretending to know', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-source-nogit-'));
+  try {
+    fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'scripts', 'forge-version.js'), "const VERSION = '9.9.9';\n");
+    const described = updater.describeSourceRepo(root);
+    assert.strictEqual(described.vcs, 'none');
+    assert.strictEqual(described.version, '9.9.9', 'a versão declarada não depende de git');
+    assert.strictEqual(described.sha, null);
+    assert.strictEqual(described.behind_tracking, null, 'sem git a distância tem de ser null, nunca 0');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the summary always says that refreshing the clone is a separate step', () => {
+  const data = fixture();
+  try {
+    const report = updater.update({ ...data, runtime: 'claude', skipCapabilityCheck: true });
+    const output = updater.render(report);
+    assert(output.includes('atualizar o clone (`git fetch` + `git pull`) é passo separado'),
+      `o resumo não avisa que o clone não é atualizado por este comando:\n${output}`);
+    // The JSON path carries the same facts as fields, not as prose.
+    for (const key of ['path', 'origin', 'vcs', 'version', 'sha', 'dirty', 'tracking_ref', 'behind_tracking']) {
+      assert(key in report.source_repo, `source_repo sem o campo ${key}`);
+    }
   } finally { data.cleanup(); }
 });
 
