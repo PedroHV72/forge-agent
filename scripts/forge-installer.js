@@ -407,6 +407,9 @@ function install(input = {}) {
     update: options.update,
     migrateLegacy: options.migrateLegacy,
     ownership: priorManifest.ownership && typeof priorManifest.ownership === 'object' ? priorManifest.ownership : {},
+    // Undefined lets each renderer build its own resolver from `repo`; an explicit
+    // null disables the release rung; an object is an injected resolver (tests).
+    provenance: options.provenance,
   });
   const existingManifest = priorManifest;
   const adapterManifest = { ...(existingManifest.adapters || {}) };
@@ -424,8 +427,12 @@ function install(input = {}) {
     const managed = artifacts.filter((item) => !conflictDestinations.has(path.resolve(item.destination)));
     const files = [...new Set(managed.filter((item) => inside(home, item.destination)).map((item) => path.relative(home, item.destination).replace(/\\/g, '/')))].sort();
     const projectFiles = [...new Set(managed.filter((item) => inside(projectRoot, item.destination)).map((item) => path.relative(projectRoot, item.destination).replace(/\\/g, '/')))].sort();
-    adapterManifest[host] = { home, project_root: projectRoot, files, project_files: projectFiles, conflicts };
-    writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files, project_files: projectFiles, conflicts }, null, 2) + '\n', plan, options);
+    // Destinations that were a permanent `user_owned` conflict until repo history
+    // proved the bytes were ours. Recorded so the transition is visible in the
+    // manifest and not only in one run's stdout.
+    const adopted = report ? (report.written || []).filter((item) => item.reason === 'release-adopted').map((item) => item.destination) : [];
+    adapterManifest[host] = { home, project_root: projectRoot, files, project_files: projectFiles, conflicts, adopted };
+    writeText(path.join(root, 'manifest.json'), JSON.stringify({ runtime: host, version: VERSION, files, project_files: projectFiles, conflicts, adopted }, null, 2) + '\n', plan, options);
   }
   const installedHosts = Object.keys(adapterManifest).sort();
   // Merge, never replace: a `--runtime claude` run must not drop the digests of
@@ -493,9 +500,22 @@ function render(report) {
   // reported success left `~/.claude/forge-hook.js` — the file `settings.json`
   // actually runs — frozen several releases back, and finding that took a
   // byte-compare against repo history rather than reading the summary.
+  // The transition out of a freeze is visible, not implicit: a destination that
+  // was a permanent `user_owned` conflict and is now replaced says so, and says on
+  // what grounds.
+  const adopted = report.manifest && report.manifest.adapters
+    ? Object.values(report.manifest.adapters).flatMap((adapter) => (Array.isArray(adapter.adopted) ? adapter.adopted : []))
+    : [];
+  if (adopted.length) {
+    lines.push(`Adopted from release history: ${adopted.length} (bytes matched a past revision of their source — previously frozen as user_owned).`);
+    for (const destination of adopted) lines.push(`  [adopted] ${destination}`);
+  }
   if (legacyConflicts.length) {
     lines.push(`Conflicts preserved: ${legacyConflicts.length}; use --migrate-legacy to replace unmarked legacy projections.`);
-    for (const item of legacyConflicts) lines.push(`  [preserved] ${item.destination}`);
+    // Each preserved destination carries WHY it was not adopted. "we proved these
+    // bytes are yours" and "we could not look" are different facts and must not
+    // read alike — a count with no grounds is how the freeze stayed invisible.
+    for (const item of legacyConflicts) lines.push(`  [preserved] ${item.destination}${item.provenance ? ` (proveniência: ${item.provenance})` : ''}`);
   }
   if (operatorOwned.length) {
     lines.push(`Operator-owned preserved: ${operatorOwned.length} (settings.json) — Forge never replaces it; use scripts/merge-settings.js to add Forge's hooks/statusLine keys.`);

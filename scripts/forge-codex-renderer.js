@@ -8,6 +8,7 @@ const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
 const sourceManifest = require('./forge-source-manifest');
 const ownership = require('./forge-projection-ownership');
+const PROVENANCE = require('./forge-projection-provenance');
 const { VERSION } = require('./forge-version');
 
 const RUNTIME = 'codex';
@@ -124,6 +125,13 @@ function write(options = {}) {
   // without the digest rung that file froze on first divergence exactly like the
   // Claude-side JSON did, and each run reported success over it.
   const recorded = (options.ownership && typeof options.ownership === 'object') ? options.ownership : {};
+  // Same release rung as the Claude host. Most Codex artifacts are SYNTHESIZED
+  // (the TOML wrappers, the instructions, `capabilities.json`), so their `source`
+  // is not a repo file and provenance answers `no-source` — named, not silent.
+  // The file-derived surfaces (commands, skills) get the real check.
+  const provenance = options.provenance === null
+    ? null
+    : (options.provenance || PROVENANCE.createResolver({ repo: report.repo }));
   for (const artifact of report.artifacts) {
     const current = exists(artifact.destination) ? fs.readFileSync(artifact.destination, 'utf8') : null;
     if (current !== null && norm(current) === artifact.content) { preserved.push({ ...artifact, reason: 'already-current' }); continue; }
@@ -132,10 +140,26 @@ function write(options = {}) {
       recordedDigest: recorded[ownership.keyFor(artifact.destination)],
       markerPresent: current !== null && hasOrigin(current),
       migrateLegacy: Boolean(options.update && options.migrateLegacy),
+      releaseDigests: provenance ? () => provenance.digestsFor(artifact.source) : undefined,
     });
-    if (!verdict.ours) { preserved.push({ ...artifact, reason: REASON.user_owned }); conflicts.push({ destination: artifact.destination, reason: REASON.user_owned }); continue; }
+    if (!verdict.ours) {
+      const checked = provenance
+        ? provenance.verdictFor(artifact.source, current)
+        : { reason: PROVENANCE.REASONS.NOT_CONSULTED, revisions: 0, truncated: false };
+      preserved.push({ ...artifact, reason: REASON.user_owned });
+      conflicts.push({
+        destination: artifact.destination,
+        reason: REASON.user_owned,
+        digest: ownership.digest(current),
+        provenance: checked.reason,
+        revisions_checked: checked.revisions,
+        ...(checked.truncated ? { provenance_truncated: true } : {}),
+      });
+      continue;
+    }
     if (options.dryRun) { written.push({ ...artifact, dry_run: true }); continue; }
-    fs.mkdirSync(path.dirname(artifact.destination), { recursive: true }); fs.writeFileSync(artifact.destination, artifact.content, 'utf8'); written.push(artifact);
+    fs.mkdirSync(path.dirname(artifact.destination), { recursive: true }); fs.writeFileSync(artifact.destination, artifact.content, 'utf8');
+    written.push(verdict.basis === 'release' ? { ...artifact, reason: 'release-adopted' } : artifact);
   }
   const ownedNow = [...written, ...preserved.filter((item) => item.reason === 'already-current')];
   const nextOwnership = { ...recorded, ...ownership.recordOf(ownedNow) };
