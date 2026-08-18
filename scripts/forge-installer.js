@@ -328,7 +328,12 @@ function install(input = {}) {
     const report = generated.reports[host];
     if (report && report.ownership && typeof report.ownership === 'object') Object.assign(ownershipRecord, report.ownership);
   }
-  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest, ownership: ownershipRecord };
+  // Provenance: WHICH clone rendered this installation. Without it an update run
+  // from the installed copy has nothing to resolve the source repo from — the
+  // Forge home holds `scripts/` (managed core) but never
+  // `forge-source-manifest.json`, so the renderer died on a raw ENOENT. Recorded
+  // additively; readers that predate it simply do not see the key.
+  const manifest = { version: VERSION, runtime: installedHosts.length === 2 ? 'both' : (installedHosts[0] || runtime), project_root: projectRoot, source_repo: repo, core: coreFiles.concat(['VERSION', 'forge-agent-prefs.jsonc']).sort(), adapters: adapterManifest, ownership: ownershipRecord };
   writeText(paths.shared.manifest, JSON.stringify(manifest, null, 2) + '\n', plan, options);
   const app = installApp(repo, plan, options, paths.platform);
   const backupPath = path.resolve(backupRoot);

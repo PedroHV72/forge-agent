@@ -57,5 +57,15 @@ try {
   fs.rmSync(operatorDoc, { force: true });
   const dry = renderer.write({ repo: root, projectRoot: project, codexHome: path.join(temp, 'dry codex'), forgeHome: path.join(temp, 'dry forge'), dryRun: true }); assert.strictEqual(dry.dry_run, true); assert(!fs.existsSync(path.join(temp, 'dry codex')));
   assert.throws(() => renderer.render({ repo: root, codexHome: path.join(temp, '.claude') }), error => error.code === 'invalid_options' || error.code === 'host-isolation');
+
+  // A repo root without the source manifest is not a clone. Same rule as the
+  // Claude renderer: name `--repo`, never surface a raw ENOENT for a file that
+  // was never supposed to live at that path (the Forge home is the real case).
+  const notAClone = path.join(temp, 'not a clone');
+  fs.mkdirSync(path.join(notAClone, 'scripts'), { recursive: true });
+  assert.throws(
+    () => renderer.render({ repo: notAClone, projectRoot: notAClone, codexHome: path.join(notAClone, '.codex'), forgeHome: path.join(notAClone, '.forge-agent') }),
+    (error) => error.code === 'missing_manifest' && /--repo/.test(error.message) && error.message.includes(notAClone) && !/ENOENT/.test(error.message),
+  );
   console.log('forge-codex-renderer tests passed');
 } finally { fs.rmSync(temp, { recursive: true, force: true }); }

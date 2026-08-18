@@ -97,7 +97,7 @@ try {
     assert.strictEqual(renderer.hasOriginMarker(text), true, `projeção CRLF (${label}) lida como user-owned`);
   }
 
-  const golden = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'claude-renderer', 'claude-4.15.0.golden.json'), 'utf8'));
+  const golden = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'claude-renderer', 'claude-4.16.0.golden.json'), 'utf8'));
   assert.strictEqual(golden.runtime, first.runtime);
   assert.strictEqual(golden.version, renderer.VERSION);
   for (const surface of golden.surfaces) {
@@ -344,6 +344,25 @@ try {
       '(g) dry-run registrou propriedade — a próxima execução acreditaria ser dona de algo que não escreveu');
 
     fs.rmSync(home, { recursive: true, force: true });
+  }
+
+  // ── A repo root that cannot render says so by name ────────────────────────
+  // The Forge home holds `scripts/` (managed core) but never the source
+  // manifest, so an update resolved from the installed copy pointed here. The
+  // raw ENOENT named the absent file — which is not the problem — and nothing
+  // in it suggested the flag that fixes it.
+  {
+    const notAClone = temp('not-a-clone');
+    fs.mkdirSync(path.join(notAClone, 'scripts'), { recursive: true });
+    let thrown = null;
+    try { renderer.render({ repo: notAClone, projectRoot: notAClone, claudeHome: path.join(notAClone, '.claude'), forgeHome: path.join(notAClone, '.forge-agent') }); }
+    catch (error) { thrown = error; }
+    assert(thrown, 'um repo sem manifesto de origem renderizou sem reclamar');
+    assert.strictEqual(thrown.code, renderer.REASON.MISSING_MANIFEST, `código inesperado: ${thrown.code}`);
+    assert.match(thrown.message, /--repo/, 'a mensagem não nomeia a flag que resolve');
+    assert(thrown.message.includes(notAClone), 'a mensagem não diz qual raiz foi avaliada');
+    assert(!/ENOENT/.test(thrown.message), 'continua sendo o ENOENT cru');
+    fs.rmSync(notAClone, { recursive: true, force: true });
   }
 
   console.log('forge-claude-renderer tests passed');

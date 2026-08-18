@@ -18,6 +18,7 @@ const ORIGIN_SUFFIX = ' -->';
 const REASON = Object.freeze({
   INVALID_OPTIONS: 'invalid_options',
   MISSING_SOURCE: 'missing_source',
+  MISSING_MANIFEST: 'missing_manifest',
   PROTECTED_PATH: 'protected_path',
   USER_OWNED: 'user_owned',
 });
@@ -256,8 +257,14 @@ function selected(source) {
   return !state || !state.status || !['unavailable', 'planned'].includes(state.status);
 }
 
+// A bare ENOENT here names a path that should NOT hold this file: the caller
+// pointed the renderer at something that is not a forge-agent clone (typically
+// the Forge home, whose `scripts/` copy is managed core while the source
+// manifest never is). The path is not the problem, so the message must name the
+// flag that fixes it instead of the file that is legitimately absent.
 function readManifest(root, manifestFile) {
   const file = path.resolve(manifestFile || path.join(root.repo, 'forge-source-manifest.json'));
+  if (!exists(file)) fail(REASON.MISSING_MANIFEST, `manifesto de origem ausente: ${file} — ${root.repo} não é um clone do forge-agent; informe \`--repo <dir>\``);
   const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
   sourceManifest.audit(manifest);
   return manifest;
