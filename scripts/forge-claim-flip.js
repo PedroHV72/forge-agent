@@ -1,0 +1,171 @@
+#!/usr/bin/env node
+'use strict';
+// Advisory reporter. It intentionally exits zero: operators use its census to decide a later flip.
+const fs = require('fs');
+const path = require('path');
+const FLIP_WINDOW_MILESTONES = 2;
+const FLIP_MAX_FALSE_POSITIVES = 0;
+const SKIP_REASONS = [
+  'scope-unresolved', 'touch-data-absent', 'run-not-registered', 'milestone-window-unmet',
+  // A line of `events.jsonl` that could not be parsed. It NEVER vanishes: it is counted, named,
+  // and it forbids `flip-ready` — certifying a flip over a log we could not read whole would be
+  // claiming more than was measured.
+  'event-log-unparseable',
+  // A fenced decision whose `counterparts[]` names nobody. The fence fired, but the event does not
+  // say against WHOM, so no pair can be confronted against the factual side. Distinct from
+  // `touch-data-absent` on purpose: there we knew who to look up and the touch record was missing;
+  // here there is no lookup to make. Collapsing the two would hide a malformed event inside a
+  // legitimate, expected gap.
+  'counterparts-unnamed',
+];
+function recordSkip(census, reason, detail) { if (!SKIP_REASONS.includes(reason)) throw new Error(`forge-claim-flip: skip desconhecido ${reason}`); census.skipped.push({ reason, detail: detail || null }); }
+
+/**
+ * PER-LINE parse. A single corrupt line used to make the whole `try` throw and return `[]`, so a
+ * truncated write (the state a kill leaves) silently shrank the universe to nothing and the report
+ * came back `inconclusive` over an empty sample with NO named reason — the census lying by omission.
+ */
+function readEventsDetailed(cwd) {
+  let raw;
+  try { raw = fs.readFileSync(path.join(cwd,'.gsd','forge','events.jsonl'),'utf8'); }
+  catch { return { parsed: [], unparseable: 0 }; }
+  const parsed = [];
+  let unparseable = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try { parsed.push(JSON.parse(line)); } catch { unparseable++; }
+  }
+  return { parsed, unparseable };
+}
+function readEvents(cwd) { return readEventsDetailed(cwd).parsed; }
+
+/** Only `true`/`false` are measurements. Anything else is an absence, never an accusation. */
+function isMeasurement(v) { return v === true || v === false; }
+
+// ── The join ────────────────────────────────────────────────────────────────
+//
+// A `claim-gate` line carries NEITHER `milestone` NOR `factual_overlap` — verified against the
+// payload `forge-claim-gate.emitGateEvent` really writes. Read literally, that made EVERY real
+// event a `scope-unresolved` skip and this reporter answer `inconclusive` forever: an instrument
+// that bites correctly and can read nothing. D14 exists precisely so the advisory default cannot
+// become permanent by inertia, and a report that never concludes prevents nothing.
+//
+// The fix is NOT to grow the event. Both facts already exist elsewhere, and are JOINED here:
+//
+//   milestone  <- the event's `run`, bridged through the run registry (`milestone_dir`, else the
+//                 run's own id when it IS a milestone run). Same bridge `forge-claim-audit.js`
+//                 uses (`runIdsForMilestone`), read in the opposite direction.
+//   factual    <- `forge-overlap`'s pair confrontation over the `touched` snapshots, asked per
+//                 pair (this run x each named counterpart) instead of globally.
+//
+// Every hole the join cannot fill stays a NAMED skip. Notably `forge-touch --record` only runs
+// before `complete-slice`, so a run fenced at a task boundary legitimately has no touch data —
+// that is `touch-data-absent`, never a zero folded into the sample.
+
+/** `run id -> milestone id`. The inverse of `forge-claim-audit.runIdsForMilestone`. */
+function milestoneBridge(cwd) {
+  const bridge = new Map();
+  let records = [];
+  try { records = require('./forge-runs.js').listAll(cwd); } catch { return null; }
+  for (const rec of records) {
+    if (!rec || typeof rec.id !== 'string') continue;
+    const dirId = typeof rec.milestone_dir === 'string'
+      ? (rec.milestone_dir.split('/').filter(Boolean).pop() || null)
+      : null;
+    const milestone = dirId || (rec.kind === 'milestone' ? rec.id : null);
+    bridge.set(rec.id, milestone);
+  }
+  return bridge;
+}
+
+function pairKey(a, b) { return [String(a), String(b)].sort().join('\u0000'); }
+
+/**
+ * `{ comparable:Set<runId>, overlapPairs:Set<pairKey> }` — who has touch data, and which pairs
+ * actually collided. `null` when the factual side cannot be consulted at all, which makes every
+ * event `touch-data-absent` (visible), never a silent `false`.
+ *
+ * `{ all: true }` on purpose: gate events are HISTORY. Restricting to active runs would judge a
+ * past fence by who happens to be running now.
+ */
+function buildJoin(cwd) {
+  let overlap;
+  try { overlap = require('./forge-overlap.js'); } catch { return null; }
+  let collected;
+  let result;
+  try {
+    collected = overlap.collectRunTouches(cwd, { all: true });
+    result = overlap.computeOverlap(collected);
+  } catch { return null; }
+  const comparable = new Set((collected.comparable || []).map((c) => c.id));
+  const overlapPairs = new Set((result.overlaps || []).map((o) => pairKey(o.runs[0], o.runs[1])));
+  return { comparable, overlapPairs };
+}
+
+/**
+ * The factual side for ONE fenced event: did the fence correspond to a real file collision?
+ *
+ * Returns a measurement or a named absence — never a default. A counterpart the join cannot see is
+ * not "no collision"; it is a pair that was not confronted, and the census says so.
+ */
+function factualForEvent(event, join) {
+  if (isMeasurement(event.factual_overlap)) return { measured: true, value: event.factual_overlap };
+  if (!join) return { measured: false, reason: 'touch-data-absent' };
+  const ids = (event.counterparts || []).map((c) => c && c.id).filter((id) => typeof id === 'string');
+  if (ids.length === 0) return { measured: false, reason: 'counterparts-unnamed' };
+  if (!join.comparable.has(event.run)) return { measured: false, reason: 'touch-data-absent' };
+  let confronted = 0;
+  let collided = false;
+  for (const id of ids) {
+    if (!join.comparable.has(id)) continue;
+    confronted++;
+    if (join.overlapPairs.has(pairKey(event.run, id))) collided = true;
+  }
+  if (confronted === 0) return { measured: false, reason: 'touch-data-absent' };
+  return { measured: true, value: collided };
+}
+
+function evaluateFlip(events, opts) {
+  const o=opts||{};
+  const unparseable = Number(o.unparseable || 0);
+  // Injectable seams so the suite can drive the join without a registry on disk; when `cwd` is
+  // given and no seam is passed, both sides are read from disk.
+  const bridge = o.milestoneBridge !== undefined
+    ? o.milestoneBridge
+    : (o.cwd ? milestoneBridge(o.cwd) : null);
+  const join = o.join !== undefined ? o.join : (o.cwd ? buildJoin(o.cwd) : null);
+  const milestonesSeen = new Set();
+  const census={ examined:0, pairs_compared:0, false_positives:0, unparseable, milestones_covered:0, skipped:[] };
+  for (const event of events || []) {
+    if (!event || event.event !== 'claim-gate' || event.decision === 'proceed') continue;
+    census.examined++;
+    if (!event.run) { recordSkip(census,'run-not-registered'); continue; }
+    if (bridge && !bridge.has(event.run)) { recordSkip(census,'run-not-registered', event.run); continue; }
+    // The event's own field wins when present (a future gate may grow one); otherwise the bridge.
+    const milestone = event.milestone !== undefined
+      ? event.milestone
+      : (bridge ? bridge.get(event.run) : undefined);
+    if (milestone === undefined || milestone === null) { recordSkip(census,'scope-unresolved', event.run); continue; }
+    // A `factual_overlap` that is not a measurement (absent, null, a string) cannot corroborate the
+    // fence NOR accuse it. Counting it as a false positive would convict the gate on evidence
+    // nobody gathered — the same silence, inverted.
+    const factual = factualForEvent(event, join);
+    if (!factual.measured) { recordSkip(census, factual.reason, event.run); continue; }
+    census.pairs_compared++;
+    milestonesSeen.add(milestone);
+    if (factual.value !== true) census.false_positives++;
+  }
+  census.milestones_covered = milestonesSeen.size;
+  // The window is DERIVED from the milestones actually covered by the compared sample. An explicit
+  // `opts.milestones` overrides it (test seam / operator override) but never invents coverage the
+  // sample does not have — the floor below still runs first.
+  const milestones = o.milestones !== undefined ? Number(o.milestones || 0) : milestonesSeen.size;
+  // The anti-silence floor comes FIRST: 0 pairs compared is inconclusive, never "clean".
+  if (census.pairs_compared === 0) return { verdict:'inconclusive', ...census };
+  if (unparseable > 0) { recordSkip(census,'event-log-unparseable',`${unparseable} linha(s)`); return { verdict:'inconclusive', ...census }; }
+  if (milestones < FLIP_WINDOW_MILESTONES) { recordSkip(census,'milestone-window-unmet'); return { verdict:'inconclusive', ...census }; }
+  return { verdict: census.false_positives > FLIP_MAX_FALSE_POSITIVES ? 'not-ready' : 'flip-ready', ...census };
+}
+function main() { const cwd=process.cwd(); const d=readEventsDetailed(cwd); process.stdout.write(JSON.stringify(evaluateFlip(d.parsed,{unparseable:d.unparseable,cwd}))+'\n'); }
+if (require.main === module) { try { main(); } catch (error) { process.stdout.write(JSON.stringify({verdict:'inconclusive',error:error.message})+'\n'); } }
+module.exports={FLIP_WINDOW_MILESTONES,FLIP_MAX_FALSE_POSITIVES,SKIP_REASONS,recordSkip,readEvents,readEventsDetailed,isMeasurement,evaluateFlip,milestoneBridge,buildJoin,factualForEvent,pairKey};

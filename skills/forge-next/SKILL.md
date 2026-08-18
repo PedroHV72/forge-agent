@@ -304,6 +304,89 @@ Skill({ skill: "forge-security", args: "{M###} {S##} {T##}" })
 ```
 The produced `T##-SECURITY.md` will be injected into the execute-task worker prompt as `## Security Checklist`.
 
+**Cross-run claim gate (execute-task e review-fix):** If `unit_type == execute-task`, run the
+**enforcing** cross-run write lease before dispatching. Spec autoritativa: `shared/forge-claim-gate.md`
+— the decision table (§ Step 3), the canonical invocation (§ Step 2), B2 e a escalação (§ Step 4) vivem
+lá, uma vez só; este bloco só invoca por referência.
+
+`RUN_ID` ausente (step mode sem run registrada, mesmo caso da linha 895) → não há `RunRecord` próprio
+para registrar o claim; pular o gate e ecoar o motivo — não há counterpart universe a confrontar sem
+uma run própria:
+```bash
+if [ -z "$RUN_ID" ]; then
+  echo "ℹ Claim gate pulado: RUN_ID ausente (step mode sem run registrada) — sem RunRecord próprio para registrar o claim."
+else
+  # --ready-alternatives: o ready set real da slice, já computado em BATCH_JSON (Step 1) — nunca uma
+  # segunda enumeração. Legacy (`BATCH_JSON.mode == legacy`, sem .details.readyCount) → 0 (piso D3).
+  READY_ALTERNATIVES=$(node -e "let r;try{r=JSON.parse(process.argv[1])}catch(e){r={}}; const rc=(r.details&&typeof r.details.readyCount==='number')?r.details.readyCount:0; process.stdout.write(String(Math.max(0, rc-1)))" "${BATCH_JSON:-{}}")
+
+  GATE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check \
+    --run "$RUN_ID" \
+    --unit "execute-task/$unit_id" \
+    --source plan-writes \
+    --plan "$PLAN_PATH" \
+    ${UNIT_CODE_DIR:+--code-dir "$UNIT_CODE_DIR"} \
+    --ready-alternatives "$READY_ALTERNATIVES" \
+    --cwd "$WORKING_DIR" \
+    --json)
+  GATE_EXIT=$?
+
+  # `--code-dir` só quando o resolvedor de código já correu para esta unidade — B2. Neste ponto do
+  # fluxo (antes do Step 4) o resolvedor per-unit ainda não rodou; `$UNIT_CODE_DIR` fica vazio salvo
+  # se um passe anterior já o deixou setado (idempotência entre invocações). A flag omitida NÃO é
+  # uma degradação silenciosa: o claim carrega `code_dir: null`, o escopo contra cada counterpart vira
+  # `unknown` e `unknown` continua em escopo — o gate fecha por precaução, nunca abre por suposição.
+
+  # Fail-closed (§ Fail-closed) — exit != 0 ou stdout não-JSON é sempre block/gate-unavailable, loud.
+  if [ "$GATE_EXIT" -ne 0 ] || ! printf '%s' "$GATE_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{JSON.parse(d);process.exit(0)}catch(e){process.exit(1)}})"; then
+    echo "⛔ Claim gate indisponível (exit $GATE_EXIT) — tratando como block/gate-unavailable. Nenhum dispatch." >&2
+    # MODE == interactive: surface direto, sem run a desativar (§ Step 4 passo 3).
+  else
+    DECISION=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).decision||'')" "$GATE_JSON")
+    CAUSE=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).cause||'')" "$GATE_JSON")
+    ESCALATION=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).escalation||'')" "$GATE_JSON")
+    NOT_COVERED=$(node -e "process.stdout.write(JSON.stringify(JSON.parse(process.argv[1]).not_covered||[]))" "$GATE_JSON")
+    echo "ℹ Claim gate not_covered: $NOT_COVERED"
+  fi
+fi
+```
+
+Mapeamento por decisão (`MODE == interactive` — `shared/forge-claim-gate.md § Step 3`, agido por
+referência, nenhuma tabela restatada aqui):
+
+O gateamento aqui é **afirmativo**, e essa é a diferença de polaridade em relação ao `forge-auto`
+(onde a task fica em `BATCH` por default): o dispatch só é alcançado pela linha `proceed`. `$DECISION`
+só é atribuída no ramo `else` do fence acima — o ramo fail-closed a deixa **não-atribuída de
+propósito**, e valor não-atribuído (ou fora do conjunto de quatro) não casa com nenhuma das linhas
+abaixo, portanto nunca alcança a instrução de despachar. Não importar a forma do `forge-auto` aqui é
+deliberado.
+
+**O que alcança o dispatch é `advised_action`, nunca `decision`.** O eixo advisory/enforcing é
+resolvido **pelo módulo** a partir de `parallelism.claim_gate` (spec § Step 0, § Enforcement) — o
+consumidor nunca relê a pref. `advised_action == dispatch` → despachar; qualquer outro valor
+(inclusive vazio/desconhecido) → **não** despachar. As quatro linhas abaixo governam a **mensagem**,
+não o dispatch. Quando `suppressed_action` está presente (postura `advisory`), prefixar o eco com
+`⚠ [advisory]` — a cerca computou a recusa e **não** agiu, e isso é dito, nunca silenciado.
+
+- `proceed` → dispatch normal (Step 4 segue).
+- `defer` → se `$BATCH_JSON` (ready set real da slice) tem outra task além desta, dispatchar ELA
+  nesta invocação (eco nomeando a troca: "↷ Claim gate: {T##} adiada (colisão com run {counterpart}) —
+  despachando {OUTRO_T##} no lugar"); senão surface "unidade adiada por claim overlap com run
+  {counterpart} — re-rode /forge-next ou resolva a colisão" e parar (step mode já retorna ao operador
+  de toda forma).
+- `block` → surface IMEDIATO ao operador, **sem** `--wait` longo (o operador está presente — esperar em
+  silêncio é pior UX que avisar): nomear counterpart, causa e paths (`.counterparts[].paths`), e as
+  saídas legítimas de `shared/forge-claim-gate.md § Step 4`.
+- `refuse` → surface da causa nomeada — `undeclared-writes` (plano sem `writes:` — repair no plano),
+  `overlap` (medido — nomear paths e counterpart) e `pathless-conceded-item` (item concedido sem path
+  — D7) são causas distintas e NUNCA substituídas uma pela outra — sem dispatch, esperar não resolve.
+- `escalation` presente (`wait-ceiling`/`defer-cap`) → mesma mensagem do spec § Step 4; step mode não
+  tem loop a desativar (só `MODE == auto` desativa a run).
+
+`not_covered` é ecoado ao operador em toda execução do gate (linha acima) — o Overlap advisory abaixo
+permanece intacto e distinto deste gate (um é sinal pós-hoc de toque; este é cerca pré-dispatch, cuja
+execução é governada por `parallelism.claim_gate`).
+
 **Overlap advisory (before complete-slice):** grave o toque desta run e confronte com as demais runs ativas — o sinal existe para ser visto **antes do merge**.
 ```bash
 node "{WORKING_DIR}/scripts/forge-touch.js" --record "{RUN_ID}" --cwd "{WORKING_DIR}" || true
@@ -325,7 +408,7 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
    - Rebuttal × `rounds` → `forge-reviewer` in rebuttal mode (DEFENSE injected)
    - The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literals are a violation detected by `forge-review-audit.js`.
    - Resolve (Step 5 truth table), write `{S##}-REVIEW.md` (Step 6).
-   - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty.
+   - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; **before dispatching**, run the cross-run claim gate per `shared/forge-review.md § Step 7a → Cross-run claim gate (before the dispatch)` + `shared/forge-claim-gate.md` (same procedure as the execute-task gate above, `--unit "review-fix/{S##}"`, `--conceded` built from the CONCEDED items' `path:line` — act by that spec's decision table, never restated here); dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty.
    - **OPEN items (Step 7b, interactive):** each OPEN objection is put to the user via `AskUserQuestion` — `Manter abordagem` / `Refatorar agora` (dispatches a `review-fix` unit for the accepted items) / `Criar follow-up` (creates an item per `shared/forge-review.md § Item capture`, source `review/{S##}/{R#}`, plus the pointer line in `.gsd/KNOWLEDGE.md § Review follow-ups`) — and the decision is written back into `{S##}-REVIEW.md`.
    - Append the `review` event to `events.jsonl` (Step 8).
 4. The gate **never blocks** — any `Agent()` throw is recorded and the step proceeds to `complete-slice` regardless.
@@ -1531,6 +1614,21 @@ Os seguintes requisitos planejados não foram entregues pela unidade anterior e 
 ```
 
 Also append this same section to `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-SUMMARY.md`.
+
+**d-release) Ask for the claim release (unit boundary)** — runs after the re-injection diff, before
+isolation cleanup. Applies to units that went through the claim gate (`execute-task`, `review-fix`);
+skip otherwise.
+
+Run the **canonical release invocation** of `shared/forge-claim-gate.md § Release lifecycle`
+verbatim, with `RUN_ID`, `WORKING_DIR` and (per the B2 rule stated there) `CODE_DIR` bound to this
+dispatch's values. Mechanisms, probes, TTL rule and flag set live in that section — do not restate
+them here, and do not add flags it does not list.
+
+**Fail-soft, by decision.** Asking for a release is *measuring*; a measurement that cannot be taken
+leaves the claim standing, which is the safe side. A non-zero exit, invalid JSON or a refused
+request (`held: true`) echoes one line and the flow **continues** — the deliberate opposite of the
+pre-dispatch gate, which is enforcing. The `claim-release` event is written **by the module**
+(`shared/forge-dispatch.md § Event claim-release`), never narrated here.
 
 **e) Isolation cleanup (complete-milestone only)** — if the unit just processed was `complete-milestone` with `status: done`, release the isolation. No-op when `ISOLATION_MODE == shared`; `branch` mode checks the repo back out to the default branch (the `forge/{run}` branch is kept for PR/merge); `worktree` mode removes the worktree only if `worktree_cleanup_on_complete: true` in prefs. Never run this on partial/blocked — the branch/worktree must survive for resume:
 ```bash

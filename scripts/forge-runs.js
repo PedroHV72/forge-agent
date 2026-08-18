@@ -107,20 +107,56 @@ function withAddressDefaults(rec) {
     // branch/root/project above: live records in .gsd/forge/runs/ are never
     // rewritten, and SCHEMA-VERSION is not bumped.
     worker_slice: (rec.worker_slice === undefined || rec.worker_slice === '') ? null : rec.worker_slice,
+    // ── Write-claim axis (S03/T01) ────────────────────────────────────────────
+    // What the current unit declares it is about to write, plus the CODE_DIR
+    // it is writing from as a GIVEN fact (never derived — see
+    // forge-write-claim.js). Additive by READ exactly like the fields above:
+    // live records in .gsd/forge/runs/ are never rewritten, no SCHEMA-VERSION
+    // bump. `null` means "never claimed"; a recorded object (even with
+    // `paths: []`) means "claimed, honestly empty" — the two must never
+    // collapse (see forge-write-claim.js::readClaim).
+    write_claim: (rec.write_claim === undefined || rec.write_claim === '') ? null : rec.write_claim,
   });
 }
 
-function listAll(cwd) {
+// Closed set. `id` is the basename without `.json` — the key the registry itself uses, so an
+// unreadable record can still be NAMED by the census that reports it.
+const UNPARSEABLE_REASONS = ['json-parse-failed', 'read-failed'];
+
+/**
+ * ADDITIVE (PR #110, finding 3). `listAll` used to `catch { return null }` + `.filter(Boolean)`, so
+ * a truncated `runs/*.json` vanished BEFORE any consumer could count it — and `runs_examined`
+ * downstream counted post-filter, making the census report a universe that silently shrank.
+ *
+ * This returns both halves. `listAll` stays byte-compatible as a wrapper over `parsed`: additive by
+ * READING, no migration, no SCHEMA-VERSION bump, every existing caller unchanged.
+ */
+function listAllDetailed(cwd) {
   const dir = runsDir(cwd);
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir)
-    .filter(f => f.endsWith('.json'))
-    .map(f => {
-      try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); }
-      catch { return null; }
-    })
-    .filter(Boolean)
-    .map(withAddressDefaults);
+  if (!fs.existsSync(dir)) return { parsed: [], unparseable: [] };
+  const parsed = [];
+  const unparseable = [];
+  for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.json'))) {
+    const file = path.join(dir, f);
+    const id = path.basename(f, '.json');
+    let raw;
+    try {
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (_) {
+      unparseable.push({ id, file, reason: 'read-failed' });
+      continue;
+    }
+    try {
+      parsed.push(withAddressDefaults(JSON.parse(raw)));
+    } catch (_) {
+      unparseable.push({ id, file, reason: 'json-parse-failed' });
+    }
+  }
+  return { parsed, unparseable };
+}
+
+function listAll(cwd) {
+  return listAllDetailed(cwd).parsed;
 }
 
 function listActive(cwd) {
@@ -161,7 +197,7 @@ function normalizeMetadataPatch(patch) {
     if (next.host_runtime === undefined || next.host_runtime === null || next.host_runtime === '') delete next.host_runtime;
     else next.host_runtime = normalizeHostRuntime(next.host_runtime);
   }
-  for (const key of ['owner', 'session', 'heartbeat', 'expires_at', 'worker_engine', 'worker_slice']) {
+  for (const key of ['owner', 'session', 'heartbeat', 'expires_at', 'worker_engine', 'worker_slice', 'write_claim']) {
     if (Object.prototype.hasOwnProperty.call(next, key) && next[key] === undefined) delete next[key];
   }
   return next;
@@ -239,6 +275,44 @@ function update(cwd, id, patch) {
     writeAtomic(runFile(cwd, id), next);
     refreshLegacyAlias(cwd);
     return next;
+  });
+}
+
+/**
+ * ADDITIVE sibling of `update` (S05/review R1) — `update` keeps its signature
+ * and its behaviour, byte for byte. The difference is WHERE the read happens.
+ *
+ * `update(cwd, id, patch)` locks the WRITE. A caller that computed `patch`
+ * from a `get()` taken BEFORE the call performs a read-modify-write ACROSS
+ * the lock: the file write is serialized, the identity of what was read is
+ * not. When the patch replaces a whole slot (`write_claim`), a record written
+ * by someone else in that window is silently overwritten by the stale object.
+ * That is not a hypothetical here — it is exactly how a fresh claim could be
+ * replaced by an older one already carrying a `released` envelope, which turns
+ * live in-flight writes into unfenced ones (under-block).
+ *
+ * `updateWith` closes the window by running the mutator INSIDE the lock, over
+ * the record read inside the same lock. The mutator decides:
+ *   - return an object -> that patch is applied  -> `{ updated: true,  record }`
+ *   - return `null`/`undefined` -> ABORT, nothing is written -> `{ updated: false, record }`
+ * Abort is a first-class outcome, not an error: a caller that finds the world
+ * changed under it must be able to refuse in a NAMED way rather than write
+ * anyway. The return shape is deliberately DIFFERENT from `update`'s (which
+ * returns the record) so no caller can confuse the two.
+ */
+function updateWith(cwd, id, mutator) {
+  if (typeof mutator !== 'function') {
+    throw new Error('forge-runs.updateWith: mutator must be a function');
+  }
+  return withRunLock(cwd, id, () => {
+    const current = get(cwd, id);
+    if (!current) throw new Error(`forge-runs.updateWith: run ${id} not found`);
+    const patch = mutator(current);
+    if (patch === null || patch === undefined) return { updated: false, record: current };
+    const next = Object.assign({}, current, normalizeMetadataPatch(patch));
+    writeAtomic(runFile(cwd, id), next);
+    refreshLegacyAlias(cwd);
+    return { updated: true, record: next };
   });
 }
 
@@ -481,8 +555,8 @@ Flags:
 if (require.main === module) cliMain();
 
 module.exports = {
-  listAll, listActive, get,
-  add, update, remove,
+  listAll, listAllDetailed, listActive, get,
+  add, update, updateWith, remove,
   bumpHeartbeat, cleanupStale,
   resolveBySessionId, oldestActive,
   refreshLegacyAlias, migrateLegacyState,

@@ -870,14 +870,41 @@ process.stdin.on('end', () => {
               // public status read.  Treat the same active run/session as a
               // reentrant owner and let the file-lock layer continue to fence
               // competing run/session identities.
-              const result = sameSession ? { acquired: true, reentrant: true } :
-                filelock.acquireFileLock(cwd, rel, r.id, sessionId, { intent: toolName.toLowerCase() });
+              // 4a (PR #110): the reentrant path RENEWS. It used to return `{acquired:true,
+              // reentrant:true}` without touching the lock, so `renewed_at` never advanced and the
+              // clock measured *time since the FIRST write* instead of *time since the last* —
+              // exactly the premise the clock-only doctrine assumed true in order to justify itself.
+              // `acquireFileLock` cannot be reused here (a hook cannot recover the private
+              // owner_token from a public status read, so it would steal from itself by another
+              // door). `touchFileLock` compares identity — run_id AND session_id — and refuses
+              // anything else with `owner_mismatch`, in which case we fall through to normal
+              // acquisition rather than pretending the renewal happened.
+              let result;
+              if (sameSession) {
+                const touched = filelock.touchFileLock(cwd, rel, { runId: r.id, sessionId });
+                result = touched && touched.ok
+                  ? { acquired: true, reentrant: true, renewed: true }
+                  : filelock.acquireFileLock(cwd, rel, r.id, sessionId, { intent: toolName.toLowerCase() });
+              } else {
+                result = filelock.acquireFileLock(cwd, rel, r.id, sessionId, { intent: toolName.toLowerCase() });
+              }
               if (!result.acquired) {
+                const h = result.holder || {};
+                const ageS = Math.round((h.age_ms || 0) / 1000);
                 if (result.reason === 'guard_busy') {
                   blockMessage = `[forge-hook] Bloqueado: mutex do arquivo "${rel}" está ocupado; tente novamente.`;
+                } else if (result.reason === 'holder_unmeasured') {
+                  // 4b: fail-closed, NAMED, with the operator's only exit written where they read it.
+                  // The lock is held by a run whose liveness could not be measured (illegible or
+                  // truncated `runs/<id>.json`). No code path can convert this one — the reaper only
+                  // reaches records it can read — so the way out is a human act, and it is spelled out.
+                  blockMessage = `[forge-hook] Bloqueado: arquivo "${rel}" preso por run ${h.run_id || 'desconhecido'} cuja atividade NÃO pôde ser medida (registro ilegível). `
+                    + `A idade sozinha não libera este lock — liveness vence o relógio. Saídas: /forge-pause ${h.run_id || '<run>'}, `
+                    + `ou remova o registro ilegível .gsd/forge/runs/${h.run_id || '<run>'}.json.`;
+                } else if (h.run_diagnostic === 'active-run') {
+                  blockMessage = `[forge-hook] Bloqueado: arquivo "${rel}" em uso por run ${h.run_id || 'desconhecido'} (VIVA) há ${ageS}s. `
+                    + `Um dono vivo nunca perde o lock para a idade. Aguarde ou execute /forge-pause ${h.run_id || ''}.`;
                 } else {
-                  const h = result.holder || {};
-                  const ageS = Math.round((h.age_ms || 0) / 1000);
                   blockMessage = `[forge-hook] Bloqueado: arquivo "${rel}" em uso por run ${h.run_id || 'desconhecido'} há ${ageS}s. Aguarde ou execute /forge-pause ${h.run_id || ''}.`;
                 }
               }

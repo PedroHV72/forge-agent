@@ -155,7 +155,7 @@ Branch on `$AUTO_STATE`:
 - **`stale`** — previous session died (Ctrl+C, terminal kill, OOM). The marker is lying. Clear it silently (M005+ aware of runs/*.json registry) and proceed normally to activation as a fresh start:
   ```bash
   # Clean any active runs in registry first
-  for f in .gsd/forge/runs/*.json 2>/dev/null; do
+  for f in .gsd/forge/runs/*.json; do
     [ -f "$f" ] || continue
     node "$FORGE_SCRIPTS_DIR/forge-runs.js" --update "$(basename "$f" .json)" --json '{"active":false}' >/dev/null 2>&1 || true
   done
@@ -538,6 +538,141 @@ Skill({ skill: "forge-security", args: "{M###} {S##} {T##}" })
 ```
 The produced `T##-SECURITY.md` will be injected into that task's worker prompt as `## Security Checklist`. Skills run in the orchestrator context — loop them serially (fast enough; each is short) before dispatching the batch in parallel.
 
+**Cross-run claim gate (step 1.7 — execute-task and review-fix; enforcement resolved BY THE MODULE from `parallelism.claim_gate`, `advisory` on debut):** If `unit_type == execute-task`, before dispatching, fence every task in `BATCH` against the write claims of every other active run sharing the same `CODE_DIR`. Authoritative spec: `shared/forge-claim-gate.md` — this block only **invokes** it; the decision table, the causes and the escalation procedure are formula-once there and are never restated here (S04-PLAN contract #1). This gate is distinct from the Overlap advisory right below: that one is a **post-work, pre-merge signal** (touch/overlap, advisory, never blocks); this one is a **pre-dispatch fence** (claim, enforcing, stops the unit).
+
+Batch order (spec § Step 1 — fixed, not an implementation detail): (1) record the union of the whole ready `BATCH` first, as one claim, before evaluating anything; (2) evaluate per task, each against the counterpart universe; (3) drop every task whose decision is not `proceed`; (4) re-record the union of the survivors.
+
+```bash
+FORGE_SCRIPTS_DIR=$([ -f scripts/forge-claim-gate.js ] && echo scripts || echo "${FORGE_HOME:-$HOME/.forge-agent}/scripts")
+
+# B2: --code-dir carries ONLY a value THIS dispatch already resolved. At this point (step 1.7 runs
+# BEFORE Step 4's per-unit CODE_DIR resolution) only `shared` isolation already has one — WORKING_DIR
+# itself. `worktree`/`branch` modes have not resolved the per-unit CODE_DIR yet, so the flag is
+# omitted here on purpose (code_dir: null -> scope unknown -> fail closed, spec contract #7). NEVER
+# $WORKTREE_DIR, NEVER a value derived from root+branch+isolation_mode (explicitly prohibited).
+# Médio 2 (PR #110): the value travels QUOTED. `$GATE_CODE_DIR_FLAG` unquoted word-split a CODE_DIR
+# containing a space, producing a truncated `code_dir` -> fabricated `different-code-dir` -> the pair
+# left scope -> silent `proceed`. The canonical shape is the spec's own: `${CODE_DIR:+--code-dir "$CODE_DIR"}`.
+GATE_CODE_DIR="" 
+[ "$ISOLATION_MODE" = "shared" ] && [ -n "$CODE_DIR" ] && GATE_CODE_DIR="$CODE_DIR"
+
+# Claim extraction, used by every union computation below. `--evaluate` and `--check-only` both carry
+# `.claim` (the derived, normalised claim). FAIL CLOSED: a missing/invalid `.claim.paths` exits != 0
+# and is NEVER swallowed into `[]` — an empty union is an absent fence, not a permissive one.
+EXTRACT_CLAIM_PATHS='let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);if(!j.claim||!Array.isArray(j.claim.paths))throw new Error("resultado sem claim.paths");process.stdout.write(JSON.stringify(j.claim.paths))}catch(e){process.stderr.write("claim-gate: derivação do claim falhou — "+e.message+"\n");process.exit(1)}})'
+UNION_ADD='const a=JSON.parse(process.argv[1]),b=JSON.parse(process.argv[2]);process.stdout.write(JSON.stringify(Array.from(new Set([...a,...b]))))'
+
+# claim_union <plan path…> -> JSON array on stdout; exit != 0 on any failed derivation (fail closed).
+claim_union() {
+  local ACC="[]" P ONE
+  for P in "$@"; do
+    ONE=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --evaluate --plan "$P" \
+      --run "$RUN_ID" --cwd "$WORKING_DIR" --json | node -e "$EXTRACT_CLAIM_PATHS") || return 1
+    ACC=$(node -e "$UNION_ADD" "$ACC" "$ONE") || return 1
+  done
+  printf '%s' "$ACC"
+}
+
+# record_union <unit label> <JSON array of paths> — the visible fence, verified.
+record_union() {
+  local CSV; CSV=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).join(','))" "$2") || return 1
+  node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --claim-and-check --paths "$CSV" --source manual \
+    --run "$RUN_ID" --unit "$1" ${GATE_CODE_DIR:+--code-dir "$GATE_CODE_DIR"} --ready-alternatives 0 \
+    --cwd "$WORKING_DIR" --json > /dev/null
+}
+
+# 1. Union of the whole ready batch, recorded BEFORE any evaluation (visible fence, contract #6).
+BATCH_IDS_CSV=$(node -e "process.stdout.write(process.argv.slice(1).join(','))" "${BATCH_TASK_IDS[@]}")
+BATCH_UNION_PATHS=$(claim_union "${BATCH_PLAN_PATHS[@]}")   # BATCH_PLAN_PATHS = "$WORKING_DIR/${ENTRY_PLAN_PATH}" of every ENTRY
+UNION_EXIT=$?
+if [ "$UNION_EXIT" -ne 0 ] || ! record_union "BATCH:$BATCH_IDS_CSV" "$BATCH_UNION_PATHS"; then
+  echo "⛔ Claim gate indisponível: a união do batch não pôde ser derivada/gravada — block/gate-unavailable. Nenhum dispatch." >&2
+  # Sentinel + explicit drop (see the per-task branch below for why a comment is not enough here).
+  CLAIM_GATE_DECISION=block
+  CLAIM_GATE_CAUSE=gate-unavailable
+  BATCH=()   # explicit drop — § Step 4 (checkpoint + deactivate). STOP.
+fi
+
+# 2. Evaluate per task with --check-only, --ready-alternatives = (tasks ready remaining in BATCH − 1).
+#    --check-only (NOT --claim-and-check): it evaluates and emits the event while PRESERVING the union
+#    recorded in step 1. `recordClaim` is a single slot, so a per-task record here would destroy the
+#    fence two lines after writing it and each task would be confronted against itself only.
+#    --wait is passed UNCONDITIONALLY: the module polls only when the decision is `block`, which is
+#    behaviourally identical to "when the effective posture is block" — and the consumer must not
+#    pre-read the posture pref (spec § Step 0).
+REMAINING=$(( ${#BATCH[@]} - 1 ))
+for ENTRY in "${BATCH[@]}"; do   # ENTRY = {id: T##, planPath}
+  GATE_JSON=$(node "$FORGE_SCRIPTS_DIR/forge-claim-gate.js" --check-only --wait \
+    --run "$RUN_ID" --unit "execute-task/${ENTRY_ID}" --source plan-writes \
+    --plan "$WORKING_DIR/${ENTRY_PLAN_PATH}" ${GATE_CODE_DIR:+--code-dir "$GATE_CODE_DIR"} \
+    --ready-alternatives "$REMAINING" --cwd "$WORKING_DIR" --json)
+  GATE_EXIT=$?
+  REMAINING=$((REMAINING - 1))
+  # Fail-closed (spec § Fail-closed): exit != 0 or non-JSON stdout -> block/gate-unavailable, LOUD.
+  if [ "$GATE_EXIT" -ne 0 ] || ! printf '%s' "$GATE_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{JSON.parse(d);process.exit(0)}catch(e){process.exit(1)}})"; then
+    echo "⛔ Claim gate indisponível (exit $GATE_EXIT) para ${ENTRY_ID} — tratando como block/gate-unavailable. Nenhum dispatch." >&2
+    # Sentinel + explicit drop. NOT a bare comment (same rule as the isolation-setup precedent above):
+    # in THIS skill a task stays in BATCH by default, so falling through a gate failure would DISPATCH.
+    # The assignments below remove that default; the bold halt paragraph after this fence is what the
+    # sentinel then makes reachable — it never depends on a comment to carry the halt.
+    CLAIM_GATE_DECISION=block
+    CLAIM_GATE_CAUSE=gate-unavailable
+    SURVIVOR_IDS=(); SURVIVOR_PLAN_PATHS=(); BATCH=()   # explicit drop: no task survives an unavailable gate
+    BATCH_CHANGED=1
+    break   # § Step 4 (checkpoint + deactivate this run). STOP — never dispatch.
+  fi
+  # Médio 1 (PR #110): the keep/drop branch is a STATEMENT, never prose. A HEALTHY gate returning
+  # `block` used to depend on the model reading a comment, and in THIS skill a task stays in BATCH by
+  # default — so an unread comment DISPATCHED. `advised_action` (never `decision`) is what reaches the
+  # dispatch: the module owns the advisory/enforcing axis (spec § Step 0, § Enforcement) and the
+  # consumer never re-reads the pref. `decision` survives only to pick the message.
+  ADVISED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).advised_action||'')" "$GATE_JSON")
+  DECISION=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).decision||'')" "$GATE_JSON")
+  SUPPRESSED=$(node -e "process.stdout.write(JSON.parse(process.argv[1]).suppressed_action||'')" "$GATE_JSON")
+  case "$ADVISED" in
+    dispatch) SURVIVOR_IDS+=("$ENTRY_ID"); SURVIVOR_PLAN_PATHS+=("$ENTRY_PLAN_PATH") ;;
+    *)        BATCH_CHANGED=1 ;;   # includes empty/unknown advised_action — default DROP
+  esac
+  # The echo is keyed on the real verdict, and names the suppression when advisory let it through.
+  # `[advisory]` means the fence computed a refusal and did NOT act on it — never silent.
+  PREFIX=""; [ -n "$SUPPRESSED" ] && PREFIX="⚠ [advisory] "
+  case "$DECISION" in
+    proceed) ;;
+    defer)   echo "${PREFIX}⤳ ${ENTRY_ID} adiada — claim overlap com run $(node -e "process.stdout.write(((JSON.parse(process.argv[1]).counterparts||[])[0]||{}).id||'?')" "$GATE_JSON")" ;;
+    block)   echo "${PREFIX}⛔ ${ENTRY_ID} bloqueada — claim overlap. Sob enforcing o módulo já pollou até o teto (--wait). Se .escalation estiver setada -> § Step 4 (Account Handoff form)." ;;
+    refuse)  echo "${PREFIX}⛔ ${ENTRY_ID} recusada — causa: $(node -e "process.stdout.write(JSON.parse(process.argv[1]).cause||'?')" "$GATE_JSON"). Não retentar (esperar não conserta)." ;;
+  esac
+  # Echo the 3 `.not_covered` boundaries once per slice (first execution of this gate in the session).
+done
+
+# 3./4. Drop non-proceed tasks and re-record the union of the SURVIVORS, so the persisted claim
+# describes what will actually run (spec § Step 1, items 3 and 4). Leaving the original union in place
+# would block counterparts on files this run already decided not to touch.
+if [ "$BATCH_CHANGED" = "1" ]; then
+  if [ ${#SURVIVOR_IDS[@]} -eq 0 ]; then
+    # ZERO SURVIVORS — named, not implicit: nothing will be dispatched this pass, so this run must hold
+    # NO fence. The claim is cleared (S03 primitive), and the loop moves to the next unit / stops per
+    # the decision that emptied the batch.
+    node "$FORGE_SCRIPTS_DIR/forge-write-claim.js" --clear "$RUN_ID" --cwd "$WORKING_DIR" \
+      || echo "⚠ claim do batch vazio não pôde ser liberado — a cerca da união segue persistida" >&2
+    echo "⤳ Nenhuma task sobreviveu ao claim gate — claim liberado, nada despachado neste passe."
+  else
+    SURVIVOR_IDS_CSV=$(node -e "process.stdout.write(process.argv.slice(1).join(','))" "${SURVIVOR_IDS[@]}")
+    SURVIVOR_UNION_PATHS=$(claim_union "${SURVIVOR_PLAN_PATHS[@]}")
+    UNION_EXIT=$?
+    if [ "$UNION_EXIT" -ne 0 ] || ! record_union "BATCH:$SURVIVOR_IDS_CSV" "$SURVIVOR_UNION_PATHS"; then
+      echo "⛔ Claim gate indisponível: a união dos sobreviventes não pôde ser regravada — block/gate-unavailable." >&2
+      # Sentinel + explicit drop (see the per-task branch above for why a comment is not enough here).
+      CLAIM_GATE_DECISION=block
+      CLAIM_GATE_CAUSE=gate-unavailable
+      BATCH=()   # explicit drop — § Step 4 (checkpoint + deactivate). STOP.
+    fi
+  fi
+fi
+```
+
+**Escalation (`wait-ceiling`/`defer-cap`, or any `block`/`refuse` that stops a run):** follow spec § Step 4 in the **Account Handoff Procedure** form (below) — checkpoint (`continue.md`), deactivate this run (same deactivation the pause path uses — the event was already written by `--claim-and-check`, do not hand-write a second line), emit the actionable message naming the counterpart run, cause, paths and the three legitimate exits from the spec. **The loop STOPS, it never dispatches** — this is the same CRITICAL rule as the isolation-setup and Account Handoff failures above: when dispatch cannot happen, stop and surface, executing inline is never a fallback.
+
 **Overlap advisory (before complete-slice):** grave o toque desta run e confronte com as demais runs ativas — o sinal existe para ser visto **antes do merge**.
 ```bash
 node "{WORKING_DIR}/scripts/forge-touch.js" --record "{RUN_ID}" --cwd "{WORKING_DIR}" || true
@@ -559,7 +694,7 @@ Imprima o veredicto ao operador e **siga**. O sinal é advisory: **nunca** bloqu
    - Rebuttal × `rounds` → `forge-reviewer` in rebuttal mode (DEFENSE injected)
    - The `model:` of `forge-advocate`/`forge-reviewer` comes exclusively from resolved `$ADVOCATE_ALIAS`/`$CHALLENGER_MODEL`; literals are a violation detected by `forge-review-audit.js`.
    - Resolve (Step 5 truth table), write `{S##}-REVIEW.md` (Step 6).
-   - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty.
+   - **CONCEDED items → fix now (Step 7a):** resolve `RF_ALIAS=$(node "$FORGE_SCRIPTS_DIR/forge-dispatch-resolve.js" --unit-type review-fix --cwd "$WORKING_DIR" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).alias||'')}catch(e){}})")`; **before dispatching**, run the cross-run claim gate exactly as `shared/forge-review.md § Step 7a` prescribes (it in turn references `shared/forge-claim-gate.md § Step 1` for the `--conceded` claim derivation — the path derivation is not repeated here); dispatch `review-fix/{S##}` with `model: '{RF_ALIAS}'` only when non-empty and the gate decision is `proceed`.
    - **OPEN items → posture (Step 7b):** `ask_in_auto: defer` (default) marks each `**Decisão:** deferido → triagem no fim da milestone` and continues WITHOUT pausing — they are guaranteed to surface at the milestone-final triage gate below. `pause` (opt-in) asks per-slice via `AskUserQuestion`.
    - Append the `review` event to `events.jsonl` (Step 8).
 4. The gate **never blocks** — any `Agent()` throw is recorded and the loop proceeds to `complete-slice` regardless.
@@ -587,7 +722,7 @@ The snapshot is written to `.gsd/forge/` on purpose — shell variables do not s
 1. Scan all `{S##}-REVIEW.md` under `.gsd/milestones/{M###}/slices/*/` for pending items: `Decisão: deferido → triagem no fim da milestone`, `Correção: falhou — deferida para triagem final`, or legacy `Decisão: deferido (auto-mode)`.
 2. Zero pending → skip silently and dispatch `complete-milestone` normally.
 3. Otherwise **fire push (call-site 2):** use Push helper with message `"Forge {RUN_ID} — {N} item(ns) de review aguardam sua triagem antes de fechar a milestone."` (N = count of pending items). Then print the digest table (slice · R# · path:line · objeção · status) and triage each item via `AskUserQuestion` (batched up to 4, header `Review M###`): `Manter abordagem atual` / `Refatorar agora` / `Criar follow-up`.
-4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (nothing has been integrated at this point — the fix commits on the still-checked-out `forge/{run}` branch). Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items create an item per `shared/forge-review.md § Item capture` (source `review/{S##}/{R#}`, status `inbox`, provenance from the digest row) and append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing — this survives `milestone_cleanup`; the item is the single destination for full content).
+4. `Refatorar agora` items → ONE `review-fix/{M###}-triage` dispatch to `forge-executor` (nothing has been integrated at this point — the fix commits on the still-checked-out `forge/{run}` branch). **Before dispatching**, run the cross-run claim gate exactly as `shared/forge-review.md § Step 9` prescribes (it references `shared/forge-claim-gate.md § Step 1` for the `--conceded` claim derivation of the triage items — not repeated here); dispatch only when the gate decision is `proceed`. Write every decision back into the R#'s `**Decisão:**` line; `Criar follow-up` items create an item per `shared/forge-review.md § Item capture` (source `review/{S##}/{R#}`, status `inbox`, provenance from the digest row) and append ONLY the pointer line `- {I-id} — {title}` to `.gsd/KNOWLEDGE.md § Review follow-ups` (create the section if missing — this survives `milestone_cleanup`; the item is the single destination for full content).
 5. Append the `review-triage` event to `events.jsonl`. The triage **never blocks** the milestone close-out.
 
 > **This gate is the explicit exception to the AUTONOMY RULE** — at this point every slice is done; asking the operator here is the designed arbitration moment that `defer` postponed to. It does not fire on pause/blocked/partial exits — only when the derived unit is `complete-milestone`.
@@ -1793,6 +1928,24 @@ Os seguintes requisitos planejados não foram entregues pela unidade anterior e 
 ```
 
 Also append this same section to `{WORKING_DIR}/.gsd/milestones/{M###}/slices/{S##}/{S##}-SUMMARY.md` (create section if not present; append if exists). Items pruned via PRUNE are excluded from the diff (already registered in CONTEXT — do not re-inject).
+
+**e-release) Ask for the claim release (unit boundary)** — runs after re-injection, before progress
+tracking. Applies to units that went through the claim gate of step 1.7 (`execute-task`,
+`review-fix`); skip otherwise.
+
+Run the **canonical release invocation** of `shared/forge-claim-gate.md § Release lifecycle`
+verbatim, with `RUN_ID`, `WORKING_DIR` and (per the B2 rule stated there) `CODE_DIR` bound to this
+dispatch's values. The mechanisms, the two probes, the TTL rule and the flag set live in that
+section — do not restate them here, and do not add flags it does not list.
+
+**Fail-soft, by decision.** Asking for a release is *measuring*; a measurement that cannot be taken
+leaves the claim standing, which is the safe side. A non-zero exit, invalid JSON or a refused
+request (`held: true`) echoes one line and the loop **continues** — it never stops the loop, never
+deactivates the run and never escalates. This is the deliberate opposite of the pre-dispatch gate of
+step 1.7, which is enforcing; the reason for the asymmetry is written in the spec section above.
+
+The `claim-release` event is written **by the module**, not narrated here
+(`shared/forge-dispatch.md § Event claim-release`).
 
 **e) Track progress:**
 ```

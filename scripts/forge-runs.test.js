@@ -337,6 +337,47 @@ test('CLI --add with a valueless --branch records null, not the boolean true', (
   });
 });
 
+// ── updateWith (S05/review R1): the read happens inside the lock ──────────────
+test('updateWith applies the mutator patch and reports updated: true', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    runs.add(dir, { id: 'M-uw1', kind: 'milestone', session_id: 's' });
+    const r = runs.updateWith(dir, 'M-uw1', (cur) => {
+      assertEq(cur.id, 'M-uw1', 'the mutator sees the CURRENT record, read inside the lock');
+      return { branch: 'forge/M-uw1' };
+    });
+    assertEq(r.updated, true, 'a patch means a write');
+    assertEq(r.record.branch, 'forge/M-uw1', 'the returned record carries the patch');
+    assertEq(runs.get(dir, 'M-uw1').branch, 'forge/M-uw1', 'and it is persisted');
+  });
+});
+
+test('updateWith ABORTS on null/undefined — nothing written, and it is not an error', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    runs.add(dir, { id: 'M-uw2', kind: 'milestone', session_id: 's', branch: 'antes' });
+    const file = path.join(dir, '.gsd', 'forge', 'runs', 'M-uw2.json');
+    const before = fs.readFileSync(file, 'utf8');
+    const r = runs.updateWith(dir, 'M-uw2', () => null);
+    assertEq(r.updated, false, 'abort is a first-class outcome, never a throw');
+    assertEq(r.record.branch, 'antes', 'the current record comes back untouched');
+    assertEq(fs.readFileSync(file, 'utf8'), before, 'an abort must not touch the file');
+    assertEq(runs.updateWith(dir, 'M-uw2', () => undefined).updated, false, 'undefined aborts too');
+  });
+});
+
+test('updateWith refuses a non-function mutator and a missing run, by name', () => {
+  withSandbox(dir => {
+    fs.mkdirSync(path.join(dir, '.gsd'), { recursive: true });
+    let threw = null;
+    try { runs.updateWith(dir, 'M-uw3', { branch: 'x' }); } catch (e) { threw = e.message; }
+    assert(threw && /mutator must be a function/.test(threw), `mutator inválido deve ser nomeado: ${threw}`);
+    threw = null;
+    try { runs.updateWith(dir, 'M-nao-existe', () => ({})); } catch (e) { threw = e.message; }
+    assert(threw && /not found/.test(threw), `run ausente deve ser nomeada: ${threw}`);
+  });
+});
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 console.log(`\n=== Result: ${passed} passed, ${failed} failed ===`);
 
