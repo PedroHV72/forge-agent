@@ -148,23 +148,123 @@ function backupExisting(paths, backupRoot, plan, options) {
   return files;
 }
 
-// Retiring is intentionally a rename, not a backup copy: the old directory is
-// no longer a runtime source and copying it would leave the fossil executable.
-function retireLegacyScripts(source, backupRoot, plan, options) {
-  const tombstone = path.join(source, 'README.md');
+const TOMBSTONE = 'README.md';
+
+// Ours by name, or ours by inventory. The prefix rule alone is not enough:
+// `merge-settings.js` and `codebase-collect.sh` are Forge files without it, and
+// classifying them as strangers would leave two fossils executable. The second
+// leg answers with the Forge scripts inventory (repo `scripts/` plus the Forge
+// home copy), which is where both of them live.
+function isForgeScriptName(relative) {
+  return /^forge/i.test(path.basename(String(relative)));
+}
+
+function classifyLegacyScripts(source, inventory) {
+  const known = inventory instanceof Set ? inventory : new Set();
+  const managed = [];
+  const retained = [];
+  for (const relative of relativeFiles(source)) {
+    const posix = relative.split(path.sep).join('/');
+    if (posix === TOMBSTONE) continue; // our own tombstone: never moved, never counted
+    (isForgeScriptName(posix) || known.has(posix) ? managed : retained).push(posix);
+  }
+  return { managed: managed.sort(), retained: retained.sort() };
+}
+
+// The guard that lost it now sees it. A `settings.json` hook pointing INTO the
+// directory being retired is exactly how the loss stayed silent: the file is
+// preserved as `user_owned`, so it stays intact and pointing at nothing, and the
+// hook fails without a word on every session start. Same discipline as #92/#93
+// on the statusline.
+//
+// One needle covers every form the path can take because JSON escapes a Windows
+// separator as `\\`: normalizing all separators to `/` makes
+// `~/.claude/scripts/x.py`, `C:\\Users\\…\\scripts\\x.py` and
+// `$HOME/.claude/scripts/x.py` the same string. A directory named `scripts`
+// elsewhere can produce a false hit — and that errs toward keeping the operator's
+// file, which is the safe direction.
+function legacyScriptReferences(settingsFiles, relatives) {
+  const hits = [];
+  for (const file of settingsFiles || []) {
+    let text = null;
+    try { text = fs.readFileSync(file, 'utf8'); } catch (_) { continue; }
+    const haystack = text.replace(/\\{1,2}/g, '/').toLowerCase();
+    for (const relative of relatives) {
+      if (haystack.includes(`scripts/${String(relative).toLowerCase()}`)) hits.push({ settings: file, script: relative });
+    }
+  }
+  return hits;
+}
+
+// A relocated FORGE_HOME can put the backup on another volume, where rename
+// fails with EXDEV. The whole-directory rename had the same exposure and no
+// fallback; per-file moves make the recovery trivial.
+function moveFile(from, to) {
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  try { fs.renameSync(from, to); }
+  catch (error) {
+    if (!error || error.code !== 'EXDEV') throw error;
+    fs.copyFileSync(from, to);
+    fs.unlinkSync(from);
+  }
+}
+
+function pruneEmptyDirectories(root) {
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory()) visit(path.join(directory, entry.name));
+    }
+    if (path.resolve(directory) !== path.resolve(root) && fs.readdirSync(directory).length === 0) {
+      try { fs.rmdirSync(directory); } catch (_) { /* best effort */ }
+    }
+  };
+  visit(root);
+}
+
+function tombstoneText(retained) {
+  const lines = ['Este diretório foi aposentado pelo forge-update. Para reverter, mova backups/legacy/claude-scripts de volta para ~/.claude/scripts.'];
+  if (retained.length) lines.push('', `Preservados aqui porque não são do Forge (${retained.length}):`, ...retained.map((relative) => `- ${relative}`));
+  return `${lines.join('\n')}\n`;
+}
+
+// Retiring is intentionally a move, not a backup copy: the old directory is no
+// longer a runtime source and copying it would leave the fossil executable.
+//
+// It is NOT, however, ours wholesale. Measured on a real 4.15.0 update: 93 files
+// moved, 91 of them `forge-*`. One of the other two was the operator's
+// `svn-session-reconcile.py`, invoked by a `SessionStart` hook in
+// `settings.json`. The whole-directory rename took it along, and from then on
+// that hook failed silently at every session start — noticed only because the
+// operator happened to know the hook existed. The tombstone explains how to
+// revert, which is good, but nobody reads the README of a directory they do not
+// know lost content.
+//
+// So: classify, move only what is ours, leave the rest exactly where the
+// operator left it, and name both halves in the plan.
+function retireLegacyScripts(source, backupRoot, plan, options, context = {}) {
+  const tombstone = path.join(source, TOMBSTONE);
   const destination = path.join(backupRoot, 'legacy', 'claude-scripts');
-  const onlyTombstone = exists(source) && fs.statSync(source).isDirectory()
-    && fs.readdirSync(source).every((name) => name === 'README.md');
-  if (!exists(source) || onlyTombstone) {
-    plan.push({ op: 'skip', reason: 'already-retired', source, destination });
+  if (!exists(source) || !fs.statSync(source).isDirectory()) {
+    plan.push({ op: 'skip', reason: 'already-retired', source, destination, moved: [], retained: [], settings_references: [] });
     return;
   }
-  plan.push({ op: 'retire', source, destination });
-  if (!options.dryRun) {
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    fs.renameSync(source, destination);
+  const { managed, retained } = classifyLegacyScripts(source, context.inventory);
+  const references = legacyScriptReferences(context.settingsFiles, [...managed, ...retained])
+    .map((hit) => ({ ...hit, action: managed.includes(hit.script) ? 'retired' : 'retained' }));
+  // `already-retired` is a statement about OUR content, not about the folder:
+  // the directory can legitimately survive holding only the operator's files.
+  // Without this branch a retained orphan would make every future update try to
+  // retire the same directory again, forever.
+  if (managed.length === 0) {
+    plan.push({ op: 'skip', reason: 'already-retired', source, destination, moved: [], retained, settings_references: references });
+    return;
   }
-  writeText(tombstone, 'Este diretório foi aposentado pelo forge-update. Para reverter, mova backups/legacy/claude-scripts de volta para ~/.claude/scripts.\n', plan, options);
+  plan.push({ op: 'retire', source, destination, moved: managed, retained, settings_references: references });
+  if (!options.dryRun) {
+    for (const relative of managed) moveFile(path.join(source, relative), path.join(destination, relative.split('/').join(path.sep)));
+    pruneEmptyDirectories(source);
+  }
+  writeText(tombstone, tombstoneText(retained), plan, options);
 }
 
 function installApp(repo, plan, options, platform) {
@@ -235,7 +335,22 @@ function install(input = {}) {
         path.join(paths.claudeHome, 'forge-agent-prefs.md'),
       ], path.join(backupRoot, 'legacy', 'claude'), plan, options);
     }
-    retireLegacyScripts(path.join(paths.userHome, '.claude', 'scripts'), backupRoot, plan, options);
+    // The inventory that answers "is this file ours?" — the repo's own scripts
+    // plus the copy already installed in the Forge home, so a script deleted from
+    // the repo is still recognized as a Forge fossil. The settings files are the
+    // ones Claude Code actually reads, in both the standard and relocated layout.
+    const legacyScripts = path.join(paths.userHome, '.claude', 'scripts');
+    const scriptInventory = new Set([
+      ...relativeFiles(path.join(repo, 'scripts')),
+      ...relativeFiles(paths.shared.scripts),
+    ].map((relative) => relative.split(path.sep).join('/')));
+    const settingsFiles = [...new Set([
+      path.join(paths.userHome, '.claude', 'settings.json'),
+      path.join(paths.userHome, '.claude', 'settings.local.json'),
+      path.join(paths.claudeHome, 'settings.json'),
+      path.join(paths.claudeHome, 'settings.local.json'),
+    ].map((file) => path.resolve(file)))];
+    retireLegacyScripts(legacyScripts, backupRoot, plan, options, { inventory: scriptInventory, settingsFiles });
     const projectFiles = [];
     if (selected.includes('claude')) projectFiles.push(path.join(projectRoot, 'CLAUDE.md'));
     if (selected.includes('codex')) projectFiles.push(path.join(projectRoot, 'AGENTS.md'));
@@ -355,6 +470,20 @@ function render(report) {
   else lines.push(`${report.changed ? 'Installed' : 'No changes'}; ${report.plan.length} operation(s).`);
   if (report.app) lines.push(`App: ${report.app.status}${report.app.reason ? ` (${report.app.reason})` : ''}`);
   if (report.backup) lines.push(`Backup: ${report.backup}`);
+  // Retirement is not wholesale, so the summary says what stayed — and a hook
+  // pointing into the retired directory is loud rather than absent. A count with
+  // no names is what made the previous loss invisible.
+  for (const entry of (report.plan || []).filter((item) => item.op === 'retire' || (item.op === 'skip' && item.reason === 'already-retired'))) {
+    if (Array.isArray(entry.retained) && entry.retained.length) {
+      lines.push(`Retired ${(entry.moved || []).length} managed file(s) from ${entry.source}; retained ${entry.retained.length} not ours:`);
+      for (const relative of entry.retained) lines.push(`  [retained] ${relative}`);
+    }
+    for (const reference of entry.settings_references || []) {
+      lines.push(reference.action === 'retired'
+        ? `  ⚠ ${reference.settings} chama ${reference.script} em ${entry.source} — esse arquivo FOI aposentado; ajuste o comando (o alvo mantido vive em ~/.forge-agent/scripts/)`
+        : `  ⚠ ${reference.settings} chama ${reference.script} em ${entry.source} — preservado no lugar para o hook continuar funcionando`);
+    }
+  }
   // Two kinds of preserved conflict, and only ONE of them has `--migrate-legacy` as its
   // remedy. An operator-owned destination (settings.json) is preserved even WITH that flag,
   // so pointing the operator at it there would promise a fix that cannot work — and would
@@ -403,5 +532,5 @@ function run(argv = process.argv.slice(2), write = process.stdout.write.bind(pro
   catch (error) { errorWrite(`forge-installer: ${error.message}\n`); return 1; }
 }
 
-module.exports = { RUNTIMES, VERSION, MANAGED_CORE, parseArgs, walk, adapterSources, installApp, retireLegacyScripts, install, render, run };
+module.exports = { RUNTIMES, VERSION, MANAGED_CORE, TOMBSTONE, parseArgs, walk, adapterSources, installApp, classifyLegacyScripts, legacyScriptReferences, retireLegacyScripts, install, render, run };
 if (require.main === module) process.exitCode = run();

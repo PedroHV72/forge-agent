@@ -222,16 +222,126 @@ test('update retires legacy Claude scripts only on apply and leaves a tombstone'
   try {
     const legacy = path.join(data.root, '.claude', 'scripts');
     fs.mkdirSync(legacy, { recursive: true });
-    fs.writeFileSync(path.join(legacy, 'old.js'), 'legacy\n');
+    fs.writeFileSync(path.join(legacy, 'forge-old.js'), 'legacy\n');
     const dry = installer.install({ ...data.options, runtime: 'claude', update: true, dryRun: true });
     assert(dry.plan.some((entry) => entry.op === 'retire' && entry.source === legacy));
-    assert.strictEqual(fs.existsSync(path.join(legacy, 'old.js')), true);
+    assert.strictEqual(fs.existsSync(path.join(legacy, 'forge-old.js')), true);
     const applied = installer.install({ ...data.options, runtime: 'claude', update: true });
     assert.strictEqual(fs.existsSync(path.join(legacy, 'README.md')), true);
     assert(applied.plan.some((entry) => entry.op === 'retire'));
     const second = installer.install({ ...data.options, runtime: 'claude', update: true });
     assert(second.plan.some((entry) => entry.op === 'skip' && entry.reason === 'already-retired'));
   } finally { data.cleanup(); }
+});
+
+// ── Retirement classifies before it moves ───────────────────────────────────
+//
+// Measured on a real 4.15.0 update: `retireLegacyScripts` renamed the whole
+// `~/.claude/scripts` directory. 93 files moved, 91 of them `forge-*`. One of the
+// other two was the operator's `svn-session-reconcile.py`, invoked by a
+// `SessionStart` hook in `settings.json` — after the update that hook pointed at
+// a file that no longer existed and failed silently at every session start. The
+// `settings.json` is preserved as `user_owned`, so it stayed intact and aimed at
+// nothing; only an operator who already knew the hook existed could notice.
+test('retirement moves only what is ours — the operator script and its hook survive', () => {
+  const data = fixture();
+  try {
+    const legacy = path.join(data.root, '.claude', 'scripts');
+    fs.mkdirSync(legacy, { recursive: true });
+    fs.writeFileSync(path.join(legacy, 'forge-doctor.js'), 'fossil do forge\n');      // ours by name
+    fs.writeFileSync(path.join(legacy, 'merge-settings.js'), 'fossil do forge\n');    // ours by inventory, no prefix
+    fs.writeFileSync(path.join(legacy, 'svn-session-reconcile.py'), 'print(1)\n');    // the operator's own
+    fs.writeFileSync(path.join(data.root, '.claude', 'settings.json'), `${JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: 'python ~/.claude/scripts/svn-session-reconcile.py', timeout: 45 }] }],
+        PreToolUse: [{ matcher: 'Agent', hooks: [{ type: 'command', command: 'node ~/.claude/scripts/forge-doctor.js' }] }],
+      },
+    }, null, 2)}\n`);
+
+    const report = installer.install({ ...data.options, runtime: 'claude', update: true });
+    const retire = report.plan.find((entry) => entry.op === 'retire');
+    assert(retire, 'nada foi aposentado — o cenário não é o que este teste mede');
+    assert.deepStrictEqual(retire.moved, ['forge-doctor.js', 'merge-settings.js'],
+      'aposentou algo que o Forge não pode provar ser seu, ou deixou um fóssil executável');
+    assert.deepStrictEqual(retire.retained, ['svn-session-reconcile.py']);
+
+    // The acceptance criterion, at the level that matters: the operator's file is
+    // still exactly where their hook points, byte for byte.
+    assert.strictEqual(fs.readFileSync(path.join(legacy, 'svn-session-reconcile.py'), 'utf8'), 'print(1)\n');
+    // ...and ours really did leave, into the backup the tombstone names.
+    assert.strictEqual(fs.existsSync(path.join(legacy, 'forge-doctor.js')), false);
+    assert.strictEqual(fs.existsSync(path.join(retire.destination, 'forge-doctor.js')), true);
+    assert.strictEqual(fs.existsSync(path.join(retire.destination, 'merge-settings.js')), true);
+
+    // Both references are named, with the action that applies to each: the
+    // operator's stays, ours went — and the one that went is the loud case.
+    assert.deepStrictEqual(
+      retire.settings_references.map((item) => [item.script, item.action]).sort(),
+      [['forge-doctor.js', 'retired'], ['svn-session-reconcile.py', 'retained']],
+    );
+
+    const text = installer.render(report);
+    const warned = text.split('\n').filter((line) => line.includes('⚠'));
+    assert(text.includes('  [retained] svn-session-reconcile.py'), `o resumo não nomeou o que ficou:\n${text}`);
+    assert(warned.some((line) => line.includes('svn-session-reconcile.py') && line.includes('preservado no lugar')),
+      `o resumo não diz que o hook do operador continua válido:\n${text}`);
+    assert(warned.some((line) => line.includes('forge-doctor.js') && line.includes('FOI aposentado')),
+      `o resumo não avisa sobre o hook que aponta para um arquivo aposentado:\n${text}`);
+    assert.strictEqual(warned.length, 2, `avisos esperados: 2, veio ${warned.length}:\n${text}`);
+
+    // The tombstone tells the same truth as the plan.
+    assert.match(fs.readFileSync(path.join(legacy, installer.TOMBSTONE), 'utf8'), /svn-session-reconcile\.py/);
+
+    // Idempotence with an orphan present: `already-retired` is a statement about
+    // OUR content, not about the folder. Without this the directory would be
+    // retired again on every future update, forever.
+    const second = installer.install({ ...data.options, runtime: 'claude', update: true });
+    const skipped = second.plan.find((entry) => entry.op === 'skip' && entry.reason === 'already-retired');
+    assert(skipped, 'com um órfão preservado, a segunda execução não reportou already-retired');
+    assert.deepStrictEqual(skipped.moved, []);
+    assert.deepStrictEqual(skipped.retained, ['svn-session-reconcile.py']);
+    assert.strictEqual(fs.readFileSync(path.join(legacy, 'svn-session-reconcile.py'), 'utf8'), 'print(1)\n');
+  } finally { data.cleanup(); }
+});
+
+test('classification: name, inventory and orphan — every leg proven capable of the other verdict', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-classify-Ω-'));
+  try {
+    fs.mkdirSync(path.join(root, 'sub'), { recursive: true });
+    for (const [relative, body] of [
+      ['forge-hook.js', 'x'], ['merge-settings.js', 'x'], ['operator.py', 'x'],
+      ['sub/forge-runs.js', 'x'], ['sub/notes.txt', 'x'], [installer.TOMBSTONE, 'tombstone'],
+    ]) fs.writeFileSync(path.join(root, relative.split('/').join(path.sep)), body);
+
+    const withInventory = installer.classifyLegacyScripts(root, new Set(['merge-settings.js']));
+    assert.deepStrictEqual(withInventory.managed, ['forge-hook.js', 'merge-settings.js', 'sub/forge-runs.js']);
+    assert.deepStrictEqual(withInventory.retained, ['operator.py', 'sub/notes.txt']);
+    assert(!withInventory.managed.includes(installer.TOMBSTONE) && !withInventory.retained.includes(installer.TOMBSTONE),
+      'o tombstone entrou na classificação — ele não é conteúdo, é a lápide');
+
+    // Control: drop the inventory and `merge-settings.js` becomes a stranger. The
+    // second leg is doing real work, not decorating the name rule.
+    const nameOnly = installer.classifyLegacyScripts(root, new Set());
+    assert(nameOnly.retained.includes('merge-settings.js'),
+      'controle: sem inventário, um arquivo nosso sem prefixo deveria cair em retained');
+    assert(nameOnly.managed.includes('forge-hook.js'), 'controle: a regra de nome parou de morder');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the settings scan sees every separator form and invents nothing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-refscan-Ω-'));
+  try {
+    const settings = path.join(root, 'settings.json');
+    // A Windows absolute path as it really appears in JSON: separators escaped.
+    fs.writeFileSync(settings, `${JSON.stringify({
+      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'python C:\\Users\\dev\\.claude\\scripts\\svn-session-reconcile.py' }] }] },
+    }, null, 2)}\n`);
+    const hits = installer.legacyScriptReferences([settings], ['svn-session-reconcile.py', 'nunca-referenciado.js']);
+    assert.deepStrictEqual(hits.map((item) => item.script), ['svn-session-reconcile.py'],
+      'a varredura não vê o separador escapado do Windows, ou inventou uma referência');
+    assert.deepStrictEqual(installer.legacyScriptReferences([path.join(root, 'ausente.json')], ['x.js']), [],
+      'um settings.json ausente precisa ser silêncio, não exceção');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('Claude 3.1.4 fixture preserves JSONC, Markdown, hooks and project .gsd on update', () => {

@@ -168,8 +168,12 @@ function update(input = {}, dependencies = {}) {
     migrateLegacy: input.migrateLegacy,
     dryRun: preview,
   });
-  if (preview) return { ...plan, source_repo: sourceRepo, applied: false, installer: installed, retirements: installed.plan.filter((entry) => entry.op === 'retire' || (entry.op === 'skip' && entry.reason === 'already-retired')) };
-  return { ...plan, source_repo: sourceRepo, applied: true, changed: installed.changed, backup: installed.backup, installer: installed };
+  // Retirement is reported on BOTH paths. It used to be summarized only in the
+  // preview, so the run that actually moved files — the `--apply` an operator
+  // reads once and never again — said nothing about what it retired or kept.
+  const retirements = installed.plan.filter((entry) => entry.op === 'retire' || (entry.op === 'skip' && entry.reason === 'already-retired'));
+  if (preview) return { ...plan, source_repo: sourceRepo, applied: false, installer: installed, retirements };
+  return { ...plan, source_repo: sourceRepo, applied: true, changed: installed.changed, backup: installed.backup, installer: installed, retirements };
 }
 
 // The clone's own state, and the sentence the summary never said: this command
@@ -212,6 +216,15 @@ function render(report) {
   for (const retirement of report.retirements || []) {
     const state = retirement.op === 'skip' ? 'skipped' : 'retire';
     lines.push(`${state}: ${retirement.source} -> ${retirement.destination}`);
+    // Retirement moves only what Forge can prove is its own. What stayed is
+    // named, and a settings.json hook aimed inside the retired directory is
+    // surfaced here — the operator who follows this output must not have to know
+    // the hook existed to learn it was affected.
+    if (Array.isArray(retirement.moved)) lines.push(`  moved: ${retirement.moved.length}; retained: ${(retirement.retained || []).length}`);
+    for (const relative of retirement.retained || []) lines.push(`  [retained] ${relative}`);
+    for (const reference of retirement.settings_references || []) {
+      lines.push(`  ⚠ ${reference.settings} chama ${reference.script} (${reference.action === 'retired' ? 'APOSENTADO — ajuste o comando' : 'preservado no lugar'})`);
+    }
   }
   const conflicts = report.installer && report.installer.manifest && report.installer.manifest.adapters
     ? Object.values(report.installer.manifest.adapters).reduce((total, adapter) => total + (Array.isArray(adapter.conflicts) ? adapter.conflicts.length : 0), 0)
