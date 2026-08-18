@@ -3,6 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const maintenance = require('./forge-maintenance.js');
 const installer = require('./forge-installer.js');
 const { resolveForgeHome } = require('./forge-home.js');
@@ -83,8 +84,63 @@ function resolveSourceRepo(input = {}) {
   ].join('\n'));
 }
 
+function gitText(repo, args) {
+  const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', shell: false, maxBuffer: 8 * 1024 * 1024 });
+  if (!result || result.status !== 0) return null;
+  return typeof result.stdout === 'string' ? result.stdout : null;
+}
+
+/**
+ * The version the CLONE declares, not the one the running code declares.
+ *
+ * When the update is resolved from recorded provenance, the code doing the reading
+ * lives in the Forge home and can be several releases behind the clone — or ahead
+ * of it. That difference is precisely the signal this reports.
+ */
+function declaredVersion(repo) {
+  try {
+    const source = fs.readFileSync(path.join(repo, 'scripts', 'forge-version.js'), 'utf8');
+    const match = /const\s+VERSION\s*=\s*'([^']+)'/.exec(source);
+    return match ? match[1] : null;
+  } catch (_) { return null; }
+}
+
+/**
+ * Provenance of the bytes about to be installed.
+ *
+ * `/forge-update` reinstalls WHATEVER IS IN THE CLONE and never fetches. Measured:
+ * a clone 113 commits behind (4.8.0 against 4.15.0 at the tip) "updated"
+ * successfully to the same version, with no signal of it anywhere in the JSON or
+ * the summary — the operator had to run `git fetch` by hand to find out.
+ *
+ * `behind_tracking` is read from the LOCAL remote-tracking ref and nothing else:
+ * this function never contacts a server. Calling it "commits behind the remote"
+ * would be a confident, unmeasured claim — the ref is exactly as fresh as the last
+ * `git fetch`. It is therefore named after the ref it reads, and the summary says
+ * out loud that refreshing the clone is a separate step.
+ */
+function describeSourceRepo(repo) {
+  const head = gitText(repo, ['rev-parse', '--short', 'HEAD']);
+  if (head === null) return { vcs: 'none', version: declaredVersion(repo), sha: null, branch: null, dirty: null, tracking_ref: null, behind_tracking: null };
+  const status = gitText(repo, ['status', '--porcelain']);
+  const tracking = gitText(repo, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+  const trackingRef = tracking ? tracking.trim() || null : null;
+  const behind = trackingRef ? gitText(repo, ['rev-list', '--count', `HEAD..${trackingRef}`]) : null;
+  const branch = gitText(repo, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  return {
+    vcs: 'git',
+    version: declaredVersion(repo),
+    sha: head.trim() || null,
+    branch: branch ? branch.trim() || null : null,
+    dirty: status === null ? null : status.trim() !== '',
+    tracking_ref: trackingRef,
+    behind_tracking: behind === null ? null : Number(behind.trim()),
+  };
+}
+
 function update(input = {}, dependencies = {}) {
-  const sourceRepo = resolveSourceRepo(input);
+  const resolved = resolveSourceRepo(input);
+  const sourceRepo = { ...describeSourceRepo(resolved.path), ...resolved };
   const plan = maintenance.planUpdate(input);
   const install = dependencies.install || installer.install;
   // A preview must stay side-effect free: the installer runs only to compute the
@@ -116,6 +172,30 @@ function update(input = {}, dependencies = {}) {
   return { ...plan, source_repo: sourceRepo, applied: true, changed: installed.changed, backup: installed.backup, installer: installed };
 }
 
+// The clone's own state, and the sentence the summary never said: this command
+// installs what the clone holds and does not refresh it. `behind_tracking` is
+// labelled with the ref it came from, because a number derived from a local
+// remote-tracking ref is only as fresh as the last fetch and must not be read as
+// the distance to the server.
+function sourceRepoLines(source) {
+  if (!source) return [];
+  const lines = [];
+  const facts = [];
+  if (source.version) facts.push(`version ${source.version}`);
+  if (source.sha) facts.push(`sha ${source.sha}${source.branch ? ` (${source.branch})` : ''}`);
+  if (source.dirty === true) facts.push('árvore suja');
+  if (facts.length) lines.push(`  ${facts.join(' | ')}`);
+  if (source.vcs === 'none') lines.push('  sem git no repo-fonte: não há sha nem distância a reportar');
+  else if (source.tracking_ref === null) lines.push('  sem upstream configurado: distância desconhecida');
+  else if (Number.isFinite(source.behind_tracking) && source.behind_tracking > 0) {
+    lines.push(`  ${source.behind_tracking} commit(s) atrás de ${source.tracking_ref} — medido no ref local, do último \`git fetch\``);
+  } else if (Number.isFinite(source.behind_tracking)) {
+    lines.push(`  em dia com ${source.tracking_ref} — medido no ref local, do último \`git fetch\``);
+  }
+  lines.push('  este comando instala o que está no clone; atualizar o clone (`git fetch` + `git pull`) é passo separado');
+  return lines;
+}
+
 function render(report) {
   const lines = [
     `Forge update ${report.applied ? 'applied' : 'plan'}`,
@@ -124,6 +204,7 @@ function render(report) {
     // Named, not implied: an update that reinstalls whatever the clone happens
     // to hold must say WHICH clone it read, and how it found it.
     `source repo: ${report.source_repo ? `${report.source_repo.path} (${report.source_repo.origin})` : 'não resolvido'}`,
+    ...sourceRepoLines(report.source_repo),
     `backup: ${report.backup_required ? 'required-before-write' : 'not-required'}`,
   ];
   if (report.legacy_migration) lines.push(`legacy migration: ${report.legacy_migration.release} (${report.legacy_migration.runtime})`);
@@ -157,5 +238,5 @@ function run(argv = process.argv.slice(2), write = process.stdout.write.bind(pro
   }
 }
 
-module.exports = { SOURCE_MANIFEST, parseArgs, resolveSourceRepo, update, render, run };
+module.exports = { SOURCE_MANIFEST, parseArgs, resolveSourceRepo, describeSourceRepo, update, render, run };
 if (require.main === module) process.exitCode = run();
