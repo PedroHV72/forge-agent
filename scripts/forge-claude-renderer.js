@@ -9,6 +9,7 @@ const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
 const sourceManifest = require('./forge-source-manifest');
 const ownership = require('./forge-projection-ownership');
+const PROVENANCE = require('./forge-projection-provenance');
 const { VERSION } = require('./forge-version');
 
 const RUNTIME = 'claude';
@@ -17,6 +18,7 @@ const ORIGIN_SUFFIX = ' -->';
 const REASON = Object.freeze({
   INVALID_OPTIONS: 'invalid_options',
   MISSING_SOURCE: 'missing_source',
+  MISSING_MANIFEST: 'missing_manifest',
   PROTECTED_PATH: 'protected_path',
   USER_OWNED: 'user_owned',
 });
@@ -255,8 +257,14 @@ function selected(source) {
   return !state || !state.status || !['unavailable', 'planned'].includes(state.status);
 }
 
+// A bare ENOENT here names a path that should NOT hold this file: the caller
+// pointed the renderer at something that is not a forge-agent clone (typically
+// the Forge home, whose `scripts/` copy is managed core while the source
+// manifest never is). The path is not the problem, so the message must name the
+// flag that fixes it instead of the file that is legitimately absent.
 function readManifest(root, manifestFile) {
   const file = path.resolve(manifestFile || path.join(root.repo, 'forge-source-manifest.json'));
+  if (!exists(file)) fail(REASON.MISSING_MANIFEST, `manifesto de origem ausente: ${file} — ${root.repo} não é um clone do forge-agent; informe \`--repo <dir>\``);
   const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
   sourceManifest.audit(manifest);
   return manifest;
@@ -302,6 +310,11 @@ function write(options = {}) {
   const preserved = [];
   const conflicts = [];
   const recorded = (options.ownership && typeof options.ownership === 'object') ? options.ownership : {};
+  // `provenance: null` disables the rung explicitly; absent means build one from
+  // the repo we are rendering out of.
+  const provenance = options.provenance === null
+    ? null
+    : (options.provenance || PROVENANCE.createResolver({ repo: report.repo }));
   const backupRoot = options.backupDir ? path.resolve(options.backupDir) : null;
   for (const artifact of report.artifacts) {
     const destination = artifact.destination;
@@ -319,16 +332,32 @@ function write(options = {}) {
     }
     // Ownership is decided in one place for both renderers (§ forge-projection-ownership).
     // The digest rung is what a marker-less format (JSON) can reach; the marker
-    // rung is unchanged, so nothing that was ours stops being ours.
+    // rung is unchanged, so nothing that was ours stops being ours. The release
+    // rung is a thunk on purpose — repo history is only read for destinations that
+    // actually get that far, so a clean update spawns no git at all.
     const verdict = ownership.decide({
       current,
       recordedDigest: recorded[ownership.keyFor(destination)],
       markerPresent: hasOriginMarker(current),
       migrateLegacy: Boolean(options.update && options.migrateLegacy),
+      releaseDigests: provenance ? () => provenance.digestsFor(artifact.source) : undefined,
     });
     if (!verdict.ours) {
+      // A preserved destination always says whether we could even check: "proved
+      // to be yours" and "could not look" are different facts.
+      const checked = provenance
+        ? provenance.verdictFor(artifact.source, current)
+        : { reason: PROVENANCE.REASONS.NOT_CONSULTED, revisions: 0, truncated: false };
       preserved.push({ ...artifact, reason: REASON.USER_OWNED });
-      conflicts.push({ destination, source_id: artifact.source_id, reason: REASON.USER_OWNED });
+      conflicts.push({
+        destination,
+        source_id: artifact.source_id,
+        reason: REASON.USER_OWNED,
+        digest: ownership.digest(current),
+        provenance: checked.reason,
+        revisions_checked: checked.revisions,
+        ...(checked.truncated ? { provenance_truncated: true } : {}),
+      });
       continue;
     }
     if (options.dryRun) { written.push({ ...artifact, dry_run: true }); continue; }
@@ -339,7 +368,10 @@ function write(options = {}) {
     }
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.writeFileSync(destination, generated, 'utf8');
-    written.push(options.migrateLegacy && current !== null && !hasOriginMarker(current)
+    // The basis is carried on the written entry so the summary can say WHY a
+    // destination that used to be a permanent conflict is being replaced.
+    if (verdict.basis === 'release') written.push({ ...artifact, reason: 'release-adopted', revisions_checked: provenance ? provenance.verdictFor(artifact.source, current).revisions : 0 });
+    else written.push(options.migrateLegacy && current !== null && !hasOriginMarker(current)
       ? { ...artifact, reason: 'legacy-migrated' }
       : artifact);
   }

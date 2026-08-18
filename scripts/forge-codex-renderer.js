@@ -8,12 +8,13 @@ const path = require('path');
 const { resolveForgePaths } = require('./forge-home');
 const sourceManifest = require('./forge-source-manifest');
 const ownership = require('./forge-projection-ownership');
+const PROVENANCE = require('./forge-projection-provenance');
 const { VERSION } = require('./forge-version');
 
 const RUNTIME = 'codex';
 const ORIGIN = '<!-- forge-source:codex -->';
 const TOML_ORIGIN = '# forge-source:codex';
-const REASON = Object.freeze({ unavailable: 'unavailable', user_owned: 'user_owned', invalid_options: 'invalid_options', missing_source: 'missing_source' });
+const REASON = Object.freeze({ unavailable: 'unavailable', user_owned: 'user_owned', invalid_options: 'invalid_options', missing_source: 'missing_source', missing_manifest: 'missing_manifest' });
 
 function norm(value) { return String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
 function tomlOrigin(kind) { return `${TOML_ORIGIN}-${kind} version=${VERSION}`; }
@@ -63,7 +64,14 @@ function roots(options) {
   if (/(?:^|[\\/])\.claude(?:[\\/]|$)/i.test(codexHome)) throw Object.assign(new Error('Codex home não pode apontar para o host Claude'), { code: REASON.invalid_options });
   return { repo, forgeHome: paths.forgeHome, codexHome, projectRoot };
 }
+// Same rule as the Claude side: a missing source manifest means the repo root is
+// not a clone, so the error names `--repo` instead of surfacing a raw ENOENT for
+// a file that was never supposed to be at that path.
 function manifestFor(root, options) {
+  if (!options.manifest) {
+    const file = path.resolve(options.manifestFile || path.join(root.repo, 'forge-source-manifest.json'));
+    if (!exists(file)) throw Object.assign(new Error(`manifesto de origem ausente: ${file} — ${root.repo} não é um clone do forge-agent; informe \`--repo <dir>\``), { code: REASON.missing_manifest });
+  }
   const manifest = options.manifest || JSON.parse(fs.readFileSync(options.manifestFile || path.join(root.repo, 'forge-source-manifest.json'), 'utf8'));
   sourceManifest.audit(manifest); return manifest;
 }
@@ -117,6 +125,13 @@ function write(options = {}) {
   // without the digest rung that file froze on first divergence exactly like the
   // Claude-side JSON did, and each run reported success over it.
   const recorded = (options.ownership && typeof options.ownership === 'object') ? options.ownership : {};
+  // Same release rung as the Claude host. Most Codex artifacts are SYNTHESIZED
+  // (the TOML wrappers, the instructions, `capabilities.json`), so their `source`
+  // is not a repo file and provenance answers `no-source` — named, not silent.
+  // The file-derived surfaces (commands, skills) get the real check.
+  const provenance = options.provenance === null
+    ? null
+    : (options.provenance || PROVENANCE.createResolver({ repo: report.repo }));
   for (const artifact of report.artifacts) {
     const current = exists(artifact.destination) ? fs.readFileSync(artifact.destination, 'utf8') : null;
     if (current !== null && norm(current) === artifact.content) { preserved.push({ ...artifact, reason: 'already-current' }); continue; }
@@ -125,10 +140,26 @@ function write(options = {}) {
       recordedDigest: recorded[ownership.keyFor(artifact.destination)],
       markerPresent: current !== null && hasOrigin(current),
       migrateLegacy: Boolean(options.update && options.migrateLegacy),
+      releaseDigests: provenance ? () => provenance.digestsFor(artifact.source) : undefined,
     });
-    if (!verdict.ours) { preserved.push({ ...artifact, reason: REASON.user_owned }); conflicts.push({ destination: artifact.destination, reason: REASON.user_owned }); continue; }
+    if (!verdict.ours) {
+      const checked = provenance
+        ? provenance.verdictFor(artifact.source, current)
+        : { reason: PROVENANCE.REASONS.NOT_CONSULTED, revisions: 0, truncated: false };
+      preserved.push({ ...artifact, reason: REASON.user_owned });
+      conflicts.push({
+        destination: artifact.destination,
+        reason: REASON.user_owned,
+        digest: ownership.digest(current),
+        provenance: checked.reason,
+        revisions_checked: checked.revisions,
+        ...(checked.truncated ? { provenance_truncated: true } : {}),
+      });
+      continue;
+    }
     if (options.dryRun) { written.push({ ...artifact, dry_run: true }); continue; }
-    fs.mkdirSync(path.dirname(artifact.destination), { recursive: true }); fs.writeFileSync(artifact.destination, artifact.content, 'utf8'); written.push(artifact);
+    fs.mkdirSync(path.dirname(artifact.destination), { recursive: true }); fs.writeFileSync(artifact.destination, artifact.content, 'utf8');
+    written.push(verdict.basis === 'release' ? { ...artifact, reason: 'release-adopted' } : artifact);
   }
   const ownedNow = [...written, ...preserved.filter((item) => item.reason === 'already-current')];
   const nextOwnership = { ...recorded, ...ownership.recordOf(ownedNow) };
