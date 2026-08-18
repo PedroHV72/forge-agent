@@ -27,10 +27,26 @@
 // closing the freeze. Recorded here as a deliberate non-change rather than an
 // oversight; flipping it is a separate decision with its own migration.
 //
+// THE RUNG THAT WAS UNREACHABLE, AND WHY A FIFTH ONE EXISTS
+// ---------------------------------------------------------
+// The digest rung closes the freeze only for destinations this installer WROTE:
+// `recordOf` records what a run wrote, and a `user_owned` destination is exactly
+// what a run does not write. So a file that was already divergent when the rung
+// shipped never enters the record, and every later run finds no marker and no
+// record and preserves it again — the digest rung is unreachable for precisely
+// the files that need it. Measured: a real 4.8.0 → 4.15.0 update reported success
+// with 110 ownership entries and NONE for the four destinations it had itself
+// listed as `user_owned`; two of them were byte-identical to their 4.8.0 upstream
+// content, with zero operator customization, and stayed frozen.
+//
+// Rung 5 supplies the missing proof from outside the file AND outside our own
+// record: the source repo's history (§ forge-projection-provenance). It is still
+// additive — it can only grant.
+//
 // Exports:
 //   digest(content) → sha256 hex of the normalized bytes
-//   decide({ current, recordedDigest, markerPresent, migrateLegacy }) → { ours, basis }
-//     basis: 'absent' | 'marker' | 'digest' | 'migrate-legacy' | null
+//   decide({ current, recordedDigest, markerPresent, migrateLegacy, releaseDigests }) → { ours, basis }
+//     basis: 'absent' | 'marker' | 'digest' | 'release' | 'migrate-legacy' | null
 //   recordOf(entries) → { [resolved destination]: digest }
 //   keyFor(destination) → resolved absolute path used as the record key
 //
@@ -57,29 +73,57 @@ function keyFor(destination) {
 }
 
 /**
+ * Match the bytes on disk against every content this projection ever shipped as.
+ *
+ * The argument may be a thunk, and that is the point: reading repo history costs
+ * git subprocesses, and it must only happen for the destinations that actually
+ * reach this rung. A clean update never evaluates it.
+ */
+function releaseMatch(current, releaseDigests) {
+  if (!releaseDigests) return false;
+  let known = releaseDigests;
+  if (typeof known === 'function') {
+    try { known = known(); } catch (_) { return false; } // provenance is advisory: it never breaks an install
+  }
+  if (!known) return false;
+  const wanted = digest(current);
+  if (known instanceof Set) return known.has(wanted);
+  if (Array.isArray(known)) return known.includes(wanted);
+  return false;
+}
+
+/**
  * Decide whether a destination is the installer's to overwrite.
  *
  * Order is the contract, not an implementation detail:
  *  1. nothing on disk        → ours (a fresh install always projects)
  *  2. --migrate-legacy       → ours (the explicit operator escape, unchanged)
  *  3. marker present         → ours (pre-existing behavior, never narrowed)
- *  4. digest matches record  → ours (NEW — the only rung a marker-less format can reach)
- *  5. otherwise              → not ours
+ *  4. digest matches record  → ours (the only rung a marker-less format can reach)
+ *  5. bytes are some past     → ours (NEW — reachable for a destination that was
+ *     revision of the source          ALREADY divergent, which rung 4 cannot be)
+ *  6. otherwise              → not ours
+ *
+ * Rung 5 sits AFTER rung 4 deliberately: our own record is a cheaper and more
+ * direct claim than repo archaeology, and when both would answer they agree.
  *
  * @param {object} input
  * @param {?string} input.current          bytes on disk, or null when absent
  * @param {?string} input.recordedDigest   digest we recorded when we last wrote it
  * @param {boolean} input.markerPresent    result of the renderer's marker probe
  * @param {boolean} [input.migrateLegacy]  operator asked to adopt unmarked files
+ * @param {Set|Array|function} [input.releaseDigests]  digests of past revisions,
+ *        or a thunk producing them (evaluated only if this rung is reached)
  * @returns {{ours: boolean, basis: ?string}}
  */
 function decide(input = {}) {
-  const { current, recordedDigest, markerPresent, migrateLegacy } = input;
+  const { current, recordedDigest, markerPresent, migrateLegacy, releaseDigests } = input;
 
   if (current === null || current === undefined) return { ours: true, basis: 'absent' };
   if (migrateLegacy) return { ours: true, basis: 'migrate-legacy' };
   if (markerPresent) return { ours: true, basis: 'marker' };
   if (recordedDigest && digest(current) === recordedDigest) return { ours: true, basis: 'digest' };
+  if (releaseMatch(current, releaseDigests)) return { ours: true, basis: 'release' };
   return { ours: false, basis: null };
 }
 
@@ -102,4 +146,4 @@ function recordOf(entries) {
   return record;
 }
 
-module.exports = { digest, decide, recordOf, keyFor, normalize };
+module.exports = { digest, decide, releaseMatch, recordOf, keyFor, normalize };

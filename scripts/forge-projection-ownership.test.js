@@ -97,6 +97,68 @@ try {
     assert.strictEqual(v.ours, false, 'um registro vazio virou passe livre');
   });
 
+  // ── decide: rung 5, the one the record cannot reach ───────────────────────
+  //
+  // `recordOf` records what a run WROTE, and a `user_owned` destination is exactly
+  // what a run does not write — so rung 4 is structurally unreachable for a file
+  // that was already divergent when it shipped. Rung 5 supplies the proof from
+  // outside both the file and our record: the source repo's own history.
+
+  test('THE SECOND FIX: bytes matching a past revision of the source are ours', () => {
+    const shipped = '{"schema":1}\n';
+    const v = ownership.decide({
+      current: shipped,
+      recordedDigest: undefined,          // never entered the record: it was preserved, not written
+      markerPresent: false,               // JSON cannot carry a marker
+      releaseDigests: new Set([ownership.digest(shipped), ownership.digest('{"schema":2}\n')]),
+    });
+    assert.strictEqual(v.ours, true, 'o destino congelado na estreia continua congelado para sempre');
+    assert.strictEqual(v.basis, 'release');
+  });
+
+  test('bytes matching no revision are still not ours — the rung only grants', () => {
+    const v = ownership.decide({
+      current: '{"schema":1,"meu":true}\n',
+      markerPresent: false,
+      releaseDigests: new Set([ownership.digest('{"schema":1}\n')]),
+    });
+    assert.strictEqual(v.ours, false, 'edição real do operador seria sobrescrita');
+    assert.strictEqual(v.basis, null);
+  });
+
+  test('the release digests may be a thunk, and it is NOT evaluated when an earlier rung answers', () => {
+    // Reading repo history costs git subprocesses. A clean update must not pay for
+    // a single one, so laziness is part of the contract and not an optimization.
+    let evaluations = 0;
+    const thunk = () => { evaluations += 1; return new Set(); };
+    ownership.decide({ current: null, releaseDigests: thunk });
+    ownership.decide({ current: 'x', markerPresent: true, releaseDigests: thunk });
+    ownership.decide({ current: 'x', markerPresent: false, recordedDigest: ownership.digest('x'), releaseDigests: thunk });
+    ownership.decide({ current: 'x', markerPresent: false, migrateLegacy: true, releaseDigests: thunk });
+    assert.strictEqual(evaluations, 0, `histórico lido sem necessidade ${evaluations} vez(es)`);
+    // ...and it IS evaluated once the earlier rungs have all declined.
+    ownership.decide({ current: 'x', markerPresent: false, releaseDigests: thunk });
+    assert.strictEqual(evaluations, 1);
+  });
+
+  test('a throwing thunk degrades to "not ours" — provenance never breaks an install', () => {
+    const v = ownership.decide({
+      current: 'x', markerPresent: false,
+      releaseDigests: () => { throw new Error('git explodiu'); },
+    });
+    assert.strictEqual(v.ours, false);
+    assert.strictEqual(v.basis, null);
+  });
+
+  test('an absent or malformed release set is ignored, not treated as a match', () => {
+    for (const releaseDigests of [undefined, null, new Set(), [], 'não é conjunto', 42]) {
+      assert.strictEqual(ownership.decide({ current: 'x', markerPresent: false, releaseDigests }).ours, false,
+        `um conjunto de releases inválido (${JSON.stringify(releaseDigests)}) virou passe livre`);
+    }
+    assert.strictEqual(ownership.decide({ current: 'x', markerPresent: false, releaseDigests: ['nope', ownership.digest('x')] }).basis, 'release',
+      'um Array de digests deveria ser aceito tanto quanto um Set');
+  });
+
   // ── recordOf ──────────────────────────────────────────────────────────────
 
   test('recordOf keys by resolved path and digests the content', () => {
