@@ -136,4 +136,96 @@ test('apply retires legacy scripts and a second update reports skipped', () => {
   } finally { data.cleanup(); }
 });
 
+// ── The source repo is resolved, not assumed ────────────────────────────────
+//
+// `commands/forge-update.md` documents `node scripts/forge-update.js --apply
+// --json`. Because `scripts/` is managed core, that command is routinely run
+// from the INSTALLED copy under `~/.forge-agent/scripts/`, where `__dirname/..`
+// is the Forge home — a directory that will never hold
+// forge-source-manifest.json, since the installer does not copy it there. The
+// documented command died on a raw ENOENT naming exactly that absent file.
+// Measured on a real 4.8.0 → 4.15.0 update and reproduced on 4.15.0 itself.
+
+test('apply resolves the source repo from recorded provenance — the documented command needs no --repo', () => {
+  const data = fixture();
+  try {
+    const base = { ...data, runtime: 'claude', skipCapabilityCheck: true };
+    delete base.root; delete base.cleanup;
+    installer.install(base);
+
+    const manifestFile = path.join(data.forgeHome, 'manifest.json');
+    assert.strictEqual(JSON.parse(fs.readFileSync(manifestFile, 'utf8')).source_repo, data.repo,
+      'a instalação não registrou de qual clone ela veio — não há o que resolver depois');
+
+    // Control: the fixture only exercises provenance if the entry point really
+    // cannot render on its own.
+    assert.strictEqual(fs.existsSync(path.join(data.forgeHome, updater.SOURCE_MANIFEST)), false,
+      'controle: o Forge home não pode conter o manifesto de origem');
+
+    const fromHome = { ...base, apply: true, entryRoot: data.forgeHome };
+    delete fromHome.repo;
+    const report = updater.update(fromHome);
+    assert.strictEqual(report.source_repo.origin, 'manifest');
+    assert.strictEqual(report.source_repo.path, data.repo);
+    assert.strictEqual(report.applied, true);
+    assert(updater.render(report).includes(`source repo: ${data.repo} (manifest)`),
+      'o resumo não nomeia o clone que foi lido nem como ele foi encontrado');
+  } finally { data.cleanup(); }
+});
+
+test('without provenance and without --repo the failure names the flag, not ENOENT', () => {
+  const data = fixture();
+  try {
+    const base = { ...data, runtime: 'claude', skipCapabilityCheck: true };
+    delete base.root; delete base.cleanup;
+    installer.install(base);
+
+    // An installation made by any release before provenance was recorded.
+    const manifestFile = path.join(data.forgeHome, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    delete manifest.source_repo;
+    fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const blind = { ...base, apply: true, entryRoot: data.forgeHome };
+    delete blind.repo;
+    const before = snapshot(data.root);
+    assert.throws(() => updater.update(blind), (error) => {
+      assert.match(error.message, /--repo/, 'a mensagem não nomeia a flag que resolve o problema');
+      assert.match(error.message, /forge-source-manifest\.json/, 'a mensagem não diz o que faltou');
+      assert.doesNotMatch(error.message, /ENOENT/, 'continua sendo o ENOENT cru');
+      assert.ok(error.message.includes(data.forgeHome), 'a mensagem não diz qual caminho foi avaliado');
+      return true;
+    });
+    assert.deepStrictEqual(snapshot(data.root), before,
+      'a resolução falhou DEPOIS de escrever — ela precisa acontecer antes do installer, sem backup órfão');
+  } finally { data.cleanup(); }
+});
+
+test('precedence: an explicit --repo wins over provenance, and the entry point wins over both', () => {
+  const data = fixture();
+  try {
+    const base = { ...data, runtime: 'claude', skipCapabilityCheck: true };
+    delete base.root; delete base.cleanup;
+    installer.install(base);
+
+    const manifestFile = path.join(data.forgeHome, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    manifest.source_repo = path.join(data.root, 'clone-que-nao-existe');
+    fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    // Explicit flag: used as given, and the stale recorded value is not consulted.
+    const explicit = updater.resolveSourceRepo({ ...base, repo: data.repo });
+    assert.strictEqual(explicit.origin, 'flag');
+    assert.strictEqual(explicit.path, data.repo);
+    assert.deepStrictEqual(explicit.considered.map((item) => item.origin), ['flag'],
+      'a flag explícita não deve nem avaliar a proveniência gravada');
+
+    // No flag, and the entry point IS a clone (a developer running from the repo):
+    // it wins without reading the manifest value at all.
+    const fromRepo = { ...base, entryRoot: data.repo };
+    delete fromRepo.repo;
+    assert.strictEqual(updater.resolveSourceRepo(fromRepo).origin, 'entry');
+  } finally { data.cleanup(); }
+});
+
 process.stdout.write(`\n${passed} passed, 0 failed\n`);

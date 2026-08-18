@@ -13,7 +13,7 @@ const { VERSION } = require('./forge-version');
 const RUNTIME = 'codex';
 const ORIGIN = '<!-- forge-source:codex -->';
 const TOML_ORIGIN = '# forge-source:codex';
-const REASON = Object.freeze({ unavailable: 'unavailable', user_owned: 'user_owned', invalid_options: 'invalid_options', missing_source: 'missing_source' });
+const REASON = Object.freeze({ unavailable: 'unavailable', user_owned: 'user_owned', invalid_options: 'invalid_options', missing_source: 'missing_source', missing_manifest: 'missing_manifest' });
 
 function norm(value) { return String(value).replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
 function tomlOrigin(kind) { return `${TOML_ORIGIN}-${kind} version=${VERSION}`; }
@@ -63,7 +63,14 @@ function roots(options) {
   if (/(?:^|[\\/])\.claude(?:[\\/]|$)/i.test(codexHome)) throw Object.assign(new Error('Codex home não pode apontar para o host Claude'), { code: REASON.invalid_options });
   return { repo, forgeHome: paths.forgeHome, codexHome, projectRoot };
 }
+// Same rule as the Claude side: a missing source manifest means the repo root is
+// not a clone, so the error names `--repo` instead of surfacing a raw ENOENT for
+// a file that was never supposed to be at that path.
 function manifestFor(root, options) {
+  if (!options.manifest) {
+    const file = path.resolve(options.manifestFile || path.join(root.repo, 'forge-source-manifest.json'));
+    if (!exists(file)) throw Object.assign(new Error(`manifesto de origem ausente: ${file} — ${root.repo} não é um clone do forge-agent; informe \`--repo <dir>\``), { code: REASON.missing_manifest });
+  }
   const manifest = options.manifest || JSON.parse(fs.readFileSync(options.manifestFile || path.join(root.repo, 'forge-source-manifest.json'), 'utf8'));
   sourceManifest.audit(manifest); return manifest;
 }
