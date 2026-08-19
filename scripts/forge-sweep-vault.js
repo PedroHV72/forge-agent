@@ -155,10 +155,47 @@ function containedDestination(cwd, rootReal, id) {
   }
 }
 
+// Authorization is decided at the MEMBER-ID boundary, never at the filesystem
+// path: the id is what the trusted apply/journal flow captured, whereas a path
+// is whatever the current disk resolves to. Normalizing both sides the same way
+// (posix separators, no `./` prefix) is what makes the comparison meaningful on
+// Windows, where the caller may hand back a `\`-separated id.
+function normalizeMemberId(value) {
+  if (typeof value !== 'string') return null;
+  const posix = toPosix(value).replace(/^\.\/+/, '').replace(/\/+$/, '');
+  return posix === '' ? null : posix;
+}
+
+// A CLOSED SET, deliberately. There is no boolean that authorizes every member:
+// the whole point of the fence is that a divergent destination outside the set
+// is still refused by name while the named one is restored. `true`/`'all'` and
+// friends are not accepted -- an unrecognized policy shape yields an empty set,
+// i.e. the historical deny-by-default behavior.
+function overwriteAuthorization(options) {
+  const source = options && typeof options === 'object' ? options.overwrite : null;
+  const set = new Set();
+  const iterable = source instanceof Set ? source : (Array.isArray(source) ? source : null);
+  if (!iterable) return set;
+  for (const entry of iterable) {
+    const id = normalizeMemberId(entry);
+    if (id) set.add(id);
+  }
+  return set;
+}
+
 // Restore is intentionally non-throwing for individual members. This lets an
 // undo report every conflict and leaves a retryable vault when only one member
 // was divergent. Only a malformed/unreadable container is structural.
-function restoreVault(cwd, containerPath) {
+//
+// `options.overwrite` names the vault members the caller explicitly authorizes
+// to be restored OVER a rewritten destination. Curation rewrites fragments in
+// place, so after a real apply the destination ALWAYS differs and the historical
+// unconditional refusal made `--undo` inert on every post-apply attempt. The
+// default (two-argument call, or any member absent from the set) still refuses
+// and still preserves the divergent bytes. Authorization never bypasses
+// containment: `containedDestination` runs first, unchanged.
+function restoreVault(cwd, containerPath, options) {
+  const authorized = overwriteAuthorization(options);
   const parsed = parseVault(containerPath);
   const restored = [];
   const alreadyPresent = [];
@@ -177,8 +214,16 @@ function restoreVault(cwd, containerPath) {
       if (fs.existsSync(resolved.path)) {
         if (Buffer.compare(fs.readFileSync(resolved.path), unit.content) === 0) {
           alreadyPresent.push(resolved.path);
+        } else if (authorized.has(normalizeMemberId(unit.id))) {
+          fs.writeFileSync(resolved.path, unit.content);
+          restored.push(resolved.path);
         } else {
-          refused.push({ path: resolved.path, reason: 'destination-has-different-bytes' });
+          refused.push({
+            path: resolved.path,
+            reason: authorized.size
+              ? 'destination-not-authorized-for-overwrite'
+              : 'destination-has-different-bytes',
+          });
         }
       } else {
         fs.writeFileSync(resolved.path, unit.content);
@@ -209,5 +254,14 @@ module.exports = {
   writeVault,
   restoreVault,
   listVaults,
-  _private: { toPosix, isInside, parseVault, containedDestination, existingAncestor },
+  normalizeMemberId,
+  _private: {
+    toPosix,
+    isInside,
+    parseVault,
+    containedDestination,
+    existingAncestor,
+    normalizeMemberId,
+    overwriteAuthorization,
+  },
 };
