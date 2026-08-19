@@ -662,6 +662,19 @@ function serializeFrontmatter(fragment, eol) {
   return nl === '\n' ? out : out.replace(/\r\n?|\n/g, nl);
 }
 
+// Returns the listFragments envelope whose storage key matches and which is
+// grouped (i.e. lives inside a container), or null.  The match is on the exact
+// qualified storage key, mirroring readFragment's lookup: a bare `T01` never
+// matches a member stored as `M-…__T01`.
+//
+// A failure to list is deliberately NOT swallowed into "no member": treating an
+// unreadable store as clean is what would let a shadowing write through on the
+// one occasion the answer mattered.
+function detectGroupedMember(cwd, storageKey, opts) {
+  return listFragments(cwd, opts)
+    .find(item => item.storageKey === storageKey && item.grouped === true) || null;
+}
+
 // ── writeFragment ─────────────────────────────────────────────────────────────
 // Writes a MEMORY fragment to disk.
 // fragment shape: { unit_id, facts?: [...], stats?: [...], ...rest }
@@ -673,6 +686,17 @@ function serializeFrontmatter(fragment, eol) {
 // Byte-compares after merge — skips write if content is identical (idempotent).
 // Returns { path: string, created: boolean }
 // created: false if content is identical after merge.
+//
+// One additive return shape exists: when the unit has no loose file and its
+// canonical envelope lives inside a grouped container, the write is REFUSED by
+// name rather than performed, and the return carries
+//   { path, created: false, quarantined: true, reason: 'grouped-member',
+//     container, remedy }
+// where `path` points at the quarantine record (where the bytes actually live),
+// not at the store.  Refusing is not an error: writing the loose file would
+// shadow the grouped member on the next read, and throwing would turn a
+// successful sweep into a failed milestone on a hot path.  Consumers that do
+// not know the field ignore it, as with every other additive field here.
 function writeFragment(cwd, fragment, opts) {
   opts = opts || {};
   // Refuse before validation, lock acquisition or merge — nothing reaches disk
@@ -692,6 +716,43 @@ function writeFragment(cwd, fragment, opts) {
     throw new Error(`Invalid memory milestone ID: "${milestoneId}"`);
   }
   const fpath = fragmentPath(cwd, fragment.unit_id, { milestoneId }); // throws if invalid id
+
+  // Grouped-member refusal — before assertMemoryDirectory(create) and before
+  // the lock, so a refused write neither creates the store directory nor takes
+  // a lock nor touches a single byte under .gsd/memory/.
+  //
+  // The loose file wins whenever it exists: this mirrors grouped-survivor in
+  // forge-memory-rewrite.js — refuse only when the canonical envelope is the
+  // grouped one.  A loose file coexisting with a same-keyed container is the
+  // ordinary merge case and stays exactly as it was.
+  if (!fs.existsSync(fpath)) {
+    const storageKey = qualifiedStorageKey(fragment.unit_id, milestoneId);
+    const member = detectGroupedMember(cwd, storageKey, { milestoneId });
+    if (member) {
+      const remedy = `forge-sweep-project --undo ${member.path} → editar → reagrupar`;
+      const { quarantineFragment } = require('./forge-memory-quarantine');
+      const parked = quarantineFragment(cwd, fragment, {
+        storageKey,
+        unitId: fragment.unit_id,
+        milestoneId: milestoneId || null,
+        container: member.path,
+        reason: 'grouped-member',
+        remedy,
+      });
+      process.stderr.write(
+        `[forge-memory] recusa: unidade ${storageKey} vive no container ${member.path} — `
+        + `fato em quarentena: ${parked.path}. Remédio: ${remedy}\n`
+      );
+      return {
+        path: parked.path,
+        created: false,
+        quarantined: true,
+        reason: 'grouped-member',
+        container: member.path,
+        remedy,
+      };
+    }
+  }
 
   // mkdir -p, then resolve the directory to prevent a .gsd/memory symlink
   // from redirecting writes outside the workspace.
@@ -891,6 +952,7 @@ module.exports = {
   validateMilestoneId,
   queryRelevant,
   ASK_ID_RE,
+  _private: { detectGroupedMember },
 };
 
 // ── cliMain ───────────────────────────────────────────────────────────────────
