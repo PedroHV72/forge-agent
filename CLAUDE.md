@@ -454,6 +454,15 @@ Onde a PR 1 foi 100% aditiva, a **PR 2 é a fatia mutante** — e por isso a dif
 - **Linguagem da UI/mensagens:** Português (pt-BR)
 - **Linguagem do código/scripts:** Inglês
 - **Commits:** Conventional commits em inglês (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`)
+- **Vínculo PR → issue:** `Closes #N` **só** quando o merge da PR de fato resolve a issue — aí ela
+  fecha sozinha e ninguém precisa lembrar. `Refs #N` quando a PR **avança** a issue sem resolvê-la:
+  entregou o instrumento mas não a medição, entregou o código mas a decisão de política segue
+  aberta, fechou 4 de 6 gaps. A escolha errada custa nos dois sentidos e os dois já aconteceram
+  aqui: `Refs` numa PR que resolvia deixou a #104 aberta sobre trabalho entregue (fechada à mão
+  depois, por lembrança e não por desenho); `Closes` numa PR que só avança descartaria a issue que
+  é **dona da decisão pendente** — a #120 (política do reaper) e a #82 (veredito do
+  `writableRoots`) existem hoje só para isso. Na dúvida, `Refs` e fechar à mão: perder a issue é
+  irreversível, fechar depois não.
 - **Naming:** Prefixo `forge-` em todos os agentes, comandos e skills
 - **Instalação:** Destino `~/.claude/{agents,commands,skills}/` — sempre via `install.sh` ou `install.ps1`
 - **Agentes:** Frontmatter com `name`, `description`, `model`, `tools`
