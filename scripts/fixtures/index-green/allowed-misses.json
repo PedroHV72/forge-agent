@@ -5,37 +5,13 @@
       "mem_id": "MEM058",
       "mention": ".md",
       "item": "#107",
-      "reason": "menção da extensão .md nua, não de um arquivo — o extrator corretamente não cita"
-    },
-    {
-      "mem_id": "MEM032",
-      "mention": "forge-agent-prefs.md",
-      "item": "#107",
-      "reason": "caminho ~/.claude/... — o lookbehind de bare-path do extrator bloqueia ~/"
-    },
-    {
-      "mem_id": "MEM054",
-      "mention": ".bat",
-      "item": "#107",
-      "reason": "par de extensões (.cmd/.bat), não um arquivo concreto"
-    },
-    {
-      "mem_id": "MEM001",
-      "mention": "`expected_output:",
-      "item": "#107",
-      "reason": "token composto entre crases (`writes:`/`expected_output:`), chaves de schema, não arquivo"
-    },
-    {
-      "mem_id": "MEM022",
-      "mention": "settings.json",
-      "item": "#107",
-      "reason": "caminho ~/.claude/settings.json — o lookbehind de bare-path do extrator bloqueia ~/"
+      "reason": "menção da extensão .md nua, sem nome de arquivo. Permanentemente ambígua por FORMA: `.env` e `.tsx` têm exatamente o mesmo shape e SÃO arquivos reais, então nenhuma regra lexical separa os dois casos. #107 fechou as outras quatro entradas (~/ x2, par de extensões, lista entre crases); estas duas continuam abertas por decisão, não por falta de tentativa — a única alternativa principiada encontrada (consultar o índice de arquivos do workspace) tornaria o recall dependente do workspace e acoplaria o detector à verdade que ele deveria observar de fora."
     },
     {
       "mem_id": "MEM001",
       "mention": ".md",
       "item": "#107",
-      "reason": "menção da extensão .md nua, não de um arquivo — o extrator corretamente não cita"
+      "reason": "menção da extensão .md nua, sem nome de arquivo. Permanentemente ambígua por FORMA: `.env` e `.tsx` têm exatamente o mesmo shape e SÃO arquivos reais, então nenhuma regra lexical separa os dois casos. #107 fechou as outras quatro entradas (~/ x2, par de extensões, lista entre crases); estas duas continuam abertas por decisão, não por falta de tentativa — a única alternativa principiada encontrada (consultar o índice de arquivos do workspace) tornaria o recall dependente do workspace e acoplaria o detector à verdade que ele deveria observar de fora."
     }
   ]
 }
