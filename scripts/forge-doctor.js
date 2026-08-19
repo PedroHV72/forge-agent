@@ -8,6 +8,7 @@
 //   checkPlanRepoDeclared(cwd)  // (cwd?) → { ok, plans: string[], skipped?: string, message }  (advisory)
 //   checkWorkspaceConsistency(cwd) // (cwd?) → { ok: true, workspaces, divergentCount, skipped?, message }  (advisory, D3)
 //   checkResources(cwd, options)   // (cwd?, { platform?, poolDir? }?) → { ok: true, verdict?, pool?, census?, skipped?, message }  (advisory)
+//   checkMemoryQuarantine(cwd)     // (cwd?) → { ok: true, pending, files: string[], skipped?, message }  (advisory, S03/T03)
 //
 // CLI:
 //   node forge-doctor.js --check schema [--cwd <dir>]
@@ -16,6 +17,7 @@
 //   node forge-doctor.js --check workspace-consistency [--cwd <dir>]
 //   node forge-doctor.js --check run-overlap [--cwd <dir>]
 //   node forge-doctor.js --check resources [--cwd <dir>]
+//   node forge-doctor.js --check memory-quarantine [--cwd <dir>]
 //   node forge-doctor.js --check all [--cwd <dir>]
 //   node forge-doctor.js --fix [--cwd <dir>]
 //   node forge-doctor.js --regen-projection [--cwd <dir>]
@@ -43,7 +45,7 @@ const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 // Single source of truth for the check names this CLI accepts via `--check`.
 // `runCheck` dispatches these; the unknown-check message and `--help` text
 // must both be derived from this array — never hand-repeated.
-const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap', 'resources'];
+const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap', 'resources', 'memory-quarantine'];
 
 // ── checkSchema ───────────────────────────────────────────────────────────────
 /**
@@ -533,6 +535,73 @@ function checkResources(cwd, options) {
   }
 }
 
+// ── checkMemoryQuarantine ─────────────────────────────────────────────────────
+/**
+ * Advisory guard (S03/T03): surfaces the memory-quarantine sidecar
+ * (`forge-memory-quarantine.js`, T02) — facts refused by `writeFragment`
+ * because the target unit is already a `grouped-member` — to the doctor,
+ * counted AND named (S03-RISK warning 1: "há pendências" without a number is
+ * silence with different clothes). Wraps `listQuarantine`; this function does
+ * not implement quarantine itself, it only shapes the result the way this
+ * CLI's other checks are shaped (molde: `checkRunOverlap`).
+ *
+ * ALWAYS `ok: true` — pending quarantine entries are advisory information,
+ * never a failure. An empty or missing quarantine directory is `pending: 0`,
+ * never an error. An unreadable/corrupted entry is counted as `unreadable`,
+ * never dropped silently.
+ *
+ * @param {string} [cwd] - Working directory (default: process.cwd())
+ * @returns {{ ok: true, pending: number, files: string[], skipped?: string, message: string }}
+ */
+function checkMemoryQuarantine(cwd) {
+  const dir = cwd || process.cwd();
+
+  let entries;
+  try {
+    const { listQuarantine } = require('./forge-memory-quarantine');
+    entries = listQuarantine(dir);
+  } catch (e) {
+    return {
+      ok: true, // advisory — an internal error here still must not fail `--check all`
+      pending: 0,
+      files: [],
+      skipped: `error: ${e.message}`,
+      message: `forge-doctor: erro ao ler a quarentena de memória (${e.message}) — advisory, não bloqueia.`,
+    };
+  }
+
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return {
+      ok: true,
+      pending: 0,
+      files: [],
+      message: 'forge-doctor: quarentena de memória — 0 pendências.',
+    };
+  }
+
+  const unreadable = entries.filter((e) => e.unreadable);
+  const readable = entries.filter((e) => !e.unreadable);
+  const names = entries.map((e) => path.basename(e.path));
+
+  const lines = [
+    `forge-doctor: quarentena de memória — ${entries.length} pendência(s)`
+    + `${unreadable.length > 0 ? ` (${unreadable.length} ilegível(is))` : ''}:`,
+  ];
+  for (const e of readable) {
+    lines.push(`    - ${path.basename(e.path)} (unit=${e.unit_id || 'n/a'}, reason=${e.reason || 'n/a'})`);
+  }
+  for (const e of unreadable) {
+    lines.push(`    - ${path.basename(e.path)} (unreadable: ${e.error || 'n/a'})`);
+  }
+
+  return {
+    ok: true, // advisory — never fails `--check all`, pending count included
+    pending: entries.length,
+    files: names,
+    message: lines.join('\n'),
+  };
+}
+
 // ── module.exports ────────────────────────────────────────────────────────────
 module.exports = {
   CURRENT_SCHEMA,
@@ -544,6 +613,7 @@ module.exports = {
   checkWorkspaceConsistency,
   checkRunOverlap,
   checkResources,
+  checkMemoryQuarantine,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -609,6 +679,12 @@ function runCheck(name, cwd, options = {}) {
       // Advisory: `r.ok` is always true, so this never flips `allOk` — live
       // pressure/pool/census here must never fail `--check all`.
       if (!r.ok) allOk = false;
+    } else if (c === 'memory-quarantine') {
+      const r = checkMemoryQuarantine(cwd);
+      results.push({ check: c, ...r });
+      // Advisory: `r.ok` is always true, so this never flips `allOk` — pending
+      // quarantine entries must never fail `--check all`.
+      if (!r.ok) allOk = false;
     } else {
       process.stderr.write(`forge-doctor: unknown check "${c}". Valid: ${VALID_CHECKS.join(', ')}, all\n`);
       process.exit(2);
@@ -629,7 +705,8 @@ function formatResults(results) {
     const advisoryWarn = (r.check === 'plan-repo-declared' && Array.isArray(r.plans) && r.plans.length > 0)
       || (r.check === 'workspace-consistency' && r.divergentCount > 0)
       || (r.check === 'run-overlap' && (r.verdict === 'overlap' || r.verdict === 'inconclusive'))
-      || (r.check === 'resources' && ((r.verdict && r.verdict !== 'clean') || Boolean(r.skipped)));
+      || (r.check === 'resources' && ((r.verdict && r.verdict !== 'clean') || Boolean(r.skipped)))
+      || (r.check === 'memory-quarantine' && r.pending > 0);
     const icon = advisoryWarn ? '⚠' : (r.ok ? '✓' : '✗');
     const label = r.check === 'schema' ? 'Layer 2 — Schema version'
       : r.check === 'review-model-drift' ? 'Advisory — Review model drift'
@@ -638,6 +715,7 @@ function formatResults(results) {
       : r.check === 'workspace-consistency' ? 'Advisory — Workspace registry × marker consistency'
       : r.check === 'run-overlap' ? 'Advisory — Cross-run overlap'
       : r.check === 'resources' ? 'Advisory — Resource control'
+      : r.check === 'memory-quarantine' ? 'Advisory — Memory quarantine'
       : 'Layer 3 — Projection versioned';
     lines.push(`  ${icon} ${label}`);
     lines.push(`    ${r.message}`);

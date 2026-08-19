@@ -35,6 +35,17 @@
 // The confirmation prompt below (askForConfirmation) implements the same policy
 // at runtime: --apply and --undo require typing "sim", and --yes is the explicit
 // opt-out for non-interactive callers.
+//
+// ── Ordem operacional obrigatória (IN-15, S03/T03) ───────────────────────────
+// Toda edição de memória vem PRIMEIRO e o agrupamento por ÚLTIMO — enquanto a
+// escrita de uma unidade não alcançar membro de container, a cópia solta
+// vence a agrupada (forge-memory.js::writeFragment, regra loose-vence-
+// agrupado). Rodar este comando antes de terminar as edições da unidade
+// agrupa memória que ainda vai receber escrita, e a próxima gravação começa
+// do zero, sombreando os fatos já acumulados no container. O sinal novo:
+// escrever numa unidade já agrupada é recusado (`grouped-member`) e o fato
+// vai para a quarentena (`.gsd/memory/quarantine/`), visível e nomeado em
+// `node scripts/forge-doctor.js --check memory-quarantine`.
 
 const fs = require('fs');
 const path = require('path');
@@ -59,6 +70,13 @@ const USAGE = [
   '  --list       Lista os containers de varredura existentes (leitura pura, exclusivo com --apply/--undo)',
   '  --json       Emite o relatório no formato JSON',
   '  --help       Mostra esta ajuda',
+  '',
+  'Ordem operacional obrigatória (IN-15): toda edição de memória vem PRIMEIRO',
+  'e o agrupamento por ÚLTIMO — enquanto a escrita de uma unidade não alcançar',
+  'membro de container, a cópia solta vence a agrupada. Escrever numa unidade',
+  'já agrupada é recusado (grouped-member) e o fato vai para a quarentena',
+  '(.gsd/memory/quarantine/), visível e nomeado em',
+  '`node scripts/forge-doctor.js --check memory-quarantine`.',
   '',
   'Códigos de saída: 0 sucesso, 1 erro de execução, 2 argumentos inválidos.',
 ].join('\n');
