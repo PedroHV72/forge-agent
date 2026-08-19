@@ -168,7 +168,22 @@ function checkIndexStoreFallback(cwd, unitId) {
   } catch (e) {
     return { outcome: 'unavailable', reason: 'listing-failed', note: e.message, facts_count: 0, source: 'store' };
   }
-  const entry = fragments.find((f) => f && (f.unitId === unitId || f.storageKey === unitId));
+  // D5 precedent (S01): a local id like `S01`/`T01` is qualified by milestone
+  // in the store, so several fragments can share the same BARE unitId. Picking
+  // the first ordered match would answer for another milestone's fragment and
+  // be right only by luck. Filter, and when more than one candidate matches,
+  // REFUSE naming them — never choose one, never ok, never fail.
+  const matches = fragments.filter((f) => f && (f.unitId === unitId || f.storageKey === unitId));
+  if (matches.length > 1) {
+    const keys = matches.map((f) => f.storageKey || f.unitId).sort();
+    return {
+      outcome: 'unavailable',
+      reason: `ambiguous-unit-id: ${keys.join(', ')}`,
+      facts_count: 0,
+      source: 'store',
+    };
+  }
+  const entry = matches[0];
   if (!entry) {
     return { outcome: 'fail', reason: 'not-in-index', facts_count: 0 };
   }

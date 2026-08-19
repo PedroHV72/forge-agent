@@ -431,4 +431,29 @@ test('checkClosure: a refused (quarantined) write never surfaces as distilled ok
   });
 });
 
+// ── 18. R1 (S04 review): bare unitId collision refuses by name, never picks ──
+test('checkIndex outcome=unavailable: same bare unitId under two qualified keys refuses naming the candidates', () => {
+  withTemp((cwd) => {
+    // A local id (S01/T01) is qualified by milestone in the store, so two
+    // distinct milestones produce two fragments sharing the SAME bare unitId.
+    // Neither fact carries a file citation, so the file index misses both and
+    // the store fallback is exactly the code under test.
+    const unitId = 'S01';
+    const msA = 'M-20260101000000-fixture-a';
+    const msB = 'M-20260202000000-fixture-b';
+    memory.writeFragment(cwd, { unit_id: unitId, facts: [uncitedFact('101')] }, { milestoneId: msA });
+    memory.writeFragment(cwd, { unit_id: unitId, facts: [uncitedFact('102')] }, { milestoneId: msB });
+
+    const listed = memory.listFragments(cwd).filter((f) => f.unitId === unitId);
+    assert.strictEqual(listed.length, 2, 'fixture setup: two fragments must share the bare unitId');
+
+    const result = _private.checkIndex(cwd, unitId);
+    assert.strictEqual(result.outcome, 'unavailable', 'an ambiguous bare id must never resolve to ok by first pick');
+    assert.strictEqual(result.facts_count, 0);
+    assert.ok(/^ambiguous-unit-id: /.test(result.reason), `reason must name the ambiguity, got: ${result.reason}`);
+    assert.ok(result.reason.includes(msA + '__' + unitId), 'the refusal must name candidate A');
+    assert.ok(result.reason.includes(msB + '__' + unitId), 'the refusal must name candidate B');
+  });
+});
+
 run();
