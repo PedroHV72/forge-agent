@@ -8,6 +8,7 @@ const path = require('path');
 
 const ledger = require('./forge-ledger');
 const memory = require('./forge-memory');
+const groupedFile = require('./forge-grouped-file');
 const { checkClosure, renderClosureSection, _private } = require('./forge-wrapper-closure');
 
 let passed = 0;
@@ -56,7 +57,7 @@ function writeLedger(cwd, unitId) {
 }
 
 function writeMemory(cwd, unitId, facts) {
-  memory.writeFragment(cwd, { unit_id: unitId, facts });
+  return memory.writeFragment(cwd, { unit_id: unitId, facts });
 }
 
 // buildFileIndex only surfaces a fact in the unit axis when its text carries
@@ -95,6 +96,42 @@ function memFact(id) {
 function writeKnowledge(cwd, body) {
   fs.mkdirSync(path.join(cwd, '.gsd'), { recursive: true });
   fs.writeFileSync(path.join(cwd, '.gsd', 'KNOWLEDGE.md'), body, 'utf8');
+}
+
+// Writes a fact to the loose store, then moves it into a grouped container so
+// the unit has NO loose file left — the only shape that exercises the
+// grouped-aware read funnel (readFragmentText/parseFragment) instead of the
+// loose-file shortcut. Mirrors the real shape produced by forge-sweep-project:
+// bytes come from an actual writeFragment() call, never hand-assembled.
+function groupIntoContainer(cwd, unitId, facts, containerName) {
+  writeMemory(cwd, unitId, facts);
+  const fpath = memory.fragmentPath(cwd, unitId);
+  const content = fs.readFileSync(fpath);
+  fs.unlinkSync(fpath);
+  const storageKey = memory.qualifiedStorageKey(unitId);
+  const { buffer } = groupedFile.serializeGroup({
+    label: 'sweep-project-01',
+    dateRange: { from: '2026-08-01', to: '2026-08-15' },
+    units: [{ id: storageKey, content }],
+  });
+  const containerPath = path.join(memory.memoryDir(cwd), `${containerName}.md`);
+  fs.mkdirSync(path.dirname(containerPath), { recursive: true });
+  fs.writeFileSync(containerPath, buffer);
+  return containerPath;
+}
+
+// A fact with NO resolvable file citation — buildFileIndex only pushes a fact
+// into the unit axis when its text carries a citation that resolves under
+// cwd, so this fact is invisible to the file-index path by construction and
+// only reachable through the store fallback.
+function uncitedFact(id) {
+  return {
+    mem_id: `MEM${id}`,
+    category: 'gotcha',
+    text: 'Fixture fact with no file citation at all — store-only signal.',
+    created_at: '2026-08-15',
+    source_unit: 'fixture-unit',
+  };
 }
 
 // ── 1. Four green layers ─────────────────────────────────────────────────────
@@ -277,6 +314,121 @@ test('_private exports the per-layer helpers and knowledgeRefPatterns', () => {
   const patterns = _private.knowledgeRefPatterns('M-20260101000000-x');
   assert.ok(patterns.includes('M-20260101000000-x'));
   assert.ok(patterns.some((p) => p.includes('.gsd/milestones/M-20260101000000-x/')));
+});
+
+// ── 12. Layer 3 outcome: file-index (control — old path stays intact) ───────
+test('checkIndex outcome=file-index: cited fact preserves the old success path with source: file-index', () => {
+  withTemp((cwd) => {
+    const unitId = 'M-20260101000000-fixture-idx-fileindex';
+    writeCitedFile(cwd);
+    writeMemory(cwd, unitId, [dstFact('gggggggggggg')]);
+
+    const result = _private.checkIndex(cwd, unitId);
+    assert.strictEqual(result.outcome, 'ok');
+    assert.strictEqual(result.source, 'file-index');
+    assert.ok(result.facts_count >= 1);
+  });
+});
+
+// ── 13. Layer 3 outcome: store (citation-less fact, the new behavior) ───────
+test('checkIndex outcome=store: citation-less fact falls back to the memory store with note no-file-citations', () => {
+  withTemp((cwd) => {
+    const unitId = 'M-20260101000000-fixture-idx-store';
+    // No cited file, no DST- fact — the only signal is a plain grouped fact
+    // in the store, unreachable by the live file-index path.
+    groupIntoContainer(cwd, unitId, [uncitedFact('001')], 'sweep-project-01');
+
+    const result = _private.checkIndex(cwd, unitId);
+    assert.strictEqual(result.outcome, 'ok');
+    assert.strictEqual(result.source, 'store');
+    assert.strictEqual(result.note, 'no-file-citations');
+    assert.strictEqual(result.facts_count, 1);
+  });
+});
+
+// ── 14. Layer 3 outcome: not-in-index (absent from BOTH sources) ────────────
+test('checkIndex outcome=fail/not-in-index: unit absent from both the file-index and the store', () => {
+  withTemp((cwd) => {
+    const unitId = 'M-20260101000000-fixture-idx-absent';
+    // Nothing written for this unit at all — neither cited fact nor store fragment.
+
+    const result = _private.checkIndex(cwd, unitId);
+    assert.strictEqual(result.outcome, 'fail');
+    assert.strictEqual(result.reason, 'not-in-index');
+    assert.strictEqual(result.facts_count, 0);
+  });
+});
+
+// ── 15. Layer 3 outcome: unavailable (fallback store read fails) ────────────
+test('checkIndex outcome=unavailable: a fallback store read failure never collapses to ok', () => {
+  withTemp((cwd) => {
+    const unitId = 'M-20260101000000-fixture-idx-unavailable';
+    // A real, listable fragment exists — the index misses it (no citation),
+    // and the fallback read is then forced to throw deterministically by
+    // monkey-patching the shared, cached forge-memory export (local, always
+    // restored in finally — no dependence on OS permission behavior).
+    groupIntoContainer(cwd, unitId, [uncitedFact('002')], 'sweep-project-01');
+
+    const originalReadFragmentText = memory.readFragmentText;
+    memory.readFragmentText = () => {
+      throw new Error('forced-read-failure-for-test');
+    };
+    try {
+      const result = _private.checkIndex(cwd, unitId);
+      assert.strictEqual(result.outcome, 'unavailable');
+      assert.notStrictEqual(result.outcome, 'ok', 'a forced read failure must never present as ok');
+      assert.strictEqual(result.facts_count, 0);
+      assert.ok(typeof result.reason === 'string' && result.reason.length > 0);
+      assert.ok(typeof result.note === 'string' && result.note.includes('forced-read-failure-for-test'));
+    } finally {
+      memory.readFragmentText = originalReadFragmentText;
+    }
+  });
+});
+
+// ── 16. Layer 2 fence: Layer 3 widening never loosens Layer 2's DST- gate ───
+test('checkClosure: MEM-only unit is index.ok/source:store while distilled stays fail/not-distilled (overall not ok)', () => {
+  withTemp((cwd) => {
+    const unitId = 'M-20260101000000-fixture-fence';
+    writeLedger(cwd, unitId);
+    // Only MEM### facts, zero DST- facts, zero file citations.
+    groupIntoContainer(cwd, unitId, [uncitedFact('003'), uncitedFact('004')], 'sweep-project-01');
+
+    const result = checkClosure(cwd, unitId);
+    assert.strictEqual(result.layers.index.outcome, 'ok');
+    assert.strictEqual(result.layers.index.source, 'store');
+    assert.strictEqual(result.layers.distilled.outcome, 'fail');
+    assert.strictEqual(result.layers.distilled.reason, 'not-distilled');
+    assert.strictEqual(result.layers.distilled.dst_count, 0);
+    assert.strictEqual(result.ok, false, 'Layer 3 widening must not close the unit without a DST- fact');
+  });
+});
+
+// ── 17. S03 boundary: a quarantined write is never normalized into closure ok
+test('checkClosure: a refused (quarantined) write never surfaces as distilled ok — quarantine is not success', () => {
+  withTemp((cwd) => {
+    const unitId = 'M-20260101000000-fixture-quarantine';
+    writeLedger(cwd, unitId);
+    // The unit's canonical envelope lives inside a grouped container with
+    // only a MEM### fact — no DST-, no loose file.
+    groupIntoContainer(cwd, unitId, [uncitedFact('005')], 'sweep-project-01');
+
+    // A later attempt to merge in a DST- fact finds no loose file and a
+    // grouped member already claiming the storage key — writeFragment
+    // REFUSES the write (quarantined: true) rather than silently shadowing
+    // the grouped envelope. This is the exact S03 safety boundary: the
+    // refusal result must never be read as "the fact is now in the store".
+    const writeResult = writeMemory(cwd, unitId, [dstFact('hhhhhhhhhhhh')]);
+    assert.strictEqual(writeResult.quarantined, true, 'fixture setup: the write must actually be refused');
+
+    const result = checkClosure(cwd, unitId);
+    // The store still only contains the original MEM### fact (from the
+    // grouped container) — the quarantined DST- fact never landed there.
+    assert.strictEqual(result.layers.distilled.outcome, 'fail');
+    assert.strictEqual(result.layers.distilled.reason, 'not-distilled');
+    assert.strictEqual(result.layers.distilled.dst_count, 0);
+    assert.strictEqual(result.ok, false, 'a quarantined write must not be normalized into closure success');
+  });
 });
 
 run();
