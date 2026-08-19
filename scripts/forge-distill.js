@@ -54,15 +54,35 @@ function wrapperRoot(cwd, unitId) {
 // moments before the wrapper is deleted. Asymmetry: a refusal costs one manual look;
 // a silent wrong pick is unrecoverable.
 //   0 matches   -> no file (caller falls back to the exact name -> `absent`)
-//   1 match     -> that file
+//   1 match     -> that file, ONLY if its stem relates to the unit (see below)
 //   >1 matches  -> strong form `<unitId>-<suffix>` (any name prefixed by unitId):
 //                    exactly 1 strong -> canonical, the others are NAMED as ignored
 //                    0 or >=2 strong  -> refusal NAMING every candidate, none read
+//
+// The single-match branch used to treat CARDINALITY as provenance: being the only
+// file ending in the suffix was accepted as proof of belonging to the unit. It is
+// not. `review-fix-triage-SUMMARY.md` exists today at the root of
+// `.gsd/milestones/M-20260811134201-controle-contexto-gsd/` and only fails to bite
+// because the canonical SUMMARY coexists (2 matches). Alone in a wrapper, it would
+// have been read as THE unit summary and written into permanent memory moments
+// before the wrapper is deleted. So the stem (basename minus suffix) must be a
+// PREFIX of the unitId — which accepts the canonical name and the shortened WDMA
+// form (`M-20260811134201` is a prefix of `M-20260811134201-controle-contexto-gsd`)
+// and refuses `review-fix-triage` with a NAMED refusal (data in an exit-0 plan,
+// never a throw). Same asymmetry as above: a refusal costs one manual look.
+function relatedStem(name, suffix, unitId) {
+  if (typeof unitId !== 'string' || unitId.length === 0) return false;
+  const stem = name.slice(0, name.length - suffix.length);
+  return stem.length > 0 && unitId.startsWith(stem);
+}
 function findBySuffix(root, suffix, unitId) {
   let names;
   try { names = fs.readdirSync(root).filter(name => name.endsWith(suffix)).sort(); } catch (_) { return { file: null }; }
   if (names.length === 0) return { file: null };
-  if (names.length === 1) return { file: path.join(root, names[0]) };
+  if (names.length === 1) {
+    if (relatedStem(names[0], suffix, unitId)) return { file: path.join(root, names[0]) };
+    return { file: null, refusal: `unrelated-suffix-match: ${names[0]} (name is not a prefix form of ${unitId})` };
+  }
   const strong = names.filter(name => typeof unitId === 'string' && unitId.length > 0 && name.startsWith(unitId));
   if (strong.length === 1) {
     const ignored = names.filter(name => name !== strong[0]);

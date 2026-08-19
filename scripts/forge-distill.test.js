@@ -489,6 +489,35 @@ function wrapperFixture(bucket, id, files) {
   assert.strictEqual(plan.candidates.length, 0, 'no candidate may come from a refused ambiguity');
 }
 
+// R1 (review-fix) — the ONLY suffix match is an unrelated auxiliary summary. The
+// single-match branch used to read it as THE unit summary; cardinality is not
+// provenance. Refusal is NAMED data in an exit-0 plan, and nothing is read.
+{
+  const other = 'review-fix-triage-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, {
+    [other]: '---\nkey_decisions:\n  - "Triage leftovers"\n---\n',
+  });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert.strictEqual(plan.eligibility.ok, true, JSON.stringify(plan.eligibility));
+  assert.strictEqual(plan.candidates.some(c => c.source_file.endsWith(other)), false, 'an unrelated summary must never become a source');
+  assert.strictEqual(plan.candidates.some(c => c.text.includes('Triage leftovers')), false, JSON.stringify(plan.candidates));
+  const refusal = plan.skipped.find(s => s.reason.startsWith('unrelated-suffix-match:'));
+  assert(refusal, JSON.stringify(plan.skipped));
+  assert(refusal.reason.includes(other) && refusal.reason.includes(MS_ID), refusal.reason);
+}
+
+// R1 unit-level — the prefix rule accepts the canonical and the shortened WDMA
+// form, and refuses an unrelated stem, at the single-match branch.
+{
+  const short = 'M-20260811134201-SUMMARY.md';
+  const { root } = wrapperFixture('milestones', MS_ID, { [short]: SUMMARY_BODY });
+  assert(distill._private.findBySuffix(root, '-SUMMARY.md', MS_ID).file.endsWith(short), 'shortened WDMA form must still be accepted');
+  const bad = wrapperFixture('milestones', MS_ID, { 'review-fix-triage-SUMMARY.md': SUMMARY_BODY });
+  const refused = distill._private.findBySuffix(bad.root, '-SUMMARY.md', MS_ID);
+  assert.strictEqual(refused.file, null);
+  assert(refused.refusal.startsWith('unrelated-suffix-match:'), refused.refusal);
+}
+
 // Unit-level contract of findBySuffix, exercised directly through _private so the
 // four branches are pinned independently of the plan shape.
 {
