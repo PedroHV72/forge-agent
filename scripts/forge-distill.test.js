@@ -607,9 +607,14 @@ function kindsOf(plan, kind) { return plan.candidates.filter(c => c.source_kind 
     'scripts/forge-distill.test.js — controle por reversão',
   ]);
   assert.deepStrictEqual(kindsOf(plan, 'label:key-deliverables'), ['forge-distill exports labelledBullets']);
-  // The boundary is the point of the test: three bullets exist outside the two
-  // named labels and NONE of them may be attributed to a label.
-  for (const stray of ['este bullet pertence a outro rótulo', 'bullet de prosa que NÃO é entrega', 'Um parágrafo qualquer que não é bullet.']) {
+  // The boundary is the point of the test: no bullet outside the two named labels
+  // may be attributed to a NAMED label. (S02/T03 shipped the ANY path, so the
+  // bullet under `**Notas soltas:**` is now a candidate — under `label-any:`,
+  // never under `label:entregas`. The two strays that sit under no label at all
+  // stay out entirely.)
+  const named = plan.candidates.filter(c => String(c.source_kind).startsWith('label:')).map(c => c.text);
+  assert.strictEqual(named.includes('este bullet pertence a outro rótulo'), false, JSON.stringify(named));
+  for (const stray of ['bullet de prosa que NÃO é entrega', 'Um parágrafo qualquer que não é bullet.']) {
     assert.strictEqual(texts(plan).includes(stray), false, `${stray} must not be extracted`);
   }
 }
@@ -680,13 +685,100 @@ function kindsOf(plan, kind) { return plan.candidates.filter(c => c.source_kind 
   assert.strictEqual(plan.candidates.length, 5, JSON.stringify(texts(plan)));
 }
 
-// Scope fence — `anyLabelledBullets` (the generalisation to ANY bold label) is
-// deliberately NOT part of this task; it is gated on the measurement that follows.
-// A bullet under an unnamed bold label must therefore stay out of the plan.
+console.log('PASS: forge-distill S02/T02 (IN-03 inline, named labels, IN-06 prefix, id dedupe)');
+
+// ---------------------------------------------------------------------------
+// S02/T03 — the generalisation to ANY bold label (`anyLabelledBullets`) shipped
+// WITH containment, because the measurement fired the explosion ruler: on this
+// repo's population of 17 local units the total went 468 -> 533 raw candidates
+// (1.14x, far from the 3x clause) but TWO units crossed from under 100 verdicts
+// to over it (87 -> 113 and 93 -> 120), which is the second clause of the rule.
+// The T02 scope fence asserting the ABSENCE of `anyLabelledBullets` is therefore
+// gone: it recorded a decision that this task measured and reversed.
+// ---------------------------------------------------------------------------
+
+// The fence of T02 inverted — a bullet under an arbitrary bold label is now a
+// candidate, and it carries the `label-any:` kind so the containment (and any
+// reader) can tell the generalised path from every other source.
 {
-  assert.strictEqual('anyLabelledBullets' in distill._private, false, 'patch 5 does not belong to this task');
   const plan = summaryOnly('**Files touched (9):**\n- scripts/forge-distill.js\n');
-  assert.deepStrictEqual(texts(plan), [], JSON.stringify(texts(plan)));
+  assert.strictEqual('anyLabelledBullets' in distill._private, true, 'patch 5 shipped in T03');
+  assert.deepStrictEqual(texts(plan), ['scripts/forge-distill.js'], JSON.stringify(texts(plan)));
+  assert.deepStrictEqual(plan.candidates.map(c => c.source_kind), ['label-any:files-touched-9-']);
 }
 
-console.log('PASS: forge-distill S02/T02 (IN-03 inline, named labels, IN-06 prefix, id dedupe)');
+// The two NAMED labels are NOT extracted twice by the ANY path: `alreadyCovered`
+// excludes them by case-insensitive name, so `label:entregas` has no `label-any:`
+// twin and the id-uniqueness assertion of T02 stays green.
+{
+  const plan = summaryOnly('**Entregas:**\n- um arquivo tocado\n\n**Decisões registradas:**\n- D9: rótulo arbitrário entra\n');
+  assert.deepStrictEqual(kindsOf(plan, 'label:entregas'), ['um arquivo tocado']);
+  assert.deepStrictEqual(kindsOf(plan, 'label-any:decisões-registradas'), ['D9: rótulo arbitrário entra']);
+  assert.strictEqual(plan.candidates.filter(c => c.text === 'um arquivo tocado').length, 1, JSON.stringify(plan.candidates));
+  const ids = plan.candidates.map(c => c.id);
+  assert.strictEqual(new Set(ids).size, ids.length, `repeated id: ${JSON.stringify(ids)}`);
+  assert.strictEqual(plan.candidates_total, plan.candidates.length);
+}
+
+// Unit level — `anyLabelledBullets` stops at the next heading or the next bold
+// label and returns `{label, text}` pairs, exercised directly.
+{
+  const body = '**Files touched (9):**\n- um\n- dois\n\n**Entregas:**\n- três\n\n# Fim\n- quatro\n';
+  assert.deepStrictEqual(distill._private.anyLabelledBullets(body, ['Entregas']), [
+    { label: 'Files touched (9)', text: 'um' },
+    { label: 'Files touched (9)', text: 'dois' },
+  ]);
+  // Case-insensitive exclusion: the caller passes the NAMED list as written.
+  assert.deepStrictEqual(distill._private.anyLabelledBullets(body, ['entregas', 'files touched (9)']), []);
+}
+
+// Containment — the discard is enumerated BY NAME and reason, never a silent
+// truncation, and the identity that IN-05 demands holds exactly:
+//   len(discarded) == candidates_before_containment - candidates_total
+{
+  const CAP = distill._private.ANY_LABEL_UNIT_CAP;
+  assert.strictEqual(CAP, 100);
+  const gathered = [];
+  for (let i = 0; i < CAP; i++) gathered.push({ id: `c-fm${i}`, source_file: 'a.md', source_kind: 'frontmatter:provides', text: `fato ${i}` });
+  for (let i = 0; i < 7; i++) gathered.push({ id: `c-any${i}`, source_file: 'a.md', source_kind: 'label-any:files-touched', text: `bullet ${i}` });
+  const contained = distill._private.containAnyLabels(gathered);
+  assert.strictEqual(contained.accepted.length, CAP, 'the unit is already at the cap, so no ANY candidate is admitted');
+  assert.strictEqual(contained.discarded.length, gathered.length - contained.accepted.length, 'IN-05 identity');
+  assert.strictEqual(contained.discarded.length, 7);
+  for (const item of contained.discarded) {
+    assert.strictEqual(item.kind, 'label-any:files-touched');
+    assert.strictEqual(item.label, 'files-touched');
+    assert(item.id && item.text && item.source_file, JSON.stringify(item));
+    assert(/^any-label-cap: /.test(item.reason), item.reason);
+  }
+  // Nothing outside the ANY path is ever discarded, even far above the cap.
+  const onlyOwn = [];
+  for (let i = 0; i < CAP + 50; i++) onlyOwn.push({ id: `c-x${i}`, source_file: 'a.md', source_kind: 'frontmatter:provides', text: `fato ${i}` });
+  const wide = distill._private.containAnyLabels(onlyOwn);
+  assert.strictEqual(wide.discarded.length, 0, 'the cap rations the widened path, it does not ration what already worked');
+  assert.strictEqual(wide.accepted.length, CAP + 50);
+}
+
+// Containment is order-independent: an ANY candidate read BEFORE the unit's other
+// sources must not get in ahead of them and leave the unit above the cap anyway.
+{
+  const CAP = distill._private.ANY_LABEL_UNIT_CAP;
+  const gathered = [{ id: 'c-any-first', source_file: 'a.md', source_kind: 'label-any:files-touched', text: 'primeiro lido' }];
+  for (let i = 0; i < CAP; i++) gathered.push({ id: `c-fm${i}`, source_file: 'b.md', source_kind: 'frontmatter:provides', text: `fato ${i}` });
+  const contained = distill._private.containAnyLabels(gathered);
+  assert.strictEqual(contained.accepted.length, CAP, JSON.stringify(contained.accepted.length));
+  assert.deepStrictEqual(contained.discarded.map(d => d.id), ['c-any-first']);
+}
+
+// The plan carries the containment as ADDITIVE fields, and under the cap nothing
+// is discarded — the identity holds trivially (0 == n - n), which is the shape the
+// IN-05 demo reports with the real numbers in S02-MEASUREMENT.md.
+{
+  const plan = summaryOnly('**Files touched (9):**\n- scripts/forge-distill.js\n- scripts/forge-distill.test.js\n');
+  assert.strictEqual(plan.candidates_before_containment, 2);
+  assert.strictEqual(plan.candidates_total, 2);
+  assert.deepStrictEqual(plan.discarded, []);
+  assert.strictEqual(plan.discarded.length, plan.candidates_before_containment - plan.candidates_total);
+}
+
+console.log('PASS: forge-distill S02/T03 (ANY labels shipped with enumerated containment)');

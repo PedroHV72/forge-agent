@@ -167,6 +167,21 @@ function labelledBullets(text, label) {
   }
   return out;
 }
+// Generalisation of labelledBullets: bullets under ANY structured bold label.
+function anyLabelledBullets(text, alreadyCovered) {
+  const out = [];
+  const re = /^\*\*([^*\n]{2,60}?):\*\*\s*$/gim;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    const label = match[1].trim();
+    if (alreadyCovered.some(l => label.toLowerCase() === l.toLowerCase())) continue;
+    const tail = text.slice(match.index + match[0].length);
+    const stop = tail.search(/^(#{1,3}\s|\*\*[^*\n]+:\*\*)/m);
+    const body = stop < 0 ? tail : tail.slice(0, stop);
+    for (const bullet of body.matchAll(/^\s*[-*]\s+(.+?)\s*$/gm)) out.push({ label, text: bullet[1].trim() });
+  }
+  return out;
+}
 // Section titles the extractor recognises. The original set covered only the two
 // English labels emitted by the CURRENT generator; this repo has five generations
 // of SUMMARY and the decisions section also appears in pt-BR.
@@ -201,8 +216,56 @@ function extractSource(spec) {
     // (acumulado)`, `## Decisões-chave do milestone (acumuladas)`.
     for (const heading of [spec.kind === 'milestone-context' ? 'Decisions from Session' : 'Forward Intelligence', ...HEADINGS]) { const start = text.search(new RegExp(`^##\\s+${heading}\\b[^\\n]*$`, 'im')); if (start >= 0) { const tail = text.slice(start).replace(/^##[^\n]*\n?/i, ''); const body = tail.slice(0, tail.search(/^##\s+/m) < 0 ? undefined : tail.search(/^##\s+/m)); for (const match of body.matchAll(/^\s*[-*]\s+(.+?)\s*$/gm)) values.push({ text: match[1].trim(), kind: `section:${heading.toLowerCase().replace(/ /g, '-')}` }); } }
     for (const label of LABELS) for (const value of labelledBullets(text, label)) values.push({ text: value, kind: `label:${label.toLowerCase().replace(/ /g, '-')}` });
+    // The ANY path carries its own kind PREFIX (`label-any:`), never `label:`. The
+    // two NAMED labels keep a stable kind, and the containment below can tell the
+    // generalised path apart from every other source without guessing at slugs.
+    // The slug keeps unicode letters (`\p{L}`): the prototype's `[^\w]+` turned
+    // `Decisões registradas` into `decis-es-registradas`, while every other kind in
+    // this file preserves the accent (`section:decisões-chave`).
+    for (const item of anyLabelledBullets(text, LABELS)) values.push({ text: item.text, kind: `label-any:${item.label.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-')}` });
   }
   return values.filter(Boolean);
+}
+// Containment for the generalised bold-label path, and ONLY for it.
+//
+// Measured on this repo (S02-MEASUREMENT.md, population of 17 local units): the ANY
+// path takes the total from 468 to 533 candidates — 1.14x, far from the 3x that named
+// the ANY class explosive elsewhere — but it does lift TWO units from under 100
+// verdicts to over it (87 -> 113 and 93 -> 120). 100 is not a taste call: it is the
+// order of magnitude of the WDMA wrapper that raised the alarm (137 verdicts), and a
+// unit whose distillation demands that many judgments is not arbitrable in one pass.
+//
+// So the ANY candidates are admitted in order until the unit reaches the cap, and the
+// overflow is DISCARDED BY NAME with a reason instead of being silently truncated:
+// `discarded: [{ id, source_file, label, kind, text, reason }]`. Candidates from every
+// other source (frontmatter, sections, the two NAMED labels) are never discarded —
+// the cap contains the path that widened, it does not ration what already worked. A
+// unit already above the cap without the ANY path keeps all of its old candidates and
+// admits none of the new ones.
+const ANY_LABEL_UNIT_CAP = 100;
+function isAnyLabel(candidate) { return typeof candidate.source_kind === 'string' && candidate.source_kind.startsWith('label-any:'); }
+function containAnyLabels(gathered, cap) {
+  const limit = typeof cap === 'number' ? cap : ANY_LABEL_UNIT_CAP;
+  // Two passes, not one: everything that is not ANY is admitted FIRST, so the cap is
+  // decided against the unit's real load instead of against whatever happened to be
+  // read before it. A single interleaved pass would admit ANY bullets from the first
+  // file while the running total was still low and then leave the unit above the cap
+  // anyway — order-dependent containment, which is no containment at all.
+  const accepted = gathered.filter(candidate => !isAnyLabel(candidate));
+  const discarded = [];
+  for (const candidate of gathered) {
+    if (!isAnyLabel(candidate)) continue;
+    if (accepted.length < limit) { accepted.push(candidate); continue; }
+    discarded.push({
+      id: candidate.id,
+      source_file: candidate.source_file,
+      label: candidate.source_kind.slice('label-any:'.length),
+      kind: candidate.source_kind,
+      text: candidate.text,
+      reason: `any-label-cap: unit already holds ${accepted.length} candidates (cap ${limit})`,
+    });
+  }
+  return { accepted, discarded };
 }
 function planDistill(cwd, milestoneId) {
   const result = { milestone: milestoneId, verdict: 'INELIGIBLE', eligibility: null, files_examined: 0, candidates_total: 0, candidates: [], skipped: [], notes: [], measured_at: new Date().toISOString() };
@@ -224,7 +287,12 @@ function planDistill(cwd, milestoneId) {
     if (spec.refusal) { result.skipped.push({ file: rel(cwd, spec.file), reason: spec.refusal }); continue; }
     if (spec.note) result.notes.push({ file: rel(cwd, spec.file), note: spec.note });
     if (!fs.existsSync(spec.file)) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'absent' }); continue; } try { for (const item of extractSource(spec)) { const source = rel(cwd, spec.file); const id = 'c-' + crypto.createHash('sha1').update(`${source}\x00${item.text}`).digest('hex').slice(0, 8); if (seen.has(id)) continue; seen.add(id); gathered.push({ id, source_file: source, source_kind: item.kind, text: item.text }); } } catch (_) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'unparseable' }); } }
-  result.candidates = gathered; result.candidates_total = gathered.length; result.verdict = gathered.length ? 'ELIGIBLE-PREVIEW' : 'NO-CANDIDATES'; return result;
+  const contained = containAnyLabels(gathered, ANY_LABEL_UNIT_CAP);
+  result.candidates = contained.accepted; result.candidates_total = contained.accepted.length;
+  // Additive fields: consumers that never heard of containment read `candidates` and
+  // ignore these, exactly as they ignore any other unknown key.
+  result.discarded = contained.discarded; result.candidates_before_containment = gathered.length;
+  result.verdict = result.candidates_total ? 'ELIGIBLE-PREVIEW' : 'NO-CANDIDATES'; return result;
 }
 
 // ROADMAP: “≤ 10 linhas/milestone além da entrada do LEDGER”; one single-line fact is one rendered line.
@@ -516,5 +584,5 @@ function cliMain(argv) {
   }
 }
 
-module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, extractSource, sourceFiles, wrapperRoot, findBySuffix, labelledBullets, HEADINGS, LABELS } };
+module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, extractSource, sourceFiles, wrapperRoot, findBySuffix, labelledBullets, anyLabelledBullets, containAnyLabels, ANY_LABEL_UNIT_CAP, HEADINGS, LABELS } };
 if (require.main === module) cliMain(process.argv.slice(2));
