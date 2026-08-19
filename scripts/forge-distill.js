@@ -121,7 +121,54 @@ function sourceFiles(cwd, milestoneId) {
   }
   return files;
 }
-function arrayValues(text, key) {
+// R1 (review S02): the inline flow used to be treated as ONE value with the first
+// and last quote stripped by regex, so `key: ["first", "second"]` produced the
+// corrupted candidate `first", "second` — YAML syntax residue presented as fact
+// text, in silence. That form is alive in this repo's own generator output
+// (`provides: ["a", "b"]` in a T##-SUMMARY.md), and the WDMA population was never
+// measured for item multiplicity, so the reach is real, not hypothetical.
+//
+// Three closed cases, and nothing else is guessed:
+//   - no quote character at all -> ONE item, commas intact (the measured WDMA
+//     form `[payload whitelisted {reason, status?}]`; splitting it would cut a
+//     fact in half, and that behaviour stays pinned by test).
+//   - every item fully quoted -> N items, quote-aware (a comma inside quotes
+//     never separates, and the quotes are consumed by the parser, never by a
+//     strip-first-and-last regex).
+//   - anything else (mixed quoted/bare, unterminated quote, text outside the
+//     quotes) -> REFUSED BY NAME. The refusal is data in the exit-0 plan, never a
+//     throw; no text carrying a quote artifact is ever emitted.
+function parseInlineFlow(inner) {
+  const raw = inner.trim();
+  if (!raw) return { values: [] };
+  if (!/["']/.test(raw)) return { values: [raw] };
+  const values = [];
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i >= raw.length) return { refusal: `inline-flow-unparsed: trailing separator after item ${values.length}` };
+    const quote = raw[i];
+    if (quote !== '"' && quote !== "'") return { refusal: `inline-flow-unparsed: item ${values.length + 1} is not fully quoted` };
+    let j = i + 1;
+    let buffer = '';
+    while (j < raw.length && raw[j] !== quote) {
+      if (quote === '"' && raw[j] === '\\' && j + 1 < raw.length) { buffer += raw[j + 1]; j += 2; continue; }
+      buffer += raw[j]; j++;
+    }
+    if (j >= raw.length) return { refusal: `inline-flow-unparsed: unterminated quote at item ${values.length + 1}` };
+    values.push(buffer);
+    i = j + 1;
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i < raw.length) {
+      if (raw[i] !== ',') return { refusal: `inline-flow-unparsed: text outside quotes after item ${values.length}` };
+      i++;
+    }
+  }
+  return { values };
+}
+// `refusals` is an optional sink: named reasons travel out alongside the values so
+// the caller can put them in the plan instead of dropping them on the floor.
+function arrayValues(text, key, refusals) {
   const lines = text.split('\n'); const values = []; let active = false;
   for (const line of lines) {
     if (line.startsWith(`${key}:`)) {
@@ -129,14 +176,14 @@ function arrayValues(text, key) {
       // understood the block list (`key:` followed by `  - item`), so wrappers
       // written with `key_decisions: [...]` extracted ZERO — no error, no warning
       // (measured on the WDMA sweep: 9 task wrappers).
-      // Deliberately conservative: the bracket content becomes ONE item, with no
-      // split on commas. Real items contain commas (e.g. `payload whitelisted
-      // {reason,status?}`), and splitting would cut a fact in half — worse than
-      // losing granularity, because the halves read as two different claims.
+      // Parsing is delegated to parseInlineFlow — see the three closed cases
+      // documented above it. A bare item keeps its commas; a fully quoted flow
+      // yields N items; anything else is refused by name.
       const inline = line.slice(key.length + 1).trim();
       if (inline.startsWith('[') && inline.endsWith(']')) {
-        const inner = inline.slice(1, -1).trim();
-        if (inner) values.push(inner.replace(/^['"]|['"]$/g, ''));
+        const parsed = parseInlineFlow(inline.slice(1, -1));
+        if (parsed.refusal) { if (Array.isArray(refusals)) refusals.push(`${key}: ${parsed.refusal}`); continue; }
+        for (const value of parsed.values) values.push(value);
         continue;
       }
       active = true; continue;
@@ -204,13 +251,13 @@ const HEADINGS = [
 ];
 // Bold labels read as sections, kept NAMED (see labelledBullets).
 const LABELS = ['Entregas', 'Key Deliverables'];
-function extractSource(spec) {
+function extractSource(spec, refusals) {
   const text = readSourceText(spec.file); const values = [];
   if (spec.bounded) {
     for (const line of text.split('\n').slice(0, MAX_LINES_PER_BOUNDED_FILE)) if (VERDICT_LINE.test(line)) values.push({ text: line.trim(), kind: 'bounded:review' });
   } else {
     if (text.startsWith('---\n') && !text.includes('\n---', 4)) throw new Error('frontmatter sem fechamento');
-    for (const key of ['provides', 'key_decisions', 'patterns_established']) for (const value of arrayValues(text, key)) values.push({ text: value, kind: `frontmatter:${key}` });
+    for (const key of ['provides', 'key_decisions', 'patterns_established']) for (const value of arrayValues(text, key, refusals)) values.push({ text: value, kind: `frontmatter:${key}` });
     // PREFIX match, not equality. The repo uses suffixes that the original `\s*$`
     // could never match: `## Forward Intelligence for S03`, `## Key Decisions
     // (acumulado)`, `## Decisões-chave do milestone (acumuladas)`.
@@ -267,6 +314,28 @@ function containAnyLabels(gathered, cap) {
   }
   return { accepted, discarded };
 }
+// Display-id assignment, lifted out of planDistill so the collision branch can be
+// exercised directly: a natural 8-hex sha1 prefix collision cannot be produced on
+// demand inside a fixture, and a test that cannot reach the branch does not bite.
+// `collisions` is the same array the plan surfaces as `id_collisions`.
+function createIdAssigner() {
+  const byDisplayId = new Map();
+  const collisions = [];
+  function displayId(digest, source, text) {
+    for (const width of [8, 16, 24, 40]) {
+      const candidateId = 'c-' + digest.slice(0, width);
+      const prior = byDisplayId.get(candidateId);
+      if (prior === digest) return candidateId;
+      if (prior === undefined) {
+        if (width > 8) collisions.push({ id: candidateId, collided_with: 'c-' + digest.slice(0, 8), source_file: source, text, reason: `candidate-id-collision: the 8-hex prefix is already taken by a different (source, text) pair; this candidate is kept under a ${width}-hex id` });
+        byDisplayId.set(candidateId, digest);
+        return candidateId;
+      }
+    }
+    throw new Error('candidate-id-collision: full sha1 digest collision');
+  }
+  return { displayId, collisions };
+}
 function planDistill(cwd, milestoneId) {
   const result = { milestone: milestoneId, verdict: 'INELIGIBLE', eligibility: null, files_examined: 0, candidates_total: 0, candidates: [], skipped: [], notes: [], measured_at: new Date().toISOString() };
   if (!isValid(milestoneId)) { result.eligibility = { ok: false, reason: 'plan-error:invalid milestone id' }; return result; }
@@ -279,19 +348,36 @@ function planDistill(cwd, milestoneId) {
   // selection must carry, and contaminate any before/after measurement of the
   // extractor's reach. First occurrence wins; the extra one is dropped silently
   // because it carries no information the first does not already carry.
+  //
+  // R2 (review S02): that last sentence is true only when the two candidates are
+  // genuinely the same, so the dedupe key is the FULL sha1 digest, never the
+  // truncated 8-hex display id. Keyed on 32 bits, a prefix collision between two
+  // DIFFERENT (source, text) pairs discarded a distinct candidate in silence.
+  // Precedent in this same file: `checkCollisions` names `mem-id-collision`
+  // instead of absorbing it. A display-id collision is likewise never absorbed —
+  // BOTH candidates are kept (dropping one was the defect), the later one gets a
+  // longer deterministic id so the selection protocol keeps unique candidate_ids,
+  // and the event is reported by name in `result.id_collisions` plus a stderr
+  // warning. Surfaced rather than thrown because planDistill is a preview whose
+  // refusals are data in an exit-0 plan; a throw would destroy the whole plan.
   const seen = new Set();
+  const assigner = createIdAssigner();
+  const displayId = assigner.displayId;
+  const idCollisions = assigner.collisions;
   for (const spec of sourceFiles(cwd, milestoneId)) {
     result.files_examined++;
     // A refused suffix ambiguity is data in the exit-0 plan, never a throw: consumers
     // read a non-zero exit as "unavailable" and would move on in silence.
     if (spec.refusal) { result.skipped.push({ file: rel(cwd, spec.file), reason: spec.refusal }); continue; }
     if (spec.note) result.notes.push({ file: rel(cwd, spec.file), note: spec.note });
-    if (!fs.existsSync(spec.file)) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'absent' }); continue; } try { for (const item of extractSource(spec)) { const source = rel(cwd, spec.file); const id = 'c-' + crypto.createHash('sha1').update(`${source}\x00${item.text}`).digest('hex').slice(0, 8); if (seen.has(id)) continue; seen.add(id); gathered.push({ id, source_file: source, source_kind: item.kind, text: item.text }); } } catch (_) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'unparseable' }); } }
+    if (!fs.existsSync(spec.file)) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'absent' }); continue; } const refusals = []; try { for (const item of extractSource(spec, refusals)) { const source = rel(cwd, spec.file); const digest = crypto.createHash('sha1').update(`${source}\x00${item.text}`).digest('hex'); if (seen.has(digest)) continue; seen.add(digest); gathered.push({ id: displayId(digest, source, item.text), source_file: source, source_kind: item.kind, text: item.text }); } } catch (_) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'unparseable' }); } for (const refusal of refusals) result.skipped.push({ file: rel(cwd, spec.file), reason: refusal }); }
   const contained = containAnyLabels(gathered, ANY_LABEL_UNIT_CAP);
   result.candidates = contained.accepted; result.candidates_total = contained.accepted.length;
   // Additive fields: consumers that never heard of containment read `candidates` and
   // ignore these, exactly as they ignore any other unknown key.
   result.discarded = contained.discarded; result.candidates_before_containment = gathered.length;
+  result.id_collisions = idCollisions;
+  for (const collision of idCollisions) process.stderr.write(`forge-distill: ${collision.reason} (${collision.source_file})\n`);
   result.verdict = result.candidates_total ? 'ELIGIBLE-PREVIEW' : 'NO-CANDIDATES'; return result;
 }
 
@@ -584,5 +670,5 @@ function cliMain(argv) {
   }
 }
 
-module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, extractSource, sourceFiles, wrapperRoot, findBySuffix, labelledBullets, anyLabelledBullets, containAnyLabels, ANY_LABEL_UNIT_CAP, HEADINGS, LABELS } };
+module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, parseInlineFlow, createIdAssigner, extractSource, sourceFiles, wrapperRoot, findBySuffix, labelledBullets, anyLabelledBullets, containAnyLabels, ANY_LABEL_UNIT_CAP, HEADINGS, LABELS } };
 if (require.main === module) cliMain(process.argv.slice(2));

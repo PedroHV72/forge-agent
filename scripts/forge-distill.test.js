@@ -782,3 +782,90 @@ console.log('PASS: forge-distill S02/T02 (IN-03 inline, named labels, IN-06 pref
 }
 
 console.log('PASS: forge-distill S02/T03 (ANY labels shipped with enumerated containment)');
+
+// ---------------------------------------------------------------------------
+// review-fix/S02 — R1 (quote-aware inline flow) and R2 (dedupe on the full
+// digest). Each assertion below was verified biting by reverting the single line
+// it pins: the suite aborts at the first failed assert, so a wholesale revert
+// would prove one group and hide the rest.
+// ---------------------------------------------------------------------------
+
+// R1 — a fully quoted two-item flow is TWO candidates, and neither carries a
+// quote artifact. Before the fix this produced the single corrupted candidate
+// `first", "second` — YAML residue presented as fact text.
+{
+  const plan = summaryOnly('---\nkey_decisions: ["primeiro item", "segundo item"]\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), ['primeiro item', 'segundo item'], JSON.stringify(texts(plan)));
+  for (const text of texts(plan)) assert.strictEqual(/["']/.test(text), false, `quote artifact in candidate text: ${text}`);
+}
+
+// R1 — single-quoted single item: the quotes are consumed by the parser, not by
+// a strip-first-and-last regex, and a comma inside the quotes survives.
+{
+  const plan = summaryOnly("---\nprovides: ['um item, com vírgula']\n---\n");
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:provides'), ['um item, com vírgula'], JSON.stringify(texts(plan)));
+}
+
+// R1 — a flow that is neither a bare scalar nor fully quoted is REFUSED BY NAME:
+// zero candidates for that key, and the reason lands in the exit-0 plan. The
+// point is that nothing is emitted, not that something better is guessed.
+{
+  const plan = summaryOnly('---\nkey_decisions: [bare, "quoted"]\nprovides:\n  - "intacto"\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), [], JSON.stringify(texts(plan)));
+  const named = plan.skipped.filter(s => /inline-flow-unparsed/.test(s.reason));
+  assert.strictEqual(named.length, 1, `refusal must be named in the plan: ${JSON.stringify(plan.skipped)}`);
+  assert(/key_decisions/.test(named[0].reason), named[0].reason);
+  // The refusal is local to the offending key; the rest of the file still reads.
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:provides'), ['intacto']);
+  assert.strictEqual(plan.eligibility.ok, true);
+}
+
+// R1 unit level — the three closed cases and the three refusal shapes, pinned
+// independently of the plan.
+{
+  const parse = distill._private.parseInlineFlow;
+  assert.deepStrictEqual(parse('payload whitelisted {reason, status?}'), { values: ['payload whitelisted {reason, status?}'] });
+  assert.deepStrictEqual(parse('"a", "b, ainda a mesma", "c"'), { values: ['a', 'b, ainda a mesma', 'c'] });
+  assert.deepStrictEqual(parse('   '), { values: [] });
+  // A trailing comma is tolerated, and that is a decision, not an oversight: it
+  // drops no item and emits no artifact, so refusing it would cost a candidate
+  // for nothing. `["a", ]` is one item.
+  assert.deepStrictEqual(parse('"a", '), { values: ['a'] });
+  for (const bad of ['bare, "quoted"', '"unterminated', '"a" lixo', '"a", "b']) {
+    const out = parse(bad);
+    assert.strictEqual(out.values, undefined, `${bad} must not yield values`);
+    assert(/^inline-flow-unparsed: /.test(out.refusal), `${bad} -> ${out.refusal}`);
+  }
+}
+
+// R2 — the display id is 8 hex, but the dedupe key is the FULL digest. Two
+// DIFFERENT (source, text) pairs sharing an 8-hex prefix both survive: the second
+// is kept under a longer id and the event is named in `id_collisions`. Keyed on
+// the truncated id (the previous behaviour) the second was dropped in silence.
+{
+  const assigner = distill._private.createIdAssigner();
+  const a = 'deadbeef' + '0'.repeat(32);
+  const b = 'deadbeef' + '1'.repeat(32);
+  const idA = assigner.displayId(a, 'f.md', 'texto A');
+  const idB = assigner.displayId(b, 'f.md', 'texto B');
+  assert.strictEqual(idA, 'c-deadbeef');
+  assert.notStrictEqual(idB, idA, 'a colliding prefix must not reuse the id');
+  assert.strictEqual(idB, 'c-' + b.slice(0, 16));
+  assert.strictEqual(assigner.collisions.length, 1, JSON.stringify(assigner.collisions));
+  assert(/candidate-id-collision/.test(assigner.collisions[0].reason), assigner.collisions[0].reason);
+  assert.strictEqual(assigner.collisions[0].collided_with, idA);
+  assert.strictEqual(assigner.collisions[0].text, 'texto B');
+  // Same digest twice is the genuine duplicate: same id, nothing reported.
+  assert.strictEqual(assigner.displayId(a, 'f.md', 'texto A'), idA);
+  assert.strictEqual(assigner.collisions.length, 1);
+}
+
+// R2 — the plan always carries the field, so "no collisions" is a reported
+// outcome rather than an absent one, and real duplicates still collapse to one.
+{
+  const plan = summaryOnly('## Decisões-chave do milestone\n- D3: um bullet, uma vez só\n');
+  assert.deepStrictEqual(plan.id_collisions, []);
+  assert.strictEqual(plan.candidates.length, 1, JSON.stringify(plan.candidates));
+}
+
+console.log('PASS: forge-distill review-fix/S02 (R1 inline flow, R2 full-digest dedupe)');
