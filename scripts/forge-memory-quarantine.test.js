@@ -349,6 +349,106 @@ test('refused write takes no lock and creates no store directory when absent', (
   assert.ok(!fs.existsSync(lockDir), 'a refused write must not acquire a fragment lock');
 });
 
+
+// ── R1/R2/R3: itens concedidos do review de S03 ──────────────────────────────
+
+test('R1: um interloper que nasce ENTRE a checagem e a escrita não é sobrescrito', () => {
+  // O defeito é a janela TOCTOU: existsSync observa ausência, e o arquivo nasce
+  // antes do writeFileSync. Aqui a janela é forçada de forma determinística —
+  // o interloper é criado de dentro do próprio writeFileSync interceptado.
+  // Com `wx` o FS arbitra (EEXIST -> sufixo); sem flag, o fato é perdido.
+  const { cwd } = fixtureGrouped();
+  const original = fs.writeFileSync;
+  let armed = true;
+  const seen = [];
+  fs.writeFileSync = function patched(target, data, options) {
+    if (armed && typeof target === 'string' && target.endsWith('.json')) {
+      armed = false;
+      original(target, 'PRIMEIRO FATO', 'utf8'); // o outro processo chegou antes
+      seen.push(target);
+    }
+    return original(target, data, options);
+  };
+  let result;
+  try {
+    result = captureStderr(() => memory.writeFragment(
+      cwd, { unit_id: 'S01', facts: [fact('MEM002', 'segundo')], stats: [] }, { milestoneId: MILESTONE }
+    )).result;
+  } finally {
+    fs.writeFileSync = original;
+  }
+  assert.strictEqual(seen.length, 1, 'a janela precisa ter sido de fato forçada uma vez');
+  assert.strictEqual(
+    fs.readFileSync(seen[0], 'utf8'), 'PRIMEIRO FATO',
+    'o fato do outro processo não pode ser sobrescrito'
+  );
+  assert.notStrictEqual(result.path, seen[0], 'o perdedor da corrida tem que receber outro nome');
+  assert.strictEqual(
+    JSON.parse(fs.readFileSync(result.path, 'utf8')).fragment.facts[0].mem_id, 'MEM002',
+    'e o próprio fato tem que estar parqueado inteiro'
+  );
+  assert.strictEqual(quarantine.listQuarantine(cwd).length, 2, 'os dois fatos sobrevivem');
+});
+
+test('R1: estourar o teto de colisões falha de forma nomeada — nunca sobrescreve nem devolve sucesso', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-quarantine-cap-'));
+  const dir = quarantine.quarantineDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = '20260818T000001Z';
+  const cap = quarantine._private.MAX_COLLISION_SUFFIX;
+  assert.ok(Number.isInteger(cap) && cap > 0, 'o teto precisa ser nomeado e numérico');
+  for (let n = 1; n <= cap; n += 1) {
+    fs.writeFileSync(path.join(dir, n === 1 ? `K~${stamp}.json` : `K~${stamp}~${n}.json`), `ocupado ${n}`);
+  }
+  assert.throws(
+    () => quarantine._private.writeExclusive(dir, 'K', stamp, 'novo'),
+    /colis/,
+    'o estouro do teto tem que falhar por nome'
+  );
+  assert.strictEqual(fs.readFileSync(path.join(dir, `K~${stamp}.json`), 'utf8'), 'ocupado 1');
+});
+
+test('R2: conteúdo do arquivo não pode forjar path/unreadable', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-quarantine-forge-'));
+  const dir = quarantine.quarantineDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  const evil = path.join(dir, 'evil~20260818T000000Z.json');
+  fs.writeFileSync(evil, JSON.stringify({ path: null, unreadable: true, reason: 'x' }));
+  const [entry] = quarantine.listQuarantine(cwd);
+  assert.strictEqual(entry.path, evil, 'path é campo confiável — o arquivo não o define');
+  assert.strictEqual(entry.unreadable, false, 'unreadable é campo confiável — o arquivo não o define');
+});
+
+test('R2: registro de forma inesperada vira unreadable em vez de ser propagado', () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-quarantine-shape-'));
+  const dir = quarantine.quarantineDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'a~20260818T000000Z.json'), '[1,2,3]');
+  fs.writeFileSync(path.join(dir, 'b~20260818T000000Z.json'), '"texto"');
+  fs.writeFileSync(path.join(dir, 'c~20260818T000000Z.json'), 'null');
+  const listed = quarantine.listQuarantine(cwd);
+  assert.strictEqual(listed.length, 3);
+  assert.strictEqual(listed.filter(e => e.unreadable === true).length, 3, 'forma inesperada é ilegível, não registro válido');
+  assert.ok(listed.every(e => typeof e.path === 'string'), 'todo registro precisa de path utilizável');
+});
+
+test('R3: falha de leitura do diretório relança — só ENOENT vira lista vazia', () => {
+  const missing = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-quarantine-enoent-'));
+  assert.deepStrictEqual(quarantine.listQuarantine(missing), [], 'diretório ausente é o vazio ordinário');
+
+  // ENOTDIR: o caminho da quarentena é um arquivo comum — não é vazio, é
+  // "não consegui ler"; um falso limpo aqui é exatamente o defeito.
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-quarantine-enotdir-'));
+  const dir = quarantine.quarantineDir(cwd);
+  fs.mkdirSync(path.dirname(dir), { recursive: true });
+  fs.writeFileSync(dir, 'não sou um diretório');
+  assert.throws(
+    () => quarantine.listQuarantine(cwd),
+    error => error && error.code !== 'ENOENT',
+    'erro de leitura tem que subir, nunca virar lista vazia'
+  );
+});
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failures.length) {
   for (const { name, error } of failures) {

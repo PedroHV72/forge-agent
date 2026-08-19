@@ -194,5 +194,48 @@ test('IN-15: the operational-order rule is present in forge-sweep-project.js hea
   assert.ok(/grouped-member/.test(source) && /grouped-member/.test(help.stdout), 'both surfaces must name the refusal signal grouped-member');
 });
 
+
+// ── R2/R3 (review S03): advisory nunca quebra, e vazio nunca mente ───────────
+
+test('R2: uma entrada com {"path": null} não quebra o check advisory', () => {
+  const root = mkTmp('doctor-quarantine-forged');
+  try {
+    const dir = quarantineDirOf(root);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'forjado~20260818T000000Z.json'),
+      JSON.stringify({ path: null, unreadable: true, unit_id: 'S01' })
+    );
+    const result = checkMemoryQuarantine(root);
+    assert.strictEqual(result.ok, true, 'o check é advisory absoluto');
+    assert.strictEqual(result.pending, 1, 'a entrada forjada continua contada');
+    assert.ok(result.files.every(n => typeof n === 'string'), 'todo nome tem que ser derivável do path confiável');
+
+    // Propriedade de processo: nem o CLI pode sair não-zero por conteúdo de arquivo.
+    const r = spawnSync(process.execPath, [DOCTOR_CLI, '--check', 'memory-quarantine', '--cwd', root], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `advisory tem que sair 0, saiu ${r.status}: ${r.stderr}`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R3: quarentena ilegível vira skipped: error — nunca "0 pendências" verde', () => {
+  const root = mkTmp('doctor-quarantine-unreadable');
+  try {
+    const dir = quarantineDirOf(root);
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    fs.writeFileSync(dir, 'não sou um diretório');
+    const result = checkMemoryQuarantine(root);
+    assert.strictEqual(result.ok, true, 'segue advisory');
+    assert.ok(result.skipped && /error/.test(result.skipped), 'não conseguir ler tem que aparecer como skipped: error');
+    assert.ok(
+      !/0 pendências/.test(result.message || ''),
+      'um falso limpo é o defeito: "0 pendências" não pode sair de uma leitura que falhou'
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

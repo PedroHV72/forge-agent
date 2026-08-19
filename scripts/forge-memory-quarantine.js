@@ -51,15 +51,50 @@ function compactStamp(date) {
 // `<storageKey>~<ts>.json`, with a numeric `~2`, `~3`… suffix on collision.
 // Two refusals inside the same second must not overwrite each other: the whole
 // point of the quarantine is that no fact is lost.
-function resolveTargetPath(dir, storageKey, stamp) {
+//
+// The refusal path runs deliberately BEFORE any lock (forge-memory.js::
+// writeFragment), so nothing serializes two processes quarantining the same
+// storage key in the same second.  Therefore the name is not resolved by
+// looking (existsSync) and then writing — that gap is the whole bug — but by
+// creating the file with an exclusive-create flag and letting the filesystem
+// arbitrate: `wx` fails with EEXIST for the loser, who then tries the next
+// suffix.
+const MAX_COLLISION_SUFFIX = 1000;
+
+function candidatePath(dir, storageKey, stamp, n) {
   const base = `${storageKey}~${stamp}`;
-  let candidate = path.join(dir, `${base}.json`);
-  let n = 2;
+  return path.join(dir, n === 1 ? `${base}.json` : `${base}~${n}.json`);
+}
+
+// Kept for callers that only need the name shape (no side effect).
+function resolveTargetPath(dir, storageKey, stamp) {
+  let n = 1;
+  let candidate = candidatePath(dir, storageKey, stamp, n);
   while (fs.existsSync(candidate)) {
-    candidate = path.join(dir, `${base}~${n}.json`);
     n += 1;
+    candidate = candidatePath(dir, storageKey, stamp, n);
   }
   return candidate;
+}
+
+// Atomically creates the quarantine candidate.  Returns the path actually
+// written.  Exhausting the suffix ceiling fails by name — never overwrites, and
+// never reports success it did not achieve.
+function writeExclusive(dir, storageKey, stamp, data) {
+  for (let n = 1; n <= MAX_COLLISION_SUFFIX; n += 1) {
+    const candidate = candidatePath(dir, storageKey, stamp, n);
+    try {
+      fs.writeFileSync(candidate, data, { encoding: 'utf8', flag: 'wx' });
+      return candidate;
+    } catch (error) {
+      if (error && error.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  throw new Error(
+    `quarantineFragment: mais de ${MAX_COLLISION_SUFFIX} colisões para `
+    + `${storageKey}~${stamp} — nada foi escrito (o fato NÃO foi parqueado).`
+  );
 }
 
 // ── quarantineFragment ────────────────────────────────────────────────────────
@@ -80,7 +115,6 @@ function quarantineFragment(cwd, fragment, info) {
   fs.mkdirSync(dir, { recursive: true });
 
   const refusedAt = new Date();
-  const target = resolveTargetPath(dir, storageKey, compactStamp(refusedAt));
 
   const record = {
     refused_at: refusedAt.toISOString(),
@@ -94,15 +128,27 @@ function quarantineFragment(cwd, fragment, info) {
     fragment,
   };
 
-  fs.writeFileSync(target, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  const target = writeExclusive(
+    dir,
+    storageKey,
+    compactStamp(refusedAt),
+    `${JSON.stringify(record, null, 2)}\n`
+  );
   return { path: target };
 }
 
 // ── listQuarantine ────────────────────────────────────────────────────────────
 // Reads the quarantine directory for the doctor / operator.  A missing
-// directory is the ordinary empty case ([]).  An unreadable or unparseable
-// entry is returned as { path, unreadable: true, error } — never dropped
-// silently, because a quarantine that hides entries is worse than none.
+// directory is the ordinary empty case ([]).  Any OTHER readdir failure
+// (EACCES/EIO/ENOTDIR…) is rethrown: an empty list is an assertion that the
+// directory was read and held nothing, and a detector that reports its own
+// blindness as good news is indistinguishable from a broken one.  The caller
+// (forge-doctor's advisory check) already turns the throw into `skipped: error`.
+//
+// An unreadable or unparseable entry is returned as { path, unreadable: true,
+// error } — never dropped silently.  Trusted fields are assigned LAST, so file
+// content can never forge `path`/`unreadable`; a parsed value that is not a
+// plain object is itself reported as unreadable rather than propagated.
 function listQuarantine(cwd) {
   const dir = quarantineDir(cwd);
   let names;
@@ -110,8 +156,9 @@ function listQuarantine(cwd) {
     names = fs.readdirSync(dir, { withFileTypes: true })
       .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
       .map(entry => entry.name);
-  } catch (_) {
-    return [];
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return [];
+    throw error;
   }
   names.sort();
 
@@ -119,7 +166,14 @@ function listQuarantine(cwd) {
     const filePath = path.join(dir, name);
     try {
       const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      return { path: filePath, unreadable: false, ...parsed };
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return {
+          path: filePath,
+          unreadable: true,
+          error: `forma inesperada de registro (${Array.isArray(parsed) ? 'array' : typeof parsed})`,
+        };
+      }
+      return { ...parsed, path: filePath, unreadable: false };
     } catch (error) {
       return { path: filePath, unreadable: true, error: error.message };
     }
@@ -131,5 +185,5 @@ module.exports = {
   quarantineDir,
   quarantineFragment,
   listQuarantine,
-  _private: { compactStamp, resolveTargetPath },
+  _private: { compactStamp, resolveTargetPath, writeExclusive, MAX_COLLISION_SUFFIX },
 };
