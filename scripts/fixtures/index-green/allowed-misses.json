@@ -1,41 +1,51 @@
 {
-  "_comment": "Misses permitidos do gate índice-verde (forge-index-green.js). Lista HUMANA e versionada — adicionar uma entrada é decisão de quem abre a PR, nunca automática. Chave estável por miss: mem_id + mention (a menção normalizada que measureF2 reporta em missing_mentions[].normalized). A comparação é em duas direções: um miss fora desta lista reprova o gate, E uma entrada cuja menção deixou de falhar também reprova até ser removida — allow-list que só cresce vira gate inerte (doctor Layer 3, TASK-021). Entrada apontando para um mem_id que não existe mais no store é fantasma e reprova. Campo item é o DONO (issue/backlog id) — obrigatório.",
+  "_comment": [
+    "Misses permitidos do gate índice-verde (forge-index-green.js).",
+    "Lista HUMANA e versionada — adicionar uma entrada é decisão de quem abre a PR, nunca automática.",
+    "Chave estável por miss: storage_key + mem_id + mention — o fragmento medido que produziu o miss,",
+    "o fato dono, e a menção normalizada que measureF2 reporta em missing_mentions[].normalized.",
+    "storage_key qualifica a entrada: o MESMO mem_id pode existir em vários fragmentos (uma memória",
+    "promovida entre unidades mantém seu mem_id) — mem_id::mention sozinho concedia permissão global,",
+    "uma entrada permitida em UM fragmento mascarava o mesmo par em outro.",
+    "A comparação é em duas direções: um miss fora desta lista reprova o gate, E uma entrada cuja",
+    "menção deixou de falhar também reprova até ser removida — allow-list que só cresce vira gate",
+    "inerte (doctor Layer 3, TASK-021).",
+    "Entrada apontando para um (storage_key, mem_id) que não existe mais no store é fantasma e",
+    "reprova, mesmo que o mem_id exista em outro fragmento.",
+    "Campo item é o DONO (issue/backlog id) — obrigatório."
+  ],
+  "_migration_S06": [
+    "Migrado em S06 (M-20260818225600): a lista anterior media contra mem_id::mention, sem storage_key.",
+    "As seis entradas antigas (MEM058/.md, MEM032/forge-agent-prefs.md, MEM054/.bat,",
+    "MEM001/`expected_output:, MEM022/settings.json, MEM001/.md) foram todas medidas obsoletas contra",
+    "o F2 pós-S05 deste repo — quatro fantasmas (mem_id não existe mais no store) e duas curadas",
+    "(mem_id vivo, a menção específica não falha mais) — e removidas.",
+    "As três entradas abaixo foram adicionadas a partir da medição direta do store deste repo pós-S05",
+    "(nenhum valor inventado): `node scripts/forge-index-f2.js --cwd . --json`, inspecionando",
+    "facts_missed_total/facts_missed_partial por mem_id e lendo o storage_key carregado por",
+    "classifyFact para cada fato correspondente."
+  ],
   "allowed": [
     {
-      "mem_id": "MEM058",
-      "mention": ".md",
-      "item": "#107",
-      "reason": "menção da extensão .md nua, não de um arquivo — o extrator corretamente não cita"
-    },
-    {
-      "mem_id": "MEM032",
-      "mention": "forge-agent-prefs.md",
-      "item": "#107",
-      "reason": "caminho ~/.claude/... — o lookbehind de bare-path do extrator bloqueia ~/"
-    },
-    {
-      "mem_id": "MEM054",
-      "mention": ".bat",
-      "item": "#107",
-      "reason": "par de extensões (.cmd/.bat), não um arquivo concreto"
-    },
-    {
+      "storage_key": "M-20260813131121-varredura-classe-eol__T03",
       "mem_id": "MEM001",
-      "mention": "`expected_output:",
+      "mention": ".swift",
       "item": "#107",
-      "reason": "token composto entre crases (`writes:`/`expected_output:`), chaves de schema, não arquivo"
+      "reason": "menção da extensão .swift nua (não de um arquivo concreto) — o extrator corretamente não cita"
     },
     {
-      "mem_id": "MEM022",
-      "mention": "settings.json",
+      "storage_key": "T-20260717151823-corrigir-bug-1-stub",
+      "mem_id": "MEM003",
+      "mention": ".tsx",
       "item": "#107",
-      "reason": "caminho ~/.claude/settings.json — o lookbehind de bare-path do extrator bloqueia ~/"
+      "reason": "par de extensões nuas (.jsx/.tsx), não um arquivo concreto — o extrator corretamente não cita"
     },
     {
-      "mem_id": "MEM001",
-      "mention": ".md",
+      "storage_key": "M-20260813131121-varredura-classe-eol__T01",
+      "mem_id": "MEM005",
+      "mention": ".swift",
       "item": "#107",
-      "reason": "menção da extensão .md nua, não de um arquivo — o extrator corretamente não cita"
+      "reason": "menção da extensão .swift nua (contagem de suítes), não de um arquivo concreto — o extrator corretamente não cita"
     }
   ]
 }
