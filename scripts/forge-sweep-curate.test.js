@@ -430,6 +430,58 @@ function testUndoRefusesDivergentMemberOutsideAuthorization() {
   } finally { removeDir(dir); }
 }
 
+// R1 (S07 review, conceded): a PARTIAL apply must authorize only the members
+// whose rewrite could have changed bytes. Here the first member is really
+// rewritten and the second is refused by the write boundary WITHOUT throwing
+// (`rewrite-failed`, one of the two real per-member skip paths) — a refusal
+// that always returns before the atomic write, so those bytes stay untouched.
+// The untouched file then receives a legitimate later edit (these are
+// forge-memory's live write target). Undo must restore the rewritten member and
+// REFUSE the untouched one BY NAME, preserving the edited bytes. With the fix
+// reverted (authorizing vault.members up front) the edit is silently clobbered
+// and counted in `restored`.
+function testPartialApplyAuthorizesOnlyRewrittenMembers() {
+  const dir = realStoreDir();
+  try {
+    writeRealFragment(dir, 'T01', ['MEM001', 'MEM002']);
+    const rewritten = writeRealFragment(dir, 'T02', ['MEM003', 'MEM004']);
+    const untouched = writeRealFragment(dir, 'T03', ['MEM005', 'MEM006']);
+    const rewrittenBefore = fs.readFileSync(rewritten);
+    const untouchedBefore = fs.readFileSync(untouched);
+
+    const clusters = [cluster('c', [item('T01', 'MEM001'), item('T02', 'MEM003'), item('T03', 'MEM005')])];
+    const doc = arbitration('c', [verdict('T01', 'MEM001', 'manter'), verdict('T02', 'MEM003', 'fundir-no-sobrevivente'), verdict('T03', 'MEM005', 'fundir-no-sobrevivente')]);
+    const ctx = realApplyContext(dir, clusters, doc);
+    const realRewrite = require('./forge-memory-rewrite').rewriteFragment;
+    ctx.rewriteFragment = (cwd, request) => (request.storageKey === 'T03'
+      ? { ok: false, path: untouched, reason: 'would-empty-fragment' }
+      : realRewrite(cwd, request));
+    const result = internals.applyCurate(ctx, internals.curatePlan(ctx));
+
+    assert.strictEqual(result.error, undefined, JSON.stringify(result.skipped));
+    assert.deepStrictEqual(result.written, [rewritten]);
+    assert(result.skipped.some(entry => entry.reason === 'would-empty-fragment'), JSON.stringify(result.skipped));
+    assert(!fs.readFileSync(rewritten).equals(rewrittenBefore), 'o primeiro membro precisa mesmo ter sido reescrito');
+    assert.strictEqual(Buffer.compare(fs.readFileSync(untouched), untouchedBefore), 0, 'o membro recusado não pode ter sido tocado pelo apply');
+    assert(result.authorized.some(id => id.endsWith('memory/T02.md')), 'o membro reescrito é autorizado');
+    assert(!result.authorized.some(id => id.endsWith('memory/T03.md')), `o membro nunca reescrito não pode ficar autorizado: ${JSON.stringify(result.authorized)}`);
+
+    // A legitimate later edit to the member the apply never rewrote.
+    fs.appendFileSync(untouched, 'edição legítima posterior\n');
+    const untouchedAfterEdit = fs.readFileSync(untouched);
+
+    const undo = runCli(dir, ['--undo', '--yes', '--json']);
+    assert.strictEqual(undo.status, 1, `a recusa do membro pulado precisa sair diferente de zero: ${JSON.stringify(undo.payload)}`);
+    const errors = undo.payload.undo.errors;
+    assert.strictEqual(errors.length, 1, JSON.stringify(errors));
+    assert(errors[0].includes('T03.md'), `a recusa precisa nomear o membro pulado: ${errors[0]}`);
+    assert(errors[0].includes('destination-not-authorized-for-overwrite'), errors[0]);
+    assert.strictEqual(Buffer.compare(fs.readFileSync(untouched), untouchedAfterEdit), 0, 'a edição legítima no membro pulado nunca é atropelada');
+    assert(!undo.payload.undo.restored.some(entry => String(entry).includes('T03.md')), 'o membro pulado não pode ser contado como restaurado');
+    assert.strictEqual(Buffer.compare(fs.readFileSync(rewritten), rewrittenBefore), 0, 'o membro efetivamente reescrito volta aos bytes pré-apply');
+  } finally { removeDir(dir); }
+}
+
 // Deny-by-default survives every degradation of the record: absent, malformed,
 // written by another operation, or naming a different container. None of these
 // is a boolean that opens the whole vault.
@@ -472,7 +524,7 @@ function testAuthorizationFailureIsZeroMutation() {
 }
 
 function main() {
-  const tests = [testRealApplyThenCliUndoRestoresExactBytes, testUndoRefusesDivergentMemberOutsideAuthorization, testAuthorizationRecordIsClosedAndDenyByDefault, testAuthorizationFailureIsZeroMutation,
+  const tests = [testPartialApplyAuthorizesOnlyRewrittenMembers, testRealApplyThenCliUndoRestoresExactBytes, testUndoRefusesDivergentMemberOutsideAuthorization, testAuthorizationRecordIsClosedAndDenyByDefault, testAuthorizationFailureIsZeroMutation,
     testEligibilityFilteredClusterSkipsWithoutAborting, testWriteBoundaryConsultsEligibleSetOnly, testRegistry, testClosedVerdicts, testExactlyOneSurvivor, testUnknownItem, testUnjudgedItems, testUnknownCluster, testCompoundAddress, testFingerprintStableAndSensitive, testPlanChangedZeroMutation, testIntentFailureZeroMutation, testRewriteIsolation, testActivePhaseFailClosed, testArgumentCodes, testNoSecondWriterOrContainers, testDefaultIsDryRun, testCliDefaultLeavesDigestUntouched, testParseConflicts, testClusterMustBeJudged, testDuplicateAddressRejected, testNoTargetsNoVault, testDropsGroupedByStorage, testPhaseBlocked];
   for (const test of tests) test();
   process.stdout.write(`forge-sweep-curate: ${tests.length} tests passed\n`);

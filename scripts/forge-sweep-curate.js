@@ -63,8 +63,22 @@ const USAGE = 'Uso: node scripts/forge-sweep-curate.js [--cwd <dir>] [--arbitrat
  *    nothing at all — the historical deny-by-default.  The record is a
  *    curate-owned sidecar rather than a journal field because the journal is
  *    pointer-only by design (S08 § W3) and its reader carries named fields
- *    only; the sidecar is written BEFORE the first rewrite so an interrupted
+ *    only; the sidecar is opened BEFORE the first rewrite so an interrupted
  *    apply still leaves an undoable authorization.
+ * 10b. That record names only the members whose rewrite MAY HAVE CHANGED BYTES.
+ *    It grows ONE MEMBER AT A TIME, each appended immediately before its own
+ *    rewrite is attempted (so a crash mid-rewrite is still undoable — the
+ *    crash-safety the pre-loop write existed to give, with no window), and the
+ *    member is WITHDRAWN again when the boundary refuses without throwing:
+ *    every `refusal()` in forge-memory-rewrite returns before the atomic write,
+ *    so the destination still holds its pre-apply bytes.  A member skipped by
+ *    OFF_SET_REASON is never named at all.  Authorizing an untouched member
+ *    buys nothing — unrewritten, it restores as `alreadyPresent` and needs no
+ *    authorization — and only removes the fence that would otherwise refuse to
+ *    clobber a legitimate LATER edit to it.  These are live `.gsd/memory/*.md`,
+ *    forge-memory's own write target after every unit, so an interim edit is
+ *    the normal flow (S07 R1; S08: "undo devolve bytes pré-apply, o problema é
+ *    atropelar a edição").
  *
  * These rules are kept near the imports because adding a convenient local
  * serializer, a group container, or a fall-through safety gate would defeat
@@ -256,10 +270,20 @@ function selectedDrops(doc, eligible) {
   return byStorage;
 }
 
+// The ordered write population: every storage key whose fragment path the
+// eligible set resolves, carrying both halves so the vault member id produced
+// for a file can be attributed back to the storage key that will be rewritten.
+function dropTargets(cwd, drops, eligible) {
+  return [...drops.keys()]
+    .map(storageKey => ({ storageKey, file: eligible.byStorage.get(storageKey) }))
+    .filter(entry => Boolean(entry.file))
+    .map(entry => ({ storageKey: entry.storageKey, file: path.resolve(cwd, entry.file) }));
+}
+
 function filesForDrops(cwd, drops, eligible) {
   // rewriteFragment owns storage-key lookup; use the eligible member addresses
   // only for vault file paths, never serialize fragments here.
-  return [...drops.keys()].map(key => eligible.byStorage.get(key)).filter(Boolean).map(file => path.resolve(cwd, file));
+  return dropTargets(cwd, drops, eligible).map(entry => entry.file);
 }
 
 const AUTH_DIR = path.join('.gsd', 'forge', 'sweep-curate-auth');
@@ -306,7 +330,8 @@ function applyCurate(ctx, plan) {
   const eligible = eligibleSet(plan);
   const filteredOut = filteredOutClusters(arbitration, eligible);
   const drops = selectedDrops(arbitration, eligible);
-  const files = filesForDrops(ctx.cwd, drops, eligible);
+  const targets = dropTargets(ctx.cwd, drops, eligible);
+  const files = targets.map(entry => entry.file);
   if (!files.length) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut) };
   let vault;
   try { vault = (ctx.writeVault || writeVault)(ctx.cwd, { operation: OPERATION, files }); }
@@ -314,17 +339,40 @@ function applyCurate(ctx, plan) {
   if (!vault || vault.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, (vault && vault.skipped) || [{ path: '.gsd/forge/sweep-vault', reason: 'vault-failed' }]), error: 'vault-failed' };
   const intent = (ctx.journal || journal).appendIntent(ctx.cwd, { operation: OPERATION, containers: [vault.containerPath] });
   if (!intent || intent.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, [{ path: vault.containerPath, reason: `journal-intent-failed: ${(intent && intent.error) || 'indisponível'}` }]), error: 'journal-intent-failed' };
-  // Before the first rewrite, for the same reason appendIntent is: an apply
-  // interrupted mid-loop must still be undoable, and undo needs the named set.
-  const authorization = (ctx.writeAuthorization || writeAuthorization)(ctx.cwd, vault.containerPath, vault.members);
+  // Opened before the first rewrite, for the same reason appendIntent is: an
+  // apply interrupted mid-loop must still be undoable. It starts EMPTY and is
+  // grown one member at a time below (§ 10b) — a member the loop never rewrites
+  // must never be authorized to overwrite a later legitimate edit.
+  const writeAuth = ctx.writeAuthorization || writeAuthorization;
+  const authorized = [];
+  let authorization = writeAuth(ctx.cwd, vault.containerPath, authorized);
   if (!authorization || authorization.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, [{ path: vault.containerPath, reason: `${AUTH_MISSING}: ${(authorization && authorization.error) || 'indisponível'}` }]), error: AUTH_MISSING };
+  const memberIds = new Map(targets.map((entry, index) => [entry.storageKey, (vault.members || [])[index]]));
   const written = []; const skipped = (fresh.skipped || []).concat(filteredOut);
   for (const [storageKey, dropMemIds] of drops) {
     // Last structural gate: an address absent from the eligible set never
     // reaches the write boundary, whatever produced `drops`.
     if (!eligible.byStorage.has(storageKey)) { skipped.push({ path: storageKey, reason: OFF_SET_REASON }); continue; }
+    // Authorize THIS member, and only it, before its rewrite can start. If the
+    // record cannot be grown, the rewrite does not happen: an unrecorded
+    // rewrite is exactly the un-undoable apply the pre-loop write forbids.
+    const candidate = authorized.concat([memberIds.get(storageKey)].filter(Boolean));
+    const grown = writeAuth(ctx.cwd, vault.containerPath, candidate);
+    if (!grown || grown.ok !== true) { skipped.push({ path: storageKey, reason: `${AUTH_MISSING}: ${(grown && grown.error) || 'indisponível'}` }); continue; }
+    authorization = grown; authorized.length = 0; authorized.push(...candidate);
     const result = (ctx.rewriteFragment || rewriteFragment)(ctx.cwd, { storageKey, dropMemIds });
-    if (result && result.ok) written.push(result.path); else skipped.push({ path: (result && result.path) || storageKey, reason: (result && result.reason) || 'rewrite-failed' });
+    if (result && result.ok) { written.push(result.path); continue; }
+    skipped.push({ path: (result && result.path) || storageKey, reason: (result && result.reason) || 'rewrite-failed' });
+    // A NON-THROWING refusal is the write boundary's own statement that it
+    // returned before touching the destination (every `refusal()` in
+    // forge-memory-rewrite precedes the atomic write). Those bytes are still
+    // the pre-apply bytes, so the member restores as `alreadyPresent` and
+    // needs no authorization — withdrawing it is pure protection. A THROW is
+    // deliberately NOT withdrawn: the rewrite may have landed.
+    const withdrawn = authorized.slice(0, -1);
+    const shrunk = writeAuth(ctx.cwd, vault.containerPath, withdrawn);
+    if (!shrunk || shrunk.ok !== true) { skipped.push({ path: vault.containerPath, reason: `authorization-withdraw-failed: ${(shrunk && shrunk.error) || 'indisponível'}` }); continue; }
+    authorization = shrunk; authorized.length = 0; authorized.push(...withdrawn);
   }
   const outcome = (ctx.journal || journal).appendOutcome(ctx.cwd, { id: intent.id, phase: 'apply-done', written: [vault.containerPath] });
   if (!outcome || outcome.ok !== true) skipped.push({ path: vault.containerPath, reason: `journal-outcome-failed: ${(outcome && outcome.error) || 'indisponível'}` });
@@ -372,5 +420,5 @@ async function main(argv) {
   } catch (error) { process.stderr.write(`${OPERATION}: ${error.reason || error.message}\n`); return error.exitCode || 1; }
 }
 
-module.exports = { buildRegistry, validateArbitrationShape, planFingerprint, main, _private: { OPERATION, parseArgs, resolveCwd, loadArbitration, validateArbitrationAgainstPlan, curatePlan, applyCurate, selectedDrops, filesForDrops, eligibleSet, filteredOutClusters, rawPlan, runUndo, FILTERED_REASON, OFF_SET_REASON, AUTH_MISSING, AUTH_DIR, authorizationPath, writeAuthorization, authorizedMembers } };
+module.exports = { buildRegistry, validateArbitrationShape, planFingerprint, main, _private: { OPERATION, parseArgs, resolveCwd, loadArbitration, validateArbitrationAgainstPlan, curatePlan, applyCurate, selectedDrops, filesForDrops, dropTargets, eligibleSet, filteredOutClusters, rawPlan, runUndo, FILTERED_REASON, OFF_SET_REASON, AUTH_MISSING, AUTH_DIR, authorizationPath, writeAuthorization, authorizedMembers } };
 if (require.main === module) main(process.argv.slice(2)).then(code => { process.exitCode = code; }).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
