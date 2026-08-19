@@ -530,3 +530,163 @@ function wrapperFixture(bucket, id, files) {
 }
 
 console.log('PASS: forge-distill S01/T02 (IN-01 wrapper root, IN-02 D5 suffix rule)');
+
+// ---------------------------------------------------------------------------
+// S02/T02 — closed-scope widening of the extractor: inline `key: [...]` (IN-03),
+// bullets under the two NAMED bold labels, the pt-BR / suffixed section titles
+// matched by PREFIX (IN-06), and id uniqueness in `plan.candidates`. Every case
+// below extracted ZERO (or duplicated) before this task; each is a positive
+// control by reversion, recorded in T02-SUMMARY.
+// ---------------------------------------------------------------------------
+
+// One SUMMARY file in a milestone wrapper, nothing else: the CONTEXT is `absent`
+// and there are no slices, so `plan.candidates` is exactly what the SUMMARY body
+// yields. That exactness is what lets the counts below be assertions instead of
+// "at least one".
+function summaryOnly(body) {
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [`${MS_ID}-SUMMARY.md`]: body });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert.strictEqual(plan.eligibility.ok, true, JSON.stringify(plan.eligibility));
+  return plan;
+}
+function texts(plan) { return plan.candidates.map(c => c.text); }
+function kindsOf(plan, kind) { return plan.candidates.filter(c => c.source_kind === kind).map(c => c.text); }
+
+// IN-03 — inline YAML. The bracket content is ONE item and the comma inside the
+// item survives byte for byte; splitting on it would cut the fact in half.
+{
+  const INLINE = 'payload whitelisted {reason, status?} antes do write';
+  const plan = summaryOnly(`---\nkey_decisions: [${INLINE}]\n---\n`);
+  const hits = plan.candidates.filter(c => c.source_kind === 'frontmatter:key_decisions');
+  assert.strictEqual(hits.length, 1, `inline form must yield exactly one candidate: ${JSON.stringify(texts(plan))}`);
+  assert.strictEqual(hits[0].text, INLINE, hits[0].text);
+  assert(hits[0].text.includes(', status?}'), 'the comma inside the item must survive');
+}
+
+// IN-03 negative control — the BLOCK form keeps extracting one candidate per
+// item, unchanged. The inline branch must not swallow the list it did not touch.
+{
+  const plan = summaryOnly('---\nkey_decisions:\n  - "Primeiro, com vírgula"\n  - "Segundo"\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), ['Primeiro, com vírgula', 'Segundo']);
+}
+
+// IN-03 edge — an empty inline list yields no candidate and does not fall through
+// to the block branch (which would then eat unrelated indented lines below it).
+{
+  const plan = summaryOnly('---\nkey_decisions: []\nprovides:\n  - "Um extrator testável"\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), []);
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:provides'), ['Um extrator testável']);
+}
+
+// Patch 4 — the two NAMED bold labels are read, each under its own stable kind.
+// The capture stops at the next heading or the next bold label, so the prose and
+// the bullets that follow the section never enter as deliveries.
+{
+  const plan = summaryOnly([
+    '# Resumo',
+    '',
+    '**Entregas:**',
+    '- scripts/forge-distill.js — ramo inline do YAML',
+    '- scripts/forge-distill.test.js — controle por reversão',
+    '',
+    '**Notas soltas:**',
+    '- este bullet pertence a outro rótulo',
+    '',
+    '## Prosa',
+    '',
+    'Um parágrafo qualquer que não é bullet.',
+    '',
+    '- bullet de prosa que NÃO é entrega',
+    '',
+    '**Key Deliverables:**',
+    '- forge-distill exports labelledBullets',
+    '',
+  ].join('\n'));
+  assert.deepStrictEqual(kindsOf(plan, 'label:entregas'), [
+    'scripts/forge-distill.js — ramo inline do YAML',
+    'scripts/forge-distill.test.js — controle por reversão',
+  ]);
+  assert.deepStrictEqual(kindsOf(plan, 'label:key-deliverables'), ['forge-distill exports labelledBullets']);
+  // The boundary is the point of the test: three bullets exist outside the two
+  // named labels and NONE of them may be attributed to a label.
+  for (const stray of ['este bullet pertence a outro rótulo', 'bullet de prosa que NÃO é entrega', 'Um parágrafo qualquer que não é bullet.']) {
+    assert.strictEqual(texts(plan).includes(stray), false, `${stray} must not be extracted`);
+  }
+}
+
+// Patch 4 unit level — `labelledBullets` returns plain strings and stops at the
+// next bold label, exercised directly so the boundary is pinned independently of
+// the plan shape.
+{
+  const body = '**Entregas:**\n- um\n- dois\n\n**Outro:**\n- três\n';
+  assert.deepStrictEqual(distill._private.labelledBullets(body, 'Entregas'), ['um', 'dois']);
+  assert.deepStrictEqual(distill._private.labelledBullets(body, 'Key Deliverables'), []);
+}
+
+// IN-06 — pt-BR and suffixed titles match by PREFIX. Both headings below carry a
+// parenthetical suffix that the previous `\s*$` anchor could never match, so both
+// sections extracted zero.
+{
+  const plan = summaryOnly([
+    '## Decisões-chave do milestone (acumuladas)',
+    '- D1: o extrator amplia, a arbitragem filtra',
+    '',
+    '## Key Decisions (acumulado)',
+    '- D2: candidato não é fato',
+    '',
+  ].join('\n'));
+  assert(texts(plan).includes('D1: o extrator amplia, a arbitragem filtra'), JSON.stringify(texts(plan)));
+  assert(texts(plan).includes('D2: candidato não é fato'), JSON.stringify(texts(plan)));
+  assert.strictEqual(plan.candidates.length, 2, JSON.stringify(plan.candidates));
+}
+
+// IN-06 / anti-duplication — `## Decisões-chave do milestone` is matched by TWO
+// entries of HEADINGS (the full title and the `Decisões-chave` prefix), so the
+// same section is extracted twice with different kinds. The candidate id is
+// sha1(source \x00 text) WITHOUT the kind, so both copies carry the same id.
+// Uniqueness is the assertion; which of the two kinds survives is not.
+{
+  const plan = summaryOnly('## Decisões-chave do milestone\n- D3: um bullet, uma vez só\n');
+  assert.strictEqual(plan.candidates.length, 1, `duplicate section extraction must be deduped: ${JSON.stringify(plan.candidates)}`);
+  assert.strictEqual(plan.candidates[0].text, 'D3: um bullet, uma vez só');
+  assert.strictEqual(plan.candidates_total, 1, 'candidates_total must not double-count');
+  const ids = plan.candidates.map(c => c.id);
+  assert.strictEqual(new Set(ids).size, ids.length, 'ids must be unique');
+}
+
+// Anti-duplication, wider — a wrapper mixing every widened path at once still
+// carries no repeated id, and the reported total equals the array length.
+{
+  const plan = summaryOnly([
+    '---',
+    'key_decisions: [inline com, vírgula]',
+    'provides:',
+    '  - "Um extrator ampliado"',
+    '---',
+    '',
+    '## Decisões-chave do milestone (acumuladas)',
+    '- D4: dedupe por id',
+    '',
+    '## Decisões travadas',
+    '- D5: patch 5 não embarca aqui',
+    '',
+    '**Entregas:**',
+    '- um arquivo tocado',
+    '',
+  ].join('\n'));
+  const ids = plan.candidates.map(c => c.id);
+  assert.strictEqual(new Set(ids).size, ids.length, `repeated id: ${JSON.stringify(ids)}`);
+  assert.strictEqual(plan.candidates_total, plan.candidates.length);
+  assert.strictEqual(plan.candidates.length, 5, JSON.stringify(texts(plan)));
+}
+
+// Scope fence — `anyLabelledBullets` (the generalisation to ANY bold label) is
+// deliberately NOT part of this task; it is gated on the measurement that follows.
+// A bullet under an unnamed bold label must therefore stay out of the plan.
+{
+  assert.strictEqual('anyLabelledBullets' in distill._private, false, 'patch 5 does not belong to this task');
+  const plan = summaryOnly('**Files touched (9):**\n- scripts/forge-distill.js\n');
+  assert.deepStrictEqual(texts(plan), [], JSON.stringify(texts(plan)));
+}
+
+console.log('PASS: forge-distill S02/T02 (IN-03 inline, named labels, IN-06 prefix, id dedupe)');

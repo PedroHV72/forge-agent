@@ -123,9 +123,72 @@ function sourceFiles(cwd, milestoneId) {
 }
 function arrayValues(text, key) {
   const lines = text.split('\n'); const values = []; let active = false;
-  for (const line of lines) { if (line.startsWith(`${key}:`)) { active = true; continue; } if (active && line.match(/^\s+-\s+/)) { const value = line.replace(/^\s+-\s+/, '').trim().replace(/^['"]|['"]$/g, ''); values.push(value); continue; } if (active && line.trim() && !line.match(/^\s/)) active = false; }
+  for (const line of lines) {
+    if (line.startsWith(`${key}:`)) {
+      // INLINE YAML form: `key: [content]` on the same line. The original only
+      // understood the block list (`key:` followed by `  - item`), so wrappers
+      // written with `key_decisions: [...]` extracted ZERO — no error, no warning
+      // (measured on the WDMA sweep: 9 task wrappers).
+      // Deliberately conservative: the bracket content becomes ONE item, with no
+      // split on commas. Real items contain commas (e.g. `payload whitelisted
+      // {reason,status?}`), and splitting would cut a fact in half — worse than
+      // losing granularity, because the halves read as two different claims.
+      const inline = line.slice(key.length + 1).trim();
+      if (inline.startsWith('[') && inline.endsWith(']')) {
+        const inner = inline.slice(1, -1).trim();
+        if (inner) values.push(inner.replace(/^['"]|['"]$/g, ''));
+        continue;
+      }
+      active = true; continue;
+    }
+    if (active && line.match(/^\s+-\s+/)) { const value = line.replace(/^\s+-\s+/, '').trim().replace(/^['"]|['"]$/g, ''); values.push(value); continue; }
+    if (active && line.trim() && !line.match(/^\s/)) active = false;
+  }
   return values;
 }
+// Bullets under a bold label (`**Entregas:**`, `**Key Deliverables:**`). Measured
+// on the WDMA sweep: the SUMMARY files without frontmatter — the ones the original
+// extractor classified as "no recognised source" — are precisely the richest; one
+// of them holds 18 delivery bullets, each naming the file touched and what changed.
+// The capture stops at the first heading or at the next bold label, so it never
+// drags the prose that follows the section.
+//
+// Scope fence: only the NAMED labels below are read here. Generalising to ANY bold
+// label is a separate, measured decision (S02 RISK) and does not live in this file.
+function labelledBullets(text, label) {
+  const out = [];
+  const re = new RegExp(`^\\*\\*${label}:\\*\\*\\s*$`, 'gim');
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    const tail = text.slice(match.index + match[0].length);
+    const stop = tail.search(/^(#{2,3}\s|\*\*[^*\n]+:\*\*)/m);
+    const body = stop < 0 ? tail : tail.slice(0, stop);
+    for (const bullet of body.matchAll(/^\s*[-*]\s+(.+?)\s*$/gm)) out.push(bullet[1].trim());
+  }
+  return out;
+}
+// Section titles the extractor recognises. The original set covered only the two
+// English labels emitted by the CURRENT generator; this repo has five generations
+// of SUMMARY and the decisions section also appears in pt-BR.
+//
+// Entries are interpolated literally into `new RegExp`: none carries a regex
+// metacharacter today and it must stay that way. If a future heading needs one,
+// the escape idiom is `forge-symbol-check.js:195`.
+const HEADINGS = [
+  'Implementation Decisions',
+  'Decisões-chave do milestone',
+  'Decisões-chave',
+  'Key Decisions',
+  // Titles seen in this repo whose content is ALREADY well-formed bullets — there
+  // the fix belongs to the extractor, not to the document. When the content is a
+  // table or prose, the direction is the opposite: fix the document.
+  'Decisões travadas',
+  'Decisões registradas',
+  'Locked Decisions',
+  'Aggregate Decisions',
+];
+// Bold labels read as sections, kept NAMED (see labelledBullets).
+const LABELS = ['Entregas', 'Key Deliverables'];
 function extractSource(spec) {
   const text = readSourceText(spec.file); const values = [];
   if (spec.bounded) {
@@ -133,7 +196,11 @@ function extractSource(spec) {
   } else {
     if (text.startsWith('---\n') && !text.includes('\n---', 4)) throw new Error('frontmatter sem fechamento');
     for (const key of ['provides', 'key_decisions', 'patterns_established']) for (const value of arrayValues(text, key)) values.push({ text: value, kind: `frontmatter:${key}` });
-    for (const heading of [spec.kind === 'milestone-context' ? 'Decisions from Session' : 'Forward Intelligence', 'Implementation Decisions']) { const start = text.search(new RegExp(`^##\\s+${heading}\\s*$`, 'im')); if (start >= 0) { const tail = text.slice(start).replace(/^##[^\n]*\n?/i, ''); const body = tail.slice(0, tail.search(/^##\s+/m) < 0 ? undefined : tail.search(/^##\s+/m)); for (const match of body.matchAll(/^\s*[-*]\s+(.+?)\s*$/gm)) values.push({ text: match[1].trim(), kind: `section:${heading.toLowerCase().replace(/ /g, '-')}` }); } }
+    // PREFIX match, not equality. The repo uses suffixes that the original `\s*$`
+    // could never match: `## Forward Intelligence for S03`, `## Key Decisions
+    // (acumulado)`, `## Decisões-chave do milestone (acumuladas)`.
+    for (const heading of [spec.kind === 'milestone-context' ? 'Decisions from Session' : 'Forward Intelligence', ...HEADINGS]) { const start = text.search(new RegExp(`^##\\s+${heading}\\b[^\\n]*$`, 'im')); if (start >= 0) { const tail = text.slice(start).replace(/^##[^\n]*\n?/i, ''); const body = tail.slice(0, tail.search(/^##\s+/m) < 0 ? undefined : tail.search(/^##\s+/m)); for (const match of body.matchAll(/^\s*[-*]\s+(.+?)\s*$/gm)) values.push({ text: match[1].trim(), kind: `section:${heading.toLowerCase().replace(/ /g, '-')}` }); } }
+    for (const label of LABELS) for (const value of labelledBullets(text, label)) values.push({ text: value, kind: `label:${label.toLowerCase().replace(/ /g, '-')}` });
   }
   return values.filter(Boolean);
 }
@@ -142,13 +209,21 @@ function planDistill(cwd, milestoneId) {
   if (!isValid(milestoneId)) { result.eligibility = { ok: false, reason: 'plan-error:invalid milestone id' }; return result; }
   result.eligibility = checkEligibility(cwd, milestoneId); if (!result.eligibility.ok) return result;
   const gathered = [];
+  // A candidate id is sha1(source \x00 text) and deliberately EXCLUDES the kind, so
+  // two headings that match the same section (`## Decisões-chave do milestone` is
+  // matched by the `Decisões-chave` prefix too) produce the very same id twice.
+  // Duplicates would inflate `candidates_total`, inflate the number of verdicts a
+  // selection must carry, and contaminate any before/after measurement of the
+  // extractor's reach. First occurrence wins; the extra one is dropped silently
+  // because it carries no information the first does not already carry.
+  const seen = new Set();
   for (const spec of sourceFiles(cwd, milestoneId)) {
     result.files_examined++;
     // A refused suffix ambiguity is data in the exit-0 plan, never a throw: consumers
     // read a non-zero exit as "unavailable" and would move on in silence.
     if (spec.refusal) { result.skipped.push({ file: rel(cwd, spec.file), reason: spec.refusal }); continue; }
     if (spec.note) result.notes.push({ file: rel(cwd, spec.file), note: spec.note });
-    if (!fs.existsSync(spec.file)) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'absent' }); continue; } try { for (const item of extractSource(spec)) { const source = rel(cwd, spec.file); const id = 'c-' + crypto.createHash('sha1').update(`${source}\x00${item.text}`).digest('hex').slice(0, 8); gathered.push({ id, source_file: source, source_kind: item.kind, text: item.text }); } } catch (_) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'unparseable' }); } }
+    if (!fs.existsSync(spec.file)) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'absent' }); continue; } try { for (const item of extractSource(spec)) { const source = rel(cwd, spec.file); const id = 'c-' + crypto.createHash('sha1').update(`${source}\x00${item.text}`).digest('hex').slice(0, 8); if (seen.has(id)) continue; seen.add(id); gathered.push({ id, source_file: source, source_kind: item.kind, text: item.text }); } } catch (_) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'unparseable' }); } }
   result.candidates = gathered; result.candidates_total = gathered.length; result.verdict = gathered.length ? 'ELIGIBLE-PREVIEW' : 'NO-CANDIDATES'; return result;
 }
 
@@ -441,5 +516,5 @@ function cliMain(argv) {
   }
 }
 
-module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, extractSource, sourceFiles, wrapperRoot, findBySuffix } };
+module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, extractSource, sourceFiles, wrapperRoot, findBySuffix, labelledBullets, HEADINGS, LABELS } };
 if (require.main === module) cliMain(process.argv.slice(2));
