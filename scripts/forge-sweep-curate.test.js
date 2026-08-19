@@ -320,8 +320,160 @@ function testWriteBoundaryConsultsEligibleSetOnly() {
   } finally { removeDir(dir); }
 }
 
+// ── Post-apply undo (S07) ────────────────────────────────────────────────────
+//
+// Curation rewrites a fragment IN PLACE, so after a real apply the destination
+// always diverges from the vaulted bytes. These fixtures deliberately use the
+// REAL vault, the REAL journal and the REAL rewriteFragment, and drive undo by
+// spawning the actual CLI: a mocked restoreVault would have reported success
+// throughout the entire period the command was inert.
+const memoryStore = require('./forge-memory');
+const { writeVault } = require('./forge-sweep-vault');
+const realJournal = require('./forge-sweep-journal');
+
+// realpathSync is load-bearing on macOS, where os.tmpdir() is a symlink: the
+// vault subtracts physical paths to build member ids, so a fixture rooted at
+// the symlinked spelling produces ids that escape `.gsd`.
+function realStoreDir() { return fs.realpathSync(osTempDir()); }
+
+function fact(memId, text) {
+  return { mem_id: memId, category: 'pattern', text, created_at: '2026-08-01T00:00:00.000Z', source_unit: 'execute-task/T01', extra_metadata: '{}' };
+}
+
+// A real, canonical two-fact fragment written by the store's own writer, so
+// rewriteFragment's canonicity fence passes without a hand-rolled serializer.
+function writeRealFragment(cwd, unitId, memIds) {
+  memoryStore.writeFragment(cwd, { unit_id: unitId, facts: memIds.map((id, index) => fact(id, `fato ${index} de ${unitId}`)) });
+  return path.join(cwd, '.gsd', 'memory', `${unitId}.md`);
+}
+
+function realApplyContext(cwd, clusters, doc) {
+  return {
+    cwd,
+    arbitration: doc,
+    buildClusters: () => ({ clusters, verdict: 'TARGETS', census: { skipped: [] } }),
+    activeUnits: () => ({ ok: true, units: [] }),
+  };
+}
+
+function runCli(dir, args) {
+  const run = childProcess.spawnSync(process.execPath, [path.join(__dirname, 'forge-sweep-curate.js'), '--cwd', dir].concat(args), { encoding: 'utf8' });
+  return { status: run.status, stderr: run.stderr, payload: run.stdout.trim() ? JSON.parse(run.stdout) : null };
+}
+
+function undoneIds(cwd) {
+  return realJournal.listEntries(cwd).entries.filter(entry => entry.phase === 'undo-done').map(entry => entry.id);
+}
+
+// The defect this slice closes. Reverting only the caller's opt-in (the third
+// argument at the runUndo -> restoreVault call) makes this fail with
+// `destination-has-different-bytes` and leaves the post-apply bytes in place.
+function testRealApplyThenCliUndoRestoresExactBytes() {
+  const dir = realStoreDir();
+  try {
+    const target = writeRealFragment(dir, 'T02', ['MEM003', 'MEM004']);
+    writeRealFragment(dir, 'T01', ['MEM001', 'MEM002']);
+    const before = fs.readFileSync(target);
+
+    const clusters = [cluster('c', [item('T01', 'MEM001'), item('T02', 'MEM003')])];
+    const doc = arbitration('c', [verdict('T01', 'MEM001', 'manter'), verdict('T02', 'MEM003', 'fundir-no-sobrevivente')]);
+    const ctx = realApplyContext(dir, clusters, doc);
+    const result = internals.applyCurate(ctx, internals.curatePlan(ctx));
+
+    assert.strictEqual(result.error, undefined, JSON.stringify(result.skipped));
+    assert.deepStrictEqual(result.written, [target]);
+    assert(!fs.readFileSync(target).equals(before), 'o apply precisa mesmo ter reescrito o fragmento');
+    assert(result.authorized.some(id => id.endsWith('memory/T02.md')), 'a autorização nomeia o membro vaultado');
+
+    const undo = runCli(dir, ['--undo', '--yes', '--json']);
+    assert.strictEqual(undo.status, 0, `${undo.stderr}${JSON.stringify(undo.payload)}`);
+    assert.deepStrictEqual(undo.payload.undo.errors, [], 'nenhuma recusa é aceitável no caminho autorizado');
+    assert(!JSON.stringify(undo.payload).includes('destination-has-different-bytes'));
+    assert.strictEqual(Buffer.compare(fs.readFileSync(target), before), 0, 'os bytes pré-apply precisam voltar exatos');
+    assert.deepStrictEqual(undoneIds(dir), [result.journalId]);
+  } finally { removeDir(dir); }
+}
+
+// The fence, from the other side: a divergent member the curate apply never
+// authorized is reported BY PATH, keeps its current bytes, and blocks the
+// undo-done outcome — while the named member is still restored.
+function testUndoRefusesDivergentMemberOutsideAuthorization() {
+  const dir = realStoreDir();
+  try {
+    const authorizedFile = writeRealFragment(dir, 'T02', ['MEM003', 'MEM004']);
+    const foreignFile = writeRealFragment(dir, 'T01', ['MEM001', 'MEM002']);
+    const authorizedBefore = fs.readFileSync(authorizedFile);
+
+    const vault = writeVault(dir, { operation: 'curadoria-semantica', files: [authorizedFile, foreignFile] });
+    assert.strictEqual(vault.ok, true);
+    const named = vault.members.filter(id => id.endsWith('memory/T02.md'));
+    assert.strictEqual(named.length, 1);
+    const intent = realJournal.appendIntent(dir, { operation: 'curadoria-semantica', containers: [vault.containerPath] });
+    // The production writer, not a fixture literal: the closed set carries the
+    // authorized member only, exactly as an apply that vaulted just that file.
+    assert.strictEqual(internals.writeAuthorization(dir, vault.containerPath, named).ok, true);
+
+    fs.appendFileSync(authorizedFile, 'divergência autorizada\n');
+    fs.appendFileSync(foreignFile, 'divergência não autorizada\n');
+    const foreignAfterDivergence = fs.readFileSync(foreignFile);
+
+    const undo = runCli(dir, ['--undo', '--yes', '--json']);
+    assert.strictEqual(undo.status, 1, 'uma recusa precisa sair diferente de zero');
+    const errors = undo.payload.undo.errors;
+    assert.strictEqual(errors.length, 1, JSON.stringify(errors));
+    assert(errors[0].includes('T01.md'), `a recusa precisa nomear o alvo: ${errors[0]}`);
+    assert(errors[0].includes('destination-not-authorized-for-overwrite'), errors[0]);
+    assert.strictEqual(Buffer.compare(fs.readFileSync(foreignFile), foreignAfterDivergence), 0, 'o membro não autorizado nunca é sobrescrito');
+    assert.strictEqual(Buffer.compare(fs.readFileSync(authorizedFile), authorizedBefore), 0, 'o membro nomeado é restaurado');
+    assert.deepStrictEqual(undoneIds(dir), [], 'undo-done não pode ser gravado com recusa pendente');
+    assert(intent.ok);
+  } finally { removeDir(dir); }
+}
+
+// Deny-by-default survives every degradation of the record: absent, malformed,
+// written by another operation, or naming a different container. None of these
+// is a boolean that opens the whole vault.
+function testAuthorizationRecordIsClosedAndDenyByDefault() {
+  const dir = realStoreDir();
+  try {
+    const container = path.join(dir, '.gsd', 'forge', 'sweep-vault', 'curadoria-semantica-1.md');
+    fs.mkdirSync(path.dirname(container), { recursive: true });
+    fs.writeFileSync(container, 'placeholder');
+    assert.deepStrictEqual(internals.authorizedMembers(dir, container), [], 'registro ausente não autoriza nada');
+
+    const record = internals.authorizationPath(dir, container);
+    fs.mkdirSync(path.dirname(record), { recursive: true });
+    for (const payload of ['{ not json', JSON.stringify({ operation: 'outra', members: ['.gsd/memory/T01.md'], container: 'curadoria-semantica-1.md' }), JSON.stringify({ operation: internals.OPERATION, container: 'outro.md', members: ['.gsd/memory/T01.md'] }), JSON.stringify({ operation: internals.OPERATION, container: 'curadoria-semantica-1.md', members: true })]) {
+      fs.writeFileSync(record, payload);
+      assert.deepStrictEqual(internals.authorizedMembers(dir, container), [], `registro degradado não autoriza: ${payload}`);
+    }
+
+    assert.strictEqual(internals.writeAuthorization(dir, container, ['.gsd/memory/T01.md', '', null]).ok, true);
+    assert.deepStrictEqual(internals.authorizedMembers(dir, container), ['.gsd/memory/T01.md']);
+  } finally { removeDir(dir); }
+}
+
+// The apply must not reach the first rewrite without a durable authorization:
+// an interrupted apply with no record is an apply that can never be undone.
+function testAuthorizationFailureIsZeroMutation() {
+  const dir = osTempDir();
+  try {
+    const clusters = [cluster('c', [item('a', 'MEM001'), item('b', 'MEM002')])];
+    const doc = arbitration('c', [verdict('a', 'MEM001', 'manter'), verdict('b', 'MEM002', 'fundir-no-sobrevivente')]);
+    let rewritten = 0;
+    const ctx = liveContext(dir, clusters, doc, {
+      writeAuthorization: () => ({ ok: false, error: 'disk full' }),
+      rewriteFragment: () => { rewritten += 1; return { ok: true }; },
+    });
+    const result = internals.applyCurate(ctx, plan(clusters));
+    assert.strictEqual(result.error, internals.AUTH_MISSING);
+    assert.strictEqual(rewritten, 0);
+  } finally { removeDir(dir); }
+}
+
 function main() {
-  const tests = [testEligibilityFilteredClusterSkipsWithoutAborting, testWriteBoundaryConsultsEligibleSetOnly, testRegistry, testClosedVerdicts, testExactlyOneSurvivor, testUnknownItem, testUnjudgedItems, testUnknownCluster, testCompoundAddress, testFingerprintStableAndSensitive, testPlanChangedZeroMutation, testIntentFailureZeroMutation, testRewriteIsolation, testActivePhaseFailClosed, testArgumentCodes, testNoSecondWriterOrContainers, testDefaultIsDryRun, testCliDefaultLeavesDigestUntouched, testParseConflicts, testClusterMustBeJudged, testDuplicateAddressRejected, testNoTargetsNoVault, testDropsGroupedByStorage, testPhaseBlocked];
+  const tests = [testRealApplyThenCliUndoRestoresExactBytes, testUndoRefusesDivergentMemberOutsideAuthorization, testAuthorizationRecordIsClosedAndDenyByDefault, testAuthorizationFailureIsZeroMutation,
+    testEligibilityFilteredClusterSkipsWithoutAborting, testWriteBoundaryConsultsEligibleSetOnly, testRegistry, testClosedVerdicts, testExactlyOneSurvivor, testUnknownItem, testUnjudgedItems, testUnknownCluster, testCompoundAddress, testFingerprintStableAndSensitive, testPlanChangedZeroMutation, testIntentFailureZeroMutation, testRewriteIsolation, testActivePhaseFailClosed, testArgumentCodes, testNoSecondWriterOrContainers, testDefaultIsDryRun, testCliDefaultLeavesDigestUntouched, testParseConflicts, testClusterMustBeJudged, testDuplicateAddressRejected, testNoTargetsNoVault, testDropsGroupedByStorage, testPhaseBlocked];
   for (const test of tests) test();
   process.stdout.write(`forge-sweep-curate: ${tests.length} tests passed\n`);
 }
