@@ -378,3 +378,126 @@ console.log('PASS: forge-distill T02 apply tests');
 }
 
 console.log('PASS: forge-distill review-fix/S03 (R1-R4)');
+
+// ---------------------------------------------------------------------------
+// S01/T02 — wrapper root resolution (IN-01) and suffix location under the D5
+// two-layer ambiguity rule (IN-02). Every fixture lives in a fresh tmp dir; the
+// live `.gsd/` of this repo is never read.
+// ---------------------------------------------------------------------------
+
+const TASK_ID = 'T-20260101010101-demo';
+const MS_ID = 'M-20260811134201-controle-contexto-gsd';
+const SUMMARY_BODY = '---\nkey_decisions:\n  - "Resolve the wrapper where it lives"\n---\n';
+
+function tmpCwd() { return fs.mkdtempSync(path.join(os.tmpdir(), 'forge-distill-t02-in-')); }
+
+// Builds a wrapper under `.gsd/<bucket>/<id>` with an explicit file name list, so a
+// test can express "two files match the suffix" without depending on the id shape.
+function wrapperFixture(bucket, id, files) {
+  const cwd = tmpCwd();
+  const root = path.join(cwd, '.gsd', bucket, id);
+  fs.mkdirSync(root, { recursive: true });
+  ledger.writeFragment(cwd, { id, title: 'fixture' });
+  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(root, name), body);
+  return { cwd, root };
+}
+
+// IN-01 positive — a task wrapper is eligible and yields candidates. Before this
+// change `checkEligibility` built the milestones path unconditionally and this
+// exact shape returned `wrapper-not-found`, so the plan never reached extraction.
+{
+  const { cwd } = wrapperFixture('tasks', TASK_ID, { [`${TASK_ID}-SUMMARY.md`]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, TASK_ID);
+  assert.strictEqual(plan.eligibility.ok, true, JSON.stringify(plan.eligibility));
+  assert(plan.candidates.length >= 1, 'a task wrapper must produce at least one candidate');
+  assert(plan.candidates.some(c => c.text.includes('Resolve the wrapper where it lives')), JSON.stringify(plan.candidates));
+}
+
+// IN-01 negative — neither root exists: the original refusal survives verbatim,
+// and the detail still names the milestones path (not the tasks one).
+{
+  const cwd = tmpCwd();
+  const eligibility = distill.checkEligibility(cwd, TASK_ID);
+  assert.strictEqual(eligibility.ok, false);
+  assert.strictEqual(eligibility.reason, 'wrapper-not-found');
+  assert(eligibility.detail.includes(path.join('.gsd', 'milestones', TASK_ID)), eligibility.detail);
+}
+
+// IN-02 case 1 — zero suffix matches: the exact-name fallback keeps the current
+// `absent` skip, unchanged.
+{
+  const { cwd } = wrapperFixture('milestones', MS_ID, { 'NOTES.md': 'no summary here\n' });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert.strictEqual(plan.eligibility.ok, true);
+  assert(plan.skipped.some(s => s.file.endsWith(`${MS_ID}-SUMMARY.md`) && s.reason === 'absent'), JSON.stringify(plan.skipped));
+  assert.deepStrictEqual(plan.notes, []);
+}
+
+// IN-02 case 2 — a single non-canonical match (SUMMARY stored without the slug)
+// is read. The exact name never matched, so this file used to be `absent`.
+{
+  const shortName = 'M-20260811134201-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [shortName]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert(plan.candidates.some(c => c.source_file.endsWith(shortName)), JSON.stringify(plan));
+  assert.strictEqual(plan.skipped.some(s => s.reason.startsWith('ambiguous-suffix')), false);
+}
+
+// IN-02 case 3 — two matches, exactly one in the strong form: D5 resolves to the
+// canonical file AND names the ignored one. This is the shape of the single real
+// occurrence measured in T01's census (a wrapper holding both the canonical
+// SUMMARY and `review-fix-triage-SUMMARY.md`).
+{
+  const canonical = `${MS_ID}-SUMMARY.md`;
+  const other = 'review-fix-triage-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, {
+    [canonical]: SUMMARY_BODY,
+    [other]: '---\nkey_decisions:\n  - "Triage leftovers"\n---\n',
+  });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert(plan.candidates.some(c => c.source_file.endsWith(canonical)), 'canonical summary must be read');
+  assert.strictEqual(plan.candidates.some(c => c.source_file.endsWith(other)), false, 'the ignored file must not be a source');
+  const note = plan.notes.find(n => n.note.startsWith('ambiguous-suffix-resolved:'));
+  assert(note, JSON.stringify(plan.notes));
+  assert(note.note.includes(canonical) && note.note.includes(other), note.note);
+}
+
+// IN-02 case 4 — two matches, none in the strong form: refusal naming BOTH, and
+// neither file is read as a source. The refusal is data in an exit-0 plan.
+{
+  const a = 'alpha-SUMMARY.md';
+  const b = 'beta-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [a]: SUMMARY_BODY, [b]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, MS_ID);
+  const refusal = plan.skipped.find(s => s.reason.startsWith('ambiguous-suffix:'));
+  assert(refusal, JSON.stringify(plan.skipped));
+  assert(refusal.reason.includes(a) && refusal.reason.includes(b), refusal.reason);
+  assert.strictEqual(plan.candidates.some(c => c.source_file.endsWith(a) || c.source_file.endsWith(b)), false, 'a refused ambiguity reads nothing');
+}
+
+// IN-02 case 5 — three matches with TWO in the strong form: the strong form does
+// not disambiguate, so the refusal names every candidate.
+{
+  const one = `${MS_ID}-SUMMARY.md`;
+  const two = `${MS_ID}-extra-SUMMARY.md`;
+  const three = 'review-fix-triage-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [one]: SUMMARY_BODY, [two]: SUMMARY_BODY, [three]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, MS_ID);
+  const refusal = plan.skipped.find(s => s.reason.startsWith('ambiguous-suffix:'));
+  assert(refusal, JSON.stringify(plan.skipped));
+  for (const name of [one, two, three]) assert(refusal.reason.includes(name), `${name} missing from ${refusal.reason}`);
+  assert.strictEqual(plan.candidates.length, 0, 'no candidate may come from a refused ambiguity');
+}
+
+// Unit-level contract of findBySuffix, exercised directly through _private so the
+// four branches are pinned independently of the plan shape.
+{
+  const { cwd, root } = wrapperFixture('milestones', MS_ID, { [`${MS_ID}-SUMMARY.md`]: SUMMARY_BODY });
+  const found = distill._private.findBySuffix(root, '-SUMMARY.md', MS_ID);
+  assert(found.file.endsWith(`${MS_ID}-SUMMARY.md`));
+  assert.strictEqual(found.refusal, undefined);
+  assert.deepStrictEqual(distill._private.findBySuffix(path.join(cwd, 'nope'), '-SUMMARY.md', MS_ID), { file: null });
+  assert.strictEqual(distill._private.wrapperRoot(cwd, MS_ID), root);
+}
+
+console.log('PASS: forge-distill S01/T02 (IN-01 wrapper root, IN-02 D5 suffix rule)');

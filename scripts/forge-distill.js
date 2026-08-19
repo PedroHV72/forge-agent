@@ -31,8 +31,47 @@ const MAX_LINES_PER_BOUNDED_FILE = 10;
 const DISTILL_CONFIDENCE_BASE = 0.8;
 const VERDICT_LINE = /conced|refut|abert|verdict|veredito|NO-TARGET|green/i;
 function readSourceText(file) { return fs.readFileSync(file, 'utf8').replace(/\r\n?/g, '\n'); }
+// Resolve the wrapper root where the wrapper actually lives. The previous version
+// built `.gsd/milestones/<id>` unconditionally, so every wrapper under `.gsd/tasks/`
+// was refused as `wrapper-not-found` and never reached the distiller at all
+// (measured on the WDMA sweep: 189 of 266 wrappers). The fallback returns the
+// milestones path so the original `wrapper-not-found` message and detail survive.
+function wrapperRoot(cwd, unitId) {
+  const ms = path.join(cwd, '.gsd', 'milestones', unitId);
+  if (fs.existsSync(ms)) return ms;
+  const tk = path.join(cwd, '.gsd', 'tasks', unitId);
+  if (fs.existsSync(tk)) return tk;
+  return ms;
+}
+// Locate a root artifact by SUFFIX instead of demanding the exact `<id>-<TYPE>.md`
+// name. Measured on the same WDMA sweep: several wrappers store the SUMMARY without
+// the slug in the file name (`M-20260529-151715-extracao-controllers/` holds
+// `M-20260529-151715-SUMMARY.md`), so the exact name never matched and the richest
+// source file entered the plan as `absent`.
+//
+// Ambiguity is decided by the two-layer D5 rule, never by `sort()[0]`: picking the
+// alphabetically first SUMMARY would write the WRONG knowledge into permanent memory
+// moments before the wrapper is deleted. Asymmetry: a refusal costs one manual look;
+// a silent wrong pick is unrecoverable.
+//   0 matches   -> no file (caller falls back to the exact name -> `absent`)
+//   1 match     -> that file
+//   >1 matches  -> strong form `<unitId>-<suffix>` (any name prefixed by unitId):
+//                    exactly 1 strong -> canonical, the others are NAMED as ignored
+//                    0 or >=2 strong  -> refusal NAMING every candidate, none read
+function findBySuffix(root, suffix, unitId) {
+  let names;
+  try { names = fs.readdirSync(root).filter(name => name.endsWith(suffix)).sort(); } catch (_) { return { file: null }; }
+  if (names.length === 0) return { file: null };
+  if (names.length === 1) return { file: path.join(root, names[0]) };
+  const strong = names.filter(name => typeof unitId === 'string' && unitId.length > 0 && name.startsWith(unitId));
+  if (strong.length === 1) {
+    const ignored = names.filter(name => name !== strong[0]);
+    return { file: path.join(root, strong[0]), note: `ambiguous-suffix-resolved: ${strong[0]} (ignored: ${ignored.join(', ')})` };
+  }
+  return { file: null, refusal: `ambiguous-suffix: ${names.join(', ')}` };
+}
 function checkEligibility(cwd, milestoneId) {
-  const wrapper = path.join(cwd, '.gsd', 'milestones', milestoneId);
+  const wrapper = wrapperRoot(cwd, milestoneId);
   if (!fs.existsSync(wrapper)) return { ok: false, reason: 'wrapper-not-found', detail: wrapper };
   let ledger;
   try { ledger = readLedgerFragment(cwd, milestoneId); } catch (error) { return { ok: false, reason: `no-ledger-entry: ${error.message}` }; }
@@ -45,8 +84,15 @@ function checkEligibility(cwd, milestoneId) {
 }
 function rel(cwd, file) { return path.relative(cwd, file).split(path.sep).join('/'); }
 function sourceFiles(cwd, milestoneId) {
-  const root = path.join(cwd, '.gsd', 'milestones', milestoneId);
-  const files = [{ file: path.join(root, `${milestoneId}-SUMMARY.md`), kind: 'milestone-summary' }, { file: path.join(root, `${milestoneId}-CONTEXT.md`), kind: 'milestone-context' }];
+  const root = wrapperRoot(cwd, milestoneId);
+  // Root artifacts are located by suffix (milestones OR tasks wrapper); the slice
+  // files below stay on exact names — that is the boundary of this change.
+  const files = [];
+  for (const [suffix, kind] of [['-SUMMARY.md', 'milestone-summary'], ['-CONTEXT.md', 'milestone-context']]) {
+    const found = findBySuffix(root, suffix, milestoneId);
+    if (found.refusal) { files.push({ file: path.join(root, `${milestoneId}${suffix}`), kind, refusal: found.refusal }); continue; }
+    files.push({ file: found.file || path.join(root, `${milestoneId}${suffix}`), kind, note: found.note });
+  }
   let entries; try { entries = fs.readdirSync(path.join(root, 'slices'), { withFileTypes: true }); } catch (_) { return files; }
   for (const entry of entries.filter(item => item.isDirectory() && /^S\d+$/.test(item.name)).sort((a, b) => a.name.localeCompare(b.name))) {
     files.push({ file: path.join(root, 'slices', entry.name, `${entry.name}-SUMMARY.md`), kind: 'slice-summary' });
@@ -72,11 +118,17 @@ function extractSource(spec) {
   return values.filter(Boolean);
 }
 function planDistill(cwd, milestoneId) {
-  const result = { milestone: milestoneId, verdict: 'INELIGIBLE', eligibility: null, files_examined: 0, candidates_total: 0, candidates: [], skipped: [], measured_at: new Date().toISOString() };
+  const result = { milestone: milestoneId, verdict: 'INELIGIBLE', eligibility: null, files_examined: 0, candidates_total: 0, candidates: [], skipped: [], notes: [], measured_at: new Date().toISOString() };
   if (!isValid(milestoneId)) { result.eligibility = { ok: false, reason: 'plan-error:invalid milestone id' }; return result; }
   result.eligibility = checkEligibility(cwd, milestoneId); if (!result.eligibility.ok) return result;
   const gathered = [];
-  for (const spec of sourceFiles(cwd, milestoneId)) { result.files_examined++; if (!fs.existsSync(spec.file)) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'absent' }); continue; } try { for (const item of extractSource(spec)) { const source = rel(cwd, spec.file); const id = 'c-' + crypto.createHash('sha1').update(`${source}\x00${item.text}`).digest('hex').slice(0, 8); gathered.push({ id, source_file: source, source_kind: item.kind, text: item.text }); } } catch (_) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'unparseable' }); } }
+  for (const spec of sourceFiles(cwd, milestoneId)) {
+    result.files_examined++;
+    // A refused suffix ambiguity is data in the exit-0 plan, never a throw: consumers
+    // read a non-zero exit as "unavailable" and would move on in silence.
+    if (spec.refusal) { result.skipped.push({ file: rel(cwd, spec.file), reason: spec.refusal }); continue; }
+    if (spec.note) result.notes.push({ file: rel(cwd, spec.file), note: spec.note });
+    if (!fs.existsSync(spec.file)) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'absent' }); continue; } try { for (const item of extractSource(spec)) { const source = rel(cwd, spec.file); const id = 'c-' + crypto.createHash('sha1').update(`${source}\x00${item.text}`).digest('hex').slice(0, 8); gathered.push({ id, source_file: source, source_kind: item.kind, text: item.text }); } } catch (_) { result.skipped.push({ file: rel(cwd, spec.file), reason: 'unparseable' }); } }
   result.candidates = gathered; result.candidates_total = gathered.length; result.verdict = gathered.length ? 'ELIGIBLE-PREVIEW' : 'NO-CANDIDATES'; return result;
 }
 
@@ -369,5 +421,5 @@ function cliMain(argv) {
   }
 }
 
-module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, extractSource, sourceFiles } };
+module.exports = { applyDistill, loadSelection, dstMemId, planDistill, checkEligibility, _private: { CATEGORIES, WRAPPER_CITATION_RES, DISTILL_BUDGET_FACTS, DISTILL_CONFIDENCE_BASE, matchedCitation, validateAgainstPlan, validateSelectionShape, checkBudget, checkCollisions, parseArgs, previewText, arrayValues, extractSource, sourceFiles, wrapperRoot, findBySuffix } };
 if (require.main === module) cliMain(process.argv.slice(2));
