@@ -33,8 +33,15 @@ function fact(mem_id, text) {
 // `~/...` paths are blocked by the extractor's bare-path lookbehind (#107),
 // so this always lands in the `missed` bucket — a genuine miss, not the
 // EMPTY-DENOMINATOR shortcut the old suite leaned on.
+// Uma miss que é miss POR DESIGN, não por acidente. Este helper embrulhava o
+// nome em `~/.claude/...`, e a #107 fechou exatamente essa lacuna — a premissa
+// do fixture morreu junto com o conserto, e a suíte acusou. `.rst` está no
+// REAL_FILE_EXT do detector e deliberadamente FORA do CODE_EXT do extrator
+// (alargá-lo para sufixo arbitrário foi medido em 311 -> 972 citações
+// fantasma), então esta forma segue sendo miss de propósito e o fixture não
+// pode ser invalidado por uma melhora futura de recall.
 function missFactText(basename) {
-  return `Veja ~/.claude/${basename} para detalhes`;
+  return `Veja ${basename} para detalhes`;
 }
 
 function fixture() {
@@ -106,15 +113,15 @@ test('an unlisted miss fails green, and reasons[] names the exact key', () => {
   try {
     writeFragment(cwd, {
       unit_id: 'T01',
-      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.md'))],
+      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))],
     });
     writeAllowed(cwd, []);
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false);
-    assert.ok(report.reasons.includes('unlisted-miss:f-miss::prefs-x.md'), `expected the miss named by key in ${JSON.stringify(report.reasons)}`);
+    assert.ok(report.reasons.includes('unlisted-miss:f-miss::prefs-x.rst'), `expected the miss named by key in ${JSON.stringify(report.reasons)}`);
     const criterion = report.criteria.find((c) => c.name === 'allowed_misses');
     assert.strictEqual(criterion.ok, false);
-    assert.deepStrictEqual(report.allowed_misses.new, ['f-miss::prefs-x.md']);
+    assert.deepStrictEqual(report.allowed_misses.new, ['f-miss::prefs-x.rst']);
   } finally { cleanup(cwd); }
 });
 
@@ -123,16 +130,16 @@ test('a listed miss is green even with f2_recall below the old 0.99 threshold �
   try {
     writeFragment(cwd, {
       unit_id: 'T01',
-      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.md'))],
+      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))],
     });
-    writeAllowed(cwd, [entry('f-miss', 'prefs-x.md')]);
+    writeAllowed(cwd, [entry('f-miss', 'prefs-x.rst')]);
     const report = measureGreen(cwd);
     // 1 miss over a denominator of 2 → recall 0.5, far below the old bar.
     // Reverting to the percentage criterion makes this assertion fail — that
     // is the bite proving the criterion moved to the enumerated list.
     assert.ok(typeof report.f2_recall === 'number' && report.f2_recall < 0.99, `recall must be below the old bar (got ${report.f2_recall})`);
     assert.strictEqual(report.green, true, 'a fully enumerated miss set must be green regardless of recall');
-    assert.deepStrictEqual(report.allowed_misses.known, ['f-miss::prefs-x.md']);
+    assert.deepStrictEqual(report.allowed_misses.known, ['f-miss::prefs-x.rst']);
   } finally { cleanup(cwd); }
 });
 
@@ -156,12 +163,12 @@ test('a stale entry (fact alive, mention no longer missing) fails green with a n
   const cwd = fixture();
   try {
     writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`')] });
-    // f-covered exists (not a ghost) but 'prefs-x.md' is not among its misses.
-    writeAllowed(cwd, [entry('f-covered', 'prefs-x.md')]);
+    // f-covered exists (not a ghost) but 'prefs-x.rst' is not among its misses.
+    writeAllowed(cwd, [entry('f-covered', 'prefs-x.rst')]);
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false, 'an allow-list that only ever grows is an inert gate — a cured entry must turn the gate red');
-    assert.ok(report.reasons.includes('stale-allowed-entry:f-covered::prefs-x.md'), `expected stale entry named in ${JSON.stringify(report.reasons)}`);
-    assert.deepStrictEqual(report.allowed_misses.stale, ['f-covered::prefs-x.md']);
+    assert.ok(report.reasons.includes('stale-allowed-entry:f-covered::prefs-x.rst'), `expected stale entry named in ${JSON.stringify(report.reasons)}`);
+    assert.deepStrictEqual(report.allowed_misses.stale, ['f-covered::prefs-x.rst']);
     assert.ok(String(report.allowed_misses.stale_action).includes('remova da lista'), 'the report must instruct removal explicitly');
   } finally { cleanup(cwd); }
 });
@@ -248,10 +255,10 @@ test('default path absent + zero misses → green, with the origin named default
 test('default path absent + one miss → red unlisted-miss — absence never loosens the gate', () => {
   const cwd = fixture();
   try {
-    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.md'))] });
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))] });
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false, 'an empty list is fail-closed: any miss is unlisted');
-    assert.ok(report.reasons.includes('unlisted-miss:f-miss::prefs-x.md'), `expected the miss named in ${JSON.stringify(report.reasons)}`);
+    assert.ok(report.reasons.includes('unlisted-miss:f-miss::prefs-x.rst'), `expected the miss named in ${JSON.stringify(report.reasons)}`);
     assert.strictEqual(report.allowed_misses.source, 'default-absent');
   } finally { cleanup(cwd); }
 });
@@ -345,11 +352,11 @@ test('writing a new fact into a sibling fragment leaves existing miss keys byte-
   try {
     writeFragment(cwd, {
       unit_id: 'T01',
-      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.md'))],
+      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))],
     });
     writeAllowed(cwd, []);
     const before = measureGreen(cwd);
-    assert.deepStrictEqual(before.allowed_misses.new, ['f-miss::prefs-x.md']);
+    assert.deepStrictEqual(before.allowed_misses.new, ['f-miss::prefs-x.rst']);
     // Neighboring write: a brand-new fact in a DIFFERENT fragment. Keys derive
     // from mem_id + the miss's own normalized mention — never from line
     // numbers, read order, or sibling content — so the existing key must not
@@ -365,9 +372,9 @@ test('a green gate with the miss listed stays green after a neighboring write', 
   try {
     writeFragment(cwd, {
       unit_id: 'T01',
-      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.md'))],
+      facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))],
     });
-    writeAllowed(cwd, [entry('f-miss', 'prefs-x.md')]);
+    writeAllowed(cwd, [entry('f-miss', 'prefs-x.rst')]);
     assert.strictEqual(measureGreen(cwd).green, true);
     writeFragment(cwd, { unit_id: 'T02', facts: [fact('f-new', 'novo fato citando `scripts/covered.js` aqui')] });
     const after = measureGreen(cwd);
@@ -474,7 +481,7 @@ console.log('\nSection 11: criteria[] always carries the three entries, pass or 
 test('criteria[] always has exactly allowed_misses, unit_axis, subject_report_present — in every scenario', () => {
   const cwd = fixture();
   try {
-    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.md'))] });
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.rst'))] });
     writeAllowed(cwd, []);
     const report = measureGreen(cwd);
     assert.deepStrictEqual(report.criteria.map((c) => c.name), ['allowed_misses', 'unit_axis', 'subject_report_present']);
@@ -488,7 +495,7 @@ console.log('\nSection 12: green:false never ships without a named reason\n');
 test('every green:false report carries at least one entry in reasons[]', () => {
   const cwd = fixture();
   try {
-    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.md'))] });
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.rst'))] });
     writeAllowed(cwd, []);
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false);
@@ -529,8 +536,8 @@ console.log('\nSection 14: determinism — two runs over the same store agree on
 test('two consecutive runs produce identical fields except measured_at', () => {
   const cwd = fixture();
   try {
-    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.md'))] });
-    writeAllowed(cwd, [entry('f-miss', 'prefs-x.md')]);
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))] });
+    writeAllowed(cwd, [entry('f-miss', 'prefs-x.rst')]);
     const first = measureGreen(cwd);
     const second = measureGreen(cwd);
     const strip = (r) => { const { measured_at, ...rest } = r; return rest; };
@@ -560,9 +567,9 @@ test('CLI --allowed <file> overrides the default cwd-relative list location', ()
   const cwd = fixture();
   const listDir = fs.mkdtempSync(path.join(os.tmpdir(), 'idxgreen-list-'));
   try {
-    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.md'))] });
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.rst'))] });
     const custom = path.join(listDir, 'my-allowed.json');
-    fs.writeFileSync(custom, JSON.stringify({ allowed: [entry('f-miss', 'prefs-x.md')] }));
+    fs.writeFileSync(custom, JSON.stringify({ allowed: [entry('f-miss', 'prefs-x.rst')] }));
     const result = spawnSync(process.execPath, [path.join(__dirname, 'forge-index-green.js'), '--cwd', cwd, '--allowed', custom, '--json'], { encoding: 'utf8' });
     assert.strictEqual(result.status, 0);
     const parsed = JSON.parse(result.stdout.trim());
@@ -603,7 +610,7 @@ test('CLI unknown flag exits 2', () => {
 test('runCli() exit code is always 0 for a valid, even failing, measurement', () => {
   const cwd = fixture();
   try {
-    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.md'))] });
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.rst'))] });
     writeAllowed(cwd, []);
     const realWrite = process.stdout.write;
     process.stdout.write = () => true;
@@ -698,7 +705,7 @@ test('neither candidate present → default-absent, and the report ENUMERATES wh
 test('absence does NOT loosen the gate: default-absent + one miss is still red', () => {
   const cwd = fixture();
   try {
-    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', missFactText('prefs-x.md'))] });
+    writeFragment(cwd, { unit_id: 'M-20260101000000-x', facts: [fact('MEM001', missFactText('prefs-x.rst'))] });
     const report = measureGreen(cwd);
     assert.strictEqual(report.allowed_misses.source, 'default-absent');
     assert.strictEqual(report.green, false, 'an empty list accepts nothing — every miss is unlisted');
