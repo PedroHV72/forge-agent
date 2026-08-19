@@ -187,6 +187,56 @@ test('CLI: invalid mem_id entry exits 2 with no success envelope', () => {
   assert.strictEqual(res.stdout.trim(), '');
 });
 
+// ── CLI: the envelope must survive a piped stdout at scale ────────────────
+//
+// Honest platform note, stated because a test that cannot fail on the machine
+// it runs on is not evidence: this repo's executor ran these on win32, where
+// `process.stdout` over a pipe is SYNCHRONOUS per Node's I/O documentation, so
+// the pre-fix `process.exit(0)` ALSO passes the behavioural assertion below on
+// this machine. It is retained because it does bite on POSIX (two of the three
+// CI platforms), where a piped stdout is asynchronous and `process.exit()`
+// discards whatever the inline flush (~64KB pipe buffer) did not accept.
+// The falsifiable-here companion is the structural test that follows it.
+test('CLI: a multi-megabyte envelope arrives whole through a piped stdout', () => {
+  const ids = [];
+  for (let i = 0; i < 200000; i++) ids.push(`MEM${String(i).padStart(9, '0')}`);
+  const payload = JSON.stringify({ before: factsWithIds(ids), after: [] });
+
+  // stdio defaults to pipes here — the asynchronous case on POSIX.
+  const res = spawnSync(process.execPath, [MODULE], {
+    input: payload,
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`);
+
+  const out = res.stdout.trim();
+  assert.ok(out.length > 64 * 1024,
+    `fixture precondition: envelope must exceed the inline-flush threshold, got ${out.length} bytes`);
+
+  // Truncation shows up as unparseable JSON; absence shows up as empty stdout.
+  const parsed = JSON.parse(out);
+  assert.strictEqual(parsed.removed.length, ids.length,
+    `every removed id must survive: expected ${ids.length}, got ${parsed.removed.length}`);
+  assert.strictEqual(parsed.removed[0], ids[0]);
+  assert.strictEqual(parsed.removed[parsed.removed.length - 1], ids[ids.length - 1]);
+});
+
+// ── structural: falsifiable on every platform, win32 included ─────────────
+test('module sets process.exitCode and never calls process.exit on the CLI path', () => {
+  const src = require('fs').readFileSync(MODULE, 'utf8');
+  const cli = src.slice(src.indexOf('require.main === module'));
+  assert.ok(cli.length > 0, 'fixture precondition: CLI section located');
+
+  // Strip comments so the rationale prose naming `process.exit()` does not
+  // count as a call site.
+  const code = cli.replace(/\/\/[^\n]*/g, '');
+  assert.ok(!/process\.exit\s*\(/.test(code),
+    'CLI must not call process.exit() — it terminates before queued stdout drains');
+  assert.ok(/process\.exitCode\s*=\s*0/.test(code), 'success path must set process.exitCode = 0');
+  assert.ok(/process\.exitCode\s*=\s*2/.test(code), 'malformed-input path must set process.exitCode = 2');
+});
+
 // ── summary ──────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

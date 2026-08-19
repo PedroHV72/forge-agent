@@ -75,6 +75,15 @@ function checkMemIdSet(before, after) {
 module.exports = { checkMemIdSet, assertValidSnapshot };
 
 // ── CLI ──────────────────────────────────────────────────────────────────
+// Exit status is set via `process.exitCode` and NEVER via `process.exit()`.
+// `process.exit()` terminates the process without waiting for queued stdout to
+// drain; on POSIX a pipe/redirect makes `process.stdout` asynchronous, so any
+// envelope larger than what the kernel accepts inline (~64KB pipe buffer) can
+// be truncated or lost while the process still reports success. The single
+// most consequential report this tool emits — a full-store removal enumerated
+// by name — is exactly the payload that grows past that threshold. Setting
+// `process.exitCode` lets the event loop flush first. Same pattern as the
+// sibling `forge-schema-guard.js`.
 if (require.main === module) {
   const chunks = [];
   process.stdin.on('data', (c) => chunks.push(c));
@@ -85,13 +94,13 @@ if (require.main === module) {
       input = JSON.parse(raw);
     } catch (e) {
       process.stderr.write(`forge-memory-set-guard: malformed JSON on stdin: ${e.message}\n`);
-      process.exit(2);
+      process.exitCode = 2;
       return;
     }
 
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       process.stderr.write('forge-memory-set-guard: input must be a JSON object with before/after arrays\n');
-      process.exit(2);
+      process.exitCode = 2;
       return;
     }
 
@@ -100,11 +109,11 @@ if (require.main === module) {
       result = checkMemIdSet(input.before, input.after);
     } catch (e) {
       process.stderr.write(`forge-memory-set-guard: malformed snapshot: ${e.message}\n`);
-      process.exit(2);
+      process.exitCode = 2;
       return;
     }
 
     process.stdout.write(`${JSON.stringify(result)}\n`);
-    process.exit(0);
+    process.exitCode = 0;
   });
 }
