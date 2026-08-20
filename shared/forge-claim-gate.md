@@ -71,6 +71,13 @@ pref no `forge-prefs.schema.json` — os dois concordam **por referência**, nun
 O gatilho do follow-up `#1(b)` é igualmente medido: **taxa de `held-uncommitted` por milestone sob
 advisory** (D6).
 
+**A série de cobertura é durável.** No `complete-milestone`, enquanto os refs
+`forge/*` ainda existem, `scripts/forge-write-coverage-ledger.js` executa a
+medição canônica e anexa um snapshot compacto a
+`.gsd/forge/write-coverage.jsonl`. O append usa mutex, retries idênticos são
+deduplicados por `measurement_id` e `inconclusive` permanece um resultado
+registrado — ausência de amostra nunca vira autorização para o flip.
+
 ## Inputs
 
 - `WORKING_DIR` — absolute workspace root. The run registry (`.gsd/forge/runs/`) and the event log
