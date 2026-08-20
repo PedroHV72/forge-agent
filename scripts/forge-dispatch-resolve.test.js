@@ -223,6 +223,18 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  runCase('frontmatter Codex overrides an explicit Claude worker pin', () => {
+    const f = mkFixture({
+      prefsJsonc: '{"workers":{"execute-task":"claude"},"tier_models":{"standard":"gpt-5.6-sol"}}',
+      plan: '---\nworker: codex\ntier: standard\n---\n# task\n',
+    });
+    const r = dispatch(f, { unitType: 'execute-task' });
+    assertEqual(r.route_source, 'frontmatter', 'frontmatter remains the highest-precedence source');
+    assertEqual(r.engine, 'gpt', 'frontmatter selects the external model family');
+    assertEqual(r.dispatch_engine, 'codex', 'the write-capable sidecar is activated');
+    cleanup(f);
+  });
+
   runCase('routable GPT tier without explicit worker still selects Codex', () => {
     const f = mkFixture({ prefsJsonc: '{"tier_models":{"standard":"gpt-5.6-sol"}}' });
     const r = dispatch(f, { unitType: 'execute-task' });

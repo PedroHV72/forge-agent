@@ -151,8 +151,11 @@ function resolveRequireWorktree(cwd) {
 //   (1) workers.execute-task == codex (the sidecar write path);
 //   (2) any routing.<domain>.executor.<tier|fallback> id whose modelFamily is
 //       gpt or gemini;
-//   (3) when workers.execute-task is not explicitly pinned, any tier_models
-//       member whose family is gpt or gemini (the legacy resolver path).
+//   (3) any tier_models member whose family is gpt or gemini. Even an explicit
+//       Claude worker cannot suppress this signal: task frontmatter has higher
+//       precedence and may select an external writer after activation, when the
+//       isolation mode is already frozen. This intentionally prefers a safe
+//       false-positive over a shared-mode external write.
 //       Read-only paths (plan-slice Branch D, review challenger)
 //       are intentionally NOT inspected — they never write.
 // Never throws (never blocks activation): any error → { detected:true,
@@ -168,9 +171,7 @@ function detectExternalWriteEngine(cwd) {
       return { detected: true, reason: 'workers.execute-task:codex' };
     }
 
-    const workerPinned = Boolean(prefs.workers && typeof prefs.workers === 'object'
-      && Object.prototype.hasOwnProperty.call(prefs.workers, 'execute-task'));
-    if (!workerPinned && prefs.tier_models && typeof prefs.tier_models === 'object') {
+    if (prefs.tier_models && typeof prefs.tier_models === 'object') {
       for (const [tier, ids] of Object.entries(prefs.tier_models)) {
         const list = Array.isArray(ids) ? ids : [ids];
         for (const id of list) {

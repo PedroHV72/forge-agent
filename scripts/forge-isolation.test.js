@@ -1098,12 +1098,13 @@ test('require_worktree:auto elevates when execute-task can derive GPT from tier_
     });
 });
 
-test('explicit Claude worker prevents tier_models GPT from forcing worktree elevation', () => {
+test('explicit Claude worker cannot suppress conservative tier_models isolation', () => {
   withShape({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'auto', 'execute-task': 'claude' }, tier_models: { standard: 'gpt-5.6-sol' } },
     { members: [] }, (s) => {
       const eff = resolveEffectiveMode(s.ws);
-      assertEq(eff.mode, 'shared');
-      assertEq(eff.elevated, false);
+      assertEq(eff.mode, 'worktree');
+      assertEq(eff.elevated, true);
+      assertEq(eff.write_engine, 'tier_models.standard:gpt');
     });
 });
 
