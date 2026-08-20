@@ -147,10 +147,13 @@ function resolveRequireWorktree(cwd) {
 }
 
 // Detects whether an external write-engine (codex/gpt/gemini) is configured for
-// execute-task. Returns { detected, reason }. Two signals (generous, OR'd):
+// execute-task. Returns { detected, reason }. Three signals (generous, OR'd):
 //   (1) workers.execute-task == codex (the sidecar write path);
 //   (2) any routing.<domain>.executor.<tier|fallback> id whose modelFamily is
-//       gpt or gemini. Read-only paths (plan-slice Branch D, review challenger)
+//       gpt or gemini;
+//   (3) when workers.execute-task is not explicitly pinned, any tier_models
+//       member whose family is gpt or gemini (the legacy resolver path).
+//       Read-only paths (plan-slice Branch D, review challenger)
 //       are intentionally NOT inspected — they never write.
 // Never throws (never blocks activation): any error → { detected:true,
 // reason:'detect-error (fail-safe: elevating)' } — detection fails SAFE
@@ -163,6 +166,20 @@ function detectExternalWriteEngine(cwd) {
     const prefs = readPrefsCached(cwd).prefs;
     if (prefs.workers && String(prefs.workers['execute-task']).toLowerCase() === 'codex') {
       return { detected: true, reason: 'workers.execute-task:codex' };
+    }
+
+    const workerPinned = Boolean(prefs.workers && typeof prefs.workers === 'object'
+      && Object.prototype.hasOwnProperty.call(prefs.workers, 'execute-task'));
+    if (!workerPinned && prefs.tier_models && typeof prefs.tier_models === 'object') {
+      for (const [tier, ids] of Object.entries(prefs.tier_models)) {
+        const list = Array.isArray(ids) ? ids : [ids];
+        for (const id of list) {
+          const fam = modelFamily(id);
+          if (fam === 'gpt' || fam === 'gemini') {
+            return { detected: true, reason: 'tier_models.' + tier + ':' + fam };
+          }
+        }
+      }
     }
 
     const cfg = readRoutingConfig(cwd);

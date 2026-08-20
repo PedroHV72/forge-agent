@@ -1088,6 +1088,25 @@ test('require_worktree:auto still elevates a derived shared base when a write en
     });
 });
 
+test('require_worktree:auto elevates when execute-task can derive GPT from tier_models', () => {
+  withShape({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'auto' }, tier_models: { standard: 'gpt-5.6-sol' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assertEq(eff.mode, 'worktree');
+      assertEq(eff.elevated, true);
+      assertEq(eff.write_engine, 'tier_models.standard:gpt');
+    });
+});
+
+test('explicit Claude worker prevents tier_models GPT from forcing worktree elevation', () => {
+  withShape({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'auto', 'execute-task': 'claude' }, tier_models: { standard: 'gpt-5.6-sol' } },
+    { members: [] }, (s) => {
+      const eff = resolveEffectiveMode(s.ws);
+      assertEq(eff.mode, 'shared');
+      assertEq(eff.elevated, false);
+    });
+});
+
 test('require_worktree:auto with no write engine leaves a derived shared base alone', () => {
   withShape({ forge_isolation: { auto_pull_main: false }, workers: { require_worktree: 'auto' } },
     { members: [] }, (s) => {
