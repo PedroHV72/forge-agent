@@ -12,12 +12,12 @@
     {
       "source_id": "commands",
       "target": "commands",
-      "sha256": "b3c3b1ff38e4be149fb283b7e8fb15ec1ae9530da1215002a936ec875f7ebda3"
+      "sha256": "0ad209f612a4f1328b520e049b9599f1558922851181ebe9cb3191ffd49f4b5d"
     },
     {
       "source_id": "skills",
       "target": "skills",
-      "sha256": "0515969bf8157c6c3e67a17da99f54b13e4ca19f0e061828d6ec7d0779bc4b59"
+      "sha256": "5743771342c9f2a979cc4ee27cc3ca1e43cce1864dd1997d438f347cb068aa51"
     },
     {
       "source_id": "dispatch-templates",
@@ -37,7 +37,7 @@
     {
       "source_id": "claude-instructions",
       "target": "project/CLAUDE.md",
-      "sha256": "684935744e4888073f03f1e98a0db1eecd293f61bd379483e6ccfd25f8ba5bf8"
+      "sha256": "4e95f8fe7caa39b5d5745b484335c16ba629f8fb75c00fcafac14f9547495497"
     },
     {
       "source_id": "claude-settings",
