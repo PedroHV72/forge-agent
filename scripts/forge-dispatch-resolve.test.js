@@ -179,6 +179,16 @@ withHermeticHome((cliEnv) => {
     cleanup(f);
   });
 
+  runCase('non-routable GPT tier derives GPT engine instead of Claude default', () => {
+    const f = mkFixture({ prefsJsonc: '{"tier_models":{"max":"gpt-5.6-sol"}}' });
+    const r = dispatch(f, { unitType: 'plan-milestone' });
+    assertEqual(r.model, 'gpt-5.6-sol', 'GPT tier model is retained');
+    assertEqual(r.engine, 'gpt', 'engine follows the GPT model family');
+    assertEqual(r.dispatch_engine, 'codex', 'GPT family normalizes to Codex dispatch');
+    assertEqual(r.engine_reason, 'tier-model-family:gpt', 'engine reason names tier family');
+    cleanup(f);
+  });
+
   runCase('routing backend executor selects capped routing chain', () => {
     const f = mkFixture({
       prefsJsonc: '{"routing":{"backend":{"executor":{"standard":["gpt-5-codex","claude-sonnet-5","claude-opus-4-8","claude-haiku-4-5-20251001"]}}}}',

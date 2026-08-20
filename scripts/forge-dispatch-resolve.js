@@ -299,6 +299,13 @@ function resolveDispatch(opts) {
   } else if (workers.workers_engine !== 'claude') {
     engine = workers.workers_engine;
     engineReason = `workers.${unitType}:${engine}`;
+  } else if (chain[0] && chain[0].engine && chain[0].engine !== 'claude') {
+    // tier_models is also allowed to carry a cross-provider model.  Treating
+    // every non-routable phase as Claude here made a GPT-only tier catalogue
+    // lie in the live phase matrix and could hand a GPT model id to a Claude
+    // dispatch.  The model-family classifier in forge-routing owns this value.
+    engine = chain[0].engine;
+    engineReason = `tier-model-family:${engine}`;
   } else {
     engine = 'claude';
     engineReason = 'default:claude';
