@@ -89,6 +89,34 @@ function readMeasurementIds(file) {
   }
 }
 
+function writeAndSync(file, content, flag) {
+  const handle = fs.openSync(file, flag);
+  try { fs.writeFileSync(handle, content, 'utf8'); fs.fsyncSync(handle); }
+  finally { fs.closeSync(handle); }
+}
+
+function recoverIncompleteTail(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch (error) { if (error && error.code === 'ENOENT') return null; throw error; }
+  if (!raw || raw.endsWith('\n')) return null;
+  const boundary = raw.lastIndexOf('\n') + 1;
+  const tail = raw.slice(boundary);
+  try {
+    JSON.parse(tail);
+    writeAndSync(file, '\n', 'a');
+    return null;
+  }
+  catch {
+    const recovery = `${file}.incomplete-${Date.now()}-${process.pid}`;
+    writeAndSync(recovery, tail, 'wx');
+    const handle = fs.openSync(file, 'r+');
+    try { fs.ftruncateSync(handle, Buffer.byteLength(raw.slice(0, boundary), 'utf8')); fs.fsyncSync(handle); }
+    finally { fs.closeSync(handle); }
+    return recovery;
+  }
+}
+
 function appendRecord(cwd, record, opts) {
   const o = opts || {};
   const file = path.join(cwd, LEDGER_RELATIVE);
@@ -96,8 +124,10 @@ function appendRecord(cwd, record, opts) {
   const lock = (o.acquire || mutex.acquireSync)(cwd, LOCK_NAME, { holderRunId: record.milestone });
   try {
     if (!mutex.assertOwned(lock)) throw new Error('lock do ledger perdido antes da escrita');
+    recoverIncompleteTail(file);
     if (readMeasurementIds(file).has(record.measurement_id)) return { ok: true, appended: false, reason: 'duplicate-measurement', file, record };
-    fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8');
+    if (!mutex.renewHandle(lock).ok || !mutex.assertOwned(lock)) throw new Error('lock do ledger perdido antes da escrita');
+    writeAndSync(file, `${JSON.stringify(record)}\n`, 'a');
     return { ok: true, appended: true, reason: 'appended', file, record };
   } finally {
     const released = lock.release();
@@ -107,8 +137,9 @@ function appendRecord(cwd, record, opts) {
 
 function recordCoverage(cwd, milestone, opts) {
   const o = opts || {};
-  const report = o.report || measureCoverage(cwd, o.measureOpts || {});
-  return appendRecord(cwd, compactRecord(report, milestone, { cwd, sourceHead: o.sourceHead }), o);
+  const milestoneId = normalizeMilestone(milestone);
+  const report = o.report || measureCoverage(cwd, { ...(o.measureOpts || {}), owner: milestoneId });
+  return appendRecord(cwd, compactRecord(report, milestoneId, { cwd, sourceHead: o.sourceHead }), o);
 }
 
 function parseArgs(argv) {
@@ -136,4 +167,4 @@ function main(argv) {
 }
 
 if (require.main === module) process.exit(main(process.argv.slice(2)));
-module.exports = { SCHEMA_VERSION, LEDGER_RELATIVE, LOCK_NAME, normalizeMilestone, sourceRevision, compactRecord, readMeasurementIds, appendRecord, recordCoverage, parseArgs, main };
+module.exports = { SCHEMA_VERSION, LEDGER_RELATIVE, LOCK_NAME, normalizeMilestone, sourceRevision, compactRecord, readMeasurementIds, recoverIncompleteTail, appendRecord, recordCoverage, parseArgs, main };

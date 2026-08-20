@@ -76,7 +76,12 @@ advisory** (D6).
 medição canônica e anexa um snapshot compacto a
 `.gsd/forge/write-coverage.jsonl`. O append usa mutex, retries idênticos são
 deduplicados por `measurement_id` e `inconclusive` permanece um resultado
-registrado — ausência de amostra nunca vira autorização para o flip.
+registrado — ausência de amostra nunca vira autorização para o flip. Cada
+snapshot filtra corpus, refs, commits e skips pelo milestone rotulado; outro
+milestone não pode melhorar nem piorar sua medição. Se uma interrupção deixar
+somente o último JSON incompleto, os bytes são preservados em um sidecar
+`.incomplete-*` antes da recuperação; corrupção em qualquer linha completa
+continua falhando de modo fechado.
 
 ## Inputs
 

@@ -42,6 +42,26 @@ test('linha corrompida impede append em vez de desaparecer do censo', () => {
   let message = ''; try { mod.appendRecord(cwd, mod.compactRecord(report(), 'M123', { sourceHead: 'abc' })); } catch (e) { message = e.message; }
   assert(message.includes('linha 1'), 'corrupção nomeada'); eq(fs.readFileSync(file, 'utf8'), '{quebrado}\n', 'arquivo não alterado');
 });
+test('tail parcial é preservado e recuperado antes do próximo append', () => {
+  const cwd = fixture(); const file = path.join(cwd, mod.LEDGER_RELATIVE); fs.mkdirSync(path.dirname(file), { recursive: true });
+  const first = mod.compactRecord(report(), 'M123', { sourceHead: 'abc' });
+  fs.writeFileSync(file, `${JSON.stringify(first)}\n{"measurement_id":"interrompido`, 'utf8');
+  const second = mod.compactRecord(report({ coverage: 0.5 }), 'M124', { sourceHead: 'def' });
+  mod.appendRecord(cwd, second);
+  const rows = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+  eq(rows.length, 2, 'duas linhas válidas'); eq(rows[1].measurement_id, second.measurement_id, 'nova linha');
+  const recovery = fs.readdirSync(path.dirname(file)).filter((name) => name.includes('.incomplete-'));
+  eq(recovery.length, 1, 'tail preservado'); assert(fs.readFileSync(path.join(path.dirname(file), recovery[0]), 'utf8').includes('interrompido'), 'bytes recuperáveis');
+});
+test('JSON completo sem newline é reparado antes do próximo append', () => {
+  const cwd = fixture(); const file = path.join(cwd, mod.LEDGER_RELATIVE); fs.mkdirSync(path.dirname(file), { recursive: true });
+  const first = mod.compactRecord(report(), 'M123', { sourceHead: 'abc' });
+  const second = mod.compactRecord(report({ coverage: 0.5 }), 'M124', { sourceHead: 'def' });
+  fs.writeFileSync(file, JSON.stringify(first), 'utf8');
+  mod.appendRecord(cwd, second);
+  const rows = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+  eq(rows.length, 2, 'objetos permanecem em linhas separadas');
+});
 test('milestone inválido falha fechado antes de criar o ledger', () => {
   const cwd = fixture(); let threw = false; try { mod.recordCoverage(cwd, '../escape', { report: report(), sourceHead: 'abc' }); } catch { threw = true; }
   assert(threw, 'recusado'); assert(!fs.existsSync(path.join(cwd, mod.LEDGER_RELATIVE)), 'nenhum arquivo');
