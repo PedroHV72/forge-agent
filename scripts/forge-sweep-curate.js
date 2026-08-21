@@ -12,7 +12,7 @@ const memory = require('./forge-memory');
 const { buildClusters } = require('./forge-memory-clusters');
 const { rewriteFragment } = require('./forge-memory-rewrite');
 const { createRegistry, formatPreview } = require('./forge-sweep-registry');
-const { writeVault, restoreVault } = require('./forge-sweep-vault');
+const { writeVault, restoreVault, normalizeMemberId } = require('./forge-sweep-vault');
 const journal = require('./forge-sweep-journal');
 const { activeUnits, isUnitBlocked } = require('./forge-sweep-active-phase');
 const { createEligibility, isVcsQueryFailure } = require('./forge-sweep-eligibility');
@@ -53,6 +53,32 @@ const USAGE = 'Uso: node scripts/forge-sweep-curate.js [--cwd <dir>] [--arbitrat
  * 9. Undo reads pointer-only journal data and lets restoreVault compare raw
  *    buffers.  It reports individual restoration conflicts without writing an
  *    undo-done outcome until all requested members are restored.
+ * 10. Curation rewrites a fragment IN PLACE, so after a real apply the
+ *    destination always diverges from the vaulted bytes.  The vault refuses a
+ *    divergent destination by default (correctly), which made `--undo` inert
+ *    on every post-apply attempt.  The opt-in is deliberately NOT a boolean:
+ *    the apply records the exact member ids it vaulted and undo replays only
+ *    that closed set into restoreVault.  A vault member outside the recorded
+ *    set is still refused by name, and a missing/foreign record authorizes
+ *    nothing at all — the historical deny-by-default.  The record is a
+ *    curate-owned sidecar rather than a journal field because the journal is
+ *    pointer-only by design (S08 § W3) and its reader carries named fields
+ *    only; the sidecar is opened BEFORE the first rewrite so an interrupted
+ *    apply still leaves an undoable authorization.
+ * 10b. That record names only the members whose rewrite MAY HAVE CHANGED BYTES.
+ *    It grows ONE MEMBER AT A TIME, each appended immediately before its own
+ *    rewrite is attempted (so a crash mid-rewrite is still undoable — the
+ *    crash-safety the pre-loop write existed to give, with no window), and the
+ *    member is WITHDRAWN again when the boundary refuses without throwing:
+ *    every `refusal()` in forge-memory-rewrite returns before the atomic write,
+ *    so the destination still holds its pre-apply bytes.  A member skipped by
+ *    OFF_SET_REASON is never named at all.  Authorizing an untouched member
+ *    buys nothing — unrewritten, it restores as `alreadyPresent` and needs no
+ *    authorization — and only removes the fence that would otherwise refuse to
+ *    clobber a legitimate LATER edit to it.  These are live `.gsd/memory/*.md`,
+ *    forge-memory's own write target after every unit, so an interim edit is
+ *    the normal flow (S07 R1; S08: "undo devolve bytes pré-apply, o problema é
+ *    atropelar a edição").
  *
  * These rules are kept near the imports because adding a convenient local
  * serializer, a group container, or a fall-through safety gate would defeat
@@ -244,10 +270,73 @@ function selectedDrops(doc, eligible) {
   return byStorage;
 }
 
+// The ordered write population: every storage key whose fragment path the
+// eligible set resolves, carrying both halves so the vault member id produced
+// for a file can be attributed back to the storage key that will be rewritten.
+function dropTargets(cwd, drops, eligible) {
+  return [...drops.keys()]
+    .map(storageKey => ({ storageKey, file: eligible.byStorage.get(storageKey) }))
+    .filter(entry => Boolean(entry.file))
+    .map(entry => ({ storageKey: entry.storageKey, file: path.resolve(cwd, entry.file) }));
+}
+
 function filesForDrops(cwd, drops, eligible) {
   // rewriteFragment owns storage-key lookup; use the eligible member addresses
   // only for vault file paths, never serialize fragments here.
-  return [...drops.keys()].map(key => eligible.byStorage.get(key)).filter(Boolean).map(file => path.resolve(cwd, file));
+  return dropTargets(cwd, drops, eligible).map(entry => entry.file);
+}
+
+const AUTH_DIR = path.join('.gsd', 'forge', 'sweep-curate-auth');
+const AUTH_MISSING = 'authorization-record-failed';
+
+// One sidecar per container, named after the container basename. The container
+// path handed to these helpers is already the journal's validated resolution
+// (safeContainerPath), so only its basename is ever used to address the record.
+function authorizationPath(cwd, containerPath) {
+  return path.join(cwd, AUTH_DIR, `${path.basename(containerPath)}.json`);
+}
+
+function writeAuthorization(cwd, containerPath, members, options) {
+  const ids = (Array.isArray(members) ? members : []).map(normalizeMemberId).filter(Boolean);
+  const io = Object.assign({}, fs, options && options.io);
+  let temporary = null;
+  let handle = null;
+  try {
+    const file = authorizationPath(cwd, containerPath);
+    io.mkdirSync(path.dirname(file), { recursive: true });
+    temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    handle = io.openSync(temporary, 'wx');
+    io.writeFileSync(handle, `${JSON.stringify({ operation: OPERATION, container: path.basename(containerPath), members: ids }, null, 2)}\n`, 'utf8');
+    io.fsyncSync(handle);
+    io.closeSync(handle);
+    handle = null;
+    // The previous authorization remains intact until this single publication
+    // boundary. A failed/truncated staging write can therefore never erase the
+    // members that already make an interrupted apply undoable.
+    io.renameSync(temporary, file);
+    temporary = null;
+    return { ok: true, file, members: ids };
+  } catch (error) {
+    if (handle !== null) { try { io.closeSync(handle); } catch (_) {} }
+    if (temporary) { try { io.unlinkSync(temporary); } catch (_) {} }
+    return { ok: false, error: error.message };
+  }
+}
+
+// Deny-by-default at every failure: unreadable, malformed, written by another
+// operation, or naming a different container all yield the empty set, which is
+// exactly the historical unconditional refusal. A record is never inferred from
+// the container's own contents — that would authorize every parsed member and
+// dissolve the fence this function exists to keep.
+function authorizedMembers(cwd, containerPath) {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(authorizationPath(cwd, containerPath), 'utf8')); }
+  catch (_) { return []; }
+  if (!parsed || typeof parsed !== 'object') return [];
+  if (parsed.operation !== OPERATION) return [];
+  if (parsed.container !== path.basename(containerPath)) return [];
+  if (!Array.isArray(parsed.members)) return [];
+  return parsed.members.map(normalizeMemberId).filter(Boolean);
 }
 
 function applyCurate(ctx, plan) {
@@ -258,7 +347,8 @@ function applyCurate(ctx, plan) {
   const eligible = eligibleSet(plan);
   const filteredOut = filteredOutClusters(arbitration, eligible);
   const drops = selectedDrops(arbitration, eligible);
-  const files = filesForDrops(ctx.cwd, drops, eligible);
+  const targets = dropTargets(ctx.cwd, drops, eligible);
+  const files = targets.map(entry => entry.file);
   if (!files.length) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut) };
   let vault;
   try { vault = (ctx.writeVault || writeVault)(ctx.cwd, { operation: OPERATION, files }); }
@@ -266,17 +356,44 @@ function applyCurate(ctx, plan) {
   if (!vault || vault.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, (vault && vault.skipped) || [{ path: '.gsd/forge/sweep-vault', reason: 'vault-failed' }]), error: 'vault-failed' };
   const intent = (ctx.journal || journal).appendIntent(ctx.cwd, { operation: OPERATION, containers: [vault.containerPath] });
   if (!intent || intent.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, [{ path: vault.containerPath, reason: `journal-intent-failed: ${(intent && intent.error) || 'indisponível'}` }]), error: 'journal-intent-failed' };
+  // Opened before the first rewrite, for the same reason appendIntent is: an
+  // apply interrupted mid-loop must still be undoable. It starts EMPTY and is
+  // grown one member at a time below (§ 10b) — a member the loop never rewrites
+  // must never be authorized to overwrite a later legitimate edit.
+  const writeAuth = ctx.writeAuthorization || writeAuthorization;
+  const authorized = [];
+  let authorization = writeAuth(ctx.cwd, vault.containerPath, authorized);
+  if (!authorization || authorization.ok !== true) return { written: [], skipped: (fresh.skipped || []).concat(filteredOut, [{ path: vault.containerPath, reason: `${AUTH_MISSING}: ${(authorization && authorization.error) || 'indisponível'}` }]), error: AUTH_MISSING };
+  const memberIds = new Map(targets.map((entry, index) => [entry.storageKey, (vault.members || [])[index]]));
   const written = []; const skipped = (fresh.skipped || []).concat(filteredOut);
   for (const [storageKey, dropMemIds] of drops) {
     // Last structural gate: an address absent from the eligible set never
     // reaches the write boundary, whatever produced `drops`.
     if (!eligible.byStorage.has(storageKey)) { skipped.push({ path: storageKey, reason: OFF_SET_REASON }); continue; }
+    // Authorize THIS member, and only it, before its rewrite can start. If the
+    // record cannot be grown, the rewrite does not happen: an unrecorded
+    // rewrite is exactly the un-undoable apply the pre-loop write forbids.
+    const candidate = authorized.concat([memberIds.get(storageKey)].filter(Boolean));
+    const grown = writeAuth(ctx.cwd, vault.containerPath, candidate);
+    if (!grown || grown.ok !== true) { skipped.push({ path: storageKey, reason: `${AUTH_MISSING}: ${(grown && grown.error) || 'indisponível'}` }); continue; }
+    authorization = grown; authorized.length = 0; authorized.push(...candidate);
     const result = (ctx.rewriteFragment || rewriteFragment)(ctx.cwd, { storageKey, dropMemIds });
-    if (result && result.ok) written.push(result.path); else skipped.push({ path: (result && result.path) || storageKey, reason: (result && result.reason) || 'rewrite-failed' });
+    if (result && result.ok) { written.push(result.path); continue; }
+    skipped.push({ path: (result && result.path) || storageKey, reason: (result && result.reason) || 'rewrite-failed' });
+    // A NON-THROWING refusal is the write boundary's own statement that it
+    // returned before touching the destination (every `refusal()` in
+    // forge-memory-rewrite precedes the atomic write). Those bytes are still
+    // the pre-apply bytes, so the member restores as `alreadyPresent` and
+    // needs no authorization — withdrawing it is pure protection. A THROW is
+    // deliberately NOT withdrawn: the rewrite may have landed.
+    const withdrawn = authorized.slice(0, -1);
+    const shrunk = writeAuth(ctx.cwd, vault.containerPath, withdrawn);
+    if (!shrunk || shrunk.ok !== true) { skipped.push({ path: vault.containerPath, reason: `authorization-withdraw-failed: ${(shrunk && shrunk.error) || 'indisponível'}` }); continue; }
+    authorization = shrunk; authorized.length = 0; authorized.push(...withdrawn);
   }
   const outcome = (ctx.journal || journal).appendOutcome(ctx.cwd, { id: intent.id, phase: 'apply-done', written: [vault.containerPath] });
   if (!outcome || outcome.ok !== true) skipped.push({ path: vault.containerPath, reason: `journal-outcome-failed: ${(outcome && outcome.error) || 'indisponível'}` });
-  return { written, skipped, journalId: intent.id, vault: vault.containerPath };
+  return { written, skipped, journalId: intent.id, vault: vault.containerPath, authorization: authorization.file, authorized: authorization.members };
 }
 
 function buildRegistry() { const registry = createRegistry(); registry.register({ name: OPERATION, description: 'Aplica somente vereditos humanos de curadoria semântica.', plan: curatePlan, apply: applyCurate }); return registry; }
@@ -289,7 +406,17 @@ async function runUndo(cwd, options) {
   if (!options.yes && !process.stdin.isTTY) { process.stdout.write('desfazer não confirmado fora de TTY; use --yes para confirmar\n'); return 0; }
   if (!options.yes && !(await askConfirmation('Confirmar desfazer? Digite "sim": '))) return 0;
   const restored = []; const errors = [];
-  for (const rel of listed.entry.containers) { const container = journal._private.safeContainerPath(cwd, rel); if (!container) { errors.push(`${rel}: container inválido`); continue; } try { const result = restoreVault(cwd, container); restored.push(...result.restored, ...result.alreadyPresent); for (const refused of result.refused) errors.push(`${refused.path}: ${refused.reason}`); } catch (error) { errors.push(error.message); } }
+  for (const rel of listed.entry.containers) {
+    const container = journal._private.safeContainerPath(cwd, rel);
+    if (!container) { errors.push(`${rel}: container inválido`); continue; }
+    try {
+      // The closed set recorded by the apply that wrote this container — never
+      // a boolean, never the container's own member list.
+      const result = restoreVault(cwd, container, { overwrite: authorizedMembers(cwd, container) });
+      restored.push(...result.restored, ...result.alreadyPresent);
+      for (const refused of result.refused) errors.push(`${refused.path}: ${refused.reason}`);
+    } catch (error) { errors.push(error.message); }
+  }
   if (!errors.length) { const outcome = journal.appendOutcome(cwd, { id: listed.entry.id, phase: 'undo-done', written: restored }); if (!outcome.ok) errors.push(outcome.error); }
   process.stdout.write(options.json ? `${JSON.stringify({ undo: { restored, errors } })}\n` : `desfeito: ${restored.length} restaurado(s)\n`); return errors.length ? 1 : 0;
 }
@@ -310,5 +437,5 @@ async function main(argv) {
   } catch (error) { process.stderr.write(`${OPERATION}: ${error.reason || error.message}\n`); return error.exitCode || 1; }
 }
 
-module.exports = { buildRegistry, validateArbitrationShape, planFingerprint, main, _private: { OPERATION, parseArgs, resolveCwd, loadArbitration, validateArbitrationAgainstPlan, curatePlan, applyCurate, selectedDrops, filesForDrops, eligibleSet, filteredOutClusters, rawPlan, runUndo, FILTERED_REASON, OFF_SET_REASON } };
+module.exports = { buildRegistry, validateArbitrationShape, planFingerprint, main, _private: { OPERATION, parseArgs, resolveCwd, loadArbitration, validateArbitrationAgainstPlan, curatePlan, applyCurate, selectedDrops, filesForDrops, dropTargets, eligibleSet, filteredOutClusters, rawPlan, runUndo, FILTERED_REASON, OFF_SET_REASON, AUTH_MISSING, AUTH_DIR, authorizationPath, writeAuthorization, authorizedMembers } };
 if (require.main === module) main(process.argv.slice(2)).then(code => { process.exitCode = code; }).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

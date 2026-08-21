@@ -41,7 +41,16 @@ function isWithin(root, candidate) {
 // workspace — no explosion (the 311 -> 972 precedent below was an ANY-suffix
 // widening, not a closed-list addition). `jsonl|jsonc` sit before `json` for
 // clarity only; the trailing guards already force the longest alternative.
-const CODE_EXT = '(?:js|mjs|cjs|ts|tsx|jsx|jsonl|jsonc|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg|txt|swift)';
+// Measured, narrow widening (T01, 2026-08-19): less|ttf added to the closed
+// list. Measured on `node scripts/forge-memory-index.js --json --cwd <cwd>`
+// against this workspace's `.gsd/memory` store: citations_total stayed
+// 37 -> 37 — no fragment in THIS repo's store currently mentions a `.less` or
+// `.ttf` file, so there is no real miss here to recover (verified: zero
+// `.less`/`.ttf` occurrences anywhere under `.gsd/memory`). The extraction and
+// resolution behavior is proven instead by forge-memory-index.test.js, which
+// exercises `mobile-reset.less` / `Roboto-Bold.ttf` via fixtures with a
+// positive control (reverting `less|ttf` here turns those cases red).
+const CODE_EXT = '(?:js|mjs|cjs|ts|tsx|jsx|jsonl|jsonc|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg|txt|swift|less|ttf)';
 
 const CITATION_REGEXES = [
   {

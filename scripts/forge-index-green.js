@@ -88,25 +88,29 @@ const DEFAULT_ALLOWED_RELPATH = ALLOWED_SEARCH_RELPATHS[1];
 //
 // A miss is a (fact, missing mention) pair taken STRAIGHT from what measureF2
 // already produces (facts_missed_total / facts_missed_partial) — the gate
-// derives, never re-measures. The key is `<mem_id>::<normalized mention>`:
+// derives, never re-measures. The key is `<storage_key>::<mem_id>::<normalized
+// mention>`:
+//   - storage_key names the exact fragment that produced the fact — the same
+//     mem_id can legitimately appear in many fragments (a memory promoted
+//     across units keeps its mem_id), so mem_id alone is not a stable unit;
 //   - mem_id is assigned once when the fact is written and never re-numbered
 //     by neighboring writes;
 //   - the normalized mention (basename, lowercased) is a pure function of the
 //     fact's own text, computed by the instrument itself (detectMentions),
 //     independent of line numbers, read order, or sibling fragments.
-// The more obvious key would also carry the fragment's storage_key (unit id),
-// but measureF2 deliberately omits it from facts_missed_partial — and reaching
-// around the instrument to re-derive it would mean re-reading the store, which
-// requirement 7 forbids. mem_id+mention is the stable subset the measurement
-// itself exposes; a same-mem_id-same-mention collision across two fragments
-// collapses into one key (named limitation, see missKey below).
+// storage_key is already computed by classifyFact (fragment.storageKey) inside
+// the existing listFragments/readFragmentText pass in measureF2 — it is
+// carried through the projection, never re-read from the store here. An
+// allowed entry with no storage_key can no longer grant a mem_id::mention pair
+// permission across every fragment that happens to reuse that mem_id — the
+// exact leak this qualification exists to close.
 // ---------------------------------------------------------------------------
 
-function missKey(memId, mention) {
+function missKey(storageKey, memId, mention) {
   // `::` is the display-friendly delimiter; a mention containing `::` is
   // theoretical (normalized basenames of file-shaped tokens) and would only
   // ever collide with itself.
-  return `${memId || '(sem-mem_id)'}::${mention}`;
+  return `${storageKey || '(sem-storage_key)'}::${memId || '(sem-mem_id)'}::${mention}`;
 }
 
 // Enumerate every (fact, missing mention) pair from a measureF2 report,
@@ -122,23 +126,25 @@ function enumerateMisses(f2) {
     for (const fact of bucket) {
       const missing = Array.isArray(fact.missing_mentions) ? fact.missing_mentions : [];
       for (const mention of missing) {
-        const key = missKey(fact.mem_id, mention.normalized);
-        if (!out.has(key)) out.set(key, { mem_id: fact.mem_id || null, mention: mention.normalized, key });
+        const key = missKey(fact.storage_key, fact.mem_id, mention.normalized);
+        if (!out.has(key)) out.set(key, { storage_key: fact.storage_key || null, mem_id: fact.mem_id || null, mention: mention.normalized, key });
       }
     }
   }
   return [...out.values()];
 }
 
-// Every mem_id the measurement actually read, across all four buckets — the
-// existence check for ghost entries derives from the same report, never from
-// a second store read.
-function collectLiveMemIds(f2) {
+// Every qualified (storage_key, mem_id) pair the measurement actually read,
+// across all four buckets — the existence check for ghost entries derives
+// from the same report, never from a second store read. Qualified by
+// storage_key so a reused mem_id in a DIFFERENT fragment can never mask a
+// nonexistent identity (a global mem_id-only set would).
+function collectLiveQualifiedIds(f2) {
   const ids = new Set();
   const buckets = ['facts_covered', 'facts_missed_total', 'facts_missed_partial', 'facts_no_mention'];
   for (const name of buckets) {
     for (const fact of Array.isArray(f2 && f2[name]) ? f2[name] : []) {
-      if (fact && fact.mem_id) ids.add(fact.mem_id);
+      if (fact && fact.mem_id) ids.add(`${fact.storage_key || ''}::${fact.mem_id}`);
     }
   }
   return ids;
@@ -170,7 +176,7 @@ function resolveAllowedMisses(text) {
     if (key !== 'allowed') errors.push(`allowed-misses tem chave desconhecida "${key}" (esperado: "allowed")`);
   }
   if (!Array.isArray(doc.allowed)) {
-    errors.push('allowed-misses deve ter "allowed" como array de {mem_id, mention, item, reason}');
+    errors.push('allowed-misses deve ter "allowed" como array de {storage_key, mem_id, mention, item, reason}');
     return { ok: false, errors };
   }
   const seen = new Set();
@@ -180,7 +186,7 @@ function resolveAllowedMisses(text) {
       errors.push(`allowed[${index}] deve ser um objeto com mem_id/mention/item/reason`);
       continue;
     }
-    const { mem_id, mention, item, reason } = entry;
+    const { storage_key, mem_id, mention, item, reason } = entry;
     if (typeof mem_id !== 'string' || mem_id.trim() === '') {
       errors.push(`allowed[${index}] está sem "mem_id" (o fato dono do miss)`);
       continue;
@@ -189,7 +195,11 @@ function resolveAllowedMisses(text) {
       errors.push(`allowed[${index}] (${mem_id}) está sem "mention" (a menção normalizada que falha)`);
       continue;
     }
-    const key = missKey(mem_id, mention);
+    if (typeof storage_key !== 'string' || storage_key.trim() === '') {
+      errors.push(`allowed[${index}] (${mem_id}::${mention}) está sem "storage_key" (o fragmento medido que produziu o miss)`);
+      continue;
+    }
+    const key = missKey(storage_key, mem_id, mention);
     // `item` is the owner — mandatory. An entry without an owner is how red
     // becomes scenery: nobody is on the hook to ever remove it.
     if (typeof item !== 'string' || item.trim() === '') {
@@ -205,11 +215,12 @@ function resolveAllowedMisses(text) {
   return {
     ok: true,
     entries: doc.allowed.map((entry) => ({
+      storage_key: entry.storage_key,
       mem_id: entry.mem_id,
       mention: entry.mention,
       item: entry.item,
       reason: entry.reason,
-      key: missKey(entry.mem_id, entry.mention),
+      key: missKey(entry.storage_key, entry.mem_id, entry.mention),
     })),
   };
 }
@@ -225,22 +236,27 @@ function resolveAllowedMisses(text) {
 // prevent.
 // ---------------------------------------------------------------------------
 
-function compareMisses({ factsEvaluated, misses, allowedEntries, liveMemIds }) {
+function compareMisses({ factsEvaluated, misses, allowedEntries, liveQualifiedIds }) {
   if (!Number.isInteger(factsEvaluated) || factsEvaluated <= 0) {
     return { ok: false, code: 'no-facts-evaluated', newMisses: [], staleEntries: [], ghostEntries: [], knownMisses: [] };
   }
   const missSet = new Set((Array.isArray(misses) ? misses : []).map((m) => m.key));
-  const live = liveMemIds instanceof Set ? liveMemIds : new Set(liveMemIds || []);
+  const live = liveQualifiedIds instanceof Set ? liveQualifiedIds : new Set(liveQualifiedIds || []);
   const allowed = Array.isArray(allowedEntries) ? allowedEntries : [];
-  const allowedKeys = allowed.map((e) => e.key || missKey(e.mem_id, e.mention));
-  const allowedByKey = new Map(allowed.map((e) => [e.key || missKey(e.mem_id, e.mention), e]));
+  const allowedKeys = allowed.map((e) => e.key || missKey(e.storage_key, e.mem_id, e.mention));
+  const allowedByKey = new Map(allowed.map((e) => [e.key || missKey(e.storage_key, e.mem_id, e.mention), e]));
 
   const newMisses = [...missSet].filter((key) => !allowedByKey.has(key)).sort();
-  // Ghost: the entry's mem_id no longer exists anywhere in the store — the
-  // fact it pointed at is gone. Distinct from stale (fact alive, mention no
-  // longer failing): a ghost can never be observed to fail again, so leaving
-  // it listed is pure scenery.
-  const ghostEntries = allowedKeys.filter((key) => !live.has(allowedByKey.get(key).mem_id)).sort();
+  // Ghost: the entry's (storage_key, mem_id) pair no longer exists anywhere in
+  // the store — the fragment/fact it pointed at is gone. Qualified by
+  // storage_key so a mem_id reused in a DIFFERENT fragment can never mask a
+  // nonexistent identity. Distinct from stale (fact alive, mention no longer
+  // failing): a ghost can never be observed to fail again, so leaving it
+  // listed is pure scenery.
+  const ghostEntries = allowedKeys.filter((key) => {
+    const e = allowedByKey.get(key);
+    return !live.has(`${e.storage_key || ''}::${e.mem_id}`);
+  }).sort();
   const ghostSet = new Set(ghostEntries);
   const staleEntries = allowedKeys.filter((key) => !ghostSet.has(key) && !missSet.has(key)).sort();
   const knownMisses = [...missSet].filter((key) => allowedByKey.has(key)).sort();
@@ -410,7 +426,7 @@ function measureGreenUnsafe(cwd, opts) {
       factsEvaluated,
       misses,
       allowedEntries: loaded.entries,
-      liveMemIds: collectLiveMemIds(f2),
+      liveQualifiedIds: collectLiveQualifiedIds(f2),
     });
     if (verdict.code === 'no-facts-evaluated') reasons.push('no-facts-evaluated');
     for (const key of verdict.newMisses) reasons.push(`unlisted-miss:${key}`);
@@ -565,7 +581,7 @@ module.exports = {
   // malformed axis shape instead of faking the store).
   missKey,
   enumerateMisses,
-  collectLiveMemIds,
+  collectLiveQualifiedIds,
   resolveAllowedMisses,
   compareMisses,
   computeUnitAxisCriterion,

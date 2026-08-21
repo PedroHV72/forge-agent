@@ -1933,6 +1933,105 @@ test('CODE_EXT widening does not explode: dotted identifiers and versions still 
   assertEq(globbed[0].path, 'evidence-*.jsonl');
 });
 
+// ── CODE_EXT widening (T01, 2026-08-19): less|ttf ────────────────────────────
+// Adição estreita: `less` e `ttf` acrescentados a CODE_EXT para capturar
+// `mobile-reset.less` e `Roboto-Bold.ttf`. Cada assert de extração morde:
+// reverter `less|ttf` de CODE_EXT devolve length 0 (ver instruções manuais de
+// controle positivo no T01-PLAN — a suíte completa também é usada como o
+// próprio controle, mudando CODE_EXT e checando failed > 0). Medido neste
+// workspace: citations_total ficou 37 -> 37, porque nenhum fragmento real do
+// `.gsd/memory` deste repo cita `.less`/`.ttf` hoje — a extração e a
+// indexação são provadas aqui via fixture, não pelo store real.
+test('CODE_EXT widening: less and ttf citations are extracted', () => {
+  const lessBasename = extractCitations('O tema vive em mobile-reset.less hoje.');
+  assertEq(lessBasename.length, 1);
+  assertEq(lessBasename[0].path, 'mobile-reset.less');
+  assertEq(lessBasename[0].pattern, 'bare-basename');
+
+  const lessPath = extractCitations('Ver assets/mobile-reset.less para o reset.');
+  assertEq(lessPath.length, 1);
+  assertEq(lessPath[0].path, 'assets/mobile-reset.less');
+  assertEq(lessPath[0].pattern, 'bare-path');
+
+  const ttf = extractCitations('A fonte é Roboto-Bold.ttf no pacote.');
+  assertEq(ttf.length, 1);
+  assertEq(ttf[0].path, 'Roboto-Bold.ttf');
+  assertEq(ttf[0].pattern, 'bare-basename');
+});
+
+test('buildFileIndex: mobile-reset.less and Roboto-Bold.ttf resolve from a fixture store', () => {
+  const root = mkStore(
+    [
+      {
+        unitId: 'T01',
+        text: 'Ajustado o tema em `assets/mobile-reset.less` e a fonte `Roboto-Bold.ttf` hoje.',
+        mem_id: 'mem-less-ttf',
+      },
+    ],
+    ['assets/mobile-reset.less', 'Roboto-Bold.ttf'],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const lessEntry = result.entries.find((e) => e.file === 'assets/mobile-reset.less');
+    const ttfEntry = result.entries.find((e) => e.file === 'Roboto-Bold.ttf');
+    assert(lessEntry, 'expected an entry for assets/mobile-reset.less');
+    assert(lessEntry.facts.some((f) => f.mem_id === 'mem-less-ttf'), 'expected mem-less-ttf under assets/mobile-reset.less');
+    assert(ttfEntry, 'expected an entry for Roboto-Bold.ttf');
+    assert(ttfEntry.facts.some((f) => f.mem_id === 'mem-less-ttf'), 'expected mem-less-ttf under Roboto-Bold.ttf');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('CODE_EXT widening does not explode for less/ttf: near-miss suffixes still extract nothing', () => {
+  // "lesser" and "ttff" are not `.less`/`.ttf` — the closed-list alternation
+  // must not fuzzy-match a suffix that merely contains the new extension.
+  assertEq(extractCitations('style.lesser e font.ttff e v2.0 e it.skip não são citações.').length, 0);
+});
+
+test('positive control: removing less|ttf from CODE_EXT makes the new cases red', () => {
+  // Mirrors withLegacyCitationRegistry above but scoped to just this widening:
+  // swap CITATION_REGEXES back to the pre-T01 vocabulary (no less|ttf), prove
+  // the two new citations disappear, then restore.
+  const preT01Ext = '(?:js|mjs|cjs|ts|tsx|jsx|jsonl|jsonc|json|md|sh|ps1|yml|yaml|vue|html|css|scss|aspx|svg|txt|swift)';
+  const barePath = CITATION_REGEXES.find((entry) => entry.name === 'bare-path');
+  const bareBasename = CITATION_REGEXES.find((entry) => entry.name === 'bare-basename');
+  const savedPath = barePath.regex;
+  const savedBasename = bareBasename.regex;
+  try {
+    barePath.regex = new RegExp('(?<![`\\w./\\-@])([\\w.\\-]+(?:/[\\w.\\-]+)+\\.' + preT01Ext + ')(?::(\\d+))?(?![`\\w])', 'g');
+    bareBasename.regex = new RegExp('(?<![`\\w./\\-@])([\\w.\\-]+\\.' + preT01Ext + ')(?![`\\w])', 'g');
+    assertEq(extractCitations('O tema vive em mobile-reset.less hoje.').length, 0, 'less basename must not extract with less|ttf removed');
+    assertEq(extractCitations('A fonte é Roboto-Bold.ttf no pacote.').length, 0, 'ttf basename must not extract with less|ttf removed');
+  } finally {
+    barePath.regex = savedPath;
+    bareBasename.regex = savedBasename;
+  }
+  // Restored: the production regexes catch both again.
+  assertEq(extractCitations('O tema vive em mobile-reset.less hoje.').length, 1, 'less basename must extract again after restoring CODE_EXT');
+  assertEq(extractCitations('A fonte é Roboto-Bold.ttf no pacote.').length, 1, 'ttf basename must extract again after restoring CODE_EXT');
+});
+
+test('theme.less ambiguous basename: two candidates, ambiguous-basename reason, no behavior change', () => {
+  // Registers the known limitation named in T01-PLAN: a basename-only citation
+  // with two same-named `.less` files in different directories resolves to
+  // ambiguous-basename, exactly like the pre-existing util.js case. resolveCitation
+  // is NOT changed to pick a candidate — this test documents the limitation.
+  const root = mkStore(
+    [{ unitId: 'T01', text: 'Dois temas usam theme.less em pastas diferentes.', mem_id: 'mem-theme-ambig' }],
+    ['web/theme.less', 'mobile/theme.less'],
+  );
+  try {
+    const result = buildFileIndex(root, {});
+    const hit = result.coverage.unresolved.find((u) => u.reason === 'ambiguous-basename' && u.raw === 'theme.less');
+    assert(hit, 'expected an ambiguous-basename entry for theme.less');
+    assert(Array.isArray(hit.candidates) && hit.candidates.length === 2, 'expected 2 candidates for ambiguous theme.less');
+    assert(hit.candidates.includes('web/theme.less') && hit.candidates.includes('mobile/theme.less'), 'expected both theme.less candidates named');
+  } finally {
+    cleanup(root);
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {
   console.log('Failures:');

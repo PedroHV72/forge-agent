@@ -8,6 +8,7 @@
 //   checkPlanRepoDeclared(cwd)  // (cwd?) → { ok, plans: string[], skipped?: string, message }  (advisory)
 //   checkWorkspaceConsistency(cwd) // (cwd?) → { ok: true, workspaces, divergentCount, skipped?, message }  (advisory, D3)
 //   checkResources(cwd, options)   // (cwd?, { platform?, poolDir? }?) → { ok: true, verdict?, pool?, census?, skipped?, message }  (advisory)
+//   checkMemoryQuarantine(cwd)     // (cwd?) → { ok: true, pending, files: string[], skipped?, message }  (advisory, S03/T03)
 //   checkClaimStuck(cwd)           // (cwd?) → { ok: true, verdict, stuck, unmeasured, census, skipped?, message }  (advisory, #120)
 //
 // CLI:
@@ -17,6 +18,7 @@
 //   node forge-doctor.js --check workspace-consistency [--cwd <dir>]
 //   node forge-doctor.js --check run-overlap [--cwd <dir>]
 //   node forge-doctor.js --check resources [--cwd <dir>]
+//   node forge-doctor.js --check memory-quarantine [--cwd <dir>]
 //   node forge-doctor.js --check claim-stuck [--cwd <dir>]
 //   node forge-doctor.js --check all [--cwd <dir>]
 //   node forge-doctor.js --fix [--cwd <dir>]
@@ -45,7 +47,7 @@ const SCHEMA_FILE = '.gsd/SCHEMA-VERSION';
 // Single source of truth for the check names this CLI accepts via `--check`.
 // `runCheck` dispatches these; the unknown-check message and `--help` text
 // must both be derived from this array — never hand-repeated.
-const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap', 'resources', 'claim-stuck'];
+const VALID_CHECKS = ['schema', 'projection-versioned', 'review-model-drift', 'plan-repo-declared', 'capabilities', 'workspace-consistency', 'run-overlap', 'resources', 'memory-quarantine', 'claim-stuck'];
 
 // ── checkSchema ───────────────────────────────────────────────────────────────
 /**
@@ -535,6 +537,73 @@ function checkResources(cwd, options) {
   }
 }
 
+// ── checkMemoryQuarantine ─────────────────────────────────────────────────────
+/**
+ * Advisory guard (S03/T03): surfaces the memory-quarantine sidecar
+ * (`forge-memory-quarantine.js`, T02) — facts refused by `writeFragment`
+ * because the target unit is already a `grouped-member` — to the doctor,
+ * counted AND named (S03-RISK warning 1: "há pendências" without a number is
+ * silence with different clothes). Wraps `listQuarantine`; this function does
+ * not implement quarantine itself, it only shapes the result the way this
+ * CLI's other checks are shaped (molde: `checkRunOverlap`).
+ *
+ * ALWAYS `ok: true` — pending quarantine entries are advisory information,
+ * never a failure. An empty or missing quarantine directory is `pending: 0`,
+ * never an error. An unreadable/corrupted entry is counted as `unreadable`,
+ * never dropped silently.
+ *
+ * @param {string} [cwd] - Working directory (default: process.cwd())
+ * @returns {{ ok: true, pending: number, files: string[], skipped?: string, message: string }}
+ */
+function checkMemoryQuarantine(cwd) {
+  const dir = cwd || process.cwd();
+
+  let entries;
+  try {
+    const { listQuarantine } = require('./forge-memory-quarantine');
+    entries = listQuarantine(dir);
+  } catch (e) {
+    return {
+      ok: true, // advisory — an internal error here still must not fail `--check all`
+      pending: 0,
+      files: [],
+      skipped: `error: ${e.message}`,
+      message: `forge-doctor: erro ao ler a quarentena de memória (${e.message}) — advisory, não bloqueia.`,
+    };
+  }
+
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return {
+      ok: true,
+      pending: 0,
+      files: [],
+      message: 'forge-doctor: quarentena de memória — 0 pendências.',
+    };
+  }
+
+  const unreadable = entries.filter((e) => e.unreadable);
+  const readable = entries.filter((e) => !e.unreadable);
+  const names = entries.map((e) => path.basename(e.path));
+
+  const lines = [
+    `forge-doctor: quarentena de memória — ${entries.length} pendência(s)`
+    + `${unreadable.length > 0 ? ` (${unreadable.length} ilegível(is))` : ''}:`,
+  ];
+  for (const e of readable) {
+    lines.push(`    - ${path.basename(e.path)} (unit=${e.unit_id || 'n/a'}, reason=${e.reason || 'n/a'})`);
+  }
+  for (const e of unreadable) {
+    lines.push(`    - ${path.basename(e.path)} (unreadable: ${e.error || 'n/a'})`);
+  }
+
+  return {
+    ok: true, // advisory — never fails `--check all`, pending count included
+    pending: entries.length,
+    files: names,
+    message: lines.join('\n'),
+  };
+}
+
 // ── module.exports ────────────────────────────────────────────────────────────
 module.exports = {
   CURRENT_SCHEMA,
@@ -546,7 +615,11 @@ module.exports = {
   checkWorkspaceConsistency,
   checkRunOverlap,
   checkResources,
+  checkMemoryQuarantine,
   checkClaimStuck,
+  // Additive export (R1 guard): lets the regression test assert the RENDERED
+  // icon, not just the check result shape. No existing signature changed.
+  formatResults,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -679,6 +752,12 @@ function runCheck(name, cwd, options = {}) {
       // Advisory: `r.ok` is always true, so this never flips `allOk` — live
       // pressure/pool/census here must never fail `--check all`.
       if (!r.ok) allOk = false;
+    } else if (c === 'memory-quarantine') {
+      const r = checkMemoryQuarantine(cwd);
+      results.push({ check: c, ...r });
+      // Advisory: `r.ok` is always true, so this never flips `allOk` — pending
+      // quarantine entries must never fail `--check all`.
+      if (!r.ok) allOk = false;
     } else if (c === 'claim-stuck') {
       const r = checkClaimStuck(cwd);
       results.push({ check: c, ...r });
@@ -707,6 +786,11 @@ function formatResults(results) {
       || (r.check === 'workspace-consistency' && r.divergentCount > 0)
       || (r.check === 'run-overlap' && (r.verdict === 'overlap' || r.verdict === 'inconclusive'))
       || (r.check === 'resources' && ((r.verdict && r.verdict !== 'clean') || Boolean(r.skipped)))
+      // Same R5 arbitration (R1, conceded): `checkMemoryQuarantine` returns
+      // `{ ok: true, pending: 0, skipped: 'error: ...' }` when `listQuarantine`
+      // throws — a ✓ there claims 'quarentena limpa' precisely when the state was
+      // never measured. Mirrors the `resources` clause on this same expression.
+      || (r.check === 'memory-quarantine' && (r.pending > 0 || Boolean(r.skipped)))
       // Same R5 arbitration: a run out of the reaper's reach, and an `inconclusive` census that
       // classified nothing, must not both render ✓ next to a genuinely measured clean.
       || (r.check === 'claim-stuck' && r.verdict !== 'clean');
@@ -718,6 +802,7 @@ function formatResults(results) {
       : r.check === 'workspace-consistency' ? 'Advisory — Workspace registry × marker consistency'
       : r.check === 'run-overlap' ? 'Advisory — Cross-run overlap'
       : r.check === 'resources' ? 'Advisory — Resource control'
+      : r.check === 'memory-quarantine' ? 'Advisory — Memory quarantine'
       : r.check === 'claim-stuck' ? 'Advisory — Runs fora do alcance do reaper'
       : r.check === 'projection-versioned' ? 'Layer 3 — Projection versioned'
       // Named, never inherited. This chain used to END at the projection label, so a check added

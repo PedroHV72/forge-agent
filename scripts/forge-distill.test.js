@@ -9,12 +9,16 @@ const { spawnSync } = require('child_process');
 const memory = require('./forge-memory');
 const ledger = require('./forge-ledger');
 const distill = require('./forge-distill');
+const { serializeGroup } = require('./forge-grouped-file');
 
 const ID = 'M123';
 const script = path.join(__dirname, 'forge-distill.js');
 
 function fixture() {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-distill-t02-'));
+  // realpath, never the raw mkdtemp: this cwd is handed to production, which resolves
+  // it — on macOS os.tmpdir() is a symlink to /private/..., so an unresolved fixture
+  // root makes every path comparison against production output fail. Do not "simplify".
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'forge-distill-t02-')));
   const root = path.join(cwd, '.gsd', 'milestones', ID);
   fs.mkdirSync(path.join(root, 'slices', 'S02'), { recursive: true });
   ledger.writeFragment(cwd, { id: ID, title: 'fixture' });
@@ -378,3 +382,537 @@ console.log('PASS: forge-distill T02 apply tests');
 }
 
 console.log('PASS: forge-distill review-fix/S03 (R1-R4)');
+
+// ---------------------------------------------------------------------------
+// S01/T02 — wrapper root resolution (IN-01) and suffix location under the D5
+// two-layer ambiguity rule (IN-02). Every fixture lives in a fresh tmp dir; the
+// live `.gsd/` of this repo is never read.
+// ---------------------------------------------------------------------------
+
+const TASK_ID = 'T-20260101010101-demo';
+const MS_ID = 'M-20260811134201-controle-contexto-gsd';
+const SUMMARY_BODY = '---\nkey_decisions:\n  - "Resolve the wrapper where it lives"\n---\n';
+
+// realpath, never the raw mkdtemp: this cwd is handed to production (planDistill /
+// checkEligibility), which resolves it — on macOS os.tmpdir() is a symlink to
+// /private/..., so an unresolved fixture root breaks path comparison. Do not "simplify".
+function tmpCwd() { return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'forge-distill-t02-in-'))); }
+
+// Builds a wrapper under `.gsd/<bucket>/<id>` with an explicit file name list, so a
+// test can express "two files match the suffix" without depending on the id shape.
+function wrapperFixture(bucket, id, files) {
+  const cwd = tmpCwd();
+  const root = path.join(cwd, '.gsd', bucket, id);
+  fs.mkdirSync(root, { recursive: true });
+  ledger.writeFragment(cwd, { id, title: 'fixture' });
+  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(root, name), body);
+  return { cwd, root };
+}
+
+// IN-01 positive — a task wrapper is eligible and yields candidates. Before this
+// change `checkEligibility` built the milestones path unconditionally and this
+// exact shape returned `wrapper-not-found`, so the plan never reached extraction.
+{
+  const { cwd } = wrapperFixture('tasks', TASK_ID, { [`${TASK_ID}-SUMMARY.md`]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, TASK_ID);
+  assert.strictEqual(plan.eligibility.ok, true, JSON.stringify(plan.eligibility));
+  assert(plan.candidates.length >= 1, 'a task wrapper must produce at least one candidate');
+  assert(plan.candidates.some(c => c.text.includes('Resolve the wrapper where it lives')), JSON.stringify(plan.candidates));
+}
+
+// IN-01 negative — neither root exists: the original refusal survives verbatim,
+// and the detail still names the milestones path (not the tasks one).
+{
+  const cwd = tmpCwd();
+  const eligibility = distill.checkEligibility(cwd, TASK_ID);
+  assert.strictEqual(eligibility.ok, false);
+  assert.strictEqual(eligibility.reason, 'wrapper-not-found');
+  assert(eligibility.detail.includes(path.join('.gsd', 'milestones', TASK_ID)), eligibility.detail);
+}
+
+// IN-02 case 1 — zero suffix matches: the exact-name fallback keeps the current
+// `absent` skip, unchanged.
+{
+  const { cwd } = wrapperFixture('milestones', MS_ID, { 'NOTES.md': 'no summary here\n' });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert.strictEqual(plan.eligibility.ok, true);
+  assert(plan.skipped.some(s => s.file.endsWith(`${MS_ID}-SUMMARY.md`) && s.reason === 'absent'), JSON.stringify(plan.skipped));
+  assert.deepStrictEqual(plan.notes, []);
+}
+
+// IN-02 case 2 — a single non-canonical match (SUMMARY stored without the slug)
+// is read. The exact name never matched, so this file used to be `absent`.
+{
+  const shortName = 'M-20260811134201-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [shortName]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert(plan.candidates.some(c => c.source_file.endsWith(shortName)), JSON.stringify(plan));
+  assert.strictEqual(plan.skipped.some(s => s.reason.startsWith('ambiguous-suffix')), false);
+}
+
+// IN-02 case 3 — two matches, exactly one in the strong form: D5 resolves to the
+// canonical file AND names the ignored one. This is the shape of the single real
+// occurrence measured in T01's census (a wrapper holding both the canonical
+// SUMMARY and `review-fix-triage-SUMMARY.md`).
+{
+  const canonical = `${MS_ID}-SUMMARY.md`;
+  const other = 'review-fix-triage-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, {
+    [canonical]: SUMMARY_BODY,
+    [other]: '---\nkey_decisions:\n  - "Triage leftovers"\n---\n',
+  });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert(plan.candidates.some(c => c.source_file.endsWith(canonical)), 'canonical summary must be read');
+  assert.strictEqual(plan.candidates.some(c => c.source_file.endsWith(other)), false, 'the ignored file must not be a source');
+  const note = plan.notes.find(n => n.note.startsWith('ambiguous-suffix-resolved:'));
+  assert(note, JSON.stringify(plan.notes));
+  assert(note.note.includes(canonical) && note.note.includes(other), note.note);
+}
+
+// IN-02 case 4 — two matches, none in the strong form: refusal naming BOTH, and
+// neither file is read as a source. The refusal is data in an exit-0 plan.
+{
+  const a = 'alpha-SUMMARY.md';
+  const b = 'beta-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [a]: SUMMARY_BODY, [b]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, MS_ID);
+  const refusal = plan.skipped.find(s => s.reason.startsWith('ambiguous-suffix:'));
+  assert(refusal, JSON.stringify(plan.skipped));
+  assert(refusal.reason.includes(a) && refusal.reason.includes(b), refusal.reason);
+  assert.strictEqual(plan.candidates.some(c => c.source_file.endsWith(a) || c.source_file.endsWith(b)), false, 'a refused ambiguity reads nothing');
+}
+
+// IN-02 case 5 — three matches with TWO in the strong form: the strong form does
+// not disambiguate, so the refusal names every candidate.
+{
+  const one = `${MS_ID}-SUMMARY.md`;
+  const two = `${MS_ID}-extra-SUMMARY.md`;
+  const three = 'review-fix-triage-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [one]: SUMMARY_BODY, [two]: SUMMARY_BODY, [three]: SUMMARY_BODY });
+  const plan = distill.planDistill(cwd, MS_ID);
+  const refusal = plan.skipped.find(s => s.reason.startsWith('ambiguous-suffix:'));
+  assert(refusal, JSON.stringify(plan.skipped));
+  for (const name of [one, two, three]) assert(refusal.reason.includes(name), `${name} missing from ${refusal.reason}`);
+  assert.strictEqual(plan.candidates.length, 0, 'no candidate may come from a refused ambiguity');
+}
+
+// R1 (review-fix) — the ONLY suffix match is an unrelated auxiliary summary. The
+// single-match branch used to read it as THE unit summary; cardinality is not
+// provenance. Refusal is NAMED data in an exit-0 plan, and nothing is read.
+{
+  const other = 'review-fix-triage-SUMMARY.md';
+  const { cwd } = wrapperFixture('milestones', MS_ID, {
+    [other]: '---\nkey_decisions:\n  - "Triage leftovers"\n---\n',
+  });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert.strictEqual(plan.eligibility.ok, true, JSON.stringify(plan.eligibility));
+  assert.strictEqual(plan.candidates.some(c => c.source_file.endsWith(other)), false, 'an unrelated summary must never become a source');
+  assert.strictEqual(plan.candidates.some(c => c.text.includes('Triage leftovers')), false, JSON.stringify(plan.candidates));
+  const refusal = plan.skipped.find(s => s.reason.startsWith('unrelated-suffix-match:'));
+  assert(refusal, JSON.stringify(plan.skipped));
+  assert(refusal.reason.includes(other) && refusal.reason.includes(MS_ID), refusal.reason);
+}
+
+// R1 unit-level — the prefix rule accepts the canonical and the shortened WDMA
+// form, and refuses an unrelated stem, at the single-match branch.
+{
+  const short = 'M-20260811134201-SUMMARY.md';
+  const { root } = wrapperFixture('milestones', MS_ID, { [short]: SUMMARY_BODY });
+  assert(distill._private.findBySuffix(root, '-SUMMARY.md', MS_ID).file.endsWith(short), 'shortened WDMA form must still be accepted');
+  const bad = wrapperFixture('milestones', MS_ID, { 'review-fix-triage-SUMMARY.md': SUMMARY_BODY });
+  const refused = distill._private.findBySuffix(bad.root, '-SUMMARY.md', MS_ID);
+  assert.strictEqual(refused.file, null);
+  assert(refused.refusal.startsWith('unrelated-suffix-match:'), refused.refusal);
+}
+
+// Unit-level contract of findBySuffix, exercised directly through _private so the
+// four branches are pinned independently of the plan shape.
+{
+  const { cwd, root } = wrapperFixture('milestones', MS_ID, { [`${MS_ID}-SUMMARY.md`]: SUMMARY_BODY });
+  const found = distill._private.findBySuffix(root, '-SUMMARY.md', MS_ID);
+  assert(found.file.endsWith(`${MS_ID}-SUMMARY.md`));
+  assert.strictEqual(found.refusal, undefined);
+  assert.deepStrictEqual(distill._private.findBySuffix(path.join(cwd, 'nope'), '-SUMMARY.md', MS_ID), { file: null });
+  assert.strictEqual(distill._private.wrapperRoot(cwd, MS_ID), root);
+}
+
+console.log('PASS: forge-distill S01/T02 (IN-01 wrapper root, IN-02 D5 suffix rule)');
+
+// ---------------------------------------------------------------------------
+// S02/T02 — closed-scope widening of the extractor: inline `key: [...]` (IN-03),
+// bullets under the two NAMED bold labels, the pt-BR / suffixed section titles
+// matched by PREFIX (IN-06), and id uniqueness in `plan.candidates`. Every case
+// below extracted ZERO (or duplicated) before this task; each is a positive
+// control by reversion, recorded in T02-SUMMARY.
+// ---------------------------------------------------------------------------
+
+// One SUMMARY file in a milestone wrapper, nothing else: the CONTEXT is `absent`
+// and there are no slices, so `plan.candidates` is exactly what the SUMMARY body
+// yields. That exactness is what lets the counts below be assertions instead of
+// "at least one".
+function summaryOnly(body) {
+  const { cwd } = wrapperFixture('milestones', MS_ID, { [`${MS_ID}-SUMMARY.md`]: body });
+  const plan = distill.planDistill(cwd, MS_ID);
+  assert.strictEqual(plan.eligibility.ok, true, JSON.stringify(plan.eligibility));
+  return plan;
+}
+function texts(plan) { return plan.candidates.map(c => c.text); }
+function kindsOf(plan, kind) { return plan.candidates.filter(c => c.source_kind === kind).map(c => c.text); }
+
+// IN-03 — inline YAML. The bracket content is ONE item and the comma inside the
+// item survives byte for byte; splitting on it would cut the fact in half.
+{
+  const INLINE = 'payload whitelisted {reason, status?} antes do write';
+  const plan = summaryOnly(`---\nkey_decisions: [${INLINE}]\n---\n`);
+  const hits = plan.candidates.filter(c => c.source_kind === 'frontmatter:key_decisions');
+  assert.strictEqual(hits.length, 1, `inline form must yield exactly one candidate: ${JSON.stringify(texts(plan))}`);
+  assert.strictEqual(hits[0].text, INLINE, hits[0].text);
+  assert(hits[0].text.includes(', status?}'), 'the comma inside the item must survive');
+}
+
+// IN-03 negative control — the BLOCK form keeps extracting one candidate per
+// item, unchanged. The inline branch must not swallow the list it did not touch.
+{
+  const plan = summaryOnly('---\nkey_decisions:\n  - "Primeiro, com vírgula"\n  - "Segundo"\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), ['Primeiro, com vírgula', 'Segundo']);
+}
+
+// IN-03 edge — an empty inline list yields no candidate and does not fall through
+// to the block branch (which would then eat unrelated indented lines below it).
+{
+  const plan = summaryOnly('---\nkey_decisions: []\nprovides:\n  - "Um extrator testável"\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), []);
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:provides'), ['Um extrator testável']);
+}
+
+// Patch 4 — the two NAMED bold labels are read, each under its own stable kind.
+// The capture stops at the next heading or the next bold label, so the prose and
+// the bullets that follow the section never enter as deliveries.
+{
+  const plan = summaryOnly([
+    '# Resumo',
+    '',
+    '**Entregas:**',
+    '- scripts/forge-distill.js — ramo inline do YAML',
+    '- scripts/forge-distill.test.js — controle por reversão',
+    '',
+    '**Notas soltas:**',
+    '- este bullet pertence a outro rótulo',
+    '',
+    '## Prosa',
+    '',
+    'Um parágrafo qualquer que não é bullet.',
+    '',
+    '- bullet de prosa que NÃO é entrega',
+    '',
+    '**Key Deliverables:**',
+    '- forge-distill exports labelledBullets',
+    '',
+  ].join('\n'));
+  assert.deepStrictEqual(kindsOf(plan, 'label:entregas'), [
+    'scripts/forge-distill.js — ramo inline do YAML',
+    'scripts/forge-distill.test.js — controle por reversão',
+  ]);
+  assert.deepStrictEqual(kindsOf(plan, 'label:key-deliverables'), ['forge-distill exports labelledBullets']);
+  // The boundary is the point of the test: no bullet outside the two named labels
+  // may be attributed to a NAMED label. (S02/T03 shipped the ANY path, so the
+  // bullet under `**Notas soltas:**` is now a candidate — under `label-any:`,
+  // never under `label:entregas`. The two strays that sit under no label at all
+  // stay out entirely.)
+  const named = plan.candidates.filter(c => String(c.source_kind).startsWith('label:')).map(c => c.text);
+  assert.strictEqual(named.includes('este bullet pertence a outro rótulo'), false, JSON.stringify(named));
+  for (const stray of ['bullet de prosa que NÃO é entrega', 'Um parágrafo qualquer que não é bullet.']) {
+    assert.strictEqual(texts(plan).includes(stray), false, `${stray} must not be extracted`);
+  }
+}
+
+// Patch 4 unit level — `labelledBullets` returns plain strings and stops at the
+// next bold label, exercised directly so the boundary is pinned independently of
+// the plan shape.
+{
+  const body = '**Entregas:**\n- um\n- dois\n\n**Outro:**\n- três\n';
+  assert.deepStrictEqual(distill._private.labelledBullets(body, 'Entregas'), ['um', 'dois']);
+  assert.deepStrictEqual(distill._private.labelledBullets(body, 'Key Deliverables'), []);
+}
+
+// IN-06 — pt-BR and suffixed titles match by PREFIX. Both headings below carry a
+// parenthetical suffix that the previous `\s*$` anchor could never match, so both
+// sections extracted zero.
+{
+  const plan = summaryOnly([
+    '## Decisões-chave do milestone (acumuladas)',
+    '- D1: o extrator amplia, a arbitragem filtra',
+    '',
+    '## Key Decisions (acumulado)',
+    '- D2: candidato não é fato',
+    '',
+  ].join('\n'));
+  assert(texts(plan).includes('D1: o extrator amplia, a arbitragem filtra'), JSON.stringify(texts(plan)));
+  assert(texts(plan).includes('D2: candidato não é fato'), JSON.stringify(texts(plan)));
+  assert.strictEqual(plan.candidates.length, 2, JSON.stringify(plan.candidates));
+}
+
+// IN-06 / anti-duplication — `## Decisões-chave do milestone` is matched by TWO
+// entries of HEADINGS (the full title and the `Decisões-chave` prefix), so the
+// same section is extracted twice with different kinds. The candidate id is
+// sha1(source \x00 text) WITHOUT the kind, so both copies carry the same id.
+// Uniqueness is the assertion; which of the two kinds survives is not.
+{
+  const plan = summaryOnly('## Decisões-chave do milestone\n- D3: um bullet, uma vez só\n');
+  assert.strictEqual(plan.candidates.length, 1, `duplicate section extraction must be deduped: ${JSON.stringify(plan.candidates)}`);
+  assert.strictEqual(plan.candidates[0].text, 'D3: um bullet, uma vez só');
+  assert.strictEqual(plan.candidates_total, 1, 'candidates_total must not double-count');
+  const ids = plan.candidates.map(c => c.id);
+  assert.strictEqual(new Set(ids).size, ids.length, 'ids must be unique');
+}
+
+// Anti-duplication, wider — a wrapper mixing every widened path at once still
+// carries no repeated id, and the reported total equals the array length.
+{
+  const plan = summaryOnly([
+    '---',
+    'key_decisions: [inline com, vírgula]',
+    'provides:',
+    '  - "Um extrator ampliado"',
+    '---',
+    '',
+    '## Decisões-chave do milestone (acumuladas)',
+    '- D4: dedupe por id',
+    '',
+    '## Decisões travadas',
+    '- D5: patch 5 não embarca aqui',
+    '',
+    '**Entregas:**',
+    '- um arquivo tocado',
+    '',
+  ].join('\n'));
+  const ids = plan.candidates.map(c => c.id);
+  assert.strictEqual(new Set(ids).size, ids.length, `repeated id: ${JSON.stringify(ids)}`);
+  assert.strictEqual(plan.candidates_total, plan.candidates.length);
+  assert.strictEqual(plan.candidates.length, 5, JSON.stringify(texts(plan)));
+}
+
+console.log('PASS: forge-distill S02/T02 (IN-03 inline, named labels, IN-06 prefix, id dedupe)');
+
+// ---------------------------------------------------------------------------
+// S02/T03 — the generalisation to ANY bold label (`anyLabelledBullets`) shipped
+// WITH containment, because the measurement fired the explosion ruler: on this
+// repo's population of 17 local units the total went 468 -> 533 raw candidates
+// (1.14x, far from the 3x clause) but TWO units crossed from under 100 verdicts
+// to over it (87 -> 113 and 93 -> 120), which is the second clause of the rule.
+// The T02 scope fence asserting the ABSENCE of `anyLabelledBullets` is therefore
+// gone: it recorded a decision that this task measured and reversed.
+// ---------------------------------------------------------------------------
+
+// The fence of T02 inverted — a bullet under an arbitrary bold label is now a
+// candidate, and it carries the `label-any:` kind so the containment (and any
+// reader) can tell the generalised path from every other source.
+{
+  const plan = summaryOnly('**Files touched (9):**\n- scripts/forge-distill.js\n');
+  assert.strictEqual('anyLabelledBullets' in distill._private, true, 'patch 5 shipped in T03');
+  assert.deepStrictEqual(texts(plan), ['scripts/forge-distill.js'], JSON.stringify(texts(plan)));
+  assert.deepStrictEqual(plan.candidates.map(c => c.source_kind), ['label-any:files-touched-9-']);
+}
+
+// The two NAMED labels are NOT extracted twice by the ANY path: `alreadyCovered`
+// excludes them by case-insensitive name, so `label:entregas` has no `label-any:`
+// twin and the id-uniqueness assertion of T02 stays green.
+{
+  const plan = summaryOnly('**Entregas:**\n- um arquivo tocado\n\n**Decisões registradas:**\n- D9: rótulo arbitrário entra\n');
+  assert.deepStrictEqual(kindsOf(plan, 'label:entregas'), ['um arquivo tocado']);
+  assert.deepStrictEqual(kindsOf(plan, 'label-any:decisões-registradas'), ['D9: rótulo arbitrário entra']);
+  assert.strictEqual(plan.candidates.filter(c => c.text === 'um arquivo tocado').length, 1, JSON.stringify(plan.candidates));
+  const ids = plan.candidates.map(c => c.id);
+  assert.strictEqual(new Set(ids).size, ids.length, `repeated id: ${JSON.stringify(ids)}`);
+  assert.strictEqual(plan.candidates_total, plan.candidates.length);
+}
+
+// Unit level — `anyLabelledBullets` stops at the next heading or the next bold
+// label and returns `{label, text}` pairs, exercised directly.
+{
+  const body = '**Files touched (9):**\n- um\n- dois\n\n**Entregas:**\n- três\n\n# Fim\n- quatro\n';
+  assert.deepStrictEqual(distill._private.anyLabelledBullets(body, ['Entregas']), [
+    { label: 'Files touched (9)', text: 'um' },
+    { label: 'Files touched (9)', text: 'dois' },
+  ]);
+  // Case-insensitive exclusion: the caller passes the NAMED list as written.
+  assert.deepStrictEqual(distill._private.anyLabelledBullets(body, ['entregas', 'files touched (9)']), []);
+}
+
+// Containment — the discard is enumerated BY NAME and reason, never a silent
+// truncation, and the identity that IN-05 demands holds exactly:
+//   len(discarded) == candidates_before_containment - candidates_total
+{
+  const CAP = distill._private.ANY_LABEL_UNIT_CAP;
+  assert.strictEqual(CAP, 100);
+  const gathered = [];
+  for (let i = 0; i < CAP; i++) gathered.push({ id: `c-fm${i}`, source_file: 'a.md', source_kind: 'frontmatter:provides', text: `fato ${i}` });
+  for (let i = 0; i < 7; i++) gathered.push({ id: `c-any${i}`, source_file: 'a.md', source_kind: 'label-any:files-touched', text: `bullet ${i}` });
+  const contained = distill._private.containAnyLabels(gathered);
+  assert.strictEqual(contained.accepted.length, CAP, 'the unit is already at the cap, so no ANY candidate is admitted');
+  assert.strictEqual(contained.discarded.length, gathered.length - contained.accepted.length, 'IN-05 identity');
+  assert.strictEqual(contained.discarded.length, 7);
+  for (const item of contained.discarded) {
+    assert.strictEqual(item.kind, 'label-any:files-touched');
+    assert.strictEqual(item.label, 'files-touched');
+    assert(item.id && item.text && item.source_file, JSON.stringify(item));
+    assert(/^any-label-cap: /.test(item.reason), item.reason);
+  }
+  // Nothing outside the ANY path is ever discarded, even far above the cap.
+  const onlyOwn = [];
+  for (let i = 0; i < CAP + 50; i++) onlyOwn.push({ id: `c-x${i}`, source_file: 'a.md', source_kind: 'frontmatter:provides', text: `fato ${i}` });
+  const wide = distill._private.containAnyLabels(onlyOwn);
+  assert.strictEqual(wide.discarded.length, 0, 'the cap rations the widened path, it does not ration what already worked');
+  assert.strictEqual(wide.accepted.length, CAP + 50);
+}
+
+// Containment is order-independent: an ANY candidate read BEFORE the unit's other
+// sources must not get in ahead of them and leave the unit above the cap anyway.
+{
+  const CAP = distill._private.ANY_LABEL_UNIT_CAP;
+  const gathered = [{ id: 'c-any-first', source_file: 'a.md', source_kind: 'label-any:files-touched', text: 'primeiro lido' }];
+  for (let i = 0; i < CAP; i++) gathered.push({ id: `c-fm${i}`, source_file: 'b.md', source_kind: 'frontmatter:provides', text: `fato ${i}` });
+  const contained = distill._private.containAnyLabels(gathered);
+  assert.strictEqual(contained.accepted.length, CAP, JSON.stringify(contained.accepted.length));
+  assert.deepStrictEqual(contained.discarded.map(d => d.id), ['c-any-first']);
+}
+
+// The plan carries the containment as ADDITIVE fields, and under the cap nothing
+// is discarded — the identity holds trivially (0 == n - n), which is the shape the
+// IN-05 demo reports with the real numbers in S02-MEASUREMENT.md.
+{
+  const plan = summaryOnly('**Files touched (9):**\n- scripts/forge-distill.js\n- scripts/forge-distill.test.js\n');
+  assert.strictEqual(plan.candidates_before_containment, 2);
+  assert.strictEqual(plan.candidates_total, 2);
+  assert.deepStrictEqual(plan.discarded, []);
+  assert.strictEqual(plan.discarded.length, plan.candidates_before_containment - plan.candidates_total);
+}
+
+console.log('PASS: forge-distill S02/T03 (ANY labels shipped with enumerated containment)');
+
+// ---------------------------------------------------------------------------
+// review-fix/S02 — R1 (quote-aware inline flow) and R2 (dedupe on the full
+// digest). Each assertion below was verified biting by reverting the single line
+// it pins: the suite aborts at the first failed assert, so a wholesale revert
+// would prove one group and hide the rest.
+// ---------------------------------------------------------------------------
+
+// R1 — a fully quoted two-item flow is TWO candidates, and neither carries a
+// quote artifact. Before the fix this produced the single corrupted candidate
+// `first", "second` — YAML residue presented as fact text.
+{
+  const plan = summaryOnly('---\nkey_decisions: ["primeiro item", "segundo item"]\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), ['primeiro item', 'segundo item'], JSON.stringify(texts(plan)));
+  for (const text of texts(plan)) assert.strictEqual(/["']/.test(text), false, `quote artifact in candidate text: ${text}`);
+}
+
+// R1 — single-quoted single item: the quotes are consumed by the parser, not by
+// a strip-first-and-last regex, and a comma inside the quotes survives.
+{
+  const plan = summaryOnly("---\nprovides: ['um item, com vírgula']\n---\n");
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:provides'), ['um item, com vírgula'], JSON.stringify(texts(plan)));
+}
+
+// R1 — a flow that is neither a bare scalar nor fully quoted is REFUSED BY NAME:
+// zero candidates for that key, and the reason lands in the exit-0 plan. The
+// point is that nothing is emitted, not that something better is guessed.
+{
+  const plan = summaryOnly('---\nkey_decisions: [bare, "quoted"]\nprovides:\n  - "intacto"\n---\n');
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:key_decisions'), [], JSON.stringify(texts(plan)));
+  const named = plan.skipped.filter(s => /inline-flow-unparsed/.test(s.reason));
+  assert.strictEqual(named.length, 1, `refusal must be named in the plan: ${JSON.stringify(plan.skipped)}`);
+  assert(/key_decisions/.test(named[0].reason), named[0].reason);
+  // The refusal is local to the offending key; the rest of the file still reads.
+  assert.deepStrictEqual(kindsOf(plan, 'frontmatter:provides'), ['intacto']);
+  assert.strictEqual(plan.eligibility.ok, true);
+}
+
+// R1 unit level — the three closed cases and the three refusal shapes, pinned
+// independently of the plan.
+{
+  const parse = distill._private.parseInlineFlow;
+  assert.deepStrictEqual(parse('payload whitelisted {reason, status?}'), { values: ['payload whitelisted {reason, status?}'] });
+  assert.deepStrictEqual(parse('"a", "b, ainda a mesma", "c"'), { values: ['a', 'b, ainda a mesma', 'c'] });
+  assert.deepStrictEqual(parse('   '), { values: [] });
+  // A trailing comma is tolerated, and that is a decision, not an oversight: it
+  // drops no item and emits no artifact, so refusing it would cost a candidate
+  // for nothing. `["a", ]` is one item.
+  assert.deepStrictEqual(parse('"a", '), { values: ['a'] });
+  for (const bad of ['bare, "quoted"', '"unterminated', '"a" lixo', '"a", "b']) {
+    const out = parse(bad);
+    assert.strictEqual(out.values, undefined, `${bad} must not yield values`);
+    assert(/^inline-flow-unparsed: /.test(out.refusal), `${bad} -> ${out.refusal}`);
+  }
+}
+
+// R2 — the display id is 8 hex, but the dedupe key is the FULL digest. Two
+// DIFFERENT (source, text) pairs sharing an 8-hex prefix both survive: the second
+// is kept under a longer id and the event is named in `id_collisions`. Keyed on
+// the truncated id (the previous behaviour) the second was dropped in silence.
+{
+  const assigner = distill._private.createIdAssigner();
+  const a = 'deadbeef' + '0'.repeat(32);
+  const b = 'deadbeef' + '1'.repeat(32);
+  const idA = assigner.displayId(a, 'f.md', 'texto A');
+  const idB = assigner.displayId(b, 'f.md', 'texto B');
+  assert.strictEqual(idA, 'c-deadbeef');
+  assert.notStrictEqual(idB, idA, 'a colliding prefix must not reuse the id');
+  assert.strictEqual(idB, 'c-' + b.slice(0, 16));
+  assert.strictEqual(assigner.collisions.length, 1, JSON.stringify(assigner.collisions));
+  assert(/candidate-id-collision/.test(assigner.collisions[0].reason), assigner.collisions[0].reason);
+  assert.strictEqual(assigner.collisions[0].collided_with, idA);
+  assert.strictEqual(assigner.collisions[0].text, 'texto B');
+  // Same digest twice is the genuine duplicate: same id, nothing reported.
+  assert.strictEqual(assigner.displayId(a, 'f.md', 'texto A'), idA);
+  assert.strictEqual(assigner.collisions.length, 1);
+}
+
+// R2 — the plan always carries the field, so "no collisions" is a reported
+// outcome rather than an absent one, and real duplicates still collapse to one.
+{
+  const plan = summaryOnly('## Decisões-chave do milestone\n- D3: um bullet, uma vez só\n');
+  assert.deepStrictEqual(plan.id_collisions, []);
+  assert.strictEqual(plan.candidates.length, 1, JSON.stringify(plan.candidates));
+}
+
+// A1 (review PR #125) — a write REFUSED by the grouped-member quarantine is not
+// an APPLIED one. Real fixture, not a monkeypatch: the milestone's own envelope is
+// moved into a container (the mould from forge-memory-quarantine.test.js) and the
+// loose file removed, so writeFragment takes the refusal branch for real.
+// Before the fix this returned verdict APPLIED with `fragment_path` naming the
+// quarantine sidecar, and `written: false` could not tell it apart from the
+// idempotent no-op, which returns the very same value.
+{
+  const cwd = fixture(); const c = candidate(cwd);
+  // Seed the milestone fragment, group it, drop the loose file.
+  memory.writeFragment(cwd, { unit_id: ID, facts: [{ mem_id: 'MEM001', category: 'test', text: 'sealed fact', source: 'a1-test' }], stats: [] }, {});
+  const loose = memory.fragmentPath(cwd, ID, {});
+  const units = [{ id: memory.qualifiedStorageKey(ID, null), content: fs.readFileSync(loose) }];
+  const container = path.join(memory.memoryDir(cwd), 'sweep-project-01.md');
+  fs.writeFileSync(container, serializeGroup({ epoch: 'sweep-project-01', units }).buffer);
+  fs.unlinkSync(loose);
+
+  const originalWrite = process.stderr.write; // the refusal narrates on stderr by design
+  let result;
+  try { process.stderr.write = () => true; result = distill.applyDistill(cwd, ID, completeSelection(cwd, [keep(c)])); }
+  finally { process.stderr.write = originalWrite; }
+
+  assert.strictEqual(result.verdict, 'QUARANTINED', JSON.stringify(result));
+  assert.strictEqual(result.fragment_path, null, 'the quarantine sidecar is NOT the fragment');
+  assert.strictEqual(result.written, false);
+  assert.strictEqual(result.reason, 'grouped-member');
+  assert.strictEqual(result.container, container);
+  assert(typeof result.remedy === 'string' && result.remedy.length > 0, 'the remedy must reach the consumer');
+  assert(typeof result.quarantine_path === 'string' && result.quarantine_path.length > 0, JSON.stringify(result));
+  assert(fs.existsSync(result.quarantine_path), 'the quarantine record must exist on disk');
+  assert.strictEqual(path.basename(path.dirname(result.quarantine_path)), 'quarantine');
+  assert.strictEqual(path.dirname(path.dirname(result.quarantine_path)), memory.memoryDir(cwd));
+  // No key the APPLIED path emitted may go missing: no --json consumer loses a field.
+  for (const key of ['verdict', 'written', 'already_present', 'deduped_in_batch', 'fragment_path', 'dst_facts_total', 'preview']) {
+    assert(key in result, `QUARANTINED dropped the key ${key}`);
+  }
+  // And nothing landed in the store.
+  assert.strictEqual(fs.existsSync(loose), false, 'a refused write must not create the loose fragment');
+}
+
+console.log('PASS: forge-distill review-fix/S02 (R1 inline flow, R2 full-digest dedupe)');

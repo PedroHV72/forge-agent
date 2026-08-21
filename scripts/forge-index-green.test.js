@@ -6,13 +6,14 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { writeFragment } = require('./forge-memory');
+const { measureF2 } = require('./forge-index-f2');
 const {
   measureGreen,
   runCli,
   DEFAULT_ALLOWED_RELPATH,
   missKey,
   enumerateMisses,
-  collectLiveMemIds,
+  collectLiveQualifiedIds,
   resolveAllowedMisses,
   compareMisses,
   computeUnitAxisCriterion,
@@ -63,8 +64,8 @@ function writeAllowed(cwd, entries) {
   fs.writeFileSync(target, body);
 }
 
-function entry(mem_id, mention, overrides) {
-  return { mem_id, mention, item: '#TEST', reason: 'entrada de teste', ...(overrides || {}) };
+function entry(storage_key, mem_id, mention, overrides) {
+  return { storage_key, mem_id, mention, item: '#TEST', reason: 'entrada de teste', ...(overrides || {}) };
 }
 
 function cleanup(cwd) {
@@ -119,10 +120,10 @@ test('an unlisted miss fails green, and reasons[] names the exact key', () => {
     writeAllowed(cwd, []);
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false);
-    assert.ok(report.reasons.includes('unlisted-miss:f-miss::prefs-x.rst'), `expected the miss named by key in ${JSON.stringify(report.reasons)}`);
+    assert.ok(report.reasons.includes('unlisted-miss:T01::f-miss::prefs-x.rst'), `expected the miss named by key in ${JSON.stringify(report.reasons)}`);
     const criterion = report.criteria.find((c) => c.name === 'allowed_misses');
     assert.strictEqual(criterion.ok, false);
-    assert.deepStrictEqual(report.allowed_misses.new, ['f-miss::prefs-x.rst']);
+    assert.deepStrictEqual(report.allowed_misses.new, ['T01::f-miss::prefs-x.rst']);
   } finally { cleanup(cwd); }
 });
 
@@ -133,14 +134,14 @@ test('a listed miss is green even with f2_recall below the old 0.99 threshold �
       unit_id: 'T01',
       facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))],
     });
-    writeAllowed(cwd, [entry('f-miss', 'prefs-x.rst')]);
+    writeAllowed(cwd, [entry('T01', 'f-miss', 'prefs-x.rst')]);
     const report = measureGreen(cwd);
     // 1 miss over a denominator of 2 → recall 0.5, far below the old bar.
     // Reverting to the percentage criterion makes this assertion fail — that
     // is the bite proving the criterion moved to the enumerated list.
     assert.ok(typeof report.f2_recall === 'number' && report.f2_recall < 0.99, `recall must be below the old bar (got ${report.f2_recall})`);
     assert.strictEqual(report.green, true, 'a fully enumerated miss set must be green regardless of recall');
-    assert.deepStrictEqual(report.allowed_misses.known, ['f-miss::prefs-x.rst']);
+    assert.deepStrictEqual(report.allowed_misses.known, ['T01::f-miss::prefs-x.rst']);
   } finally { cleanup(cwd); }
 });
 
@@ -165,11 +166,11 @@ test('a stale entry (fact alive, mention no longer missing) fails green with a n
   try {
     writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`')] });
     // f-covered exists (not a ghost) but 'prefs-x.rst' is not among its misses.
-    writeAllowed(cwd, [entry('f-covered', 'prefs-x.rst')]);
+    writeAllowed(cwd, [entry('T01', 'f-covered', 'prefs-x.rst')]);
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false, 'an allow-list that only ever grows is an inert gate — a cured entry must turn the gate red');
-    assert.ok(report.reasons.includes('stale-allowed-entry:f-covered::prefs-x.rst'), `expected stale entry named in ${JSON.stringify(report.reasons)}`);
-    assert.deepStrictEqual(report.allowed_misses.stale, ['f-covered::prefs-x.rst']);
+    assert.ok(report.reasons.includes('stale-allowed-entry:T01::f-covered::prefs-x.rst'), `expected stale entry named in ${JSON.stringify(report.reasons)}`);
+    assert.deepStrictEqual(report.allowed_misses.stale, ['T01::f-covered::prefs-x.rst']);
     assert.ok(String(report.allowed_misses.stale_action).includes('remova da lista'), 'the report must instruct removal explicitly');
   } finally { cleanup(cwd); }
 });
@@ -181,12 +182,12 @@ test('a ghost entry fails green with ghost-allowed-entry, distinct from stale', 
   const cwd = fixture();
   try {
     writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`')] });
-    writeAllowed(cwd, [entry('MEM-GONE', 'x.md')]);
+    writeAllowed(cwd, [entry('T01', 'MEM-GONE', 'x.md')]);
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false);
-    assert.ok(report.reasons.includes('ghost-allowed-entry:MEM-GONE::x.md'), `expected ghost named in ${JSON.stringify(report.reasons)}`);
-    assert.ok(!report.reasons.includes('stale-allowed-entry:MEM-GONE::x.md'), 'a ghost must never double-report as stale — the distinction is the point');
-    assert.deepStrictEqual(report.allowed_misses.ghost, ['MEM-GONE::x.md']);
+    assert.ok(report.reasons.includes('ghost-allowed-entry:T01::MEM-GONE::x.md'), `expected ghost named in ${JSON.stringify(report.reasons)}`);
+    assert.ok(!report.reasons.includes('stale-allowed-entry:T01::MEM-GONE::x.md'), 'a ghost must never double-report as stale — the distinction is the point');
+    assert.deepStrictEqual(report.allowed_misses.ghost, ['T01::MEM-GONE::x.md']);
     assert.deepStrictEqual(report.allowed_misses.stale, []);
   } finally { cleanup(cwd); }
 });
@@ -195,12 +196,26 @@ test('compareMisses: ghost classification wins over stale for the same entry (is
   const verdict = compareMisses({
     factsEvaluated: 1,
     misses: [],
-    allowedEntries: [{ mem_id: 'GONE', mention: 'a.md', key: missKey('GONE', 'a.md') }],
-    liveMemIds: new Set(['ALIVE']),
+    allowedEntries: [{ storage_key: 'T01', mem_id: 'GONE', mention: 'a.md', key: missKey('T01', 'GONE', 'a.md') }],
+    liveQualifiedIds: new Set(['T01::ALIVE']),
   });
   assert.strictEqual(verdict.ok, false);
-  assert.deepStrictEqual(verdict.ghostEntries, ['GONE::a.md']);
+  assert.deepStrictEqual(verdict.ghostEntries, ['T01::GONE::a.md']);
   assert.deepStrictEqual(verdict.staleEntries, [], 'a ghost entry must not also appear stale');
+});
+
+test('compareMisses: a live mem_id in a DIFFERENT storage_key does not save a ghost entry — qualified existence (isolated)', () => {
+  // The old global check would find mem_id "SHARED" alive (in T02) and wrongly
+  // clear the entry pointing at T01::SHARED. Qualified existence must not be
+  // fooled by a same mem_id reused in a sibling fragment.
+  const verdict = compareMisses({
+    factsEvaluated: 1,
+    misses: [],
+    allowedEntries: [{ storage_key: 'T01', mem_id: 'SHARED', mention: 'a.md', key: missKey('T01', 'SHARED', 'a.md') }],
+    liveQualifiedIds: new Set(['T02::SHARED']),
+  });
+  assert.strictEqual(verdict.ok, false);
+  assert.deepStrictEqual(verdict.ghostEntries, ['T01::SHARED::a.md'], 'mem_id alive elsewhere must not mask a nonexistent qualified pair');
 });
 
 // ── Section 5: anti-silence floor — zero facts is never a clean pass ────────
@@ -219,7 +234,7 @@ test('an empty store with an empty allow-list is green:false with no-facts-evalu
 });
 
 test('compareMisses: executedCount floor is a distinct named code, even with both sets empty (isolated)', () => {
-  const verdict = compareMisses({ factsEvaluated: 0, misses: [], allowedEntries: [], liveMemIds: new Set() });
+  const verdict = compareMisses({ factsEvaluated: 0, misses: [], allowedEntries: [], liveQualifiedIds: new Set() });
   assert.strictEqual(verdict.ok, false);
   assert.strictEqual(verdict.code, 'no-facts-evaluated');
 });
@@ -259,7 +274,7 @@ test('default path absent + one miss → red unlisted-miss — absence never loo
     writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))] });
     const report = measureGreen(cwd);
     assert.strictEqual(report.green, false, 'an empty list is fail-closed: any miss is unlisted');
-    assert.ok(report.reasons.includes('unlisted-miss:f-miss::prefs-x.rst'), `expected the miss named in ${JSON.stringify(report.reasons)}`);
+    assert.ok(report.reasons.includes('unlisted-miss:T01::f-miss::prefs-x.rst'), `expected the miss named in ${JSON.stringify(report.reasons)}`);
     assert.strictEqual(report.allowed_misses.source, 'default-absent');
   } finally { cleanup(cwd); }
 });
@@ -316,20 +331,20 @@ test('an invalid-JSON allow-list refuses with allowed-misses-invalid — in BOTH
 });
 
 test('an entry without an owner (item) is invalid and the error names the entry — ownerless red is scenery', () => {
-  const resolved = resolveAllowedMisses(JSON.stringify({ allowed: [{ mem_id: 'M1', mention: 'a.md', reason: 'sem dono' }] }));
+  const resolved = resolveAllowedMisses(JSON.stringify({ allowed: [{ storage_key: 'T01', mem_id: 'M1', mention: 'a.md', reason: 'sem dono' }] }));
   assert.strictEqual(resolved.ok, false);
-  assert.ok(resolved.errors.some((e) => e.includes('M1::a.md') && e.includes('item')), `error must name key and missing owner field: ${JSON.stringify(resolved.errors)}`);
+  assert.ok(resolved.errors.some((e) => e.includes('T01::M1::a.md') && e.includes('item')), `error must name qualified key and missing owner field: ${JSON.stringify(resolved.errors)}`);
 });
 
 test('resolveAllowedMisses: validation is enumerated — duplicates, missing reason, unknown keys, non-array (isolated)', () => {
   const dup = resolveAllowedMisses(JSON.stringify({ allowed: [
-    { mem_id: 'M1', mention: 'a.md', item: '#1', reason: 'x' },
-    { mem_id: 'M1', mention: 'a.md', item: '#1', reason: 'x' },
+    { storage_key: 'T01', mem_id: 'M1', mention: 'a.md', item: '#1', reason: 'x' },
+    { storage_key: 'T01', mem_id: 'M1', mention: 'a.md', item: '#1', reason: 'x' },
   ] }));
   assert.strictEqual(dup.ok, false);
   assert.ok(dup.errors.some((e) => e.includes('duas vezes')));
 
-  const noReason = resolveAllowedMisses(JSON.stringify({ allowed: [{ mem_id: 'M1', mention: 'a.md', item: '#1' }] }));
+  const noReason = resolveAllowedMisses(JSON.stringify({ allowed: [{ storage_key: 'T01', mem_id: 'M1', mention: 'a.md', item: '#1' }] }));
   assert.strictEqual(noReason.ok, false);
   assert.ok(noReason.errors.some((e) => e.includes('reason')));
 
@@ -345,6 +360,29 @@ test('resolveAllowedMisses: validation is enumerated — duplicates, missing rea
   assert.deepStrictEqual(withComment.entries, []);
 });
 
+test('resolveAllowedMisses: missing, blank, or non-string storage_key is refused with a named error — mandatory, not optional', () => {
+  const missing = resolveAllowedMisses(JSON.stringify({ allowed: [{ mem_id: 'M1', mention: 'a.md', item: '#1', reason: 'x' }] }));
+  assert.strictEqual(missing.ok, false);
+  assert.ok(missing.errors.some((e) => e.includes('storage_key')), `missing storage_key must be a named error: ${JSON.stringify(missing.errors)}`);
+
+  const blank = resolveAllowedMisses(JSON.stringify({ allowed: [{ storage_key: '  ', mem_id: 'M1', mention: 'a.md', item: '#1', reason: 'x' }] }));
+  assert.strictEqual(blank.ok, false);
+  assert.ok(blank.errors.some((e) => e.includes('storage_key')), `blank storage_key must be a named error: ${JSON.stringify(blank.errors)}`);
+
+  const nonString = resolveAllowedMisses(JSON.stringify({ allowed: [{ storage_key: 42, mem_id: 'M1', mention: 'a.md', item: '#1', reason: 'x' }] }));
+  assert.strictEqual(nonString.ok, false);
+  assert.ok(nonString.errors.some((e) => e.includes('storage_key')), `non-string storage_key must be a named error: ${JSON.stringify(nonString.errors)}`);
+});
+
+test('resolveAllowedMisses: identical mem_id::mention under DIFFERENT storage_key are NOT duplicates', () => {
+  const resolved = resolveAllowedMisses(JSON.stringify({ allowed: [
+    { storage_key: 'T01', mem_id: 'MEM006', mention: 'a.md', item: '#1', reason: 'x' },
+    { storage_key: 'T02', mem_id: 'MEM006', mention: 'a.md', item: '#1', reason: 'y' },
+  ] }));
+  assert.strictEqual(resolved.ok, true, `distinct storage_key must not collide: ${JSON.stringify(resolved.errors || [])}`);
+  assert.deepStrictEqual(resolved.entries.map((e) => e.key).sort(), ['T01::MEM006::a.md', 'T02::MEM006::a.md']);
+});
+
 // ── Section 7: key stability under neighboring writes ───────────────────────
 console.log('\nSection 7: a NEW fact in a neighboring fragment never changes the key of an existing miss\n');
 
@@ -357,7 +395,7 @@ test('writing a new fact into a sibling fragment leaves existing miss keys byte-
     });
     writeAllowed(cwd, []);
     const before = measureGreen(cwd);
-    assert.deepStrictEqual(before.allowed_misses.new, ['f-miss::prefs-x.rst']);
+    assert.deepStrictEqual(before.allowed_misses.new, ['T01::f-miss::prefs-x.rst']);
     // Neighboring write: a brand-new fact in a DIFFERENT fragment. Keys derive
     // from mem_id + the miss's own normalized mention — never from line
     // numbers, read order, or sibling content — so the existing key must not
@@ -375,7 +413,7 @@ test('a green gate with the miss listed stays green after a neighboring write', 
       unit_id: 'T01',
       facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))],
     });
-    writeAllowed(cwd, [entry('f-miss', 'prefs-x.rst')]);
+    writeAllowed(cwd, [entry('T01', 'f-miss', 'prefs-x.rst')]);
     assert.strictEqual(measureGreen(cwd).green, true);
     writeFragment(cwd, { unit_id: 'T02', facts: [fact('f-new', 'novo fato citando `scripts/covered.js` aqui')] });
     const after = measureGreen(cwd);
@@ -384,25 +422,39 @@ test('a green gate with the miss listed stays green after a neighboring write', 
 });
 
 // ── Section 8: enumeration/extraction pure helpers ──────────────────────────
-console.log('\nSection 8: enumerateMisses and collectLiveMemIds derive from the F2 report, deduplicated\n');
+console.log('\nSection 8: enumerateMisses and collectLiveQualifiedIds derive from the F2 report, deduplicated\n');
 
-test('enumerateMisses covers missed AND partial buckets, deduplicated by key (isolated)', () => {
+test('enumerateMisses covers missed AND partial buckets, deduplicated by qualified key (isolated)', () => {
   const f2 = {
-    facts_missed_total: [{ mem_id: 'M1', missing_mentions: [{ normalized: 'a.md' }, { normalized: 'a.md' }] }],
-    facts_missed_partial: [{ mem_id: 'M1', missing_mentions: [{ normalized: 'a.md' }, { normalized: 'b.md' }] }],
+    facts_missed_total: [{ mem_id: 'M1', storage_key: 'T01', missing_mentions: [{ normalized: 'a.md' }, { normalized: 'a.md' }] }],
+    facts_missed_partial: [{ mem_id: 'M1', storage_key: 'T01', missing_mentions: [{ normalized: 'a.md' }, { normalized: 'b.md' }] }],
   };
   const misses = enumerateMisses(f2);
-  assert.deepStrictEqual(misses.map((m) => m.key).sort(), ['M1::a.md', 'M1::b.md']);
+  assert.deepStrictEqual(misses.map((m) => m.key).sort(), ['T01::M1::a.md', 'T01::M1::b.md']);
 });
 
-test('collectLiveMemIds spans all four fact buckets (isolated)', () => {
+test('enumerateMisses: the SAME mem_id under DIFFERENT storage_key produces distinct qualified keys, never collapsed (isolated)', () => {
+  // The exact isolation leak this slice closes: two fragments sharing MEM006
+  // and the same normalized missing mention must never collapse into one key.
   const f2 = {
-    facts_covered: [{ mem_id: 'A' }],
-    facts_missed_total: [{ mem_id: 'B' }],
-    facts_missed_partial: [{ mem_id: 'C' }],
-    facts_no_mention: [{ mem_id: 'D' }, { mem_id: null }],
+    facts_missed_total: [
+      { mem_id: 'MEM006', storage_key: 'T01', missing_mentions: [{ normalized: 'a.md' }] },
+      { mem_id: 'MEM006', storage_key: 'T02', missing_mentions: [{ normalized: 'a.md' }] },
+    ],
+    facts_missed_partial: [],
   };
-  assert.deepStrictEqual([...collectLiveMemIds(f2)].sort(), ['A', 'B', 'C', 'D']);
+  const misses = enumerateMisses(f2);
+  assert.deepStrictEqual(misses.map((m) => m.key).sort(), ['T01::MEM006::a.md', 'T02::MEM006::a.md']);
+});
+
+test('collectLiveQualifiedIds spans all four fact buckets, qualified by storage_key (isolated)', () => {
+  const f2 = {
+    facts_covered: [{ mem_id: 'A', storage_key: 'T01' }],
+    facts_missed_total: [{ mem_id: 'B', storage_key: 'T01' }],
+    facts_missed_partial: [{ mem_id: 'C', storage_key: 'T01' }],
+    facts_no_mention: [{ mem_id: 'D', storage_key: 'T01' }, { mem_id: null, storage_key: 'T01' }],
+  };
+  assert.deepStrictEqual([...collectLiveQualifiedIds(f2)].sort(), ['T01::A', 'T01::B', 'T01::C', 'T01::D']);
 });
 
 // ── Section 9: unit axis incomplete (fragment lost) ─────────────────────────
@@ -538,7 +590,7 @@ test('two consecutive runs produce identical fields except measured_at', () => {
   const cwd = fixture();
   try {
     writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-covered', '`scripts/covered.js`'), fact('f-miss', missFactText('prefs-x.rst'))] });
-    writeAllowed(cwd, [entry('f-miss', 'prefs-x.rst')]);
+    writeAllowed(cwd, [entry('T01', 'f-miss', 'prefs-x.rst')]);
     const first = measureGreen(cwd);
     const second = measureGreen(cwd);
     const strip = (r) => { const { measured_at, ...rest } = r; return rest; };
@@ -570,7 +622,7 @@ test('CLI --allowed <file> overrides the default cwd-relative list location', ()
   try {
     writeFragment(cwd, { unit_id: 'T01', facts: [fact('f-miss', missFactText('prefs-x.rst'))] });
     const custom = path.join(listDir, 'my-allowed.json');
-    fs.writeFileSync(custom, JSON.stringify({ allowed: [entry('f-miss', 'prefs-x.rst')] }));
+    fs.writeFileSync(custom, JSON.stringify({ allowed: [entry('T01', 'f-miss', 'prefs-x.rst')] }));
     const result = spawnSync(process.execPath, [path.join(__dirname, 'forge-index-green.js'), '--cwd', cwd, '--allowed', custom, '--json'], { encoding: 'utf8' });
     assert.strictEqual(result.status, 0);
     const parsed = JSON.parse(result.stdout.trim());
@@ -748,6 +800,81 @@ test('an EXPLICIT path still refuses when absent — the search order does not s
     assert.strictEqual(report.green, false);
     assert.strictEqual(report.allowed_misses.code, 'allowed-misses-file-missing');
     assert.strictEqual(report.allowed_misses.source, 'explicit');
+  } finally { cleanup(cwd); }
+});
+
+// ── Section 19: storage_key qualification end-to-end (real store, real gate) ─
+console.log('\nSection 19: storage_key qualification through the real store — isolation, ghost, stale, F2 projection\n');
+
+test('two fragments sharing the same MEM006 mem_id and mention: allowing ONE storage_key leaves the OTHER as unlisted-miss', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('MEM006', missFactText('prefs-x.rst'))] });
+    writeFragment(cwd, { unit_id: 'T02', facts: [fact('MEM006', missFactText('prefs-x.rst'))] });
+    // Allow only the T01 fragment's miss — the old mem_id::mention scheme
+    // would have (wrongly) covered T02 as well, because the key never named
+    // WHICH fragment produced the miss.
+    writeAllowed(cwd, [entry('T01', 'MEM006', 'prefs-x.rst')]);
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.green, false, 'the T02 miss must remain unlisted — permission does not leak across fragments');
+    assert.deepStrictEqual(report.allowed_misses.new, ['T02::MEM006::prefs-x.rst']);
+    assert.deepStrictEqual(report.allowed_misses.known, ['T01::MEM006::prefs-x.rst']);
+  } finally { cleanup(cwd); }
+});
+
+test('allowing BOTH qualified entries for the same mem_id/mention under distinct storage_key is green', () => {
+  const cwd = fixture();
+  try {
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('MEM006', missFactText('prefs-x.rst'))] });
+    writeFragment(cwd, { unit_id: 'T02', facts: [fact('MEM006', missFactText('prefs-x.rst'))] });
+    writeAllowed(cwd, [entry('T01', 'MEM006', 'prefs-x.rst'), entry('T02', 'MEM006', 'prefs-x.rst')]);
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.green, true);
+    assert.deepStrictEqual(report.allowed_misses.known.sort(), ['T01::MEM006::prefs-x.rst', 'T02::MEM006::prefs-x.rst']);
+  } finally { cleanup(cwd); }
+});
+
+test('a nonexistent allowed storage_key paired with a mem_id that DOES exist elsewhere is a ghost — the qualified check cannot be masked', () => {
+  const cwd = fixture();
+  try {
+    // MEM006 is genuinely alive, but only under T01 — never under T99.
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('MEM006', '`scripts/covered.js`')] });
+    writeAllowed(cwd, [entry('T99', 'MEM006', 'x.md')]);
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.green, false);
+    assert.ok(report.reasons.includes('ghost-allowed-entry:T99::MEM006::x.md'), `expected qualified ghost named in ${JSON.stringify(report.reasons)}`);
+    assert.ok(!report.reasons.some((r) => r.startsWith('stale-allowed-entry:T99::MEM006')), 'a ghost must never double-report as stale even though the mem_id is alive under another storage_key');
+    assert.deepStrictEqual(report.allowed_misses.ghost, ['T99::MEM006::x.md']);
+  } finally { cleanup(cwd); }
+});
+
+test('a qualified fact that exists but whose mention no longer misses is stale, not ghost — same mem_id, distinct outcome from the ghost case above', () => {
+  const cwd = fixture();
+  try {
+    // T01::MEM006 is alive and its ONLY mention is covered — 'x.md' was never
+    // a real miss of this fact, so the entry is stale (fact alive, claim
+    // false), the opposite failure mode from the ghost test above (fact never
+    // existed under that storage_key at all).
+    writeFragment(cwd, { unit_id: 'T01', facts: [fact('MEM006', '`scripts/covered.js`')] });
+    writeAllowed(cwd, [entry('T01', 'MEM006', 'x.md')]);
+    const report = measureGreen(cwd);
+    assert.strictEqual(report.green, false);
+    assert.ok(report.reasons.includes('stale-allowed-entry:T01::MEM006::x.md'), `expected qualified stale named in ${JSON.stringify(report.reasons)}`);
+    assert.ok(!report.reasons.includes('ghost-allowed-entry:T01::MEM006::x.md'), 'a stale entry must never double-report as ghost');
+    assert.deepStrictEqual(report.allowed_misses.stale, ['T01::MEM006::x.md']);
+  } finally { cleanup(cwd); }
+});
+
+test('measureF2: facts_missed_partial retains the exact source fragment storage_key — no second store read needed downstream', () => {
+  const cwd = fixture();
+  try {
+    // Two mentions, one cited, one not → lands in the `partial` bucket, the
+    // exact bucket whose projection used to drop storage_key.
+    const text = 'cita `scripts/covered.js` e também ' + missFactText('prefs-x.rst');
+    writeFragment(cwd, { unit_id: 'T07', facts: [fact('MEM-PARTIAL', text)] });
+    const report = measureF2(cwd);
+    assert.strictEqual(report.facts_missed_partial.length, 1, `expected exactly one partial fact: ${JSON.stringify(report.facts_missed_partial)}`);
+    assert.strictEqual(report.facts_missed_partial[0].storage_key, 'T07', 'the partial projection must carry the fragment storage_key it was computed from — no re-read of the store');
   } finally { cleanup(cwd); }
 });
 

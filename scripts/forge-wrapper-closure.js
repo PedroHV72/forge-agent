@@ -20,7 +20,12 @@
 //                     PROVED here, never presumed from "milestone closed".
 //   3. index        — forge-memory-axes.buildUnitAxis computed LIVE against
 //                     forge-memory-index.buildFileIndex(cwd) — never the
-//                     materialized MEMORY-INDEX-BY-FILE.md.
+//                     materialized MEMORY-INDEX-BY-FILE.md. A complete miss
+//                     falls back to the canonical memory store funnel
+//                     (listFragments/readFragmentText/parseFragment) so a
+//                     fact with no file citation still proves existence;
+//                     `source` names which signal decided (file-index |
+//                     store).
 //   4. knowledge    — .gsd/KNOWLEDGE.md refs to the unit, enumerated with
 //                     line numbers. Purely informative: this layer NEVER
 //                     decides `ok`; refs found are always surfaced, never
@@ -99,6 +104,18 @@ function checkDistilled(cwd, unitId) {
 // — never reading that materialized artifact. An index that lost coverage
 // (fragment_listing_failed, partial) is 'unavailable': a degraded index is
 // not evidence of absence (same ruler as the index-verde gate).
+//
+// The file index only ever surfaces a fact when its text carries a resolvable
+// file citation (buildFileIndex skips citation-less facts by design — see the
+// fixture comment in the test file). That made Layer 3's real question wrong:
+// it was answering "does this unit have a CITED fact?", not "does this unit
+// have a durable fact at all?". A complete index miss is therefore NOT proof
+// of absence — it only proves the fact (if any) did not cite a file. When the
+// complete axis has nothing for the unit, checkIndex falls back to the
+// canonical memory store funnel (listFragments → readFragmentText →
+// parseFragment — never fs.readFileSync of a path directly, so grouped
+// fragments work) and asks the more honest question directly. Fields stay
+// additive: `source` names which signal actually established existence.
 function checkIndex(cwd, unitId) {
   let memoryIndex;
   let memoryAxes;
@@ -128,7 +145,58 @@ function checkIndex(cwd, unitId) {
   }
   const unit = axis.units.find((u) => u && (u.unit_id === unitId || u.storage_key === unitId));
   if (unit && Array.isArray(unit.facts) && unit.facts.length >= 1) {
-    return { outcome: 'ok', reason: null, facts_count: unit.facts.length };
+    return { outcome: 'ok', reason: null, facts_count: unit.facts.length, source: 'file-index' };
+  }
+  return checkIndexStoreFallback(cwd, unitId);
+}
+
+// Fallback funnel used only after a COMPLETE file-index/axis lookup found no
+// facts for the unit. Never invoked on a degraded first read (partial /
+// fragment_listing_failed / build errors all return before reaching here) —
+// a degraded index is not evidence of absence and must not trigger a
+// fallback that could disguise it as a clean miss.
+function checkIndexStoreFallback(cwd, unitId) {
+  let memory;
+  try {
+    memory = require('./forge-memory');
+  } catch (e) {
+    return { outcome: 'unavailable', reason: 'module-unavailable', note: e.message, facts_count: 0, source: 'store' };
+  }
+  let fragments;
+  try {
+    fragments = memory.listFragments(cwd);
+  } catch (e) {
+    return { outcome: 'unavailable', reason: 'listing-failed', note: e.message, facts_count: 0, source: 'store' };
+  }
+  // D5 precedent (S01): a local id like `S01`/`T01` is qualified by milestone
+  // in the store, so several fragments can share the same BARE unitId. Picking
+  // the first ordered match would answer for another milestone's fragment and
+  // be right only by luck. Filter, and when more than one candidate matches,
+  // REFUSE naming them — never choose one, never ok, never fail.
+  const matches = fragments.filter((f) => f && (f.unitId === unitId || f.storageKey === unitId));
+  if (matches.length > 1) {
+    const keys = matches.map((f) => f.storageKey || f.unitId).sort();
+    return {
+      outcome: 'unavailable',
+      reason: `ambiguous-unit-id: ${keys.join(', ')}`,
+      facts_count: 0,
+      source: 'store',
+    };
+  }
+  const entry = matches[0];
+  if (!entry) {
+    return { outcome: 'fail', reason: 'not-in-index', facts_count: 0 };
+  }
+  let facts;
+  try {
+    const text = memory.readFragmentText(cwd, entry);
+    const parsed = memory.parseFragment(text);
+    facts = Array.isArray(parsed.facts) ? parsed.facts : [];
+  } catch (e) {
+    return { outcome: 'unavailable', reason: 'store-read-error', note: e.message, facts_count: 0, source: 'store' };
+  }
+  if (facts.length >= 1) {
+    return { outcome: 'ok', reason: null, source: 'store', note: 'no-file-citations', facts_count: facts.length };
   }
   return { outcome: 'fail', reason: 'not-in-index', facts_count: 0 };
 }
@@ -246,6 +314,7 @@ module.exports = {
     checkLedger,
     checkDistilled,
     checkIndex,
+    checkIndexStoreFallback,
     checkKnowledge,
     knowledgeRefPatterns,
     KNOWLEDGE_REL_PATH,

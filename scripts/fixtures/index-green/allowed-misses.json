@@ -1,17 +1,72 @@
 {
-  "_comment": "Misses permitidos do gate índice-verde (forge-index-green.js). Lista HUMANA e versionada — adicionar uma entrada é decisão de quem abre a PR, nunca automática. Chave estável por miss: mem_id + mention (a menção normalizada que measureF2 reporta em missing_mentions[].normalized). A comparação é em duas direções: um miss fora desta lista reprova o gate, E uma entrada cuja menção deixou de falhar também reprova até ser removida — allow-list que só cresce vira gate inerte (doctor Layer 3, TASK-021). Entrada apontando para um mem_id que não existe mais no store é fantasma e reprova. Campo item é o DONO (issue/backlog id) — obrigatório.",
-  "allowed": [
+  "_comment": [
+    "Misses permitidos do gate índice-verde (forge-index-green.js).",
+    "Lista HUMANA e versionada — adicionar uma entrada é decisão de quem abre a PR, nunca automática.",
+    "Chave estável por miss: storage_key + mem_id + mention — o fragmento medido que produziu o miss,",
+    "o fato dono, e a menção normalizada que measureF2 reporta em missing_mentions[].normalized.",
+    "storage_key qualifica a entrada: o MESMO mem_id pode existir em vários fragmentos (uma memória",
+    "promovida entre unidades mantém seu mem_id) — mem_id::mention sozinho concedia permissão global,",
+    "uma entrada permitida em UM fragmento mascarava o mesmo par em outro.",
+    "A comparação é em duas direções: um miss fora desta lista reprova o gate, E uma entrada cuja",
+    "menção deixou de falhar também reprova até ser removida — allow-list que só cresce vira gate",
+    "inerte (doctor Layer 3, TASK-021).",
+    "Entrada apontando para um (storage_key, mem_id) que não existe mais no store é fantasma e",
+    "reprova, mesmo que o mem_id exista em outro fragmento.",
+    "Campo item é o DONO (issue/backlog id) — obrigatório."
+  ],
+  "_migration_S06": [
+    "Migrado em S06 (M-20260818225600): a lista anterior media contra mem_id::mention, sem storage_key.",
+    "As seis entradas antigas (MEM058/.md, MEM032/forge-agent-prefs.md, MEM054/.bat,",
+    "MEM001/`expected_output:, MEM022/settings.json, MEM001/.md) foram todas medidas obsoletas contra",
+    "o F2 pós-S05 deste repo — quatro fantasmas (mem_id não existe mais no store) e duas curadas",
+    "(mem_id vivo, a menção específica não falha mais) — e removidas.",
+    "As três entradas então adicionadas vieram da medição direta do store deste repo pós-S05",
+    "(nenhum valor inventado): `node scripts/forge-index-f2.js --cwd . --json`, inspecionando",
+    "facts_missed_total/facts_missed_partial por mem_id e lendo o storage_key carregado por",
+    "classifyFact para cada fato correspondente.",
+    "SUPERSEDIDO por _migration_A3 abaixo — o extrator mudou desde essa medição. Mantido como",
+    "registro de contra qual estado a lista de três entradas foi medida."
+  ],
+  "_migration_A3": [
+    "RE-MEDIDO no merge de origin/master a16581e8 (base eca7bfce) na branch da PR #125.",
+    "Motivo: a #124 mudou o extrator (fechou quatro dos seis gaps de citação), então o conjunto de",
+    "misses medido em S06 deixou de valer — as três entradas de _migration_S06 foram medidas contra",
+    "o extrator ANTIGO. As duas entradas que vinham de origin/master (MEM058/.md e MEM001/.md, sem",
+    "storage_key) também não sobreviveram: não aparecem em nenhum dos dois buckets desta medição.",
+    "A lista abaixo NÃO é a união dos dois lados do conflito — é o que o instrumento reportou.",
+    "Medição: `node scripts/forge-index-f2.js --cwd <workspace> --json` com o código pós-merge,",
+    "contra o store dogfood deste repo (.gsd/memory, 21 fragmentos, gitignored — vive no workspace",
+    "principal, não no worktree). Resultado: f2_recall 0.9230769230769231, citations_total 38,",
+    "facts_missed_total 1 fato, facts_missed_partial 1 fato — duas chaves qualificadas ao todo.",
+    "Removida por CURA (não por escolha): T-20260717151823-corrigir-bug-1-stub::MEM003::.tsx —",
+    "o par de extensões nuas (.jsx/.tsx) passou a ser citado pelo extrator da #124 e não falha mais.",
+    "Mantê-la seria entrada stale, que reprova o gate na direção inversa por desenho.",
+    "As duas entradas sobreviventes conservam item e reason da medição de S06 — a razão da miss",
+    "(extensão nua, sem arquivo concreto) não mudou; só a população medida mudou."
+  ],
+  "_migration_126": [
+    "RE-MEDIDO apos a integracao da gramatica contextual da PR #139 e da master c9717c3.",
+    "Instrumento: node scripts/forge-index-f2.js --cwd C:/dev/forge-agent --json, executado com",
+    "o codigo desta branch combinado a master contra o store dogfood gitignored vigente.",
+    "Populacao: 1 fragmento, 7 fatos; facts_missed_total 0; facts_missed_partial 0; f2_recall 1;",
+    "citations_total 5. As duas entradas .swift anteriores nao existem mais na populacao",
+    "qualificada e seriam ghosts. Nenhuma proveniencia historica foi inventada."
+  ],
+  "_historical_allowed_before_126": [
     {
-      "mem_id": "MEM058",
-      "mention": ".md",
+      "storage_key": "M-20260813131121-varredura-classe-eol__T03",
+      "mem_id": "MEM001",
+      "mention": ".swift",
       "item": "#107",
-      "reason": "menção da extensão .md nua, sem nome de arquivo. Permanentemente ambígua por FORMA: `.env` e `.tsx` têm exatamente o mesmo shape e SÃO arquivos reais, então nenhuma regra lexical separa os dois casos. #107 fechou as outras quatro entradas (~/ x2, par de extensões, lista entre crases); estas duas continuam abertas por decisão, não por falta de tentativa — a única alternativa principiada encontrada (consultar o índice de arquivos do workspace) tornaria o recall dependente do workspace e acoplaria o detector à verdade que ele deveria observar de fora."
+      "reason": "menção da extensão .swift nua (não de um arquivo concreto) — o extrator corretamente não cita"
     },
     {
-      "mem_id": "MEM001",
-      "mention": ".md",
+      "storage_key": "M-20260813131121-varredura-classe-eol__T01",
+      "mem_id": "MEM005",
+      "mention": ".swift",
       "item": "#107",
-      "reason": "menção da extensão .md nua, sem nome de arquivo. Permanentemente ambígua por FORMA: `.env` e `.tsx` têm exatamente o mesmo shape e SÃO arquivos reais, então nenhuma regra lexical separa os dois casos. #107 fechou as outras quatro entradas (~/ x2, par de extensões, lista entre crases); estas duas continuam abertas por decisão, não por falta de tentativa — a única alternativa principiada encontrada (consultar o índice de arquivos do workspace) tornaria o recall dependente do workspace e acoplaria o detector à verdade que ele deveria observar de fora."
+      "reason": "menção da extensão .swift nua (contagem de suítes), não de um arquivo concreto — o extrator corretamente não cita"
     }
-  ]
+  ],
+  "allowed": []
 }

@@ -32,7 +32,11 @@ function assert(value, message) {
 }
 
 function fixture() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-vault-test-'));
+  // realpath, never the raw mkdtemp: this cwd is handed to production, which resolves it
+  // — on macOS os.tmpdir() is a symlink to /private/..., so an unresolved fixture root
+  // makes asserts like `refused[0].path === f.memberB` compare two spellings of the same
+  // file and fail. The symlink case below exists precisely because of this. Do not "simplify".
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'forge-sweep-vault-test-')));
 }
 
 function write(cwd, relative, bytes) {
@@ -97,6 +101,12 @@ test('an identical present destination is reported without rewriting it', () => 
   remove(cwd);
 });
 
+// DEFAULT-POLICY GUARD. This test predates the restore-over-rewrite fence and
+// is deliberately kept verbatim in behavior: a two-argument `restoreVault` must
+// still refuse a divergent destination with the historical reason and preserve
+// its bytes. The fence added below is opt-in and per-member; if this test ever
+// has to be loosened to keep the suite green, the fence has become a global
+// switch and that is the defect, not the test.
 test('a divergent destination is named and never overwritten', () => {
   const cwd = fixture();
   const original = Buffer.from('before\n', 'utf8');
@@ -108,6 +118,136 @@ test('a divergent destination is named and never overwritten', () => {
   assert(result.refused.length === 1, 'divergence must be recorded as one refusal');
   assert(result.refused[0].reason === 'destination-has-different-bytes', 'refusal needs a stable reason');
   assert(Buffer.compare(changed, fs.readFileSync(member)) === 0, 'divergent destination must remain untouched');
+  remove(cwd);
+});
+
+// ── Restore-over-rewrite fence ───────────────────────────────────────────────
+// Curation rewrites a fragment IN PLACE, so after a real apply the destination
+// always differs from the vault bytes and the unconditional refusal above made
+// `--undo` refuse every single time. The fence authorizes overwrite by MEMBER
+// NAME. Selectivity is the property under test: one authorized member restores
+// while a second divergent member, equally rewritten, is refused by name.
+
+// Two divergent members, exactly one authorized.
+function twoDivergentMembers() {
+  const cwd = fixture();
+  const originalA = Buffer.from('A original\r\n', 'utf8');
+  const originalB = Buffer.from('B original\n', 'utf8');
+  const memberA = write(cwd, '.gsd/memory/a.md', originalA);
+  const memberB = write(cwd, '.gsd/memory/b.md', originalB);
+  const vault = writeVault(cwd, { operation: 'curate', files: [memberA, memberB] });
+  assert(vault.ok, 'vault write should succeed');
+  // Rewrite in place -- what a real curate apply does to both.
+  const rewrittenA = Buffer.from('A rewritten by curate\r\n', 'utf8');
+  const rewrittenB = Buffer.from('B rewritten by curate\n', 'utf8');
+  fs.writeFileSync(memberA, rewrittenA);
+  fs.writeFileSync(memberB, rewrittenB);
+  return { cwd, vault, memberA, memberB, originalA, originalB, rewrittenA, rewrittenB };
+}
+
+test('an explicitly named divergent member is restored over the rewrite', () => {
+  const f = twoDivergentMembers();
+  const result = restoreVault(f.cwd, f.vault.containerPath, { overwrite: ['.gsd/memory/a.md'] });
+  assert(result.restored.length === 1, `exactly the named member restores, got ${JSON.stringify(result.restored)}`);
+  assert(
+    Buffer.compare(f.originalA, fs.readFileSync(f.memberA)) === 0,
+    'the authorized member must return to its exact pre-apply bytes',
+  );
+  remove(f.cwd);
+});
+
+test('a divergent member outside the authorization set is refused by name', () => {
+  const f = twoDivergentMembers();
+  const result = restoreVault(f.cwd, f.vault.containerPath, { overwrite: ['.gsd/memory/a.md'] });
+  assert(result.refused.length === 1, `only the unauthorized member is refused, got ${JSON.stringify(result.refused)}`);
+  assert(result.refused[0].path === f.memberB, 'the refusal must carry the offending destination path');
+  assert(
+    result.refused[0].reason === 'destination-not-authorized-for-overwrite',
+    `refusal needs a stable policy reason, got ${result.refused[0].reason}`,
+  );
+  assert(
+    Buffer.compare(f.rewrittenB, fs.readFileSync(f.memberB)) === 0,
+    'the unauthorized member must keep the bytes it had before the call',
+  );
+  remove(f.cwd);
+});
+
+test('an authorization naming a member that does not match authorizes nothing', () => {
+  const f = twoDivergentMembers();
+  const result = restoreVault(f.cwd, f.vault.containerPath, { overwrite: ['.gsd/memory/a.md.bak', '.gsd/memory/'] });
+  assert(result.restored.length === 0, 'a near-miss name must not authorize anything');
+  assert(result.refused.length === 2, 'both divergent members stay refused');
+  assert(Buffer.compare(f.rewrittenA, fs.readFileSync(f.memberA)) === 0, 'A keeps its rewritten bytes');
+  assert(Buffer.compare(f.rewrittenB, fs.readFileSync(f.memberB)) === 0, 'B keeps its rewritten bytes');
+  remove(f.cwd);
+});
+
+// The caller may hand the id back the way the host spells paths. Authorization
+// is compared at the normalized member-id boundary, so a NATIVE-separator or
+// `./`-prefixed spelling of the SAME member is the same member -- and nothing
+// else is.
+//
+// The input is native BY CONSTRUCTION (`path.sep`), never a hand-written literal:
+// `normalizeMemberId` -> `toPosix` folds `path.sep` only, so a literal `\` would
+// exercise the intent on win32 and assert a falsehood on POSIX, where `\` is a
+// legal filename character and must NOT be read as a separator.
+test('authorization matches the normalized member id, not the raw spelling', () => {
+  const f = twoDivergentMembers();
+  const nativeSpelling = '.' + path.sep + ['.gsd', 'memory', 'a.md'].join(path.sep);
+  const result = restoreVault(f.cwd, f.vault.containerPath, { overwrite: [nativeSpelling] });
+  assert(result.restored.length === 1, 'a normalized spelling of the id must still authorize');
+  assert(Buffer.compare(f.originalA, fs.readFileSync(f.memberA)) === 0, 'A restored to original bytes');
+  remove(f.cwd);
+});
+
+// There is no global switch, by construction: the fence takes a closed set of
+// names. Anything that is not a set/array of ids yields an empty set, i.e. the
+// historical deny-by-default. A `true` that meant "all" would reintroduce the
+// blanket overwrite this slice exists to avoid.
+test('a truthy non-set policy authorizes nothing and keeps the default reason', () => {
+  for (const policy of [true, 'all', '*', { '.gsd/memory/a.md': true }, 42]) {
+    const f = twoDivergentMembers();
+    const result = restoreVault(f.cwd, f.vault.containerPath, { overwrite: policy });
+    assert(result.restored.length === 0, `policy ${JSON.stringify(policy)} must authorize nothing`);
+    assert(result.refused.length === 2, `policy ${JSON.stringify(policy)} must refuse both members`);
+    assert(
+      result.refused.every(entry => entry.reason === 'destination-has-different-bytes'),
+      'an empty authorization set is indistinguishable from no policy at all',
+    );
+    assert(Buffer.compare(f.rewrittenA, fs.readFileSync(f.memberA)) === 0, 'A untouched');
+    remove(f.cwd);
+  }
+});
+
+// Authorization is a policy about WHICH member may be overwritten; it is not a
+// permission to leave `.gsd`. Containment runs first and is unaffected.
+test('authorizing an escaping member id does not bypass containment', () => {
+  const cwd = fixture();
+  const dir = vaultDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  const container = path.join(dir, 'authorized-escape.md');
+  fs.writeFileSync(container, serializeGroup({ label: 'curate', units: [
+    { id: '../outside.md', content: Buffer.from('never write this', 'utf8') },
+  ] }).buffer);
+  const result = restoreVault(cwd, container, { overwrite: ['../outside.md'] });
+  assert(result.refused.length === 1, 'the escaping member is still refused');
+  assert(result.refused[0].reason === 'path-escapes-gsd', 'containment reason wins over the policy');
+  assert(result.restored.length === 0, 'nothing may be restored outside .gsd');
+  assert(!fs.existsSync(path.join(cwd, 'outside.md')), 'outside path must remain absent');
+  remove(cwd);
+});
+
+test('an authorized member whose bytes already match is still reported as present', () => {
+  const cwd = fixture();
+  const bytes = Buffer.from('unchanged\r\n', 'utf8');
+  const member = write(cwd, '.gsd/memory/same.md', bytes);
+  const vault = writeVault(cwd, { operation: 'curate', files: [member] });
+  const before = fs.statSync(member).mtimeMs;
+  const result = restoreVault(cwd, vault.containerPath, { overwrite: vault.members });
+  const after = fs.statSync(member).mtimeMs;
+  assert(result.alreadyPresent.length === 1, 'byte identity is checked before the policy');
+  assert(result.restored.length === 0, 'an identical destination is never rewritten, authorized or not');
+  assert(before === after, 'mtime must be untouched');
   remove(cwd);
 });
 
