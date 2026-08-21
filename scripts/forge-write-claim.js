@@ -356,7 +356,17 @@ function releaseClaim(cwd, runId, release, opts) {
  * see S05-PLAN.md contract #6.
  */
 function isHeld(claim) {
-  return !!claim && !claim.released;
+  // Only the canonical absence values mean "no claim". Falsy persisted values
+  // are malformed claims, not proof that ownership ended.
+  if (claim === null || claim === undefined) return false;
+  if (typeof claim !== 'object' || Array.isArray(claim)) return true;
+  try {
+    return normalizeReleased(claim.released) === null;
+  } catch {
+    // A malformed release envelope cannot prove that ownership ended. Legacy,
+    // hand-edited and partially-corrupt records stay protected (fail closed).
+    return true;
+  }
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────
