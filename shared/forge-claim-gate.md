@@ -5,6 +5,11 @@ will write code, it records what that unit claims to write into its own `RunReco
 that claim against the claims of every other active run sharing the same `CODE_DIR`. A measured
 collision **stops the dispatch** — it never becomes a merge conflict discovered hours later.
 
+Claim paths use one POSIX lexical contract across gate, release and recovery: `.` means the entire
+workspace, `./src` and `src/../src` canonicalize to `src`, and a `..` that would escape above the
+workspace root is invalid and fails closed. POSIX-absolute, drive-rooted and UNC paths are filesystem
+addresses, never claims, and also fail closed. Glob tokens remain intact during claim canonicalization.
+
 This file is boundary-agnostic and has **three consumers**, exactly like `shared/forge-review.md`:
 
 | Consumer | Boundary | MODE | Unit types gated |
@@ -650,6 +655,32 @@ never defaulted to proceed.
   predicate of `scripts/forge-parallelism.js` has the **opposite polarity** (an empty list means no
   conflict there) and is correct in its own boundary; it is neither imported nor consulted here, and
   suites guard that absence in both modules.
+
+## Recuperação manual de owner interrompido
+
+Um claim live nunca é liberado por inferência de PID, sessão ou idade. Quando a run aparece no censo
+`forge-claim-stuck`, o operador pode usar `forge-doctor --recover-claim <id>` para preview. A mutação
+exige as três flags `--apply --confirm-owner-stopped --confirm-workspace-quiescent`. O fluxo mede apenas paths dirty dentro do
+escopo declarado usando `forge-vcs.workingStatus`; para escopo dirty, registra primeiro o evento de
+intenção, persiste, reabre e verifica um bundle byte-preserving, registra `bundle-verified` e mede o
+dirty scope novamente. A transição final é CAS, sob o lock da run, para
+`released.mechanism: manual` e `active:false`.
+
+`--confirm-owner-stopped` e `--confirm-workspace-quiescent` são fences explícitos: o segundo cobre
+troca externa concorrente dos paths. Node cross-platform não fornece `openat`/no-follow
+handle-relative; lstat, identidade e revalidação cobrem estado preexistente, não prometem
+atomicidade contra processo hostil ainda ativo. Journal e bundle são fsyncados antes do CAS. A segunda
+medição é uma precondition executada dentro do lock de `runs.updateWith`, imediatamente antes do
+patch; junto ao CAS do RunRecord completo, ela fecha a concorrência cooperativa.
+
+A estratégia e suas limitações são registradas no manifest, evidence e journal. Arquivos do bundle
+usam staging + file fsync + publicação atômica; o journal append-only usa file fsync. POSIX também
+exige directory fsync bottom-up. No Windows, Node não oferece directory fsync portável: o fluxo
+registra `directory-entry-durability-not-portable` e não promete sobrevivência dessa entrada a crash.
+
+O restore do bundle também é preview-first e idempotente. Um destino ausente recebe os bytes
+capturados; bytes já idênticos são mantidos; bytes divergentes nunca são sobrescritos e o payload é
+extraído sob `conflicts/` na área de recuperação.
 
 ## Cross-references
 
